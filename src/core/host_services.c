@@ -31,22 +31,33 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
-        !hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)))
+        (!hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)) ||
+         services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
+         services->file->metadata == NULL || services->file->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
-        !hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)))
+        (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||
+         services->process->spawn == NULL || services->process->wait == NULL || services->process->terminate == NULL ||
+         services->process->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_EVENT) != 0 &&
-        !hl_valid_group(services->event, HL_HOST_EVENT_ABI, sizeof(*services->event)))
+        (!hl_valid_group(services->event, HL_HOST_EVENT_ABI, sizeof(*services->event)) ||
+         services->event->create == NULL || services->event->control == NULL || services->event->wait == NULL ||
+         services->event->wake == NULL || services->event->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_NETWORK) != 0 &&
-        !hl_valid_group(services->network, HL_HOST_NETWORK_ABI, sizeof(*services->network)))
+        (!hl_valid_group(services->network, HL_HOST_NETWORK_ABI, sizeof(*services->network)) ||
+         services->network->socket == NULL || services->network->bind == NULL || services->network->connect == NULL ||
+         services->network->send == NULL || services->network->receive == NULL || services->network->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_SHARED_MEMORY) != 0 &&
-        !hl_valid_group(services->shared_memory, HL_HOST_SHARED_MEMORY_ABI, sizeof(*services->shared_memory)))
+        (!hl_valid_group(services->shared_memory, HL_HOST_SHARED_MEMORY_ABI, sizeof(*services->shared_memory)) ||
+         services->shared_memory->create == NULL || services->shared_memory->open == NULL ||
+         services->shared_memory->resize == NULL || services->shared_memory->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_GPU) != 0 &&
-        !hl_valid_group(services->gpu, HL_HOST_GPU_ABI, sizeof(*services->gpu)))
+        (!hl_valid_group(services->gpu, HL_HOST_GPU_ABI, sizeof(*services->gpu)) || services->gpu->allocate == NULL ||
+         services->gpu->identity == NULL || services->gpu->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

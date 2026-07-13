@@ -32,6 +32,46 @@ enum {
     HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 9
 };
 
+enum {
+    HL_HOST_FILE_READ = 1u << 0,
+    HL_HOST_FILE_WRITE = 1u << 1,
+    HL_HOST_FILE_APPEND = 1u << 2,
+    HL_HOST_FILE_DIRECTORY = 1u << 3
+};
+
+enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
+
+typedef enum hl_host_network_family {
+    HL_HOST_NETWORK_IPV4 = 1,
+    HL_HOST_NETWORK_IPV6 = 2,
+    HL_HOST_NETWORK_LOCAL = 3
+} hl_host_network_family;
+
+typedef enum hl_host_network_type { HL_HOST_NETWORK_STREAM = 1, HL_HOST_NETWORK_DATAGRAM = 2 } hl_host_network_type;
+
+typedef struct hl_host_network_address {
+    uint32_t family;
+    uint16_t port;
+    uint16_t size;
+    uint8_t address[16];
+    char local_path[108];
+} hl_host_network_address;
+
+#define HL_HOST_HANDLE_CWD UINT64_MAX
+
+enum { HL_HOST_MEMORY_READ = 1u << 0, HL_HOST_MEMORY_WRITE = 1u << 1, HL_HOST_MEMORY_EXECUTE = 1u << 2 };
+
+enum { HL_HOST_EVENT_ADD = 1, HL_HOST_EVENT_MODIFY = 2, HL_HOST_EVENT_DELETE = 3 };
+
+enum {
+    HL_HOST_READY_READ = 1u << 0,
+    HL_HOST_READY_WRITE = 1u << 1,
+    HL_HOST_READY_ERROR = 1u << 2,
+    HL_HOST_READY_HANGUP = 1u << 3,
+    HL_HOST_READY_EDGE = 1u << 4,
+    HL_HOST_READY_ONESHOT = 1u << 5
+};
+
 typedef struct hl_host_bytes {
     void *data;
     size_t size;
@@ -117,8 +157,8 @@ typedef struct hl_host_event_services {
 typedef struct hl_host_network_services {
     HL_ABI_HEADER;
     hl_host_result (*socket)(void *context, uint32_t family, uint32_t type, uint32_t protocol);
-    hl_host_result (*bind)(void *context, hl_host_handle socket, hl_host_const_bytes address);
-    hl_host_result (*connect)(void *context, hl_host_handle socket, hl_host_const_bytes address);
+    hl_host_result (*bind)(void *context, hl_host_handle socket, const hl_host_network_address *address);
+    hl_host_result (*connect)(void *context, hl_host_handle socket, const hl_host_network_address *address);
     hl_host_result (*send)(void *context, hl_host_handle socket, hl_host_const_bytes data, uint32_t flags);
     hl_host_result (*receive)(void *context, hl_host_handle socket, hl_host_bytes data, uint32_t flags);
     hl_host_result (*close)(void *context, hl_host_handle socket);

@@ -2,6 +2,7 @@ CC ?= cc
 AR ?= ar
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
+HOST ?= linux
 
 CPPFLAGS := -Iinclude
 CFLAGS ?= -O2 -g
@@ -15,6 +16,13 @@ FAKE_HOST_SOURCES := src/host/fake/fake_host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
 OBJECTS := $(PORTABLE_SOURCES:%.c=$(BUILD)/%.o)
 
+ifeq ($(HOST),linux)
+LINUX_HOST_SOURCES := src/host/linux/host_linux.c
+LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
+LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
+LINUX_HOST_TEST := run-unit-host_linux
+endif
+
 UNIT_NAMES := config host_services ir linux_abi engine
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
@@ -26,7 +34,7 @@ NATIVE_SMOKE_BINS := $(NATIVE_SMOKE:%=$(BUILD)/fixtures/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) compat-build compat-native check-domains format format-check help
 
-all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-fake.a $(BUILD)/bin/hl-engine-runner
+all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
 
 $(BUILD)/src/%.o: src/%.c
 	@mkdir -p $(@D)
@@ -37,6 +45,10 @@ $(BUILD)/lib/libhl-engine.a: $(filter-out $(BUILD)/src/host/fake/fake_host.o,$(O
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-host-fake.a: $(BUILD)/src/host/fake/fake_host.o
+	@mkdir -p $(@D)
+	$(AR) rcs $@ $^
+
+$(BUILD)/lib/libhl-host-linux.a: $(LINUX_HOST_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
 
@@ -61,7 +73,7 @@ $(BUILD)/tools/compat-runner: tools/compat_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
-unit: $(UNIT_RUN_TARGETS)
+unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST)
 
 define HL_UNIT_RULE
 run-unit-$(1): $(BUILD)/tests/test_$(1)
@@ -69,6 +81,14 @@ run-unit-$(1): $(BUILD)/tests/test_$(1)
 endef
 
 $(foreach test,$(UNIT_NAMES),$(eval $(call HL_UNIT_RULE,$(test))))
+
+run-unit-host_linux: $(BUILD)/tests/test_host_linux
+	$<
+
+$(BUILD)/tests/test_host_linux: tests/unit/test_host_linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 compat-build: $(FIXTURE_BINS)
 
@@ -81,10 +101,10 @@ check-domains: $(BUILD)/tools/check-domains
 test: unit check-domains compat-native
 
 format:
-	$(CLANG_FORMAT) -i $(PORTABLE_SOURCES) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
+	$(CLANG_FORMAT) -i $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
 
 format-check:
-	$(CLANG_FORMAT) --dry-run --Werror $(PORTABLE_SOURCES) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
+	$(CLANG_FORMAT) --dry-run --Werror $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
 
 clean:
 	rm -rf $(BUILD)
