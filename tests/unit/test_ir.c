@@ -20,6 +20,8 @@ int main(void) {
     hl_ir_instruction exit_instruction;
     hl_ir_value first;
     hl_ir_value second;
+    hl_ir_value sum;
+    hl_ir_exit ir_exit;
     uint32_t bad;
 
     HL_CHECK(hl_ir_block_init(&block, UINT64_C(0x400000), storage, HL_ARRAY_COUNT(storage)) == HL_STATUS_OK);
@@ -33,11 +35,15 @@ int main(void) {
     add.operand_count = 2;
     add.operands[0] = first;
     add.operands[1] = second;
-    HL_CHECK(hl_ir_append(&block, &add, NULL) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_append(&block, &add, &sum) == HL_STATUS_OK);
 
     exit_instruction = instruction(HL_IR_OP_GUEST_RETURN, HL_IR_TYPE_NONE);
+    exit_instruction.operand_count = 1;
+    exit_instruction.operands[0] = sum;
     HL_CHECK(hl_ir_append(&block, &exit_instruction, NULL) == HL_STATUS_OK);
     HL_CHECK(hl_ir_validate(&block, &bad) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_interpret(&block, &ir_exit) == HL_STATUS_OK);
+    HL_CHECK(ir_exit.kind == HL_IR_EXIT_RETURN && ir_exit.value == 42);
     HL_CHECK(hl_ir_append(&block, &constant, NULL) == HL_STATUS_INVALID_ARGUMENT);
 
     storage[2].operands[1].id = 99;

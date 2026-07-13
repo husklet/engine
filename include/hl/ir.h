@@ -67,10 +67,25 @@ typedef struct hl_ir_block {
     uint32_t terminated;
 } hl_ir_block;
 
+typedef enum hl_ir_exit_kind {
+    HL_IR_EXIT_NONE = 0,
+    HL_IR_EXIT_RETURN = 1,
+    HL_IR_EXIT_SYSCALL = 2,
+    HL_IR_EXIT_FAULT = 3
+} hl_ir_exit_kind;
+
+typedef struct hl_ir_exit {
+    uint32_t kind;
+    uint32_t reserved;
+    uint64_t value;
+    uint64_t detail;
+} hl_ir_exit;
+
 HL_API hl_status hl_ir_block_init(hl_ir_block *block, uint64_t guest_pc, hl_ir_instruction *storage, uint32_t capacity);
 HL_API hl_status hl_ir_append(hl_ir_block *block, const hl_ir_instruction *instruction, hl_ir_value *result);
 HL_API hl_status hl_ir_validate(const hl_ir_block *block, uint32_t *bad_instruction);
 HL_API int hl_ir_opcode_is_terminator(uint16_t opcode);
+HL_API hl_status hl_ir_interpret(const hl_ir_block *block, hl_ir_exit *out_exit);
 
 HL_EXTERN_C_END
 

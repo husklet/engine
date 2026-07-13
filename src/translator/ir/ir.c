@@ -7,6 +7,37 @@ int hl_ir_opcode_is_terminator(uint16_t opcode) {
            opcode == HL_IR_OP_SYSCALL_EXIT || opcode == HL_IR_OP_FAULT_EXIT;
 }
 
+static int hl_ir_is_integer(uint16_t type) {
+    return type == HL_IR_TYPE_I32 || type == HL_IR_TYPE_I64 || type == HL_IR_TYPE_GUEST_ADDRESS;
+}
+
+static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
+    switch (instruction->opcode) {
+    case HL_IR_OP_CONSTANT: return instruction->operand_count == 0 && instruction->result.type != HL_IR_TYPE_NONE;
+    case HL_IR_OP_COPY:
+        return instruction->operand_count == 1 && instruction->result.type == instruction->operands[0].type;
+    case HL_IR_OP_ADD:
+    case HL_IR_OP_SUB:
+    case HL_IR_OP_AND:
+    case HL_IR_OP_OR:
+    case HL_IR_OP_XOR:
+        return instruction->operand_count == 2 && hl_ir_is_integer(instruction->result.type) &&
+               instruction->operands[0].type == instruction->result.type &&
+               instruction->operands[1].type == instruction->result.type;
+    case HL_IR_OP_SAFEPOINT: return instruction->operand_count == 0 && instruction->result.type == HL_IR_TYPE_NONE;
+    case HL_IR_OP_GUEST_RETURN: return instruction->operand_count <= 1 && instruction->result.type == HL_IR_TYPE_NONE;
+    case HL_IR_OP_SYSCALL_EXIT:
+    case HL_IR_OP_FAULT_EXIT: return instruction->operand_count == 0 && instruction->result.type == HL_IR_TYPE_NONE;
+    case HL_IR_OP_LOAD:
+    case HL_IR_OP_STORE:
+    case HL_IR_OP_COMPARE:
+    case HL_IR_OP_BRANCH:
+    case HL_IR_OP_BRANCH_CONDITIONAL:
+    case HL_IR_OP_GUEST_CALL: return 1;
+    default: return 0;
+    }
+}
+
 hl_status hl_ir_block_init(hl_ir_block *block, uint64_t guest_pc, hl_ir_instruction *storage, uint32_t capacity) {
     if (block == NULL || storage == NULL || capacity == 0) return HL_STATUS_INVALID_ARGUMENT;
     memset(block, 0, sizeof(*block));
@@ -54,7 +85,8 @@ hl_status hl_ir_validate(const hl_ir_block *block, uint32_t *bad_instruction) {
         uint32_t operand;
         if (instruction->opcode == HL_IR_OP_INVALID || instruction->opcode >= HL_IR_OP_COUNT ||
             instruction->operand_count > HL_IR_MAX_OPERANDS ||
-            (hl_ir_opcode_is_terminator(instruction->opcode) && i + 1 != block->instruction_count))
+            (hl_ir_opcode_is_terminator(instruction->opcode) && i + 1 != block->instruction_count) ||
+            !hl_ir_signature_valid(instruction))
             goto corrupt;
         for (operand = 0; operand < instruction->operand_count; ++operand) {
             const hl_ir_value value = instruction->operands[operand];

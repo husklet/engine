@@ -10,7 +10,7 @@ WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-pro
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c
-IR_SOURCES := src/translator/ir/ir.c
+IR_SOURCES := src/translator/ir/interpreter.c src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
 FAKE_HOST_SOURCES := src/host/fake/fake_host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)

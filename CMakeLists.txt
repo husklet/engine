@@ -10,6 +10,7 @@ add_library(hl-engine STATIC
     src/core/config.c
     src/core/engine.c
     src/core/host_services.c
+    src/translator/ir/interpreter.c
     src/translator/ir/ir.c
     src/linux_abi/linux_abi.c)
 target_include_directories(hl-engine PUBLIC include)
