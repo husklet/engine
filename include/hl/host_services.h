@@ -29,7 +29,8 @@ enum {
     HL_HOST_CAP_PROCESS = UINT64_C(1) << 6,
     HL_HOST_CAP_EVENT = UINT64_C(1) << 7,
     HL_HOST_CAP_NETWORK = UINT64_C(1) << 8,
-    HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 9
+    HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 9,
+    HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 10
 };
 
 enum {
@@ -89,12 +90,23 @@ typedef struct hl_host_result {
     uint64_t detail;
 } hl_host_result;
 
+typedef struct hl_host_code_mapping {
+    HL_ABI_HEADER;
+    hl_host_handle handle;
+    uint64_t writable_address;
+    uint64_t executable_address;
+    uint64_t mapped_size;
+    uint64_t reserved;
+} hl_host_code_mapping;
+
 typedef struct hl_host_memory_services {
     HL_ABI_HEADER;
     hl_host_result (*reserve)(void *context, uint64_t size, uint64_t alignment, uint32_t flags);
     hl_host_result (*protect)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size, uint32_t flags);
     hl_host_result (*release)(void *context, hl_host_handle mapping);
     hl_host_result (*publish_code)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
+    hl_host_result (*reserve_code)(void *context, uint64_t size, uint64_t alignment, hl_host_code_mapping *output);
+    hl_host_result (*repair_code_after_fork)(void *context, hl_host_code_mapping *mapping, uint32_t preserve);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

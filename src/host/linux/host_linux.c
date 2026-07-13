@@ -37,6 +37,7 @@ typedef struct hl_linux_handle_entry {
     uint16_t reserved;
     int descriptor;
     void *address;
+    void *executable_address;
     uint64_t size;
     int wake_descriptor;
 } hl_linux_handle_entry;
@@ -94,7 +95,8 @@ static hl_linux_handle_entry *hl_linux_lookup_locked(hl_host_linux *host, hl_hos
 }
 
 static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_handle_kind kind, int descriptor,
-                                               void *address, uint64_t size, int wake_descriptor) {
+                                               void *address, void *executable_address, uint64_t size,
+                                               int wake_descriptor) {
     uint32_t index;
     hl_host_handle handle = 0;
     pthread_mutex_lock(&host->lock);
@@ -106,6 +108,7 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
             entry->kind = (uint16_t)kind;
             entry->descriptor = descriptor;
             entry->address = address;
+            entry->executable_address = executable_address;
             entry->size = size;
             entry->wake_descriptor = wake_descriptor;
             handle = hl_linux_encode_handle(index, entry->generation);
@@ -133,7 +136,7 @@ static hl_host_result hl_linux_memory_reserve(void *context, uint64_t size, uint
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     address = mmap(NULL, (size_t)size, hl_linux_protection(flags), MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (address == MAP_FAILED) return hl_linux_errno_result();
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, address, size, -1);
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, address, NULL, size, -1);
     if (result.status != HL_STATUS_OK) munmap(address, (size_t)size);
     return result;
 }
@@ -165,10 +168,15 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     result = munmap(entry->address, (size_t)entry->size);
+    if (result == 0 && entry->executable_address != NULL)
+        result = munmap(entry->executable_address, (size_t)entry->size);
+    if (result == 0 && entry->descriptor >= 0) result = close(entry->descriptor);
     if (result == 0) {
         entry->kind = HL_LINUX_HANDLE_NONE;
         entry->address = NULL;
+        entry->executable_address = NULL;
         entry->size = 0;
+        entry->descriptor = -1;
     }
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
@@ -183,9 +191,73 @@ static hl_host_result hl_linux_memory_publish(void *context, hl_host_handle mapp
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    __builtin___clear_cache((char *)entry->address + offset, (char *)entry->address + offset + size);
+    char *address = entry->executable_address != NULL ? entry->executable_address : entry->address;
+    __builtin___clear_cache(address + offset, address + offset + size);
     pthread_mutex_unlock(&host->lock);
     return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size, uint64_t alignment,
+                                                   hl_host_code_mapping *output) {
+    hl_host_linux *host = context;
+    long page = sysconf(_SC_PAGESIZE);
+    int descriptor;
+    void *writable;
+    void *executable;
+    hl_host_result handle;
+    if (output == NULL || size == 0 || size > SIZE_MAX || size > INT64_MAX || page <= 0 || alignment > (uint64_t)page)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memset(output, 0, sizeof(*output));
+    descriptor = memfd_create("hl-code", MFD_CLOEXEC);
+    if (descriptor < 0) return hl_linux_errno_result();
+    if (ftruncate(descriptor, (off_t)size) != 0) {
+        close(descriptor);
+        return hl_linux_errno_result();
+    }
+    writable = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
+    if (writable == MAP_FAILED) {
+        close(descriptor);
+        return hl_linux_errno_result();
+    }
+    executable = mmap(NULL, (size_t)size, PROT_READ | PROT_EXEC, MAP_SHARED, descriptor, 0);
+    if (executable == MAP_FAILED) {
+        munmap(writable, (size_t)size);
+        close(descriptor);
+        return hl_linux_errno_result();
+    }
+    handle = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, descriptor, writable, executable, size, -1);
+    if (handle.status != HL_STATUS_OK) {
+        munmap(executable, (size_t)size);
+        munmap(writable, (size_t)size);
+        close(descriptor);
+        return handle;
+    }
+    output->abi = 1;
+    output->size = sizeof(*output);
+    output->handle = handle.value;
+    output->writable_address = (uint64_t)(uintptr_t)writable;
+    output->executable_address = (uint64_t)(uintptr_t)executable;
+    output->mapped_size = size;
+    return hl_linux_result(HL_STATUS_OK, handle.value, 0);
+}
+
+static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    (void)preserve;
+    if (mapping == NULL || mapping->abi != 1 || mapping->size < sizeof(*mapping))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, mapping->handle, HL_LINUX_HANDLE_MAPPING);
+    if (entry == NULL || entry->executable_address == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    mapping->writable_address = (uint64_t)(uintptr_t)entry->address;
+    mapping->executable_address = (uint64_t)(uintptr_t)entry->executable_address;
+    mapping->mapped_size = entry->size;
+    pthread_mutex_unlock(&host->lock);
+    return hl_linux_result(HL_STATUS_OK, mapping->handle, 0);
 }
 
 static hl_host_result hl_linux_clock(int clock_id) {
@@ -248,7 +320,7 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
     if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
     descriptor = openat(directory_fd, local, flags | O_CLOEXEC, 0600);
     if (descriptor < 0) return hl_linux_errno_result();
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, 0, -1);
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, NULL, 0, -1);
     if (result.status != HL_STATUS_OK) close(descriptor);
     return result;
 }
@@ -345,7 +417,7 @@ static hl_host_result hl_linux_event_create(void *context) {
         close(pollset);
         return hl_linux_errno_result();
     }
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_POLLSET, pollset, NULL, 0, wake);
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_POLLSET, pollset, NULL, NULL, 0, wake);
     if (result.status != HL_STATUS_OK) {
         close(wake);
         close(pollset);
@@ -466,7 +538,7 @@ static hl_host_result hl_linux_network_socket(void *context, uint32_t family, ui
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     descriptor = socket(native_family, native_type | SOCK_CLOEXEC, (int)protocol);
     if (descriptor < 0) return hl_linux_errno_result();
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SOCKET, descriptor, NULL, 0, -1);
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SOCKET, descriptor, NULL, NULL, 0, -1);
     if (result.status != HL_STATUS_OK) close(descriptor);
     return result;
 }
@@ -563,7 +635,8 @@ static hl_host_result hl_linux_shared_create(void *context, uint64_t size, uint3
         close(descriptor);
         return hl_linux_errno_result();
     }
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SHARED_MEMORY, descriptor, NULL, size, -1);
+    hl_host_result result =
+        hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SHARED_MEMORY, descriptor, NULL, NULL, size, -1);
     if (result.status != HL_STATUS_OK) close(descriptor);
     return result;
 }
@@ -593,9 +666,9 @@ static hl_host_result hl_linux_shared_resize(void *context, hl_host_handle objec
 }
 
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
-    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,      sizeof(memory),
-                                                   hl_linux_memory_reserve, hl_linux_memory_protect,
-                                                   hl_linux_memory_release, hl_linux_memory_publish};
+    static const hl_host_memory_services memory = {
+        HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
+        hl_linux_memory_release, hl_linux_memory_publish, hl_linux_memory_reserve_code, hl_linux_memory_repair_code};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_linux_monotonic,
                                                  hl_linux_realtime};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,         sizeof(file),
@@ -629,7 +702,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE | HL_HOST_CAP_EVENT |
-                                 HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY;
+                                 HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -646,9 +719,11 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     if (host == NULL) return;
     for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
-        if (entry->kind == HL_LINUX_HANDLE_MAPPING)
+        if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
             munmap(entry->address, (size_t)entry->size);
-        else if (entry->kind != HL_LINUX_HANDLE_NONE) {
+            if (entry->executable_address != NULL) munmap(entry->executable_address, (size_t)entry->size);
+            if (entry->descriptor >= 0) close(entry->descriptor);
+        } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);
         }

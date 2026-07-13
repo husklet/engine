@@ -13,6 +13,7 @@ int main(void) {
     hl_host_result file;
     hl_host_result pollset;
     hl_host_result shared;
+    hl_host_code_mapping code;
     hl_host_event_record event;
     hl_host_file_metadata metadata;
     const char contents[] = "portable-host";
@@ -22,7 +23,8 @@ int main(void) {
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE |
                                                       HL_HOST_CAP_EVENT | HL_HOST_CAP_NETWORK |
-                                                      HL_HOST_CAP_SHARED_MEMORY) == HL_STATUS_OK);
+                                                      HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING) ==
+             HL_STATUS_OK);
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.clock->realtime_ns(services.context).status == HL_STATUS_OK);
 
@@ -33,6 +35,15 @@ int main(void) {
     HL_CHECK(services.memory->publish_code(services.context, mapping.value, 0, 4096).status == HL_STATUS_OK);
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_OK);
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
+
+    memset(&code, 0, sizeof code);
+    HL_CHECK(services.memory->reserve_code(services.context, 4096, 4096, &code).status == HL_STATUS_OK);
+    HL_CHECK(code.handle != 0 && code.writable_address != 0 && code.executable_address != 0);
+    memcpy((void *)(uintptr_t)code.writable_address, "jit", 4);
+    HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 4).status == HL_STATUS_OK);
+    HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "jit", 4) == 0);
+    HL_CHECK(services.memory->repair_code_after_fork(services.context, &code, 1).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->release(services.context, code.handle).status == HL_STATUS_OK);
 
     snprintf(path, sizeof(path), "/tmp/hl_host_linux_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),

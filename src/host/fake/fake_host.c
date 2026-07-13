@@ -54,8 +54,14 @@ static hl_host_result hl_fake_realtime(void *context) {
 }
 
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
-    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI, sizeof(memory),  hl_fake_reserve,
-                                                   hl_fake_protect,    hl_fake_release, hl_fake_publish};
+    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
+                                                   sizeof(memory),
+                                                   hl_fake_reserve,
+                                                   hl_fake_protect,
+                                                   hl_fake_release,
+                                                   hl_fake_publish,
+                                                   NULL,
+                                                   NULL};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_fake_monotonic, hl_fake_realtime};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));

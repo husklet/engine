@@ -24,6 +24,10 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
             memory->publish_code == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
+    if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&
+        (services->memory == NULL || services->memory->size < sizeof(*services->memory) ||
+         services->memory->reserve_code == NULL || services->memory->repair_code_after_fork == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_CLOCK) != 0) {
         const hl_host_clock_services *clock = services->clock;
         if (clock == NULL || clock->abi != HL_HOST_CLOCK_ABI || clock->size < sizeof(*clock) ||

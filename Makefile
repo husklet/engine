@@ -18,6 +18,7 @@ IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
 FAKE_HOST_SOURCES := src/host/fake/fake_host.c
+MACOS_HOST_SOURCES := src/host/macos/host_macos.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/%.o)
 TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
@@ -43,7 +44,7 @@ E2E_CASES := atomics epoll_edge eventfd
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) compat-build compat-native compat-engines e2e-compat \
+.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-macos-host compat-build compat-native compat-engines e2e-compat \
 	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -119,7 +120,7 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
-e2e-compat: compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+e2e-compat: test-macos-host compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
@@ -188,6 +189,15 @@ $(BUILD)/tests/test_host_linux: tests/unit/test_host_linux.c $(BUILD)/lib/libhl-
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
+$(BUILD)/tests/test-host-macos: tests/unit/test_host_macos.c src/host/macos/host_macos.c src/core/host_services.c \
+	include/hl/host_macos.h include/hl/host_services.h
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/test_host_macos.c \
+		src/host/macos/host_macos.c src/core/host_services.c -o $@
+
+test-macos-host: $(BUILD)/tests/test-host-macos
+	$(MAC) $(abspath $<)
+
 compat-build: $(FIXTURE_BINS)
 
 compat-native: $(NATIVE_SMOKE_BINS) $(BUILD)/tools/compat-runner
@@ -199,10 +209,10 @@ check-domains: $(BUILD)/tools/check-domains
 test: unit check-domains compat-native
 
 format:
-	$(CLANG_FORMAT) -i $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) $(PRIVATE_HEADERS) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
+	$(CLANG_FORMAT) -i $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) $(MACOS_HOST_SOURCES) $(PRIVATE_HEADERS) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
 
 format-check:
-	$(CLANG_FORMAT) --dry-run --Werror $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) $(PRIVATE_HEADERS) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
+	$(CLANG_FORMAT) --dry-run --Werror $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) $(MACOS_HOST_SOURCES) $(PRIVATE_HEADERS) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
 
 clean:
 	rm -rf $(BUILD)
