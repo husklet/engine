@@ -6,6 +6,7 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
+#define HL_CONFIG_LEGACY_MAGIC UINT32_C(0x44434647)
 #define HL_CONFIG_ABI 1u
 
 typedef struct hl_launch_config {
@@ -46,6 +47,10 @@ HL_API hl_status hl_launch_config_validate(const void *wire, size_t wire_size, h
                                            const char **out_pool);
 HL_API hl_status hl_launch_config_string(const hl_launch_config *config, const char *pool, uint32_t offset,
                                          const char **out_string, size_t *out_size);
+HL_API hl_status hl_launch_config_arguments_validate(const hl_launch_config *config, const char *pool,
+                                                     size_t *out_count);
+HL_API hl_status hl_launch_config_argument(const hl_launch_config *config, const char *pool, size_t index,
+                                           const char **out_argument, size_t *out_size);
 
 HL_EXTERN_C_END
 
