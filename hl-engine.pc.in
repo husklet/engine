@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: hl-engine
+Description: Portable Linux guest translation and ABI engine
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lhl-engine
+Cflags: -I${includedir}
