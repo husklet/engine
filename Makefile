@@ -3,6 +3,9 @@ AR ?= ar
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
 HOST ?= linux
+MAC ?= mac
+AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
+X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
 
 CPPFLAGS := -Iinclude
 CFLAGS ?= -O2 -g
@@ -36,8 +39,12 @@ FIXTURE_SOURCES := $(sort $(wildcard tests/compat/fixtures/*.c))
 FIXTURE_BINS := $(FIXTURE_SOURCES:tests/compat/fixtures/%.c=$(BUILD)/fixtures/%)
 NATIVE_SMOKE := atomics clockelapsed epoll epoll_edge eventfd eventfd_sema forkwait mmapanon mmapshared statx_agree timerfd
 NATIVE_SMOKE_BINS := $(NATIVE_SMOKE:%=$(BUILD)/fixtures/%)
+E2E_CASES := atomics epoll_edge eventfd
+E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
+E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) compat-build compat-native check-domains format format-check help
+.PHONY: all clean test unit $(UNIT_RUN_TARGETS) compat-build compat-native compat-engines e2e-compat \
+	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -82,6 +89,54 @@ $(BUILD)/fixtures/%: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(CC) -O2 -g -std=gnu11 -Wall -Wextra $< -pthread -o $@
 
+$(BUILD)/e2e/guest-exit-aarch64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-exit-x86_64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/%-aarch64: tests/compat/fixtures/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -pthread $< -o $@
+
+$(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
+
+$(BUILD)/compat/hl-engine-linux-aarch64: compat/current/runtime/targets/linux_aarch64.c \
+	compat/current/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
+	$(MAC) codesign -s - --entitlements compat/current/jit.entitlements -f $@
+
+$(BUILD)/compat/hl-engine-linux-x86_64: compat/current/runtime/targets/linux_x86_64.c \
+	compat/current/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
+	$(MAC) codesign -s - --entitlements compat/current/jit.entitlements -f $@
+
+compat-engines: $(BUILD)/compat/hl-engine-linux-aarch64 $(BUILD)/compat/hl-engine-linux-x86_64
+
+e2e-compat: compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/tools/e2e-runner $(E2E_CASE_RUNS)
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+
+define HL_E2E_CASE_RULE
+run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
+	compat-engines
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/$(1)-aarch64) 0
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/$(1)-x86_64) 0
+endef
+
+$(foreach test,$(E2E_CASES),$(eval $(call HL_E2E_CASE_RULE,$(test))))
+
 $(BUILD)/tools/check-domains: tools/check_domains.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
@@ -89,6 +144,20 @@ $(BUILD)/tools/check-domains: tools/check_domains.c
 $(BUILD)/tools/compat-runner: tools/compat_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/e2e-runner: tools/e2e_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/perf-runner: tools/perf_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+perf-compat: e2e-compat $(BUILD)/tools/perf-runner
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/atomics-aarch64) 0 25
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/atomics-x86_64) 0 25
 
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST)
 
@@ -130,4 +199,6 @@ help:
 	@echo 'make all           build pure-C static libraries and runner'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
 	@echo 'make compat-build  compile every imported compatibility fixture'
+	@echo 'make e2e-compat    build/codesign transferred engines and execute both guest ISAs'
+	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
 	@echo 'make format-check  enforce the repository clang-format policy'
