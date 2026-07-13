@@ -14,9 +14,7 @@
 // the shift either way (the shift path writes no AF), so eliding cannot perturb it.
 // Gate: NOSHIFTFLAGELIDE=1 (independent A/B); also off under NOFLAGELIDE and whenever xblkflags is off.
 static int noshiftflagelide(void) {
-    static int v = -1;
-    if (v < 0) v = (getenv("NOSHIFTFLAGELIDE") || getenv("NOFLAGELIDE")) ? 1 : 0;
-    return v;
+    return 0;
 }
 
 // PROF: SHL/SHR/SAR immediate flag-materializations elided by the successor-dead-flag scan.

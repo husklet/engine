@@ -27,7 +27,7 @@ static int write_full(int fd, const void *buffer, size_t size) {
     return 0;
 }
 
-static int make_config(const char *path, const char *guest, uint32_t magic) {
+static int make_config(const char *path, const char *guest) {
     hl_launch_config config;
     size_t guest_size = strlen(guest) + 1;
     size_t pool_size = 1 + guest_size + 1;
@@ -36,7 +36,7 @@ static int make_config(const char *path, const char *guest, uint32_t magic) {
     int result = -1;
     if (pool == NULL || pool_size > UINT32_MAX) goto done;
     memset(&config, 0, sizeof config);
-    config.magic = magic;
+    config.magic = HL_CONFIG_MAGIC;
     config.pool_size = (uint32_t)pool_size;
     config.header_size = (uint32_t)sizeof config;
     config.abi = HL_CONFIG_ABI;
@@ -84,23 +84,21 @@ static int run_config(const char *bridge, const char *engine, const char *config
 int main(int argc, char **argv) {
     char directory[1024];
     char path[128];
-    uint32_t magic;
     int expected_exit;
-    if (argc != 6 || (strcmp(argv[4], "new") != 0 && strcmp(argv[4], "legacy") != 0)) {
-        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST new|legacy EXPECTED_EXIT\n");
+    if (argc != 5) {
+        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT\n");
         return 2;
     }
-    magic = strcmp(argv[4], "new") == 0 ? HL_CONFIG_MAGIC : HL_CONFIG_LEGACY_MAGIC;
-    expected_exit = atoi(argv[5]);
+    expected_exit = atoi(argv[4]);
     if (getcwd(directory, sizeof directory) == NULL) {
         perror("getcwd");
         return 1;
     }
-    if (snprintf(path, sizeof path, "%s/.hl-config-%ld-%u", directory, (long)getpid(), magic) >= (int)sizeof path) {
+    if (snprintf(path, sizeof path, "%s/.hl-config-%ld", directory, (long)getpid()) >= (int)sizeof path) {
         fprintf(stderr, "config path is too long\n");
         return 1;
     }
-    if (make_config(path, argv[3], magic) != 0) {
+    if (make_config(path, argv[3]) != 0) {
         perror("make config");
         unlink(path);
         return 1;

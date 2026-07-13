@@ -478,7 +478,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // generated code, "executes" it (guest PC enters the page -> map_host miss -> translate), and runs.
         // Setting g_rwx_guest also arms the (otherwise inert) SMC write-fault invalidation in frontend/x86_64
         // so a guest that OVERWRITES already-translated code re-translates. NORWXFIX=1 disables the strip.
-        if (!getenv("NORWXFIX") && (prot & PROT_EXEC)) {
+        if (prot & PROT_EXEC) {
             if (a3 & 0x20) {
                 // Anon JIT arena: strip EXEC and map R+W so the guest can write its generated code.
                 prot = (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE;
@@ -510,7 +510,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // binary. A plain hint, never MAP_FIXED: if the range is busy the kernel places it elsewhere and
         // the map simply isn't cacheable this run (pcache_note_libmap below only records hint-honored
         // maps, and a warm run only ACTIVATES restored blocks when the same file identity lands on the
-        // same base). No-op unless DDJIT_PCACHE is on.
+        // same base). No-op unless HL_PCACHE is on.
         if (a0 == 0 && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0) {
             pc_hint = pcache_mmap_hint((uint64_t)a1);
             a0 = pc_hint;
@@ -743,7 +743,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // g_rwx_guest latches -- once a JIT guest is present it stays armed across every re-toggle, so
             // SMC coverage is kept, not lost, on a subsequent mprotect(RW)->mprotect(RX). NORWXFIX=1
             // disables, mirroring case 222.
-            if (((int)a2 & PROT_EXEC) && !getenv("NORWXFIX"))
+            if ((int)a2 & PROT_EXEC)
                 g_rwx_guest = 1;
         }
         G_RET(c) = 0;
@@ -761,17 +761,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (s3db_durability() == 2) {
-            int lf = (int)a2, mf = 0;
-            if (lf & 0x1) mf |= MS_ASYNC;                    // Linux MS_ASYNC=1
-            if (lf & 0x2) mf |= MS_INVALIDATE;               // Linux MS_INVALIDATE=2
-            if (lf & 0x4) mf |= MS_SYNC;                     // Linux MS_SYNC=4 -> macOS MS_SYNC(16)
-            if (!(mf & (MS_ASYNC | MS_SYNC))) mf |= MS_SYNC; // default to a sync flush
-            int r = msync((void *)a0, (size_t)a1, mf);
-            G_RET(c) = (r < 0 && errno != EINVAL) ? (uint64_t)(-errno) : 0;
-        } else {
-            G_RET(c) = 0;
-        }
+        G_RET(c) = 0;
         break;
     // mlock(addr,len): wire+fault via macOS mlock so the range is RESIDENT (LTP mincore03), AND track the
     // range so the guest observes the lock STATE back through /proc/self/{smaps Locked:, status VmLck:}

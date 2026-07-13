@@ -155,7 +155,6 @@ static void ep_rearm_from_interest(int ep, int ident, int slot) {
     }
     for (int i = 0; i < n; i++) {
         kevent(ep, &kv[i], 1, NULL, 0, NULL);
-        ep_count();
     }
 }
 
@@ -212,7 +211,6 @@ static void ep_flush(int ep, int wake) {
     if (ep < 0 || ep >= DD_NFD) return;
     if (g_ep_chgn[ep] > 0) {
         kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL); // registrations only; ignore EV_ERROR echoes
-        ep_count();
         g_ep_chgn[ep] = 0;
     }
     if (!wake) return;
@@ -220,7 +218,6 @@ static void ep_flush(int ep, int wake) {
     struct kevent trig;
     EV_SET(&trig, EP_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
     kevent(ep, &trig, 1, NULL, 0, NULL);
-    ep_count();
 }
 
 // macOS does NOT inherit kqueue() descriptors across fork(2) (unlike Linux epoll/timer/inotify fds, which
@@ -570,7 +567,6 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         for (int i = 0; i < n; i++) {
             // per-filter so DEL of an absent one is ignored
             kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
-            ep_count();
         }
         // EPOLLET: prime an already-ready fd so its initial readiness is reported (see g_ep_prime).
         if ((xf & EV_CLEAR) && op != 2) {
@@ -678,7 +674,6 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             ts_wait_enter();                                                    // 'S' while blocked in epoll_wait/epoll_pwait
             do {
                 r = kevent(ep, chg, nchg, kv, maxev, tp);
-                ep_count();
                 chg = NULL;
                 nchg = 0;
             } while (r < 0 && svc_poll_retry(c));

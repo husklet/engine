@@ -59,12 +59,7 @@ static void emit_prologue(void) {
 // so a vector-dirty region can reach a statically-"clean" syscall block with host V != cpu->V. A syscall
 // that itself writes cpu->V (sigreturn) is republished by the prologue reload, so V state is never lost.
 static int g_blk_vdirty;   // per-region latch: has the vdirty-set store already been emitted this region?
-static int g_slimsys = -1; // DDJIT_NOSLIMSYS=1 -> 0 = byte-identical full-spill baseline (A/B kill switch)
-
-static int slimsys_on(void) {
-    if (g_slimsys < 0) g_slimsys = getenv("DDJIT_NOSLIMSYS") ? 0 : 1;
-    return g_slimsys;
-}
+static int slimsys_on(void) { return 1; }
 
 // GPR + flags + SP spill, WITHOUT the V-register save. Leaves x0 = &cpu (callers rely on it). Must NOT
 // touch the guest red zone [sp,#-16..] (see emit_spill).

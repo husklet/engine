@@ -6,7 +6,6 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_LEGACY_MAGIC UINT32_C(0x44434647)
 #define HL_CONFIG_ABI 1u
 
 typedef struct hl_launch_config {
@@ -40,7 +39,7 @@ typedef struct hl_launch_config {
     uint32_t gpu_enabled;
     uint32_t translation_cache_disabled;
     uint32_t egress_proxy_offset;
-    uint32_t reserved;
+    uint32_t debug_log_offset;
 } hl_launch_config;
 
 HL_API hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launch_config *out_config,

@@ -296,7 +296,7 @@ static size_t dd_pground(size_t n) {
 static uint32_t ipc_ns(void) {
     if (g_ns_hash) return g_ns_hash;
     char buf[80];
-    const char *ns = getenv("DD_NETNS");
+    const char *ns = hl_option_get("HL_NETNS");
     if (ns && ns[0])
         snprintf(buf, sizeof buf, "n:%s", ns);
     else

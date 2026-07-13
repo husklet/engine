@@ -4,6 +4,9 @@
 #include "hl/base.h"
 #include "hl/host_services.h"
 
+#include <stdatomic.h>
+#include <threads.h>
+
 HL_EXTERN_C_BEGIN
 
 #define HL_LINUX_ABI_VERSION 1u
@@ -13,20 +16,60 @@ HL_EXTERN_C_BEGIN
 typedef uint32_t hl_linux_fd;
 typedef uint32_t hl_linux_ofd;
 
+/* Linux guest errno numbers returned by this library as negative syscall results. */
+typedef enum hl_linux_errno {
+    HL_LINUX_EINTR = 4,
+    HL_LINUX_EIO = 5,
+    HL_LINUX_EBADF = 9,
+    HL_LINUX_EAGAIN = 11,
+    HL_LINUX_ENOMEM = 12,
+    HL_LINUX_EACCES = 13,
+    HL_LINUX_EBUSY = 16,
+    HL_LINUX_EEXIST = 17,
+    HL_LINUX_EINVAL = 22,
+    HL_LINUX_ENFILE = 23,
+    HL_LINUX_ENOSYS = 38
+} hl_linux_errno;
+
 typedef struct hl_linux_ofd_entry {
+    /* Host object owned by this OFD. Closed when the final descriptor is closed. */
     hl_host_handle host_handle;
+    /* Linux open-file-description offset, shared by dup'd descriptors. */
     uint64_t offset;
+    /* Open status flags belong to the OFD; descriptor flags do not. */
     uint32_t status_flags;
     uint32_t references;
+    /* Operations pin the entry while table_lock is dropped around host calls. */
+    uint32_t active_operations;
+    /* Final close claimed this slot; allocation cannot recycle it yet. */
+    uint32_t closing;
     uint32_t generation;
     uint32_t kind;
+    /* Serializes the shared offset and final close for this OFD only. */
+    mtx_t io_lock;
 } hl_linux_ofd_entry;
 
 typedef struct hl_linux_fd_entry {
+    /* Index zero means unused; live descriptors refer to one shared OFD. */
     hl_linux_ofd ofd;
+    /* Per-descriptor flags such as FD_CLOEXEC. */
     uint32_t descriptor_flags;
     uint32_t generation;
 } hl_linux_fd_entry;
+
+/* Copyable descriptor metadata captured atomically under table ownership. */
+typedef struct hl_linux_fd_snapshot {
+    hl_linux_fd fd;
+    hl_linux_ofd ofd;
+    hl_host_handle host_handle;
+    uint64_t offset;
+    uint32_t status_flags;
+    uint32_t descriptor_flags;
+    uint32_t descriptor_generation;
+    uint32_t ofd_generation;
+    uint32_t descriptor_references;
+    uint32_t kind;
+} hl_linux_fd_snapshot;
 
 typedef struct hl_linux_abi {
     HL_ABI_HEADER;
@@ -35,17 +78,49 @@ typedef struct hl_linux_abi {
     uint32_t fd_capacity;
     hl_linux_ofd_entry *ofds;
     uint32_t ofd_capacity;
+    /*
+     * Serializes only descriptor lookup and OFD lifetime counters. Host calls
+     * never hold it; each OFD has independent I/O ownership instead.
+     */
+    atomic_flag table_lock;
 } hl_linux_abi;
+
+/*
+ * An initialized hl_linux_abi owns its synchronization state and must not be
+ * copied. Host service callbacks invoked by it must not re-enter the same
+ * hl_linux_abi instance. Contending operations use C11 synchronization only;
+ * unrelated OFDs never wait for one another's host I/O.
+ */
 
 HL_API hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_services *host, hl_linux_fd_entry *fd_storage,
                                    uint32_t fd_capacity, hl_linux_ofd_entry *ofd_storage, uint32_t ofd_capacity);
+/*
+ * Requires every descriptor to be closed and releases the per-OFD C11 mutexes.
+ * The owner must externally exclude every concurrent call on this instance from
+ * destroy's entry onward; after success the instance may only be initialized.
+ */
+HL_API hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi);
 HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,
                                      uint32_t descriptor_flags, hl_linux_fd *out_fd);
 HL_API hl_status hl_linux_fd_dup(hl_linux_abi *linux_abi, hl_linux_fd source, uint32_t descriptor_flags,
                                  hl_linux_fd *out_fd);
 HL_API hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle);
-HL_API hl_status hl_linux_fd_get(const hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_linux_fd_entry **fd_entry,
-                                 const hl_linux_ofd_entry **ofd_entry);
+/* Returns a stable value snapshot; internal entries and mutex-bearing OFDs never escape. */
+HL_API hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linux_fd fd,
+                                          hl_linux_fd_snapshot *snapshot);
+
+/*
+ * Host-agnostic Linux file-I/O syscall semantics.
+ *
+ * Buffers are already validated/translated guest memory owned by the caller. The
+ * library resolves the guest fd to its OFD, calls only hl_host_file_services,
+ * translates hl_status to a negative Linux errno, and applies Linux offset rules.
+ * read() advances the shared OFD offset only on success; pread64() never changes it.
+ */
+HL_API int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t size);
+HL_API int64_t hl_linux_pread64(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t size, uint64_t offset);
+/* close() invalidates this descriptor even if the host reports a late close error. */
+HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
 
 HL_EXTERN_C_END
 

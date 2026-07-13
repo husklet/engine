@@ -48,12 +48,12 @@ int g_go_iscgo; // 1 iff the loaded aarch64 main image is a cgo (iscgo) Go binar
 static int sigurg_drop_enabled(void) {
     static int cached = -2; // -2 uncomputed; -1 auto; 0 force-deliver; 1 force-drop
     if (cached == -2) {
-        const char *e = getenv("DD_SIGURG");
+        const char *e = hl_option_get("HL_SIGURG");
         if (e && (!strcmp(e, "deliver") || !strcmp(e, "async") || !strcmp(e, "on")))
             cached = 0;
         else if (e && (!strcmp(e, "drop") || !strcmp(e, "off")))
             cached = 1;
-        else if (getenv("DDDBG_DROPURG"))
+        else if (hl_option_get("HL_DEBUG_DROPURG"))
             cached = 1; // legacy repro/debug knob
         else
             cached = -1; // auto
@@ -604,10 +604,10 @@ static int sig_diag_put_hex(char *b, int n, const char *k, uint64_t v) {
 }
 
 static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c) {
-    if (!getenv("DD_FATALSIG_LOG")) return;
+    if (!hl_option_get("HL_FATALSIG_LOG")) return;
     char b[384];
     int n = 0;
-    n = sig_diag_put(b, n, "[DDFATAL]");
+    n = sig_diag_put(b, n, "[HLFATAL]");
     n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
     n = sig_diag_put_hex(b, n, " cpid=", (uint64_t)container_pid());
     n = sig_diag_put_hex(b, n, " sig=", (uint64_t)sig);
@@ -626,7 +626,7 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
 }
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
-    if (!getenv("DD_FATALSIG_LOG")) return;
+    if (!hl_option_get("HL_FATALSIG_LOG")) return;
     ucontext_t *u = (ucontext_t *)ucv;
 #if defined(__aarch64__)
     uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
@@ -642,7 +642,7 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     char b[512];
     int n = 0;
-    n = sig_diag_put(b, n, "[DDSYNC]");
+    n = sig_diag_put(b, n, "[HLSYNC]");
     n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
     n = sig_diag_put_hex(b, n, " cpid=", (uint64_t)container_pid());
     n = sig_diag_put_hex(b, n, " hostsig=", (uint64_t)sig);
@@ -665,10 +665,10 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
-    if (!getenv("DD_FATALSIG_LOG")) return;
+    if (!hl_option_get("HL_FATALSIG_LOG")) return;
     char b[384];
     int n = 0;
-    n = sig_diag_put(b, n, "[DDRAISE]");
+    n = sig_diag_put(b, n, "[HLRAISE]");
     n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
     n = sig_diag_put_hex(b, n, " cpid=", (uint64_t)container_pid());
     n = sig_diag_put_hex(b, n, " tid=", c ? (uint64_t)cpu_tid(c) : 0);

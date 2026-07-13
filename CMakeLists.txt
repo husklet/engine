@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine VERSION 0.1.0 LANGUAGES C)
 
+option(HL_ENABLE_LOGGING "Compile tagged engine logging into the binaries" OFF)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -16,8 +18,9 @@ target_include_directories(hl-translator PUBLIC include)
 add_library(hl-linux-abi STATIC src/linux_abi/linux_abi.c)
 target_include_directories(hl-linux-abi PUBLIC include)
 
-add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c)
+add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c)
 target_include_directories(hl-engine PUBLIC include)
+target_compile_definitions(hl-engine PUBLIC HL_ENABLE_LOGGING=$<BOOL:${HL_ENABLE_LOGGING}>)
 target_link_libraries(hl-engine PUBLIC hl-translator hl-linux-abi)
 
 foreach(target_name hl-translator hl-linux-abi hl-engine)
@@ -39,12 +42,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                                                  -Wmissing-prototypes)
 endif()
 
+if(APPLE)
+    add_library(hl-host-macos STATIC src/host/macos/host_macos.c)
+    target_include_directories(hl-host-macos PUBLIC include)
+    target_compile_options(hl-host-macos PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                                 -Wmissing-prototypes)
+endif()
+
 add_executable(hl-engine-runner src/runner/main.c)
 target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name config host_services ir linux_abi engine)
+    foreach(test_name config host_services ir linux_abi engine log)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)

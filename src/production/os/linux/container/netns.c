@@ -904,12 +904,12 @@ static uint32_t br_parse_ip(const char *s) {
 static void br_init(void) {
     if (g_br_init) return;
     g_br_init = 1;
-    const char *nbr = getenv("DD_NETBR");
+    const char *nbr = hl_option_get("HL_NETBR");
     if (nbr && nbr[0]) {
         snprintf(g_netbr, sizeof g_netbr, "/tmp/.ddbr-%.40s", nbr);
         mkdir(g_netbr, 0700); // shared per-network dir; EEXIST is fine (peers share it)
     }
-    const char *dip = getenv("DD_IP");
+    const char *dip = hl_option_get("HL_IP");
     if (dip && dip[0]) g_myip = br_parse_ip(dip);
 }
 
@@ -1186,7 +1186,7 @@ static int switch_dial(const char *path) {
 static int g_hostfwd_daemon = -1;
 
 static int hostfwd_by_daemon(void) {
-    if (g_hostfwd_daemon < 0) g_hostfwd_daemon = (getenv("DD_PUBLISH_DAEMON") != NULL);
+    if (g_hostfwd_daemon < 0) g_hostfwd_daemon = (hl_option_get("HL_PUBLISH_DAEMON") != NULL);
     return g_hostfwd_daemon;
 }
 
@@ -1496,12 +1496,7 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
 // (network byte order) so only family/len need fixing. AF_UNIX and other families pass through.
 #define LX_AF_INET 2
 #define LX_AF_INET6 10
-static int g_saxl = -1;
-
-static int saxl_on(void) {
-    if (g_saxl < 0) g_saxl = getenv("NOSOCKADDR") ? 0 : 1;
-    return g_saxl;
-}
+static int saxl_on(void) { return 1; }
 
 // guest domain (Linux) -> host (macOS), for socket()/socketpair(). AF_INET(2)/AF_UNIX(1) match.
 static int af_l2m(int d) {
@@ -1579,7 +1574,7 @@ static int g_egress_probed = 0;
 static const char *egress_socks(void) {
     if (!g_egress_probed) {
         g_egress_probed = 1;
-        const char *e = getenv("DD_EGRESS_SOCKS");
+        const char *e = hl_option_get("HL_EGRESS_SOCKS");
         g_egress_socks = (e && *e) ? e : NULL;
     }
     return g_egress_socks;
@@ -1616,9 +1611,6 @@ static int egress_should_redirect(const struct sockaddr *m) {
 // tunneled through the proxy instead (egress_should_redirect handles AF_INET6), so this is consulted only on
 // the direct path, after that redirect has had its chance.
 static int v6_no_route(const struct sockaddr *m) {
-    static int off = -1;
-    if (off < 0) off = (getenv("NOV6UNREACH") != NULL);
-    if (off) return 0;
     if (!m || m->sa_family != AF_INET6) return 0;
     const struct in6_addr *a6 = &((const struct sockaddr_in6 *)m)->sin6_addr;
     return !(IN6_IS_ADDR_LOOPBACK(a6) || IN6_IS_ADDR_UNSPECIFIED(a6) || IN6_IS_ADDR_LINKLOCAL(a6));
@@ -1791,7 +1783,7 @@ static int g_abs_init;
 static void abs_init(void) {
     if (g_abs_init) return;
     g_abs_init = 1;
-    const char *ns = getenv("DD_NETNS"); // same key used by ipc_ns_key (service.c)
+    const char *ns = hl_option_get("HL_NETNS"); // same key used by ipc_ns_key (service.c)
     snprintf(g_absdir, sizeof g_absdir, "/tmp/.ddabs-%.40s", (ns && ns[0]) ? ns : "default");
     mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
 }
@@ -2372,7 +2364,7 @@ static int g_dns_peer[DD_NFD];     // fd -> engine-held socketpair end we write 
 static int g_dns_off = -1;
 
 static int dns_enabled(void) {
-    if (g_dns_off < 0) g_dns_off = (getenv("DD_NET_ISOLATE") != NULL);
+    if (g_dns_off < 0) g_dns_off = (hl_option_get("HL_NET_ISOLATE") != NULL);
     return !g_dns_off;
 }
 

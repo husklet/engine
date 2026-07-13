@@ -210,26 +210,12 @@ static int loop_flags_dead(uint64_t start) {
 #define XF_ALL 0x3F
 #define XF_NZCV (XF_CF | XF_ZF | XF_SF | XF_OF)
 
-static int xblkflags_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOXBLOCKFLAGS");
-        v = (lazyflags_on() && !(s && *s && *s != '0') && !getenv("NOFLAGELIDE")) ? 1 : 0;
-    }
-    return v;
-}
+static int xblkflags_on(void) { return lazyflags_on(); }
 
 // x86-xflags kill-switch (A/B): NOXALUFLAGELIDE=1 disables the block-scan mid-block NZCV / PF-AF dead-flag
 // elision on ALU producers (falls back to the 1-insn insn_is_flagkill / insn_kills_pfaf peepholes).
 // Piggybacks on the same xblkflags_on() master switch (NOXBLOCKFLAGS/NOFLAGELIDE turn it off too).
-static int xblkalu_elide_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOXALUFLAGELIDE");
-        v = (xblkflags_on() && !(s && *s && *s != '0')) ? 1 : 0;
-    }
-    return v;
-}
+static int xblkalu_elide_on(void) { return xblkflags_on(); }
 
 // x86 condition code (opcode low nibble) -> the RFLAGS bits the condition READS.
 static const uint8_t xf_cond_rd[16] = {
@@ -515,7 +501,7 @@ static int pfaf_dead_thru(const struct insn *NI, uint64_t ni_pc, uint64_t anchor
 //   flow + cpu->nzcv in every case.
 static void emit_selfloop_x86(int cc, uint64_t start, uint64_t fall, void *body, int slot) {
     if (g_tier2_build) {
-        int dead = (g_fl_pending == FL_SUB) && !getenv("NOFLAGELIDE") && loop_flags_dead(start);
+        int dead = (g_fl_pending == FL_SUB) && loop_flags_dead(start);
         if (g_fl_pending == FL_SUB) {
             if (dead) {
                 // FOLD + ELIDE: branch off the live NZCV (still holds the subs result); save only on the

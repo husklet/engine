@@ -3,17 +3,27 @@ AR ?= ar
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
 HOST ?= linux
+DEBUG ?= 0
 MAC ?= mac
 AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
 
-CPPFLAGS := -Iinclude
+CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h
 
-CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c
+# Production engines are unity translation units: their target .c files textually include the engine,
+# translator, and Linux-personality implementation. Make cannot discover those nested includes from the
+# compiler command, so conservatively track the complete production C/header tree plus public HL headers.
+# This GNU Make-only recursive wildcard keeps newly added included files in the dependency closure without
+# a generated list or a clean build.
+rwildcard = $(foreach entry,$(wildcard $1*),$(call rwildcard,$(entry)/,$2) $(filter $(subst *,%,$2),$(entry)))
+PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/production/,*.c) \
+	$(call rwildcard,src/production/,*.h) $(call rwildcard,include/hl/,*.h))
+
+CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
 IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
@@ -32,7 +42,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := codegen config host_services ir linux_abi engine
+UNIT_NAMES := codegen config host_services ir linux_abi engine log
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -44,7 +54,7 @@ E2E_CASES := atomics epoll_edge eventfd forkwait
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-macos-host compat-build compat-native compat-engines e2e-compat \
+.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos-host compat-build compat-native compat-engines e2e-compat \
 	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -106,20 +116,20 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
-$(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c \
-	src/production/os/launch_config.c src/core/config.c src/core/host_services.c src/host/macos/host_macos.c \
-	include/hl/config.h include/hl/host_macos.h packaging/macos/jit.entitlements
+$(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c $(PRODUCTION_UNITY_DEPS) \
+	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c \
+	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
-		src/core/host_services.c src/host/macos/host_macos.c
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c \
-	src/production/os/launch_config.c src/core/config.c src/core/host_services.c src/host/macos/host_macos.c \
-	include/hl/config.h include/hl/host_macos.h packaging/macos/jit.entitlements
+$(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c $(PRODUCTION_UNITY_DEPS) \
+	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c \
+	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
-		src/core/host_services.c src/host/macos/host_macos.c
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
@@ -131,13 +141,9 @@ e2e-compat: test-macos-host compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUI
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
 	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit-aarch64) new 42
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/guest-exit-x86_64) new 42
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit-aarch64) legacy 42
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/guest-exit-x86_64) legacy 42
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
@@ -194,13 +200,20 @@ $(BUILD)/tests/test_host_linux: tests/unit/test_host_linux.c $(BUILD)/lib/libhl-
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test-host-macos: tests/unit/test_host_macos.c src/host/macos/host_macos.c src/core/host_services.c \
-	include/hl/host_macos.h include/hl/host_services.h
+	src/core/log.c include/hl/host_macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/test_host_macos.c \
-		src/host/macos/host_macos.c src/core/host_services.c -o $@
+		src/host/macos/host_macos.c src/core/host_services.c src/core/log.c -o $@
 
 test-macos-host: $(BUILD)/tests/test-host-macos
 	$(MAC) $(abspath $<)
+
+$(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
+	@mkdir -p $(@D)
+	$(CC) $(filter-out -DHL_ENABLE_LOGGING=%,$(CPPFLAGS)) -DHL_ENABLE_LOGGING=1 -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+test-debug-log: $(BUILD)/tests/test-log-debug
+	$<
 
 compat-build: $(FIXTURE_BINS)
 

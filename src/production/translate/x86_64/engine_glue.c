@@ -25,12 +25,7 @@ static uint64_t g_repstr_n;     // PROF: rep cmps/scas idiom firings
 static uint64_t g_repstr_elems; // PROF: elements consumed by the rep cmps/scas idiom
 static uint64_t g_repmovs_n;    // PROF: rep movs -> host memcpy fast-path firings (ERMS funnel meter)
 static uint64_t g_repstos_n;    // PROF: rep stos -> host memset fast-path firings
-static int g_norepcmp = -1;     // gate: NOREPCMP=1 -> rep cmps/scas use the naive per-element loop
-
-static int norepcmp(void) { // (the A/B kill-switch; also the bit-exact per-element oracle path)
-    if (g_norepcmp < 0) g_norepcmp = getenv("NOREPCMP") ? 1 : 0;
-    return g_norepcmp;
-}
+static int norepcmp(void) { return 0; }
 
 // ---- opt2: x86-only 2-way set-associative IBTC (gate IBTC1WAY=1) ----
 // The x86 engine gets its OWN indirect-branch-target cache here, leaving the SHARED engine/cache.c g_ibtc
@@ -48,12 +43,7 @@ static struct {
     void *body;
 } g_xibtc[XIBTC_SETS * XIBTC_WAYS];
 
-static int g_ibtc1way = -1; // -1 = uninitialized; cached getenv("IBTC1WAY")
-
-static int ibtc1way(void) {
-    if (g_ibtc1way < 0) g_ibtc1way = (getenv("IBTC1WAY") != NULL);
-    return g_ibtc1way;
-}
+static int ibtc1way(void) { return 0; }
 
 // ---- opt8 cold-start timing helper (COLDPROF=1; diagnostic-only, zero-cost when off) ----
 static int g_coldprof;
@@ -64,7 +54,7 @@ static inline uint64_t coldprof_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-// ---- opt8 persistent translated-code cache (DDJIT_PCACHE=1; default OFF) ----
+// ---- persistent translated-code cache (HL_PCACHE=1; default off) ----
 // Deterministic guest/arena bases let us persist the translated arena + block map and mmap it back on
 // the next run of the same binary, skipping retranslation. Emitted blocks bake a handful of HOST pointers
 // (block_return, &g_ibtc, &g_fast_count, &g_pending, &g_t2cnt[], &dd_rep_movs/stos, the inline-fastsys
@@ -72,7 +62,7 @@ static inline uint64_t coldprof_now_ns(void) {
 // We record each baked slot's arena offset (g_reloc; emitted as a fixed 4-insn movz/movk so it is
 // rewritable to any address) and, on load, add (block_return_now - block_return_at_save) -- the single
 // image slide -- to each. All x86-only, all gated by g_pcache; default OFF -> emit is byte-identical.
-static int g_pcache;          // persistent cache feature on (DDJIT_PCACHE set)
+static int g_pcache;          // persistent cache feature on (HL_PCACHE set)
 static int g_pcache_loaded;   // cache hit this run (translation skipped)
 static uint64_t g_pc_binid;   // identity of (guest binary + interp)
 static uint64_t g_pc_entry;   // initial guest rip (cache-validity sanity)
@@ -122,22 +112,12 @@ static const char *g_self_path = ""; // host path to this jit86 binary (for exec
 // g_pmovmskb_n: # of `pmovmskb` sites lowered to the cascading-shift NEON sequence
 // (vs the old per-byte scalar spill loop). Printed under PROF.
 static uint64_t g_pmovmskb_n;
-static int g_nosseopt = -1; // -1 = uninitialized; cached getenv("NOSSEOPT")
-
-static int nosseopt(void) {
-    if (g_nosseopt < 0) g_nosseopt = (getenv("NOSSEOPT") != NULL);
-    return g_nosseopt;
-}
+static int nosseopt(void) { return 0; }
 
 // ---- opt7 address-gen / memory-fold fast path (gate NOEAOPT=1) ----
 // Disabling it reverts emit_ea + the mov [base+disp] load/store fold to the exact baseline
 // codegen (movconst-built disp + base+0 load/store). Env read once, then cached.
-static int g_noeaopt = -1; // -1 = uninitialized; cached getenv("NOEAOPT")
-
-static int noeaopt(void) {
-    if (g_noeaopt < 0) g_noeaopt = (getenv("NOEAOPT") != NULL);
-    return g_noeaopt;
-}
+static int noeaopt(void) { return 0; }
 
 // ---- guest_base bias-fold (non-PIE ET_EXEC; see docs/design/nonpie-pagezero.md) ----
 // A non-PIE x86_64 image maps HIGH (+g_nonpie_bias) but its baked absolute pointers stay LOW (link vaddr);
@@ -147,12 +127,7 @@ static int noeaopt(void) {
 // forward-declared here (tentative; merge with the real defs set by load_elf in elf.c / translate.c). 0
 // for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
 static uint64_t g_nonpie_lo, g_nonpie_bias;
-static int g_x86fold = -1; // cached: NOGUESTFOLD=1 disables (A/B kill-switch); default on for non-PIE
-
-static int guestfold_on(void) {
-    if (g_x86fold < 0) g_x86fold = (getenv("NOGUESTFOLD") == NULL);
-    return g_x86fold && g_nonpie_lo != 0;
-}
+static int guestfold_on(void) { return g_nonpie_lo != 0; }
 
 // ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----
 // The hotness counter table (g_t2cnt/g_t2gpc/g_t2n), the dedup slot allocator (t2_slot), the promotion
@@ -178,7 +153,4 @@ static uint64_t g_prof_t2fold; // PROF: of the promoted loops, how many also eli
 static uint64_t g_prof_xflag;      // PROF: block-edge flag materializations elided (per edge)
 static uint64_t g_prof_xflag_scan; // PROF: successor liveness scans performed
 
-static int notier2x(void) {
-    if (g_notier2x < 0) g_notier2x = (getenv("NOTIER2X") != NULL);
-    return g_notier2x;
-}
+static int notier2x(void) { return g_notier2x; }

@@ -15,6 +15,8 @@ axes. Host operating-system behavior enters only through `hl_host_services`.
 5. Public structures begin with `abi,size`, are append-only within an ABI, and use fixed-width types. No `pid_t`, native
    fd, compiler-sized enum or Rust layout leaks into the public boundary.
 6. Execution stays in the runner while migrated code still owns global signal handlers, fork behavior and `_exit`.
+7. Logging calls use portable tags and an instance-owned `hl_log_context`. They are compiled out unless
+   `HL_ENABLE_LOGGING=1`; host backends are byte sinks and never implement tag policy.
 
 ## IR rule
 
@@ -25,6 +27,6 @@ through a big-bang rewrite.
 
 ## Rebranding
 
-All new exported symbols, libraries and binaries use `hl`. Old `ddjit` names remain only inside the transferred
-production implementation until each boundary receives a deliberate adapter. Linux ABI names such as `epoll` are
-third-party compatibility contracts and are not rebranded.
+All exported symbols, libraries and binaries use `hl`. Transferred implementation internals are renamed as their
+owning layer is extracted. Linux ABI names such as `epoll` are third-party compatibility contracts and are not
+rebranded.

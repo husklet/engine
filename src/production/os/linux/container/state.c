@@ -245,7 +245,7 @@ static unsigned long long acct_mem_total(void) {
 // A same-ISA JIT keeps guest VA == host VA, so a restore MAP_FIXEDs every guest region back to its exact
 // address. But macOS ASLR places kernel-chosen guest mmaps (heap, stack, anon/file maps) at LOW addresses
 // that differ every exec -- so a VA free in the checkpointed run can be occupied by the fresh restore
-// process's own libraries. When armed (DDJIT_CHECKPOINT_DIR or DDJIT_RESTORE_DIR set), guest allocations are
+// process's own libraries. When HL_CHECKPOINT_DIR or HL_RESTORE_DIR is set, guest allocations are
 // instead HINTED into a high arena well above the engine's own mappings and the pcache image/interp bases
 // (0x40../0x48..TB) -- a range reliably free in any process, so the restore's MAP_FIXED always lands. Inert
 // (returns 0 -> normal kernel placement) unless armed, so a normal launch and the whole gate are unchanged.
@@ -357,7 +357,7 @@ static int pidmap_to_guest(int live) {
 static int g_net_isolate = -1;
 
 static int net_isolate(void) {
-    if (g_net_isolate < 0) g_net_isolate = getenv("DD_NET_ISOLATE") != NULL;
+    if (g_net_isolate < 0) g_net_isolate = hl_option_get("HL_NET_ISOLATE") != NULL;
     return g_net_isolate;
 }
 
@@ -372,7 +372,7 @@ static int net_isolate(void) {
 // Returns the address as a network-order u32 held in host byte order (a | b<<8 | c<<16 | d<<24), the
 // same encoding netns.c's br_parse_ip produces and /proc/net/route prints with %08X.
 static uint32_t netif_eth0_ip(void) {
-    const char *ip = getenv("DD_IP");
+    const char *ip = hl_option_get("HL_IP");
     if (ip && ip[0]) {
         unsigned a = 0, b = 0, cc = 0, d = 0;
         if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &cc, &d) == 4 && a < 256 && b < 256 && cc < 256 && d < 256)
@@ -445,7 +445,7 @@ static int cgid(void) {
 // written, so a stale "no xattr" verdict can never outlive the xattr appearing. Cross-process correctness
 // is free: a new engine process starts with an empty cache, so its first stat of any inode does the real
 // read and sees a pre-existing (persisted-on-disk) xattr. fork inherits the cache (same host files, same
-// xattr state); in-process execve keeps it (idem). Kill switch: DDJIT_NOXATTRCACHE=1 forces the old
+// xattr state); in-process execve keeps it. HL_NOXATTRCACHE=1 forces the uncached
 // always-read path. Keyed on (st_dev,st_ino) which fill_linux_stat already has from the just-done stat.
 static uint32_t g_chown_gen = 1; // 0 reserved for "empty slot"
 static int g_noxattrcache = -1;  // -1 = uninit; 1 = cache disabled (kill switch)
@@ -500,7 +500,7 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
     *uid = -1;
     *gid = -1;
     if (fd < 0 && !hostpath) return 0; // synthetic: no backing file to read
-    if (g_noxattrcache < 0) g_noxattrcache = getenv("DDJIT_NOXATTRCACHE") != NULL ? 1 : 0;
+    if (g_noxattrcache < 0) g_noxattrcache = 0;
     int use_cache = !g_noxattrcache && ino != 0;
     uint32_t slot = 0;
     if (use_cache) {
@@ -747,8 +747,8 @@ static void parse_publish(const char *s) {
             fprintf(stderr, "dd: invalid DD_PUBLISH '%s': expected HOST:CONTAINER\n", s);
             exit(2);
         }
-        unsigned h = dd_parse_port_field("DD_PUBLISH host port", s, colon);
-        unsigned cc = dd_parse_port_field("DD_PUBLISH container port", colon + 1, comma);
+        unsigned h = dd_parse_port_field("HL_PUBLISH host port", s, colon);
+        unsigned cc = dd_parse_port_field("HL_PUBLISH container port", colon + 1, comma);
         g_portmap[g_nportmap].cport = (uint16_t)cc;
         g_portmap[g_nportmap].hport = (uint16_t)h;
         g_nportmap++;
@@ -869,13 +869,13 @@ static void parse_ulimits(const char *spec) {
 // call this from container init, so the contract is engine-identical. Env-only: DD_* survive the mac bridge
 // and the x86 fork-server (both inherit env), and the daemon serializes the HostConfig into these vars.
 static void container_read_resource_env(void) {
-    const char *c = getenv("DD_CPUS");
+    const char *c = hl_option_get("HL_CPUS");
     if (c && c[0] && !g_cpu_max) {
-        int v = dd_parse_id("DD_CPUS", c);
+        int v = dd_parse_id("HL_CPUS", c);
         if (v > 0) g_cpu_max = v;
     }
-    if (!g_rootfs_ro && getenv("DD_ROOTFS_RO")) g_rootfs_ro = 1;
-    const char *u = getenv("DD_ULIMITS");
+    if (!g_rootfs_ro && hl_option_get("HL_ROOTFS_RO")) g_rootfs_ro = 1;
+    const char *u = hl_option_get("HL_ULIMITS");
     if (u && u[0]) parse_ulimits(u);
 }
 

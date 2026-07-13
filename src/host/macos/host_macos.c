@@ -270,12 +270,28 @@ static hl_host_result hl_macos_realtime(void *context) {
     return hl_macos_clock(CLOCK_REALTIME);
 }
 
+static void hl_macos_log(void *context, uint32_t event, const char *message, size_t message_size) {
+    size_t written = 0;
+    (void)context;
+    (void)event;
+    while (written < message_size) {
+        ssize_t result = write(STDERR_FILENO, message + written, message_size - written);
+        if (result > 0) {
+            written += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        break;
+    }
+}
+
 hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,    sizeof(memory),      hl_macos_reserve,
                                                    hl_macos_protect,      hl_macos_release,    hl_macos_publish,
                                                    hl_macos_reserve_code, hl_macos_repair_code};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_macos_monotonic,
                                                  hl_macos_realtime};
+    static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -288,10 +304,11 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
-    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING;
+    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
+    out_services->log = &log;
     *out_host = host;
     return HL_STATUS_OK;
 }

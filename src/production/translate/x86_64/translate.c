@@ -391,16 +391,7 @@ static int g_pfaf_dead;
 enum { DF_FWD = 0, DF_BWD = 1, DF_DYN = 2 };
 static int g_df; // one of DF_FWD/DF_BWD/DF_DYN; the runtime truth is cpu->df
 
-// opt3 kill-switch: NOLAZY=1 (any non-"0") reverts to the PR1 partial scheme (only sub/cmp defers;
-// add/logical materialize inline; no dead-flag elimination). Read once, cached.
-static int lazyflags_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOLAZY");
-        v = (s && *s && *s != '0') ? 0 : 1;
-    }
-    return v;
-}
+static int lazyflags_on(void) { return 1; }
 
 // Direct-write ALU dst: when an ALU (or group1) instruction's r/m operand is a REGISTER (not memory)
 // at width>=4, compute the result straight into the guest reg's host home instead of into scratch x16
@@ -408,14 +399,7 @@ static int lazyflags_on(void) {
 // as the dst==reg forms do) and computes PF/AF from the pristine a,b BEFORE overwriting `out`, so
 // out==a is byte-identical to out==x16 + rm_store — one fewer instruction on the dependent chain.
 // Gate NOXALUDIRECT=1 for A/B (elide-on default). Independent of the flag levers.
-static int xaludirect_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOXALUDIRECT");
-        v = (s && *s && *s != '0') ? 0 : 1;
-    }
-    return v;
-}
+static int xaludirect_on(void) { return 1; }
 
 // Direct-write SHIFT dst (follow-on to the ALU residency above): when an IMMEDIATE/by-1
 // SHL/SHR/SAR's r/m operand is a REGISTER at width>=4, shift straight into the guest reg's host home
@@ -425,14 +409,7 @@ static int xaludirect_on(void) {
 // guest home. rm_store(...,rmreg) is already a no-op (val==I->rm_reg), so gate-OFF is byte-identical.
 // Memory / byte / word / CL-variable / rotate / RCL-RCR keep the x16+store-back path untouched.
 // Gate NOXSHIFTDIRECT=1 for A/B (elide-on default). Independent of the flag-elision lever.
-static int xshiftdirect_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOXSHIFTDIRECT");
-        v = (s && *s && *s != '0') ? 0 : 1;
-    }
-    return v;
-}
+static int xshiftdirect_on(void) { return 1; }
 
 // Spill the deferred flags to cpu->nzcv with the producer-correct finalizer (byte-identical to the
 // old inline finalizer) and clear the pending state. Every finalizer also msr's the corrected value
@@ -506,14 +483,7 @@ static int insn_is_carry_consumer(const struct insn *I) {
 
 // kill-switch: NOPFAFELIM=1 (any non-"0") disables PF/AF dead-flag elimination -> revert to the
 // always-eager PF/AF substrate (every ALU op materializes cpu->pf/cpu->af). Read once, cached.
-static int pfaf_elim_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *s = getenv("NOPFAFELIM");
-        v = (s && *s && *s != '0') ? 0 : 1;
-    }
-    return v;
-}
+static int pfaf_elim_on(void) { return 1; }
 
 // 1 iff I's handler EMITS the PF/AF substrate (so the translate loop knows a lookahead is worth
 // doing -- and, crucially, that I falls through to a real successor at `next`, making the lookahead
@@ -862,11 +832,7 @@ static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int ari
 // keeps that input's sign on BOTH ISAs, so we must fix up ONLY generated default-NaNs, identified as
 // "result is NaN AND no input is NaN". Branchless: v20/v21 scratch, per-lane so scalar and packed share
 // one path (scalar upper lanes are 0.0 in the result -> never flagged). Set NOXFPDNAN to disable (A/B).
-static int g_fpdnan = -1;
-static int fpdnan_on(void) {
-    if (g_fpdnan < 0) g_fpdnan = (getenv("NOXFPDNAN") == NULL);
-    return g_fpdnan;
-}
+static int fpdnan_on(void) { return 1; }
 // PRE (emit BEFORE the arithmetic, while vd still holds src1): v20 <- "no input is NaN" lane mask.
 // two_in: 1 for add/sub/mul/div (src1=vd, src2=s); 0 for sqrt (single operand s, vd is not an input).
 static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
@@ -1098,7 +1064,6 @@ static void emit_div64_fast(uint64_t next, uint64_t gpc, int idiv, int rmv) {
 static void emit_sigill(uint64_t pc) {
     // Quiet by default: UD2 frequently sits on never-taken paths (compiler trap/unreachable slots) that get
     // translated as block fall-through but never run; an unconditional message would falsely imply delivery.
-    if (getenv("CRASHDBG")) fprintf(stderr, "[dd] #UD ud2 at rip=%llx -> SIGILL\n", (unsigned long long)pc);
     emit_guest_signal(pc, 4, 2); // ud2 -> SIGILL (si_code ILL_ILLOPN), rip = the faulting insn
 }
 
@@ -1117,11 +1082,6 @@ static void emit_sigill(uint64_t pc) {
 static uint32_t *g_irq_patch;
 
 static void emit_irq_check(uint64_t rip) {
-    // NOIRQCHECK=1: MEASUREMENT-ONLY kill switch (quantifies the per-block-entry poll cost).
-    // Unsafe for async signal delivery into syscall-free loops -- never default.
-    static int noirq = -1;
-    if (noirq < 0) noirq = getenv("NOIRQCHECK") != NULL;
-    if (noirq) return;
     if (g_fwdskip) {
         e_ldr(16, 28, (int)OFF_IRQ); // ldr x16, [x28(cpu), #irq]
         g_irq_patch = (uint32_t *)g_cp;
@@ -1151,7 +1111,7 @@ static void *translate_block(uint64_t gpc) {
     g_fp_dirty = 0;
     g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
     g_prof_xlate++;   // PROF (measurement-only): translate_block calls
-    if (g_stitch < 0) g_stitch = (getenv("NOSTITCH") == NULL);
+    if (g_stitch < 0) g_stitch = 1;
     // W3-A superblock state: guest block-starts already laid in this region + region budget.
     uint64_t seen[TRACE_MAX_BLK];
     int nseen = 0, trace_blk = 0;
@@ -3903,20 +3863,6 @@ static void *translate_block(uint64_t gpc) {
         *p = 0xB5000000u | (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16; // cbnz x16
         emit_exit_const(start, R_BRANCH);
     }
-    // BLKDUMP=<hex guest pc> diagnostic: print the emitted host words for one translated block (any tier).
-    {
-        static uint64_t s_blkdump = ~0ull;
-        if (s_blkdump == ~0ull) {
-            const char *e = getenv("BLKDUMP");
-            s_blkdump = e ? strtoull(e, NULL, 16) : 0;
-        }
-        if (s_blkdump && (start == s_blkdump || (s_blkdump < 0x1000000ull && (start & 0xFFFFFFull) == s_blkdump))) {
-            fprintf(stderr, "[blkdump] gpc=%llx tier%d:", (unsigned long long)start, g_tier2_build ? 2 : 1);
-            for (uint32_t *p = (uint32_t *)host; (uint8_t *)p < g_cp; p++)
-                fprintf(stderr, " %08x", *p);
-            fprintf(stderr, "\n");
-        }
-    }
     // W5B tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
     // itself, so don't insert a duplicate and don't chain pending edges here (the promoter does both
     // AFTER icache-flushing the new code). Expose the body for it.
@@ -3947,12 +3893,6 @@ static void tier2_promote(uint64_t gpc) {
     void *nh = translate_block(gpc); // folded recompile; no counter, no map_put, no chain
     void *nb = g_last_body;
     g_tier2_build = 0;
-    if (getenv("T2DUMP")) {
-        fprintf(stderr, "[t2dump] gpc=%llx body+%ld:", (unsigned long long)gpc, (long)((uint8_t *)nb - (uint8_t *)nh));
-        for (uint32_t *p = (uint32_t *)nb; (uint8_t *)p < g_cp; p++)
-            fprintf(stderr, " %08x", *p);
-        fprintf(stderr, "\n");
-    }
     // make the tier-2 code coherent BEFORE anything can branch into it
     sys_icache_invalidate(g_emit_start, (size_t)(g_cp - g_emit_start));
     // redirect the OLD tier-1 body to tier-2 (predecessor chains were resolved to the old body when they

@@ -65,19 +65,13 @@
 // re-save (the fresh save's atomic rename self-heals the bad file). Publication is always write-temp +
 // rename -- a reader never observes a partially-written file, and concurrent savers can never interleave.
 //
-// Keyed by (engine build id, codegen-mode env flags, cpu-struct size, map/ibtc sizes, both fixed bases,
+// Keyed by (engine build id, cpu-struct size, map/ibtc sizes, both fixed bases,
 // entry PC, argv[0] basename, and the identity -- dev/ino/size/mtime(ns) -- of the guest binary AND its
-// interpreter). OPT-IN via DDJIT_PCACHE=1 (byte-identical matrix when off, exactly like the x86 pcache);
-// DDJIT_NOPCACHE=1 is the kill-switch that wins over everything.
+// interpreter). Opt in via HL_PCACHE=1; HL_NOPCACHE=1 always wins.
 
 #define PC_MAGIC 0x3436414350544a44ull // "DDJTPCA4" (LE tag)
-#define PC_VERSION 3 // BUMP on ANY aarch64 codegen/layout change. v3: IRQSLIM/IBSLIM layout + pend.fwd.
-// IRQSLIM changes the block-entry layout (fixed 2-insn poll header + poll-free forward-chain entry at
-// body+8), and it is env-toggleable (NOIRQSLIM/NOIRQCHECK/NOSTEAL1617) -- mix the LIVE mode into the
-// version (mirrors the x86 pcache's PC_VERSION_EFF) so a cache written in one layout can never be
-// reloaded into the other: a +8 forward chain into a legacy-layout block would land mid-instruction,
-// and a legacy chain into an IRQSLIM block would double-run the poll header's cbnz target.
-#define PC_VERSION_EFF (PC_VERSION | ((uint64_t)(g_fwdskip ? 0x100 : 0)))
+#define PC_VERSION 4 // v4 retires mode-dependent A/B cache identities; production codegen is fixed.
+#define PC_VERSION_EFF PC_VERSION
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
 #define PC_RELOC_CAP (1u << 20)              // recorded baked-host-pointer slots (poison if exceeded)
@@ -94,7 +88,7 @@ struct pc_reloc {
 };
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
-static int g_pcache;            // persistent cache active (DDJIT_PCACHE=1; DDJIT_NOPCACHE=1 kills)
+static int g_pcache;            // persistent cache active (HL_PCACHE=1; HL_NOPCACHE=1 disables)
 static int g_coldprof;          // COLDPROF=1: print pcache hit/miss + save timing
 static uint64_t g_force_base;   // if nonzero, load_elf() maps the NEXT image MAP_FIXED here (one-shot; elf.c)
 static int g_force_base_failed; // a fixed-VA map fell back to a kernel base -> this image can't hit OR save
@@ -225,24 +219,6 @@ static uint64_t pcache_engine_id(void) {
     return pc_fnv(1469598103934665603ull, tag, sizeof tag - 1);
 }
 
-// Codegen-mode env flags that change the EMITTED BYTES (A/B kill-switches). Folded into the cache id so
-// an arena saved under one mode is never loaded under another (each mode gets its own cache file).
-static uint64_t pcache_mode_id(void) {
-    static const char *envs[] = {"NOSTEAL1617", "NOSTEALFAST", "NOGUESTFOLD", "NOSHADOWTUNE", "SHADOWGATE",
-                                 "NOSTITCH", "NOLSE", "NOTIER2",
-                                 // perf-wave-2 codegen toggles: IRQSLIM (2-insn poll header + body+8
-                                 // forward entries; also mixed into PC_VERSION_EFF via the LIVE
-                                 // g_fwdskip), IBSLIM (set_x30 + hash_tail shapes).
-                                 "NOIRQSLIM", "NOIRQCHECK", "NOIBSLIM"};
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < sizeof envs / sizeof envs[0]; i++) {
-        const char *v = getenv(envs[i]);
-        h = pc_fnv(h, envs[i], strlen(envs[i]));
-        h = pc_fnv(h, v ? v : "\x01", v ? strlen(v) : 1);
-    }
-    return h;
-}
-
 // Hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs DIFFERENT code
 // paths per argv[0]; the translated arena is therefore per-applet, so the cache MUST be keyed by argv[0]
 // too or one applet loads another's arena. Basename (not full argv) so a single-purpose binary invoked
@@ -259,12 +235,11 @@ static uint64_t pcache_argv0_id(const char *argv0) {
 static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, const char *argv0) {
     uint64_t a = pcache_id_of(prog_host);
     uint64_t b = interp_host ? pcache_id_of(interp_host) : 0xABCDEFull;
-    return (a ^ (b * 1099511628211ull)) ^ pcache_engine_id() ^ (pcache_argv0_id(argv0) * 0x100000001B3ull) ^
-           (pcache_mode_id() * 0x9E3779B97F4A7C15ull);
+    return (a ^ (b * 1099511628211ull)) ^ pcache_engine_id() ^ (pcache_argv0_id(argv0) * 0x100000001B3ull);
 }
 
 static void pcache_file(char *out, size_t n) {
-    const char *dir = getenv("DDJIT_PCACHE_DIR");
+    const char *dir = hl_option_get("HL_PCACHE_DIR");
     if (!dir || !dir[0]) dir = "/tmp/ddjit-pcache-arm64";
     mkdir(dir, 0700);
     snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
@@ -459,7 +434,7 @@ static void pcache_save(void) {
     struct pc_hdr h;
     memset(&h, 0, sizeof h);
     h.magic = PC_MAGIC;
-    h.version = PC_VERSION_EFF; // layout-mode-mixed (IRQSLIM on/off) -- cross-mode loads are guaranteed MISSes
+    h.version = PC_VERSION_EFF;
     h.cpu_sz = sizeof(struct cpu);
     h.jit_map_n = JIT_MAP_N;
     h.ibtc_n = IBTC_N;

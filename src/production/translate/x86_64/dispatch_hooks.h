@@ -49,12 +49,8 @@ extern int g_rwx_guest;
 static uint64_t g_smc_pg[SMC_MAX];
 static int g_smc_n;
 static uint64_t g_smc_flushes; // PROF: number of SMC re-translate events
-static int g_nosmc = -1;
-
 static void smc_protect(uint64_t pc) {
     if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
-    if (g_nosmc < 0) g_nosmc = (getenv("NOSMC") != NULL);
-    if (g_nosmc) return;
     uint64_t pg = pc & ~0x3FFFull; // 16KB macOS hardware page
     for (int i = 0; i < g_smc_n; i++)
         if (g_smc_pg[i] == pg) return; // already protected

@@ -612,7 +612,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // --network none: no external egress (DD_NET_ISOLATE). Loopback is redirected by the lo_* path
         // below; any non-127/8 AF_INET destination is refused, matching docker's null network.
         static int net_isolate = -1;
-        if (net_isolate < 0) net_isolate = getenv("DD_NET_ISOLATE") != NULL;
+        if (net_isolate < 0) net_isolate = hl_option_get("HL_NET_ISOLATE") != NULL;
         uint8_t *sa = (uint8_t *)a1;
         // A bad address POINTER must return EFAULT, not fault the engine: the DNS/loopback/AF_UNIX
         // classifiers below deref `sa` directly (Linux copies the sockaddr in before any routing).

@@ -473,37 +473,11 @@ static void poslk_on_exit(void) {
 //   1 = none   no-op barrier (return success without syncing) -- for ephemeral/CI containers, which are
 //               page-cache-coherent for any reader but NOT host-crash-durable. ~2.9x sqlite insert tps.
 //   2 = strict fcntl(fd, F_FULLFSYNC) for real on-platter durability (falls back to fsync on non-reg fds).
-static int s3db_durability(void) {
-    static int mode = -1;
-    if (__builtin_expect(mode < 0, 0)) {
-        const char *e = getenv("S3DB_DURABILITY");
-        int m = 0; // default == fast == legacy
-        if (e) {
-            if (!strcmp(e, "none"))
-                m = 1;
-            else if (!strcmp(e, "strict"))
-                m = 2;
-            else
-                m = 0; // "fast" or anything unrecognized -> fast (safe default)
-        }
-        mode = m;
-    }
-    return mode;
-}
-
 // Route fsync/fdatasync/sync_file_range (82/83/84) through the durability policy. Returns 0 on success
 // or -errno (Linux ABI convention used by the caller's G_RET). `fast`/default is byte-identical to the
 // legacy `fsync((int)fd) < 0 ? -errno : 0` path.
 static uint64_t s3db_sync_fd(int fd) {
-    switch (s3db_durability()) {
-    case 1: return 0; // none: no-op barrier
-    case 2:           // strict: real host-crash durability; fall back to fsync if F_FULLFSYNC unsupported
-        if (fcntl(fd, F_FULLFSYNC, 0) == 0) return 0;
-        // EINVAL/ENOTSUP on non-regular fds (pipes, sockets, etc.) -> plain fsync
-        return fsync(fd) < 0 ? (uint64_t)(-errno) : 0;
-    default: // 0 fast (== legacy default)
-        return fsync(fd) < 0 ? (uint64_t)(-errno) : 0;
-    }
+    return fsync(fd) < 0 ? (uint64_t)(-errno) : 0;
 }
 
 // list a directory's entries (minus . / ..) as a newline-joined, NUL-terminated malloc'd string (for the
@@ -675,7 +649,7 @@ static void dirs_drop(int fd) {
 // begins with "#!", fills `interp` (size ni) with the interpreter path and `arg` (size na) with the
 // optional single argument (arg[0]==0 when there is none) and returns 1. Returns 0 when it is not a
 // shebang script, -1 when the file can't be opened/read. Shared by execve (case 221) and the initial
-// program loader (dd_run): both then rewrite argv to [interp, (arg), scriptpath, args...] and load the
+// program loader: both then rewrite argv to [interp, (arg), scriptpath, args...] and load the
 // INTERPRETER instead of the script. load_elf has no ELF-magic/#! check, so the script bytes would
 // otherwise be parsed as a bogus ELF and fault.
 static int parse_shebang(const char *host_path, char *interp, size_t ni, char *arg, size_t na) {
@@ -916,8 +890,6 @@ static uint8_t g_epoll[DD_NFD]; // per fd: an epoll instance (backed by kqueue) 
 // interest DIRECTLY to the kernel (the deferred per-epfd changelist would strand a change on one alias);
 // forces epoll_ctl/epoll_wait onto the immediate path for a dup'd instance.
 static uint8_t g_ep_dupd[DD_NFD];
-static unsigned long long g_ep_kevent_calls; // PROF: kevent() syscalls issued by the epoll path
-static int g_epprof = -1;
 
 // ---- per-instance epoll interest table (fd -> owning instance + events + udata) --------------------
 // Linux keeps an interest list per epoll instance and ties each registration to the underlying OPEN FILE
@@ -962,24 +934,8 @@ static int ofd_surviving_alias(int fd) {
 }
 
 static int epopt_on(void) {
-    if (g_epopt < 0) {
-        const char *e = getenv("NOEPOLLOPT");
-        g_epopt = (e && e[0] == '1') ? 0 : 1;
-    }
+    if (g_epopt < 0) g_epopt = 1;
     return g_epopt;
-}
-
-static void ep_prof_dump(void) {
-    if (g_epprof == 1) fprintf(stderr, "[ddepollprof] epoll_kevent_syscalls=%llu\n", g_ep_kevent_calls);
-}
-
-static void ep_count(void) {
-    if (g_epprof < 0) {
-        const char *e = getenv("DDEPOLLPROF");
-        g_epprof = (e && e[0] == '1') ? 1 : 0;
-        if (g_epprof) atexit(ep_prof_dump);
-    }
-    if (g_epprof == 1) g_ep_kevent_calls++;
 }
 
 // append a change to epfd's buffer, coalescing on (ident,filter) so repeated ctls collapse.

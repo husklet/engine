@@ -132,7 +132,7 @@ static uint8_t g_devdri[DD_NFD];
 // unless this is set in the engine env (the --gui launcher sets it). Cached; -1 = unqueried.
 static int g_gpu_iosurface = -1;
 static int gpu_iosurface_on(void) {
-    if (g_gpu_iosurface < 0) g_gpu_iosurface = getenv("DD_GPU_IOSURFACE") != NULL ? 1 : 0;
+    if (g_gpu_iosurface < 0) g_gpu_iosurface = hl_option_get("HL_GPU_IOSURFACE") != NULL ? 1 : 0;
     return g_gpu_iosurface;
 }
 // Overlay merged-getdents snapshot cursor reset (rewinddir/seekdir on an overlay dir). Defined in fs.c
@@ -353,9 +353,7 @@ static struct memf *g_memf[DD_NFD];
 static _Atomic uint64_t g_memf_total; // sum of logical sizes of all backed files
 
 static int memf_disabled(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("NOTMPFS") ? 1 : 0;
-    return v;
+    return 0;
 }
 
 static inline struct memf *memf_get(int fd) {
@@ -1132,7 +1130,7 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
 // merged with any `docker run/exec -e PATH=` override -- the authoritative search path for bare commands.
 static void container_path_env(char *out, size_t n) {
     out[0] = 0;
-    const char *ge = getenv("DD_GUEST_ENV");
+    const char *ge = hl_option_get("HL_GUEST_ENV");
     if (!ge) return;
     for (const char *s = ge; *s;) {
         const char *e = s;
@@ -1688,7 +1686,7 @@ static int proc_stat_text(char *b, size_t n) {
 // DD_GUEST_ENV (the container env the daemon forwards, "K=V\nK=V"); absent it (manual/direct mode), fall
 // back to the same defaults build_stack hands the guest. Returns the byte count written.
 // The running process's FINAL environment (container env + merged engine defaults), captured by build_stack
-// -- the exact set placed on the guest stack, i.e. what getenv() sees. /proc/self/environ was generated from
+// -- the exact set placed on the guest stack, i.e. what hl_option_get() sees. /proc/self/environ was generated from
 // the RAW DD_GUEST_ENV instead, omitting the defaults (HOME/LANG/…) build_stack adds, so procfs disagreed
 // with getenv. Using this blob makes them consistent. (build_stack in elf.c is compiled after vfs.c.)
 static char g_self_environ[16384];
@@ -1714,7 +1712,7 @@ static int proc_environ_text(char *b, size_t n) {
         memcpy(b, g_self_environ, (size_t)L);
         return L;
     }
-    const char *ge = getenv("DD_GUEST_ENV");
+    const char *ge = hl_option_get("HL_GUEST_ENV");
     if (ge && ge[0]) {
         for (const char *s = ge; *s;) {
             const char *e = s;
@@ -1997,8 +1995,8 @@ static int proc_mountinfo_text(char *b, size_t n) {
 // inherited across fork + survive guest execve), so two containers on the same host never collide; a
 // direct-mode run with neither falls back to the host session id. All peers compute the SAME key.
 static void proc_reg_key(char *out, size_t n) {
-    const char *k = getenv("DD_NETNS");
-    if (!k || !k[0]) k = getenv("DD_HOSTNAME");
+    const char *k = hl_option_get("HL_NETNS");
+    if (!k || !k[0]) k = hl_option_get("HL_HOSTNAME");
     if (k && k[0]) {
         char s[48];
         int o = 0;
@@ -4608,7 +4606,7 @@ static void dd_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf
     mach_port_t server = MACH_PORT_NULL;
     // DD_GPU_BRIDGE_NAME lets multiple dd-display instances coexist (one per agent/benchmark); the
     // compositor registers under the SAME name. Unset → the historical singleton "com.dd.display.gpu".
-    const char *bridge = getenv("DD_GPU_BRIDGE_NAME");
+    const char *bridge = hl_option_get("HL_GPU_BRIDGE_NAME");
     if (!bridge || !*bridge) bridge = "com.dd.display.gpu";
     if (bootstrap_look_up(bootstrap_port, (char *)bridge, &server) != KERN_SUCCESS) return;
     mach_port_t port = IOSurfaceCreateMachPort(surf);
@@ -4779,7 +4777,7 @@ static uint32_t dd_gpu_align_u32(uint32_t v, uint32_t align) {
 #ifdef __APPLE__
 static int gpu_alloc_dbg(void) {
     static int v = -1;
-    if (v < 0) v = getenv("DD_GPU_ALLOC_DEBUG") != NULL ? 1 : 0;
+    if (v < 0) v = 0;
     return v;
 }
 
@@ -4983,7 +4981,7 @@ static void dd_gpu_prewarm_fork_safety(void) {
     mach_port_t port = IOSurfaceCreateMachPort(surf);
     if (port != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), port);
     mach_port_t server = MACH_PORT_NULL;
-    const char *bridge = getenv("DD_GPU_BRIDGE_NAME");
+    const char *bridge = hl_option_get("HL_GPU_BRIDGE_NAME");
     if (!bridge || !*bridge) bridge = "com.dd.display.gpu";
     if (bootstrap_look_up(bootstrap_port, (char *)bridge, &server) == KERN_SUCCESS && server != MACH_PORT_NULL)
         mach_port_deallocate(mach_task_self(), server);
@@ -4999,12 +4997,12 @@ static void dd_gpu_prewarm_fork_safety(void) {
     // --gui launcher passes the window size); DD_GPU_POOL_N sets how many per size (default 6 — covers a
     // gbm 2-4 bo pool plus slack). Unset → no prefill (root-side on-demand batch-create still amplifies).
     int per = 6;
-    const char *pn = getenv("DD_GPU_POOL_N");
+    const char *pn = hl_option_get("HL_GPU_POOL_N");
     if (pn && *pn) {
         int v = atoi(pn);
         if (v > 0 && v <= 64) per = v;
     }
-    const char *pool = getenv("DD_GPU_POOL");
+    const char *pool = hl_option_get("HL_GPU_POOL");
     if (pool && *pool) {
         // Explicit "WxH[,WxH...]" list.
         char buf[256];
@@ -5018,7 +5016,7 @@ static void dd_gpu_prewarm_fork_safety(void) {
     } else {
         // Fallback: the --gui launcher already exports the window geometry as CHROME_WINDOW_SIZE="W,H";
         // seed the pool from it so the fix works without a dedicated DD_GPU_POOL env.
-        const char *ws = getenv("CHROME_WINDOW_SIZE");
+        const char *ws = hl_option_get("HL_CHROME_WINDOW_SIZE");
         unsigned pw = 0, ph = 0;
         if (ws && sscanf(ws, "%u,%u", &pw, &ph) == 2 && pw && ph)
             for (int k = 0; k < per; k++)

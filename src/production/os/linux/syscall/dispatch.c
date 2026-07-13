@@ -117,7 +117,7 @@ static void fd_reset_emul(int fd);
 #include <stdarg.h>
 static int g_w7_trace = -1;
 static inline int w7_on(void) {
-    if (__builtin_expect(g_w7_trace < 0, 0)) g_w7_trace = getenv("DD_WALL7_TRACE") ? 1 : 0;
+    if (__builtin_expect(g_w7_trace < 0, 0)) g_w7_trace = hl_option_get("HL_WALL7_TRACE") ? 1 : 0;
     return g_w7_trace;
 }
 __attribute__((format(printf, 1, 2))) static void w7_trace(const char *fmt, ...) {

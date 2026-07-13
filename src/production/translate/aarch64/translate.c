@@ -123,13 +123,7 @@ static int uses_x18(uint32_t in, int mask) {
 // instruction, store back. Sampled attribution on the CPython eval loop showed the mscratch dance +
 // cpu->x[] traffic at ~20% of total run time (PLT stubs -- adrp x16/ldr x17/add x16/br x17, all-stolen --
 // alone were 19% of samples), so this is the single biggest engine tax on call-heavy aarch64 guests.
-// NOSTEALFAST=1 restores the exact legacy sequences (A/B kill switch); NOSTEAL1617 implies legacy.
-static int g_stealfast = -1;
-
-static int stealfast_on(void) {
-    if (g_stealfast < 0) g_stealfast = (g_steal1617 && !getenv("NOSTEALFAST")) ? 1 : 0;
-    return g_stealfast;
-}
+static int stealfast_on(void) { return g_steal1617; }
 
 // Emit a guest insn that references stolen reg(s): for each, a scratch S = cpu->x[stolen]; run the
 // insn with the stolen field(s) replaced by scratch(es); store back. Real x28 = cpu is the base;
@@ -610,19 +604,7 @@ static uint32_t *emit_shadow_push(uint64_t gpc) {
 //    0 NOSHADOWTUNE=1 -> EXACT original §B-on gate (byte-identical baseline codegen). A/B kill switch.
 //    1 SHADOWGATE=1   -> widen-fix: window-exhaustion = large/complex fn -> DEEP not leaf (measured: worse).
 //    2 SHADOWGATE=2   -> widen more: ANY direct call -> §B (measured: worse / no better).
-static int g_shadowgate = -2;
-
-static int shadowgate(void) {
-    if (g_shadowgate == -2) {
-        if (getenv("NOSHADOWTUNE"))
-            g_shadowgate = 0;
-        else {
-            const char *e = getenv("SHADOWGATE");
-            g_shadowgate = e ? atoi(e) : -1;
-        }
-    }
-    return g_shadowgate;
-}
+static int shadowgate(void) { return -1; }
 
 // Scan target's straight-line extent (bounded by forward-branch reach). Returns -1 if a blr (unknown
 // callee) -- or, when tuned, if the scan window is exhausted with no clean terminal (large/complex fn,
@@ -1163,15 +1145,7 @@ static void stitch_cond(uint32_t inv, uint64_t taken) {
     *patch = recode_cond(inv, ((uint8_t *)g_cp - (uint8_t *)patch) / 4);
 }
 
-// ---- SMC: self-modifying-code support (gate NOSMC=1) ----
-// NOSMC=1 reverts to the legacy behavior (guest `ic ivau` emitted verbatim, no translation-cache drop) so
-// a stale-translation A/B is still possible. Read once (idempotent static guard).
-static int g_smc_off = -1;
-
-static int smc_disabled(void) {
-    if (g_smc_off < 0) g_smc_off = (getenv("NOSMC") != NULL);
-    return g_smc_off;
-}
+static int smc_disabled(void) { return 0; }
 
 // A guest `ic ivau` reached the dispatcher (R_ICFLUSH): the guest is about to execute code it just rewrote,
 // so every gpc->host translation may be stale. Drop the whole block map + IBTC + pending chains (mirrors the
@@ -1269,11 +1243,6 @@ static void smc_icflush(uint64_t va) {
 static uint32_t *g_irq_patch;
 
 static void emit_irq_check(uint64_t gpc) {
-    // NOIRQCHECK=1: MEASUREMENT-ONLY kill switch (quantifies the per-block-entry cost of the
-    // async-signal poll). Unsafe for async signal delivery into syscall-free loops -- never default.
-    static int noirq = -1;
-    if (noirq < 0) noirq = getenv("NOIRQCHECK") != NULL;
-    if (noirq) return;
     (void)gpc;
     if (g_fwdskip) {
         e_ldr(16, CPUREG, OFF_IRQ); // ldr x16, [x28, #irq]
@@ -1343,7 +1312,7 @@ static void *translate_block(uint64_t gpc) {
     // region STOPS (falls to the baseline single-block exit) at any dispatcher-mediated edge
     // (indirect br/blr, bl/call, ret, svc/syscall), inside an exclusive monitor region, or on
     // hitting the 16-block / 16 KB bound -- "when unsure, end the region".
-    if (g_stitch < 0) g_stitch = getenv("NOSTITCH") ? 0 : 1;
+    if (g_stitch < 0) g_stitch = 1;
     uint64_t seen[TRACE_MAX_BLK];
     int nseen = 0, trace_blk = 0;
 #define STITCH_OK (g_stitch && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
@@ -1360,7 +1329,7 @@ static void *translate_block(uint64_t gpc) {
             g_blk_vdirty = 1;
         }
 
-        if (!in_excl && !getenv("NOLSE")) {
+        if (!in_excl) {
             int n = try_lse_atomic(gpc);
             if (n) {
                 gpc += n;
@@ -1986,7 +1955,7 @@ static void tier2_promote(uint64_t gpc) {
     void *nh = translate_block(gpc); // folded recompile; no counter, no map_put
     void *nb = g_last_body;
     g_tier2_build = 0;
-    if (getenv("T2DUMP")) {
+    if (hl_option_get("HL_T2DUMP")) {
         fprintf(stderr, "[t2dump] gpc=%llx body+%ld:", (unsigned long long)gpc, (long)((uint8_t *)nb - (uint8_t *)nh));
         for (uint32_t *p = (uint32_t *)nb; (uint8_t *)p < g_cp; p++)
             fprintf(stderr, " %08x", *p);

@@ -19,15 +19,15 @@
 // sets DD_GUEST_ENV_EXACT); a guest execve that curates its env -- or clears it -- must match Linux, where
 // `execve(path, argv, NULL)` yields an empty environment and `execve(path,argv,["FOO=bar"])` yields exactly
 // one entry. Each pointer may be a low non-PIE address, so rebase the array base and every element with
-// nonpie_p(), exactly as the argv loop does. setenv() copies the buffer, so it survives the teardown.
+// nonpie_p(), exactly as the argv loop does. hl_option_set() copies the buffer, so it survives the teardown.
 static void exec_forward_env(uint64_t envp_guest) {
     if (!envp_guest) {
         // Linux: NULL envp -> the new program runs with an EMPTY environment. Publish an empty, authoritative
         // env (do NOT leak the container's stale/default DD_GUEST_ENV) and flag it EXACT so build_stack adds
         // no defaults -> the guest sees envc==0, byte-exact with the native oracle.
-        setenv("DD_GUEST_ENV", "", 1);
-        setenv("DD_GUEST_ENV_ESC", "1", 1);
-        setenv("DD_GUEST_ENV_EXACT", "1", 1);
+        hl_option_set("HL_GUEST_ENV", "", 1);
+        hl_option_set("HL_GUEST_ENV_ESC", "1", 1);
+        hl_option_set("HL_GUEST_ENV_EXACT", "1", 1);
         return;
     }
     uint64_t *ev = (uint64_t *)nonpie_p(envp_guest);
@@ -65,9 +65,9 @@ static void exec_forward_env(uint64_t envp_guest) {
         buf[len++] = '\n'; // DD_GUEST_ENV record separator (build_stack splits on '\n')
         buf[len] = 0;
     }
-    setenv("DD_GUEST_ENV", buf, 1);
-    setenv("DD_GUEST_ENV_ESC", "1", 1);   // tell build_stack the records are escape-encoded
-    setenv("DD_GUEST_ENV_EXACT", "1", 1); // guest-initiated exec: this env is authoritative, inject no defaults
+    hl_option_set("HL_GUEST_ENV", buf, 1);
+    hl_option_set("HL_GUEST_ENV_ESC", "1", 1);   // tell build_stack the records are escape-encoded
+    hl_option_set("HL_GUEST_ENV_EXACT", "1", 1); // guest-initiated exec: this env is authoritative, inject no defaults
     free(buf);
 }
 
@@ -197,7 +197,7 @@ static void exec_close_cloexec(void) {
 static int forkprof_on(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("DD_FORKPROF");
+        const char *e = hl_option_get("HL_FORKPROF");
         on = (e && e[0] == '1') ? 1 : 0;
     }
     return on;
@@ -257,7 +257,7 @@ static void fork_child_hooks(struct cpu *c) {
     // The CRASHDBG Mach exception port + its receiver thread do NOT survive fork, so a crash in the
     // child silently dies. Clear the inherited task exception port so a fault falls through to the
     // POSIX diag_crash handler (which IS inherited) and reports fault=/pc=.
-    if (getenv("CRASHDBG"))
+    if (hl_option_get("HL_CRASHDBG"))
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION, MACH_PORT_NULL,
                                  EXCEPTION_DEFAULT, 0);
 #endif
@@ -502,7 +502,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // exit_group: end the whole process
     case 94:
-        if (getenv("PROF"))
+        if (hl_option_get("HL_PROF"))
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
                     "wx_toggles=%llu dualmap=%d xlate_ms=%.3f mtibtc=%d mtfill=%llu futexq=%d "
@@ -514,7 +514,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
         // A3: §B shadow-return coverage. hit-rate = shret_hit / (shret_hit + shret_fb). bl_shadow /
         // bl_leaf show how the depth-gate split call sites at translate time. PROF-only (keep dark).
-        if (getenv("PROF")) {
+        if (hl_option_get("HL_PROF")) {
             unsigned long long h = (unsigned long long)g_prof_shret_hit, f = (unsigned long long)g_prof_shret_fb;
             double hr = (h + f) ? 100.0 * (double)h / (double)(h + f) : 0.0;
             fprintf(
@@ -523,24 +523,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 (unsigned long long)g_prof_shpush, h, f, hr, (unsigned long long)g_prof_bl_shadow,
                 (unsigned long long)g_prof_bl_leaf);
         }
-#ifdef R_REPSTR // W4-C: x86-only rep cmps/scas idiom firing counts
-        if (getenv("PROF"))
-            fprintf(stderr, "[prof] repstr=%llu repstr_elems=%llu repmovs=%llu repstos=%llu\n",
-                    (unsigned long long)g_repstr_n, (unsigned long long)g_repstr_elems, (unsigned long long)g_repmovs_n,
-                    (unsigned long long)g_repstos_n);
-#endif
-#ifdef G_PROF_EXTRA
-        G_PROF_EXTRA; // W5B: x86 tier-2 promotion counters
-#endif
-        ep_prof_dump(); // w3e: flush epoll kevent-syscall counter (atexit is bypassed by _exit)
-        md_dump();      // MAPDUMP: translation-map + code-cache dump for offline PC attribution (profiling)
         if (g_noexit) { // W3D fork-server prewarm: don't kill the resident parent; unwind run_guest instead
             c->exited = 1;
             c->exit_code = (int)a0;
             break;
         }
 #ifdef PCACHE_SAVE_HOOK
-        PCACHE_SAVE_HOOK; // opt8: persist the translated arena before the one-shot _exit (DDJIT_PCACHE only)
+        PCACHE_SAVE_HOOK; // persist the translated arena before one-shot exit when HL_PCACHE is active
 #endif
         futex_robust_exit(c); // robust mutexes still held by the calling thread -> OWNER_DIED + wake waiters
         acct_proc_leave();    // release this process's cgroup accounting slot (_exit bypasses atexit)

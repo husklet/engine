@@ -239,7 +239,7 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
         g_nonpie_types_hi = thi;
     }
     extern int g_diag;
-    if (g_trace || g_diag || getenv("JT"))
+    if (g_trace || g_diag)
         fprintf(stderr, "[go-rebase] firstmoduledata@%llx +bias=%llx (magic=%x) types=[%llx,%llx)\n",
                 (unsigned long long)md_va, (unsigned long long)bias, magic, (unsigned long long)g_nonpie_types_lo,
                 (unsigned long long)g_nonpie_types_hi);
@@ -283,10 +283,6 @@ static void load_elf(const char *path, struct loaded *out) {
         // #210 test hook: deterministically simulate a fixed-VA collision (unreachable naturally -- the two
         // fixed bases sit 512GB apart) so the fallback path below is exercised byte-exact. Drops the map we
         // just made and forces MAP_FAILED. Inert unless DDX_FORCE_BASE_COLLIDE is set.
-        if (base != MAP_FAILED && getenv("DDX_FORCE_BASE_COLLIDE")) {
-            munmap(base, span);
-            base = MAP_FAILED;
-        }
         // #210: the requested fixed VA can already be occupied -- a prior mapping (the interp vs the main
         // image both want deterministic bases), an ASLR collision, or 16KiB-host vs 4KiB-guest page
         // rounding leaving PC_IMG_BASE/PC_INTERP_BASE straddling a live entry. MAP_FIXED then returns
@@ -316,11 +312,11 @@ static void load_elf(const char *path, struct loaded *out) {
     // original link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV
     // handler (nonpie_fixup) can serve absolute DATA loads/stores at +bias. PIE/static-PIE leave these
     // 0 -> no redirect, no fixup, byte-identical. Coexists with the opt8 g_force_base path above (that
-    // only fires for PIE images under DDJIT_PCACHE; a non-PIE ET_EXEC takes the NULL-hint branch).
+    // only fires for PIE images under HL_PCACHE; a non-PIE ET_EXEC takes the NULL-hint branch).
     // NONPIE_NOFIXUP=1 disables (legacy: code jump still faults on the low vaddr). g_nonpie_* live in the
     // shared os/linux/container/vfs.c; service.c resets them across execve (case 221) for re-loaded images.
     int etype = rd16(f + 16);
-    if (etype == 2 && !getenv("NONPIE_NOFIXUP")) {
+    if (etype == 2) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;
@@ -335,7 +331,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
     // (ET_EXEC only); NOGOREBASE=1 disables for A/B testing.
-    if (g_nonpie_lo && !getenv("NOGOREBASE")) go_rebase_nonpie(f, st.st_size, bias, g_nonpie_lo, g_nonpie_hi);
+    if (g_nonpie_lo) go_rebase_nonpie(f, st.st_size, bias, g_nonpie_lo, g_nonpie_hi);
     // record V8's embedded-builtins CODE base symbol (LOW link value) so the frontend can bias its one
     // baked `mov r32,imm` materialization to the high mapping -- see translate.c g_nonpie_blob_code. Only for a
     // biased non-PIE image that actually carries the symbol (node/mongosh/any embedded-V8 ET_EXEC); 0 otherwise
@@ -343,7 +339,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // Gate on THIS image being the non-PIE ET_EXEC (etype==2), not on the persistent g_nonpie_lo: the
     // interpreter (ld.so, a DYN loaded by a SECOND load_elf in the same process) has no v8 symbol and would
     // otherwise reset the value the main image just recorded. Only the main non-PIE exe carries the blob.
-    if (etype == 2 && !getenv("NOV8BLOB"))
+    if (etype == 2)
         g_nonpie_blob_code = go_symval(f, st.st_size, "v8_Default_embedded_blob_code_");
     // a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
     // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
@@ -371,7 +367,7 @@ static void load_elf(const char *path, struct loaded *out) {
             has_interp = 1;
             break;
         } // PT_INTERP
-    if (g_nonpie_lo && !getenv("NORELRO") && (!has_interp || getenv("DDRELRODYN")) &&
+    if (g_nonpie_lo && !has_interp &&
         !go_section_by_name(f, st.st_size, ".gopclntab", NULL, NULL, NULL)) {
         uint64_t shoff = rd64(f + 40);
         uint16_t shentsize = rd16(f + 58), shnum = rd16(f + 60), shstrndx = rd16(f + 62);
@@ -396,7 +392,7 @@ static void load_elf(const char *path, struct loaded *out) {
     out->phent = phentsize;
     out->phnum = phnum;
     extern int g_diag;
-    if (g_trace || g_diag || getenv("JT"))
+    if (g_trace || g_diag)
         fprintf(stderr, "[LOADED] %s base=%llx span=%llx end=%llx entry=%llx\n", path, (unsigned long long)base,
                 (unsigned long long)span, (unsigned long long)((uint64_t)base + span), (unsigned long long)out->entry);
     munmap(f, st.st_size);
@@ -441,13 +437,14 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // defaults then fill ONLY the keys the container didn't set (match on the "KEY=" prefix). Mirrors the
     // shared aarch64 build_stack (os/linux/elf.c) -- without this, x86 guests ignored the container env.
     const char *estr[256];
-    char *ge = getenv("DD_GUEST_ENV"), *gecopy = NULL;
+    const char *ge = hl_option_get("HL_GUEST_ENV");
+    char *gecopy = NULL;
     // execve() escape-encodes records (DD_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
     // record separator -- unescape "\\n"->'\n' and "\\\\"->'\\' after splitting. Mirrors os/linux/elf.c.
-    int env_escaped = (getenv("DD_GUEST_ENV_ESC") != NULL);
+    int env_escaped = (hl_option_get("HL_GUEST_ENV_ESC") != NULL);
     // Guest-initiated execve makes its envp authoritative (exec_forward_env sets DD_GUEST_ENV_EXACT): forward
     // it verbatim and inject NO fallback defaults, so NULL/curated envp matches Linux. Mirrors os/linux/elf.c.
-    int env_exact = (getenv("DD_GUEST_ENV_EXACT") != NULL);
+    int env_exact = (hl_option_get("HL_GUEST_ENV_EXACT") != NULL);
     if (ge) {
         gecopy = strdup(ge);
         char *save = NULL;
@@ -596,26 +593,11 @@ static int lazy_neighbor_mapped(uintptr_t pg) {
     return 0;
 }
 
-static int lazy_budget(void) {
-    static int b = -1;
-    if (b < 0) {
-        const char *e = getenv("LAZYBUDGET");
-        b = (e && *e) ? atoi(e) : 4096;
-    }
-    return b;
-}
+static int lazy_budget(void) { return 4096; }
 
-static int lazy_nofix(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("NOLAZYFIX") ? 1 : 0;
-    return v;
-}
+static int lazy_nofix(void) { return 0; }
 
-static void lazy_diag(void) {
-    if (getenv("LAZYDIAG"))
-        fprintf(stderr, "[lazy] grow=%d wild=%d (budget=%d nofix=%d)\n", (int)g_growmaps, (int)g_lazymaps,
-                lazy_budget(), lazy_nofix());
-}
+static void lazy_diag(void) {}
 
 // W6A item 1: emulate a faulting host load/store against the biased non-PIE image. A non-PIE guest's
 // absolute ref resolves to the original low link vaddr (in [g_nonpie_lo,g_nonpie_hi)); the real data
@@ -882,20 +864,6 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
             } // retry the faulting instruction
         }
     }
-    if (getenv("CRASHDBG")) { // diagnostic: dump the guest instruction that faulted (gated; off by default)
-        struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
-        fprintf(stderr, "[FAULT] sig=%d addr=%p guest_rip=%llx\n", sig, si ? si->si_addr : 0,
-                c ? (unsigned long long)c->rip : 0);
-        if (c && c->rip) {
-            fprintf(stderr, "  bytes@rip:");
-            uint8_t *p = (uint8_t *)c->rip;
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, " %02x", p[i]);
-            fprintf(stderr, "\n  rax=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx\n", (unsigned long long)c->r[0],
-                    (unsigned long long)c->r[6], (unsigned long long)c->r[7], (unsigned long long)c->r[4],
-                    (unsigned long long)c->r[5]);
-        }
-    }
     // a genuine in-translated-code guest fault with no handler and no legitimate lazy mapping ->
     // terminate the guest process faithfully (WIFSIGNALED/WTERMSIG=sig for its parent) instead of a raw host
     // raise() that degrades to exit(255) across dd's fork. Declines for an engine fault -> real crash below.
@@ -927,7 +895,6 @@ static void jit86_syncguard(int sig, siginfo_t *si, void *uc) {
 }
 
 __attribute__((constructor)) static void jit86_install_sync_fault_guards(void) {
-    if (getenv("CRASHDBG")) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = jit86_syncguard;

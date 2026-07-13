@@ -445,8 +445,69 @@ static int64_t svc_mount(struct cpu *c, uint64_t a_src, uint64_t a_tgt, uint64_t
     return -ENODEV;
 }
 
+static const char *fs_operation_name(uint64_t nr) {
+    switch (nr) {
+    case 5: return "setxattr";
+    case 6: return "lsetxattr";
+    case 7: return "fsetxattr";
+    case 8: return "getxattr";
+    case 9: return "lgetxattr";
+    case 10: return "fgetxattr";
+    case 11: return "listxattr";
+    case 12: return "llistxattr";
+    case 13: return "flistxattr";
+    case 14: return "removexattr";
+    case 15: return "lremovexattr";
+    case 16: return "fremovexattr";
+    case 17: return "getcwd";
+    case 29: return "ioctl";
+    case 33: return "mknodat";
+    case 34: return "mkdirat";
+    case 35: return "unlinkat";
+    case 36: return "symlinkat";
+    case 37: return "linkat";
+    case 38:
+    case 276: return "renameat";
+    case 39: return "umount2";
+    case 40: return "mount";
+    case 41: return "pivot_root";
+    case 43:
+    case 44: return "statfs";
+    case 46: return "ftruncate";
+    case 47: return "fallocate";
+    case 48:
+    case 439: return "faccessat";
+    case 49: return "chdir";
+    case 50: return "fchdir";
+    case 52: return "fchmod";
+    case 53:
+    case 452: return "fchmodat";
+    case 54: return "fchownat";
+    case 55: return "fchown";
+    case 56: return "openat";
+    case 57: return "close";
+    case 61: return "getdents64";
+    case 78: return "readlinkat";
+    case 79: return "newfstatat";
+    case 80: return "fstat";
+    case 81:
+    case 267: return "sync";
+    case 88: return "utimensat";
+    case 166: return "umask";
+    case 223: return "fadvise64";
+    case 264: return "name_to_handle_at";
+    case 291: return "statx";
+    case 437: return "openat2";
+    default: return NULL;
+    }
+}
+
 static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
+    const char *operation = fs_operation_name(nr);
+    if (operation != NULL)
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "%s nr=%llu a0=%#llx a1=%#llx a2=%#llx", operation,
+                (unsigned long long)nr, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     switch (nr) {
     // ===================== Filesystem — open/stat/dir/link/perm/xattr/cwd, all path-confined to the rootfs jail
     // =====================
@@ -3359,5 +3420,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     default: return 0;
     }
-    return svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
+    int handled = svc_done(c); // boundary errno xlate (host macOS -> Linux); see helpers.c svc_done
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "%s result=%lld", operation != NULL ? operation : "fs",
+            (long long)(int64_t)G_RET(c));
+    return handled;
 }

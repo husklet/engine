@@ -380,23 +380,7 @@ static struct rcent {
 // kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization. This gates
 // the rc_/ud_/udv_/dc_ path caches (and, via oc_enabled below, the oc_ open-resolution cache too).
 static int res_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        // Gated by EITHER the DD_NOPATHCACHE env var OR a host sentinel file /tmp/dd_nopathcache. The
-        // file gate is the reliable one: the engine is spawned with a curated config (via --configfd),
-        // NOT the full parent environ, so an ambient DD_NOPATHCACHE never reaches getenv() here (the
-        // "mac bridge drops env" seam) -- without the sentinel the kill switch was silently inert.
-        // access() runs in engine context against the HOST fs (not the guest jail), so
-        // `touch /tmp/dd_nopathcache` mac-side arms it. Cached once; inert (caches ON) when neither is
-        // present -> gate-neutral.
-        int saved = errno; // access() sets errno=ENOENT when the sentinel is absent -- MUST NOT leak
-        const char *e = getenv("DD_NOPATHCACHE");
-        int envset = (e && e[0] == '1');
-        int fileset = access("/tmp/dd_nopathcache", F_OK) == 0;
-        errno = saved;
-        on = (envset || fileset) ? 0 : 1;
-    }
-    return on;
+    return 1;
 }
 
 // Bump the epoch -> the whole cache misses. Skip 0 (the reserved "never matches" stamp).
@@ -691,21 +675,7 @@ static struct ocent {
 } g_oc[OCACHE_N];
 
 static int oc_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        // Same curated-env seam as res_enabled (the engine sees no ambient env under --configfd): honor
-        // W4_NOOPENCACHE via env OR the host sentinel /tmp/dd_noopencache, and fold in the master
-        // DD_NOPATHCACHE gate (res_enabled) so the master kill switch disables the open-resolution cache
-        // alongside the other path caches, matching its documented intent. Gate-neutral: when nothing is
-        // armed res_enabled()==1 and off==0 -> on=1 (cache ON), byte-identical to the prior default.
-        int saved = errno; // access() sets errno=ENOENT when the sentinel is absent -- MUST NOT leak
-        const char *e = getenv("W4_NOOPENCACHE");
-        int envset = (e && e[0] == '1');
-        int fileset = access("/tmp/dd_noopencache", F_OK) == 0;
-        errno = saved;
-        on = (envset || fileset || !res_enabled()) ? 0 : 1;
-    }
-    return on;
+    return 1;
 }
 
 static int oc_lookup(const char *g, char *out, size_t n) {
@@ -787,7 +757,7 @@ static _Atomic uint32_t *g_fsgen_ptr = &g_fsgen_local; // -> the daemon's file p
 static _Atomic uint32_t g_fsgen_seen = 0;              // last generation this process acted on
 
 __attribute__((constructor)) static void fsgen_ctor(void) {
-    const char *p = getenv("DD_FSGEN_FILE");
+    const char *p = hl_option_get("HL_FSGEN_FILE");
     if (!p || !p[0]) return;
     int fd = open(p, O_RDONLY | O_CLOEXEC); // engine only READS the counter; the daemon writes it
     if (fd < 0) return;

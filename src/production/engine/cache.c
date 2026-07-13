@@ -3,6 +3,7 @@
 
 // ---------------- JIT code cache ----------------
 #include "../../../include/hl/host_macos.h"
+#include "../../../include/hl/log.h"
 
 #define CACHE_SZ (64u << 20)
 // base, bump pointer
@@ -24,6 +25,7 @@ static uint64_t g_wx_toggles; // # of pthread_jit_write_protect_np() calls actua
 static hl_host_macos *g_jit_host;
 static hl_host_services g_jit_services;
 static hl_host_code_mapping g_code_mapping;
+static hl_log_context g_jit_log;
 #define J_RX(p) ((void *)((uint8_t *)(p) + g_rw2rx)) // RW alias addr -> RX alias addr
 #define J_RW(p) ((void *)((uint8_t *)(p) - g_rw2rx)) // RX alias addr -> RW alias addr
 
@@ -49,6 +51,7 @@ static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
          hl_host_services_validate(&g_jit_services,
                                    HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK))
         return -1;
+    if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
     return g_jit_services.memory
                        ->reserve_code(g_jit_services.context, CACHE_SZ, 16384, dual_alias ? HL_HOST_CODE_DUAL_ALIAS : 0,
                                       mapping)
@@ -58,10 +61,14 @@ static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
 }
 
 static int jit_cache_init(void) {
-    if (code_mapping_reserve(&g_code_mapping, getenv("NODUALMAP") == NULL) != 0) return -1;
+    // Dual aliases avoid global W^X flips. Hosts that cannot create them still have a correct MAP_JIT
+    // path; this is a capability fallback, not a user-facing mode switch.
+    if (code_mapping_reserve(&g_code_mapping, 1) != 0 && code_mapping_reserve(&g_code_mapping, 0) != 0) return -1;
     g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
     g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
     g_dualmap = g_rw2rx != 0;
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache reserve rw=%p rx=%p bytes=%u dual=%d", (void *)g_cache, J_RX(g_cache),
+            CACHE_SZ, g_dualmap);
     return 0;
 }
 
@@ -214,7 +221,6 @@ static void txln_clear(void) {
 }
 
 // NOSMCHASH=1: revert the content gate to the legacy always-drop behaviour (A/B for the SMC-livelock fix).
-static int g_smc_nohash = -1;
 
 // FNV-1a over the 64B guest line at `line_base` (64B-aligned). The line was just executed/flushed by the
 // guest, so it is in a mapped code page -> the 64-byte read never faults. Guest VA == host VA under the
@@ -237,13 +243,11 @@ static uint64_t line_hash64(uint64_t line_base) {
 // code no longer nukes the working set. Correct-by-construction: a genuine in-place rewrite changes the
 // 64B line -> case 1 -> the block still re-translates (g_smc_seen already latched by the caller).
 static int txln_flush_class(uint64_t addr) {
-    if (g_smc_nohash < 0) g_smc_nohash = (getenv("NOSMCHASH") != NULL);
     uint64_t l = addr >> 6;
     uint32_t h = (uint32_t)(l * 2654435761u) & (TXLN_N - 1);
     for (uint32_t i = 0; i < TXLN_PROBE_CAP; i++) { // bounded probe: see TXLN_PROBE_CAP
         uint32_t j = (h + i) & (TXLN_N - 1);
         if (g_txln[j] == l) {
-            if (g_smc_nohash) return 1; // A/B: always drop (legacy)
             uint64_t cur = line_hash64(l << 6);
             if (g_txlh[j] == 0) { // first flush: no pre-flush baseline -> drop
                 g_txlh[j] = cur;
@@ -404,7 +408,7 @@ static void md_dump_to(const char *pfx) {
 }
 
 static void md_dump(void) {
-    md_dump_to(getenv("MAPDUMP"));
+    md_dump_to(hl_option_get("HL_MAPDUMP"));
 }
 
 // ARM-B1: recognize a clang jump-table switch dispatch at a guest `br xN`. The compiler emits
@@ -480,15 +484,7 @@ static int g_tier2_build;          // set while recompiling a block as tier-2 (f
 static void *g_last_body;          // body pointer of the most recent translate_block (for the promoter)
 // Kill-switch + threshold env, read ONCE (idempotent static guard; the W4E diff read these in the target
 // main(), relocated here to keep the integration inside the allowed jit/ + frontend/aarch64/ units).
-static int g_t2_envdone;
-
-static void tier2_env_init(void) {
-    if (g_t2_envdone) return;
-    g_t2_envdone = 1;
-    g_notier2 = getenv("NOTIER2") != NULL;
-    const char *t = getenv("TIER2_THRESHOLD");
-    if (t && atoll(t) > 0) g_t2thresh = (uint64_t)atoll(t);
-}
+static void tier2_env_init(void) { g_notier2 = 0; }
 
 // Find (or allocate) the counter slot for a self-loop whose body starts at gpc. Re-translation of the
 // same loop reuses its slot so the count is not reset (and a re-translated promoted loop won't re-arm a
@@ -816,7 +812,7 @@ static void *md_watcher(void *arg) {
 }
 
 static void md_sig_install(void) {
-    const char *pfx = getenv("MAPDUMP");
+    const char *pfx = hl_option_get("HL_MAPDUMP");
     if (!pfx) return;
     static _Atomic int spawned;
     if (atomic_exchange_explicit(&spawned, 1, memory_order_seq_cst) != 0) return;
@@ -831,6 +827,7 @@ static void cache_unmap(hl_host_handle handle, uint8_t *rw, ptrdiff_t rw2rx) {
     g_freed[slot].rw2rx = rw2rx;
     g_freed[slot].gen = 0;
     (void)g_jit_services.memory->release(g_jit_services.context, handle);
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache release rw=%p rx=%p", (void *)rw, (void *)(rw + rw2rx));
 }
 
 // True if some live guest thread is still executing in generation `gen`. Caller holds g_stw_reg_lock;
@@ -895,6 +892,8 @@ static void jit_flush_to_fresh(void) {
     g_code_mapping = mapping;
     g_cache = g_cp = (uint8_t *)(uintptr_t)mapping.writable_address;
     g_rw2rx = (uint8_t *)(uintptr_t)mapping.executable_address - g_cache;
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache rotate generation=%llu rw=%p rx=%p",
+            (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache));
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
     memset(g_map, 0, sizeof g_map);
     memset(g_ibtc, 0, sizeof g_ibtc);
@@ -1016,10 +1015,13 @@ static void jit_after_fork(void) {
         cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
     g_nretired = 0;
     g_fork_preserved = preserve;
-    if (preserve) return;
-    g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
-    g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
-    memset(g_map, 0, sizeof g_map);
-    memset(g_ibtc, 0, sizeof g_ibtc);
-    g_npend = 0;
+    if (!preserve) {
+        g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
+        g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
+        memset(g_map, 0, sizeof g_map);
+        memset(g_ibtc, 0, sizeof g_ibtc);
+        g_npend = 0;
+    }
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_PROCESS, "fork cache preserve=%d rw=%p rx=%p", preserve, (void *)g_cache,
+            J_RX(g_cache));
 }

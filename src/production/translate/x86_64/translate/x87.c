@@ -35,15 +35,11 @@
 // instructions; any non-x87 instruction ends the run (materialize + drop to the runtime model), and
 // any x87 op we cannot statically track falls back to the baseline helpers. NOX87OPT forces the
 // runtime-top path everywhere -> byte-identical to the pre-opt engine.
-static int g_x87opt = -1;  // -1 uninit; 0 = NOX87OPT set (off); 1 = on
 static int g_fp_known = 0; // 1 if the absolute top is statically known right now
 static int g_fp_top = 0;   // the known top (0..7), valid iff g_fp_known
 static int g_fp_dirty = 0; // 1 if the shadow top has not been written to cpu->fptop
 
-static int x87opt_on(void) {
-    if (g_x87opt < 0) g_x87opt = (getenv("NOX87OPT") == NULL);
-    return g_x87opt;
-}
+static int x87opt_on(void) { return 1; }
 
 // &cpu->st[(g_fp_top+i)&7] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
 static void fp_slot_addr(int xdst, int i) {

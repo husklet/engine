@@ -34,6 +34,9 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
             clock->monotonic_ns == NULL || clock->realtime_ns == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
+    if ((services->capabilities & HL_HOST_CAP_LOG) != 0 &&
+        (!hl_valid_group(services->log, HL_HOST_LOG_ABI, sizeof(*services->log)) || services->log->emit == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
         (!hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)) ||
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||

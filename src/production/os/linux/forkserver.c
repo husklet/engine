@@ -11,7 +11,7 @@
 // HISTORY: this began as the x86-only translate/x86_64/forkserver.c (the W3D research diff).
 // ported it to aarch64 by hoisting it here, parameterized by the SAME per-target seam the x86 W3D
 // refactor already carved: container_init() / engine_global_init() / load_program() / run_loaded() /
-// dd_run(), all defined by the including target TU before this file. ONE implementation, two engines.
+// hl_run_linux_guest(), all defined by the including target TU before this file. One implementation, two engines.
 //
 // PROTOCOL v2 (AF_UNIX SOCK_STREAM; v2 extends the W3D research protocol with env/cwd + signal
 // propagation so a forkserver launch is INDISTINGUISHABLE from a cold spawn):
@@ -48,9 +48,9 @@
 // fork-child latch (g_pcache_forked) before running -- its COW arena is the parent's prewarm mix, and
 // persisting it under the request binary's identity would poison the cache. A guest execve inside the
 // runner re-keys + lifts the bar via pcache_exec_reload (aarch64), exactly like any other fork child.
-// The resident PARENT never calls pcache_save (prewarm uses run_loaded directly, not dd_run).
+// The resident parent never calls pcache_save; prewarm uses the loaded-program path directly.
 //
-// CONFIG MODEL: engine-level env (JT/PROF/DDJIT_*/NODUALMAP...) and the container rootfs are SERVER
+// Config model: engine-level HL options and the container rootfs are server
 // launch config, read once at --server startup. Guest-visible env + the per-request container env the
 // cold path re-parses (DDVOL/DD_NETNS/DD_CWD/DD_PUBLISH...) come from the CLIENT per request.
 
@@ -311,7 +311,7 @@ static void ddjitd_runner(int conn, int *fds, int nfd, int argc, char **argv, ch
         // worker inherited the SERVER's table on fork, but each launch is its own container (state.c).
         if (g_srv_rootfs[0]) acct_container_reset();
         FSRV_WARM_CHDIR_ROOTFS();
-        const char *icwd = getenv("DD_CWD"); // docker -w from the CLIENT's env
+        const char *icwd = hl_option_get("HL_CWD"); // docker -w from the CLIENT's env
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
         _exit(run_loaded(argc, argv, &g_wmain, g_wjump, g_wat_base));
     }
@@ -322,9 +322,9 @@ static void ddjitd_runner(int conn, int *fds, int nfd, int argc, char **argv, ch
     // A PREWARMED arena bars the persistent cache in a cold runner: pcache_load() restores over the
     // arena from offset 0 WITHOUT clearing the prewarm block map (stale entries would point into the
     // clobbered bytes), and the pcache fixed-VA image base (PC_IMG_BASE) is already occupied by the
-    // prewarm image. DDJIT_NOPCACHE is the engine's own kill-switch and always wins inside dd_run.
-    if (g_warm_ready) setenv("DDJIT_NOPCACHE", "1", 1);
-    _exit(dd_run(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv));
+    // prewarm image. HL_NOPCACHE always wins inside the guest entry.
+    if (g_warm_ready) hl_option_set("HL_NOPCACHE", "1", 1);
+    _exit(hl_run_linux_guest(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv));
 }
 
 // ---- server ----

@@ -292,6 +292,21 @@ static hl_host_result hl_linux_realtime(void *context) {
     return hl_linux_clock(CLOCK_REALTIME);
 }
 
+static void hl_linux_log(void *context, uint32_t event, const char *message, size_t message_size) {
+    size_t written = 0;
+    (void)context;
+    (void)event;
+    while (written < message_size) {
+        ssize_t result = write(STDERR_FILENO, message + written, message_size - written);
+        if (result > 0) {
+            written += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        break;
+    }
+}
+
 static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_linux_handle_kind first,
                                hl_linux_handle_kind second) {
     uint32_t low = (uint32_t)handle;
@@ -687,6 +702,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         hl_linux_memory_release, hl_linux_memory_publish, hl_linux_memory_reserve_code, hl_linux_memory_repair_code};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_linux_monotonic,
                                                  hl_linux_realtime};
+    static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,         sizeof(file),
                                                hl_linux_file_open,       hl_linux_file_read,
                                                hl_linux_file_write,      hl_linux_file_metadata_get,
@@ -717,11 +733,13 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
-    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE | HL_HOST_CAP_EVENT |
-                                 HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING;
+    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
+                                 HL_HOST_CAP_EVENT | HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY |
+                                 HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
+    out_services->log = &log;
     out_services->file = &file;
     out_services->event = &event;
     out_services->network = &network;

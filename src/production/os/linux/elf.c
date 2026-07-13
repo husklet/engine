@@ -572,7 +572,7 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     // DIAGNOSTIC (gated, async-signal-safe, NO user-pointer deref): every no-handler fault about to be
     // turned into a fatal guest termination or re-raised. Prints sig / host PC / fault addr / host SP +
     // whether the host PC is inside the RX code cache (1 = a wild jump in translated guest code).
-    if (getenv("DDDBG_ENGFAULT")) {
+    if (hl_option_get("HL_DEBUG_ENGFAULT")) {
         extern int jit_pc_in_cache(uint64_t pc, uint64_t *base);
         ucontext_t *u = (ucontext_t *)uc;
         uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
@@ -628,7 +628,7 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     raise(sig);
 }
 
-// Synchronous CPU faults other than SIGSEGV/SIGBUS (which dd_run wires to nonpie_guard above): a guest
+// Synchronous CPU faults other than SIGSEGV/SIGBUS (which the Linux guest entry wires above): a guest
 // may install a handler for SIGILL/SIGFPE/SIGTRAP and DELIBERATELY trigger it -- the canonical case is a
 // CPU-feature probe (ring/OpenSSL/musl) that executes an optional instruction guarded by a SIGILL handler
 // and falls back when it traps. The aarch64 frontend emits such instructions verbatim, so on a host CPU
@@ -639,7 +639,7 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
 // the high faulting PC, never in the low link range), so reuse it. CRASHDBG handles these via its mach
 // exception port + diag_crash instead, so leave its diagnostics untouched.
 __attribute__((constructor)) static void install_sync_fault_guards(void) {
-    if (getenv("CRASHDBG")) return;
+    if (hl_option_get("HL_CRASHDBG")) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = nonpie_guard;
@@ -666,7 +666,7 @@ __attribute__((constructor)) static void install_sync_fault_guards(void) {
 // DDFAILMPROT = "N" fails attempt N once (transient; the retry must recover); "N-" fails every attempt
 // from N onward (permanent; the loader must abort cleanly / stay best-effort, never leave a hole).
 static int elf_inject_fail(const char *var, int attempt) {
-    const char *s = getenv(var);
+    const char *s = hl_option_get(var);
     if (!s || !*s) return 0;
     return strchr(s, '-') ? attempt >= atoi(s) : attempt == atoi(s);
 }
@@ -712,7 +712,7 @@ static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char
             r = mprotect(addr, len, prot);
         }
         if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) {
-            if (r != 0 && getenv("JT"))
+            if (r != 0 && hl_option_get("HL_JT"))
                 fprintf(stderr, "dd: load_elf: mprotect %s (%zu bytes) skipped: %s (region stays R+W, backed)\n", what,
                         len, strerror(errno));
             return;
@@ -878,7 +878,7 @@ static void load_elf(const char *path, struct loaded *out) {
     int nonpie = (etype == 2);
     out->entry = nonpie ? e_entry : (e_entry + bias);
     out->base = (uint64_t)base;
-    if (getenv("JT"))
+    if (hl_option_get("HL_JT"))
         fprintf(stderr, "[LOADED] %s base=%llx entry=%llx\n", path, (unsigned long long)base,
                 (unsigned long long)out->entry);
     // phdrs live at file offset phoff in seg 0. Non-PIE: report the LOW link vaddr (base+phoff-bias) so the
@@ -932,20 +932,21 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     set_guest_cmdline(argc, argv); // capture the full argv for /proc/self/cmdline (bare-mode fallback)
     int envc = 0;
     // Resolve the env string list WITHOUT placing it yet (the placement order below is what matters). The
-    // container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon) -- forward EXACTLY these to
+    // container's env arrives as HL_GUEST_ENV="K=V\nK=V\n…" (set by the launcher) -- forward EXACTLY these to
     // the guest FIRST so they override the defaults, NOT the daemon/host environment. Then the built-in
     // defaults fill ONLY the keys the container didn't set.
     const char *estr[256];
-    char *ge = getenv("DD_GUEST_ENV"), *gecopy = NULL;
-    // execve() escape-encodes records (DD_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
+    const char *ge = hl_option_get("HL_GUEST_ENV");
+    char *gecopy = NULL;
+    // execve() escape-encodes records (HL_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
     // record separator -- unescape "\\n"->'\n' and "\\\\"->'\\' after splitting. The daemon-launch path sets
-    // DD_GUEST_ENV plain (no marker) and is left byte-for-byte unchanged.
-    int env_escaped = (getenv("DD_GUEST_ENV_ESC") != NULL);
+    // HL_GUEST_ENV plain (no marker) and is left byte-for-byte unchanged.
+    int env_escaped = (hl_option_get("HL_GUEST_ENV_ESC") != NULL);
     // A guest-initiated execve makes its envp AUTHORITATIVE (proc.c exec_forward_env sets this): forward
     // EXACTLY what the guest passed and inject NONE of the engine's fallback defaults below, so an empty
     // envp yields an empty environment and a curated envp is passed verbatim -- byte-exact with Linux. The
-    // INITIAL container launch never sets this (the daemon's DD_GUEST_ENV path), so defaults still fill gaps.
-    int env_exact = (getenv("DD_GUEST_ENV_EXACT") != NULL);
+    // INITIAL container launch never sets this (the launcher's HL_GUEST_ENV path), so defaults still fill gaps.
+    int env_exact = (hl_option_get("HL_GUEST_ENV_EXACT") != NULL);
     if (ge) {
         gecopy = strdup(ge);
         char *save = NULL;

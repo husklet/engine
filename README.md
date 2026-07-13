@@ -16,6 +16,11 @@ make format-check
 Make orchestrates the C compiler and archiver. Project tooling and tests are C; there are no Python or shell-script
 build/test helpers. CMake metadata is also provided for installation and Rust `build.rs` consumers.
 
+Tagged logging is absent from release call sites. Build with `make DEBUG=1` to compile it in, then select tags with
+`HL_LOG=log:fs,log:jit` or the launch wire's `debug_log_offset`. Available tags are `fs`, `jit`, `syscall`, `process`,
+`network`, `signal`, `gpu`, and `translate`; `log:all` enables every tag. Filtering is common portable-core behavior,
+while each host backend only supplies the final byte sink.
+
 ## Domains
 
 - `include/hl` — stable C/C++-compatible lifecycle, launch-wire and host-service ABI, using the husklet `hl_` namespace.
@@ -40,7 +45,7 @@ enforced at link time rather than represented only by directories.
 
 The new libraries build and prove ABI validation, IR construction/validation, Linux fd/OFD lifetime, fake-host
 failure injection and the public lifecycle. The transferred Linux production engines execute AArch64 and x86-64
-guests through both the new `hl_launch_config` wire and its legacy input adapter. The layered engine execution entry
+guests through the typed `hl_launch_config` wire. The layered engine execution entry
 still returns `HL_STATUS_NOT_SUPPORTED`; migrate one proven domain at a time from `src/production`, keeping that
 end-to-end lane as the oracle. Darwin/macOS is a host backend only; there is no Darwin guest personality.
 

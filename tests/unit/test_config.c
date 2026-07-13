@@ -45,8 +45,8 @@ int main(void) {
     HL_CHECK(value_size == 6 && memcmp(value, "--flag", 6) == 0);
     HL_CHECK(hl_launch_config_argument(&config, pool, 2, NULL, NULL) == HL_STATUS_NOT_FOUND);
 
-    wire.config.magic = HL_CONFIG_LEGACY_MAGIC;
-    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_OK);
+    wire.config.magic = UINT32_C(0x44434647);
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
     wire.config.magic = HL_CONFIG_MAGIC;
 
     wire.config.pool_size++;

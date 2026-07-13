@@ -5,12 +5,7 @@
 // that scalar loop for all lengths (incl. 0), alignments, and the forward-overlap smear.
 // Kill-switch: NOREP=1 (or any non-"0" value) -> fall back to the original element loop.
 static int norep_disabled(void) {
-    static int v = -1; // env read once, then cached
-    if (v < 0) {
-        const char *s = getenv("NOREP");
-        v = (s && *s && *s != '0') ? 1 : 0;
-    }
-    return v;
+    return 0;
 }
 
 // Host helper for `rep movs`: copy `nbytes` forward, x86 element-by-element semantics.
