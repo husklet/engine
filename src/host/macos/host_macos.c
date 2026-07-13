@@ -157,7 +157,8 @@ static hl_host_result hl_macos_release(void *context, hl_host_handle handle) {
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     result = munmap(mapping->writable, (size_t)mapping->size);
-    if (result == 0 && mapping->executable != NULL) result = munmap(mapping->executable, (size_t)mapping->size);
+    if (mapping->executable != NULL && mapping->executable != mapping->writable)
+        (void)munmap(mapping->executable, (size_t)mapping->size);
     if (result == 0) {
         mapping->active = 0;
         mapping->writable = NULL;
@@ -183,7 +184,7 @@ static hl_host_result hl_macos_publish(void *context, hl_host_handle handle, uin
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_host_result hl_macos_reserve_code(void *context, uint64_t size, uint64_t alignment,
+static hl_host_result hl_macos_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                             hl_host_code_mapping *output) {
     hl_host_macos *host = context;
     void *writable;
@@ -193,11 +194,18 @@ static hl_host_result hl_macos_reserve_code(void *context, uint64_t size, uint64
     if (output == NULL || size == 0 || size > SIZE_MAX || page <= 0 || alignment > (uint64_t)page)
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     memset(output, 0, sizeof(*output));
-    if (hl_macos_dual_map(size, VM_INHERIT_NONE, &writable, &executable) != 0)
-        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if ((flags & HL_HOST_CODE_DUAL_ALIAS) != 0) {
+        if (hl_macos_dual_map(size, VM_INHERIT_NONE, &writable, &executable) != 0)
+            return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    } else {
+        writable =
+            mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+        if (writable == MAP_FAILED) return hl_macos_errno();
+        executable = writable;
+    }
     handle = hl_macos_register(host, writable, executable, size);
     if (handle.status != HL_STATUS_OK) {
-        munmap(executable, (size_t)size);
+        if (executable != writable) munmap(executable, (size_t)size);
         munmap(writable, (size_t)size);
         return handle;
     }
@@ -221,15 +229,20 @@ static hl_host_result hl_macos_repair_code(void *context, hl_host_code_mapping *
     pthread_mutex_init(&host->lock, NULL);
     mapping = hl_macos_lookup(host, public_mapping->handle);
     if (mapping == NULL || mapping->executable == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (mapping->executable == mapping->writable) return hl_macos_result(HL_STATUS_OK, public_mapping->handle, 0);
     if (preserve != 0) {
         mach_vm_address_t target = (mach_vm_address_t)mapping->executable;
         vm_prot_t current = 0;
         vm_prot_t maximum = 0;
+        int remapped = 0;
         result = mach_vm_remap(mach_task_self(), &target, mapping->size, 0, VM_FLAGS_FIXED, mach_task_self(),
                                (mach_vm_address_t)mapping->writable, FALSE, &current, &maximum, VM_INHERIT_NONE);
-        if (result == KERN_SUCCESS)
+        if (result == KERN_SUCCESS) {
+            remapped = 1;
             result = mach_vm_protect(mach_task_self(), target, mapping->size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        }
         if (result == KERN_SUCCESS) return hl_macos_result(HL_STATUS_OK, public_mapping->handle, 0);
+        if (remapped) mach_vm_deallocate(mach_task_self(), target, mapping->size);
     }
     if (hl_macos_dual_map(mapping->size, VM_INHERIT_NONE, &writable, &executable) != 0)
         return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, (uint64_t)result);
@@ -290,7 +303,8 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) continue;
         munmap(mapping->writable, (size_t)mapping->size);
-        if (mapping->executable != NULL) munmap(mapping->executable, (size_t)mapping->size);
+        if (mapping->executable != NULL && mapping->executable != mapping->writable)
+            munmap(mapping->executable, (size_t)mapping->size);
     }
     pthread_mutex_destroy(&host->lock);
     free(host);

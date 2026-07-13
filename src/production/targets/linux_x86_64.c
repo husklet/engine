@@ -85,7 +85,7 @@
 #include "../engine/dispatch.c"              // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
                                              // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../translate/x86_64/elf.c"         // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
-#include "../os/launch_config.c"            // `--configfd` launch bridge -> re-hydrate DD_*/DDJIT_* env -> dd_run()
+#include "../os/launch_config.c"             // `--configfd` launch bridge -> re-hydrate DD_*/DDJIT_* env -> dd_run()
 
 // ---- entry + main ----
 // ---------------- entry ----------------
@@ -129,7 +129,7 @@ static void container_init(const char *rootfs) {
         const char *p = getenv("DD_PIDS_MAX");
         if (p && p[0] && !g_pids_max) g_pids_max = dd_parse_id("DD_PIDS_MAX", p);
     }
-    if (rootfs && rootfs[0]) {     // the shared container jails against the canonical rootfs + its dir fd
+    if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
         if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
         g_rootfs_canon_len = strlen(g_rootfs_canon);
@@ -208,31 +208,12 @@ static int engine_global_init(void) {
         perror("pthread_key_create");
         return 1;
     }
-    // Code cache. Default: dual-mapped RW/RX so the engine never toggles W^X (identical mechanism the
-    // aarch64 target ships -- see targets/linux_aarch64.c). Allocate a plain anon RW region (the writer
-    // alias = g_cache) and vm_remap the SAME physical pages to a second address marked RX (the executor
-    // alias). Writes through g_cache become visible to execution at g_cache+g_rw2rx after an icache flush,
-    // with NO per-region pthread_jit_write_protect_np() flip (no per-translation / per-IC-fill toggle).
-    // NODUALMAP=1 reverts to a single MAP_JIT mapping that toggles W^X per translation/IC-fill.
-    if (!getenv("NODUALMAP")) {
-        uint8_t *rw;
-        ptrdiff_t d;
-        if (dualmap_alloc(&rw, &d) == 0) {
-            g_cache = rw;
-            g_rw2rx = d;
-            g_dualmap = 1;
-        } else {
-            fprintf(stderr, "[jit] dual-map unavailable -> W^X-toggle fallback\n");
-        }
+    // macOS host services own code mappings and post-fork alias repair. NODUALMAP keeps the single-MAP_JIT
+    // compatibility mode; the default remains a stable dual RW/RX mapping.
+    if (jit_cache_init() != 0) {
+        fprintf(stderr, "hl-engine: unable to allocate JIT code mapping\n");
+        return 1;
     }
-    if (!g_dualmap) {
-        g_cache = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-        if (g_cache == MAP_FAILED) {
-            perror("mmap jit");
-            return 1;
-        }
-    }
-    g_cp = g_cache;
     g_trace = getenv("JT") != NULL;
     g_systrace = getenv("JTS") != NULL;
     g_prof = getenv("PROF") != NULL;

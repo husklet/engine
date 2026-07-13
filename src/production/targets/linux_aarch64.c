@@ -26,7 +26,7 @@
 #include <dirent.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h> // mach_vm_remap/protect for the dual-mapped RW/RX code cache
+#include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
 #define DD_HAS_MACH_EXC 1 // service.c gates its CRASHDBG fork-child Mach re-arm on this
 #include <dlfcn.h>
 #include <sys/event.h>
@@ -177,9 +177,12 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     diag_hx(b + bp, hx10);
     bp += 16;
     if (u) {
-        for (int r = 2; r <= 8; r++) bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
-        for (int r = 11; r <= 15; r++) bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
-        for (int r = 18; r <= 27; r++) bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+        for (int r = 2; r <= 8; r++)
+            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+        for (int r = 11; r <= 15; r++)
+            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+        for (int r = 18; r <= 27; r++)
+            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
     }
     extern int jit_pc_in_retained_cache(uint64_t pc);
     memcpy(b + bp, " jit=0x", 7);
@@ -368,8 +371,8 @@ static void *exc_thread(void *arg) {
         vm_region_basic_info_data_64_t rinfo;
         mach_msg_type_number_t ricnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t robj = MACH_PORT_NULL;
-        kern_return_t rkr =
-            mach_vm_region(mach_task_self(), &raddr, &rsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&rinfo, &ricnt, &robj);
+        kern_return_t rkr = mach_vm_region(mach_task_self(), &raddr, &rsz, VM_REGION_BASIC_INFO_64,
+                                           (vm_region_info_t)&rinfo, &ricnt, &robj);
         // Append the GUEST pc (x28 is the reserved CPUREG -> struct cpu*), so a guest `brk`/fault maps to a
         // guest instruction, not just the host JIT pc. Guarded: x28 may not be a cpu ptr outside the cache.
         int bp = 130 + sl;
@@ -428,9 +431,12 @@ static void *exc_thread(void *arg) {
         bp += 7;
         diag_hx(b + bp, st.__x[10]);
         bp += 16;
-        for (int r = 2; r <= 8; r++) bp = diag_reg(b, bp, r, st.__x[r]);
-        for (int r = 11; r <= 15; r++) bp = diag_reg(b, bp, r, st.__x[r]);
-        for (int r = 18; r <= 27; r++) bp = diag_reg(b, bp, r, st.__x[r]);
+        for (int r = 2; r <= 8; r++)
+            bp = diag_reg(b, bp, r, st.__x[r]);
+        for (int r = 11; r <= 15; r++)
+            bp = diag_reg(b, bp, r, st.__x[r]);
+        for (int r = 18; r <= 27; r++)
+            bp = diag_reg(b, bp, r, st.__x[r]);
         extern int jit_pc_in_retained_cache(uint64_t pc);
         memcpy(b + bp, " jit=0x", 7);
         bp += 7;
@@ -708,30 +714,12 @@ static int engine_global_init(void) {
         return 1;
     }
 
-    // Code cache. Default: dual-mapped RW/RX so the engine never toggles W^X. Allocate a
-    // plain anon RW region (the writer alias = g_cache) and vm_remap the SAME physical pages
-    // to a second address that we mark RX (the executor alias). Writes through g_cache become
-    // visible to execution at g_cache+g_rw2rx after an icache flush, with NO per-region
-    // pthread_jit_write_protect_np() flip. NODUALMAP=1 reverts to a single MAP_JIT mapping.
-    if (!getenv("NODUALMAP")) {
-        uint8_t *rw;
-        ptrdiff_t d;
-        if (dualmap_alloc(&rw, &d) == 0) {
-            g_cache = rw;
-            g_rw2rx = d;
-            g_dualmap = 1;
-        } else {
-            fprintf(stderr, "[jit] dual-map unavailable -> W^X-toggle fallback\n");
-        }
+    // Code cache ownership belongs to the macOS host-service backend. NODUALMAP retains the single-MAP_JIT
+    // compatibility mode; the default is a stable RW/RX alias pair repaired by the backend after fork.
+    if (jit_cache_init() != 0) {
+        fprintf(stderr, "hl-engine: unable to allocate JIT code mapping\n");
+        return 1;
     }
-    if (!g_dualmap) {
-        g_cache = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-        if (g_cache == MAP_FAILED) {
-            perror("mmap jit");
-            return 1;
-        }
-    }
-    g_cp = g_cache;
 
     g_trace = getenv("JT") != NULL;
     g_systrace = getenv("JTS") != NULL;

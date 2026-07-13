@@ -168,7 +168,7 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     result = munmap(entry->address, (size_t)entry->size);
-    if (result == 0 && entry->executable_address != NULL)
+    if (result == 0 && entry->executable_address != NULL && entry->executable_address != entry->address)
         result = munmap(entry->executable_address, (size_t)entry->size);
     if (result == 0 && entry->descriptor >= 0) result = close(entry->descriptor);
     if (result == 0) {
@@ -197,7 +197,7 @@ static hl_host_result hl_linux_memory_publish(void *context, hl_host_handle mapp
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size, uint64_t alignment,
+static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                                    hl_host_code_mapping *output) {
     hl_host_linux *host = context;
     long page = sysconf(_SC_PAGESIZE);
@@ -208,6 +208,22 @@ static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size,
     if (output == NULL || size == 0 || size > SIZE_MAX || size > INT64_MAX || page <= 0 || alignment > (uint64_t)page)
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     memset(output, 0, sizeof(*output));
+    if ((flags & HL_HOST_CODE_DUAL_ALIAS) == 0) {
+        writable = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (writable == MAP_FAILED) return hl_linux_errno_result();
+        handle = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, writable, writable, size, -1);
+        if (handle.status != HL_STATUS_OK) {
+            munmap(writable, (size_t)size);
+            return handle;
+        }
+        output->abi = 1;
+        output->size = sizeof(*output);
+        output->handle = handle.value;
+        output->writable_address = (uint64_t)(uintptr_t)writable;
+        output->executable_address = (uint64_t)(uintptr_t)writable;
+        output->mapped_size = size;
+        return handle;
+    }
     descriptor = memfd_create("hl-code", MFD_CLOEXEC);
     if (descriptor < 0) return hl_linux_errno_result();
     if (ftruncate(descriptor, (off_t)size) != 0) {
@@ -721,7 +737,8 @@ void hl_host_linux_destroy(hl_host_linux *host) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
             munmap(entry->address, (size_t)entry->size);
-            if (entry->executable_address != NULL) munmap(entry->executable_address, (size_t)entry->size);
+            if (entry->executable_address != NULL && entry->executable_address != entry->address)
+                munmap(entry->executable_address, (size_t)entry->size);
             if (entry->descriptor >= 0) close(entry->descriptor);
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);

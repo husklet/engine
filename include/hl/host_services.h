@@ -62,6 +62,8 @@ typedef struct hl_host_network_address {
 
 enum { HL_HOST_MEMORY_READ = 1u << 0, HL_HOST_MEMORY_WRITE = 1u << 1, HL_HOST_MEMORY_EXECUTE = 1u << 2 };
 
+enum { HL_HOST_CODE_DUAL_ALIAS = 1u << 0 };
+
 enum { HL_HOST_EVENT_ADD = 1, HL_HOST_EVENT_MODIFY = 2, HL_HOST_EVENT_DELETE = 3 };
 
 enum {
@@ -105,7 +107,8 @@ typedef struct hl_host_memory_services {
     hl_host_result (*protect)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size, uint32_t flags);
     hl_host_result (*release)(void *context, hl_host_handle mapping);
     hl_host_result (*publish_code)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
-    hl_host_result (*reserve_code)(void *context, uint64_t size, uint64_t alignment, hl_host_code_mapping *output);
+    hl_host_result (*reserve_code)(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
+                                   hl_host_code_mapping *output);
     hl_host_result (*repair_code_after_fork)(void *context, hl_host_code_mapping *mapping, uint32_t preserve);
 } hl_host_memory_services;
 

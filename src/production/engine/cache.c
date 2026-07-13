@@ -2,6 +2,8 @@
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
+#include "../../../include/hl/host_macos.h"
+
 #define CACHE_SZ (64u << 20)
 // base, bump pointer
 static uint8_t *g_cache, *g_cp;
@@ -16,9 +18,12 @@ static uint8_t *g_emit_start;
 // only the few ABSOLUTE handoffs (run_block target, IBTC/IC body literals, icache flush)
 // convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
 // region's W^X per translation/IC-fill (NODUALMAP=1).
-static ptrdiff_t g_rw2rx;                            // RX_addr - RW_addr (0 in fallback)
-static int g_dualmap;                                // 1 when the RW/RX dual mapping is active
-static uint64_t g_wx_toggles;                        // # of pthread_jit_write_protect_np() calls actually made (PROF)
+static ptrdiff_t g_rw2rx;     // RX_addr - RW_addr (0 in fallback)
+static int g_dualmap;         // 1 when the RW/RX dual mapping is active
+static uint64_t g_wx_toggles; // # of pthread_jit_write_protect_np() calls actually made (PROF)
+static hl_host_macos *g_jit_host;
+static hl_host_services g_jit_services;
+static hl_host_code_mapping g_code_mapping;
 #define J_RX(p) ((void *)((uint8_t *)(p) + g_rw2rx)) // RW alias addr -> RX alias addr
 #define J_RW(p) ((void *)((uint8_t *)(p) - g_rw2rx)) // RX alias addr -> RW alias addr
 
@@ -37,31 +42,26 @@ static inline void jit_wprot(int enable_exec) {
     pthread_jit_write_protect_np(enable_exec);
 }
 
-// Allocate one dual-mapped code cache: a plain anon RW region + an RX alias of the SAME physical
-// pages at a second VA (vm_remap). Returns 0 and fills *rw / *delta(=RX-RW) on success.
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-
-static int dualmap_alloc(uint8_t **rw_out, ptrdiff_t *delta_out) {
-    uint8_t *rw = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (rw == MAP_FAILED) return -1;
-    mach_vm_address_t rx = 0;
-    vm_prot_t cur = 0, max = 0;
-    // the RX alias is created VM_INHERIT_NONE, so a fork child gets a HOLE at the RX VA instead of
-    // an independently-COW'd (silently diverged) second copy. jit_after_fork() then re-remaps a fresh RX
-    // alias of the child's OWN (COW-inherited) RW pages at that same VA -- ~1us -- which re-couples the
-    // two views, so the child keeps every inherited translation AND its later writes propagate to RX
-    // (empirically verified, incl. 4 nested fork generations). Every fork path runs jit_after_fork()
-    // before any guest code executes, so nothing ever fetches from the hole.
-    kern_return_t kr = mach_vm_remap(mach_task_self(), &rx, CACHE_SZ, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
-                                     (mach_vm_address_t)rw, FALSE, &cur, &max, VM_INHERIT_NONE);
-    if (kr == KERN_SUCCESS) kr = mach_vm_protect(mach_task_self(), rx, CACHE_SZ, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        munmap(rw, CACHE_SZ);
+static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
+    memset(mapping, 0, sizeof(*mapping));
+    if (g_jit_host == NULL &&
+        (hl_host_macos_create(&g_jit_host, &g_jit_services) != HL_STATUS_OK ||
+         hl_host_services_validate(&g_jit_services,
+                                   HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK))
         return -1;
-    }
-    *rw_out = rw;
-    *delta_out = (uint8_t *)rx - rw;
+    return g_jit_services.memory
+                       ->reserve_code(g_jit_services.context, CACHE_SZ, 16384, dual_alias ? HL_HOST_CODE_DUAL_ALIAS : 0,
+                                      mapping)
+                       .status == HL_STATUS_OK
+               ? 0
+               : -1;
+}
+
+static int jit_cache_init(void) {
+    if (code_mapping_reserve(&g_code_mapping, getenv("NODUALMAP") == NULL) != 0) return -1;
+    g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
+    g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
+    g_dualmap = g_rw2rx != 0;
     return 0;
 }
 
@@ -69,9 +69,8 @@ static int dualmap_alloc(uint8_t **rw_out, ptrdiff_t *delta_out) {
 static uint64_t g_xlate_ns;
 
 static inline uint64_t now_ns(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+    hl_host_result result = g_jit_services.clock->monotonic_ns(g_jit_services.context);
+    return result.status == HL_STATUS_OK ? result.value : 0;
 }
 
 // Threads: each guest thread runs run_guest on its OWN struct cpu, stored in a
@@ -244,14 +243,14 @@ static int txln_flush_class(uint64_t addr) {
     for (uint32_t i = 0; i < TXLN_PROBE_CAP; i++) { // bounded probe: see TXLN_PROBE_CAP
         uint32_t j = (h + i) & (TXLN_N - 1);
         if (g_txln[j] == l) {
-            if (g_smc_nohash) return 1;                        // A/B: always drop (legacy)
+            if (g_smc_nohash) return 1; // A/B: always drop (legacy)
             uint64_t cur = line_hash64(l << 6);
-            if (g_txlh[j] == 0) {                              // first flush: no pre-flush baseline -> drop
+            if (g_txlh[j] == 0) { // first flush: no pre-flush baseline -> drop
                 g_txlh[j] = cur;
                 return 1;
             }
-            if (g_txlh[j] == cur) return 2;                    // unchanged -> benign, skip the drop
-            g_txlh[j] = cur;                                   // changed -> genuine rewrite, drop + re-record
+            if (g_txlh[j] == cur) return 2; // unchanged -> benign, skip the drop
+            g_txlh[j] = cur;                // changed -> genuine rewrite, drop + re-record
             return 1;
         }
         if (g_txln[j] == 0) return 0; // empty slot before the line -> not translated
@@ -611,6 +610,7 @@ static __thread _Atomic uint64_t *g_my_exec_gen; // this thread's exec_gen slot 
 #define STW_RETIRED_MAX (STW_MAXTHREAD + 8)
 
 static struct {
+    hl_host_handle handle;
     uint8_t *rw;     // RW base of the retired mapping
     ptrdiff_t rw2rx; // RX-RW delta (0 for the single-mapping MAP_JIT fallback)
     uint64_t gen;    // generation this cache served
@@ -622,11 +622,13 @@ static int g_no_stw_reclaim;
 // Crash diagnostics: keep a bounded tombstone ring of retired caches we have unmapped. If a later crash PC
 // falls in one of these ranges, the process resumed through a stale cache pointer after reclamation.
 #define STW_FREED_MAX 4096
+
 static struct {
     uint8_t *rw;
     ptrdiff_t rw2rx;
     uint64_t gen;
 } g_freed[STW_FREED_MAX];
+
 static uint64_t g_nfreed_total;
 
 static void cache_oom_abort(void);
@@ -823,13 +825,12 @@ static void md_sig_install(void) {
 }
 
 // Unmap a retired cache's mapping(s): the RW base, plus the RX alias when dual-mapped (delta != 0).
-static void cache_unmap(uint8_t *rw, ptrdiff_t rw2rx) {
+static void cache_unmap(hl_host_handle handle, uint8_t *rw, ptrdiff_t rw2rx) {
     uint64_t slot = g_nfreed_total++ % STW_FREED_MAX;
     g_freed[slot].rw = rw;
     g_freed[slot].rw2rx = rw2rx;
     g_freed[slot].gen = 0;
-    munmap(rw, CACHE_SZ);
-    if (rw2rx) munmap(rw + rw2rx, CACHE_SZ);
+    (void)g_jit_services.memory->release(g_jit_services.context, handle);
 }
 
 // True if some live guest thread is still executing in generation `gen`. Caller holds g_stw_reg_lock;
@@ -850,7 +851,7 @@ static void reclaim_retired(void) {
     for (int i = 0; i < g_nretired;) {
         if (!gen_in_use(g_retired[i].gen)) {
             uint64_t gen = g_retired[i].gen;
-            cache_unmap(g_retired[i].rw, g_retired[i].rw2rx);
+            cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
             if (g_nfreed_total) g_freed[(g_nfreed_total - 1) % STW_FREED_MAX].gen = gen;
             g_retired[i] = g_retired[--g_nretired]; // swap-remove
         } else
@@ -862,6 +863,7 @@ static void reclaim_retired(void) {
 // so a later reclaim_retired() frees it once every thread has drifted off its generation.
 static void retire_current(void) {
     if (g_nretired < STW_RETIRED_MAX) {
+        g_retired[g_nretired].handle = g_code_mapping.handle;
         g_retired[g_nretired].rw = g_cache;
         g_retired[g_nretired].rw2rx = g_rw2rx;
         g_retired[g_nretired].gen = g_cache_gen;
@@ -886,20 +888,13 @@ static void cache_oom_abort(void) {
 // generation, so retained VA stays bounded (no per-flush leak). MUST run with all peers quiesced
 // (stw_flush) and the dispatcher holding g_jit_lock.
 static void jit_flush_to_fresh(void) {
+    hl_host_code_mapping mapping;
     reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
-    if (g_dualmap) {
-        uint8_t *rw;
-        ptrdiff_t d;
-        if (dualmap_alloc(&rw, &d) != 0) cache_oom_abort();
-        retire_current();
-        g_cache = g_cp = rw;
-        g_rw2rx = d;
-    } else {
-        uint8_t *nc = mmap(NULL, CACHE_SZ, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-        if (nc == MAP_FAILED) cache_oom_abort();
-        retire_current(); // rw2rx == 0 in this fallback -> reclaim unmaps the single RWX region
-        g_cache = g_cp = nc;
-    }
+    if (code_mapping_reserve(&mapping, g_dualmap) != 0) cache_oom_abort();
+    retire_current();
+    g_code_mapping = mapping;
+    g_cache = g_cp = (uint8_t *)(uintptr_t)mapping.writable_address;
+    g_rw2rx = (uint8_t *)(uintptr_t)mapping.executable_address - g_cache;
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
     memset(g_map, 0, sizeof g_map);
     memset(g_ibtc, 0, sizeof g_ibtc);
@@ -978,7 +973,7 @@ static void stw_after_fork(void) {
 
 // fork() and the dual-mapped cache. Left alone, fork() would COW the RW and RX aliases independently and
 // the child's two views of the SAME cache would silently diverge (writes through RW never reach the COW'd
-// RX -> the child executes stale/zero pages). dualmap_alloc therefore marks the RX alias VM_INHERIT_NONE
+// RX -> the child executes stale/zero pages). The host backend marks the RX alias VM_INHERIT_NONE
 // (the child gets a hole at the RX VA), and here -- in the child, before its next run_block -- we re-remap
 // a fresh RX alias of the child's OWN COW-inherited RW pages at that SAME VA. That re-couples the aliases
 // (child RW writes are visible through child RX again; verified empirically incl. nested forks) at the
@@ -998,8 +993,8 @@ static void stw_after_fork(void) {
 static int g_fork_preserved;
 
 static void jit_after_fork(void) {
-    g_fork_preserved = 1; // MAP_JIT fallback + successful re-remap keep the arena; rebuild paths clear it
-    stw_after_fork();     // single-threaded child: shed the inherited thread registry (also for the MAP_JIT path)
+    int preserve;
+    stw_after_fork(); // single-threaded child: shed the inherited thread registry (also for the MAP_JIT path)
     // fork() only clones the CALLING thread. If a peer M was translating (holding g_jit_lock, and g_cache_lock
     // under it in map_put) at the instant the guest forked, the child inherits those mutexes LOCKED with no
     // owner thread left to release them -- so the child's very first dispatcher iteration deadlocks forever in
@@ -1011,58 +1006,20 @@ static void jit_after_fork(void) {
     // is covered too.
     pthread_mutex_init(&g_jit_lock, NULL);
     pthread_mutex_init(&g_cache_lock, NULL);
+    preserve = !g_threaded || !g_dualmap;
+    if (g_jit_services.memory->repair_code_after_fork(g_jit_services.context, &g_code_mapping, (uint32_t)preserve)
+            .status != HL_STATUS_OK)
+        cache_oom_abort();
     // The child inherited the parent's retired-cache list as COW copies but will never resume a parent peer
     // into them; drop the bookkeeping and unmap them so the child does not carry the parent's retired VA.
     for (int i = 0; i < g_nretired; i++)
-        cache_unmap(g_retired[i].rw, g_retired[i].rw2rx);
+        cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
     g_nretired = 0;
-    if (!g_dualmap) return;
-    if (!g_threaded) {
-        // Single-threaded parent (shells, make, configure -- the fork-storm case): the inherited RW arena
-        // is a consistent snapshot (no peer could be mid-emit; the forking thread never forks while
-        // translating). Re-alias RX from the child's RW at the SAME VA the parent used -- the RX range is
-        // a guaranteed hole here (VM_INHERIT_NONE in dualmap_alloc). ~1us, preserves everything.
-        mach_vm_address_t rx = (mach_vm_address_t)(g_cache + g_rw2rx);
-        vm_prot_t cur = 0, max = 0;
-        kern_return_t kr = mach_vm_remap(mach_task_self(), &rx, CACHE_SZ, 0, VM_FLAGS_FIXED, mach_task_self(),
-                                         (mach_vm_address_t)g_cache, FALSE, &cur, &max, VM_INHERIT_NONE);
-        if (kr == KERN_SUCCESS) {
-            if (mach_vm_protect(mach_task_self(), rx, CACHE_SZ, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS)
-                return; // arena + g_map/g_ibtc/chains all still valid -- nothing to drop
-            // we own the new mapping but could not make it executable: scrub OUR mapping, then rebuild.
-            mach_vm_deallocate(mach_task_self(), rx, CACHE_SZ);
-        }
-        // Defensive fall-through (the FIXED remap can only fail if something else occupied the RX hole,
-        // which nothing between fork() and this hook should do): leave whatever occupies the range alone
-        // -- it is not ours to deallocate -- and take the full rebuild below, which allocates elsewhere.
-    }
-    // Threaded parent (or the defensive fall-through): conservative rebuild -- fresh dual map, drop the
-    // (possibly torn) inherited translations; the child re-translates on demand.
-    //
-    // NB: do NOT munmap the old RX range here. In this child it is a hole (VM_INHERIT_NONE at
-    // dualmap_alloc; or scrubbed/foreign after the defensive fall-through above), and dualmap_alloc below
-    // is free to place the FRESH arena exactly inside that 64MB gap -- a post-alloc munmap of the old RX
-    // range would then silently unmap the brand-new cache and the child's first emission faults
-    // (SIGSEGV at new-RW+0x10; hit by every fork from a threaded parent until this note existed).
-    g_fork_preserved = 0;
-    uint8_t *old_rw = g_cache;
-    uint8_t *rw;
-    ptrdiff_t d;
-    if (dualmap_alloc(&rw, &d) != 0) { // alloc failure (extremely rare): leave map as-is. The RX range is
-        // a hole in the child (INHERIT_NONE), so re-alias it in place as a last resort; if even that
-        // fails the child aborts on its first fetch, which is still better than executing stale bytes.
-        mach_vm_address_t rx = (mach_vm_address_t)(g_cache + g_rw2rx);
-        vm_prot_t cur = 0, max = 0;
-        if (mach_vm_remap(mach_task_self(), &rx, CACHE_SZ, 0, VM_FLAGS_FIXED, mach_task_self(),
-                          (mach_vm_address_t)g_cache, FALSE, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS)
-            mach_vm_protect(mach_task_self(), rx, CACHE_SZ, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-        return;
-    }
-    g_cache = g_cp = rw;
-    g_rw2rx = d;
+    g_fork_preserved = preserve;
+    if (preserve) return;
+    g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
+    g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
     memset(g_map, 0, sizeof g_map);
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
-    munmap(old_rw, CACHE_SZ); // the old RW was still mapped through the alloc, so it cannot overlap the
-                              // fresh arena; the old RX range is a pre-existing hole (see the NB above)
 }

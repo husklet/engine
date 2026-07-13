@@ -40,7 +40,7 @@ FIXTURE_SOURCES := $(sort $(wildcard tests/compat/fixtures/*.c))
 FIXTURE_BINS := $(FIXTURE_SOURCES:tests/compat/fixtures/%.c=$(BUILD)/fixtures/%)
 NATIVE_SMOKE := atomics clockelapsed epoll epoll_edge eventfd eventfd_sema forkwait mmapanon mmapshared statx_agree timerfd
 NATIVE_SMOKE_BINS := $(NATIVE_SMOKE:%=$(BUILD)/fixtures/%)
-E2E_CASES := atomics epoll_edge eventfd
+E2E_CASES := atomics epoll_edge eventfd forkwait
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
@@ -107,15 +107,19 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c \
-	src/production/os/launch_config.c src/core/config.c include/hl/config.h packaging/macos/jit.entitlements
+	src/production/os/launch_config.c src/core/config.c src/core/host_services.c src/host/macos/host_macos.c \
+	include/hl/config.h include/hl/host_macos.h packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c
+	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/core/host_services.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c \
-	src/production/os/launch_config.c src/core/config.c include/hl/config.h packaging/macos/jit.entitlements
+	src/production/os/launch_config.c src/core/config.c src/core/host_services.c src/host/macos/host_macos.c \
+	include/hl/config.h include/hl/host_macos.h packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c
+	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/core/host_services.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64

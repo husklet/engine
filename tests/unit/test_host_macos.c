@@ -16,7 +16,8 @@ int main(void) {
              HL_STATUS_OK);
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
     memset(&code, 0, sizeof code);
-    HL_CHECK(services.memory->reserve_code(services.context, 16384, 16384, &code).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->reserve_code(services.context, 16384, 16384, HL_HOST_CODE_DUAL_ALIAS, &code).status ==
+             HL_STATUS_OK);
     memcpy((void *)(uintptr_t)code.writable_address, "code", 5);
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 5).status == HL_STATUS_OK);
     HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "code", 5) == 0);

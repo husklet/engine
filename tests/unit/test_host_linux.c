@@ -37,7 +37,8 @@ int main(void) {
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
 
     memset(&code, 0, sizeof code);
-    HL_CHECK(services.memory->reserve_code(services.context, 4096, 4096, &code).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->reserve_code(services.context, 4096, 4096, HL_HOST_CODE_DUAL_ALIAS, &code).status ==
+             HL_STATUS_OK);
     HL_CHECK(code.handle != 0 && code.writable_address != 0 && code.executable_address != 0);
     memcpy((void *)(uintptr_t)code.writable_address, "jit", 4);
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 4).status == HL_STATUS_OK);
