@@ -791,7 +791,7 @@ static int container_online_cpus(void) {
     // engine process (the `mac` bridge / x86 fork-server spawn context) macOS sysconf reports 1, which would
     // pin every unconstrained container to a single CPU (nproc=1, affinity mask=1 bit, /sys .../cpu/online="0")
     // and stop guests scaling. hw.activecpu is what Go / the JVM / most runtimes read anyway; mirror the darwin
-    // jail (os/darwin/jail/jail.c hw.ncpu/hw.activecpu). Fallbacks: hw.logicalcpu -> hw.ncpu -> sysconf.
+    // Linux guest CPU reporting. Fallbacks: hw.logicalcpu -> hw.ncpu -> sysconf.
     long n = 0;
     int v = 0;
     size_t sz = sizeof v;

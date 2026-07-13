@@ -85,7 +85,7 @@
 #include "../engine/dispatch.c"              // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
                                              // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../translate/x86_64/elf.c"         // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
-#include "../os/ddjit_configfd.c"            // `--configfd` launch bridge -> re-hydrate DD_*/DDJIT_* env -> dd_run()
+#include "../os/launch_config.c"            // `--configfd` launch bridge -> re-hydrate DD_*/DDJIT_* env -> dd_run()
 
 // ---- entry + main ----
 // ---------------- entry ----------------
@@ -111,7 +111,7 @@ static void container_init(const char *rootfs) {
     if (rootfs) acct_container_reset();
     container_read_resource_env(); // docker --cpus / --read-only / --ulimit (DD_CPUS/DD_ROOTFS_RO/DD_ULIMITS)
     // #353: the daemon's DEFAULT launch path is the typed --configfd bridge, which hands the container
-    // model to the engine as DD_* ENV (ddjit_configfd.c), NOT as the --hostname/--mem-max/--pids-max CLI
+    // model to the engine as DD_* ENV (launch_config.c), NOT as the --hostname/--mem-max/--pids-max CLI
     // flags that ddjit_entry() parses. aarch64's container_init() already re-reads these from the env
     // (linux_aarch64.c); x86-64 did not, so a `docker run --hostname h` on x86 dropped the hostname
     // (uname/gethostname/`/etc/hostname` returned "jit") and --memory/--pids-limit were ignored. The
@@ -471,10 +471,10 @@ int ddjit_entry(int argc, char **argv) {
         g_self_path = self;
     else
         g_self_path = argv[0];
-    // typed-config launch (the daemon's default path): `--configfd <fd>` streams a serialized ddjit_config
+    // typed-config launch (the daemon's default path): `--configfd <fd>` streams a serialized launch config
     // over the inherited fd instead of the DD_* env/flag dialect. Dispatched before all other flags.
-    if (argc > 2 && strcmp(argv[1], "--configfd") == 0) return ddjit_run_configfd(atoi(argv[2]));
-    if (argc > 2 && strcmp(argv[1], "--configfile") == 0) return ddjit_run_configfile(argv[2]);
+    if (argc > 2 && strcmp(argv[1], "--configfd") == 0) return hl_run_config_fd(atoi(argv[2]));
+    if (argc > 2 && strcmp(argv[1], "--configfile") == 0) return hl_run_config_file(argv[2]);
     // W3D fork-server dispatch (gated; standalone path untouched when neither flag is present):
     //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run resident ddjitd, listen on SOCK
     //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to a ddjitd

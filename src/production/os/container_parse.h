@@ -7,7 +7,7 @@
 // kills: `atoi("oops") == 0`, which would silently run the container as uid 0 (root).
 //
 // Shared by both the linux container code (os/linux/container/state.c) and the darwin jail
-// (os/darwin/darwinjail.c) so the rules + error messages are identical across all targets.
+// Keep this parser guest-OS-neutral even though Linux is now the only supported guest ABI.
 #ifndef DD_CONTAINER_PARSE_H
 #define DD_CONTAINER_PARSE_H
 #include <errno.h>

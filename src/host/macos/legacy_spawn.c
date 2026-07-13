@@ -8,7 +8,7 @@
 // non-stdio descriptors across exec despite FD_CLOEXEC being clear. We `fork()` rather than `posix_spawn`
 // because the caller may need the child to lead its own process group (pause/kill via killpg) and/or own a
 // controlling terminal (interactive PTY) — both require setpgid/setsid/TIOCSCTTY in the child before exec.
-#include "../../include/ddjit_api.h"
+#include "../../production/include/ddjit_api.h"
 
 #include <errno.h>
 #include <fcntl.h>

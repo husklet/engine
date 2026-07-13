@@ -106,25 +106,33 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c \
-	packaging/macos/jit.entitlements
+	src/production/os/launch_config.c src/core/config.c include/hl/config.h packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
+	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c \
-	packaging/macos/jit.entitlements
+	src/production/os/launch_config.c src/core/config.c include/hl/config.h packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
+	$(MAC) clang -Iinclude -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
 e2e-compat: compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
-	$(BUILD)/tools/e2e-runner $(E2E_CASE_RUNS)
+	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) new 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) new 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) legacy 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) legacy 42
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
@@ -148,6 +156,10 @@ $(BUILD)/tools/compat-runner: tools/compat_runner.c
 $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< -o $@
 
 $(BUILD)/tools/perf-runner: tools/perf_runner.c
 	@mkdir -p $(@D)

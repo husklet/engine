@@ -39,7 +39,9 @@ enforced at link time rather than represented only by directories.
 ## Current status
 
 The new libraries build and prove ABI validation, IR construction/validation, Linux fd/OFD lifetime, fake-host
-failure injection and the public lifecycle. Guest execution still returns `HL_STATUS_NOT_SUPPORTED`; agents should
-migrate one proven domain at a time from `src/production`, keeping its end-to-end lane as the oracle.
+failure injection and the public lifecycle. The transferred Linux production engines execute AArch64 and x86-64
+guests through both the new `hl_launch_config` wire and its legacy input adapter. The layered engine execution entry
+still returns `HL_STATUS_NOT_SUPPORTED`; migrate one proven domain at a time from `src/production`, keeping that
+end-to-end lane as the oracle. Darwin/macOS is a host backend only; there is no Darwin guest personality.
 
 See `docs/ARCHITECTURE.md` and `docs/MIGRATION.md` before moving code.

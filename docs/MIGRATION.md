@@ -3,10 +3,13 @@
 `src/production` is the complete transferred runtime. Its explicit end-to-end target is the behavioral oracle and
 source pool for decomposition; the new default libraries remain independently compiled.
 
+Linux is the sole guest operating-system ABI. macOS, Linux and Windows names below refer only to host-service
+implementations; no Darwin, BSD or Windows guest personality may be introduced.
+
 ## Next work packages
 
-1. Replace textual `.c` inclusion in the snapshot with private headers and object libraries without changing behavior.
-2. Add macOS memory/JIT and clock host-service implementations, then migrate cache allocation/publication behind them.
+1. Replace textual `.c` inclusion in production with private headers and object libraries without changing behavior.
+2. Add macOS-host memory/JIT and clock services, then migrate cache allocation/publication behind them.
 3. Introduce instance-owned engine and Linux ABI state cluster by cluster; keep hot tables direct until assembly and
    performance comparison proves no regression.
 4. Migrate syscall-independent control exits, memory operations, faults and safepoints into IR; add native/QEMU state
