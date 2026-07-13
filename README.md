@@ -32,6 +32,9 @@ build/test helpers. CMake metadata is also provided for installation and Rust `b
 The dependency direction is `runner -> core -> translator + linux_abi -> host_services <- host backend`.
 Platform headers are forbidden in portable source and checked by a C domain tool.
 
+The build emits separate `libhl-engine`, `libhl-translator`, and `libhl-linux-abi` archives so ownership is
+enforced at link time rather than represented only by directories.
+
 ## Current status
 
 The new libraries build and prove ABI validation, IR construction/validation, Linux fd/OFD lifetime, fake-host
