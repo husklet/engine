@@ -1,0 +1,6 @@
+source_repository=/Users/x/dd/dd
+source_commit=61dd4912c531a9d6bc581d888ce29f3e1e485d84
+source_runtime=dd-jit-darwin/src/runtime
+snapshot_date=2026-07-13
+
+The compatibility snapshot is an unmodified migration oracle. New code uses the hl rebrand from its first ABI.
