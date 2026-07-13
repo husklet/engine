@@ -26,7 +26,8 @@ build/test helpers. CMake metadata is also provided for installation and Rust `b
 - `src/linux_abi` — Linux-visible syscall/process/fd/OFD/proc/sys models; never a host passthrough.
 - `src/host` — fake, macOS, Linux and Windows implementations of the universal host-service ABI.
 - `src/runner` — isolated C runner. Rust bindings should supervise this runner until the engine is safe to embed.
-- `compat/current` — fresh unmodified runtime snapshot at the commit recorded in `SOURCE_SNAPSHOT`.
+- `src/production` — complete transferred production runtime at the commit recorded in `SOURCE_SNAPSHOT`; it is the
+  runnable oracle while its unity domains are replaced.
 - `tests` — C unit tests and imported Linux compatibility fixtures.
 
 The dependency direction is `runner -> core -> translator + linux_abi -> host_services <- host backend`.
@@ -39,6 +40,6 @@ enforced at link time rather than represented only by directories.
 
 The new libraries build and prove ABI validation, IR construction/validation, Linux fd/OFD lifetime, fake-host
 failure injection and the public lifecycle. Guest execution still returns `HL_STATUS_NOT_SUPPORTED`; agents should
-migrate one proven domain at a time from `compat/current`, keeping the existing runtime as the oracle.
+migrate one proven domain at a time from `src/production`, keeping its end-to-end lane as the oracle.
 
 See `docs/ARCHITECTURE.md` and `docs/MIGRATION.md` before moving code.

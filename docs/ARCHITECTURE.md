@@ -25,6 +25,6 @@ through a big-bang rewrite.
 
 ## Rebranding
 
-All new exported symbols, libraries and binaries use `hl`. Old `ddjit` names exist only in the compatibility snapshot
-until a deliberate adapter is added. Linux ABI names such as `epoll` are third-party compatibility contracts and are
-not rebranded.
+All new exported symbols, libraries and binaries use `hl`. Old `ddjit` names remain only inside the transferred
+production implementation until each boundary receives a deliberate adapter. Linux ABI names such as `epoll` are
+third-party compatibility contracts and are not rebranded.

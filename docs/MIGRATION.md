@@ -1,7 +1,7 @@
 # Implementation handoff
 
-The compatibility snapshot is intentionally not compiled by the new default build. It is the behavioral oracle and
-source pool for decomposition.
+`src/production` is the complete transferred runtime. Its explicit end-to-end target is the behavioral oracle and
+source pool for decomposition; the new default libraries remain independently compiled.
 
 ## Next work packages
 
@@ -21,7 +21,7 @@ source pool for decomposition.
 - Existing imported guest fixtures executed through old and new runners with the same result/output.
 - `make format-check`, `make test`, and `make compat-build`.
 - Linked size, startup, translation, pcache cold/warm and steady workload distributions for hot-path moves.
-- No new platform token outside `src/host/<platform>`, runner packaging, or `compat/current`.
+- No new platform token outside `src/host/<platform>`, runner packaging, or the not-yet-migrated `src/production`.
 
 When a compatibility component is fully migrated, delete its snapshot copy in the same commit. Do not maintain two
 semantic implementations or permanent fallback flags.

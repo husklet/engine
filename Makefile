@@ -105,33 +105,33 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
-$(BUILD)/compat/hl-engine-linux-aarch64: compat/current/runtime/targets/linux_aarch64.c \
-	compat/current/jit.entitlements
+$(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c \
+	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
-	$(MAC) codesign -s - --entitlements compat/current/jit.entitlements -f $@
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/compat/hl-engine-linux-x86_64: compat/current/runtime/targets/linux_x86_64.c \
-	compat/current/jit.entitlements
+$(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c \
+	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -O2 -framework IOSurface -framework CoreFoundation -o $@ $<
-	$(MAC) codesign -s - --entitlements compat/current/jit.entitlements -f $@
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-compat-engines: $(BUILD)/compat/hl-engine-linux-aarch64 $(BUILD)/compat/hl-engine-linux-x86_64
+compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
 e2e-compat: compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/tools/e2e-runner $(E2E_CASE_RUNS)
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
 	compat-engines
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/$(1)-aarch64) 0
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/$(1)-x86_64) 0
 endef
 
@@ -154,9 +154,9 @@ $(BUILD)/tools/perf-runner: tools/perf_runner.c
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
 perf-compat: e2e-compat $(BUILD)/tools/perf-runner
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-aarch64) \
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/atomics-aarch64) 0 25
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/compat/hl-engine-linux-x86_64) \
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/atomics-x86_64) 0 25
 
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST)
