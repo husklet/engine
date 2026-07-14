@@ -1960,7 +1960,8 @@ int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, 
         result = -HL_LINUX_ENOSYS;
     else if (hl_linux_metadata_owned(linux_abi, ofd, &metadata) != 0)
         result = -HL_LINUX_EIO;
-    else if (metadata.type != HL_HOST_FILE_TYPE_REGULAR && metadata.type != HL_HOST_FILE_TYPE_BLOCK)
+    else if (metadata.type != HL_HOST_FILE_TYPE_REGULAR && metadata.type != HL_HOST_FILE_TYPE_BLOCK &&
+             metadata.type != HL_HOST_FILE_TYPE_DIRECTORY)
         result = -HL_LINUX_ESPIPE;
     else {
         host_result = files->seek(linux_abi->host->context, ofd->host_handle, offset, (uint32_t)whence);

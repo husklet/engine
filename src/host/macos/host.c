@@ -59,6 +59,12 @@ typedef struct hl_macos_stream_shared {
     uint32_t references;
 } hl_macos_stream_shared;
 
+typedef struct hl_macos_directory_shared {
+    pthread_mutex_t lock;
+    uint32_t references;
+    uint64_t position;
+} hl_macos_directory_shared;
+
 typedef struct hl_macos_file {
     uint32_t generation;
     uint32_t active;
@@ -67,6 +73,9 @@ typedef struct hl_macos_file {
     int append_descriptor;
     hl_macos_stream_shared *stream;
     uint32_t stream_endpoint;
+    DIR *directory;
+    uint64_t directory_position;
+    hl_macos_directory_shared *directory_shared;
 } hl_macos_file;
 
 typedef struct hl_macos_process {
@@ -206,6 +215,34 @@ static void hl_macos_stream_release(hl_macos_stream_shared *stream) {
     if (stream != NULL && __atomic_sub_fetch(&stream->references, 1u, __ATOMIC_ACQ_REL) == 0) {
         (void)semctl(stream->semaphore, 0, IPC_RMID);
         (void)munmap(stream, sizeof(*stream));
+    }
+}
+
+static hl_macos_directory_shared *hl_macos_directory_shared_create(void) {
+    pthread_mutexattr_t attributes;
+    hl_macos_directory_shared *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                                              MAP_ANON | MAP_SHARED, -1, 0);
+    if (shared == MAP_FAILED) return NULL;
+    memset(shared, 0, sizeof(*shared));
+    if (pthread_mutexattr_init(&attributes) != 0) {
+        munmap(shared, sizeof(*shared));
+        return NULL;
+    }
+    int initialized = pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+                      pthread_mutex_init(&shared->lock, &attributes) == 0;
+    pthread_mutexattr_destroy(&attributes);
+    if (!initialized) {
+        munmap(shared, sizeof(*shared));
+        return NULL;
+    }
+    shared->references = 1;
+    return shared;
+}
+
+static void hl_macos_directory_shared_release(hl_macos_directory_shared *shared) {
+    if (shared != NULL && __atomic_sub_fetch(&shared->references, 1u, __ATOMIC_ACQ_REL) == 0) {
+        pthread_mutex_destroy(&shared->lock);
+        munmap(shared, sizeof(*shared));
     }
 }
 
@@ -871,6 +908,9 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
             file->append_descriptor = append_descriptor;
             file->stream = NULL;
             file->stream_endpoint = 0;
+            file->directory = NULL;
+            file->directory_position = 0;
+            file->directory_shared = NULL;
             handle = hl_macos_handle(HL_MACOS_HANDLE_FILE, index, file->generation);
             break;
         }
@@ -893,6 +933,11 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
             file->shared = shared;
             file->descriptor = descriptor;
             file->append_descriptor = append_descriptor;
+            file->stream = NULL;
+            file->stream_endpoint = 0;
+            file->directory = NULL;
+            file->directory_position = 0;
+            file->directory_shared = NULL;
             handle = hl_macos_handle(HL_MACOS_HANDLE_FILE, index, file->generation);
         }
     }
@@ -1203,6 +1248,8 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
     uint32_t shared = 0;
     hl_macos_stream_shared *stream = NULL;
     uint32_t stream_endpoint = 0;
+    hl_macos_directory_shared *directory_shared = NULL;
+    int directory_error = 0;
     pthread_mutex_lock(&host->lock);
     entry = hl_macos_file_lookup(host, file);
     if (entry != NULL) {
@@ -1210,14 +1257,23 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
         shared = entry->shared;
         stream = entry->stream;
         stream_endpoint = entry->stream_endpoint;
+        struct stat status;
+        if (entry->directory_shared == NULL && fstat(entry->descriptor, &status) == 0 && S_ISDIR(status.st_mode)) {
+            entry->directory_shared = hl_macos_directory_shared_create();
+            if (entry->directory_shared == NULL) directory_error = 1;
+        }
+        directory_shared = entry->directory_shared;
+        if (directory_shared != NULL)
+            (void)__atomic_add_fetch(&directory_shared->references, 1u, __ATOMIC_ACQ_REL);
         if (stream != NULL) (void)__atomic_add_fetch(&stream->references, 1u, __ATOMIC_ACQ_REL);
         descriptor = fcntl(entry->descriptor, F_DUPFD_CLOEXEC, 0);
         if (descriptor >= 0 && needs_append) append_descriptor = fcntl(entry->append_descriptor, F_DUPFD_CLOEXEC, 0);
     }
     pthread_mutex_unlock(&host->lock);
-    if (descriptor < 0 || (needs_append && append_descriptor < 0)) {
-        hl_host_result error = hl_macos_errno();
+    if (descriptor < 0 || (needs_append && append_descriptor < 0) || directory_error) {
+        hl_host_result error = directory_error ? hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0) : hl_macos_errno();
         if (stream != NULL) (void)__atomic_sub_fetch(&stream->references, 1u, __ATOMIC_ACQ_REL);
+        hl_macos_directory_shared_release(directory_shared);
         if (descriptor >= 0) close(descriptor);
         return error;
     }
@@ -1225,13 +1281,17 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
         hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor, shared);
         if (result.status != HL_STATUS_OK) {
             if (stream != NULL) (void)__atomic_sub_fetch(&stream->references, 1u, __ATOMIC_ACQ_REL);
+            hl_macos_directory_shared_release(directory_shared);
             close(descriptor);
             if (append_descriptor >= 0) close(append_descriptor);
-        } else if (stream != NULL) {
+        } else {
             pthread_mutex_lock(&host->lock);
             hl_macos_file *copy = hl_macos_file_lookup(host, result.value);
-            copy->stream = stream;
-            copy->stream_endpoint = stream_endpoint;
+            if (copy != NULL) {
+                copy->directory_shared = directory_shared;
+                copy->stream = stream;
+                copy->stream_endpoint = stream_endpoint;
+            }
             pthread_mutex_unlock(&host->lock);
         }
         return result;
@@ -1239,9 +1299,35 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
 }
 
 static hl_host_result hl_macos_file_seek(void *context, hl_host_handle file, int64_t offset, uint32_t whence) {
-    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    hl_host_macos *host = context;
+    int descriptor = -1;
     off_t result;
-    if (descriptor < 0 || whence > UINT32_C(2)) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (whence > UINT32_C(2)) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_macos_file *entry = hl_macos_file_lookup(host, file);
+    if (entry != NULL) descriptor = entry->descriptor;
+    if (entry != NULL && entry->directory_shared != NULL) {
+        hl_macos_directory_shared *shared = entry->directory_shared;
+        pthread_mutex_lock(&shared->lock);
+        if (whence == SEEK_SET) result = (off_t)offset;
+        else if (whence == SEEK_CUR && shared->position <= INT64_MAX)
+            result = (off_t)shared->position + (off_t)offset;
+        else result = -1;
+        if (result >= 0) {
+            shared->position = (uint64_t)result;
+            if (entry->directory != NULL) {
+                rewinddir(entry->directory);
+                entry->directory_position = 0;
+            }
+        } else {
+            errno = EINVAL;
+        }
+        pthread_mutex_unlock(&shared->lock);
+        pthread_mutex_unlock(&host->lock);
+        return result < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)result, 0);
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = lseek(descriptor, (off_t)offset, (int)whence);
     return result < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)result, 0);
 }
@@ -1726,52 +1812,91 @@ static hl_host_result hl_macos_file_filesystem_metadata(void *context, hl_host_h
 
 static hl_host_result hl_macos_file_read_directory(void *context, hl_host_handle file, hl_host_file_entry *entries,
                                                    uint32_t entry_capacity, uint32_t byte_capacity) {
-    int descriptor = hl_macos_file_descriptor(context, file, 0);
-    uint8_t *buffer;
-    off_t base;
-    long count;
-    uint32_t at = 0, produced = 0;
-    if (descriptor < 0 || entries == NULL || entry_capacity == 0 || byte_capacity < 24 ||
+    hl_host_macos *host = context;
+    uint32_t produced = 0, used = 0;
+    int saved_error = 0;
+    if (entries == NULL || entry_capacity == 0 || byte_capacity < 24 ||
         byte_capacity > UINT32_C(1 << 20))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    buffer = malloc(byte_capacity);
-    if (buffer == NULL) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
-    base = lseek(descriptor, 0, SEEK_CUR);
-    if (base < 0) {
-        free(buffer);
-        return hl_macos_errno();
+    pthread_mutex_lock(&host->lock);
+    hl_macos_file *entry = hl_macos_file_lookup(host, file);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    do
-        count = syscall(SYS_getdirentries64, descriptor, buffer, byte_capacity, &base);
-    while (count < 0 && errno == EINTR);
-    if (count < 0) {
-        free(buffer);
-        return hl_macos_errno();
-    }
-    while (at < (uint32_t)count) {
-        const struct dirent *native = (const struct dirent *)(buffer + at);
-        size_t name_size;
-        if (native->d_reclen < 24 || native->d_reclen > (uint32_t)count - at || produced == entry_capacity) {
-            free(buffer);
-            return hl_macos_result(HL_STATUS_CORRUPT, 0, 0);
+    if (entry->directory_shared == NULL) {
+        struct stat status;
+        if (fstat(entry->descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
+            saved_error = errno != 0 ? errno : ENOTDIR;
+        } else {
+            entry->directory_shared = hl_macos_directory_shared_create();
+            if (entry->directory_shared == NULL) saved_error = ENOMEM;
         }
-        name_size = strnlen(native->d_name, native->d_reclen - offsetof(struct dirent, d_name));
-        if (name_size > 255 || name_size == native->d_reclen - offsetof(struct dirent, d_name)) {
-            free(buffer);
-            return hl_macos_result(HL_STATUS_CORRUPT, 0, 0);
+    }
+    hl_macos_directory_shared *shared = entry->directory_shared;
+    if (saved_error == 0) pthread_mutex_lock(&shared->lock);
+    if (saved_error == 0 && entry->directory == NULL) {
+        int duplicate = fcntl(entry->descriptor, F_DUPFD_CLOEXEC, 0);
+        if (duplicate < 0) {
+            saved_error = errno;
+        } else {
+            entry->directory = fdopendir(duplicate);
+            if (entry->directory == NULL) {
+                saved_error = errno;
+                close(duplicate);
+            } else {
+                entry->directory_position = 0;
+            }
+        }
+    }
+    if (saved_error == 0 && entry->directory_position != shared->position) {
+        rewinddir(entry->directory);
+        entry->directory_position = 0;
+        while (entry->directory_position < shared->position) {
+            errno = 0;
+            if (readdir(entry->directory) == NULL) {
+                saved_error = errno != 0 ? errno : EINVAL;
+                break;
+            }
+            entry->directory_position++;
+        }
+    }
+    while (saved_error == 0 && produced < entry_capacity) {
+        long before = telldir(entry->directory);
+        errno = 0;
+        struct dirent *native = readdir(entry->directory);
+        if (native == NULL) {
+            saved_error = errno;
+            break;
+        }
+        size_t name_size = strnlen(native->d_name, sizeof(native->d_name));
+        uint32_t record_size = (uint32_t)((19u + name_size + 1u + 7u) & ~(size_t)7u);
+        if (name_size == sizeof(native->d_name)) {
+            saved_error = EIO;
+            break;
+        }
+        if (record_size > byte_capacity - used) {
+            seekdir(entry->directory, before);
+            if (produced == 0) saved_error = EINVAL;
+            break;
         }
         entries[produced].object = native->d_ino;
-        /* d_seekoff is relative to getdirentries64's block base on APFS; Linux d_off is the absolute
-           cookie consumed by lseek/seekdir, so retain the kernel-supplied base. */
-        entries[produced].next_offset = (uint64_t)base + native->d_seekoff;
+        entries[produced].next_offset = entry->directory_position + 1;
         entries[produced].type = native->d_type;
         entries[produced].name_size = (uint32_t)name_size;
         memcpy(entries[produced].name, native->d_name, name_size + 1);
+        used += record_size;
         produced++;
-        at += native->d_reclen;
+        entry->directory_position++;
     }
-    free(buffer);
-    return hl_macos_result(HL_STATUS_OK, produced, (uint64_t)count);
+    if (saved_error == 0) shared->position = entry->directory_position;
+    if (shared != NULL) pthread_mutex_unlock(&shared->lock);
+    pthread_mutex_unlock(&host->lock);
+    if (saved_error != 0) {
+        errno = saved_error;
+        return hl_macos_errno();
+    }
+    return hl_macos_result(HL_STATUS_OK, produced, used);
 }
 
 static int hl_macos_file_directory(hl_host_macos *host, hl_host_handle directory) {
@@ -1983,6 +2108,8 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     int descriptor;
     int append_descriptor;
     hl_macos_stream_shared *stream;
+    DIR *directory;
+    hl_macos_directory_shared *directory_shared;
     pthread_mutex_lock(&host->lock);
     file = hl_macos_file_lookup(host, handle);
     if (file == NULL) {
@@ -1992,6 +2119,8 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     descriptor = file->descriptor;
     append_descriptor = file->append_descriptor;
     stream = file->stream;
+    directory = file->directory;
+    directory_shared = file->directory_shared;
     hl_host_process_fd_private_remove(descriptor);
     hl_host_process_fd_private_remove(append_descriptor);
     file->active = 0;
@@ -2000,10 +2129,19 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     file->append_descriptor = -1;
     file->stream = NULL;
     file->stream_endpoint = 0;
+    file->directory = NULL;
+    file->directory_position = 0;
+    file->directory_shared = NULL;
     pthread_mutex_unlock(&host->lock);
-    if (close(descriptor) != 0) return hl_macos_errno();
-    if (append_descriptor >= 0 && close(append_descriptor) != 0) return hl_macos_errno();
+    int saved_error = close(descriptor) != 0 ? errno : 0;
+    if (directory != NULL && closedir(directory) != 0 && saved_error == 0) saved_error = errno;
+    if (append_descriptor >= 0 && close(append_descriptor) != 0 && saved_error == 0) saved_error = errno;
     hl_macos_stream_release(stream);
+    hl_macos_directory_shared_release(directory_shared);
+    if (saved_error != 0) {
+        errno = saved_error;
+        return hl_macos_errno();
+    }
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -3648,6 +3786,13 @@ static hl_host_result hl_macos_fork_prepare(void *context) {
     result = hl_host_sync_fork_prepare(host->sync);
     if (result.status == HL_STATUS_OK) {
         uint32_t index;
+        /* clone_for_fork has created one additional handle per OFD.  fork duplicates both the
+           parent and child handles into the other process, so reserve one reference for every
+           inherited handle before either side closes its unwanted half. */
+        for (index = 0; index < host->file_capacity; ++index)
+            if (host->files[index].active && host->files[index].directory_shared != NULL)
+                (void)__atomic_add_fetch(&host->files[index].directory_shared->references, 1u,
+                                         __ATOMIC_ACQ_REL);
         for (index = 0; index < host->counter_capacity; ++index) {
             hl_macos_counter_object *object;
             uint32_t previous;
@@ -4019,7 +4164,10 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         hl_macos_file *file = &host->files[index];
         if (!file->active) continue;
         close(file->descriptor);
+        if (file->directory != NULL) closedir(file->directory);
         if (file->append_descriptor >= 0) close(file->append_descriptor);
+        hl_macos_stream_release(file->stream);
+        hl_macos_directory_shared_release(file->directory_shared);
     }
     for (index = 0; index < host->process_capacity; ++index) {
         hl_macos_process *process = &host->processes[index];

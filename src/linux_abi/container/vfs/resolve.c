@@ -384,6 +384,7 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
             memcpy(plan->path, resolved.final, resolved.final_size + 1);
             if (typed && g_host_services->file->open_beneath != NULL &&
                 (resolved.target_type == HL_HOST_FILE_TYPE_REGULAR ||
+                 (resolved.target_type == HL_HOST_FILE_TYPE_DIRECTORY && (intent & HL_OPEN_DIRECTORY) != 0) ||
                  (resolved.target == HL_HOST_HANDLE_INVALID && (intent & HL_OPEN_CREATE) != 0))) {
                 int opened_created = 0;
                 uint32_t open_policy = policy & ~(uint32_t)HL_HOST_RESOLVE_ALLOW_MISSING;
