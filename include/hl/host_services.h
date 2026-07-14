@@ -5,7 +5,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_HOST_SERVICES_ABI 2u
+#define HL_HOST_SERVICES_ABI 3u
 #define HL_HOST_MEMORY_ABI 3u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
@@ -19,6 +19,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_SYNC_ABI 2u
 #define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u
+#define HL_HOST_WATCH_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -38,7 +39,8 @@ enum {
     HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11,
     HL_HOST_CAP_COUNTER = UINT64_C(1) << 12,
     HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13,
-    HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14
+    HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14,
+    HL_HOST_CAP_WATCH = UINT64_C(1) << 15
 };
 
 enum {
@@ -441,6 +443,33 @@ typedef struct hl_host_sync_services {
     hl_host_result (*fork_child)(void *context);
 } hl_host_sync_services;
 
+enum {
+    HL_HOST_WATCH_SIZE = 1u << 0,
+    HL_HOST_WATCH_DATA = 1u << 1,
+    HL_HOST_WATCH_IDENTITY = 1u << 2,
+    HL_HOST_WATCH_DELETED = 1u << 3
+};
+
+typedef struct hl_host_watch_record {
+    uint64_t generation;
+    uint64_t stable_device;
+    uint64_t stable_object;
+    uint64_t size;
+    uint32_t changes;
+    uint32_t reserved;
+} hl_host_watch_record;
+
+/* Pull-based file notifications. Watch handles are accepted by event.control;
+   readiness wakes the dispatcher, which drains/querys at an engine safe point.
+   query returns current state even when the host coalesced notifications. */
+typedef struct hl_host_watch_services {
+    HL_ABI_HEADER;
+    hl_host_result (*open)(void *context, hl_host_handle file);
+    hl_host_result (*query)(void *context, hl_host_handle watch, hl_host_watch_record *record);
+    hl_host_result (*drain)(void *context, hl_host_handle watch, hl_host_watch_record *records, size_t capacity);
+    hl_host_result (*close)(void *context, hl_host_handle watch);
+} hl_host_watch_services;
+
 typedef struct hl_host_services {
     HL_ABI_HEADER;
     uint64_t capabilities;
@@ -457,6 +486,7 @@ typedef struct hl_host_services {
     const hl_host_counter_services *counter;
     const hl_host_transfer_services *transfer;
     const hl_host_directory_services *directory;
+    const hl_host_watch_services *watch;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

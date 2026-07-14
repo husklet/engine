@@ -30,6 +30,24 @@ static void fake_counter_notify(void *observer, uint64_t token) {
     *value = token;
 }
 
+static hl_host_result fake_watch_open(void *context, hl_host_handle file) {
+    (void)context; (void)file;
+    return (hl_host_result){HL_STATUS_OK, 0, 1, 0};
+}
+static hl_host_result fake_watch_query(void *context, hl_host_handle watch, hl_host_watch_record *record) {
+    (void)context; (void)watch; (void)record;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+static hl_host_result fake_watch_drain(void *context, hl_host_handle watch, hl_host_watch_record *records,
+                                       size_t capacity) {
+    (void)context; (void)watch; (void)records; (void)capacity;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+static hl_host_result fake_watch_close(void *context, hl_host_handle watch) {
+    (void)context; (void)watch;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
 int main(void) {
     hl_fake_host fake;
     hl_host_services services;
@@ -56,6 +74,8 @@ int main(void) {
     hl_host_result pollset;
     hl_host_directory_record directory_record;
     hl_host_event_record ready;
+    hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), fake_watch_open, fake_watch_query,
+                                    fake_watch_drain, fake_watch_close};
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
@@ -64,6 +84,17 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT) == HL_STATUS_OK);
+    truncated = services;
+    truncated.capabilities |= HL_HOST_CAP_WATCH;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
+    truncated.watch = &watch;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_OK);
+    truncated.size = (uint32_t)offsetof(hl_host_services, watch);
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
+    truncated.size = sizeof(truncated);
+    watch.size = sizeof(watch) - 1;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
+    watch.size = sizeof(watch);
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);

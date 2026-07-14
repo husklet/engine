@@ -110,5 +110,11 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->directory->read == NULL || services->directory->duplicate == NULL ||
          services->directory->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_WATCH) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, watch), sizeof(services->watch)) ||
+         !hl_valid_group(services->watch, HL_HOST_WATCH_ABI, sizeof(*services->watch)) ||
+         services->watch->open == NULL || services->watch->query == NULL || services->watch->drain == NULL ||
+         services->watch->close == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }
