@@ -615,6 +615,15 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {
+        size_t common = result->output_size < expected_size ? result->output_size : expected_size;
+        size_t mismatch = 0;
+        while (mismatch < common && result->output[mismatch] == expected[mismatch]) ++mismatch;
+        if (mismatch < common)
+            fprintf(stderr, "matrix-runner: %s [%s] first stdout difference at byte %zu: got=%02x expected=%02x\n",
+                    item->name, isa, mismatch, result->output[mismatch], expected[mismatch]);
+        else if (result->output_size != expected_size)
+            fprintf(stderr, "matrix-runner: %s [%s] stdout length: got=%zu expected=%zu\n", item->name, isa,
+                    result->output_size, expected_size);
         diagnostic(item, isa, status == 2 ? "timeout" : "exit/stdout mismatch", result);
         free(expected);
         return 1;
