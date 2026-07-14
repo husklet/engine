@@ -225,6 +225,18 @@ static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_no
 // return addresses stay HIGH (Go's gentraceback/findfunc keep working). 0 for PIE / non-V8 / stripped.
 static uint64_t g_nonpie_blob_code;
 
+// A biased ET_EXEC executes from the host mapping at link_pc+bias, but the address pushed by x86 CALL is
+// guest-visible architectural state.  Keep it in the ELF link-address domain so DWARF FDE ranges, dladdr,
+// backtrace, and forced unwinding see the same PCs they would on Linux; RET is redirected to the high mapping
+// by the dispatcher.  Go and V8 are deliberate exceptions: their runtime code metadata is explicitly rebased
+// to the high execution domain by elf.c, and their stack walkers therefore require high return PCs.
+static uint64_t call_return_pc(uint64_t pc) {
+    if (g_nonpie_lo && !g_nonpie_types_lo && !g_nonpie_blob_code && pc >= g_nonpie_lo + g_nonpie_bias &&
+        pc < g_nonpie_hi + g_nonpie_bias)
+        return pc - g_nonpie_bias;
+    return pc;
+}
+
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 static void emit_ea(struct insn *I, uint64_t next_rip);
 // unimplemented-insn diagnostic (defined below translate_block); fwd-declared so the instruction-class
@@ -1539,7 +1551,7 @@ static void *translate_block(uint64_t gpc) {
                     e_str(19, 28, OFF_IBSRC); // debug
                     if (k == 2) {
                         e_subi(RSP, RSP, 8, 1);
-                        e_movconst(19, next);
+                        e_movconst(19, call_return_pc(next));
                         e_store(8, 19, RSP);
                     } // call: push ret
                     emit_ibranch();
@@ -1666,7 +1678,7 @@ static void *translate_block(uint64_t gpc) {
             // ---- call rel32 (E8) ----
             if (op == 0xE8) {
                 e_subi(RSP, RSP, 8, 1); // flag-free push of the return address
-                e_movconst(16, next);
+                e_movconst(16, call_return_pc(next));
                 e_store(8, 16, RSP);
                 // x86-xflags: consult the CALLEE's flag live-in (function prologues kill flags fast).
                 flags_edge(next + (uint64_t)I.imm, gpc);
