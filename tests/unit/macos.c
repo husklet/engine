@@ -504,6 +504,7 @@ int main(void) {
     HL_CHECK(memcmp(contents, "xbc", sizeof(contents)) == 0);
     {
         hl_host_file_metadata metadata;
+        struct stat native_metadata;
         hl_host_result clone;
         char first = 0;
         char second = 0;
@@ -511,11 +512,14 @@ int main(void) {
         hl_host_iovec vectors[] = {{(uint64_t)(uintptr_t)&vector_contents[0], 1},
                                    {(uint64_t)(uintptr_t)&vector_contents[1], 2}};
         HL_CHECK(services.file->metadata(services.context, file.value, &metadata).status == HL_STATUS_OK);
+        HL_CHECK(stat(path, &native_metadata) == 0);
         HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR && metadata.size == 3 &&
                  (metadata.permissions & 0600u) == 0600u);
         HL_CHECK(metadata.link_count >= 1);
-        HL_CHECK(metadata.user == (uint32_t)getuid());
-        HL_CHECK(metadata.group == (uint32_t)getgid());
+        /* Host metadata describes the native object.  In particular, macOS may inherit a new file's
+           group from its parent directory instead of the process GID. */
+        HL_CHECK(metadata.user == (uint32_t)native_metadata.st_uid);
+        HL_CHECK(metadata.group == (uint32_t)native_metadata.st_gid);
         HL_CHECK(metadata.modified_ns != 0 && metadata.accessed_ns != 0 && metadata.changed_ns != 0 &&
                  metadata.created_ns != 0);
         HL_CHECK(services.file->seek(services.context, file.value, 0, SEEK_SET).value == 0);
