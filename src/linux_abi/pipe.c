@@ -1,0 +1,152 @@
+#include "pipe.h"
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct pipe_object {
+    const hl_host_services *host;
+    hl_host_handle stream;
+    uint32_t writing;
+} pipe_object;
+
+static int64_t pipe_error(hl_host_result result) {
+    if (result.status == HL_STATUS_OK) return (int64_t)result.value;
+    if (result.detail == EPIPE) return -HL_LINUX_EPIPE;
+    switch ((hl_status)result.status) {
+    case HL_STATUS_WOULD_BLOCK: return -HL_LINUX_EAGAIN;
+    case HL_STATUS_INTERRUPTED: return -HL_LINUX_EINTR;
+    case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
+    case HL_STATUS_RESOURCE_LIMIT: return -HL_LINUX_ENFILE;
+    case HL_STATUS_INVALID_ARGUMENT: return -HL_LINUX_EINVAL;
+    case HL_STATUS_NOT_SUPPORTED: return -HL_LINUX_ENOSYS;
+    default: return -HL_LINUX_EIO;
+    }
+}
+
+static int pipe_services(const hl_host_services *host) {
+    return host != NULL && (host->capabilities & HL_HOST_CAP_STREAM) != 0 && host->stream != NULL;
+}
+
+static int64_t pipe_read(void *opaque, void *buffer, size_t size) {
+    pipe_object *object = opaque;
+    if (object->writing) return -HL_LINUX_EBADF;
+    return pipe_error(object->host->stream->read(object->host->context, object->stream,
+                                                 (hl_host_bytes){buffer, size}));
+}
+
+static int64_t pipe_write(void *opaque, const void *buffer, size_t size) {
+    pipe_object *object = opaque;
+    if (!object->writing) return -HL_LINUX_EBADF;
+    return pipe_error(object->host->stream->write(object->host->context, object->stream,
+                                                  (hl_host_const_bytes){buffer, size}));
+}
+
+static int64_t pipe_status(void *opaque, hl_linux_file_status *status) {
+    (void)opaque;
+    memset(status, 0, sizeof(*status));
+    status->mode = HL_LINUX_S_IFIFO | 0600u;
+    return 0;
+}
+
+static int64_t pipe_set_status_flags(void *opaque, uint32_t flags) {
+    pipe_object *object = opaque;
+    uint32_t host_flags = (flags & HL_LINUX_O_NONBLOCK) != 0 ? HL_HOST_STREAM_NONBLOCK : 0;
+    return pipe_error(object->host->stream->set_status_flags(object->host->context, object->stream, host_flags));
+}
+
+static uint32_t pipe_readiness(void *opaque, uint32_t interests) {
+    pipe_object *object = opaque;
+    uint32_t host_interests = 0, ready = 0;
+    if ((interests & HL_LINUX_READY_READ) != 0) host_interests |= HL_HOST_READY_READ;
+    if ((interests & HL_LINUX_READY_WRITE) != 0) host_interests |= HL_HOST_READY_WRITE;
+    if ((interests & HL_LINUX_READY_ERROR) != 0) host_interests |= HL_HOST_READY_ERROR;
+    if ((interests & HL_LINUX_READY_HANGUP) != 0) host_interests |= HL_HOST_READY_HANGUP;
+    hl_host_result result =
+        object->host->stream->readiness(object->host->context, object->stream, host_interests);
+    if (result.status != HL_STATUS_OK) return HL_LINUX_READY_ERROR & interests;
+    if ((result.value & HL_HOST_READY_READ) != 0) ready |= HL_LINUX_READY_READ;
+    if ((result.value & HL_HOST_READY_WRITE) != 0) ready |= HL_LINUX_READY_WRITE;
+    if ((result.value & HL_HOST_READY_ERROR) != 0) ready |= HL_LINUX_READY_ERROR;
+    if ((result.value & HL_HOST_READY_HANGUP) != 0) ready |= HL_LINUX_READY_HANGUP;
+    return ready & interests;
+}
+
+static hl_host_result pipe_wait_handle(void *opaque) {
+    pipe_object *object = opaque;
+    return (hl_host_result){HL_STATUS_OK, 1, object->stream, 0};
+}
+
+static hl_status pipe_clone(void *opaque, void **child) {
+    pipe_object *object = opaque;
+    hl_host_result duplicated;
+    pipe_object *copy;
+    if (child == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    duplicated = object->host->stream->duplicate(object->host->context, object->stream);
+    if (duplicated.status != HL_STATUS_OK) return (hl_status)duplicated.status;
+    copy = malloc(sizeof(*copy));
+    if (copy == NULL) {
+        (void)object->host->stream->close(object->host->context, duplicated.value);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
+    *copy = (pipe_object){object->host, duplicated.value, object->writing};
+    *child = copy;
+    return HL_STATUS_OK;
+}
+
+static hl_status pipe_close(void *opaque) {
+    pipe_object *object = opaque;
+    hl_host_result result = object->host->stream->close(object->host->context, object->stream);
+    free(object);
+    return (hl_status)result.status;
+}
+
+static const hl_linux_object_ops pipe_ops = {
+    .read = pipe_read,
+    .write = pipe_write,
+    .status = pipe_status,
+    .set_status_flags = pipe_set_status_flags,
+    .readiness = pipe_readiness,
+    .wait_handle = pipe_wait_handle,
+    .clone = pipe_clone,
+    .close = pipe_close,
+};
+
+int64_t hl_linux_pipe_create(hl_linux_abi *linux_abi, uint32_t status_flags, uint32_t descriptor_flags,
+                             hl_linux_fd output[2]) {
+    hl_host_result pair;
+    pipe_object *reader, *writer;
+    hl_status status;
+    uint32_t host_flags = (status_flags & HL_LINUX_O_NONBLOCK) != 0 ? HL_HOST_STREAM_NONBLOCK : 0;
+    if (linux_abi == NULL || output == NULL ||
+        (status_flags & ~(uint32_t)HL_LINUX_O_NONBLOCK) != 0 || !pipe_services(linux_abi->host))
+        return -HL_LINUX_EINVAL;
+    pair = linux_abi->host->stream->pipe_pair(linux_abi->host->context, host_flags);
+    if (pair.status != HL_STATUS_OK) return pipe_error(pair);
+    reader = malloc(sizeof(*reader));
+    writer = malloc(sizeof(*writer));
+    if (reader == NULL || writer == NULL) {
+        free(reader);
+        free(writer);
+        (void)linux_abi->host->stream->close(linux_abi->host->context, pair.value);
+        (void)linux_abi->host->stream->close(linux_abi->host->context, pair.detail);
+        return -HL_LINUX_ENOMEM;
+    }
+    *reader = (pipe_object){linux_abi->host, pair.value, 0};
+    *writer = (pipe_object){linux_abi->host, pair.detail, 1};
+    status = hl_linux_object_install(linux_abi, &pipe_ops, reader, HL_LINUX_OBJECT_PIPE,
+                                     HL_LINUX_O_RDONLY | status_flags, descriptor_flags, &output[0]);
+    if (status != HL_STATUS_OK) {
+        (void)pipe_close(reader);
+        (void)pipe_close(writer);
+        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : -HL_LINUX_EIO;
+    }
+    status = hl_linux_object_install(linux_abi, &pipe_ops, writer, HL_LINUX_OBJECT_PIPE,
+                                     HL_LINUX_O_WRONLY | status_flags, descriptor_flags, &output[1]);
+    if (status != HL_STATUS_OK) {
+        (void)hl_linux_fd_close(linux_abi, output[0], NULL);
+        (void)pipe_close(writer);
+        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : -HL_LINUX_EIO;
+    }
+    return 0;
+}

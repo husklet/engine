@@ -33,6 +33,7 @@ typedef enum hl_linux_errno {
     HL_LINUX_ENFILE = 23,
     HL_LINUX_EMFILE = 24,
     HL_LINUX_ESPIPE = 29,
+    HL_LINUX_EPIPE = 32,
     HL_LINUX_EROFS = 30,
     HL_LINUX_ENAMETOOLONG = 36,
     HL_LINUX_ENOSYS = 38,
