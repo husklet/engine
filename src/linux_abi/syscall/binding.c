@@ -396,6 +396,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
         break;
     }
+    case 46: result = hl_linux_ftruncate(g_linux_box, source.fd, a1); break;
+    case 82: result = hl_linux_fsync(g_linux_box, source.fd); break;
+    case 83: result = hl_linux_fdatasync(g_linux_box, source.fd); break;
     case 80: {
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
@@ -455,7 +458,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 29:           /* ioctl */
     case 32:           /* flock */
     case 44:           /* fstatfs */
-    case 46:           /* ftruncate */
     case 52:           /* fchmod */
     case 55:           /* fchown */
     case 61:           /* getdents64 */
@@ -464,8 +466,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 76:           /* splice */
     case 77:           /* tee */
     case 79:           /* newfstatat directory */
-    case 82:           /* fsync */
-    case 83:           /* fdatasync */
     case 84:           /* sync_file_range */
     case 200:          /* bind */
     case 201:          /* listen */

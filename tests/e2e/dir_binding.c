@@ -23,6 +23,8 @@ int main(void) {
     if (read(input, bytes, 2) != 2 || memcmp(bytes, "he", 2)) return 12;
     alias = dup(input);
     if (alias < 0 || close(input) != 0) return 13;
+    errno = 0;
+    if (ftruncate(alias, 0) != -1 || errno != EBADF) return 25;
     if (read(alias, bytes + 2, 3) != 3 || memcmp(bytes, "hello", 5) || close(alias) != 0) return 14;
     output = openat(DIRECTORY_FD, "output", O_CREAT | O_EXCL | O_RDWR | O_APPEND | O_CLOEXEC, 0600);
     if (output < 0 || (fcntl(output, F_GETFD) & FD_CLOEXEC) == 0) return 15;
@@ -38,8 +40,21 @@ int main(void) {
     vectors[0] = (struct iovec){bytes, 2};
     vectors[1] = (struct iovec){bytes + 2, 3};
     if (preadv(output, vectors, 2, 0) != 5 || memcmp(bytes, "mIXe!", 5) || fstat(output, &status) != 0 ||
-        status.st_size != 5 || close(output) != 0)
+        status.st_size != 5)
         return 24;
+    if (lseek(output, 2, SEEK_SET) != 2 || ftruncate(output, 8) != 0 || lseek(output, 0, SEEK_CUR) != 2 ||
+        fstat(output, &status) != 0 || status.st_size != 8)
+        return 26;
+    memset(bytes, 1, 3);
+    if (pread(output, bytes, 3, 5) != 3 || bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0) return 27;
+    if (ftruncate(output, 3) != 0 || fstat(output, &status) != 0 || status.st_size != 3 || fsync(output) != 0 ||
+        fdatasync(output) != 0)
+        return 28;
+    if (close(output) != 0) return 29;
+    errno = 0;
+    if (ftruncate(output, 0) != -1 || errno != EBADF) return 30;
+    errno = 0;
+    if (fsync(output) != -1 || errno != EBADF) return 31;
     errno = 0;
     if (openat(DIRECTORY_FD, "missing", O_RDONLY) != -1 || errno != ENOENT) return 17;
     errno = 0;

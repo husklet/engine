@@ -613,6 +613,36 @@ HL_LINUX_VECTOR_WRAPPER(hl_linux_file_readv, 0)
 HL_LINUX_VECTOR_WRAPPER(hl_linux_file_writev, 1)
 HL_LINUX_VECTOR_WRAPPER(hl_linux_file_appendv, 4)
 
+static hl_host_result hl_linux_file_truncate(void *context, hl_host_handle file, uint64_t size) {
+    hl_host_linux *host = context;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0 || size > INT64_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return ftruncate(descriptor, (off_t)size) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_sync(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return fsync(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_data_sync(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return fdatasync(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
                                              uint32_t count, uint64_t offset) {
     return hl_linux_file_vector(context, file, vectors, count, offset, 2);
@@ -1171,7 +1201,10 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_writev,
                                                hl_linux_file_readv_at,
                                                hl_linux_file_writev_at,
-                                               hl_linux_file_appendv};
+                                               hl_linux_file_appendv,
+                                               hl_linux_file_truncate,
+                                               hl_linux_file_sync,
+                                               hl_linux_file_data_sync};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};

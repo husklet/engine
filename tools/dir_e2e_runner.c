@@ -55,12 +55,16 @@ int main(int argc, char **argv) {
     result.abi = HL_ENGINE_ABI;
     result.size = sizeof(result);
     if (hl_engine_run(engine, 1, (const char *const *)(argv + 1), &result) != HL_STATUS_OK ||
-        result.kind != HL_ENGINE_EXIT_CODE || result.guest_status != 0)
+        result.kind != HL_ENGINE_EXIT_CODE)
         goto destroy;
+    if (result.guest_status != 0) {
+        outcome = (int)result.guest_status;
+        goto destroy;
+    }
     output = services.file->open_relative(services.context, directory.value, "output", 6, HL_HOST_FILE_READ, 0, 0);
     if (output.status != HL_STATUS_OK) goto destroy;
-    checked = services.file->read_at(services.context, output.value, 0, (hl_host_bytes){bytes, 5});
-    if (checked.status != HL_STATUS_OK || checked.value != 5 || memcmp(bytes, "mIXe!", 5)) goto destroy;
+    checked = services.file->read_at(services.context, output.value, 0, (hl_host_bytes){bytes, 3});
+    if (checked.status != HL_STATUS_OK || checked.value != 3 || memcmp(bytes, "mIX", 3)) goto destroy;
     outcome = 0;
 destroy:
     hl_engine_destroy(engine);

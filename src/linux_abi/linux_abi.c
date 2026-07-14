@@ -880,6 +880,64 @@ int64_t hl_linux_pwritev(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_host_
     return hl_linux_vector(linux_abi, fd, vectors, count, offset, 3);
 }
 
+static int64_t hl_linux_file_control(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t size, uint32_t operation) {
+    const hl_linux_fd_entry *fd_entry;
+    const hl_linux_ofd_entry *found;
+    const hl_host_file_services *files;
+    hl_linux_ofd_entry *ofd;
+    hl_host_result host_result;
+    hl_status status;
+    int64_t result;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    if (operation == 0 && size > INT64_MAX) return -HL_LINUX_EINVAL;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, &fd_entry, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[fd_entry->ofd];
+    if (operation == 0 && (ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_RDONLY) {
+        hl_linux_unlock(linux_abi);
+        return -HL_LINUX_EBADF;
+    }
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(linux_abi, ofd);
+    files = hl_linux_files(linux_abi);
+    if (files == NULL)
+        result = -HL_LINUX_ENOSYS;
+    else {
+        if (operation == 0)
+            host_result = files->truncate == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                                                  : files->truncate(linux_abi->host->context, ofd->host_handle, size);
+        else if (operation == 1)
+            host_result = files->sync == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                                              : files->sync(linux_abi->host->context, ofd->host_handle);
+        else
+            host_result = files->data_sync == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                                                   : files->data_sync(linux_abi->host->context, ofd->host_handle);
+        result = host_result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)host_result.status);
+    }
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(linux_abi, ofd);
+    return result;
+}
+
+int64_t hl_linux_ftruncate(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t size) {
+    return hl_linux_file_control(linux_abi, fd, size, 0);
+}
+
+int64_t hl_linux_fsync(hl_linux_abi *linux_abi, hl_linux_fd fd) {
+    return hl_linux_file_control(linux_abi, fd, 0, 1);
+}
+
+int64_t hl_linux_fdatasync(hl_linux_abi *linux_abi, hl_linux_fd fd) {
+    return hl_linux_file_control(linux_abi, fd, 0, 2);
+}
+
 static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
                                        int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
                                        uint32_t mode) {

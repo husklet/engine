@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 6u
+#define HL_HOST_FILE_ABI 7u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
@@ -178,6 +178,9 @@ typedef struct hl_host_file_services {
     hl_host_result (*writev_at)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
                                 uint64_t offset);
     hl_host_result (*appendv)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count);
+    hl_host_result (*truncate)(void *context, hl_host_handle file, uint64_t size);
+    hl_host_result (*sync)(void *context, hl_host_handle file);
+    hl_host_result (*data_sync)(void *context, hl_host_handle file);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

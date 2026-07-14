@@ -21,6 +21,9 @@ typedef struct test_file_host {
     _Atomic uint32_t concurrent_calls;
     uint32_t writes;
     uint32_t appends;
+    uint32_t truncates;
+    uint32_t syncs;
+    uint32_t data_syncs;
     uint32_t opens;
     uint32_t last_access;
     uint32_t last_creation;
@@ -208,6 +211,44 @@ static hl_host_result test_appendv(void *context, hl_host_handle file, const hl_
     return test_vector(context, file, vectors, count, host->size, 1, 0);
 }
 
+static hl_host_result test_truncate(void *context, hl_host_handle file, uint64_t size) {
+    test_file_host *host = context;
+    if ((file != 55 && file != 56) || size > sizeof(host->bytes)) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    if (host->next_status != HL_STATUS_OK) {
+        hl_status status = host->next_status;
+        host->next_status = HL_STATUS_OK;
+        return file_result(status, 0);
+    }
+    if (size > host->size) memset(host->bytes + host->size, 0, (size_t)size - host->size);
+    host->size = (size_t)size;
+    host->truncates++;
+    return file_result(HL_STATUS_OK, 0);
+}
+
+static hl_host_result test_sync(void *context, hl_host_handle file) {
+    test_file_host *host = context;
+    if (file != 55 && file != 56) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    host->syncs++;
+    if (host->next_status != HL_STATUS_OK) {
+        hl_status status = host->next_status;
+        host->next_status = HL_STATUS_OK;
+        return file_result(status, 0);
+    }
+    return file_result(HL_STATUS_OK, 0);
+}
+
+static hl_host_result test_data_sync(void *context, hl_host_handle file) {
+    test_file_host *host = context;
+    if (file != 55 && file != 56) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    host->data_syncs++;
+    if (host->next_status != HL_STATUS_OK) {
+        hl_status status = host->next_status;
+        host->next_status = HL_STATUS_OK;
+        return file_result(status, 0);
+    }
+    return file_result(HL_STATUS_OK, 0);
+}
+
 static hl_host_result test_clone(void *context, hl_host_handle file) {
     (void)context;
     return file == 55 ? file_result(HL_STATUS_OK, 56) : file_result(HL_STATUS_INVALID_ARGUMENT, 0);
@@ -277,7 +318,10 @@ int main(void) {
                                    .writev = test_writev,
                                    .readv_at = test_readv_at,
                                    .writev_at = test_writev_at,
-                                   .appendv = test_appendv};
+                                   .appendv = test_appendv,
+                                   .truncate = test_truncate,
+                                   .sync = test_sync,
+                                   .data_sync = test_data_sync};
     char buffer[8] = {0};
 
     file_host.size = 6;
@@ -561,6 +605,38 @@ int main(void) {
         vectors[0] = (hl_host_iovec){(uint64_t)(uintptr_t)buffer, 1};
         HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY, 0, &original) == HL_STATUS_OK);
         HL_CHECK(hl_linux_readv(&linux_abi, original, vectors, 1) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        file_host.closes = 0;
+    }
+
+    {
+        hl_linux_file_status control_status;
+        file_host.size = 3;
+        file_host.offset = 0;
+        file_host.truncates = 0;
+        file_host.syncs = 0;
+        file_host.data_syncs = 0;
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_lseek(&linux_abi, original, 2, HL_LINUX_SEEK_SET) == 2);
+        HL_CHECK(hl_linux_ftruncate(&linux_abi, original, 6) == 0 && file_host.truncates == 1);
+        HL_CHECK(hl_linux_lseek(&linux_abi, original, 0, HL_LINUX_SEEK_CUR) == 2);
+        HL_CHECK(file_host.bytes[3] == 0 && file_host.bytes[4] == 0 && file_host.bytes[5] == 0);
+        HL_CHECK(hl_linux_fstat(&linux_abi, original, &control_status) == 0 && control_status.size == 6);
+        HL_CHECK(hl_linux_ftruncate(&linux_abi, original, 1) == 0 && file_host.truncates == 2);
+        HL_CHECK(hl_linux_fsync(&linux_abi, original) == 0 && file_host.syncs == 1);
+        HL_CHECK(hl_linux_fdatasync(&linux_abi, original) == 0 && file_host.data_syncs == 1);
+        file_host.next_status = HL_STATUS_IO;
+        HL_CHECK(hl_linux_fsync(&linux_abi, original) == -HL_LINUX_EIO);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_ftruncate(&linux_abi, original, (uint64_t)INT64_MAX + 1u) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        file_host.closes = 0;
+        HL_CHECK(hl_linux_fsync(&linux_abi, original) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_fdatasync(&linux_abi, original) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_ftruncate(&linux_abi, original, 0) == -HL_LINUX_EBADF);
+
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &original) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_ftruncate(&linux_abi, original, 0) == -HL_LINUX_EBADF);
         HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
         file_host.closes = 0;
     }
