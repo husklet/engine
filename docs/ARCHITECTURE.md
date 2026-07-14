@@ -14,7 +14,8 @@ axes. Host operating-system behavior enters only through `hl_host_services`.
 4. Engine state is opaque and instance-owned. New code cannot add mutable process globals.
 5. Public structures begin with `abi,size`, are append-only within an ABI, and use fixed-width types. No `pid_t`, native
    fd, compiler-sized enum or Rust layout leaks into the public boundary.
-6. Execution stays in the runner while migrated code still owns global signal handlers, fork behavior and `_exit`.
+6. Process-global signal handlers, fork behavior, and `_exit` belong to the production runner boundary. Library
+   interfaces must not acquire those responsibilities implicitly.
 7. Logging calls use portable tags and an instance-owned `hl_log_context`. They are compiled out unless
    `HL_ENABLE_LOGGING=1`; host backends are byte sinks and never implement tag policy.
 
@@ -22,11 +23,10 @@ axes. Host operating-system behavior enters only through `hl_host_services`.
 
 IR is private and versioned. Operands refer only to earlier SSA-like values; blocks end in an explicit terminator;
 validation occurs before lowering. Persistent cache identity will include guest ISA, host ISA, IR ABI, codegen ABI
-and every code-changing feature. The current direct ARM64 emitters migrate incrementally through an adapter, never
-through a big-bang rewrite.
+and every code-changing feature. Direct emitters and IR lowerers obey the same guest-state and cache-identity
+contracts.
 
 ## Rebranding
 
-All exported symbols, libraries and binaries use `hl`. Transferred implementation internals are renamed as their
-owning layer is extracted. Linux ABI names such as `epoll` are third-party compatibility contracts and are not
-rebranded.
+All exported symbols, libraries and binaries use `hl`. Project-owned internal names use the same namespace when they
+cross a file or process boundary. Linux ABI names such as `epoll` are compatibility contracts and are not rebranded.

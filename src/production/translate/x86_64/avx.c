@@ -1001,7 +1001,7 @@ static void do_avx(struct cpu *c) {
 
     // ---- unimplemented: report precisely + exit 70 so coverage is grown test-driven ----
 avx_unimpl:
-    if (!g_avx_warned || hl_option_get("HL_CRASHDBG")) {
+    if (!g_avx_warned) {
         g_avx_warned = 1;
         fprintf(stderr, "[avx] UNIMPLEMENTED %s map=%d op=0x%02x pp=%d L=%d w=%d rip=%llx\n", I.evex ? "EVEX" : "VEX",
                 map, op, pp, L, I.vex_w, (unsigned long long)c->rip);
@@ -2006,7 +2006,7 @@ static void do_sse3b(struct cpu *c) {
     }
 
 unimpl:
-    if (!g_avx_warned || hl_option_get("HL_CRASHDBG")) {
+    if (!g_avx_warned) {
         g_avx_warned = 1;
         fprintf(stderr, "[sse3b] UNIMPLEMENTED map=%d op=0x%02x p66=%d rep=%d repne=%d rip=%llx\n", map, op, I.p66,
                 I.rep, I.repne, (unsigned long long)c->rip);

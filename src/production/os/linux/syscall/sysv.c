@@ -2,7 +2,7 @@
 // Included by service.c after service/helpers.c, before service(); sees the same TU scope (globals + helpers).
 //
 // ============================================================================================
-// -- dd-INTERNAL SysV IPC emulation (was: host-macOS shmget/semget/msgget passthrough).
+// -- HL-internal SysV IPC emulation (formerly host-macOS shmget/semget/msgget passthrough).
 // --------------------------------------------------------------------------------------------
 // The macOS host SysV table is tiny (kern.sysv.shmmni=32) and GLOBAL: it is not per-container, so real
 // software (postgres allocates many segments) hit ENOSPC where Linux succeeds, every container + the whole
@@ -11,7 +11,7 @@
 // with Linux-like limits:
 //
 //   * A per-container CONTROL BLOCK, a named POSIX shared-memory object (shm_open) keyed by the container
-//     identity (DD_NETNS, else the container init / engine-root pid) so two containers never collide and a
+//     identity (HL_NETNS, else the container init / engine-root pid) so two containers never collide and a
 //     leak in one namespace can never break another. It holds a robust cross-process spinlock plus the
 //     descriptor tables for shm segments, semaphore sets (values inline) and message queues. Every process
 //     in the container mmap()s the SAME object MAP_SHARED, so they all see one coherent id<->key table --
@@ -149,7 +149,7 @@ struct sembuf_guest {
 };
 
 // ============================================================================================
-// dd-internal shared registry
+// HL-internal shared registry
 // ============================================================================================
 // Advertised Linux-like limits (also mirrored in /proc/sys/kernel/{shmmni,shmmax,shmall,sem,msgmni,...}).
 #define DDIPC_SHMMAX 0xffffffffffffffffULL
@@ -289,7 +289,7 @@ static size_t dd_pground(size_t n) {
 }
 
 // ---- namespace + object names --------------------------------------------------------------------
-// Key the namespace by DD_NETNS (per-IPC-ns isolation; --network host leaves it unset -> shared). When
+// Key the namespace by HL_NETNS (per-IPC-namespace isolation; host networking leaves it unset and shared). When
 // unset we fall back to the container init pid (daemon path) or the engine-root pid (single-binary/test
 // path, captured by the constructor and COW-inherited by every child) -- unique per run, shared by the
 // whole process tree, so a leak is per-run and cross-run runs never collide.
@@ -311,15 +311,15 @@ static uint32_t ipc_ns(void) {
     return h;
 }
 
-static void dd_ctrl_name(char *out, size_t n) {
+static void hl_ipc_control_name(char *out, size_t n) {
     snprintf(out, n, "/di%08xC", ipc_ns());
 }
 
-static void dd_shm_name(char *out, size_t n, uint32_t idx) {
+static void hl_ipc_shm_name(char *out, size_t n, uint32_t idx) {
     snprintf(out, n, "/di%08xs%x", ipc_ns(), idx);
 }
 
-static void dd_msg_name(char *out, size_t n, uint32_t idx) {
+static void hl_ipc_message_name(char *out, size_t n, uint32_t idx) {
     snprintf(out, n, "/di%08xm%x", ipc_ns(), idx);
 }
 
@@ -354,7 +354,7 @@ static void sysv_on_exit(void);
 static struct ddipc_ctrl *dd_ctrl(void) {
     if (g_ctrl) return g_ctrl;
     char nm[40];
-    dd_ctrl_name(nm, sizeof nm);
+    hl_ipc_control_name(nm, sizeof nm);
     int created = 0, fd = shm_open(nm, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd >= 0) {
         created = 1;
@@ -402,7 +402,7 @@ static struct ddmsg_store *dd_msg_store(uint32_t idx, uint32_t seq, int create) 
     pthread_mutex_unlock(&g_ipc_local_m);
 
     char nm[40];
-    dd_msg_name(nm, sizeof nm, idx);
+    hl_ipc_message_name(nm, sizeof nm, idx);
     int fd;
     if (create) {
         shm_unlink(nm); // clear any stale object at this (ns,idx) before (re)creating
@@ -519,7 +519,7 @@ static uint32_t shm_idx_of(struct ddipc_ctrl *C, const struct ddshm *s) {
 
 static void shm_free(struct ddipc_ctrl *C, uint32_t idx) {
     char nm[40];
-    dd_shm_name(nm, sizeof nm, idx);
+    hl_ipc_shm_name(nm, sizeof nm, idx);
     shm_unlink(nm);
     uint32_t seq = C->shm[idx].perm.seq + 1;
     memset(&C->shm[idx], 0, sizeof C->shm[idx]);
@@ -620,7 +620,7 @@ static uint32_t msg_idx_of(struct ddipc_ctrl *C, const struct ddmsgq *q) {
 static void msg_free(struct ddipc_ctrl *C, uint32_t idx) {
     dd_msg_uncache(idx);
     char nm[40];
-    dd_msg_name(nm, sizeof nm, idx);
+    hl_ipc_message_name(nm, sizeof nm, idx);
     shm_unlink(nm);
     uint32_t seq = C->msg[idx].perm.seq + 1;
     memset(&C->msg[idx], 0, sizeof C->msg[idx]);
@@ -771,20 +771,20 @@ static void sysv_on_exit(void) {
         for (int i = 0; i < DDIPC_SHMMNI; i++)
             if (C->shm[i].inuse) {
                 char nm[40];
-                dd_shm_name(nm, sizeof nm, (uint32_t)i);
+                hl_ipc_shm_name(nm, sizeof nm, (uint32_t)i);
                 shm_unlink(nm);
             }
         for (int i = 0; i < DDIPC_MSGMNI; i++)
             if (C->msg[i].inuse) {
                 char nm[40];
-                dd_msg_name(nm, sizeof nm, (uint32_t)i);
+                hl_ipc_message_name(nm, sizeof nm, (uint32_t)i);
                 shm_unlink(nm);
             }
     }
     dd_unlock(&C->lock);
     if (gc) {
         char nm[40];
-        dd_ctrl_name(nm, sizeof nm);
+        hl_ipc_control_name(nm, sizeof nm);
         shm_unlink(nm);
     }
 }
@@ -856,7 +856,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         char nm[40];
-        dd_shm_name(nm, sizeof nm, (uint32_t)idx);
+        hl_ipc_shm_name(nm, sizeof nm, (uint32_t)idx);
         shm_unlink(nm);
         int fd = shm_open(nm, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd < 0) {
@@ -914,7 +914,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         uint32_t idx = shm_idx_of(C, s);
         size_t len = dd_pground(s->segsz);
         char nm[40];
-        dd_shm_name(nm, sizeof nm, idx);
+        hl_ipc_shm_name(nm, sizeof nm, idx);
         dd_unlock(&C->lock); // shm_open/mmap can be slow -- don't hold the lock across them
         int fd = shm_open(nm, O_RDWR, 0600);
         if (fd < 0) {

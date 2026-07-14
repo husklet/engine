@@ -322,11 +322,12 @@ static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_li
 }
 
 static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory, const char *path, size_t path_size,
-                                         uint32_t access, uint32_t creation) {
+                                         uint32_t access, uint32_t creation, uint32_t permissions) {
     hl_host_linux *host = context;
     char local[PATH_MAX];
     int directory_fd;
     int descriptor;
+    int append_descriptor = -1;
     if (path == NULL || path_size == 0 || path_size >= sizeof(local))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     memcpy(local, path, path_size);
@@ -344,15 +345,27 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
         flags = O_RDONLY;
     else
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if ((access & HL_HOST_FILE_APPEND) != 0) flags |= O_APPEND;
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
     if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
     if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
     if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
-    descriptor = openat(directory_fd, local, flags | O_CLOEXEC, 0600);
+    descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
     if (descriptor < 0) return hl_linux_errno_result();
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, NULL, 0, -1);
-    if (result.status != HL_STATUS_OK) close(descriptor);
+    if ((access & HL_HOST_FILE_APPEND) != 0) {
+        int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+        append_descriptor = openat(directory_fd, local, append_flags | O_APPEND | O_CLOEXEC, 0);
+        if (append_descriptor < 0) {
+            hl_host_result error = hl_linux_errno_result();
+            close(descriptor);
+            return error;
+        }
+    }
+    hl_host_result result =
+        hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, NULL, 0, append_descriptor);
+    if (result.status != HL_STATUS_OK) {
+        close(descriptor);
+        if (append_descriptor >= 0) close(append_descriptor);
+    }
     return result;
 }
 
@@ -381,6 +394,33 @@ static hl_host_result hl_linux_file_write(void *context, hl_host_handle file, ui
     if (descriptor < 0 || offset > INT64_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     count = pwrite(descriptor, input.data, input.size, (off_t)offset);
     return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
+    hl_host_linux *host = context;
+    uint32_t low = (uint32_t)file;
+    hl_linux_handle_entry *entry;
+    int descriptor;
+    ssize_t count;
+    off_t end;
+    if (input.size != 0 && input.data == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    entry = &host->handles[low - 1u];
+    descriptor = entry->generation == (uint32_t)(file >> 32) && entry->kind == HL_LINUX_HANDLE_FILE
+                     ? entry->wake_descriptor
+                     : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* The descriptor was opened O_APPEND: this write is atomic with every other O_APPEND write. */
+    count = write(descriptor, input.data, input.size);
+    if (count < 0) return hl_linux_errno_result();
+    end = lseek(descriptor, 0, SEEK_CUR);
+    if (end < 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)count, (uint64_t)end);
 }
 
 static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle file, hl_host_file_metadata *output) {
@@ -703,10 +743,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_linux_monotonic,
                                                  hl_linux_realtime};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
-    static const hl_host_file_services file = {HL_HOST_FILE_ABI,         sizeof(file),
-                                               hl_linux_file_open,       hl_linux_file_read,
-                                               hl_linux_file_write,      hl_linux_file_metadata_get,
-                                               hl_linux_close_descriptor};
+    static const hl_host_file_services file = {
+        HL_HOST_FILE_ABI,    sizeof(file),         hl_linux_file_open,         hl_linux_file_read,
+        hl_linux_file_write, hl_linux_file_append, hl_linux_file_metadata_get, hl_linux_close_descriptor};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};

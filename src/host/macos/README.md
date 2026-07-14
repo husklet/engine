@@ -1,5 +1,4 @@
 # macOS host backend
 
-Move Mach VM, `MAP_JIT`, kqueue, process/thread, BSD filesystem/network and IOSurface ownership here one
-service group at a time. No macOS header may be included outside this directory, the runner packaging target,
-or the not-yet-migrated production implementation.
+Mach VM, `MAP_JIT`, clocks, process/thread, BSD filesystem/network, and IOSurface operations belong to this backend.
+No macOS header may be included by portable core, translator, or Linux ABI code.

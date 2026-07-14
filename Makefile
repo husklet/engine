@@ -48,9 +48,9 @@ UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
 FIXTURE_SOURCES := $(sort $(wildcard tests/compat/fixtures/*.c))
 FIXTURE_BINS := $(FIXTURE_SOURCES:tests/compat/fixtures/%.c=$(BUILD)/fixtures/%)
-NATIVE_SMOKE := atomics clockelapsed epoll epoll_edge eventfd eventfd_sema forkwait mmapanon mmapshared statx_agree timerfd
+NATIVE_SMOKE := atomics clockelapsed epoll epoll_edge eventfd eventfd_sema forkwait mmapanon mmapshared statx_agree sysv_ipc timerfd
 NATIVE_SMOKE_BINS := $(NATIVE_SMOKE:%=$(BUILD)/fixtures/%)
-E2E_CASES := atomics epoll_edge eventfd forkwait
+E2E_CASES := atomics epoll_edge eventfd forkwait sysv_ipc
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
@@ -238,6 +238,6 @@ help:
 	@echo 'make all           build pure-C static libraries and runner'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
 	@echo 'make compat-build  compile every imported compatibility fixture'
-	@echo 'make e2e-compat    build/codesign transferred engines and execute both guest ISAs'
+	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
 	@echo 'make format-check  enforce the repository clang-format policy'

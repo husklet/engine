@@ -28,15 +28,9 @@ static int cfd_read_full(int fd, void *buf, size_t n) {
         ssize_t r = read(fd, p + got, n - got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            if (hl_option_get("HL_CONFIGFD_DEBUG"))
-                fprintf(stderr, "[HLCONFIG] fd=%d read error got=%zu want=%zu errno=%d\n", fd, got, n, errno);
             return -1;
         }
         if (r == 0) {
-            if (hl_option_get("HL_CONFIGFD_DEBUG")) {
-                int fl = fcntl(fd, F_GETFD, 0);
-                fprintf(stderr, "[HLCONFIG] fd=%d eof got=%zu want=%zu fdflags=%d errno=%d\n", fd, got, n, fl, errno);
-            }
             return -1;
         } // premature EOF
         got += (size_t)r;

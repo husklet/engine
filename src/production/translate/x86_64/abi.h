@@ -61,13 +61,4 @@
 // g_prof_t2 lives in the shared jit/cache.c, g_prof_t2fold in frontend/x86_64/engine_glue.c -- both
 // defined before the shared service.c is #included in the x86 unity TU.
 static void xs_dump(void); // EXITSTAT diagnostic histogram (defined in avx.c; no-op unless EXITSTAT set)
-#define G_PROF_EXTRA                                                                                                   \
-    do {                                                                                                               \
-        if (hl_option_get("HL_PROF"))                                                                                            \
-            fprintf(stderr,                                                                                            \
-                    "[prof] tier2=%llu tier2_fold_elide=%llu xflag_elide=%llu xflag_scan=%llu shflag_elide=%llu\n",    \
-                    (unsigned long long)g_prof_t2, (unsigned long long)g_prof_t2fold,                                  \
-                    (unsigned long long)g_prof_xflag, (unsigned long long)g_prof_xflag_scan,                           \
-                    (unsigned long long)g_prof_shflag);                                                                \
-        xs_dump();                                                                                                     \
-    } while (0)
+#define G_PROF_EXTRA do {} while (0)

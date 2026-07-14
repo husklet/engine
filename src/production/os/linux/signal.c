@@ -46,19 +46,6 @@ int g_go_iscgo; // 1 iff the loaded aarch64 main image is a cgo (iscgo) Go binar
 // Should SIGURG (Go async-preempt) delivery be dropped for this process? Env override wins; else auto on the
 // detected iscgo class. Env is parsed once (it never changes); g_go_iscgo is fixed before any signal fires.
 static int sigurg_drop_enabled(void) {
-    static int cached = -2; // -2 uncomputed; -1 auto; 0 force-deliver; 1 force-drop
-    if (cached == -2) {
-        const char *e = hl_option_get("HL_SIGURG");
-        if (e && (!strcmp(e, "deliver") || !strcmp(e, "async") || !strcmp(e, "on")))
-            cached = 0;
-        else if (e && (!strcmp(e, "drop") || !strcmp(e, "off")))
-            cached = 1;
-        else if (hl_option_get("HL_DEBUG_DROPURG"))
-            cached = 1; // legacy repro/debug knob
-        else
-            cached = -1; // auto
-    }
-    if (cached >= 0) return cached;
     return g_go_iscgo ? 1 : 0;
 }
 
@@ -604,7 +591,7 @@ static int sig_diag_put_hex(char *b, int n, const char *k, uint64_t v) {
 }
 
 static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c) {
-    if (!hl_option_get("HL_FATALSIG_LOG")) return;
+    return;
     char b[384];
     int n = 0;
     n = sig_diag_put(b, n, "[HLFATAL]");
@@ -626,7 +613,7 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
 }
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
-    if (!hl_option_get("HL_FATALSIG_LOG")) return;
+    return;
     ucontext_t *u = (ucontext_t *)ucv;
 #if defined(__aarch64__)
     uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
@@ -665,7 +652,7 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
-    if (!hl_option_get("HL_FATALSIG_LOG")) return;
+    return;
     char b[384];
     int n = 0;
     n = sig_diag_put(b, n, "[HLRAISE]");

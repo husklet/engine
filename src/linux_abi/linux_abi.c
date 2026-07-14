@@ -319,6 +319,163 @@ done:
     return result;
 }
 
+static int64_t hl_linux_write_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd, const void *buffer, size_t size,
+                                    uint64_t offset, int append, uint64_t *resulting_offset) {
+    const hl_host_file_services *files;
+    hl_host_result result;
+    if (size != 0 && buffer == NULL) return -HL_LINUX_EINVAL;
+    files = hl_linux_files(linux_abi);
+    if (files == NULL) return -HL_LINUX_ENOSYS;
+    if (append) {
+        if (files->append == NULL) return -HL_LINUX_ENOSYS;
+        result = files->append(linux_abi->host->context, ofd->host_handle, (hl_host_const_bytes){buffer, size});
+    } else {
+        if (files->write_at == NULL) return -HL_LINUX_ENOSYS;
+        result =
+            files->write_at(linux_abi->host->context, ofd->host_handle, offset, (hl_host_const_bytes){buffer, size});
+    }
+    if (result.status != HL_STATUS_OK) return hl_linux_error((hl_status)result.status);
+    if (result.value > size || result.value > (uint64_t)INT64_MAX) return -HL_LINUX_EIO;
+    if (append) {
+        if (result.detail < result.value || result.detail > (uint64_t)INT64_MAX) return -HL_LINUX_EIO;
+        *resulting_offset = result.detail;
+    }
+    return (int64_t)result.value;
+}
+
+int64_t hl_linux_pwrite64(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size, uint64_t offset) {
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    uint64_t ignored_offset = 0;
+    int64_t result;
+    hl_status status;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    if (size > (size_t)INT64_MAX) return -HL_LINUX_EINVAL;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, NULL, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
+    if ((ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_RDONLY) {
+        hl_linux_unlock(linux_abi);
+        return -HL_LINUX_EBADF;
+    }
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(ofd);
+    result = hl_linux_write_owned(linux_abi, ofd, buffer, size, offset, 0, &ignored_offset);
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(ofd);
+    return result;
+}
+
+int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size) {
+    const hl_linux_fd_entry *fd_entry;
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    uint64_t resulting_offset = 0;
+    int append;
+    int64_t result;
+    hl_status status;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    if (size > (size_t)INT64_MAX) return -HL_LINUX_EINVAL;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, &fd_entry, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[fd_entry->ofd];
+    if ((ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_RDONLY) {
+        hl_linux_unlock(linux_abi);
+        return -HL_LINUX_EBADF;
+    }
+    append = (ofd->status_flags & HL_LINUX_O_APPEND) != 0;
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(ofd);
+    result = hl_linux_write_owned(linux_abi, ofd, buffer, size, ofd->offset, append, &resulting_offset);
+    if (result > 0) {
+        uint64_t count = (uint64_t)result;
+        if (append)
+            ofd->offset = resulting_offset;
+        else if (UINT64_MAX - ofd->offset >= count)
+            ofd->offset += count;
+        else
+            result = -HL_LINUX_EIO;
+    }
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(ofd);
+    return result;
+}
+
+int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
+                        uint32_t flags, uint32_t mode) {
+    const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
+                               HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
+    const hl_host_file_services *files;
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *directory_ofd = NULL;
+    hl_host_handle directory = HL_HOST_HANDLE_CWD;
+    hl_host_result opened;
+    hl_linux_fd installed;
+    uint32_t access;
+    uint32_t creation = 0;
+    hl_status status;
+    if (linux_abi == NULL || path == NULL || path_size == 0 || (flags & ~supported) != 0) return -HL_LINUX_EINVAL;
+    switch (flags & HL_LINUX_O_ACCMODE) {
+    case HL_LINUX_O_RDONLY: access = HL_HOST_FILE_READ; break;
+    case HL_LINUX_O_WRONLY: access = HL_HOST_FILE_WRITE; break;
+    case HL_LINUX_O_RDWR: access = HL_HOST_FILE_READ | HL_HOST_FILE_WRITE; break;
+    default: return -HL_LINUX_EINVAL;
+    }
+    if ((flags & HL_LINUX_O_APPEND) != 0) access |= HL_HOST_FILE_APPEND;
+    if ((flags & HL_LINUX_O_DIRECTORY) != 0) access |= HL_HOST_FILE_DIRECTORY;
+    if ((flags & HL_LINUX_O_CREAT) != 0) creation |= HL_HOST_FILE_CREATE;
+    if ((flags & HL_LINUX_O_EXCL) != 0) creation |= HL_HOST_FILE_EXCLUSIVE;
+    if ((flags & HL_LINUX_O_TRUNC) != 0) creation |= HL_HOST_FILE_TRUNCATE;
+    files = hl_linux_files(linux_abi);
+    if (files == NULL || files->open_relative == NULL) return -HL_LINUX_ENOSYS;
+
+    if (directory_fd != HL_LINUX_AT_FDCWD) {
+        if (directory_fd < 0) return -HL_LINUX_EBADF;
+        hl_linux_lock(linux_abi);
+        status = hl_linux_fd_get_unlocked(linux_abi, (hl_linux_fd)directory_fd, NULL, &found);
+        if (status != HL_STATUS_OK) {
+            hl_linux_unlock(linux_abi);
+            return -HL_LINUX_EBADF;
+        }
+        directory_ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
+        directory_ofd->active_operations++;
+        hl_linux_unlock(linux_abi);
+        hl_linux_ofd_lock(directory_ofd);
+        directory = directory_ofd->host_handle;
+    }
+
+    opened = files->open_relative(linux_abi->host->context, directory, path, path_size, access, creation, mode);
+    if (directory_ofd != NULL) {
+        hl_linux_lock(linux_abi);
+        directory_ofd->active_operations--;
+        hl_linux_unlock(linux_abi);
+        hl_linux_ofd_unlock(directory_ofd);
+    }
+    if (opened.status != HL_STATUS_OK)
+        return opened.status == HL_STATUS_NOT_FOUND ? -HL_LINUX_ENOENT : hl_linux_error((hl_status)opened.status);
+    status = hl_linux_fd_install(linux_abi, opened.value, flags & ~(uint32_t)HL_LINUX_O_CLOEXEC,
+                                 (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0, &installed);
+    if (status != HL_STATUS_OK) {
+        if (files->close != NULL) (void)files->close(linux_abi->host->context, opened.value);
+        return hl_linux_error(status);
+    }
+    return (int64_t)installed;
+}
+
 int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {
     const hl_host_file_services *files;
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;

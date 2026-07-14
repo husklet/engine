@@ -195,12 +195,7 @@ static void exec_close_cloexec(void) {
 // fork-cost histogram (DD_FORKPROF=1, read once) prints one stderr line per fork with per-hook wall-ns
 // deltas so a regression in the fork path is measurable, at zero cost when unset.
 static int forkprof_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = hl_option_get("HL_FORKPROF");
-        on = (e && e[0] == '1') ? 1 : 0;
-    }
-    return on;
+    return 0;
 }
 
 static void fork_child_hooks(struct cpu *c) {
@@ -257,7 +252,7 @@ static void fork_child_hooks(struct cpu *c) {
     // The CRASHDBG Mach exception port + its receiver thread do NOT survive fork, so a crash in the
     // child silently dies. Clear the inherited task exception port so a fault falls through to the
     // POSIX diag_crash handler (which IS inherited) and reports fault=/pc=.
-    if (hl_option_get("HL_CRASHDBG"))
+    if (0)
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION, MACH_PORT_NULL,
                                  EXCEPTION_DEFAULT, 0);
 #endif
@@ -502,7 +497,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // exit_group: end the whole process
     case 94:
-        if (hl_option_get("HL_PROF"))
+        if (0)
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
                     "wx_toggles=%llu dualmap=%d xlate_ms=%.3f mtibtc=%d mtfill=%llu futexq=%d "
@@ -514,7 +509,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     (unsigned long long)g_futex_wake_slow, (unsigned long long)g_futex_wait_n);
         // A3: §B shadow-return coverage. hit-rate = shret_hit / (shret_hit + shret_fb). bl_shadow /
         // bl_leaf show how the depth-gate split call sites at translate time. PROF-only (keep dark).
-        if (hl_option_get("HL_PROF")) {
+        if (0) {
             unsigned long long h = (unsigned long long)g_prof_shret_hit, f = (unsigned long long)g_prof_shret_fb;
             double hr = (h + f) ? 100.0 * (double)h / (double)(h + f) : 0.0;
             fprintf(

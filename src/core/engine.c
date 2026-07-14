@@ -13,7 +13,7 @@ uint32_t hl_engine_abi(void) {
 }
 
 const char *hl_engine_version(void) {
-    return "0.1.0-phase5";
+    return "0.1.0";
 }
 
 hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine) {

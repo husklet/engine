@@ -1,4 +1,4 @@
 # Windows host backend
 
-Future Win32/NT implementation of `hl_host_services`. Guest fork, epoll and signals stay in the Linux ABI
-model and are implemented using spawn/state restoration, IOCP/waits and engine-controlled interruption.
+This directory reserves the Win32/NT implementation boundary for `hl_host_services`; no Windows backend is
+currently built. Guest fork, epoll, and signal semantics remain owned by the Linux ABI rather than a host passthrough.

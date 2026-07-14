@@ -572,7 +572,7 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     // DIAGNOSTIC (gated, async-signal-safe, NO user-pointer deref): every no-handler fault about to be
     // turned into a fatal guest termination or re-raised. Prints sig / host PC / fault addr / host SP +
     // whether the host PC is inside the RX code cache (1 = a wild jump in translated guest code).
-    if (hl_option_get("HL_DEBUG_ENGFAULT")) {
+    if (0) {
         extern int jit_pc_in_cache(uint64_t pc, uint64_t *base);
         ucontext_t *u = (ucontext_t *)uc;
         uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
@@ -639,7 +639,6 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
 // the high faulting PC, never in the low link range), so reuse it. CRASHDBG handles these via its mach
 // exception port + diag_crash instead, so leave its diagnostics untouched.
 __attribute__((constructor)) static void install_sync_fault_guards(void) {
-    if (hl_option_get("HL_CRASHDBG")) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = nonpie_guard;
@@ -712,9 +711,6 @@ static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char
             r = mprotect(addr, len, prot);
         }
         if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) {
-            if (r != 0 && hl_option_get("HL_JT"))
-                fprintf(stderr, "dd: load_elf: mprotect %s (%zu bytes) skipped: %s (region stays R+W, backed)\n", what,
-                        len, strerror(errno));
             return;
         }
         usleep(2000u << t); // transient pressure: back off and re-tighten
@@ -878,9 +874,6 @@ static void load_elf(const char *path, struct loaded *out) {
     int nonpie = (etype == 2);
     out->entry = nonpie ? e_entry : (e_entry + bias);
     out->base = (uint64_t)base;
-    if (hl_option_get("HL_JT"))
-        fprintf(stderr, "[LOADED] %s base=%llx entry=%llx\n", path, (unsigned long long)base,
-                (unsigned long long)out->entry);
     // phdrs live at file offset phoff in seg 0. Non-PIE: report the LOW link vaddr (base+phoff-bias) so the
     // main link_map is built LOW; PIE: the real HIGH address.
     out->phdr = nonpie ? ((uint64_t)base + phoff - bias) : ((uint64_t)base + phoff);

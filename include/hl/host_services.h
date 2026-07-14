@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 1u
+#define HL_HOST_FILE_ABI 2u
 #define HL_HOST_PROCESS_ABI 1u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
@@ -136,9 +136,15 @@ typedef struct hl_host_file_metadata {
 typedef struct hl_host_file_services {
     HL_ABI_HEADER;
     hl_host_result (*open_relative)(void *context, hl_host_handle directory, const char *path, size_t path_size,
-                                    uint32_t access, uint32_t creation);
+                                    uint32_t access, uint32_t creation, uint32_t permissions);
     hl_host_result (*read_at)(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output);
     hl_host_result (*write_at)(void *context, hl_host_handle file, uint64_t offset, hl_host_const_bytes input);
+    /*
+     * One indivisible append on a handle opened with HL_HOST_FILE_APPEND.
+     * value is bytes written; detail is the file offset immediately afterward.
+     * The host, not the guest ABI, owns cross-thread/process append atomicity.
+     */
+    hl_host_result (*append)(void *context, hl_host_handle file, hl_host_const_bytes input);
     hl_host_result (*metadata)(void *context, hl_host_handle file, hl_host_file_metadata *output);
     hl_host_result (*close)(void *context, hl_host_handle file);
 } hl_host_file_services;

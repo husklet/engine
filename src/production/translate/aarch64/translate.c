@@ -1955,7 +1955,7 @@ static void tier2_promote(uint64_t gpc) {
     void *nh = translate_block(gpc); // folded recompile; no counter, no map_put
     void *nb = g_last_body;
     g_tier2_build = 0;
-    if (hl_option_get("HL_T2DUMP")) {
+    if (0) {
         fprintf(stderr, "[t2dump] gpc=%llx body+%ld:", (unsigned long long)gpc, (long)((uint8_t *)nb - (uint8_t *)nh));
         for (uint32_t *p = (uint32_t *)nb; (uint8_t *)p < g_cp; p++)
             fprintf(stderr, " %08x", *p);

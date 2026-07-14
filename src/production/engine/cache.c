@@ -408,7 +408,6 @@ static void md_dump_to(const char *pfx) {
 }
 
 static void md_dump(void) {
-    md_dump_to(hl_option_get("HL_MAPDUMP"));
 }
 
 // ARM-B1: recognize a clang jump-table switch dispatch at a guest `br xN`. The compiler emits
@@ -812,12 +811,6 @@ static void *md_watcher(void *arg) {
 }
 
 static void md_sig_install(void) {
-    const char *pfx = hl_option_get("HL_MAPDUMP");
-    if (!pfx) return;
-    static _Atomic int spawned;
-    if (atomic_exchange_explicit(&spawned, 1, memory_order_seq_cst) != 0) return;
-    pthread_t t;
-    if (pthread_create(&t, NULL, md_watcher, (void *)pfx) == 0) pthread_detach(t);
 }
 
 // Unmap a retired cache's mapping(s): the RW base, plus the RX alias when dual-mapped (delta != 0).

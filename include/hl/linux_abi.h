@@ -18,6 +18,7 @@ typedef uint32_t hl_linux_ofd;
 
 /* Linux guest errno numbers returned by this library as negative syscall results. */
 typedef enum hl_linux_errno {
+    HL_LINUX_ENOENT = 2,
     HL_LINUX_EINTR = 4,
     HL_LINUX_EIO = 5,
     HL_LINUX_EBADF = 9,
@@ -30,6 +31,22 @@ typedef enum hl_linux_errno {
     HL_LINUX_ENFILE = 23,
     HL_LINUX_ENOSYS = 38
 } hl_linux_errno;
+
+enum {
+    HL_LINUX_O_ACCMODE = 00000003u,
+    HL_LINUX_O_RDONLY = 00000000u,
+    HL_LINUX_O_WRONLY = 00000001u,
+    HL_LINUX_O_RDWR = 00000002u,
+    HL_LINUX_O_CREAT = 00000100u,
+    HL_LINUX_O_EXCL = 00000200u,
+    HL_LINUX_O_TRUNC = 00001000u,
+    HL_LINUX_O_APPEND = 00002000u,
+    HL_LINUX_O_DIRECTORY = 00200000u,
+    HL_LINUX_O_CLOEXEC = 02000000u,
+    HL_LINUX_FD_CLOEXEC = 1u
+};
+
+#define HL_LINUX_AT_FDCWD (-100)
 
 typedef struct hl_linux_ofd_entry {
     /* Host object owned by this OFD. Closed when the final descriptor is closed. */
@@ -119,6 +136,12 @@ HL_API hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linu
  */
 HL_API int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t size);
 HL_API int64_t hl_linux_pread64(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t size, uint64_t offset);
+HL_API int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size);
+HL_API int64_t hl_linux_pwrite64(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size,
+                                 uint64_t offset);
+/* path is translated guest memory; mode is used only with O_CREAT. */
+HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
+                               uint32_t flags, uint32_t mode);
 /* close() invalidates this descriptor even if the host reports a late close error. */
 HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
 

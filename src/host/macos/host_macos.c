@@ -3,7 +3,9 @@
 #include "hl/host_macos.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <libkern/OSCacheControl.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
@@ -11,10 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #define HL_MACOS_MAPPING_CAPACITY 4096u
+#define HL_MACOS_FILE_CAPACITY 1024u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -24,9 +28,17 @@ typedef struct hl_macos_mapping {
     uint64_t size;
 } hl_macos_mapping;
 
+typedef struct hl_macos_file {
+    uint32_t generation;
+    uint32_t active;
+    int descriptor;
+    int append_descriptor;
+} hl_macos_file;
+
 struct hl_host_macos {
     pthread_mutex_t lock;
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
+    hl_macos_file files[HL_MACOS_FILE_CAPACITY];
 };
 
 static hl_host_result hl_macos_result(hl_status status, uint64_t value, uint64_t detail) {
@@ -38,6 +50,10 @@ static hl_status hl_macos_status(int error) {
     case 0: return HL_STATUS_OK;
     case EINVAL: return HL_STATUS_INVALID_ARGUMENT;
     case ENOMEM: return HL_STATUS_OUT_OF_MEMORY;
+    case EMFILE:
+    case ENFILE: return HL_STATUS_RESOURCE_LIMIT;
+    case ENOENT: return HL_STATUS_NOT_FOUND;
+    case EEXIST: return HL_STATUS_ALREADY_EXISTS;
     case EACCES:
     case EPERM: return HL_STATUS_PERMISSION_DENIED;
     case EAGAIN: return HL_STATUS_WOULD_BLOCK;
@@ -270,6 +286,169 @@ static hl_host_result hl_macos_realtime(void *context) {
     return hl_macos_clock(CLOCK_REALTIME);
 }
 
+static hl_macos_file *hl_macos_file_lookup(hl_host_macos *host, hl_host_handle handle) {
+    uint32_t low = (uint32_t)handle;
+    uint32_t index;
+    if (low <= HL_MACOS_MAPPING_CAPACITY) return NULL;
+    index = low - HL_MACOS_MAPPING_CAPACITY - 1u;
+    if (index >= HL_MACOS_FILE_CAPACITY || !host->files[index].active ||
+        host->files[index].generation != (uint32_t)(handle >> 32))
+        return NULL;
+    return &host->files[index];
+}
+
+static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor, int append_descriptor) {
+    uint32_t index;
+    hl_host_handle handle = 0;
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < HL_MACOS_FILE_CAPACITY; ++index) {
+        hl_macos_file *file = &host->files[index];
+        if (!file->active) {
+            file->generation++;
+            if (file->generation == 0) file->generation = 1;
+            file->active = 1;
+            file->descriptor = descriptor;
+            file->append_descriptor = append_descriptor;
+            handle = ((uint64_t)file->generation << 32) | (HL_MACOS_MAPPING_CAPACITY + index + 1u);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&host->lock);
+    return handle != 0 ? hl_macos_result(HL_STATUS_OK, handle, 0) : hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+}
+
+static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory, const char *path, size_t path_size,
+                                         uint32_t access, uint32_t creation, uint32_t permissions) {
+    hl_host_macos *host = context;
+    char local[PATH_MAX];
+    int directory_fd = AT_FDCWD;
+    int flags;
+    int descriptor;
+    int append_descriptor = -1;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    if (directory != HL_HOST_HANDLE_CWD) {
+        pthread_mutex_lock(&host->lock);
+        hl_macos_file *file = hl_macos_file_lookup(host, directory);
+        directory_fd = file != NULL ? file->descriptor : -1;
+        pthread_mutex_unlock(&host->lock);
+        if (directory_fd < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if ((access & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)) == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE))
+        flags = O_RDWR;
+    else if ((access & HL_HOST_FILE_WRITE) != 0)
+        flags = O_WRONLY;
+    else if ((access & HL_HOST_FILE_READ) != 0)
+        flags = O_RDONLY;
+    else
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+#ifdef O_DIRECTORY
+    if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
+#endif
+    if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
+    if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
+    if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
+    if (descriptor < 0) return hl_macos_errno();
+    if ((access & HL_HOST_FILE_APPEND) != 0) {
+        int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+        append_descriptor = openat(directory_fd, local, append_flags | O_APPEND | O_CLOEXEC, 0);
+        if (append_descriptor < 0) {
+            hl_host_result error = hl_macos_errno();
+            close(descriptor);
+            return error;
+        }
+    }
+    hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor);
+    if (result.status != HL_STATUS_OK) {
+        close(descriptor);
+        if (append_descriptor >= 0) close(append_descriptor);
+    }
+    return result;
+}
+
+static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append) {
+    hl_macos_file *file;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    file = hl_macos_file_lookup(host, handle);
+    descriptor = file == NULL ? -1 : (append ? file->append_descriptor : file->descriptor);
+    pthread_mutex_unlock(&host->lock);
+    return descriptor;
+}
+
+static hl_host_result hl_macos_file_read(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    ssize_t count;
+    if ((output.size != 0 && output.data == NULL) || descriptor < 0 || offset > INT64_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = pread(descriptor, output.data, output.size, (off_t)offset);
+    return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_macos_file_write(void *context, hl_host_handle file, uint64_t offset,
+                                          hl_host_const_bytes input) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    ssize_t count;
+    if ((input.size != 0 && input.data == NULL) || descriptor < 0 || offset > INT64_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = pwrite(descriptor, input.data, input.size, (off_t)offset);
+    return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_macos_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
+    int descriptor = hl_macos_file_descriptor(context, file, 1);
+    ssize_t count;
+    off_t offset;
+    if ((input.size != 0 && input.data == NULL) || descriptor < 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = write(descriptor, input.data, input.size);
+    if (count < 0) return hl_macos_errno();
+    offset = lseek(descriptor, 0, SEEK_CUR);
+    return offset < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, (uint64_t)offset);
+}
+
+static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle file, hl_host_file_metadata *output) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    struct stat status;
+    if (descriptor < 0 || output == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (fstat(descriptor, &status) != 0) return hl_macos_errno();
+    memset(output, 0, sizeof(*output));
+    output->stable_device = (uint64_t)status.st_dev;
+    output->stable_object = (uint64_t)status.st_ino;
+    output->size = (uint64_t)status.st_size;
+    output->allocated_size = (uint64_t)status.st_blocks * 512u;
+    output->modified_ns =
+        (uint64_t)status.st_mtimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtimespec.tv_nsec;
+    output->permissions = (uint32_t)status.st_mode & 07777u;
+    output->type = (uint32_t)status.st_mode & S_IFMT;
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    hl_macos_file *file;
+    int descriptor;
+    int append_descriptor;
+    pthread_mutex_lock(&host->lock);
+    file = hl_macos_file_lookup(host, handle);
+    if (file == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = file->descriptor;
+    append_descriptor = file->append_descriptor;
+    file->active = 0;
+    file->descriptor = -1;
+    file->append_descriptor = -1;
+    pthread_mutex_unlock(&host->lock);
+    if (close(descriptor) != 0) return hl_macos_errno();
+    if (append_descriptor >= 0 && close(append_descriptor) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static void hl_macos_log(void *context, uint32_t event, const char *message, size_t message_size) {
     size_t written = 0;
     (void)context;
@@ -292,6 +471,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_macos_monotonic,
                                                  hl_macos_realtime};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
+    static const hl_host_file_services file = {HL_HOST_FILE_ABI,           sizeof(file),        hl_macos_file_open,
+                                               hl_macos_file_read,         hl_macos_file_write, hl_macos_file_append,
+                                               hl_macos_file_metadata_get, hl_macos_file_close};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -304,11 +486,13 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
-    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_CODE_MAPPING;
+    out_services->capabilities =
+        HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE | HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
     out_services->log = &log;
+    out_services->file = &file;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -322,6 +506,12 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         munmap(mapping->writable, (size_t)mapping->size);
         if (mapping->executable != NULL && mapping->executable != mapping->writable)
             munmap(mapping->executable, (size_t)mapping->size);
+    }
+    for (index = 0; index < HL_MACOS_FILE_CAPACITY; ++index) {
+        hl_macos_file *file = &host->files[index];
+        if (!file->active) continue;
+        close(file->descriptor);
+        if (file->append_descriptor >= 0) close(file->append_descriptor);
     }
     pthread_mutex_destroy(&host->lock);
     free(host);

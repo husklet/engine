@@ -40,7 +40,7 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
         (!hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)) ||
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
-         services->file->metadata == NULL || services->file->close == NULL))
+         services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||
