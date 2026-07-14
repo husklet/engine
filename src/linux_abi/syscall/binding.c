@@ -1924,6 +1924,57 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
         break;
     }
+    case 61: {
+        uint64_t byte_capacity = a2 > UINT32_C(1 << 20) ? UINT32_C(1 << 20) : a2;
+        if (a2 < 24) {
+            result = -EINVAL;
+            break;
+        }
+        if (a1 == 0 || byte_capacity > SIZE_MAX ||
+            !host_range_mapped((uintptr_t)a1, (size_t)byte_capacity)) {
+            result = -EFAULT;
+            break;
+        }
+        uint32_t capacity = (uint32_t)(byte_capacity / 24);
+        hl_host_file_entry *entries = calloc(capacity, sizeof(*entries));
+        if (entries == NULL) {
+            result = -ENOMEM;
+            break;
+        }
+        hl_host_result read = g_host_services->file->read_directory(
+            g_host_services->context, source.host_handle, entries, capacity, (uint32_t)byte_capacity);
+        if (read.status != HL_STATUS_OK) {
+            result = bound_host_error(read.status);
+            free(entries);
+            break;
+        }
+        if (read.value > capacity) {
+            result = -EIO;
+            free(entries);
+            break;
+        }
+        uint8_t *output = (uint8_t *)(uintptr_t)a1;
+        size_t used = 0;
+        result = 0;
+        for (uint32_t index = 0; index < (uint32_t)read.value; ++index) {
+            size_t record_size = (19u + entries[index].name_size + 1u + 7u) & ~(size_t)7u;
+            if (entries[index].name_size > 255 || record_size > byte_capacity - used) {
+                result = -EIO;
+                break;
+            }
+            uint8_t *record = output + used;
+            memset(record, 0, record_size);
+            *(uint64_t *)(record + 0) = entries[index].object;
+            *(uint64_t *)(record + 8) = entries[index].next_offset;
+            *(uint16_t *)(record + 16) = (uint16_t)record_size;
+            record[18] = (uint8_t)entries[index].type;
+            memcpy(record + 19, entries[index].name, entries[index].name_size);
+            used += record_size;
+        }
+        if (result == 0) result = (int64_t)used;
+        free(entries);
+        break;
+    }
     case 23: result = bound_dup_at_least(source.fd, 0, 0); break;
     case 24: {
         uint32_t flags = (uint32_t)a2;
@@ -2060,7 +2111,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 20: return 0; /* epoll_create1: a0 is flags, not an fd */
     case 21:           /* epoll_ctl */
     case 22:           /* epoll_pwait */
-    case 61:           /* getdents64 */
     case 71:           /* sendfile */
     case 75:           /* vmsplice */
     case 76:           /* splice */

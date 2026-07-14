@@ -14,7 +14,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_ABI_14 14u
 #define HL_HOST_FILE_ABI_15 15u
 #define HL_HOST_FILE_ABI_16 16u
-#define HL_HOST_FILE_ABI 17u
+#define HL_HOST_FILE_ABI_17 17u
+#define HL_HOST_FILE_ABI 18u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -268,6 +269,25 @@ typedef struct hl_host_file_time {
     uint32_t mode;
 } hl_host_file_time;
 
+enum {
+    HL_HOST_DIRECTORY_TYPE_UNKNOWN = 0,
+    HL_HOST_DIRECTORY_TYPE_FIFO = 1,
+    HL_HOST_DIRECTORY_TYPE_CHARACTER = 2,
+    HL_HOST_DIRECTORY_TYPE_DIRECTORY = 4,
+    HL_HOST_DIRECTORY_TYPE_BLOCK = 6,
+    HL_HOST_DIRECTORY_TYPE_REGULAR = 8,
+    HL_HOST_DIRECTORY_TYPE_LINK = 10,
+    HL_HOST_DIRECTORY_TYPE_SOCKET = 12
+};
+
+typedef struct hl_host_file_entry {
+    uint64_t object;
+    uint64_t next_offset;
+    uint32_t type;
+    uint32_t name_size;
+    char name[256];
+} hl_host_file_entry;
+
 enum { HL_HOST_FILE_IOV_MAX = 1024 };
 enum {
     HL_HOST_FILE_SYNC_WAIT_BEFORE = 1u << 0,
@@ -338,6 +358,9 @@ typedef struct hl_host_file_services {
     hl_host_result (*set_permissions)(void *context, hl_host_handle file, uint32_t permissions);
     /* Atomically update access and modification times on the open object. */
     hl_host_result (*set_times)(void *context, hl_host_handle file, const hl_host_file_time times[2]);
+    /* Consume complete entries from the open directory's shared OFD cursor. */
+    hl_host_result (*read_directory)(void *context, hl_host_handle file, hl_host_file_entry *entries,
+                                     uint32_t entry_capacity, uint32_t byte_capacity);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

@@ -6,6 +6,7 @@
 #include "../sync.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
@@ -22,6 +23,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -1555,6 +1557,61 @@ static hl_host_result hl_linux_file_filesystem_metadata(void *context, hl_host_h
     output->name_max = NAME_MAX;
     output->flags = (uint64_t)status.f_flags;
     return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+typedef struct hl_linux_dirent64 {
+    uint64_t object;
+    int64_t offset;
+    uint16_t record_size;
+    uint8_t type;
+    char name[];
+} hl_linux_dirent64;
+
+static hl_host_result hl_linux_file_read_directory(void *context, hl_host_handle file, hl_host_file_entry *entries,
+                                                   uint32_t entry_capacity, uint32_t byte_capacity) {
+    hl_host_linux *host = context;
+    int descriptor;
+    uint8_t *buffer;
+    long count;
+    uint32_t at = 0, produced = 0;
+    if (entries == NULL || entry_capacity == 0 || byte_capacity < 24 || byte_capacity > UINT32_C(1 << 20))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    buffer = malloc(byte_capacity);
+    if (buffer == NULL) return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    do
+        count = syscall(SYS_getdents64, descriptor, buffer, byte_capacity);
+    while (count < 0 && errno == EINTR);
+    if (count < 0) {
+        free(buffer);
+        return hl_linux_errno_result();
+    }
+    while (at < (uint32_t)count) {
+        const hl_linux_dirent64 *native = (const hl_linux_dirent64 *)(buffer + at);
+        size_t maximum, name_size;
+        if (native->record_size < 24 || native->record_size > (uint32_t)count - at || produced == entry_capacity) {
+            free(buffer);
+            return hl_linux_result(HL_STATUS_CORRUPT, 0, 0);
+        }
+        maximum = native->record_size - offsetof(hl_linux_dirent64, name);
+        name_size = strnlen(native->name, maximum);
+        if (name_size == maximum || name_size > 255) {
+            free(buffer);
+            return hl_linux_result(HL_STATUS_CORRUPT, 0, 0);
+        }
+        entries[produced].object = native->object;
+        entries[produced].next_offset = (uint64_t)native->offset;
+        entries[produced].type = native->type;
+        entries[produced].name_size = (uint32_t)name_size;
+        memcpy(entries[produced].name, native->name, name_size + 1);
+        produced++;
+        at += native->record_size;
+    }
+    free(buffer);
+    return hl_linux_result(HL_STATUS_OK, produced, (uint64_t)count);
 }
 
 static hl_host_result hl_linux_file_path(void *context, hl_host_handle file, hl_host_bytes output) {
@@ -3104,7 +3161,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_allocate_range,
                                                hl_linux_file_filesystem_metadata,
                                                hl_linux_file_set_permissions,
-                                               hl_linux_file_set_times};
+                                               hl_linux_file_set_times,
+                                               hl_linux_file_read_directory};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

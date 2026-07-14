@@ -6,6 +6,7 @@
 #include "../sync.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <libkern/OSCacheControl.h>
 #include <limits.h>
@@ -24,6 +25,7 @@
 #include <sys/mount.h>
 #include <sys/event.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/sem.h>
 #include <sys/uio.h>
@@ -1647,6 +1649,56 @@ static hl_host_result hl_macos_file_filesystem_metadata(void *context, hl_host_h
     output->name_max = NAME_MAX;
     output->flags = (uint64_t)status.f_flags;
     return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_file_read_directory(void *context, hl_host_handle file, hl_host_file_entry *entries,
+                                                   uint32_t entry_capacity, uint32_t byte_capacity) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    uint8_t *buffer;
+    off_t base;
+    long count;
+    uint32_t at = 0, produced = 0;
+    if (descriptor < 0 || entries == NULL || entry_capacity == 0 || byte_capacity < 24 ||
+        byte_capacity > UINT32_C(1 << 20))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    buffer = malloc(byte_capacity);
+    if (buffer == NULL) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    base = lseek(descriptor, 0, SEEK_CUR);
+    if (base < 0) {
+        free(buffer);
+        return hl_macos_errno();
+    }
+    do
+        count = syscall(SYS_getdirentries64, descriptor, buffer, byte_capacity, &base);
+    while (count < 0 && errno == EINTR);
+    if (count < 0) {
+        free(buffer);
+        return hl_macos_errno();
+    }
+    while (at < (uint32_t)count) {
+        const struct dirent *native = (const struct dirent *)(buffer + at);
+        size_t name_size;
+        if (native->d_reclen < 24 || native->d_reclen > (uint32_t)count - at || produced == entry_capacity) {
+            free(buffer);
+            return hl_macos_result(HL_STATUS_CORRUPT, 0, 0);
+        }
+        name_size = strnlen(native->d_name, native->d_reclen - offsetof(struct dirent, d_name));
+        if (name_size > 255 || name_size == native->d_reclen - offsetof(struct dirent, d_name)) {
+            free(buffer);
+            return hl_macos_result(HL_STATUS_CORRUPT, 0, 0);
+        }
+        entries[produced].object = native->d_ino;
+        /* d_seekoff is relative to getdirentries64's block base on APFS; Linux d_off is the absolute
+           cookie consumed by lseek/seekdir, so retain the kernel-supplied base. */
+        entries[produced].next_offset = (uint64_t)base + native->d_seekoff;
+        entries[produced].type = native->d_type;
+        entries[produced].name_size = (uint32_t)name_size;
+        memcpy(entries[produced].name, native->d_name, name_size + 1);
+        produced++;
+        at += native->d_reclen;
+    }
+    free(buffer);
+    return hl_macos_result(HL_STATUS_OK, produced, (uint64_t)count);
 }
 
 static int hl_macos_file_directory(hl_host_macos *host, hl_host_handle directory) {
@@ -3579,7 +3631,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_allocate_range,
                                                hl_macos_file_filesystem_metadata,
                                                hl_macos_file_set_permissions,
-                                               hl_macos_file_set_times};
+                                               hl_macos_file_set_times,
+                                               hl_macos_file_read_directory};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
