@@ -19,6 +19,10 @@ Sources are grouped by what they test, not by the host implementation:
 - `x86_64/`: x86-64 instruction behavior.
 - `syscall/`: Linux ABI behavior, normally compiled for both guest ISAs.
 
+The byte-preserved `compat.h` is shared support material, not a standalone guest. Every syscall source
+includes it through the Make dependency and the registered matrix therefore compiles and exercises the
+header transitively; no synthetic header-only runtime case is introduced.
+
 One source may back several manifest cases. Eleven environment-driven engine
 mechanism variants are retained in the manifest as `excluded-replaced`; the
 portable engine does not expose those private switches. Their observable

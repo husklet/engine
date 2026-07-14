@@ -138,8 +138,8 @@ SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
 	$(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/x86_64/%)
-PROCESS_CASE_SOURCES := $(sort $(wildcard tests/compat/process/*.c))
-PROCESS_CASE_NAMES := $(basename $(notdir $(PROCESS_CASE_SOURCES)))
+PROCESS_CASE_SOURCES := $(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c))
+PROCESS_CASE_NAMES := $(patsubst tests/compat/process/%.c,%,$(PROCESS_CASE_SOURCES))
 PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
 	$(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/x86_64/%)
 TIME_CASE_SOURCES := $(sort $(wildcard tests/compat/time/*.c))
@@ -446,6 +446,14 @@ $(BUILD)/compat/process/aarch64/%: tests/compat/process/%.c
 $(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/process/aarch64/procexe/%: tests/compat/process/procexe/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/process/x86_64/procexe/%: tests/compat/process/procexe/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/aarch64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
 	@mkdir -p $(@D)
