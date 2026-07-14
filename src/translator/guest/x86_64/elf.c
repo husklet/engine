@@ -277,9 +277,6 @@ static void load_elf(const char *path, struct loaded *out) {
         void *want = (void *)(g_force_base + basepage);
         g_force_base = 0; // one-shot: consumed for THIS load
         base = mmap(want, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-        // #210 test hook: deterministically simulate a fixed-VA collision (unreachable naturally -- the two
-        // fixed bases sit 512GB apart) so the fallback path below is exercised byte-exact. Drops the map we
-        // just made and forces MAP_FAILED. Inert unless DDX_FORCE_BASE_COLLIDE is set.
         // #210: the requested fixed VA can already be occupied -- a prior mapping (the interp vs the main
         // image both want deterministic bases), an ASLR collision, or 16KiB-host vs 4KiB-guest page
         // rounding leaving PC_IMG_BASE/PC_INTERP_BASE straddling a live entry. MAP_FIXED then returns
