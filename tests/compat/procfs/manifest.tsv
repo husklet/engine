@@ -1,0 +1,23 @@
+# case	group	source	legacy_source	isas	cflags	defines	env	exit	stdout	dependencies	disposition	note
+pf-sysctl	proc	sysctl.c	ext_procfs/sysctl.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/sysctl.out	linux-libc,procfs	active	byte-preserving transfer
+pf-meminfo	proc	meminfo.c	ext_procfs/meminfo.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/meminfo.out	linux-libc,procfs	active	byte-preserving transfer
+pf-stat	proc	pstat.c	ext_procfs/pstat.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/pstat.out	linux-libc,procfs	active	byte-preserving transfer
+pf-selfstat	proc	selfstat.c	ext_procfs/selfstat.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfstat.out	linux-libc,procfs	active	byte-preserving transfer
+pf-selfstatus	proc	selfstatus.c	ext_procfs/selfstatus.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfstatus.out	linux-libc,procfs	active	byte-preserving transfer
+pf-selfcaps	proc	selfcaps.c	ext_procfs/selfcaps.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfcaps.out	linux-libc,procfs	active	byte-preserving transfer
+pf-selfrss	proc	selfrss.c	ext_procfs/selfrss.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfrss.out	linux-libc,procfs	active	byte-preserving transfer
+pf-procstate	proc	procstate.c	ext_procfs/procstate.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/procstate.out	linux-libc,procfs	active	byte-preserving transfer
+pf-futexstate	proc	futexstate.c	ext_procfs/futexstate.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/futexstate.out	linux-libc,procfs,threads	active	byte-preserving transfer
+pf-cpuinfo	proc	cpuinfo.c	ext_procfs/cpuinfo.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/cpuinfo.out	linux-libc,procfs	active	byte-preserving transfer
+pf-misc	proc	miscfiles.c	ext_procfs/miscfiles.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/miscfiles.out	linux-libc,procfs	active	byte-preserving transfer
+pf-net	proc	netfiles.c	ext_procfs/netfiles.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/netfiles.out	linux-libc,procfs,network	active	byte-preserving transfer
+pf-net2	proc	netfiles2.c	ext_procfs/netfiles2.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/netfiles2.out	linux-libc,procfs,network	active	byte-preserving transfer
+pf-maps	proc	maps.c	ext_procfs/maps.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/maps.out	linux-libc,procfs	active	byte-preserving transfer
+pf-devnodes	device	devnodes.c	ext_procfs/devnodes.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/devnodes.out	linux-libc,procfs	active	byte-preserving transfer
+pf-sysfs	sysfs	sysfs.c	ext_procfs/sysfs.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/sysfs.out	linux-libc,procfs	active	byte-preserving transfer
+pf-netnone-direct	sysfs	netnone.c	ext_procfs/netnone.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	HL_NET_ISOLATE=1	0	expected/shared/netnone.out	linux-libc,procfs,network	active	legacy environment preserved
+pf-mountinfo-bind	proc	bindmount.c	ext_procfs/bindmount.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	HL_VOLUMES=/mnt:/tmp	0	expected/shared/bindmount.out	linux-libc,procfs	active	legacy env HL_VOL=/mnt:/tmp normalized to production HL_VOLUMES=/mnt:/tmp
+pf-peer-ns	proc	peerns.c	ext_procfs/peerns.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/peerns.out	linux-libc,procfs	active	byte-preserving transfer
+pf-peer-fd	proc	peerfd.c	ext_procfs/peerfd.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/peerfd.out	linux-libc,procfs	active	byte-preserving transfer
+pf-ttynonblock	device	tynonblock.c	ext_procfs/ttynonblock.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/ttynonblock.out	linux-libc,procfs	active	byte-preserving transfer
+pf-permbits	permission	permbits.c	ext_procfs/permbits.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/permbits.out	linux-libc	active	byte-preserving transfer
