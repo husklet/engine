@@ -3426,20 +3426,21 @@ static int proc_limits_text(char *buf, size_t cap) {
     int n = snprintf(buf, cap, "%-25s %-20s %-20s %-10s\n", "Limit", "Soft Limit", "Hard Limit", "Units");
     for (size_t i = 0; i < sizeof L / sizeof *L; i++) {
         const char *soft = L[i].soft, *hard = L[i].hard;
-        // docker --ulimit override (g_ulimit, resource number == table index): render the requested values
+        // docker --ulimit override (g_limits, resource number == table index): render the requested values
         // so /proc/self/limits agrees with getrlimit (svc_fill_rlimit). RLIM_INFINITY -> "unlimited".
         char sb[24], hb[24];
-        if (i < DD_RLIM_MAX && g_ulimit[i].set) {
-            if (g_ulimit[i].cur == ~0ull)
+        uint64_t current, maximum;
+        if (i < HL_LIMIT_COUNT && hl_limit_table_get(&g_limits, (int)i, &current, &maximum)) {
+            if (current == ~0ull)
                 soft = "unlimited";
             else {
-                snprintf(sb, sizeof sb, "%llu", (unsigned long long)g_ulimit[i].cur);
+                snprintf(sb, sizeof sb, "%llu", (unsigned long long)current);
                 soft = sb;
             }
-            if (g_ulimit[i].max == ~0ull)
+            if (maximum == ~0ull)
                 hard = "unlimited";
             else {
-                snprintf(hb, sizeof hb, "%llu", (unsigned long long)g_ulimit[i].max);
+                snprintf(hb, sizeof hb, "%llu", (unsigned long long)maximum);
                 hard = hb;
             }
         }

@@ -838,11 +838,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // raising RLIMIT_CORE to enable cores must have wait4/waitid report WCOREDUMP afterwards.
         int res = (int)a0;
         const uint64_t *nl = (const uint64_t *)a1;
-        if (nl && res >= 0 && res < DD_RLIM_MAX) {
-            g_ulimit[res].set = 1;
-            g_ulimit[res].cur = nl[0];
-            g_ulimit[res].max = nl[1];
-        }
+        if (nl && res >= 0 && res < HL_LIMIT_COUNT) hl_limit_table_set(&g_limits, res, nl[0], nl[1]);
         G_RET(c) = 0;
         break; // setrlimit -> accepted
     }

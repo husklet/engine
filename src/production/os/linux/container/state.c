@@ -2,6 +2,7 @@
 #include "../../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 #include "xattr_cache.h"
 #include "readonly/table.h"
+#include "limits/table.h"
 #include <sys/sysctl.h>            // sysctlbyname("hw.activecpu") -- true host core count (see container_online_cpus)
 
 // DD_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
@@ -32,12 +33,7 @@ static hl_readonly_table g_ro_subpaths;
 // 1 if `abs` falls under a runtime remount,ro subtree.
 // Register a subtree as read-only (runtime remount,ro). Dedupes; 0 on success, -1 if the table is full.
 // docker --ulimit overrides, indexed by Linux RLIMIT_* resource number; .set gates the override.
-#define DD_RLIM_MAX 16
-
-static struct {
-    int set;
-    uint64_t cur, max;
-} g_ulimit[DD_RLIM_MAX];
+static hl_limit_table g_limits;
 
 // current anon charge (bytes)
 static _Atomic uint64_t g_mem_charged = 0;
@@ -789,7 +785,7 @@ static uint64_t ulimit_val(const char *s) {
     return (uint64_t)v;
 }
 
-// Parse DD_ULIMITS="name=soft:hard,name=soft:hard,name=both,..." into g_ulimit[] (docker --ulimit set).
+// Parse HL_ULIMITS="name=soft:hard,name=soft:hard,name=both,..." into g_limits (docker --ulimit set).
 static void parse_ulimits(const char *spec) {
     char tb[2048];
     snprintf(tb, sizeof tb, "%s", spec);
@@ -802,7 +798,7 @@ static void parse_ulimits(const char *spec) {
         }
         *eq = 0;
         int r = ulimit_resource(t);
-        if (r < 0 || r >= DD_RLIM_MAX) continue; // unknown resource -> ignore (forward-compat)
+        if (r < 0 || r >= HL_LIMIT_COUNT) continue; // unknown resource -> ignore (forward-compat)
         char *colon = strchr(eq + 1, ':');
         uint64_t soft, hard;
         if (colon) {
@@ -812,9 +808,7 @@ static void parse_ulimits(const char *spec) {
         } else {
             soft = hard = ulimit_val(eq + 1);
         }
-        g_ulimit[r].set = 1;
-        g_ulimit[r].cur = soft;
-        g_ulimit[r].max = hard;
+        hl_limit_table_set(&g_limits, r, soft, hard);
     }
 }
 

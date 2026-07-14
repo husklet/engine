@@ -117,14 +117,15 @@ static int sig_coredumps(int sig) {
 }
 
 // Current soft RLIMIT_CORE (resource 4), guest-visible: a docker --ulimit / the guest's own
-// setrlimit/prlimit64 store (g_ulimit, seeded in state.c) wins, else the dd default. A core dump only
+// setrlimit/prlimit64 store (g_limits, seeded in state.c) wins, else the engine default. A core dump only
 // happens when a coredumping signal kills a process whose SOFT core limit is nonzero, so this is the single
-// input WCOREDUMP is gated on. g_ulimit/DD_RLIM_MAX come from container/state.c (included first).
+// input WCOREDUMP is gated on. g_limits comes from container/state.c (included first).
 // The default MUST be 0 (cores OFF), matching getrlimit(RLIMIT_CORE)'s Linux/docker default soft=0 -- the
 // old RLIM_INFINITY default contradicted getrlimit and made every crash report WCOREDUMP even though cores
 // were disabled (wait4/waitid reported CLD_DUMPED while getrlimit said the core limit was 0).
 static uint64_t svc_core_rlimit_cur(void) {
-    if (4 < DD_RLIM_MAX && g_ulimit[4].set) return g_ulimit[4].cur;
+    uint64_t current;
+    if (hl_limit_table_get(&g_limits, 4, &current, NULL)) return current;
     return 0; // Linux/docker default: cores OFF (soft RLIMIT_CORE = 0)
 }
 

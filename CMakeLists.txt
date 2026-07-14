@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine VERSION 0.1.0 LANGUAGES C)
 
+find_package(Threads REQUIRED)
+
 option(HL_ENABLE_LOGGING "Compile tagged engine logging into the binaries" OFF)
 
 set(CMAKE_C_STANDARD 11)
@@ -34,6 +36,11 @@ target_include_directories(hl-production-readonly PRIVATE src/production/os/linu
 target_compile_options(hl-production-readonly PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                      -Wstrict-prototypes -Wmissing-prototypes)
 
+add_library(hl-production-limits OBJECT src/production/os/linux/container/limits/table.c)
+target_include_directories(hl-production-limits PRIVATE src/production/os/linux/container/limits)
+target_compile_options(hl-production-limits PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                   -Wstrict-prototypes -Wmissing-prototypes)
+
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
                                                   -Wmissing-prototypes)
@@ -45,7 +52,6 @@ target_compile_options(hl-host-fake PRIVATE -Wall -Wextra -Wpedantic -Wconversio
                                             -Wmissing-prototypes)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(Threads REQUIRED)
     add_library(hl-host-linux STATIC src/host/linux/host.c)
     target_include_directories(hl-host-linux PUBLIC include)
     target_link_libraries(hl-host-linux PUBLIC Threads::Threads)
@@ -77,6 +83,10 @@ if(BUILD_TESTING)
     add_executable(test-readonly tests/unit/test_readonly.c $<TARGET_OBJECTS:hl-production-readonly>)
     target_include_directories(test-readonly PRIVATE include tests/unit)
     add_test(NAME readonly COMMAND test-readonly)
+    add_executable(test-limits tests/unit/test_limits.c $<TARGET_OBJECTS:hl-production-limits>)
+    target_include_directories(test-limits PRIVATE include tests/unit)
+    target_link_libraries(test-limits PRIVATE Threads::Threads)
+    add_test(NAME limits COMMAND test-limits)
     if(TARGET hl-host-linux)
         add_executable(test-host_linux tests/unit/linux.c)
         target_include_directories(test-host_linux PRIVATE include tests/unit)

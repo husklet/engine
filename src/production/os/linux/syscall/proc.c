@@ -77,12 +77,10 @@ static void exec_forward_env(uint64_t envp_guest) {
 // RLIMIT_NOFILE(7) reports a finite fd cap (soft 20480 / hard 1048576, the docker container default) -- a
 // guest like memcached does calloc(rlim_cur, sizeof(conn)), which overflows if the soft limit is RLIM_INFINITY.
 static void svc_fill_rlimit(int resource, uint64_t *o) {
-    // Docker --ulimit override wins (g_ulimit, seeded from HL_ULIMITS in state.c): a guest that reads its
+    // Docker --ulimit override wins (g_limits, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
     // requested value, not the dd default. `set` gates each resource so unspecified ones keep the defaults.
-    if (resource >= 0 && resource < DD_RLIM_MAX && g_ulimit[resource].set) {
-        o[0] = g_ulimit[resource].cur;
-        o[1] = g_ulimit[resource].max;
+    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) {
         return;
     }
     switch (resource) {
@@ -1881,7 +1879,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // prlimit64(pid, resource, NEW, OLD): report the CURRENT limit into OLD first (so a combined
         // get+set returns the pre-change value), THEN apply NEW into the per-resource store so a later
         // get reflects it. glibc's getrlimit/setrlimit/prlimit all funnel through this syscall, so the
-        // store (g_ulimit, also seeded by docker --ulimit) is the single source of truth. without
+        // store (g_limits, also seeded by docker --ulimit) is the single source of truth. without
         // applying NEW, setrlimit "succeeded" but the value never took -- the next getrlimit saw the old.
         int res = (int)a1;
         // Linux validates BEFORE touching the limits: the task lookup runs first (a negative or dead target
@@ -1891,7 +1889,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
             break;
         }
-        if (res < 0 || res >= DD_RLIM_MAX) {
+        if (res < 0 || res >= HL_LIMIT_COUNT) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
@@ -1904,11 +1902,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
-            if (res >= 0 && res < DD_RLIM_MAX) {
-                g_ulimit[res].set = 1;
-                g_ulimit[res].cur = ncur;
-                g_ulimit[res].max = nmax;
-            }
+            hl_limit_table_set(&g_limits, res, ncur, nmax);
         }
         G_RET(c) = 0;
         break;
