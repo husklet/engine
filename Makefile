@@ -43,7 +43,7 @@ LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c
 	src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
-MACOS_HOST_SOURCES := src/host/macos/host.c src/host/macos/range.c src/host/macos/system.c
+MACOS_HOST_SOURCES := src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c src/host/macos/system.c
 COMMON_HOST_SOURCES := src/host/child.c src/host/range.c src/host/sync.c
 MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
 MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
@@ -59,7 +59,8 @@ TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
-LINUX_HOST_SOURCES := src/host/linux/host.c src/host/linux/range.c src/host/linux/system.c $(COMMON_HOST_SOURCES)
+LINUX_HOST_SOURCES := src/host/linux/host.c src/host/linux/process.c src/host/linux/range.c src/host/linux/system.c \
+	$(COMMON_HOST_SOURCES)
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
 ifeq ($(HOST),linux)
@@ -81,7 +82,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi linux_fork native range system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi linux_fork native process range system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -331,6 +332,10 @@ $(BUILD)/tests/test_clock: tests/unit/test_clock.c src/host/clock.c src/host/fak
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 $(BUILD)/tests/test_child: tests/unit/test_child.c src/host/child.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_process: tests/unit/test_process.c src/host/linux/process.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -1135,13 +1140,18 @@ $(BUILD)/tests/child-macos: tests/unit/test_child.c src/host/child.c
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
+$(BUILD)/tests/process-macos: tests/unit/test_process.c src/host/macos/process.c
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/tests/native-macos: tests/unit/test_native.c $(MAC_LIBS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
+	$(MAC) $(abspath $(BUILD)/tests/process-macos)
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 	$(MAC) $(abspath $(BUILD)/tests/system-macos)
 	$(MAC) $(abspath $(BUILD)/tests/native-macos)

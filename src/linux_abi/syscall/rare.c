@@ -214,7 +214,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
             hpid = pid;
         }
-        int fd = pidfd_make(hpid); // kqueue EVFILT_PROC/NOTE_EXIT so poll/epoll on it wakes on the target's exit
+        int fd = pidfd_make(hpid); // host pollable process watch; poll/epoll wakes when the target exits
         if (fd < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;

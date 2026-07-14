@@ -24,6 +24,7 @@ int g_rwx_guest;
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
 #include "../errno.h"
+#include "../../host/process.h"
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
@@ -251,29 +252,21 @@ static void pidfd_forget(int fd) {
         if (g_pidfd[i].fd == fd) g_pidfd[i].fd = 0;
 }
 
-// Mint a pidfd for `pid`. macOS has no pidfd, so back it with a kqueue armed EVFILT_PROC/NOTE_EXIT on the
-// process: the fd is pollable and goes readable exactly when `pid` exits (poll(2) directly, and epoll --
-// itself a kqueue -- via EVFILT_READ on this nested kqueue). No EV_CLEAR, so the exit stays pending and the
-// fd stays readable afterwards, matching Linux pidfd semantics. This is the load-bearing half of CLONE_PIDFD
+// Mint a pidfd for `pid`. Ask the host for a descriptor that becomes persistently readable when the process
+// exits; the macOS backend uses an EVFILT_PROC watch and Linux uses pidfd_open. This is the load-bearing half of CLONE_PIDFD
 // (go/rust/glibc-posix_spawn epoll_wait the returned pidfd to reap their compiler child). If the process is
 // already gone or EVFILT_PROC can't arm (e.g. a non-child target), fall back to an always-readable /dev/null
 // fd so a wait returns immediately instead of blocking forever. Registers the fd->pid map for
 // waitid(P_PIDFD)/pidfd_send_signal. Returns -1 only if no fd could be opened at all.
 static int pidfd_make(pid_t pid) {
-    int kq = kqueue();
-    if (kq >= 0) {
-        struct kevent kv;
-        EV_SET(&kv, (uintptr_t)pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL);
-        if (kevent(kq, &kv, 1, NULL, 0, NULL) == 0) {
-            fcntl(kq, F_SETFD, FD_CLOEXEC);
-            if (pidfd_register(kq, pid) != 0) { // table full: don't hand back an unresolvable fd
-                close(kq);
-                errno = EMFILE;
-                return -1;
-            }
-            return kq;
+    int watched = hl_host_process_open(pid);
+    if (watched >= 0) {
+        if (pidfd_register(watched, pid) != 0) { // table full: don't hand back an unresolvable fd
+            close(watched);
+            errno = EMFILE;
+            return -1;
         }
-        close(kq);
+        return watched;
     }
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;

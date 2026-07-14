@@ -1432,8 +1432,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (a0 & 0x00200000) c->ctid = a4;
         }
         // CLONE_PIDFD(0x1000): the kernel stores a pidfd for the new child at the address in `parent_tid`
-        // (a2, the aarch64 clone slot). macOS has no pidfd, so mint a kqueue that fires on the child's exit
-        // (pidfd_make); modern runtimes (Go/Rust/glibc posix_spawn) then epoll_wait/poll THAT fd to reap the
+        // (a2, the aarch64 clone slot). Mint a host pollable process watch through pidfd_make; modern runtimes
+        // (Go/Rust/glibc posix_spawn) then epoll_wait/poll THAT fd to reap the
         // compiler child they just forked. Without it the guest's pidfd storage keeps its stale value (Go
         // seeds it 0 -> fd 0 = stdin) and the wait blocks forever at 0% CPU -- the go/npm/cargo build hang.
         if (pid > 0 && (a0 & 0x1000) && a2) {

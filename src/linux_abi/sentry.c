@@ -417,7 +417,7 @@ static int sentry_forwarded(uint64_t nr) {
     case 72: // pselect6     (three fd_sets in/out + timeout)
     case 73: // ppoll        (pollfd array in/out + timeout)
     case 19: // eventfd2     (returns a sentry-owned eventfd backing pipe)
-    case 20: // epoll_create1(returns a sentry-owned kqueue fd)
+    case 20: // epoll_create1 (returns a sentry-owned host event descriptor)
     case 21: // epoll_ctl    (in epoll_event; operates on sentry fds)
     case 22: // epoll_pwait  (out events buffer)
     // --- fd-table ops on sentry-owned fds (item 3): keep the guest fd space entirely sentry-side ---
