@@ -50,7 +50,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->unlink_relative == NULL || services->file->path == NULL ||
          services->file->standard_stream == NULL || services->file->readlink == NULL ||
          services->file->set_owner == NULL || services->file->resolve_beneath == NULL ||
-         services->file->sync_range == NULL || services->file->sync_filesystem == NULL))
+         services->file->sync_range == NULL || services->file->sync_filesystem == NULL ||
+         services->file->open_beneath == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

@@ -1566,6 +1566,23 @@ static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handl
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_macos_file_open_beneath(void *context, hl_host_handle root, const char *path,
+                                                 size_t path_size, uint32_t access, uint32_t creation,
+                                                 uint32_t permissions, uint32_t policy) {
+    hl_host_file_resolution resolved;
+    hl_host_result result;
+    if (path == NULL || path_size == 0 || path[0] == '/' || memchr(path, '\0', path_size) != NULL ||
+        (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = hl_macos_file_resolve_beneath(context, root, path, path_size, policy | HL_HOST_RESOLVE_ALLOW_MISSING,
+                                           &resolved);
+    if (result.status != HL_STATUS_OK) return result;
+    result = hl_macos_file_open(context, resolved.parent, resolved.final, resolved.final_size,
+                                access | HL_HOST_FILE_NOFOLLOW, creation, permissions);
+    (void)hl_macos_file_close(context, resolved.parent);
+    return result;
+}
+
 static hl_host_result hl_macos_file_path(void *context, hl_host_handle handle, hl_host_bytes output) {
     hl_host_macos *host = context;
     char path[PATH_MAX];
@@ -3286,7 +3303,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_set_owner,
                                                hl_macos_file_resolve_beneath,
                                                hl_macos_file_sync_range,
-                                               hl_macos_file_sync_filesystem};
+                                               hl_macos_file_sync_filesystem,
+                                               hl_macos_file_open_beneath};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

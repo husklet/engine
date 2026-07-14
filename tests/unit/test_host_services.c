@@ -201,7 +201,7 @@ int main(void) {
     truncated.transfer = &malformed_transfer;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TRANSFER) == HL_STATUS_ABI_MISMATCH);
     /* Validator-only mock: every callback slot starts as a non-null sentinel;
-     * no callback is invoked. This isolates each mandatory ABI12 tail field. */
+     * no callback is invoked. This isolates each mandatory file ABI tail field. */
     memset(&malformed_file, 0xff, sizeof(malformed_file));
     malformed_file.abi = HL_HOST_FILE_ABI;
     malformed_file.size = sizeof(malformed_file);
@@ -214,6 +214,12 @@ int main(void) {
     malformed_file.abi = HL_HOST_FILE_ABI;
     malformed_file.size = sizeof(malformed_file);
     malformed_file.sync_filesystem = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.open_beneath = NULL;
     truncated.file = &malformed_file;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
 
