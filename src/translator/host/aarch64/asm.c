@@ -89,7 +89,20 @@ static void e_adrp_add(int rd, uint64_t target) {
     // adrp's page immediate is PC-relative; this instruction EXECUTES from the RX alias, so it
     // must be computed against the RX-alias address of the emit cursor (g_cp is the RW alias).
     // `target` is always an absolute external address (e.g. &g_ibtc), so no J_RX on it.
-    int64_t off = (int64_t)((target & ~0xFFFull) - ((uint64_t)J_RX(g_cp) & ~0xFFFull)) >> 12;
+    uint64_t target_page = target & ~0xFFFull;
+    uint64_t pc_page = (uint64_t)J_RX(g_cp) & ~0xFFFull;
+    int64_t off;
+    if ((target_page >= pc_page && target_page - pc_page > ((UINT64_C(1) << 20) - 1) * 4096) ||
+        (target_page < pc_page && pc_page - target_page > (UINT64_C(1) << 20) * 4096)) {
+        // ADRP has a signed 21-bit page displacement (±4 GiB). Linux ASLR is free to place an anonymous
+        // JIT arena farther from the executable's data than that; truncating the displacement silently
+        // materializes an unrelated address and makes the result depend on process layout. Absolute MOVZ /
+        // MOVK materialization has no placement constraint. Keep the two-instruction path when reachable.
+        e_movconst(rd, target);
+        return;
+    }
+    off = target_page >= pc_page ? (int64_t)((target_page - pc_page) >> 12)
+                                 : -(int64_t)((pc_page - target_page) >> 12);
     emit32(0x90000000u | (((uint32_t)off & 3) << 29) | (((uint32_t)(off >> 2) & 0x7FFFF) << 5) | rd);
     emit32(0x91000000u | (((uint32_t)(target & 0xFFF)) << 10) | (rd << 5) | rd);
 }
