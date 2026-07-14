@@ -74,14 +74,23 @@ static int ip_opt_l2m(int o) {
 // (case 200) AF_UNIX handling. Returns 1 + fills `host` when the dest should be overlay/abstract-routed
 // (caller sends via unix_dgram_sendmsg_at); 0 otherwise (AF_INET, unnamed, or a non-jail pathname whose raw
 // sockaddr already round-trips -> caller sends unchanged, keeping the bare-metal AF_UNIX dgram path intact).
+static int unix_path_routed(const char *guest) {
+    if (g_rootfs) return 1;
+    if (!guest || guest[0] != '/') return 0;
+    char normalized[4200];
+    confine(guest, normalized, sizeof normalized);
+    return jail_match(normalized) >= 0;
+}
+
 static int unix_dgram_dest(const uint8_t *sa, socklen_t l, char *host, size_t hn) {
     if (abs_is(sa, l)) { // abstract namespace (sun_path[0]==0): HL_NETNS-keyed fs socket (same as bind/connect)
         abs_path(sa, l, host, hn);
         return 1;
     }
-    if (g_rootfs && unix_path_is(sa, l)) { // pathname socket in the overlay: resolve to the topmost layer
+    if (unix_path_is(sa, l)) {
         char gp[200], hb[1024];
         unix_path_copy(sa, l, gp, sizeof gp);
+        if (!unix_path_routed(gp)) return 0;
         const char *hp = atpath(-100, gp, hb, sizeof hb, 0); // guest path -> host path (upper then lowers)
         snprintf(host, hn, "%s", hp);
         return 1;
@@ -458,11 +467,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // AF_UNIX pathname bind: materialize the socket inode in the overlay (writable upper), jail-confined,
         // so the guest can stat/chmod/connect it through the SAME resolver. A raw host bind created the inode
         // OUTSIDE the jail (at the literal guest path on the host fs), so the guest's overlay-routed stat()
-        // ENOENT'd it (mongod "Failed to chmod socket file", mariadb "Bind on unix socket"). Jail only.
-        if (g_rootfs && unix_path_is(sa, (socklen_t)a2)) {
+        // ENOENT'd it (mongod "Failed to chmod socket file", mariadb "Bind on unix socket"). This also
+        // applies to a typed bind volume in bare mode: every pathname operation must select its backing.
+        if (unix_path_is(sa, (socklen_t)a2)) {
             char gp[200], host[1024];
             unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
-            overlay_copyup(gp, host, sizeof host); // guest path -> upper host path (+ materialize parent dirs)
+            if (!unix_path_routed(gp)) goto bind_passthrough;
+            if (g_rootfs)
+                overlay_copyup(gp, host, sizeof host); // guest path -> upper host path (+ materialize parent dirs)
+            else
+                xlate(gp, host, sizeof host); // missing final socket name inside the bare bind volume
             unlink(host);                          // clear a stale inode (else EADDRINUSE)
             // bind at the FULL upper path (via unix_sock_at, which fchdir-shortens paths past sun_path[104])
             // so the socket inode lands exactly where the guest's stat/chmod/connect resolves -- a plain bind
@@ -472,6 +486,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+    bind_passthrough:
         // Published UDP (`-p H:C/udp`): swap an AF_INET datagram socket bound to a published port onto
         // the AF_UNIX switch + start its host->guest datagram forwarder. No-op (returns 0) for
         // non-published UDP, non-switch nets, or non-datagram sockets -> they fall through unchanged.
@@ -748,9 +763,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         // AF_UNIX pathname connect: resolve through the overlay (same resolver as stat/open) so we dial the
         // socket the guest actually bound -- materialized in the upper -- not a host path outside the jail.
-        if (g_rootfs && unix_path_is(sa, (socklen_t)a2)) {
+        if (unix_path_is(sa, (socklen_t)a2)) {
             char gp[200], host[1024];
             unix_path_copy(sa, (socklen_t)a2, gp, sizeof gp);
+            if (!unix_path_routed(gp)) goto connect_passthrough;
             const char *hp = atpath(-100, gp, host, sizeof host, 0); // guest path -> topmost layer's host path
             // dial via unix_sock_at (matches the bind side): fchdir-shortens paths past sun_path[104] so a
             // long upper socket path is reached exactly, not truncated to some other (nonexistent) inode.
@@ -762,6 +778,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
+    connect_passthrough:
         // Real host connect: translate Linux AF_INET/INET6 sockaddr -> macOS; others pass through.
         {
             struct sockaddr_storage ss;
