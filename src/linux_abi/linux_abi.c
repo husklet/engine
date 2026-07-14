@@ -9,6 +9,21 @@
 static hl_status hl_linux_fd_get_unlocked(const hl_linux_abi *linux_abi, hl_linux_fd fd,
                                           const hl_linux_fd_entry **fd_entry,
                                           const hl_linux_ofd_entry **ofd_entry);
+static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi);
+static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd_entry,
+                                       hl_host_handle *final_handle);
+
+static hl_status hl_linux_ofd_finalize_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry *entry) {
+    hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+    hl_status status = hl_linux_ofd_finalize(linux_abi, entry, &handle);
+    if (handle != HL_HOST_HANDLE_INVALID) {
+        const hl_host_file_services *files = hl_linux_files(linux_abi);
+        if (files == NULL || files->close == NULL) return status == HL_STATUS_OK ? HL_STATUS_NOT_SUPPORTED : status;
+        hl_host_result closed = files->close(linux_abi->host->context, handle);
+        if (status == HL_STATUS_OK && closed.status != HL_STATUS_OK) status = (hl_status)closed.status;
+    }
+    return status;
+}
 
 static void hl_linux_lock(hl_linux_abi *linux_abi) {
     while (atomic_flag_test_and_set_explicit(&linux_abi->table_lock, memory_order_acquire)) {}
@@ -24,6 +39,49 @@ static const hl_host_sync_services *hl_linux_sync(const hl_linux_abi *linux_abi)
         host->sync == NULL || host->sync->abi != HL_HOST_SYNC_ABI || host->sync->size < sizeof(*host->sync))
         return NULL;
     return host->sync;
+}
+
+static void hl_linux_fork_unpin(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan) {
+    for (uint32_t index = 0; index < plan->count; ++index) {
+        hl_linux_fork_record *record = &plan->records[index];
+        int finalize = 0;
+        if (record->snapshot_pin == 0 || record->ofd >= linux_abi->ofd_capacity) continue;
+        hl_linux_lock(linux_abi);
+        hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
+        if (entry->generation == record->generation && entry->active_operations != 0) {
+            entry->active_operations--;
+            finalize = entry->active_operations == 0 && entry->references == 0 && entry->closing != 0;
+        }
+        record->snapshot_pin = 0;
+        hl_linux_unlock(linux_abi);
+        if (finalize) (void)hl_linux_ofd_finalize_owned(linux_abi, entry);
+    }
+}
+
+/* After fork only the snapshot pin belongs to the child.  Counts for operations
+ * running in other parent threads are copied memory, not live child owners. */
+static void hl_linux_fork_child_abort(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan) {
+    hl_linux_lock(linux_abi);
+    for (uint32_t index = 0; index < plan->count; ++index) {
+        hl_linux_fork_record *record = &plan->records[index];
+        if (record->snapshot_pin == 0 || record->ofd >= linux_abi->ofd_capacity) continue;
+        hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
+        if (entry->generation == record->generation) entry->active_operations = 1;
+    }
+    hl_linux_unlock(linux_abi);
+    hl_linux_fork_unpin(linux_abi, plan);
+}
+
+static void hl_linux_fork_discard_children(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan) {
+    const hl_host_file_services *files = hl_linux_files(linux_abi);
+    for (uint32_t index = plan->count; index != 0;) {
+        hl_linux_fork_record *record = &plan->records[--index];
+        if (record->object_ops != NULL)
+            (void)record->object_ops->close(record->child_context);
+        else if (files != NULL && files->close != NULL)
+            (void)files->close(linux_abi->host->context, record->child_handle);
+    }
+    plan->count = 0;
 }
 
 static void hl_linux_ofd_lock(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd) {
@@ -240,9 +298,11 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
         }
         if (plan->count == plan->capacity) {
             hl_linux_unlock(linux_abi);
+            hl_linux_fork_unpin(linux_abi, plan);
             plan->count = 0;
             return HL_STATUS_RESOURCE_LIMIT;
         }
+        entry->active_operations++; /* lifetime pin across the unlocked clone phase */
         plan->records[plan->count++] = (hl_linux_fork_record){
             .ofd = index,
             .generation = entry->generation,
@@ -251,6 +311,7 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
             .child_mutex = HL_HOST_HANDLE_INVALID,
             .object_ops = entry->object_ops,
             .parent_context = entry->object_context,
+            .snapshot_pin = 1,
         };
     }
     hl_linux_unlock(linux_abi);
@@ -281,6 +342,7 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
                 else
                     (void)files->close(linux_abi->host->context, rollback->child_handle);
             }
+            hl_linux_fork_unpin(linux_abi, plan);
             plan->count = 0;
             return clone_status;
         }
@@ -299,7 +361,7 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
                 record->parent_context == entry->object_context)
                 matches++;
         }
-        if (entry->active_operations != 0 && entry->object_ops != NULL &&
+        if (entry->active_operations > 1 && entry->object_ops != NULL &&
             entry->object_ops->fork_while_active_safe == 0) {
             goto arm_failed;
         }
@@ -323,13 +385,15 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     return HL_STATUS_OK;
 arm_failed:
     hl_linux_unlock(linux_abi);
-    while (plan->count != 0) {
-        hl_linux_fork_record *rollback = &plan->records[--plan->count];
+    for (uint32_t rollback_index = plan->count; rollback_index != 0;) {
+        hl_linux_fork_record *rollback = &plan->records[--rollback_index];
         if (rollback->object_ops != NULL)
             (void)rollback->object_ops->close(rollback->child_context);
         else
             (void)files->close(linux_abi->host->context, rollback->child_handle);
     }
+    hl_linux_fork_unpin(linux_abi, plan);
+    plan->count = 0;
     return HL_STATUS_BUSY;
 }
 
@@ -356,7 +420,30 @@ hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *
         if (plan->host_completed == 0) completed = sync->fork_parent(linux_abi->host->context);
         plan->armed = 0;
         plan->host_completed = 0;
+        for (uint32_t index = 0; index < plan->count; ++index) {
+            hl_linux_fork_record *record = &plan->records[index];
+            if (record->snapshot_pin != 0 && record->ofd < linux_abi->ofd_capacity) {
+                hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
+                if (entry->generation == record->generation && entry->active_operations != 0) {
+                    entry->active_operations--;
+                    /* Preserve a finalize request across the unlock.  Generation
+                     * prevents a recycled slot from being finalized below. */
+                    record->snapshot_pin =
+                        entry->active_operations == 0 && entry->references == 0 && entry->closing != 0 ? 2 : 0;
+                } else {
+                    record->snapshot_pin = 0;
+                }
+            }
+        }
         hl_linux_unlock(linux_abi);
+        for (uint32_t index = 0; index < plan->count; ++index) {
+            hl_linux_fork_record *record = &plan->records[index];
+            if (record->snapshot_pin != 2 || record->ofd >= linux_abi->ofd_capacity) continue;
+            hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
+            if (entry->generation == record->generation)
+                (void)hl_linux_ofd_finalize_owned(linux_abi, entry);
+            record->snapshot_pin = 0;
+        }
         if (completed.status != HL_STATUS_OK) status = (hl_status)completed.status;
     }
     while (plan->count != 0) {
@@ -384,7 +471,15 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
     {
         hl_host_result completed = {HL_STATUS_OK, 1, 0, 0};
         if (plan->host_completed == 0) completed = sync->fork_child(linux_abi->host->context);
-        if (completed.status != HL_STATUS_OK) return (hl_status)completed.status;
+        if (completed.status != HL_STATUS_OK) {
+            hl_status status = (hl_status)completed.status;
+            plan->armed = 0;
+            plan->host_completed = 0;
+            atomic_flag_clear(&linux_abi->table_lock);
+            hl_linux_fork_child_abort(linux_abi, plan);
+            hl_linux_fork_discard_children(linux_abi, plan);
+            return status;
+        }
     }
     plan->armed = 0;
     plan->host_completed = 0;
@@ -403,6 +498,8 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
             hl_status status = created.status == HL_STATUS_OK ? HL_STATUS_PLATFORM_FAILURE : (hl_status)created.status;
             while (index != 0)
                 (void)sync->mutex_close(linux_abi->host->context, plan->records[--index].child_mutex);
+            hl_linux_fork_child_abort(linux_abi, plan);
+            hl_linux_fork_discard_children(linux_abi, plan);
             return status;
         }
         record->child_mutex = created.value;
@@ -411,6 +508,8 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
     for (index = 0; index < plan->count; ++index) {
         hl_linux_fork_record *record = &plan->records[index];
         hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
+        entry->active_operations = 0; /* parent peer operations do not survive fork */
+        record->snapshot_pin = 0;
         (void)sync->mutex_close(linux_abi->host->context, entry->io_mutex);
         entry->io_mutex = record->child_mutex;
         if (record->object_ops != NULL) {
@@ -426,6 +525,8 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
 corrupt:
     while (index != 0)
         (void)sync->mutex_close(linux_abi->host->context, plan->records[--index].child_mutex);
+    hl_linux_fork_child_abort(linux_abi, plan);
+    hl_linux_fork_discard_children(linux_abi, plan);
     return HL_STATUS_CORRUPT;
 }
 

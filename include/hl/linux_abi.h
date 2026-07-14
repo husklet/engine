@@ -153,6 +153,7 @@ typedef struct hl_linux_fork_record {
     const struct hl_linux_object_ops *object_ops;
     void *parent_context;
     void *child_context;
+    uint32_t snapshot_pin;
 } hl_linux_fork_record;
 
 typedef struct hl_linux_fork_plan {

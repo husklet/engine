@@ -20,6 +20,8 @@ typedef struct test_file_host {
     uint64_t next_value;
     _Atomic uint32_t barrier_enabled;
     _Atomic uint32_t concurrent_calls;
+    _Atomic uint32_t clone_block;
+    _Atomic uint32_t clone_entered;
     uint32_t writes;
     uint32_t appends;
     uint32_t truncates;
@@ -42,6 +44,8 @@ typedef struct test_object {
     uint32_t clones;
     hl_status clone_status;
     hl_status close_status;
+    _Atomic uint32_t clone_block;
+    _Atomic uint32_t clone_entered;
 } test_object;
 
 static int64_t object_read(void *opaque, void *buffer, size_t size) {
@@ -68,6 +72,10 @@ static uint32_t object_ready(void *opaque, uint32_t interests) {
 static hl_status object_clone(void *opaque, void **child) {
     test_object *object = opaque;
     object->clones++;
+    if (atomic_load_explicit(&object->clone_block, memory_order_acquire) != 0) {
+        atomic_store_explicit(&object->clone_entered, 1, memory_order_release);
+        while (atomic_load_explicit(&object->clone_block, memory_order_acquire) != 0) {}
+    }
     if (object->clone_status != HL_STATUS_OK) return object->clone_status;
     *child = object;
     return HL_STATUS_OK;
@@ -341,7 +349,11 @@ static hl_host_result test_unlink(void *context, hl_host_handle directory, const
 }
 
 static hl_host_result test_clone(void *context, hl_host_handle file) {
-    (void)context;
+    test_file_host *host = context;
+    if (atomic_load_explicit(&host->clone_block, memory_order_acquire) != 0) {
+        atomic_store_explicit(&host->clone_entered, 1, memory_order_release);
+        while (atomic_load_explicit(&host->clone_block, memory_order_acquire) != 0) {}
+    }
     return file == 55 ? file_result(HL_STATUS_OK, 56) : file_result(HL_STATUS_INVALID_ARGUMENT, 0);
 }
 
@@ -367,6 +379,18 @@ typedef struct read_thread_args {
     hl_linux_fd fd;
     char bytes[3];
 } read_thread_args;
+
+typedef struct fork_thread_args {
+    hl_linux_abi *linux_abi;
+    hl_linux_fork_plan *plan;
+    hl_status status;
+} fork_thread_args;
+
+static void *prepare_fork(void *opaque) {
+    fork_thread_args *args = opaque;
+    args->status = hl_linux_abi_fork_prepare(args->linux_abi, args->plan);
+    return NULL;
+}
 
 static void *read_three_bytes(void *opaque) {
     read_thread_args *args = opaque;
@@ -818,6 +842,48 @@ int main(void) {
         HL_CHECK(atomic_load_explicit(&file_host.concurrent_calls, memory_order_acquire) == 2);
         HL_CHECK(hl_linux_close(&linux_abi, first.fd) == 0);
         HL_CHECK(hl_linux_close(&linux_abi, second.fd) == 0);
+    }
+    {
+        /* Fork snapshots pin an OFD while host cloning runs without table ownership.
+         * A concurrent last close retires the parent handle only after that pin drops. */
+        hl_linux_fork_record records[2];
+        hl_linux_fork_plan plan = {
+            .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
+        fork_thread_args args = {&linux_abi, &plan, HL_STATUS_PLATFORM_FAILURE};
+        pthread_t fork_thread;
+        uint32_t closes = atomic_load_explicit(&file_host.closes, memory_order_relaxed);
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &original) == HL_STATUS_OK);
+        atomic_store_explicit(&file_host.clone_entered, 0, memory_order_relaxed);
+        atomic_store_explicit(&file_host.clone_block, 1, memory_order_release);
+        HL_CHECK(pthread_create(&fork_thread, NULL, prepare_fork, &args) == 0);
+        while (atomic_load_explicit(&file_host.clone_entered, memory_order_acquire) == 0) {}
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        HL_CHECK(atomic_load_explicit(&file_host.closes, memory_order_relaxed) == closes);
+        atomic_store_explicit(&file_host.clone_block, 0, memory_order_release);
+        /* Topology changed while cloning, so prepare retries cleanly after
+         * releasing both the cloned child and pinned retiring parent. */
+        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_BUSY);
+        HL_CHECK(atomic_load_explicit(&file_host.closes, memory_order_relaxed) == closes + 2);
+        HL_CHECK(atomic_load_explicit(&file_host.bad_handles, memory_order_relaxed) == 0);
+    }
+    {
+        test_object object = {.byte = 'p'};
+        hl_linux_fd typed;
+        hl_linux_fork_record records[2];
+        hl_linux_fork_plan plan = {
+            .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
+        fork_thread_args args = {&linux_abi, &plan, HL_STATUS_PLATFORM_FAILURE};
+        pthread_t fork_thread;
+        HL_CHECK(hl_linux_object_install(&linux_abi, &object_ops, &object, 78, HL_LINUX_O_RDWR, 0, &typed) ==
+                 HL_STATUS_OK);
+        atomic_store_explicit(&object.clone_block, 1, memory_order_release);
+        HL_CHECK(pthread_create(&fork_thread, NULL, prepare_fork, &args) == 0);
+        while (atomic_load_explicit(&object.clone_entered, memory_order_acquire) == 0) {}
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 0);
+        atomic_store_explicit(&object.clone_block, 0, memory_order_release);
+        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_BUSY);
+        HL_CHECK(object.clones == 1 && object.closes == 2);
+        HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
     }
     {
         test_object object = {.byte = 'q'};
