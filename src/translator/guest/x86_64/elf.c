@@ -1,13 +1,8 @@
 // translator/guest/x86_64 -- ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
 
-// W6A: the x86 target (linux_x86_64.c) does not pull in the mach VM headers (only the aarch64 target
-// does, for item 2's dual map). The lazy-fault budget classifier (item 4) queries the real VM map via
-// mach_vm_region, and the non-PIE data fixup (item 1) reads the arm64 thread state out of the ucontext.
-// Include guards make these idempotent if the unity build ever includes them earlier.
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <sys/ucontext.h>
 
+#include "../../../host/range.h"
 #include "../../../linux_abi/page.h"
 
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
@@ -580,29 +575,12 @@ static _Atomic int g_growmaps; // adjacent (stack-grow / over-read) faults: larg
 // net PRESERVED). Page contents + retry are unchanged, so this is bit-identical for any workload the old
 // code completed. Gate: NOLAZYFIX=1 reverts to the single 4096 monotonic budget (everything on g_lazymaps);
 // LAZYBUDGET=<n> overrides the small cap (repro/testing); LAZYDIAG=1 prints final counts at exit.
-static int lazy_addr_mapped(uintptr_t a) {
-    // mincore() is useless here -- on macOS it returns 0 for ANY address, mapped or not. Query the real
-    // VM map: mach_vm_region returns the first region at-or-above `a`; `a` is mapped iff it falls inside
-    // that region's [start,start+size).
-    mach_vm_address_t addr = a;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr =
-        mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj);
-    if (kr != KERN_SUCCESS) return 0; // nothing at/above -> unmapped
-    return a >= (uintptr_t)addr && a < (uintptr_t)addr + (uintptr_t)size;
-}
-
 static int lazy_neighbor_mapped(uintptr_t pg) {
     // A fault adjacent to a live mapping is legitimate growth/over-read: the byte just below the fault
     // page is the end of a real region (over-read), or the page just above is the committed stack
-    // (grow-down). An isolated fault (both neighbors unmapped) is a candidate wild pointer. Use the 16KB
-    // macOS hardware page granularity for the "above" probe.
-    if (pg >= 1 && lazy_addr_mapped(pg - 1)) return 1;
-    if (lazy_addr_mapped(pg + 0x4000)) return 1;
-    return 0;
+    // (grow-down). An isolated fault (both neighbors unmapped) is a candidate wild pointer. Probe above
+    // using the native host VM page size: 16 KiB on the primary macOS host and commonly 4 KiB on Linux.
+    return hl_host_page_neighbor_mapped(pg);
 }
 
 static int lazy_budget(void) {

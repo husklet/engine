@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #endif
 
-static size_t hl_host_page_size(void) {
+size_t hl_host_page_size(void) {
     long value = sysconf(_SC_PAGESIZE);
     if (value <= 0 || ((size_t)value & ((size_t)value - 1)) != 0) return 0;
     return (size_t)value;
@@ -52,4 +52,12 @@ int hl_host_range_mapped(uintptr_t address, size_t size) {
         if (end - 1 - page < page_size) return 1;
         page += page_size;
     }
+}
+
+int hl_host_page_neighbor_mapped(uintptr_t page_address) {
+    size_t page_size = hl_host_page_size();
+    if (page_size == 0 || (page_address & ((uintptr_t)page_size - 1)) != 0) return 0;
+    if (page_address != 0 && hl_host_address_mapped(page_address - 1)) return 1;
+    if (page_address <= UINTPTR_MAX - page_size && hl_host_address_mapped(page_address + page_size)) return 1;
+    return 0;
 }
