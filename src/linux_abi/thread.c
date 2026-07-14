@@ -607,6 +607,20 @@ static void gbus_prepare_release(void) {
     pthread_mutex_unlock(&g_bus_transition);
 }
 
+/* A host MAP_FIXED replacement must not run concurrently with a translated
+   peer accessing the replaced range.  This is only a mapping transaction: it
+   deliberately does not activate BUS instrumentation or change the ledger. */
+static void gbus_mapping_prepare(void) {
+    (void)pthread_once(&g_bus_atfork_once, gbus_atfork_install);
+    pthread_mutex_lock(&g_bus_transition);
+    if (g_bus_transition_begin != NULL) g_bus_transition_begin(g_bus_transition_opaque);
+}
+
+static void gbus_mapping_prepare_release(void) {
+    if (g_bus_transition_end != NULL) g_bus_transition_end(g_bus_transition_opaque);
+    pthread_mutex_unlock(&g_bus_transition);
+}
+
 int hl_linux_bus_transition_begin(hl_linux_bus_transition *transition) {
     if (transition == NULL || transition->held != 0) return -1;
     gbus_prepare();

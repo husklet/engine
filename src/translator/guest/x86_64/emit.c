@@ -752,6 +752,11 @@ static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     uint32_t *clear = (uint32_t *)g_cp;
     emit32(0);
     e_str(0, 28, OFF_FAULT_ADDR);
+    /* The filter probe borrows host x9 before the full spill.  A no-fault
+       resume reloads and restores it below, but the BUS exit goes directly to
+       the dispatcher; repair guest r9 in the saved CPU image first. */
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
+    e_str(9, 28, R_OFF(9));
     e_movconst(16, rip);
     e_str(16, 28, OFF_RIP);
     e_movconst(16, R_BUS);

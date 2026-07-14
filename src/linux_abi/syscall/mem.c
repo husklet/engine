@@ -446,6 +446,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int off_emul = 0;
         uint64_t bus_accessible = a1;
         int bus_prepared = 0;
+        int mapping_prepared = 0;
         if (!(a3 & 0x20) && (a3 & 0x02) && (int)a4 >= 0) {
             struct stat metadata;
             if (fstat((int)a4, &metadata) == 0) {
@@ -455,6 +456,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                      : (available + UINT64_C(4095)) & ~UINT64_C(4095);
                 if (bus_accessible < a1) { gbus_prepare(); bus_prepared = 1; }
             }
+        }
+        if (!bus_prepared && (a3 & 0x10)) {
+            gbus_mapping_prepare();
+            mapping_prepared = 1;
         }
         uint64_t pc_hint = 0;
         (void)pc_hint;
@@ -603,6 +608,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 errno = ENOMEM;
             }
             gbus_prepare_release();
+        } else if (mapping_prepared) {
+            if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1 + guard);
+            gbus_mapping_prepare_release();
         }
         // refund
         if (r == MAP_FAILED && charge) {
@@ -611,7 +619,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (r != MAP_FAILED) {
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
-            if (!bus_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
+            if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             gmap_set_glen((uint64_t)r, (uint64_t)a1);    // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
