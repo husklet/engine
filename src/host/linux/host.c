@@ -2155,6 +2155,28 @@ static hl_host_result hl_linux_fork_complete(void *context) {
     return result;
 }
 
+static hl_host_result hl_linux_fork_child(void *context) {
+    hl_host_linux *host = context;
+    uint32_t index;
+    hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    for (index = 0; index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index) {
+        hl_linux_counter_subscription *subscription = &host->counter_subscriptions[index];
+        if (!subscription->active) continue;
+        close(subscription->descriptor);
+        close(subscription->wake[0]);
+        close(subscription->wake[1]);
+        subscription->active = 0;
+        subscription->counter = HL_HOST_HANDLE_INVALID;
+        subscription->notify = NULL;
+        subscription->observer = NULL;
+    }
+    if (pthread_mutex_unlock(&host->lock) != 0 && result.status == HL_STATUS_OK)
+        result = hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_unlock(&host->fork_gate) != 0 && result.status == HL_STATUS_OK)
+        result = hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    return result;
+}
+
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,           sizeof(memory),
                                                    hl_linux_memory_reserve,      hl_linux_memory_protect,
@@ -2220,7 +2242,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create,
                                                hl_linux_mutex_lock,   hl_linux_mutex_unlock,  hl_linux_mutex_close,
-                                               hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_complete};
+                                               hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_child};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;

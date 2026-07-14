@@ -2209,6 +2209,17 @@ static hl_host_result hl_macos_fork_complete(void *context) {
 static hl_host_result hl_macos_fork_child(void *context) {
     hl_host_macos *host = context;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    for (uint32_t index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
+        hl_macos_counter_subscription *subscription = &host->counter_subscriptions[index];
+        if (!subscription->active) continue;
+        close(subscription->descriptor);
+        close(subscription->wake[0]);
+        close(subscription->wake[1]);
+        subscription->active = 0;
+        subscription->counter = HL_HOST_HANDLE_INVALID;
+        subscription->notify = NULL;
+        subscription->observer = NULL;
+    }
     for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_CAPACITY && result.status == HL_STATUS_OK; ++index) {
         hl_macos_directory_object *object;
         uint32_t previous;
