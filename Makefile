@@ -20,10 +20,11 @@ PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h src/translator/
 # This GNU Make-only recursive wildcard keeps newly added included files in the dependency closure without
 # a generated list or a clean build.
 rwildcard = $(foreach entry,$(wildcard $1*),$(call rwildcard,$(entry)/,$2) $(filter $(subst *,%,$2),$(entry)))
-PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/production/,*.c) \
-	$(call rwildcard,src/production/,*.h) $(call rwildcard,src/translator/guest/,*.c) \
-	$(call rwildcard,src/translator/guest/,*.h) $(call rwildcard,src/translator/host/,*.c) \
-	$(call rwildcard,src/translator/host/,*.h) $(call rwildcard,include/hl/,*.h))
+PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard,src/core/,*.h) \
+	$(call rwildcard,src/host/,*.c) $(call rwildcard,src/host/,*.h) \
+	$(call rwildcard,src/linux_abi/,*.c) $(call rwildcard,src/linux_abi/,*.h) \
+	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
+	$(call rwildcard,include/hl/,*.h))
 
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
 IR_SOURCES := src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
@@ -179,7 +180,7 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
-$(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c $(PRODUCTION_UNITY_DEPS) \
+$(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS) \
 	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
@@ -200,7 +201,7 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch6
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c $(PRODUCTION_UNITY_DEPS) \
+$(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS) \
 	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
@@ -223,13 +224,13 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
-$(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c \
+$(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/aarch64.c \
 	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
 	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c src/core/config.c \
+		-o $@ tools/lifecycle_e2e_runner.c src/core/target/aarch64.c src/core/config.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \
@@ -247,13 +248,13 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/ta
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c \
+$(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/core/target/x86_64.c \
 	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
 	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c src/core/config.c \
+		-o $@ tools/lifecycle_e2e_runner.c src/core/target/x86_64.c src/core/config.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \

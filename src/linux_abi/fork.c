@@ -1,4 +1,4 @@
-// os/linux/forkserver.c -- W3D: resident "ddjitd" fork-server, SHARED by both Linux engines.
+// linux_abi/fork.c -- W3D: resident engine server fork-server, SHARED by both Linux engines.
 //
 // WHY: per-launch wall is dominated by the irreducible per-process posix_spawn + dyld +
 // codesign-validation floor of the engine ITSELF (opt8 measured ~2 ms of a ~3-5 ms launch), paid on

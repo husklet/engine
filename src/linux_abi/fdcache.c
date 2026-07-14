@@ -1,4 +1,4 @@
-// dd/runtime/os/linux -- ELF loader fwd-decls + the FS-metadata cache (stat/access/readlink memoized).
+// hl/linux_abi -- ELF loader fwd-decls + the FS-metadata cache (stat/access/readlink memoized).
 
 static void load_elf(const char *path, struct loaded *out);
 static int elf_interp(const char *path, char *out, size_t n);

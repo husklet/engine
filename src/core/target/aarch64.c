@@ -36,8 +36,8 @@
 
 #include "hl/engine.h"
 
-#include "../include/cpu_aarch64.h"
-#include "../../core/options.c"
+#include "../../translator/guest/aarch64/cpu.h"
+#include "../options.c"
 #include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
 #include "../../translator/guest/aarch64/stat.c" // the per-arch struct-stat layout os/linux/ fills
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
@@ -47,31 +47,31 @@
 // container/ns config state + parsers (early globals)
 #include "../../linux_abi/container/state.c"
 // code cache + block map + chaining
-#include "../engine/cache.c"
+#include "../../translator/cache.c"
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
 #include "../../translator/host/aarch64/asm.c"
 // persistent cross-process translated-code cache (recorded emitters used by stubs.c/translate.c;
 // load/save/relocate). MUST precede stubs.c + translate.c (they call the recorded emitters).
 #include "../../translator/guest/aarch64/cache.c"
 // engine block-ABI stubs: prologue/spill + IBTC/IC + exit/chain trampolines (built on the assembler above)
-#include "../engine/stubs.c"
+#include "../../translator/guest/aarch64/stubs.c"
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../../translator/guest/aarch64/translate.c"
 // clone/futex/threads (declares run_guest)
-#include "../os/linux/thread.c"
+#include "../../linux_abi/thread.c"
 // signal delivery
-#include "../os/linux/signal.c"
+#include "../../linux_abi/signal.c"
 #include "../../translator/guest/aarch64/signal.c" // per-arch rt_sigframe build/restore (uses signal.c state)
 // path jail + overlay + /proc synth
 #include "../../linux_abi/container/vfs.c"
 // termios + NET-ns loopback
 #include "../../linux_abi/container/netns.c"
 // ELF fwd-decls + FS-metadata cache
-#include "../os/linux/fscache.c"
+#include "../../linux_abi/fdcache.c"
 // the syscall layer (service())
 #include "../../linux_abi/syscall/dispatch.c"
 // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
-#include "../os/linux/sentry.c"
+#include "../../linux_abi/sentry.c"
 // native checkpoint/restore control seam: the shared dispatcher (engine/dispatch.c) polls G_CKPT_POLL at
 // its per-block safepoint. Declared here (before the include) so only the aarch64 TU wires it; ckpt_poll is
 // DEFINED in os/linux/checkpoint.c below (a forward-declared static call is legal).
@@ -81,13 +81,13 @@ static void ckpt_poll(struct cpu *c);
 static void container_init(const char *rootfs);
 static int engine_global_init(void);
 // host trampoline + run_guest
-#include "../engine/dispatch.c"
+#include "../dispatch.c"
 // ELF loader + initial stack
-#include "../os/linux/elf.c"
+#include "../../linux_abi/elf.c"
 // native checkpoint/restore (multi-process tree): dump/restore guest RAM + cpu + path-backed fds + pty
-#include "../os/linux/checkpoint.c"
+#include "../../linux_abi/checkpoint.c"
 // Final-product bridge: read the serialized HL config file and enter this target's Linux guest.
-#include "../../core/launch.c"
+#include "../launch.c"
 
 // ---- library entry (Rust binding) + main() ----
 // ---------------- library entry (Rust bindings call this) ----------------
@@ -296,7 +296,7 @@ static int mach_resolve_fault(mach_port_t thread, int hostsig, uint64_t fault, a
     // (a genuine engine fault) -- both then fall through to the [MACH] crash report below.
     // This runs on the dedicated exc_thread, NOT the faulting thread, so g_cpu_key TLS is NULL here --
     // pass the FAULTING thread's cpu explicitly. x28 is the engine's reserved CPUREG in translated code
-    // (cpu_aarch64.h), so ss->__x[28] is the faulting thread's struct cpu whenever the fault is in the
+    // (guest/aarch64/cpu.h), so ss->__x[28] is the faulting thread's struct cpu whenever the fault is in the
     // code cache -- the only case deliver_guest_fault_hint dereferences it (it validates the host PC first).
     // Without this the exc_thread found no cpu and declined EVERY guest-handled fault -> a spurious [MACH].
     struct cpu *fcpu = (struct cpu *)ss->__x[28];
@@ -523,7 +523,7 @@ static void container_init(const char *rootfs) {
         const char *m = hl_option_get("HL_MEM_MAX");
         if (m && !g_mem_max) g_mem_max = parse_size(m);
         const char *p = hl_option_get("HL_PIDS_MAX");
-        if (p && !g_pids_max) g_pids_max = dd_parse_id("HL_PIDS_MAX", p);
+        if (p && !g_pids_max) g_pids_max = hl_parse_id("HL_PIDS_MAX", p);
         container_read_resource_env(); // Docker CPU, read-only-root, and ulimit values from centralized HL options.
         const char *pub = hl_option_get("HL_PUBLISH");
         if (pub && !g_nportmap) parse_publish(pub);
@@ -556,9 +556,9 @@ static void container_init(const char *rootfs) {
             if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(nn && nn[0])) hl_option_set("HL_NETNS", key, 1);
         }
         const char *eu = hl_option_get("HL_UID");
-        if (eu && g_uid < 0) g_uid = dd_parse_id("HL_UID", eu);
+        if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);
         const char *eg = hl_option_get("HL_GID");
-        if (eg && g_gid < 0) g_gid = dd_parse_id("HL_GID", eg);
+        if (eg && g_gid < 0) g_gid = hl_parse_id("HL_GID", eg);
         // USER ns (process.user)
     }
     if (rootfs && rootfs[0]) {
@@ -846,7 +846,7 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
 
 #define FSRV_RESTORE_PREP(L, span) fsrv_restore_prep_a64((L), (span))
 #define FSRV_RESTORE_DONE(L, span) fsrv_restore_done_a64((L), (span))
-#include "../os/linux/forkserver.c"
+#include "../../linux_abi/fork.c"
 
 // The engine entry point uses the public HL prefix so the runtime can be linked as a library and launched
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
@@ -885,7 +885,7 @@ int hl_engine_entry(int argc, char **argv) {
             g_mem_max = parse_size(argv[ai + 1]);
             ai += 2;
         } else if (!strcmp(argv[ai], "--pids-max") && ai + 1 < argc) {
-            g_pids_max = dd_parse_id("--pids-max", argv[ai + 1]);
+            g_pids_max = hl_parse_id("--pids-max", argv[ai + 1]);
             ai += 2;
         } else if (!strcmp(argv[ai], "--publish") && ai + 1 < argc) {
             parse_publish(argv[ai + 1]);
@@ -900,11 +900,11 @@ int hl_engine_entry(int argc, char **argv) {
             ai += 2;
             // private loopback ns
         } else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
-            g_uid = dd_parse_id("--uid", argv[ai + 1]);
+            g_uid = hl_parse_id("--uid", argv[ai + 1]);
             ai += 2;
             // USER ns uid
         } else if (!strcmp(argv[ai], "--gid") && ai + 1 < argc) {
-            g_gid = dd_parse_id("--gid", argv[ai + 1]);
+            g_gid = hl_parse_id("--gid", argv[ai + 1]);
             ai += 2;
         } else
             break;

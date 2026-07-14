@@ -27,7 +27,7 @@ int g_rwx_guest;
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
-#include "../../production/os/linux/seccomp.c"
+#include "../seccomp.c"
 // macOS renamex_np/renameatx_np flags (Linux renameat2 flags map onto these)
 #ifndef RENAME_SWAP
 #define RENAME_SWAP 0x00000002 // atomic swap  <- Linux RENAME_EXCHANGE(2)

@@ -1,4 +1,4 @@
-// dd/runtime/os/linux -- seccomp: a real classic-BPF (cBPF) interpreter + syscall gating.
+// hl/linux_abi -- seccomp: a real classic-BPF (cBPF) interpreter + syscall gating.
 //
 // Guests self-sandbox with seccomp(2) / prctl(PR_SET_SECCOMP): they install a cBPF program that the
 // kernel runs against a `struct seccomp_data` on EVERY syscall and honours the program's return action

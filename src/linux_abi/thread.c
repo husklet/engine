@@ -1,4 +1,4 @@
-// dd/runtime/os/linux -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
+// hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>       // mach_vm_region: probe whether a guest address is still mapped (see cleartid)

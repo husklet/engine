@@ -1,6 +1,6 @@
-// dd/runtime/include -- x86-64 guest CPU state. r[16]=rax..r15, rip, nzcv (ARM-flag substrate for
+// translator/guest/x86_64 -- guest CPU state. r[16]=rax..r15, rip, nzcv (ARM-flag substrate for
 // x86 EFLAGS), fs/gs_base, xmm in v[32], x87 ST(0..7) at double precision. Offsets baked into emitted
-// code. Differs entirely from cpu_aarch64.h -- why os/linux can't be literally shared yet.
+// code. Differs entirely from the aarch64 cpu.h -- why the guest state cannot be shared.
 
 // ---------------- guest CPU state ----------------
 // Offsets are baked into emitted code; keep in sync (see the OFF_* defines).

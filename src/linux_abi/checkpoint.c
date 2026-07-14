@@ -1,4 +1,4 @@
-// dd/runtime/os/linux -- native checkpoint/restore ("CRIU-equivalent"), MULTI-PROCESS.
+// hl/linux_abi -- native checkpoint/restore ("CRIU-equivalent"), MULTI-PROCESS.
 //
 // Freezes a running guest -- a WHOLE process tree (multiple shells, background jobs, their children) -- to an
 // on-disk directory (RAM + CPU + fds, per process), so every host engine process can exit and free its

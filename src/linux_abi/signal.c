@@ -1,4 +1,4 @@
-// dd/runtime/os/linux -- signal delivery (Linux<->macOS signal-number translation; sigframe build).
+// hl/linux_abi -- signal delivery (Linux<->macOS signal-number translation; sigframe build).
 
 // ptrace signal-delivery/group stops. Defined later in the TU (os/linux/syscall/ptrace.c, pulled in
 // via dispatch.c). ptrace_intercept_signal: this process is traced and a signal is about to be delivered

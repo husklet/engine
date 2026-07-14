@@ -4581,7 +4581,7 @@ static const char *dev_node_hostpath(const char *gp) {
 // ================= dd GPU rung 2: host-IOSurface-backed guest buffer =================
 // See include/gpu.h. Entirely gated behind HL_GPU_IOSURFACE (gpu_iosurface_on()); the code compiles
 // always (the engine is always a macOS binary) but never runs for existing workloads / the gate.
-#include "../../production/include/gpu.h"
+#include "../gpu.h"
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>

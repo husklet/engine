@@ -1,11 +1,11 @@
-// dd/runtime/jit -- the code cache, the gpc->host block map, and lazy inter-block chaining.
+// translator -- the code cache, the gpc->host block map, and lazy inter-block chaining.
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
-#include "../../../include/hl/macos.h"
-#include "../../../include/hl/log.h"
-#include "../../host/clock.h"
-#include "../../host/file.h"
+#include "../../include/hl/macos.h"
+#include "../../include/hl/log.h"
+#include "../host/clock.h"
+#include "../host/file.h"
 
 #define CACHE_SZ (64u << 20)
 // base, bump pointer
@@ -332,7 +332,7 @@ static void map_put(uint64_t gpc, void *host, void *body) {
 // evict the others' from a shared slot -- a cross-thread thrash whose miss bounces through
 // the C dispatcher (lock + map_host) every time. A 64Ki table (vs the former 8Ki) cuts the
 // aliasing pressure ~8x, so far more indirect branches hit inline and never reach the
-// dispatcher. The reader's hash width (engine/stubs.c) and both fills (the per-arch
+// dispatcher. The reader's hash width (guest/aarch64/stubs.c) and both fills (the per-arch
 // G_IBTC_FILL, which key on `(target>>2) & (IBTC_N-1)`) follow this constant.
 #define IBTC_N 65536
 
@@ -452,11 +452,11 @@ static int is_interp_dispatch_br(uint64_t gpc, int brn) {
 // ---------------- W4E adaptive tier-2 ----------------
 // W4E tier-2: a hot self-loop's in-cache back-edge counter reached threshold -> the dispatcher
 // recompiles (promotes) the block with the optimized codegen, then resumes (pc already = block start).
-// (The reason code normally lives next to R_BRANCH/R_SYSCALL in include/cpu_aarch64.h; it is defined here
+// (The reason code normally lives next to R_BRANCH/R_SYSCALL in guest/aarch64/cpu.h; it is defined here
 // because this engine integration is confined to the jit/ + frontend/aarch64/ translate units.)
 // W5B: the x86 engine reuses this substrate but its reason-code space already uses 2 for R_CPUID, so it
-// pre-defines R_TIER2=7 in include/cpu_x86_64.h. Guard the aarch64 default so the x86 value wins in the
-// x86 unity build; aarch64 (whose cpu_aarch64.h does not define it) still gets 2. No aarch64 change.
+// pre-defines R_TIER2=7 in guest/x86_64/cpu.h. Guard the aarch64 default so the x86 value wins in the
+// x86 unity build; aarch64 (whose cpu.h does not define it) still gets 2. No aarch64 change.
 #ifndef R_TIER2
 #define R_TIER2 2
 #endif

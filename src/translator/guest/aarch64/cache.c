@@ -6,7 +6,7 @@
 //      emit_host_ptr() into a g_reloc table; the aarch64 emitter bakes host addresses inline
 //      (block_return via e_movconst, &g_ibtc / &g_t2cnt[] via adrp+add) with no record. So this file
 //      provides the recorded emitters (emit_blockret / emit_ibtcptr / emit_t2cntptr / pc_record_icsite)
-//      that engine/stubs.c + translate/aarch64/translate.c call. When g_pcache is OFF they fall back to
+//      that stubs.c + translate.c call. When g_pcache is OFF they fall back to
 //      the exact original emitters, so the default correctness matrix stays byte-identical.
 //
 //   2. DUAL-MAPPED W^X arena. The engine writes g_cache (RW alias) and executes g_cache+g_rw2rx (RX
@@ -103,7 +103,7 @@ static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 #define g_reloc (g_reloc_table.records)
 #define g_nreloc (g_reloc_table.count)
 
-static void block_return(void); // engine trampoline (also forward-declared in engine/stubs.c)
+static void block_return(void); // engine trampoline (also forward-declared in stubs.c)
 
 static void pc_reloc_add(uint32_t off, uint8_t kind, uint8_t rd, uint16_t slot) {
     if (!hl_reloc_add(&g_reloc_table, off, (uint32_t)kind | ((uint32_t)rd << 8) | ((uint32_t)slot << 16))) {

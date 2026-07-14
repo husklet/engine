@@ -1,6 +1,6 @@
 // translator/host/aarch64 -- the HOST ARM64 ASSEMBLER: emit32 + the e_* instruction encoders. Host is
 // always arm64. Pure encoders (no engine/guest knowledge) -- the lowest layer, below engine/ and used by
-// the engine block-ABI stubs (engine/stubs.c) and the aarch64 translator. Extracted from the former
+// the engine block-ABI stubs (guest/aarch64/stubs.c) and the aarch64 translator. Extracted from the former
 // engine/emit_arm64.c (C7: home the assembler in its own host layer). Emits into the engine cursor g_cp.
 
 // ---------------- instruction emitters ----------------

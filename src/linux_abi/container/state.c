@@ -1,5 +1,5 @@
 // hl/linux_abi/container -- container config state (UTS/cgroup/USER-ns/port-map) + parsers.
-#include "../../production/os/container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
+#include "../parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 #include "../xattr.h"
 #include "../readonly.h"
 #include "../limits.h"
@@ -693,11 +693,11 @@ static void parse_publish(const char *s) {
         const char *colon = strchr(s, ':');
         const char *comma = strchr(s, ',');
         if (!colon || (comma && colon > comma)) {
-            fprintf(stderr, "dd: invalid DD_PUBLISH '%s': expected HOST:CONTAINER\n", s);
+            fprintf(stderr, "hl: invalid HL_PUBLISH '%s': expected HOST:CONTAINER\n", s);
             exit(2);
         }
-        unsigned h = dd_parse_port_field("HL_PUBLISH host port", s, colon);
-        unsigned cc = dd_parse_port_field("HL_PUBLISH container port", colon + 1, comma);
+        unsigned h = hl_parse_port_field("HL_PUBLISH host port", s, colon);
+        unsigned cc = hl_parse_port_field("HL_PUBLISH container port", colon + 1, comma);
         g_portmap[g_nportmap].cport = (uint16_t)cc;
         g_portmap[g_nportmap].hport = (uint16_t)h;
         g_nportmap++;
@@ -714,7 +714,7 @@ static uint64_t parse_size(const char *s) {
     char *e = NULL;
     uint64_t v = strtoull(s, &e, 10);
     if (errno != 0 || e == s) {
-        fprintf(stderr, "dd: invalid size '%s': not a number\n", s);
+        fprintf(stderr, "hl: invalid size '%s': not a number\n", s);
         exit(2);
     }
     switch (*e) {
@@ -725,7 +725,7 @@ static uint64_t parse_size(const char *s) {
     case 'M': return v << 20;
     case 'g':
     case 'G': return v << 30;
-    default: fprintf(stderr, "dd: invalid size '%s': bad suffix\n", s); exit(2);
+    default: fprintf(stderr, "hl: invalid size '%s': bad suffix\n", s); exit(2);
     }
 }
 
@@ -779,7 +779,7 @@ static uint64_t ulimit_val(const char *s) {
     char *e = NULL;
     unsigned long long v = strtoull(s, &e, 10);
     if (errno != 0 || e == s || *e) {
-        fprintf(stderr, "dd: invalid DD_ULIMITS value '%s': not a number\n", s);
+        fprintf(stderr, "hl: invalid HL_ULIMITS value '%s': not a number\n", s);
         exit(2);
     }
     return (uint64_t)v;
@@ -793,7 +793,7 @@ static void parse_ulimits(const char *spec) {
     for (char *t = strtok_r(tb, ",", &sv); t; t = strtok_r(NULL, ",", &sv)) {
         char *eq = strchr(t, '=');
         if (!eq) {
-            fprintf(stderr, "dd: invalid DD_ULIMITS entry '%s': expected NAME=SOFT[:HARD]\n", t);
+            fprintf(stderr, "hl: invalid HL_ULIMITS entry '%s': expected NAME=SOFT[:HARD]\n", t);
             exit(2);
         }
         *eq = 0;
@@ -813,12 +813,12 @@ static void parse_ulimits(const char *spec) {
 }
 
 // Shared resource-config reader (docker --cpus/--read-only/--ulimit). BOTH the aarch64 and x86_64 frontends
-// call this from container init, so the contract is engine-identical. Env-only: DD_* survive the mac bridge
+// call this from container init, so the contract is engine-identical. Env-only: HL_* survive the mac bridge
 // and the x86 fork-server (both inherit env), and the daemon serializes the HostConfig into these vars.
 static void container_read_resource_env(void) {
     const char *c = hl_option_get("HL_CPUS");
     if (c && c[0] && !g_cpu_max) {
-        int v = dd_parse_id("HL_CPUS", c);
+        int v = hl_parse_id("HL_CPUS", c);
         if (v > 0) g_cpu_max = v;
     }
     if (!g_rootfs_ro && hl_option_get("HL_ROOTFS_RO")) g_rootfs_ro = 1;
