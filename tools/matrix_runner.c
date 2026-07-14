@@ -18,6 +18,13 @@
 
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 30000 };
 
+#ifndef AARCH64_DYNAMIC_LOADER
+#define AARCH64_DYNAMIC_LOADER ""
+#define AARCH64_DYNAMIC_LIBC ""
+#define X86_64_DYNAMIC_LOADER ""
+#define X86_64_DYNAMIC_LIBC ""
+#endif
+
 typedef enum case_isa { ISA_AARCH64, ISA_X86_64, ISA_BOTH } case_isa;
 
 typedef struct suite_case {
@@ -29,6 +36,7 @@ typedef struct suite_case {
     case_isa isa;
     int expected_exit;
     int needs_rootfs;
+    int dynamic_rootfs;
 } suite_case;
 
 typedef struct capture {
@@ -141,6 +149,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             goto invalid;
         /* Rootfs shape is explicit manifest metadata; ABI4 always carries the staged root as typed launch data. */
         cases[*case_count].needs_rootfs = strstr(fields[10], "-rootfs") != NULL;
+        cases[*case_count].dynamic_rootfs = strstr(fields[10], "dynamic-rootfs") != NULL;
         cases[*case_count].argument[0] = 0;
         if (strncmp(fields[6], "argv:", 5) == 0 &&
             snprintf(cases[*case_count].argument, sizeof(cases[*case_count].argument), "%s", fields[6] + 5) >=
@@ -457,8 +466,24 @@ static int copy_file(const char *source, const char *destination) {
     return close(input) != 0 || close(output) != 0;
 }
 
-static int stage_rootfs(const char *binary_root, const char *guest, char rootfs[1024]) {
-    char bin[1024], dev[1024], pts[1024], tmp[1024], staged[1024];
+static int make_parents(char *path) {
+    char *cursor;
+    for (cursor = path + 1; *cursor != 0; ++cursor) {
+        if (*cursor != '/') continue;
+        *cursor = 0;
+        if (mkdir(path, 0755) != 0 && errno != EEXIST) return 1;
+        *cursor = '/';
+    }
+    return 0;
+}
+
+static int stage_rootfs(const char *binary_root, const char *guest, const char *isa, int dynamic,
+                        char rootfs[1024]) {
+    char bin[1024], dev[1024], pts[1024], tmp[1024], staged[1024], loader[1024], libc[1024];
+    const char *loader_source = strcmp(isa, "aarch64") == 0 ? AARCH64_DYNAMIC_LOADER : X86_64_DYNAMIC_LOADER;
+    const char *libc_source = strcmp(isa, "aarch64") == 0 ? AARCH64_DYNAMIC_LIBC : X86_64_DYNAMIC_LIBC;
+    const char *loader_guest = strcmp(isa, "aarch64") == 0 ? "/lib/ld-linux-aarch64.so.1"
+                                                             : "/lib64/ld-linux-x86-64.so.2";
     if (snprintf(rootfs, 1024, "%s/.rootfs-XXXXXX", binary_root) >= 1024 || mkdtemp(rootfs) == NULL ||
         snprintf(bin, sizeof bin, "%s/bin", rootfs) >= (int)sizeof bin ||
         snprintf(dev, sizeof dev, "%s/dev", rootfs) >= (int)sizeof dev ||
@@ -467,16 +492,27 @@ static int stage_rootfs(const char *binary_root, const char *guest, char rootfs[
         snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged || mkdir(bin, 0755) != 0 ||
         mkdir(dev, 0755) != 0 || mkdir(pts, 0755) != 0 || mkdir(tmp, 01777) != 0 || copy_file(guest, staged) != 0)
         return 1;
+    if (!dynamic) return 0;
+    if (*loader_source == 0 || *libc_source == 0 ||
+        snprintf(loader, sizeof loader, "%s%s", rootfs, loader_guest) >= (int)sizeof loader ||
+        snprintf(libc, sizeof libc, "%s/lib/libc.so.6", rootfs) >= (int)sizeof libc || make_parents(loader) != 0 ||
+        make_parents(libc) != 0 || copy_file(loader_source, loader) != 0 || copy_file(libc_source, libc) != 0)
+        return 1;
     return 0;
 }
 
 static void remove_rootfs(const char *rootfs) {
     char path[1024];
+    if (snprintf(path, sizeof path, "%s/lib/ld-linux-aarch64.so.1", rootfs) < (int)sizeof path) (void)unlink(path);
+    if (snprintf(path, sizeof path, "%s/lib64/ld-linux-x86-64.so.2", rootfs) < (int)sizeof path) (void)unlink(path);
+    if (snprintf(path, sizeof path, "%s/lib/libc.so.6", rootfs) < (int)sizeof path) (void)unlink(path);
     if (snprintf(path, sizeof path, "%s/bin/guest", rootfs) < (int)sizeof path) (void)unlink(path);
     if (snprintf(path, sizeof path, "%s/dev/pts", rootfs) < (int)sizeof path) (void)rmdir(path);
     if (snprintf(path, sizeof path, "%s/bin", rootfs) < (int)sizeof path) (void)rmdir(path);
     if (snprintf(path, sizeof path, "%s/dev", rootfs) < (int)sizeof path) (void)rmdir(path);
     if (snprintf(path, sizeof path, "%s/tmp", rootfs) < (int)sizeof path) (void)rmdir(path);
+    if (snprintf(path, sizeof path, "%s/lib64", rootfs) < (int)sizeof path) (void)rmdir(path);
+    if (snprintf(path, sizeof path, "%s/lib", rootfs) < (int)sizeof path) (void)rmdir(path);
     (void)rmdir(rootfs);
 }
 
@@ -524,7 +560,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         fprintf(stderr, "matrix-runner: %s input path/read failure\n", item->name);
         return 1;
     }
-    if (item->needs_rootfs && stage_rootfs(binary_root, guest, rootfs) != 0) {
+    if (item->needs_rootfs && stage_rootfs(binary_root, guest, isa, item->dynamic_rootfs, rootfs) != 0) {
         fprintf(stderr, "matrix-runner: %s rootfs staging failure\n", item->name);
         free(expected);
         return 1;

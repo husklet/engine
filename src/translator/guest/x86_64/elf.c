@@ -394,9 +394,13 @@ static void load_elf(const char *path, struct loaded *out) {
         }
     }
     mprotect(base, span, PROT_READ | PROT_WRITE | PROT_EXEC);
-    out->entry = e_entry + bias;
+    // A dynamic ET_EXEC remains a LOW-address Linux object even though macOS forces its storage HIGH.
+    // ld.so derives the main link_map bias and lookup range from AT_ENTRY/AT_PHDR; publishing host-biased
+    // values makes dladdr/dlsym miss every LOW function pointer. The dispatcher already translates LOW
+    // execution addresses through g_nonpie_bias, matching the AArch64 loader contract.
+    out->entry = etype == 2 ? e_entry : e_entry + bias;
     out->base = (uint64_t)base;
-    out->phdr = (uint64_t)base + phoff;
+    out->phdr = etype == 2 ? basepage + phoff : (uint64_t)base + phoff;
     out->phent = phentsize;
     out->phnum = phnum;
     extern int g_diag;

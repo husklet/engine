@@ -182,10 +182,12 @@ IPC_CASE_BINS := $(addprefix $(BUILD)/compat/ipc/aarch64/,$(filter-out ipc_tso_u
 THREAD_CASE_SOURCES := $(sort $(wildcard tests/compat/threads/*.c))
 THREAD_CASE_NAMES := $(basename $(notdir $(THREAD_CASE_SOURCES)))
 THREAD_CASE_BINS := $(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/aarch64/%) \
-	$(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/x86_64/%)
+	$(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/x86_64/%) \
+	$(BUILD)/compat/threads/aarch64/threads_mutex_nopie \
+	$(BUILD)/compat/threads/x86_64/threads_mutex_nopie
 PURPOSE_ABI_PIE := atomics_builtins cpuid_features rflags_id tls tlsmodels
 PURPOSE_FILESYSTEM_PIE := dup2redir fcntlflags ltp_aterr ltp_dupfcntl ltp_linkstat mkfifo scratch_exec sentry_fs
-PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpoint ltp_procmisc nonpie_dladdr \
+PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpoint ltp_procmisc \
 	pipeproc procreap sentry_fork sysinfo thrfork waitcore
 PURPOSE_NETWORK_PIE := ltp_neterr net_nonblock net_sendmsg net_sockopt net_tcp net_udp net_unix sentry_net
 PURPOSE_IPC_PIE := msg neonshm sem shm shmposix sysvshm
@@ -568,6 +570,14 @@ $(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
+$(BUILD)/compat/threads/aarch64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+
+$(BUILD)/compat/threads/x86_64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+
 $(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/aarch64/%): $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
@@ -591,6 +601,14 @@ $(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/aarch64/%): $(BUILD)/compat/proc
 $(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/x86_64/%): $(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(BUILD)/compat/process/aarch64/nonpie_dladdr: tests/compat/process/nonpie_dladdr.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -no-pie -rdynamic -pthread $< -ldl -o $@
+
+$(BUILD)/compat/process/x86_64/nonpie_dladdr: tests/compat/process/nonpie_dladdr.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -no-pie -rdynamic -pthread $< -ldl -o $@
 
 $(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/aarch64/%): $(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)

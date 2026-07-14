@@ -649,6 +649,11 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // mprotect is harmful on macOS -- would fault the guest's own RELRO writes). The g_gna PROT_NONE
         // registry tracks the guest's INTENT (reserve PROT_NONE -> commit RW) so buffer checks EFAULT.
         if (a1) {
+            // ET_EXEC addresses remain LOW in the Linux ABI while their storage is mapped at the engine's
+            // HIGH bias. Keep all logical permission registries in guest coordinates, but use this translated
+            // address for mapping validation and any safe host-side protection change.
+            uint64_t physical_a0 =
+                (g_nonpie_lo && a0 >= g_nonpie_lo && a0 < g_nonpie_hi) ? a0 + g_nonpie_bias : a0;
             // Linux mm/mprotect.c rejects a start not aligned to the (guest) page size with EINVAL BEFORE
             // touching anything, so a bad-alignment probe must not read as success.
             if (a0 & (uint64_t)(guest_pagesz() - 1)) {
@@ -668,9 +673,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // a low-range miss must re-check at nonpie_p(a0) before ENOMEM (inert for PIE: nonpie_p == a0).
             if (!gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
                 // (open-coded nonpie_p: dispatch.c defines it AFTER this module in the TU)
-                uint64_t reb = (g_nonpie_lo && a0 >= g_nonpie_lo && a0 < g_nonpie_hi) ? a0 + g_nonpie_bias : a0;
-                if (reb == a0 ||
-                    (!gmap_contains(reb, (uint64_t)a1) && !host_range_mapped((uintptr_t)reb, (size_t)a1))) {
+                if (physical_a0 == a0 || (!gmap_contains(physical_a0, (uint64_t)a1) &&
+                                          !host_range_mapped((uintptr_t)physical_a0, (size_t)a1))) {
                     G_RET(c) = (uint64_t)(-ENOMEM);
                     break;
                 }
@@ -692,11 +696,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // PROT_EXEC is intentionally omitted: translated guest bytes are data to the host, not executed.
             {
                 size_t hp = (size_t)getpagesize();
-                uint64_t tracked = gmap_find_len(a0);
+                uint64_t tracked = gmap_find_len(physical_a0);
                 uint64_t host_len = (a1 + hp - 1) & ~((uint64_t)hp - 1);
-                if (tracked && host_len <= tracked) {
+                // A Linux 4 KiB subpage may start inside one 16 KiB macOS VM page. In that case physical
+                // mprotect would be EINVAL (or, after rounding down, alter adjacent guest subpages), so the
+                // logical gna/gro registries above provide the precise Linux permission model instead.
+                if (tracked && !(physical_a0 & (uint64_t)(hp - 1)) && host_len <= tracked) {
                     int host_prot = (int)a2 & (PROT_READ | PROT_WRITE);
-                    if (mprotect((void *)(uintptr_t)a0, (size_t)host_len, host_prot) != 0) {
+                    if (mprotect((void *)(uintptr_t)physical_a0, (size_t)host_len, host_prot) != 0) {
                         G_RET(c) = (uint64_t)(-errno);
                         break;
                     }

@@ -26,6 +26,6 @@ ltp_dupfcntl	filesystem	ltp_dupfcntl.c	ltp_dupfcntl.c	aarch64,x86_64	-static-pie
 ltp_linkstat	filesystem	ltp_linkstat.c	ltp_linkstat.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_linkstat.out	linux-libc	active	exact source; deterministic checked registration
 mkfifo	filesystem	mkfifo.c	mkfifo.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mkfifo.out	linux-libc	active	exact source; deterministic checked registration
 sentry_fs	filesystem	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_fs.out	linux-libc	active	exact source; deterministic checked registration
-scratch-exec	rootfs	scratch_exec.c	scratch_exec.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/scratch_exec.out	linux-libc	excluded-unsupported-registration	exact source; requires synthesized scratch-rootfs execution
+scratch-exec	rootfs	scratch_exec.c	scratch_exec.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/scratch_exec.out	linux-libc,scratch-rootfs	active	exact source; typed ABI4 stages the static guest as the only executable in an otherwise empty rootfs
 sentry-fs-untrusted	sandbox	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_fs.out	linux-libc	active	exact typed untrusted registration
 sentry-fs-sandbox	sandbox	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_SANDBOX=1	0	expected/sentry_fs.out	linux-libc	active	exact typed sandbox registration
