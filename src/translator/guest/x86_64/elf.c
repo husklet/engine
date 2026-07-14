@@ -362,7 +362,13 @@ static void load_elf(const char *path, struct loaded *out) {
     // materializes those same pointers as LOW link addresses in code (mov-imm / data loads that dd's
     // ea_bias17 folds on access), so it compares LOW==LOW natively -- rebasing its words HIGH is what broke
     // gcc's set_static_spec pointer-identity check (gcc_unreachable ICE). Gating on static cleanly separates
-    // the two: jq/busybox stay rebased, gcc/cc1 stay low-consistent. DDRELRODYN=1 forces the old behavior.
+    // the two: jq/busybox stay rebased, gcc/cc1 stay low-consistent.
+    //
+    // Preserve links whose slot and target are in the SAME section. These are guest identity links in
+    // mutable/runtime structures, not host pointers: glibc's main_arena.next is the canonical example.
+    // Rebasing that self-link while a RIP-relative LEA still produces the low guest address breaks the
+    // circular-list sentinel and makes fork lock main_arena twice. Cross-section pointers retain the
+    // historical relocation needed by static jq/busybox pointer tables.
     int has_interp = 0;
     for (int i = 0; i < phnum; i++)
         if (rd32(f + phoff + (uint64_t)i * phentsize) == 3) {
@@ -382,7 +388,9 @@ static void load_elf(const char *path, struct loaded *out) {
                 uint64_t saddr = rd64(sh + 16), ssize = rd64(sh + 32);
                 for (uint64_t o = 0; o + 8 <= ssize; o += 8) {
                     uint64_t *slot = (uint64_t *)(saddr + bias + o);
-                    if (*slot >= g_nonpie_lo && *slot < g_nonpie_hi) *slot += bias;
+                    uint64_t target = *slot;
+                    int same_section = target >= saddr && target < saddr + ssize;
+                    if (!same_section && target >= g_nonpie_lo && target < g_nonpie_hi) *slot += bias;
                 }
             }
         }
