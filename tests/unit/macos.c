@@ -59,6 +59,24 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
                                                       HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     {
+        const uint32_t count = 65536;
+        hl_host_handle *mutexes = calloc(count, sizeof(*mutexes));
+        uint32_t index;
+        HL_CHECK(mutexes != NULL);
+        for (index = 0; index < count; ++index) {
+            hl_host_result created = services.sync->mutex_create(services.context);
+            HL_CHECK(created.status == HL_STATUS_OK);
+            mutexes[index] = created.value;
+        }
+        HL_CHECK(services.sync->mutex_create(services.context).status == HL_STATUS_RESOURCE_LIMIT);
+        for (index = 0; index < count; ++index) {
+            HL_CHECK(services.sync->mutex_lock(services.context, mutexes[index]).status == HL_STATUS_OK);
+            HL_CHECK(services.sync->mutex_unlock(services.context, mutexes[index]).status == HL_STATUS_OK);
+            HL_CHECK(services.sync->mutex_close(services.context, mutexes[index]).status == HL_STATUS_OK);
+        }
+        free(mutexes);
+    }
+    {
         hl_host_result first = services.sync->mutex_create(services.context);
         hl_host_result second = services.sync->mutex_create(services.context);
         HL_CHECK(first.status == HL_STATUS_OK && second.status == HL_STATUS_OK && first.value != second.value);

@@ -188,9 +188,31 @@ int main(void) {
     }
     HL_CHECK(hl_linux_abi_init(&linux_abi, &services, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) ==
              HL_STATUS_OK);
-    HL_CHECK(file_host.fake.live_mutexes == HL_ARRAY_COUNT(ofds));
+    HL_CHECK(file_host.fake.live_mutexes == 0);
+    hl_fake_host_fail_next(&file_host.fake, HL_STATUS_IO);
+    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0, 0, &original) == HL_STATUS_IO);
+    HL_CHECK(file_host.fake.live_mutexes == 0);
+    {
+        hl_linux_fd capacity_fds[HL_ARRAY_COUNT(ofds) - 1];
+        size_t i;
+        for (i = 0; i < HL_ARRAY_COUNT(capacity_fds); ++i) {
+            HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0, 0, &capacity_fds[i]) == HL_STATUS_OK);
+            HL_CHECK(file_host.fake.live_mutexes == i + 1);
+        }
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0, 0, &original) == HL_STATUS_RESOURCE_LIMIT);
+        HL_CHECK(file_host.fake.live_mutexes == HL_ARRAY_COUNT(capacity_fds));
+        for (i = 0; i < HL_ARRAY_COUNT(capacity_fds); ++i) {
+            HL_CHECK(hl_linux_fd_close(&linux_abi, capacity_fds[i], &closed) == HL_STATUS_OK);
+            HL_CHECK(closed == 55);
+            HL_CHECK(file_host.fake.live_mutexes == HL_ARRAY_COUNT(capacity_fds) - i - 1);
+        }
+    }
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0123, 1, &original) == HL_STATUS_OK);
+    HL_CHECK(file_host.fake.live_mutexes == 1);
+    HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_BUSY);
+    HL_CHECK(file_host.fake.live_mutexes == 1);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
+    HL_CHECK(file_host.fake.live_mutexes == 1);
     HL_CHECK(original != duplicate);
     HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_OK);
     HL_CHECK(snapshot.fd == duplicate && snapshot.ofd == fds[original].ofd);

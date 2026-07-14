@@ -138,9 +138,9 @@ static int hl_read_config_file(int fd) {
     if (cfg.rootfs_read_only) hl_option_set("HL_ROOTFS_RO", "1", 1);
     if (cfg.network_isolated) hl_option_set("HL_NET_ISOLATE", "1", 1);
     if (cfg.publish_external) hl_option_set("HL_PUBLISH_DAEMON", "1", 1);
-    // GPU rung 2/3 (--gui): opt-in the host-IOSurface path. The engine hl_option_get()s this (vfs.c
-    // gpu_iosurface_on()); carrying it in the typed config — not the ambient host env — is what makes it
-    // reach the engine reliably (the FFI/bridge does not forward the launcher's ambient environment).
+    // GPU rung 2/3 (--gui): opt in to the configured host presentation path. Carrying this in the typed config,
+    // rather than the ambient host environment, makes it reach the engine reliably because the embedding bridge
+    // does not forward the launcher's ambient environment.
     if (cfg.gpu_enabled) hl_option_set("HL_GPU_IOSURFACE", "1", 1);
     if (cfg.gpu_pool_capacity) {
         snprintf(num, sizeof num, "%u", cfg.gpu_pool_capacity);

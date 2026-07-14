@@ -12,7 +12,7 @@ CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
-PRIVATE_HEADERS := src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
+PRIVATE_HEADERS := src/host/sync.h src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
 # translator, and Linux-personality implementation. Make cannot discover those nested includes from the
@@ -31,30 +31,31 @@ CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
 	src/translator/window.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/encode.c src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/device.c src/linux_abi/encode.c \
+	src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
+	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/stat.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
-MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES) src/linux_abi/affinity.c src/linux_abi/device.c src/linux_abi/errno.c \
-	src/linux_abi/limits.c src/linux_abi/number.c src/linux_abi/readonly.c \
-	src/linux_abi/xattr.c
-MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) src/host/clock.c src/host/file.c
+COMMON_HOST_SOURCES := src/host/sync.c
+MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
+MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
 MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_LINUX_ABI_OBJECTS := $(MAC_LINUX_ABI_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_HOST_OBJECTS := $(MAC_HOST_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
 	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
-PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
+PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES) $(COMMON_HOST_SOURCES)
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/%.o)
 TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
 ifeq ($(HOST),linux)
-LINUX_HOST_SOURCES := src/host/linux/host.c
+LINUX_HOST_SOURCES := src/host/linux/host.c $(COMMON_HOST_SOURCES)
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
-LINUX_HOST_TEST := run-unit-host_linux
+LINUX_HOST_TEST := run-unit-linux
 endif
 
 UNIT_NAMES := affinity arena clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
@@ -69,7 +70,7 @@ E2E_CASES := atomics epoll_edge eventfd forkwait sysv_ipc
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos-host compat-build compat-native compat-engines e2e-compat \
+.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines e2e-compat \
 	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -137,17 +138,9 @@ $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-en
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
 
-$(BUILD)/tests/test_xattr_cache: tests/unit/test_xattr_cache.c src/linux_abi/xattr.c
+$(BUILD)/tests/test_limits: tests/unit/test_limits.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_readonly: tests/unit/test_readonly.c src/linux_abi/readonly.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_limits: tests/unit/test_limits.c src/linux_abi/limits.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -pthread -o $@
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -pthread -o $@
 
 $(BUILD)/tests/test_reloc: tests/unit/test_reloc.c src/translator/reloc.c
 	@mkdir -p $(@D)
@@ -162,26 +155,6 @@ $(BUILD)/tests/test_window: tests/unit/test_window.c src/translator/window.c
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 $(BUILD)/tests/test_identity: tests/unit/test_identity.c src/translator/identity.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_device: tests/unit/test_device.c src/linux_abi/device.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_affinity: tests/unit/test_affinity.c src/linux_abi/affinity.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_errno: tests/unit/test_errno.c src/linux_abi/errno.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_number: tests/unit/test_number.c src/linux_abi/number.c
-	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
-
-$(BUILD)/tests/test_parse: tests/unit/test_parse.c src/linux_abi/parse.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -281,7 +254,7 @@ $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^) -framework IOSurface -framework CoreFoundation
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
@@ -348,22 +321,22 @@ endef
 
 $(foreach test,$(UNIT_NAMES),$(eval $(call HL_UNIT_RULE,$(test))))
 
-run-unit-host_linux: $(BUILD)/tests/test_host_linux
+run-unit-linux: $(BUILD)/tests/linux
 	$<
 
-$(BUILD)/tests/test_host_linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+$(BUILD)/tests/linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
-$(BUILD)/tests/test-host-macos: tests/unit/macos.c src/host/macos/host.c src/core/host_services.c \
+$(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/sync.c src/core/host_services.c \
 	src/core/log.c src/host/clock.c src/host/file.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
-		src/host/macos/host.c src/core/host_services.c src/core/log.c src/host/clock.c \
+		src/host/macos/host.c src/host/sync.c src/core/host_services.c src/core/log.c src/host/clock.c \
 		src/host/file.c -o $@
 
-test-macos-host: $(BUILD)/tests/test-host-macos
+test-macos: $(BUILD)/tests/macos
 	$(MAC) $(abspath $<)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c

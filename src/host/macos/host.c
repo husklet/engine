@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "hl/macos.h"
+#include "../sync.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +23,6 @@
 #define HL_MACOS_MAPPING_CAPACITY 4096u
 #define HL_MACOS_FILE_CAPACITY 1024u
 #define HL_MACOS_PROCESS_CAPACITY 1024u
-#define HL_MACOS_MUTEX_CAPACITY 4096u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -50,21 +50,14 @@ typedef struct hl_macos_process {
     uint32_t exit_value;
 } hl_macos_process;
 
-typedef struct hl_macos_mutex {
-    uint32_t generation;
-    uint32_t active;
-    uint32_t users;
-    pthread_mutex_t mutex;
-} hl_macos_mutex;
-
 struct hl_host_macos {
     pthread_mutex_t lock;
     pthread_cond_t process_changed;
     uint32_t destroying;
+    hl_host_sync_registry *sync;
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
-    hl_macos_mutex mutexes[HL_MACOS_MUTEX_CAPACITY];
 };
 
 static uint64_t hl_macos_monotonic_value(void) {
@@ -675,95 +668,24 @@ static hl_host_result hl_macos_process_close(void *context, hl_host_handle handl
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_macos_mutex *hl_macos_mutex_ref(hl_host_macos *host, hl_host_handle handle) {
-    uint32_t low = (uint32_t)handle;
-    hl_macos_mutex *mutex = NULL;
-    pthread_mutex_lock(&host->lock);
-    if (low != 0 && low - 1u < HL_MACOS_MUTEX_CAPACITY) {
-        hl_macos_mutex *candidate = &host->mutexes[low - 1u];
-        if (candidate->active && candidate->generation == (uint32_t)(handle >> 32) && !host->destroying) {
-            candidate->users++;
-            mutex = candidate;
-        }
-    }
-    pthread_mutex_unlock(&host->lock);
-    return mutex;
-}
-
-static void hl_macos_mutex_unref(hl_host_macos *host, hl_macos_mutex *mutex) {
-    pthread_mutex_lock(&host->lock);
-    if (mutex->users != 0) mutex->users--;
-    pthread_mutex_unlock(&host->lock);
-}
-
 static hl_host_result hl_macos_mutex_create(void *context) {
     hl_host_macos *host = context;
-    pthread_mutexattr_t attributes;
-    int error = pthread_mutexattr_init(&attributes);
-    int attributes_initialized = error == 0;
-    if (attributes_initialized) error = pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_ERRORCHECK);
-    if (error != 0) {
-        if (attributes_initialized) pthread_mutexattr_destroy(&attributes);
-        return hl_macos_result(hl_macos_status(error), 0, (uint64_t)(unsigned int)error);
-    }
-    pthread_mutex_lock(&host->lock);
-    uint32_t index;
-    for (index = 0; index < HL_MACOS_MUTEX_CAPACITY; ++index)
-        if (!host->mutexes[index].active) break;
-    if (index == HL_MACOS_MUTEX_CAPACITY || host->destroying) {
-        pthread_mutex_unlock(&host->lock);
-        pthread_mutexattr_destroy(&attributes);
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
-    }
-    hl_macos_mutex *mutex = &host->mutexes[index];
-    error = pthread_mutex_init(&mutex->mutex, &attributes);
-    pthread_mutexattr_destroy(&attributes);
-    if (error == 0) {
-        mutex->generation++;
-        if (mutex->generation == 0) mutex->generation = 1;
-        mutex->active = 1;
-    }
-    pthread_mutex_unlock(&host->lock);
-    return error == 0 ? hl_macos_result(HL_STATUS_OK, hl_macos_handle(index, mutex->generation), 0)
-                      : hl_macos_result(hl_macos_status(error), 0, (uint64_t)(unsigned int)error);
+    return hl_host_sync_mutex_create(host->sync);
 }
 
 static hl_host_result hl_macos_mutex_lock(void *context, hl_host_handle handle) {
     hl_host_macos *host = context;
-    hl_macos_mutex *mutex = hl_macos_mutex_ref(host, handle);
-    if (mutex == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    int error = pthread_mutex_lock(&mutex->mutex);
-    hl_macos_mutex_unref(host, mutex);
-    return hl_macos_result(hl_macos_status(error), 0, (uint64_t)(unsigned int)error);
+    return hl_host_sync_mutex_lock(host->sync, handle);
 }
 
 static hl_host_result hl_macos_mutex_unlock(void *context, hl_host_handle handle) {
     hl_host_macos *host = context;
-    hl_macos_mutex *mutex = hl_macos_mutex_ref(host, handle);
-    if (mutex == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    int error = pthread_mutex_unlock(&mutex->mutex);
-    hl_macos_mutex_unref(host, mutex);
-    return hl_macos_result(hl_macos_status(error), 0, (uint64_t)(unsigned int)error);
+    return hl_host_sync_mutex_unlock(host->sync, handle);
 }
 
 static hl_host_result hl_macos_mutex_close(void *context, hl_host_handle handle) {
     hl_host_macos *host = context;
-    uint32_t low = (uint32_t)handle;
-    pthread_mutex_lock(&host->lock);
-    hl_macos_mutex *mutex = low != 0 && low - 1u < HL_MACOS_MUTEX_CAPACITY ? &host->mutexes[low - 1u] : NULL;
-    if (mutex == NULL || !mutex->active || mutex->generation != (uint32_t)(handle >> 32) || host->destroying) {
-        pthread_mutex_unlock(&host->lock);
-        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    }
-    if (mutex->users != 0 || pthread_mutex_trylock(&mutex->mutex) != 0) {
-        pthread_mutex_unlock(&host->lock);
-        return hl_macos_result(HL_STATUS_BUSY, 0, 0);
-    }
-    pthread_mutex_unlock(&mutex->mutex);
-    pthread_mutex_destroy(&mutex->mutex);
-    mutex->active = 0;
-    pthread_mutex_unlock(&host->lock);
-    return hl_macos_result(HL_STATUS_OK, 0, 0);
+    return hl_host_sync_mutex_close(host->sync, handle);
 }
 
 static void hl_macos_log(void *context, uint32_t event, const char *message, size_t message_size) {
@@ -811,6 +733,12 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (hl_host_sync_registry_create(&host->sync) != HL_STATUS_OK) {
+        pthread_cond_destroy(&host->process_changed);
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
@@ -835,10 +763,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         hl_macos_process *process = &host->processes[index];
         if (process->active && !process->reaped) kill(process->pid, SIGKILL);
     }
-    for (index = 0; index < HL_MACOS_MUTEX_CAPACITY; ++index) {
-        hl_macos_mutex *mutex = &host->mutexes[index];
-        if (mutex->active) pthread_mutex_destroy(&mutex->mutex);
-    }
+    hl_host_sync_registry_destroy(host->sync);
     for (;;) {
         uint32_t waiters = 0;
         for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index)

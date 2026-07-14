@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "hl/linux.h"
+#include "../sync.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,8 +32,7 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_SOCKET = 3,
     HL_LINUX_HANDLE_POLLSET = 4,
     HL_LINUX_HANDLE_SHARED_MEMORY = 5,
-    HL_LINUX_HANDLE_PROCESS = 6,
-    HL_LINUX_HANDLE_MUTEX = 7
+    HL_LINUX_HANDLE_PROCESS = 6
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -49,13 +49,13 @@ typedef struct hl_linux_handle_entry {
     uint32_t process_waiters;
     uint32_t process_exit_kind;
     uint32_t process_exit_value;
-    uint32_t sync_users;
 } hl_linux_handle_entry;
 
 struct hl_host_linux {
     pthread_mutex_t lock;
     pthread_cond_t process_changed;
     uint32_t destroying;
+    hl_host_sync_registry *sync;
     hl_linux_handle_entry handles[HL_LINUX_HANDLE_CAPACITY];
 };
 
@@ -920,87 +920,24 @@ static hl_host_result hl_linux_process_close(void *context, hl_host_handle handl
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
-static pthread_mutex_t *hl_linux_mutex_ref(hl_host_linux *host, hl_host_handle handle) {
-    pthread_mutex_t *mutex = NULL;
-    pthread_mutex_lock(&host->lock);
-    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
-    if (entry != NULL && !host->destroying) {
-        entry->sync_users++;
-        mutex = entry->address;
-    }
-    pthread_mutex_unlock(&host->lock);
-    return mutex;
-}
-
-static void hl_linux_mutex_unref(hl_host_linux *host, hl_host_handle handle) {
-    pthread_mutex_lock(&host->lock);
-    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
-    if (entry != NULL && entry->sync_users != 0) entry->sync_users--;
-    pthread_mutex_unlock(&host->lock);
-}
-
 static hl_host_result hl_linux_mutex_create(void *context) {
     hl_host_linux *host = context;
-    pthread_mutex_t *mutex = malloc(sizeof(*mutex));
-    pthread_mutexattr_t attributes;
-    int error;
-    if (mutex == NULL) return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
-    error = pthread_mutexattr_init(&attributes);
-    if (error == 0) {
-        error = pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_ERRORCHECK);
-        if (error == 0) error = pthread_mutex_init(mutex, &attributes);
-        pthread_mutexattr_destroy(&attributes);
-    }
-    if (error != 0) {
-        free(mutex);
-        return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
-    }
-    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MUTEX, -1, mutex, NULL, sizeof(*mutex), -1);
-    if (result.status != HL_STATUS_OK) {
-        pthread_mutex_destroy(mutex);
-        free(mutex);
-    }
-    return result;
+    return hl_host_sync_mutex_create(host->sync);
 }
 
 static hl_host_result hl_linux_mutex_lock(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
-    pthread_mutex_t *mutex = hl_linux_mutex_ref(host, handle);
-    if (mutex == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    int error = pthread_mutex_lock(mutex);
-    hl_linux_mutex_unref(host, handle);
-    return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
+    return hl_host_sync_mutex_lock(host->sync, handle);
 }
 
 static hl_host_result hl_linux_mutex_unlock(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
-    pthread_mutex_t *mutex = hl_linux_mutex_ref(host, handle);
-    if (mutex == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    int error = pthread_mutex_unlock(mutex);
-    hl_linux_mutex_unref(host, handle);
-    return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
+    return hl_host_sync_mutex_unlock(host->sync, handle);
 }
 
 static hl_host_result hl_linux_mutex_close(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
-    pthread_mutex_lock(&host->lock);
-    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
-    if (entry == NULL || host->destroying) {
-        pthread_mutex_unlock(&host->lock);
-        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    }
-    if (entry->sync_users != 0 || pthread_mutex_trylock(entry->address) != 0) {
-        pthread_mutex_unlock(&host->lock);
-        return hl_linux_result(HL_STATUS_BUSY, 0, 0);
-    }
-    pthread_mutex_t *mutex = entry->address;
-    pthread_mutex_unlock(mutex);
-    pthread_mutex_destroy(mutex);
-    free(mutex);
-    entry->address = NULL;
-    entry->kind = HL_LINUX_HANDLE_NONE;
-    pthread_mutex_unlock(&host->lock);
-    return hl_linux_result(HL_STATUS_OK, 0, 0);
+    return hl_host_sync_mutex_close(host->sync, handle);
 }
 
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
@@ -1042,6 +979,12 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         pthread_mutex_destroy(&host->lock);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
+    }
+    if (hl_host_sync_registry_create(&host->sync) != HL_STATUS_OK) {
+        pthread_cond_destroy(&host->process_changed);
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_OUT_OF_MEMORY;
     }
     for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
         host->handles[i].descriptor = -1;
@@ -1095,14 +1038,12 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             if (entry->process_reaped) continue;
             kill(entry->descriptor, SIGKILL);
             while (waitpid(entry->descriptor, &status, 0) < 0 && errno == EINTR) {}
-        } else if (entry->kind == HL_LINUX_HANDLE_MUTEX) {
-            pthread_mutex_destroy(entry->address);
-            free(entry->address);
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);
         }
     }
+    hl_host_sync_registry_destroy(host->sync);
     pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->lock);
     free(host);

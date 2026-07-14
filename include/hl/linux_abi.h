@@ -138,8 +138,8 @@ typedef struct hl_linux_abi {
 } hl_linux_abi;
 
 /*
- * An initialized hl_linux_abi owns its synchronization state and must not be
- * copied. Host service callbacks invoked by it must not re-enter the same
+ * Each live OFD owns one host mutex; unused capacity owns no host resources.
+ * An initialized hl_linux_abi must not be copied. Host service callbacks must not re-enter the same
  * hl_linux_abi instance. Contending operations use host synchronization;
  * unrelated OFDs never wait for one another's host I/O.
  */
