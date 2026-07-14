@@ -1,6 +1,7 @@
 #include "hl/fake_host.h"
 
 #include <string.h>
+#include <sched.h>
 
 static hl_host_result hl_fake_result(hl_fake_host *fake, uint64_t value) {
     hl_host_result result = {HL_STATUS_OK, 0, value, 0};
@@ -59,7 +60,7 @@ static hl_host_result hl_fake_spawn_cloned(void *context, hl_host_process_entry 
     if (entry == NULL) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     (void)entry_context;
     result = hl_fake_result(fake, ++fake->next_handle);
-    if (result.status == HL_STATUS_OK) fake->live_processes++;
+    if (result.status == HL_STATUS_OK) __atomic_add_fetch(&fake->live_processes, 1, __ATOMIC_RELEASE);
     return result;
 }
 
@@ -67,7 +68,10 @@ static hl_host_result hl_fake_process_wait(void *context, hl_host_handle process
     hl_fake_host *fake = context;
     hl_host_result result;
     (void)deadline_ns;
-    if (process == 0 || fake->live_processes == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (process == 0 || __atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    while (__atomic_load_n(&fake->process_block_wait, __ATOMIC_ACQUIRE) != 0)
+        sched_yield();
     result = hl_fake_result(fake, (uint64_t)(uint32_t)fake->process_exit_value);
     result.detail = fake->process_exit_kind;
     if (result.status == HL_STATUS_OK) fake->process_waited = 1;
@@ -76,10 +80,13 @@ static hl_host_result hl_fake_process_wait(void *context, hl_host_handle process
 
 static hl_host_result hl_fake_process_terminate(void *context, hl_host_handle process, uint32_t reason) {
     hl_fake_host *fake = context;
-    (void)reason;
-    if (process == 0 || fake->live_processes == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (process == 0 || __atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (reason != HL_HOST_PROCESS_TERMINATE_INTERRUPT && reason != HL_HOST_PROCESS_TERMINATE_FORCE)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_SIGNAL;
-    fake->process_exit_value = 9;
+    fake->process_exit_value = reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? 2 : 9;
+    __atomic_store_n(&fake->process_block_wait, 0, __ATOMIC_RELEASE);
     return hl_fake_result(fake, 0);
 }
 
@@ -90,7 +97,7 @@ static hl_host_result hl_fake_process_close(void *context, hl_host_handle proces
     if (!fake->process_waited) return (hl_host_result){HL_STATUS_BUSY, 0, 0, 0};
     result = hl_fake_result(fake, 0);
     if (result.status == HL_STATUS_OK) {
-        fake->live_processes--;
+        __atomic_sub_fetch(&fake->live_processes, 1, __ATOMIC_RELEASE);
         fake->process_waited = 0;
     }
     return result;
@@ -125,4 +132,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {
     fake->next_failure = status;
+}
+
+void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block) {
+    __atomic_store_n(&fake->process_block_wait, block != 0, __ATOMIC_RELEASE);
 }

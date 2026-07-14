@@ -170,7 +170,7 @@ typedef enum hl_host_process_exit_kind {
     HL_HOST_PROCESS_EXIT_SIGNAL = 2
 } hl_host_process_exit_kind;
 
-enum { HL_HOST_PROCESS_TERMINATE_FORCE = 1 };
+enum { HL_HOST_PROCESS_TERMINATE_INTERRUPT = 1, HL_HOST_PROCESS_TERMINATE_FORCE = 2 };
 
 typedef struct hl_host_process_services {
     HL_ABI_HEADER;

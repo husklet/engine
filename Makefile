@@ -112,6 +112,14 @@ $(BUILD)/e2e/guest-exit-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/guest-spin-aarch64: tests/e2e/guest_spin.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
 $(BUILD)/e2e/%-aarch64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static -pthread $< -o $@
@@ -166,6 +174,7 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/tar
 
 e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
@@ -179,6 +188,10 @@ e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BU
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --force-stop \
+		$(abspath $(BUILD)/e2e/guest-spin-aarch64)
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --force-stop \
+		$(abspath $(BUILD)/e2e/guest-spin-x86_64)
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \

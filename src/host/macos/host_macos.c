@@ -550,13 +550,14 @@ static hl_host_result hl_macos_process_terminate(void *context, hl_host_handle h
     hl_host_macos *host = context;
     hl_macos_process *process;
     pid_t pid;
-    if (reason != HL_HOST_PROCESS_TERMINATE_FORCE) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (reason != HL_HOST_PROCESS_TERMINATE_INTERRUPT && reason != HL_HOST_PROCESS_TERMINATE_FORCE)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     process = hl_macos_process_lookup(host, handle);
     pid = process != NULL ? process->pid : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (kill(pid, SIGKILL) != 0) return hl_macos_errno();
+    if (kill(pid, reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT : SIGKILL) != 0) return hl_macos_errno();
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 

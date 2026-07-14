@@ -805,13 +805,15 @@ static hl_host_result hl_linux_process_terminate(void *context, hl_host_handle h
     hl_host_linux *host = context;
     hl_linux_handle_entry *entry;
     pid_t pid;
-    if (reason != HL_HOST_PROCESS_TERMINATE_FORCE) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (reason != HL_HOST_PROCESS_TERMINATE_INTERRUPT && reason != HL_HOST_PROCESS_TERMINATE_FORCE)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
     pid = entry != NULL && !entry->process_reaped ? entry->descriptor : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (kill(pid, SIGKILL) != 0) return hl_linux_errno_result();
+    if (kill(pid, reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT : SIGKILL) != 0)
+        return hl_linux_errno_result();
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 

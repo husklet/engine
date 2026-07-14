@@ -20,6 +20,11 @@ typedef enum hl_engine_exit_kind {
     HL_ENGINE_EXIT_ENGINE_ERROR = 4
 } hl_engine_exit_kind;
 
+typedef enum hl_engine_request_kind {
+    HL_ENGINE_REQUEST_INTERRUPT = 1,
+    HL_ENGINE_REQUEST_FORCE_STOP = 2
+} hl_engine_request_kind;
+
 typedef struct hl_engine_config {
     HL_ABI_HEADER;
     uint32_t guest_isa;
