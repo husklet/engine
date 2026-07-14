@@ -164,6 +164,27 @@ static int bound_path_copy(uint64_t address, char path[HL_LINUX_PATH_MAX + 1], s
     return -HL_LINUX_ENAMETOOLONG;
 }
 
+static int bound_vectors_copy(uint64_t address, uint64_t count, hl_host_iovec vectors[HL_LINUX_IOV_MAX]) {
+    uint64_t index;
+    size_t array_size;
+    if (count > HL_LINUX_IOV_MAX) return -HL_LINUX_EINVAL;
+    if (count == 0) return 0;
+    if (address == 0 || count > SIZE_MAX / sizeof(*vectors)) return -HL_LINUX_EFAULT;
+    array_size = (size_t)count * sizeof(*vectors);
+    if (address > UINTPTR_MAX || array_size > UINTPTR_MAX - (uintptr_t)address ||
+        !host_range_mapped((uintptr_t)address, array_size))
+        return -HL_LINUX_EFAULT;
+    memcpy(vectors, (const void *)(uintptr_t)address, array_size);
+    for (index = 0; index < count; ++index) {
+        uint64_t base = vectors[index].address;
+        uint64_t size = vectors[index].size;
+        if (size > SIZE_MAX || base > UINTPTR_MAX || (size != 0 && base == 0) || size > UINTPTR_MAX - (uintptr_t)base ||
+            (size != 0 && !host_range_mapped((uintptr_t)base, (size_t)size)))
+            return -HL_LINUX_EFAULT;
+    }
+    return 0;
+}
+
 static int bound_poll_references(uint64_t address, uint64_t count) {
     struct pollfd *fds;
     uint64_t index;
@@ -358,6 +379,23 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         else
             result = hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)a2, a3);
         break;
+    case 65:
+    case 66:
+    case 69:
+    case 70: {
+        static _Thread_local hl_host_iovec vectors[HL_LINUX_IOV_MAX];
+        result = bound_vectors_copy(a1, a2, vectors);
+        if (result != 0) break;
+        if (nr == 65)
+            result = hl_linux_readv(g_linux_box, source.fd, vectors, (uint32_t)a2);
+        else if (nr == 66)
+            result = hl_linux_writev(g_linux_box, source.fd, vectors, (uint32_t)a2);
+        else if (nr == 69)
+            result = hl_linux_preadv(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
+        else
+            result = hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
+        break;
+    }
     case 80: {
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
@@ -421,10 +459,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 52:           /* fchmod */
     case 55:           /* fchown */
     case 61:           /* getdents64 */
-    case 65:           /* readv */
-    case 66:           /* writev */
-    case 69:           /* preadv */
-    case 70:           /* pwritev */
     case 71:           /* sendfile */
     case 75:           /* vmsplice */
     case 76:           /* splice */

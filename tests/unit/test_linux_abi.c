@@ -114,7 +114,6 @@ static hl_host_result test_append(void *context, hl_host_handle file, hl_host_co
     hl_host_result result = test_write_at(context, file, host->size, input);
     if (result.status == HL_STATUS_OK) {
         host->appends++;
-        result.detail = host->size;
         host->offset = host->size;
     }
     return result;
@@ -147,6 +146,66 @@ static hl_host_result test_write(void *context, hl_host_handle file, const void 
         test_write_at(context, file, host->offset, (hl_host_const_bytes){input, (size_t)input_size});
     if (result.status == HL_STATUS_OK && result.value <= input_size) host->offset += result.value;
     return result;
+}
+
+static hl_host_result test_vector(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                                  uint64_t offset, int write_operation, int advance) {
+    test_file_host *host = context;
+    uint64_t total = 0;
+    uint32_t index;
+    if (host->next_status != HL_STATUS_OK) {
+        hl_status status = host->next_status;
+        host->next_status = HL_STATUS_OK;
+        return file_result(status, 0);
+    }
+    if (host->next_value != 0) {
+        uint64_t value = host->next_value;
+        host->next_value = 0;
+        if (advance) host->offset += value;
+        return file_result(HL_STATUS_OK, value);
+    }
+    for (index = 0; index < count; ++index) {
+        hl_host_result result;
+        if (write_operation)
+            result = test_write_at(
+                context, file, offset + total,
+                (hl_host_const_bytes){(const void *)(uintptr_t)vectors[index].address, (size_t)vectors[index].size});
+        else
+            result =
+                test_read_at(context, file, offset + total,
+                             (hl_host_bytes){(void *)(uintptr_t)vectors[index].address, (size_t)vectors[index].size});
+        if (result.status != HL_STATUS_OK) return result;
+        total += result.value;
+        if (result.value != vectors[index].size) break;
+    }
+    if (advance) host->offset = offset + total;
+    return file_result(HL_STATUS_OK, total);
+}
+
+static hl_host_result test_readv(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count) {
+    test_file_host *host = context;
+    return test_vector(context, file, vectors, count, host->offset, 0, 1);
+}
+
+static hl_host_result test_writev(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count) {
+    test_file_host *host = context;
+    return test_vector(context, file, vectors, count, host->offset, 1, 1);
+}
+
+static hl_host_result test_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                                    uint64_t offset) {
+    return test_vector(context, file, vectors, count, offset, 0, 0);
+}
+
+static hl_host_result test_writev_at(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                                     uint64_t offset) {
+    return test_vector(context, file, vectors, count, offset, 1, 0);
+}
+
+static hl_host_result test_appendv(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count) {
+    test_file_host *host = context;
+    host->appends++;
+    return test_vector(context, file, vectors, count, host->size, 1, 0);
 }
 
 static hl_host_result test_clone(void *context, hl_host_handle file) {
@@ -213,7 +272,12 @@ int main(void) {
                                    .read = test_read,
                                    .write = test_write,
                                    .clone_for_fork = test_clone,
-                                   .seek = test_seek};
+                                   .seek = test_seek,
+                                   .readv = test_readv,
+                                   .writev = test_writev,
+                                   .readv_at = test_readv_at,
+                                   .writev_at = test_writev_at,
+                                   .appendv = test_appendv};
     char buffer[8] = {0};
 
     file_host.size = 6;
@@ -419,7 +483,7 @@ int main(void) {
     HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
     HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0);
 
-    /* O_APPEND delegates one atomic append to the host and adopts its resulting offset. */
+    /* O_APPEND delegates each write as one atomic append to the host's authoritative open description. */
     file_host.size = 3;
     file_host.offset = 0;
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY | HL_LINUX_O_APPEND, 0, &original) == HL_STATUS_OK);
@@ -466,6 +530,39 @@ int main(void) {
             HL_CHECK(hl_linux_openat(&linux_abi, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY, 0) ==
                      errors[i].result);
         }
+    }
+
+    {
+        hl_host_iovec vectors[2] = {{(uint64_t)(uintptr_t)buffer, 2}, {(uint64_t)(uintptr_t)(buffer + 2), 3}};
+        file_host.offset = 0;
+        file_host.next_value = 3;
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &original) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_readv(&linux_abi, original, vectors, 2) == 3);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 0);
+        file_host.next_status = HL_STATUS_WOULD_BLOCK;
+        HL_CHECK(hl_linux_preadv(&linux_abi, original, vectors, 2, 1) == -HL_LINUX_EAGAIN);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 0);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        file_host.closes = 0;
+
+        file_host.size = 0;
+        file_host.appends = 0;
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY | HL_LINUX_O_APPEND, 0, &original) ==
+                 HL_STATUS_OK);
+        HL_CHECK(hl_linux_writev(&linux_abi, original, vectors, 2) == 5 && file_host.appends == 1);
+        HL_CHECK(hl_linux_pwritev(&linux_abi, original, vectors, 1, 1) == 2 && file_host.appends == 1);
+        HL_CHECK(hl_linux_writev(&linux_abi, original, vectors, HL_LINUX_IOV_MAX + 1u) == -HL_LINUX_EINVAL);
+        vectors[0].size = (uint64_t)INT64_MAX;
+        vectors[1].size = 1;
+        HL_CHECK(hl_linux_writev(&linux_abi, original, vectors, 2) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        file_host.closes = 0;
+
+        vectors[0] = (hl_host_iovec){(uint64_t)(uintptr_t)buffer, 1};
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY, 0, &original) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_readv(&linux_abi, original, vectors, 1) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+        file_host.closes = 0;
     }
 
     {

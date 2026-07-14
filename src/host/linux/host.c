@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <sys/un.h>
@@ -409,12 +411,29 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
     descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
     if (descriptor < 0) return hl_linux_errno_result();
     if ((access & HL_HOST_FILE_APPEND) != 0) {
+        char descriptor_path[64];
         int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
-        append_descriptor = openat(directory_fd, local, append_flags | O_APPEND | O_CLOEXEC, 0);
+        int length = snprintf(descriptor_path, sizeof(descriptor_path), "/proc/self/fd/%d", descriptor);
+        if (length < 0 || (size_t)length >= sizeof(descriptor_path)) {
+            close(descriptor);
+            return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+        }
+        append_descriptor = open(descriptor_path, append_flags | O_APPEND | O_CLOEXEC, 0);
         if (append_descriptor < 0) {
             hl_host_result error = hl_linux_errno_result();
             close(descriptor);
             return error;
+        }
+        {
+            struct stat primary_status;
+            struct stat append_status;
+            if (fstat(descriptor, &primary_status) != 0 || fstat(append_descriptor, &append_status) != 0 ||
+                primary_status.st_dev != append_status.st_dev || primary_status.st_ino != append_status.st_ino) {
+                hl_host_result error = hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+                close(append_descriptor);
+                close(descriptor);
+                return error;
+            }
         }
     }
     hl_host_result result =
@@ -532,7 +551,6 @@ static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, h
     hl_linux_handle_entry *entry;
     int descriptor;
     ssize_t count;
-    off_t end;
     if (input.size != 0 && input.data == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) {
@@ -548,9 +566,61 @@ static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, h
     /* The descriptor was opened O_APPEND: this write is atomic with every other O_APPEND write. */
     count = write(descriptor, input.data, input.size);
     if (count < 0) return hl_linux_errno_result();
-    end = lseek(descriptor, 0, SEEK_CUR);
-    if (end < 0) return hl_linux_errno_result();
-    return hl_linux_result(HL_STATUS_OK, (uint64_t)count, (uint64_t)end);
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_linux_file_vector(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                           uint32_t count, uint64_t offset, int operation) {
+    hl_host_linux *host = context;
+    struct iovec native[HL_HOST_FILE_IOV_MAX];
+    int descriptor;
+    ssize_t transferred;
+    uint32_t index;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    if (operation == 4 && (uint32_t)file != 0 && (uint32_t)file - 1u < HL_LINUX_HANDLE_CAPACITY) {
+        hl_linux_handle_entry *entry = &host->handles[(uint32_t)file - 1u];
+        descriptor = entry->generation == (uint32_t)(file >> 32) && entry->kind == HL_LINUX_HANDLE_FILE
+                         ? entry->wake_descriptor
+                         : -1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if ((count != 0 && vectors == NULL) || count > HL_HOST_FILE_IOV_MAX || descriptor < 0 ||
+        ((operation == 2 || operation == 3) && offset > INT64_MAX))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    for (index = 0; index < count; ++index) {
+        if (vectors[index].size > SIZE_MAX || vectors[index].address > UINTPTR_MAX)
+            return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        native[index].iov_base = (void *)(uintptr_t)vectors[index].address;
+        native[index].iov_len = (size_t)vectors[index].size;
+    }
+    switch (operation) {
+    case 0: transferred = readv(descriptor, native, (int)count); break;
+    case 1: transferred = writev(descriptor, native, (int)count); break;
+    case 2: transferred = preadv(descriptor, native, (int)count, (off_t)offset); break;
+    case 3: transferred = pwritev(descriptor, native, (int)count, (off_t)offset); break;
+    default: transferred = writev(descriptor, native, (int)count); break;
+    }
+    if (transferred < 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)transferred, 0);
+}
+
+#define HL_LINUX_VECTOR_WRAPPER(name, operation)                                                                       \
+    static hl_host_result name(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count) {     \
+        return hl_linux_file_vector(context, file, vectors, count, 0, operation);                                      \
+    }
+HL_LINUX_VECTOR_WRAPPER(hl_linux_file_readv, 0)
+HL_LINUX_VECTOR_WRAPPER(hl_linux_file_writev, 1)
+HL_LINUX_VECTOR_WRAPPER(hl_linux_file_appendv, 4)
+
+static hl_host_result hl_linux_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                             uint32_t count, uint64_t offset) {
+    return hl_linux_file_vector(context, file, vectors, count, offset, 2);
+}
+
+static hl_host_result hl_linux_file_writev_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                              uint32_t count, uint64_t offset) {
+    return hl_linux_file_vector(context, file, vectors, count, offset, 3);
 }
 
 static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle file, hl_host_file_metadata *output) {
@@ -1096,7 +1166,12 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_read_sequential,
                                                hl_linux_file_write_sequential,
                                                hl_linux_file_clone_for_fork,
-                                               hl_linux_file_seek};
+                                               hl_linux_file_seek,
+                                               hl_linux_file_readv,
+                                               hl_linux_file_writev,
+                                               hl_linux_file_readv_at,
+                                               hl_linux_file_writev_at,
+                                               hl_linux_file_appendv};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};

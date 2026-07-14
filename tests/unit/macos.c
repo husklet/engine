@@ -145,11 +145,16 @@ int main(void) {
                                         HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
     HL_CHECK(file.status == HL_STATUS_OK);
     HL_CHECK(services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){"a", 1}).value == 1);
-    HL_CHECK(services.file->append(services.context, file.value, (hl_host_const_bytes){"bc", 2}).value == 2);
+    {
+        const hl_host_iovec positioned[] = {{(uint64_t)(uintptr_t)"x", 1}};
+        const hl_host_iovec appended[] = {{(uint64_t)(uintptr_t)"b", 1}, {(uint64_t)(uintptr_t)"c", 1}};
+        HL_CHECK(services.file->writev_at(services.context, file.value, positioned, 1, 0).value == 1);
+        HL_CHECK(services.file->appendv(services.context, file.value, appended, 2).value == 2);
+    }
     HL_CHECK(
         services.file->read_at(services.context, file.value, 0, (hl_host_bytes){contents, sizeof(contents)}).value ==
         sizeof(contents));
-    HL_CHECK(memcmp(contents, "abc", sizeof(contents)) == 0);
+    HL_CHECK(memcmp(contents, "xbc", sizeof(contents)) == 0);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     {
         struct stat status;

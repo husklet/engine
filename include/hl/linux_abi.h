@@ -8,7 +8,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_LINUX_ABI_VERSION 1u
+#define HL_LINUX_ABI_VERSION 2u
 #define HL_LINUX_FD_LIMIT 65536u
 #define HL_LINUX_OFD_LIMIT 65536u
 
@@ -41,6 +41,8 @@ typedef enum hl_linux_errno {
 } hl_linux_errno;
 
 enum { HL_LINUX_PATH_MAX = 4096 };
+
+enum { HL_LINUX_IOV_MAX = 1024 };
 
 enum {
     HL_LINUX_O_ACCMODE = 00000003u,
@@ -216,6 +218,12 @@ HL_API int64_t hl_linux_pread64(hl_linux_abi *linux_abi, hl_linux_fd fd, void *b
 HL_API int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size);
 HL_API int64_t hl_linux_pwrite64(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buffer, size_t size,
                                  uint64_t offset);
+HL_API int64_t hl_linux_readv(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_host_iovec *vectors, uint32_t count);
+HL_API int64_t hl_linux_writev(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_host_iovec *vectors, uint32_t count);
+HL_API int64_t hl_linux_preadv(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_host_iovec *vectors, uint32_t count,
+                               uint64_t offset);
+HL_API int64_t hl_linux_pwritev(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_host_iovec *vectors, uint32_t count,
+                                uint64_t offset);
 /* path is translated guest memory; mode is used only with O_CREAT. */
 HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
                                uint32_t flags, uint32_t mode);

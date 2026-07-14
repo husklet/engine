@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -414,11 +415,11 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
     if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
     if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
     if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    if ((access & HL_HOST_FILE_APPEND) != 0) flags |= O_APPEND;
     descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
     if (descriptor < 0) return hl_macos_errno();
     if ((access & HL_HOST_FILE_APPEND) != 0) {
-        int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
-        append_descriptor = openat(directory_fd, local, append_flags | O_APPEND | O_CLOEXEC, 0);
+        append_descriptor = dup(descriptor);
         if (append_descriptor < 0) {
             hl_host_result error = hl_macos_errno();
             close(descriptor);
@@ -522,13 +523,55 @@ static hl_host_result hl_macos_file_seek(void *context, hl_host_handle file, int
 static hl_host_result hl_macos_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
     int descriptor = hl_macos_file_descriptor(context, file, 1);
     ssize_t count;
-    off_t offset;
     if ((input.size != 0 && input.data == NULL) || descriptor < 0)
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     count = write(descriptor, input.data, input.size);
     if (count < 0) return hl_macos_errno();
-    offset = lseek(descriptor, 0, SEEK_CUR);
-    return offset < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, (uint64_t)offset);
+    return hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_macos_file_vector(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                           uint32_t count, uint64_t offset, int operation) {
+    struct iovec native[HL_HOST_FILE_IOV_MAX];
+    int descriptor = hl_macos_file_descriptor(context, file, operation == 4);
+    ssize_t transferred;
+    uint32_t index;
+    if ((count != 0 && vectors == NULL) || count > HL_HOST_FILE_IOV_MAX || descriptor < 0 ||
+        ((operation == 2 || operation == 3) && offset > INT64_MAX))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    for (index = 0; index < count; ++index) {
+        if (vectors[index].size > SIZE_MAX || vectors[index].address > UINTPTR_MAX)
+            return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        native[index].iov_base = (void *)(uintptr_t)vectors[index].address;
+        native[index].iov_len = (size_t)vectors[index].size;
+    }
+    switch (operation) {
+    case 0: transferred = readv(descriptor, native, (int)count); break;
+    case 1: transferred = writev(descriptor, native, (int)count); break;
+    case 2: transferred = preadv(descriptor, native, (int)count, (off_t)offset); break;
+    case 3: transferred = pwritev(descriptor, native, (int)count, (off_t)offset); break;
+    default: transferred = writev(descriptor, native, (int)count); break;
+    }
+    if (transferred < 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, (uint64_t)transferred, 0);
+}
+
+#define HL_MACOS_VECTOR_WRAPPER(name, operation)                                                                       \
+    static hl_host_result name(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count) {     \
+        return hl_macos_file_vector(context, file, vectors, count, 0, operation);                                      \
+    }
+HL_MACOS_VECTOR_WRAPPER(hl_macos_file_readv, 0)
+HL_MACOS_VECTOR_WRAPPER(hl_macos_file_writev, 1)
+HL_MACOS_VECTOR_WRAPPER(hl_macos_file_appendv, 4)
+
+static hl_host_result hl_macos_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                             uint32_t count, uint64_t offset) {
+    return hl_macos_file_vector(context, file, vectors, count, offset, 2);
+}
+
+static hl_host_result hl_macos_file_writev_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
+                                              uint32_t count, uint64_t offset) {
+    return hl_macos_file_vector(context, file, vectors, count, offset, 3);
 }
 
 static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle file, hl_host_file_metadata *output) {
@@ -848,7 +891,12 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_read_sequential,
                                                hl_macos_file_write_sequential,
                                                hl_macos_file_clone_for_fork,
-                                               hl_macos_file_seek};
+                                               hl_macos_file_seek,
+                                               hl_macos_file_readv,
+                                               hl_macos_file_writev,
+                                               hl_macos_file_readv_at,
+                                               hl_macos_file_writev_at,
+                                               hl_macos_file_appendv};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

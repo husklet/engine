@@ -59,8 +59,8 @@ int main(int argc, char **argv) {
         goto destroy;
     output = services.file->open_relative(services.context, directory.value, "output", 6, HL_HOST_FILE_READ, 0, 0);
     if (output.status != HL_STATUS_OK) goto destroy;
-    checked = services.file->read_at(services.context, output.value, 0, (hl_host_bytes){bytes, 4});
-    if (checked.status != HL_STATUS_OK || checked.value != 4 || memcmp(bytes, "made", 4)) goto destroy;
+    checked = services.file->read_at(services.context, output.value, 0, (hl_host_bytes){bytes, 5});
+    if (checked.status != HL_STATUS_OK || checked.value != 5 || memcmp(bytes, "mIXe!", 5)) goto destroy;
     outcome = 0;
 destroy:
     hl_engine_destroy(engine);

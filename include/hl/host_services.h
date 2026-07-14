@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 5u
+#define HL_HOST_FILE_ABI 6u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
@@ -145,6 +145,13 @@ typedef struct hl_host_file_metadata {
     uint32_t permissions;
 } hl_host_file_metadata;
 
+typedef struct hl_host_iovec {
+    uint64_t address;
+    uint64_t size;
+} hl_host_iovec;
+
+enum { HL_HOST_FILE_IOV_MAX = 1024 };
+
 typedef struct hl_host_file_services {
     HL_ABI_HEADER;
     hl_host_result (*open_relative)(void *context, hl_host_handle directory, const char *path, size_t path_size,
@@ -153,7 +160,7 @@ typedef struct hl_host_file_services {
     hl_host_result (*write_at)(void *context, hl_host_handle file, uint64_t offset, hl_host_const_bytes input);
     /*
      * One indivisible append on a handle opened with HL_HOST_FILE_APPEND.
-     * value is bytes written; detail is the file offset immediately afterward.
+     * value is bytes written. The native open-file-description position remains authoritative.
      * The host, not the guest ABI, owns cross-thread/process append atomicity.
      */
     hl_host_result (*append)(void *context, hl_host_handle file, hl_host_const_bytes input);
@@ -164,6 +171,13 @@ typedef struct hl_host_file_services {
     hl_host_result (*write)(void *context, hl_host_handle file, const void *input, uint64_t input_size);
     hl_host_result (*clone_for_fork)(void *context, hl_host_handle file);
     hl_host_result (*seek)(void *context, hl_host_handle file, int64_t offset, uint32_t whence);
+    hl_host_result (*readv)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count);
+    hl_host_result (*writev)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count);
+    hl_host_result (*readv_at)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                               uint64_t offset);
+    hl_host_result (*writev_at)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                                uint64_t offset);
+    hl_host_result (*appendv)(void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

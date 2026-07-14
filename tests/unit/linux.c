@@ -3,6 +3,7 @@
 #include "hl/linux.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -76,6 +77,7 @@ int main(void) {
     const char suffix[] = "append";
     char readback[sizeof(contents) + sizeof(suffix)] = {0};
     char path[128];
+    char moved_path[160];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE |
@@ -141,8 +143,15 @@ int main(void) {
     HL_CHECK(file.status == HL_STATUS_OK);
     HL_CHECK(services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){contents, sizeof(contents)})
                  .value == sizeof(contents));
-    HL_CHECK(services.file->append(services.context, file.value, (hl_host_const_bytes){suffix, sizeof(suffix)}).value ==
-             sizeof(suffix));
+    snprintf(moved_path, sizeof(moved_path), "%s.moved", path);
+    HL_CHECK(rename(path, moved_path) == 0);
+    {
+        int replacement = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        const hl_host_iovec append_vectors[] = {{(uint64_t)(uintptr_t)suffix, 3},
+                                                {(uint64_t)(uintptr_t)(suffix + 3), sizeof(suffix) - 3}};
+        HL_CHECK(replacement >= 0 && write(replacement, "replacement", 11) == 11 && close(replacement) == 0);
+        HL_CHECK(services.file->appendv(services.context, file.value, append_vectors, 2).value == sizeof(suffix));
+    }
     HL_CHECK(
         services.file->read_at(services.context, file.value, 0, (hl_host_bytes){readback, sizeof(readback)}).value ==
         sizeof(readback));
@@ -153,7 +162,15 @@ int main(void) {
     HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR);
     HL_CHECK((metadata.permissions & 0777u) == 0600u);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+    {
+        char replacement[11];
+        int descriptor = open(path, O_RDONLY);
+        HL_CHECK(descriptor >= 0 &&
+                 read(descriptor, replacement, sizeof(replacement)) == (ssize_t)sizeof(replacement) &&
+                 memcmp(replacement, "replacement", sizeof(replacement)) == 0 && close(descriptor) == 0);
+    }
     unlink(path);
+    unlink(moved_path);
 
     pollset = services.event->create(services.context);
     HL_CHECK(pollset.status == HL_STATUS_OK);
