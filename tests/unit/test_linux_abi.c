@@ -38,6 +38,7 @@ typedef struct test_object {
     uint32_t writes;
     uint32_t closes;
     uint32_t clones;
+    hl_status clone_status;
     hl_status close_status;
 } test_object;
 
@@ -65,6 +66,7 @@ static uint32_t object_ready(void *opaque, uint32_t interests) {
 static hl_status object_clone(void *opaque, void **child) {
     test_object *object = opaque;
     object->clones++;
+    if (object->clone_status != HL_STATUS_OK) return object->clone_status;
     *child = object;
     return HL_STATUS_OK;
 }
@@ -790,6 +792,9 @@ int main(void) {
         hl_linux_object_pin pin;
         hl_linux_fd typed;
         hl_linux_fd alias;
+        hl_linux_fork_record records[8];
+        hl_linux_fork_plan plan = {
+            .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
         uint32_t old_generation;
         char byte = 0;
         HL_CHECK(hl_linux_object_install(&linux_abi, &object_ops, &object, 77, HL_LINUX_O_RDWR, 0, &typed) ==
@@ -804,16 +809,21 @@ int main(void) {
         HL_CHECK(hl_linux_object_pin_fd(&linux_abi, alias, &pin) == HL_STATUS_OK);
         HL_CHECK(hl_linux_object_ready(&pin, HL_LINUX_READY_READ) == HL_LINUX_READY_READ);
         hl_linux_object_unpin(&pin);
-        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 0);
+        HL_CHECK(hl_linux_abi_fork_prepare(&linux_abi, &plan) == HL_STATUS_OK && object.clones == 1);
+        HL_CHECK(hl_linux_abi_fork_parent(&linux_abi, &plan) == HL_STATUS_OK && object.closes == 1);
+        object.clone_status = HL_STATUS_OUT_OF_MEMORY;
+        HL_CHECK(hl_linux_abi_fork_prepare(&linux_abi, &plan) == HL_STATUS_OUT_OF_MEMORY && object.clones == 2);
+        object.clone_status = HL_STATUS_OK;
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 1);
         object.close_status = HL_STATUS_IO;
-        HL_CHECK(hl_linux_close(&linux_abi, alias) == -HL_LINUX_EIO && object.closes == 1);
+        HL_CHECK(hl_linux_close(&linux_abi, alias) == -HL_LINUX_EIO && object.closes == 2);
         HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_NOT_FOUND);
         object.close_status = HL_STATUS_OK;
         HL_CHECK(hl_linux_object_install_at(&linux_abi, typed, &object_ops, &object, 77, HL_LINUX_O_RDWR, 0) ==
                  HL_STATUS_OK);
         HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_OK &&
                  snapshot.descriptor_generation != old_generation);
-        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 2);
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 3);
     }
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
     HL_CHECK(file_host.fake.live_mutexes == 0);
