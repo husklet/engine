@@ -153,6 +153,7 @@ struct hl_host_macos {
 };
 
 static hl_host_result hl_macos_fork_complete(void *context);
+static hl_host_result hl_macos_fork_child(void *context);
 static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle subscription);
 static void hl_macos_counter_unsubscribe_all(hl_host_macos *host, hl_host_handle counter);
 
@@ -1986,7 +1987,9 @@ static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process
     pid = fork();
     fork_error = errno;
     if (prepared) {
-        hl_host_result completed = hl_macos_fork_complete(host);
+        /* Only the parent retains its watcher threads.  The child must discard
+         * inherited subscription slots before object teardown can join them. */
+        hl_host_result completed = pid == 0 ? hl_macos_fork_child(host) : hl_macos_fork_complete(host);
         if (completed.status != HL_STATUS_OK) {
             if (pid > 0) {
                 int status;

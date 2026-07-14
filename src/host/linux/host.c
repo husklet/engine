@@ -110,6 +110,7 @@ struct hl_host_linux {
 };
 
 static hl_host_result hl_linux_fork_complete(void *context);
+static hl_host_result hl_linux_fork_child(void *context);
 static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle subscription);
 static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter);
 
@@ -1968,7 +1969,10 @@ static hl_host_result hl_linux_process_spawn_mode(void *context, hl_host_process
     pid = fork();
     fork_error = errno;
     if (prepared) {
-        result = hl_linux_fork_complete(host);
+        /* The fork child has no watcher threads.  Reset inherited subscription
+         * records there instead of applying the parent's completion path: a
+         * later close must never pthread_join a thread that vanished at fork. */
+        result = pid == 0 ? hl_linux_fork_child(host) : hl_linux_fork_complete(host);
     } else {
         result = pthread_mutex_unlock(&host->fork_gate) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0)
                                                              : hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
