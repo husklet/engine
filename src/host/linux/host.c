@@ -778,6 +778,30 @@ static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle f
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_linux_file_path(void *context, hl_host_handle file, hl_host_bytes output) {
+    hl_host_linux *host = context;
+    char link[64];
+    char path[PATH_MAX];
+    int descriptor;
+    ssize_t length;
+    if ((output.size != 0 && output.data == 0) || output.size > SIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    if (descriptor >= 0) {
+        snprintf(link, sizeof link, "/proc/self/fd/%d", descriptor);
+        length = readlink(link, path, sizeof path);
+    } else {
+        length = -1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (length < 0) return hl_linux_errno_result();
+    if ((uint64_t)length > output.size) return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, (uint64_t)length, 0);
+    if (length != 0) memcpy(output.data, path, (size_t)length);
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)length, 0);
+}
+
 static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
     uint32_t low = (uint32_t)handle;
@@ -1433,7 +1457,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_sync,
                                                hl_linux_file_data_sync,
                                                hl_linux_file_rename,
-                                               hl_linux_file_unlink};
+                                               hl_linux_file_unlink,
+                                               hl_linux_file_path};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

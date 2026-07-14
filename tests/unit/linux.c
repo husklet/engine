@@ -211,6 +211,18 @@ int main(void) {
                                         HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,
                                         HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
     HL_CHECK(file.status == HL_STATUS_OK);
+    {
+        char resolved[1024];
+        char *expected = realpath(path, NULL);
+        hl_host_result result =
+            services.file->path(services.context, file.value, (hl_host_bytes){resolved, sizeof resolved});
+        HL_CHECK(expected != NULL);
+        HL_CHECK(result.status == HL_STATUS_OK && result.value == strlen(expected) &&
+                 memcmp(resolved, expected, (size_t)result.value) == 0);
+        result = services.file->path(services.context, file.value, (hl_host_bytes){resolved, strlen(expected) - 1});
+        HL_CHECK(result.status == HL_STATUS_RESOURCE_LIMIT && result.value == strlen(expected));
+        free(expected);
+    }
     HL_CHECK(services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){contents, sizeof(contents)})
                  .value == sizeof(contents));
     snprintf(moved_path, sizeof(moved_path), "%s.moved", path);

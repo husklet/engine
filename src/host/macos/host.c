@@ -764,6 +764,31 @@ static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle f
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_macos_file_path(void *context, hl_host_handle handle, hl_host_bytes output) {
+    hl_host_macos *host = context;
+    char path[PATH_MAX];
+    hl_macos_file *file;
+    int error = 0;
+    size_t length;
+    if ((output.size != 0 && output.data == 0) || output.size > SIZE_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    file = hl_macos_file_lookup(host, handle);
+    if (file == NULL)
+        error = EBADF;
+    else if (fcntl(file->descriptor, F_GETPATH, path) != 0)
+        error = errno;
+    pthread_mutex_unlock(&host->lock);
+    if (error != 0) {
+        errno = error;
+        return hl_macos_errno();
+    }
+    length = strnlen(path, sizeof path);
+    if (length > output.size) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, length, 0);
+    if (length != 0) memcpy(output.data, path, length);
+    return hl_macos_result(HL_STATUS_OK, length, 0);
+}
+
 static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) {
     hl_host_macos *host = context;
     hl_macos_file *file;
@@ -1325,7 +1350,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_sync,
                                                hl_macos_file_sync,
                                                hl_macos_file_rename,
-                                               hl_macos_file_unlink};
+                                               hl_macos_file_unlink,
+                                               hl_macos_file_path};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

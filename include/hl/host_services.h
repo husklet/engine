@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 2u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 8u
+#define HL_HOST_FILE_ABI 9u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -204,6 +204,8 @@ typedef struct hl_host_file_services {
                                       size_t old_path_size, hl_host_handle new_directory, const char *new_path,
                                       size_t new_path_size);
     hl_host_result (*unlink_relative)(void *context, hl_host_handle directory, const char *path, size_t path_size);
+    /* Copy the native absolute path of an open path-backed file. value is the bytes copied, without a NUL. */
+    hl_host_result (*path)(void *context, hl_host_handle file, hl_host_bytes output);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

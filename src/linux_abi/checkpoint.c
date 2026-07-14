@@ -221,28 +221,41 @@ static int ckpt_live_threads(void) {
 // never mistaken for guest fds.
 static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
     int n = 0;
-    for (int fd = 0; fd < HL_NFD && n < cap; fd++) {
-        if (fcntl(fd, F_GETFD) < 0) continue; // not open
-        struct stat st;
-        if (fstat(fd, &st) != 0) continue;
+    if (g_linux_box == NULL || g_linux_box->host == NULL || g_linux_box->host->file == NULL ||
+        g_linux_box->host->file->path == NULL)
+        return -1;
+    for (int fd = 0; fd < (int)g_linux_box->fd_capacity && n < cap; fd++) {
+        hl_linux_fd_snapshot snapshot;
+        hl_host_file_metadata metadata;
+        if (hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &snapshot) != HL_STATUS_OK) continue;
+        if (g_linux_box->host->file->metadata(g_linux_box->host->context, snapshot.host_handle, &metadata).status !=
+            HL_STATUS_OK)
+            continue;
         struct ckpt_fd r;
         memset(&r, 0, sizeof r);
         r.gfd = fd;
-        if (isatty(fd)) {
+        if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER) {
             r.kind = CKF_TTY;             // inherited from the launcher pty down the restore fork
-            r.flags = fcntl(fd, F_GETFD); // preserve FD_CLOEXEC (bash's job-control fd-255 dup is cloexec)
-        } else if (S_ISREG(st.st_mode)) {
+            r.flags = (int32_t)snapshot.descriptor_flags;
+        } else if (metadata.type == HL_HOST_FILE_TYPE_REGULAR) {
             const char *p = (g_fdpath[fd][0]) ? g_fdpath[fd] : NULL;
             char fp[512];
-            if (!p && fcntl(fd, F_GETPATH, fp) == 0) p = fp; // macOS host path fallback
+            if (!p) {
+                hl_host_result path = g_linux_box->host->file->path(
+                    g_linux_box->host->context, snapshot.host_handle,
+                    (hl_host_bytes){fp, sizeof(fp) - 1});
+                if (path.status == HL_STATUS_OK) {
+                    fp[path.value] = '\0';
+                    p = fp;
+                }
+            }
             if (!p) {
                 fprintf(stderr, "[ckpt] refuse: fd %d is a regular file with no recoverable path\n", fd);
                 return -1;
             }
             r.kind = CKF_FILE;
-            r.flags = fcntl(fd, F_GETFL);
-            off_t off = lseek(fd, 0, SEEK_CUR);
-            r.offset = (off == (off_t)-1) ? 0 : (int64_t)off;
+            r.flags = (int32_t)snapshot.status_flags;
+            r.offset = (int64_t)snapshot.offset;
             snprintf(r.path, sizeof r.path, "%s", p);
         } else {
             const char *ty = ckpt_guest_kernel_fd(fd);
