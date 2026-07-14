@@ -249,7 +249,7 @@ static hl_status hl_macos_status(int error) {
     case 0: return HL_STATUS_OK;
     case EINVAL: return HL_STATUS_INVALID_ARGUMENT;
     case ENOMEM: return HL_STATUS_OUT_OF_MEMORY;
-    case EMFILE:
+    case EMFILE: return HL_STATUS_PROCESS_LIMIT;
     case ENFILE: return HL_STATUS_RESOURCE_LIMIT;
     case ENOENT: return HL_STATUS_NOT_FOUND;
     case EEXIST: return HL_STATUS_ALREADY_EXISTS;
@@ -263,6 +263,16 @@ static hl_status hl_macos_status(int error) {
     case ELOOP: return HL_STATUS_SYMLINK_LOOP;
     case EROFS: return HL_STATUS_READ_ONLY;
     case EPIPE: return HL_STATUS_DISCONNECTED;
+    case EXDEV: return HL_STATUS_CROSS_DEVICE;
+    case ENOTEMPTY: return HL_STATUS_NOT_EMPTY;
+    case ENOSPC: return HL_STATUS_NO_SPACE;
+    case EDQUOT: return HL_STATUS_QUOTA;
+    case EFBIG: return HL_STATUS_FILE_TOO_LARGE;
+    case ETIMEDOUT: return HL_STATUS_TIMED_OUT;
+    case ECONNREFUSED: return HL_STATUS_CONNECTION_REFUSED;
+    case ECONNRESET: return HL_STATUS_CONNECTION_RESET;
+    case ENETUNREACH: return HL_STATUS_NETWORK_UNREACHABLE;
+    case EADDRINUSE: return HL_STATUS_ADDRESS_IN_USE;
     default: return HL_STATUS_PLATFORM_FAILURE;
     }
 }
