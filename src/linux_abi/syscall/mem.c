@@ -167,6 +167,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // addresses no longer name an inaccessible mapping. Uses the guest logical [a0,a1) even when the
         // physical release below is partial -- the guest's mapping is logically gone either way.
         gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+        gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
         // A non-fixed anon mapping carries a 64 KB guard tail that mmap (case 222) reserved
         // past the guest's logical length (so glibc's vectorized over-reads land in mapped memory).
         // The guest only knows its logical length a1, so a plain munmap(a0, a1) leaves that tail mapped
@@ -626,6 +627,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     gna_add(glo, ghi);
                 else
                     gna_clear(glo, ghi);
+                gro_clear(glo, ghi);
             }
 #ifdef PCACHE_MMAP_HINT
             // (pcache): a hinted library map that landed ON its deterministic hint. Cold epoch:
@@ -678,6 +680,28 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 gna_add(glo, ghi);
             else
                 gna_clear(glo, ghi);
+            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
+                gro_add(glo, ghi);
+            else
+                gro_clear(glo, ghi);
+            // Enforce protections physically when the requested guest range starts at an independently
+            // tracked mmap and host-page rounding stays inside that mapping's private guard allocation.
+            // This is the safe 4K-guest/16K-host case: rounding a standalone 4K mmap to one 16K host page
+            // cannot clobber a neighbouring guest mapping because mmap reserved a 64K guard tail. Never
+            // round an interior subrange (ELF segments and adjacent 4K guest pages may share that host page).
+            // PROT_EXEC is intentionally omitted: translated guest bytes are data to the host, not executed.
+            {
+                size_t hp = (size_t)getpagesize();
+                uint64_t tracked = gmap_find_len(a0);
+                uint64_t host_len = (a1 + hp - 1) & ~((uint64_t)hp - 1);
+                if (tracked && host_len <= tracked) {
+                    int host_prot = (int)a2 & (PROT_READ | PROT_WRITE);
+                    if (mprotect((void *)(uintptr_t)a0, (size_t)host_len, host_prot) != 0) {
+                        G_RET(c) = (uint64_t)(-errno);
+                        break;
+                    }
+                }
+            }
             // #423 / H9: a guest that mprotect()s a page to add PROT_EXEC is a JIT toggling an
             // already-written page executable -- the mmap(RW) -> write code -> mprotect(RX) pattern that
             // .NET/Wasm/managed runtimes use (as opposed to the RWX mmap case 222 already covers). It MUST

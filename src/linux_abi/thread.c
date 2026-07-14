@@ -336,6 +336,14 @@ static struct {
 static int g_ngna;
 static void gna_clear(uint64_t lo, uint64_t hi);
 
+// Guest read-only ranges physically protected on the host. The x86 lazy-map fault handler must not
+// reinterpret a legitimate write-protection fault as demand-zero growth and silently make it writable.
+static struct {
+    uint64_t lo, hi;
+} g_gro[GNA_MAX];
+static int g_ngro;
+static void gro_clear(uint64_t lo, uint64_t hi);
+
 static void gna_add(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     gna_clear(lo, hi); // coalesce: drop any prior coverage so re-marking never double-counts
@@ -384,10 +392,55 @@ static int gna_hit(uint64_t a, uint64_t len) {
     return 0;
 }
 
+static void gro_add(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    gro_clear(lo, hi);
+    if (g_ngro < GNA_MAX) {
+        g_gro[g_ngro].lo = lo;
+        g_gro[g_ngro].hi = hi;
+        __atomic_store_n(&g_ngro, g_ngro + 1, __ATOMIC_RELEASE);
+    }
+}
+
+static void gro_clear(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    for (int i = 0; i < g_ngro;) {
+        uint64_t b = g_gro[i].lo, e = g_gro[i].hi;
+        if (lo >= e || hi <= b) {
+            i++;
+            continue;
+        }
+        int keep_head = b < lo, keep_tail = hi < e;
+        if (!keep_head && !keep_tail) {
+            g_gro[i] = g_gro[--g_ngro];
+            continue;
+        }
+        if (keep_head)
+            g_gro[i].hi = lo;
+        else
+            g_gro[i].lo = hi;
+        if (keep_head && keep_tail && g_ngro < GNA_MAX) {
+            g_gro[g_ngro].lo = hi;
+            g_gro[g_ngro].hi = e;
+            __atomic_store_n(&g_ngro, g_ngro + 1, __ATOMIC_RELEASE);
+        }
+        i++;
+    }
+}
+
+static int gro_hit(uint64_t a, uint64_t len) {
+    if (!len || __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE) == 0) return 0;
+    uint64_t end = a + len;
+    for (int i = 0; i < g_ngro; i++)
+        if (a < g_gro[i].hi && end > g_gro[i].lo) return 1;
+    return 0;
+}
+
 // execve replaces the whole address space -> drop all tracked PROT_NONE ranges (they're gone with the old
 // image; a stale entry could otherwise wrongly EFAULT a fresh mapping the new image lays at the same address).
 static void gna_reset(void) {
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
 }
 
 // True iff host virtual address `a` is currently mapped. mincore() is useless on macOS (returns 0 for ANY

@@ -815,6 +815,16 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
         raise(sig);
         return;
     }
+    // A store into a guest read-only mapping physically faults on the host. It must be delivered to the
+    // guest, never consumed by the lazy mapper below (which would mprotect the page RW and retry it).
+    // Host reads remain legal under PROT_READ, so any protection fault in this registry is a write fault.
+    if (si && si->si_addr && gro_hit((uint64_t)si->si_addr, 1)) {
+        if (deliver_guest_fault(sig, si, uc)) return;
+        if (deliver_guest_fatal_fault(sig, si, uc)) return;
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
     // W6A item 3 (SMC): a guest write to a translated, write-protected JIT code page. Drop the cached
     // translations + IBTC (they're stale; do NOT reset g_cp -> the currently-running block's host code
     // stays intact, orphaned translations are reclaimed by the normal wholesale flush), unprotect the
