@@ -609,7 +609,7 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
                 int d = dup(pp->real[v]);
                 cp->real[v] = d;
                 cp->borrowed[v] = (d < 0); // dup failure: leave the slot unusable but never closeable
-                if (d >= 0 && d < DD_NFD && pp->real[v] >= 0 && pp->real[v] < DD_NFD) {
+                if (d >= 0 && d < HL_NFD && pp->real[v] >= 0 && pp->real[v] < HL_NFD) {
                     strcpy(g_fdpath[d], g_fdpath[pp->real[v]]);
                     strcpy(g_proc_text_desc[d], g_proc_text_desc[pp->real[v]]);
                     g_proc_text_ro[d] = g_proc_text_ro[pp->real[v]];
@@ -1230,7 +1230,7 @@ static void sentry_service_one(struct sentry_ring *R) {
                         case 242: cx = (R->a[3] & LX_O_CLOEXEC) != 0; break; // accept4 flags
                         case 19: cx = (R->a[1] & LX_O_CLOEXEC) != 0; break;  // eventfd2 flags
                         case 20: cx = (R->a[0] & LX_O_CLOEXEC) != 0; break;  // epoll_create1 flags
-                        default: cx = 0; break;                           // dup(23) / accept(202)
+                        default: cx = 0; break;                              // dup(23) / accept(202)
                         }
                         p->cloexec[v] = (uint8_t)cx;
                         R->ret = v;
@@ -1290,18 +1290,17 @@ static void sentry_service_one(struct sentry_ring *R) {
                      //   positive virtual fd (marked on the IN-path). The kernel returned revents 0 for the -1
                      //   we substituted; Linux reports POLLNVAL so an event loop notices the invalidation. A
                      //   POLLNVAL entry also counts toward the ready-fd return value.
-                {
-                    uint32_t nf = (uint32_t)R->a[1];
-                    for (uint32_t k = 0; k < nf; k++) {
-                        if (!(poll_nval[k >> 3] & (1u << (k & 7)))) continue;
-                        uint16_t *rev = (uint16_t *)(R->buf + (size_t)k * 8u + 6u);
-                        if (!(*rev & 0x20u)) {
-                            *rev |= 0x20u; // POLLNVAL
-                            if (R->ret >= 0) R->ret++;
-                        }
+            {
+                uint32_t nf = (uint32_t)R->a[1];
+                for (uint32_t k = 0; k < nf; k++) {
+                    if (!(poll_nval[k >> 3] & (1u << (k & 7)))) continue;
+                    uint16_t *rev = (uint16_t *)(R->buf + (size_t)k * 8u + 6u);
+                    if (!(*rev & 0x20u)) {
+                        *rev |= 0x20u; // POLLNVAL
+                        if (R->ret >= 0) R->ret++;
                     }
                 }
-                break;
+            } break;
             case 72: // pselect6: remap the kernel-narrowed REAL fd_sets back to the guest's VIRTUAL fd positions
                 if (ret >= 0) {
                     uint8_t *win[3] = {R->buf + SENTRY_PSEL_RD, R->buf + SENTRY_PSEL_WR, R->buf + SENTRY_PSEL_EX};

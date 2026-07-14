@@ -119,12 +119,12 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
         struct sockaddr_storage pn;
         socklen_t pnl = sizeof pn;
         int connected = (getpeername(fd, (struct sockaddr *)&pn, &pnl) == 0) ||
-                        (fd >= 0 && fd < DD_NFD && g_sock_conn[fd]); // sticky: survives a peer FIN (see decl)
+                        (fd >= 0 && fd < HL_NFD && g_sock_conn[fd]); // sticky: survives a peer FIN (see decl)
         if (connected) return -EISCONN;
     }
     // The socket's own family: prefer the value recorded at socket()/accept() (robust even after a prior
     // failed connect on this fd); fall back to a getsockname() probe for an untracked (e.g. inherited) fd.
-    int sfam = (fd >= 0 && fd < DD_NFD) ? g_sock_fam[fd] : 0;
+    int sfam = (fd >= 0 && fd < HL_NFD) ? g_sock_fam[fd] : 0;
     if (sfam == 0) {
         struct sockaddr_storage ln;
         socklen_t lnl = sizeof ln;
@@ -236,7 +236,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
-            if (r < DD_NFD) {
+            if (r < HL_NFD) {
                 // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
                 // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
@@ -293,7 +293,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
             if ((int)a0 == AF_UNIX) {
-                if (sv[0] >= 0 && sv[0] < DD_NFD) {
+                if (sv[0] >= 0 && sv[0] < HL_NFD) {
                     g_sock_fam[sv[0]] = AF_UNIX;
                     g_sock_stream[sv[0]] = (lty == SOCK_STREAM);
                     g_sock_dgram[sv[0]] = (lty == SOCK_DGRAM || lty == SOCK_SEQPACKET);
@@ -301,7 +301,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     g_sock_peer_pid[sv[0]] = sock_alloc_synth_peer();
                     g_sock_passcred[sv[0]] = 0;
                 }
-                if (sv[1] >= 0 && sv[1] < DD_NFD) {
+                if (sv[1] >= 0 && sv[1] < HL_NFD) {
                     g_sock_fam[sv[1]] = AF_UNIX;
                     g_sock_stream[sv[1]] = (lty == SOCK_STREAM);
                     g_sock_dgram[sv[1]] = (lty == SOCK_DGRAM || lty == SOCK_SEQPACKET);
@@ -337,8 +337,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // CREATOR's pid via LOCAL_PEERPID on BOTH ends (never updated on fork), so once the parent
                 // forks a child its cred/peercred query degenerates to self; without a distinct id every
                 // forked child collides on guest pid 1 and peer-node merging hangs.
-                if (sv[0] >= 0 && sv[0] < DD_NFD) g_sock_seqpacket[sv[0]] = 1;
-                if (sv[1] >= 0 && sv[1] < DD_NFD) g_sock_seqpacket[sv[1]] = 1;
+                if (sv[0] >= 0 && sv[0] < HL_NFD) g_sock_seqpacket[sv[0]] = 1;
+                if (sv[1] >= 0 && sv[1] < HL_NFD) g_sock_seqpacket[sv[1]] = 1;
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -370,7 +370,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // LISTEN row in /proc/net/tcp[6] (ss/netstat -l). Independent of which network mode the bind resolves
         // to below -- the synthesized table has no real IP stack to read back from. AF is the guest sockaddr
         // family at offset 0 (LE u16); port is BE at offset 2 (identical v4/v6 layout).
-        if ((int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] && a2 >= 8) {
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && a2 >= 8) {
             uint16_t fam = *(uint16_t *)(sa + 0), bp = ntohs(*(uint16_t *)(sa + 2));
             if (fam == AF_INET)
                 netns_tcp_bind_note((int)a0, bp, 0, *(uint32_t *)(sa + 4), NULL);
@@ -381,7 +381,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // or v6 ::1/:: (dual-stack servers bind v6 too; route it to the SAME per-container loopback so it is
         // isolated from the real host stack instead of escaping it). port@2 is identical in v4/v6 layout.
         int is_lo6 = lo6_any_is(sa, (socklen_t)a2);
-        if (lo_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] &&
+        if (lo_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
             (lo_any_is(sa, (socklen_t)a2) || is_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
@@ -408,7 +408,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // A dual-stack listener that binds `::` (busybox nc's default, and many servers') is the IPv6 analogue
         // of 0.0.0.0 and takes the same path (br6_any_is), so it's reachable by peer containers over the switch
         // instead of landing on the isolated per-container loopback (which broke cross-container reach-by-name).
-        if (br_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] &&
+        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
             (br_bind_is(sa, (socklen_t)a2) || br6_any_is(sa, (socklen_t)a2))) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
@@ -485,7 +485,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
             uint16_t cp = ntohs(*(uint16_t *)(sa + 2)), hp = pm_host(cp);
             // remember for getsockname
-            if ((int)a0 >= 0 && (int)a0 < DD_NFD) g_fd_cport[(int)a0] = cp;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_fd_cport[(int)a0] = cp;
             if (hp != cp) {
                 uint8_t buf[128];
                 socklen_t L = a2 < 128 ? (socklen_t)a2 : 128;
@@ -532,10 +532,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 242: {
         int lfd = (int)a0;
         // accept / accept4
-        int pl = (lfd >= 0 && lfd < DD_NFD) ? g_lo_port[lfd] : 0;
-        int pl6 = (lfd >= 0 && lfd < DD_NFD) ? g_lo_v6[lfd] : 0; // listener is AF_INET6 -> report v6 peer
-        int pbr = (lfd >= 0 && lfd < DD_NFD) ? g_br_port[lfd] : 0;
-        uint32_t pbrip = (lfd >= 0 && lfd < DD_NFD) ? g_br_ip[lfd] : 0;
+        int pl = (lfd >= 0 && lfd < HL_NFD) ? g_lo_port[lfd] : 0;
+        int pl6 = (lfd >= 0 && lfd < HL_NFD) ? g_lo_v6[lfd] : 0; // listener is AF_INET6 -> report v6 peer
+        int pbr = (lfd >= 0 && lfd < HL_NFD) ? g_br_port[lfd] : 0;
+        uint32_t pbrip = (lfd >= 0 && lfd < HL_NFD) ? g_br_ip[lfd] : 0;
         // Real host accept writes a macOS sockaddr; receive into a host scratch then translate the
         // peer addr back to Linux layout for the guest. (private-lo / bridge: don't expose unix peer.)
         struct sockaddr_storage hss;
@@ -555,9 +555,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 int on = 1;
                 setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             }
-            if (r >= 0 && r < DD_NFD) {
+            if (r >= 0 && r < HL_NFD) {
                 g_sock_conn[r] = 1; // an accepted socket is already connected
-                if (lfd >= 0 && lfd < DD_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
+                if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
@@ -575,7 +575,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     *(socklen_t *)a2 = (socklen_t)ll;
             }
             if (pl) {
-                if (r < DD_NFD) {
+                if (r < HL_NFD) {
                     g_lo_port[r] = pl;
                     g_lo_v6[r] = (uint8_t)pl6;
                     g_sock_stream[r] = 1;
@@ -585,7 +585,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 else
                     fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, pl);
             } else if (pbr) {
-                if (r < DD_NFD) {
+                if (r < HL_NFD) {
                     g_br_port[r] = pbr;
                     g_br_ip[r] = pbrip;
                     g_sock_stream[r] = 1;
@@ -627,7 +627,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // Container DNS: connect(127.0.0.11:53) -> swap the socket to a socketpair we answer on (host
         // resolver). Subsequent send/recv on the connected fd are handled by the DNS paths below.
         if (dns_enabled() && dns_dest_is(sa, (socklen_t)a2)) {
-            int stream = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_sock_stream[(int)a0] : 0;
+            int stream = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_stream[(int)a0] : 0;
             if (dns_swap((int)a0, stream) == 0) {
                 G_RET(c) = 0;
                 break;
@@ -639,7 +639,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int c_lo6 = lo6_is(sa, (socklen_t)a2);
-        if (lo_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] &&
+        if (lo_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
             // private loopback: v4 127/8 or v6 ::1 (port@2 identical) -> the per-container loopback switch
             (lo_is(sa, (socklen_t)a2) || c_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
@@ -684,11 +684,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // inode doesn't exist); Linux returns ECONNREFUSED for a closed TCP port. Map it (host
             // errno, translated to Linux 111); other errnos including EINPROGRESS pass through.
             G_RET(c) = r < 0 ? (uint64_t)(-(errno == ENOENT ? ECONNREFUSED : errno)) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
-        if (br_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] && br_connect_is(sa, (socklen_t)a2)) {
+        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && br_connect_is(sa, (socklen_t)a2)) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
@@ -729,7 +729,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_br_ip[(int)a0] = dip; // peer ip for getpeername
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
         // abstract AF_UNIX (sun_path[0]==0): dial the same HL_NETNS-keyed fs socket bind used. Must run
@@ -743,7 +743,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
         // AF_UNIX pathname connect: resolve through the overlay (same resolver as stat/open) so we dial the
@@ -759,7 +759,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 r = unix_sock_at((int)a0, hp, 1);
             } while (r < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
         // Real host connect: translate Linux AF_INET/INET6 sockaddr -> macOS; others pass through.
@@ -770,11 +770,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // connect through the SOCKS5 proxy instead of dialing directly. INERT when unset — egress_should_
             // redirect() short-circuits to 0, so control falls straight to the direct connect() below with no
             // behavior change. Streams only; UDP/raw and non-INET dests use the direct path.
-            if (hl != (socklen_t)-1 && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] &&
+            if (hl != (socklen_t)-1 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
                 egress_should_redirect((struct sockaddr *)&ss)) {
                 int er = egress_connect((int)a0, (struct sockaddr *)&ss, hl);
                 G_RET(c) = er < 0 ? (uint64_t)(-errno) : 0;
-                if (er == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+                if (er == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
                 break;
             }
             // #261 IPv4-only network: a genuine external IPv6 dest has no route -> ENETUNREACH *now* (not a
@@ -789,14 +789,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                            : connect((int)a0, (void *)a1, (socklen_t)a2);
             } while (cr < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = cr < 0 ? (uint64_t)(-errno) : 0;
-            if (cr == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (cr == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
         }
         break;
     }
     case 204: {
         // getsockname
         int fd = (int)a0;
-        if (fd >= 0 && fd < DD_NFD && g_dns_sock[fd]) { // DNS socket: report an AF_INET local addr (0.0.0.0:0)
+        if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: report an AF_INET local addr (0.0.0.0:0)
             if (a1) {
                 uint8_t *g = (uint8_t *)a1;
                 memset(g, 0, 8);
@@ -806,7 +806,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < DD_NFD && g_lo_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_lo_port[fd]) {
             if (g_lo_v6[fd])
                 fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             else
@@ -814,7 +814,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < DD_NFD && g_br_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_br_port[fd]) {
             fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_br_ip[fd], g_br_port[fd]);
             G_RET(c) = 0;
             break;
@@ -835,7 +835,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (a2) *(socklen_t *)a2 = hsl;
             } else {
                 if (a2) *(socklen_t *)a2 = (socklen_t)ll;
-                if (g_nportmap && fd >= 0 && fd < DD_NFD && g_fd_cport[fd] && gcap >= 4)
+                if (g_nportmap && fd >= 0 && fd < HL_NFD && g_fd_cport[fd] && gcap >= 4)
                     // app sees the port it asked for (port @2)
                     *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
             }
@@ -846,12 +846,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
-        if (fd >= 0 && fd < DD_NFD && g_dns_sock[fd]) { // DNS socket: peer is the nameserver 127.0.0.11:53
+        if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: peer is the nameserver 127.0.0.11:53
             dns_fill_ns((uint8_t *)a1, (socklen_t *)a2);
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < DD_NFD && g_lo_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_lo_port[fd]) {
             if (g_lo_v6[fd])
                 fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             else
@@ -859,7 +859,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < DD_NFD && g_br_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_br_port[fd]) {
             fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_br_ip[fd], g_br_port[fd]);
             G_RET(c) = 0;
             break;
@@ -968,7 +968,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // SEQPACKET-as-DGRAM EOF: a peer-closed DGRAM recv reports ECONNRESET, but Linux SEQPACKET
         // returns 0 (EOF). Translate so the guest sees the expected end-of-stream. (See case 199.)
         if (r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
-        if (r >= 0 && want && (int)a0 >= 0 && (int)a0 < DD_NFD && g_dns_sock[(int)a0]) {
+        if (r >= 0 && want && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
             // DNS socket: report the source as the nameserver (127.0.0.11:53) so the guest resolver's
             // "answer came from the server we queried" anti-spoof check passes (the real src is AF_UNIX).
             dns_fill_ns((uint8_t *)a4, (socklen_t *)a5);
@@ -1001,7 +1001,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
             int on = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
-            if ((int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_passcred[(int)a0] = on ? 1 : 0;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_passcred[(int)a0] = on ? 1 : 0;
             G_RET(c) = 0;
             break;
         }
@@ -1075,7 +1075,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (lvl == 1 && opt == 16) {
             if (a3 && a4 && *(socklen_t *)a4 >= 4) {
-                *(int *)a3 = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_sock_passcred[(int)a0] : 0;
+                *(int *)a3 = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_passcred[(int)a0] : 0;
                 *(socklen_t *)a4 = 4;
             }
             G_RET(c) = 0;
@@ -1090,7 +1090,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     // reads its OWN pid here for every child. Report the end's peer pid we resolved (the REAL
                     // guest pid of the process holding the OTHER end, stamped across fork/close -- see
                     // g_sock_peer_pid / seq_reassign_peer); else this guest's own pid.
-                    int sp = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_sock_peer_pid[(int)a0] : 0;
+                    int sp = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_peer_pid[(int)a0] : 0;
                     ppid = sp ? sp : container_pid();
                 } else if (g_init_hostpid && ppid == g_init_hostpid) {
                     ppid = 1; // peer is the container init -> guest pid 1
@@ -1172,8 +1172,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         uint64_t giov_count = *(uint64_t *)(g + 24);
         struct iovec rebased_iov[1024];
         struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
-        if (giov_count > 1024 || (giov_count && guest_bad_ptr((uintptr_t)guest_iov,
-                                                              (size_t)giov_count * sizeof *guest_iov))) {
+        if (giov_count > 1024 ||
+            (giov_count && guest_bad_ptr((uintptr_t)guest_iov, (size_t)giov_count * sizeof *guest_iov))) {
             G_RET(c) = (uint64_t)(giov_count > 1024 ? -EMSGSIZE : -EFAULT);
             break;
         }
@@ -1186,7 +1186,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int dfd = (int)a0;
             uint8_t *nm = (uint8_t *)net_nonpie_p(*(uint64_t *)(g + 0));
             socklen_t nml = *(uint32_t *)(g + 8);
-            if ((dfd >= 0 && dfd < DD_NFD && g_dns_sock[dfd]) || dns_dest_is(nm, nml)) {
+            if ((dfd >= 0 && dfd < HL_NFD && g_dns_sock[dfd]) || dns_dest_is(nm, nml)) {
                 uint8_t tmp[2048];
                 size_t tl = dns_gather(rebased_iov, (int)giov_count, tmp, sizeof tmp);
                 int64_t dret;
@@ -1303,7 +1303,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
         if (nr == 212 && r >= 0) {
             // recvmsg writes back name len + (host->guest) control + translated flags
-            if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < DD_NFD && g_dns_sock[(int)a0]) {
+            if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
                 // DNS socket: report the nameserver (127.0.0.11:53) as the source (see case 207).
                 dns_fill_ns(gname, NULL);
                 *(uint32_t *)(g + 8) = 16;
@@ -1318,7 +1318,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // every received message; macOS does not, so synthesize it (uid/gid = container identity, pid =
             // the peer's -- LOCAL_PEERPID, mapping the container init's host pid back to guest pid 1, self as
             // the container pid). IPC bootstrap may abort with "missing credentials" without it.
-            int passcred_active = gc && gcl && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_passcred[(int)a0];
+            int passcred_active = gc && gcl && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_passcred[(int)a0];
             int cred_trunc = 0;
             size_t ln = 0;
             if (passcred_active) {
@@ -1329,7 +1329,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     // fork parent reads its OWN pid here for every child -> container_pid() collapsed all of
                     // them to guest 1, colliding peer node identities. Prefer the end's distinct synthetic
                     // peer node id stamped at socketpair(); fall back to this guest's own pid only if unstamped.
-                    int sp = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_sock_peer_pid[(int)a0] : 0;
+                    int sp = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_peer_pid[(int)a0] : 0;
                     ppid = sp ? sp : container_pid();
                 } else if (g_init_hostpid && ppid == g_init_hostpid)
                     ppid = 1;
@@ -1370,12 +1370,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint8_t *g0 = vec;
             uint8_t *nm0 = (uint8_t *)net_nonpie_p(*(uint64_t *)(g0 + 0));
             socklen_t nml0 = *(uint32_t *)(g0 + 8);
-            int is_dns = (dfd >= 0 && dfd < DD_NFD && g_dns_sock[dfd]);
+            int is_dns = (dfd >= 0 && dfd < HL_NFD && g_dns_sock[dfd]);
             if (!is_dns && dns_dest_is(nm0, nml0) &&
-                dns_swap(dfd, (dfd >= 0 && dfd < DD_NFD) ? g_sock_stream[dfd] : 0) == 0)
+                dns_swap(dfd, (dfd >= 0 && dfd < HL_NFD) ? g_sock_stream[dfd] : 0) == 0)
                 is_dns = 1;
             if (is_dns) {
-                int stream = (dfd >= 0 && dfd < DD_NFD) ? g_sock_stream[dfd] : 0;
+                int stream = (dfd >= 0 && dfd < HL_NFD) ? g_sock_stream[dfd] : 0;
                 unsigned n;
                 for (n = 0; n < vlen; n++) {
                     uint8_t *g = vec + (size_t)n * 64;
@@ -1411,8 +1411,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint64_t giov_count = *(uint64_t *)(g + 24);
             struct iovec rebased_iov[1024];
             struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
-            if (giov_count > 1024 || (giov_count && guest_bad_ptr((uintptr_t)guest_iov,
-                                                                  (size_t)giov_count * sizeof *guest_iov))) {
+            if (giov_count > 1024 ||
+                (giov_count && guest_bad_ptr((uintptr_t)guest_iov, (size_t)giov_count * sizeof *guest_iov))) {
                 err = giov_count > 1024 ? EMSGSIZE : EFAULT;
                 break;
             }
@@ -1496,7 +1496,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // msg_len
             *(uint32_t *)(g + 56) = (uint32_t)r;
             if (nr == 243) {
-                if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < DD_NFD && g_dns_sock[(int)a0]) {
+                if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
                     dns_fill_ns(gname, NULL); // DNS socket: source is the nameserver (see case 207)
                     *(uint32_t *)(g + 8) = 16;
                 } else if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
@@ -1520,7 +1520,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             done++;
         }
         G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
-mmsg_done:
+    mmsg_done:
         break;
     }
     default: return 0;

@@ -96,8 +96,10 @@ E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 ABI_CASE_SOURCES := $(sort $(wildcard tests/compat/abi/*.c))
 ABI_CASE_NAMES := $(basename $(notdir $(ABI_CASE_SOURCES)))
-ABI_CASE_BINS := $(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/aarch64/%) \
-	$(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/x86_64/%)
+ABI_CASE_AARCH64_NAMES := $(filter-out cpuid_features rflags_id,$(ABI_CASE_NAMES))
+ABI_CASE_X86_64_NAMES := $(filter-out lse_atomics,$(ABI_CASE_NAMES))
+ABI_CASE_BINS := $(ABI_CASE_AARCH64_NAMES:%=$(BUILD)/compat/abi/aarch64/%) \
+	$(ABI_CASE_X86_64_NAMES:%=$(BUILD)/compat/abi/x86_64/%)
 LIBC_CASE_SOURCES := $(sort $(wildcard tests/compat/libc/*.c))
 LIBC_CASE_NAMES := $(basename $(notdir $(LIBC_CASE_SOURCES)))
 LIBC_CASE_BINS := $(LIBC_CASE_NAMES:%=$(BUILD)/compat/libc/aarch64/%) \
@@ -137,7 +139,7 @@ FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aar
 SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
-	$(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/x86_64/%)
+	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt,$(SIGNALS_CASE_NAMES)))
 PROCESS_CASE_SOURCES := $(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c))
 PROCESS_CASE_NAMES := $(patsubst tests/compat/process/%.c,%,$(PROCESS_CASE_SOURCES))
 PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
@@ -173,16 +175,21 @@ CORE_REGRESS_X86_64 := $(CORE_REGRESS_BOTH) nonpie_vec repcmps_nopie nonpie_v8bl
 CORE_REGRESS_BINS := $(CORE_REGRESS_AARCH64:%=$(BUILD)/compat/core/regress/aarch64/%) \
 	$(CORE_REGRESS_X86_64:%=$(BUILD)/compat/core/regress/x86_64/%)
 tests/compat/core/regress/go_cgo_stackgrow_arm: ;
-CORE_FINAL_AARCH_ONLY := lse_atomics neonshm sigurg_preempt
-CORE_FINAL_X86_ONLY := cpuid_features rflags_id
-CORE_FINAL_BOTH := atomics dup2redir execfault fcntlflags forkstorm forkwait ltp_aterr ltp_checkpoint \
-	ltp_dupfcntl ltp_linkstat ltp_neterr ltp_procmisc mkfifo msg net_nonblock net_sendmsg net_sockopt \
-	net_tcp net_udp net_unix pipeproc procreap sem sentry_fork sentry_fs sentry_net shm shmposix signals \
-	sysinfo sysvshm threads threads_many threads_mutex threads_nopie_tls thrfork tls tlsmodels tlsmodels_main waitcore
-CORE_FINAL_AARCH64 := $(CORE_FINAL_BOTH) $(CORE_FINAL_AARCH_ONLY)
-CORE_FINAL_X86_64 := $(CORE_FINAL_BOTH) $(CORE_FINAL_X86_ONLY)
-CORE_FINAL_BINS := $(CORE_FINAL_AARCH64:%=$(BUILD)/compat/core/final/aarch64/%) \
-	$(CORE_FINAL_X86_64:%=$(BUILD)/compat/core/final/x86_64/%)
+IPC_CASE_SOURCES := $(sort $(wildcard tests/compat/ipc/*.c))
+IPC_CASE_NAMES := $(basename $(notdir $(IPC_CASE_SOURCES)))
+IPC_CASE_BINS := $(addprefix $(BUILD)/compat/ipc/aarch64/,$(filter-out ipc_tso_unaligned,$(IPC_CASE_NAMES))) \
+	$(addprefix $(BUILD)/compat/ipc/x86_64/,$(filter-out ipc_mq_notify neonshm,$(IPC_CASE_NAMES)))
+THREAD_CASE_SOURCES := $(sort $(wildcard tests/compat/threads/*.c))
+THREAD_CASE_NAMES := $(basename $(notdir $(THREAD_CASE_SOURCES)))
+THREAD_CASE_BINS := $(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/aarch64/%) \
+	$(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/x86_64/%)
+PURPOSE_ABI_PIE := atomics_builtins cpuid_features rflags_id tls tlsmodels
+PURPOSE_FILESYSTEM_PIE := dup2redir fcntlflags ltp_aterr ltp_dupfcntl ltp_linkstat mkfifo scratch_exec sentry_fs
+PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpoint ltp_procmisc nonpie_dladdr \
+	pipeproc procreap sentry_fork sysinfo thrfork waitcore
+PURPOSE_NETWORK_PIE := ltp_neterr net_nonblock net_sendmsg net_sockopt net_tcp net_udp net_unix sentry_net
+PURPOSE_IPC_PIE := msg neonshm sem shm shmposix sysvshm
+PURPOSE_THREADS_PIE := threads_basic threads_many threads_mutex_queue
 ISOLATION_CASE_SOURCES := $(sort $(wildcard tests/compat/isolation/*.c))
 ISOLATION_CASE_NAMES := $(basename $(notdir $(ISOLATION_CASE_SOURCES)))
 ISOLATION_CASE_BINS := $(ISOLATION_CASE_NAMES:%=$(BUILD)/compat/isolation/aarch64/%) \
@@ -197,7 +204,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-core compat-core-abi compat-core-final compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -545,27 +552,89 @@ $(BUILD)/compat/core/regress/aarch64/go_cgo_stackgrow_arm: tests/compat/core/reg
 	@mkdir -p $(@D)
 	cp -p $< $@
 
-$(BUILD)/compat/core/final/aarch64/%: tests/compat/core/final/%.c
+$(BUILD)/compat/ipc/aarch64/%: tests/compat/ipc/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
+
+$(BUILD)/compat/ipc/x86_64/%: tests/compat/ipc/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
+
+$(BUILD)/compat/threads/aarch64/%: tests/compat/threads/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+
+$(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+
+$(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/aarch64/%): $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
-$(BUILD)/compat/core/final/x86_64/%: tests/compat/core/final/%.c
+$(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/x86_64/%): $(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
-$(BUILD)/compat/core/final/aarch64/threads_nopie_tls $(BUILD)/compat/core/final/aarch64/tlsmodels_main: \
-	$(BUILD)/compat/core/final/aarch64/%: tests/compat/core/final/%.c
+$(PURPOSE_FILESYSTEM_PIE:%=$(BUILD)/compat/filesystem/aarch64/%): $(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_FILESYSTEM_PIE:%=$(BUILD)/compat/filesystem/x86_64/%): $(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/aarch64/%): $(BUILD)/compat/process/aarch64/%: tests/compat/process/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/x86_64/%): $(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/aarch64/%): $(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/x86_64/%): $(BUILD)/compat/network/x86_64/%: tests/compat/network/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_IPC_PIE:%=$(BUILD)/compat/ipc/aarch64/%): $(BUILD)/compat/ipc/aarch64/%: tests/compat/ipc/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_IPC_PIE:%=$(BUILD)/compat/ipc/x86_64/%): $(BUILD)/compat/ipc/x86_64/%: tests/compat/ipc/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_THREADS_PIE:%=$(BUILD)/compat/threads/aarch64/%): $(BUILD)/compat/threads/aarch64/%: tests/compat/threads/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(PURPOSE_THREADS_PIE:%=$(BUILD)/compat/threads/x86_64/%): $(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+
+$(BUILD)/compat/abi/aarch64/lse_atomics: tests/compat/abi/lse_atomics.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread -march=armv8.2-a+lse -mno-outline-atomics $< -lm -o $@
+
+$(BUILD)/compat/threads/aarch64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+
+$(BUILD)/compat/threads/x86_64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+
+$(BUILD)/compat/abi/aarch64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
 
-$(BUILD)/compat/core/final/x86_64/threads_nopie_tls $(BUILD)/compat/core/final/x86_64/tlsmodels_main: \
-	$(BUILD)/compat/core/final/x86_64/%: tests/compat/core/final/%.c
+$(BUILD)/compat/abi/x86_64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
-
-$(BUILD)/compat/core/final/aarch64/lse_atomics: tests/compat/core/final/lse_atomics.c
-	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread -march=armv8.2-a+lse -mno-outline-atomics $< -lm -o $@
 
 $(BUILD)/compat/isolation/aarch64/%: tests/compat/isolation/%.c
 	@mkdir -p $(@D)
@@ -804,7 +873,11 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 
 $(BUILD)/tools/matrix-runner: tools/matrix_runner.c
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) \
+		-DAARCH64_DYNAMIC_LOADER='"$(AARCH64_DYNAMIC_LOADER)"' \
+		-DAARCH64_DYNAMIC_LIBC='"$(AARCH64_DYNAMIC_LIBC)"' \
+		-DX86_64_DYNAMIC_LOADER='"$(X86_64_DYNAMIC_LOADER)"' \
+		-DX86_64_DYNAMIC_LIBC='"$(X86_64_DYNAMIC_LIBC)"' $< -o $@
 
 compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
@@ -866,7 +939,7 @@ compat-isa-x86-64: compat-engines $(BUILD)/tools/matrix-runner $(ISA_X86_64_BINS
 		$(abspath $(BUILD)/compat/isa/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/isa/x86_64) $(abspath tests/compat/isa/x86_64)
 
-compat-core: compat-core-abi compat-core-syscall compat-core-regress compat-core-workload compat-core-final
+compat-core: compat-core-abi compat-core-syscall compat-core-regress compat-core-workload
 
 compat-core-abi: compat-engines $(BUILD)/tools/matrix-runner $(CORE_ABI_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
@@ -888,10 +961,15 @@ compat-core-regress: compat-engines $(BUILD)/tools/matrix-runner $(CORE_REGRESS_
 		$(abspath $(BUILD)/compat/core/regress/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/core/regress/x86_64) $(abspath tests/compat/core/regress)
 
-compat-core-final: compat-engines $(BUILD)/tools/matrix-runner $(CORE_FINAL_BINS)
+compat-ipc: compat-engines $(BUILD)/tools/matrix-runner $(IPC_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/core/final/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/core/final/x86_64) $(abspath tests/compat/core/final)
+		$(abspath $(BUILD)/compat/ipc/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/ipc/x86_64) $(abspath tests/compat/ipc)
+
+compat-threads: compat-engines $(BUILD)/tools/matrix-runner $(THREAD_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/threads/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/threads/x86_64) $(abspath tests/compat/threads)
 
 compat-isolation: compat-engines $(BUILD)/tools/matrix-runner $(ISOLATION_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \

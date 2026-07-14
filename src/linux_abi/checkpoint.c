@@ -47,7 +47,7 @@
 // Restore: HL_RESTORE_DIR=<dir> (or `--restore <dir>`) calls the restore path.
 // The embedding runtime layers checkpoint(dir)/restore(dir) on this explicit lifecycle operation.
 
-#include <libproc.h>   // proc_pidpath: filter session members to engine processes
+#include <libproc.h>    // proc_pidpath: filter session members to engine processes
 #include <sys/sysctl.h> // KERN_PROC_SESSION: enumerate the container's whole process tree
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
 
@@ -131,8 +131,13 @@ static volatile uint32_t *ckpt_map_trigger(const char *dir) {
     return (m == MAP_FAILED) ? NULL : (volatile uint32_t *)m;
 }
 
-static int ckpt_wr_all(FILE *f, const void *buf, size_t n) { return fwrite(buf, 1, n, f) == n ? 0 : -1; }
-static int ckpt_rd_all(FILE *f, void *buf, size_t n) { return fread(buf, 1, n, f) == n ? 0 : -1; }
+static int ckpt_wr_all(FILE *f, const void *buf, size_t n) {
+    return fwrite(buf, 1, n, f) == n ? 0 : -1;
+}
+
+static int ckpt_rd_all(FILE *f, void *buf, size_t n) {
+    return fread(buf, 1, n, f) == n ? 0 : -1;
+}
 
 static int ckpt_rmrf(const char *path) {
     DIR *d = opendir(path);
@@ -188,7 +193,7 @@ static void ckpt_control_init(void) {
 // descriptor (a global kqueue, the netns control socket, ...) the guest cannot see -- skipped. A guest-owned
 // one is the P3 case ckpt_dump_self refuses cleanly.
 static const char *ckpt_guest_kernel_fd(int fd) {
-    if (fd < 0 || fd >= DD_NFD) return NULL;
+    if (fd < 0 || fd >= HL_NFD) return NULL;
     if (g_epoll[fd]) return "epoll";
     if (g_sock_stream[fd] || g_sock_dgram[fd] || g_sock_seqpacket[fd] || g_dns_sock[fd] || g_sock_fam[fd])
         return "socket";
@@ -214,7 +219,7 @@ static int ckpt_live_threads(void) {
 // never mistaken for guest fds.
 static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
     int n = 0;
-    for (int fd = 0; fd < DD_NFD && n < cap; fd++) {
+    for (int fd = 0; fd < HL_NFD && n < cap; fd++) {
         if (fcntl(fd, F_GETFD) < 0) continue; // not open
         struct stat st;
         if (fstat(fd, &st) != 0) continue;
@@ -222,8 +227,8 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
         memset(&r, 0, sizeof r);
         r.gfd = fd;
         if (isatty(fd)) {
-            r.kind = CKF_TTY;              // inherited from the launcher pty down the restore fork
-            r.flags = fcntl(fd, F_GETFD);  // preserve FD_CLOEXEC (bash's job-control fd-255 dup is cloexec)
+            r.kind = CKF_TTY;             // inherited from the launcher pty down the restore fork
+            r.flags = fcntl(fd, F_GETFD); // preserve FD_CLOEXEC (bash's job-control fd-255 dup is cloexec)
         } else if (S_ISREG(st.st_mode)) {
             const char *p = (g_fdpath[fd][0]) ? g_fdpath[fd] : NULL;
             char fp[512];
@@ -463,7 +468,8 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // Freeze + dump every peer: the shared trigger generation is already advanced (the requester bumped it),
     // so KICK each peer with the guest-proof THREAD_INT_SIG to bounce it out of a blocked syscall / chained
     // in-cache loop to its safepoint, where ckpt_poll sees the new generation and dumps proc.<gpid> + _exit()s.
-    for (int i = 0; i < nfoll; i++) kill(foll[i], CKPT_KICK_SIG);
+    for (int i = 0; i < nfoll; i++)
+        kill(foll[i], CKPT_KICK_SIG);
     for (int i = 0; i < nfoll; i++) {
         char pd[1200];
         snprintf(pd, sizeof pd, "%s/proc.%d", base, foll[i]);
@@ -563,13 +569,13 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
         return -1;
     }
     if (m->version != CKPT_VERSION || m->arch != CKPT_ARCH_AARCH64) {
-        fprintf(stderr, "[restore] version/arch mismatch (file v%llu arch %llu)\n",
-                (unsigned long long)m->version, (unsigned long long)m->arch);
+        fprintf(stderr, "[restore] version/arch mismatch (file v%llu arch %llu)\n", (unsigned long long)m->version,
+                (unsigned long long)m->arch);
         return -1;
     }
     if (m->cpu_sz != sizeof(struct cpu)) {
-        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, engine %zu)\n",
-                (unsigned long long)m->cpu_sz, sizeof(struct cpu));
+        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, engine %zu)\n", (unsigned long long)m->cpu_sz,
+                sizeof(struct cpu));
         return -1;
     }
     if (m->n_threads != 1) {
@@ -607,8 +613,8 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 break;
             }
         if (!contained) {
-            void *r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE,
-                           MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            void *r =
+                mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
             if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
                 fprintf(stderr, "[restore] cannot map guest region %llx+%llx: %s\n", (unsigned long long)a,
                         (unsigned long long)reg.len, strerror(errno));
@@ -627,8 +633,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 fclose(f);
                 return -1;
             }
-            size_t n =
-                (va - reg.addr + m->pagesz > reg.len) ? (size_t)(reg.len - (va - reg.addr)) : (size_t)m->pagesz;
+            size_t n = (va - reg.addr + m->pagesz > reg.len) ? (size_t)(reg.len - (va - reg.addr)) : (size_t)m->pagesz;
             if (ckpt_rd_all(f, (void *)va, n) != 0) {
                 fclose(f);
                 return -1;
@@ -679,8 +684,7 @@ static int ckpt_restore_fds_dir(const char *procdir) {
             int flags = r.flags & ~(O_CREAT | O_EXCL | O_TRUNC);
             int hf = open(r.path, flags);
             if (hf < 0) {
-                fprintf(stderr, "[restore] warning: cannot reopen fd %d (%s): %s\n", r.gfd, r.path,
-                        strerror(errno));
+                fprintf(stderr, "[restore] warning: cannot reopen fd %d (%s): %s\n", r.gfd, r.path, strerror(errno));
                 continue;
             }
             if (hf != r.gfd) {
@@ -856,7 +860,7 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
 
     struct cpu c;
     if (ckpt_restore_cpu_dir(pd, &c) != 0) _exit(70);
-    fork_child_hooks(&c); // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
+    fork_child_hooks(&c);       // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
     ckpt_reinstall_sigacts(&m); // restore guest signal dispositions (AFTER the fork hooks reset host state)
 
     ckpt_restore_fds_dir(pd);

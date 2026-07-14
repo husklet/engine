@@ -312,8 +312,8 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     //      hang). Serve them as a software 128-bit (or 64-bit) LL/SC, mirroring the single-register monitor. ----
     if ((insn & 0xBFA00000u) == 0x88200000u) {
         int is64 = (insn >> 30) & 1, load = (insn >> 22) & 1, rs = (insn >> 16) & 0x1F, rt2 = (insn >> 10) & 0x1F;
-        if (is64) {                                                          // 16-byte pair
-            if (load) {                                                      // LDXP/LDAXP: open a 128-bit reservation
+        if (is64) {     // 16-byte pair
+            if (load) { // LDXP/LDAXP: open a 128-bit reservation
                 unsigned __int128 v = __atomic_load_n((unsigned __int128 *)real, __ATOMIC_ACQUIRE);
                 g_llsc.addr = real, g_llsc.size = 4, g_llsc.val = (uint64_t)v, g_llsc.val2 = (uint64_t)(v >> 64);
                 if (rt != 31) X[rt] = (uint64_t)v;
@@ -330,8 +330,8 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
                 }
                 if (rs != 31) X[rs] = ok ? 0 : 1;
             }
-        } else {          // 8-byte pair (two 32-bit words: Rt=low, Rt2=high)
-            if (load) {   // LDXP/LDAXP
+        } else {        // 8-byte pair (two 32-bit words: Rt=low, Rt2=high)
+            if (load) { // LDXP/LDAXP
                 uint64_t v = __atomic_load_n((uint64_t *)real, __ATOMIC_ACQUIRE);
                 g_llsc.addr = real, g_llsc.size = 5, g_llsc.val = v;
                 if (rt != 31) X[rt] = (uint32_t)v;
@@ -341,8 +341,8 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
                 if (g_llsc.addr == real && g_llsc.size == 5) {
                     g_llsc.addr = 0;
                     uint64_t exp = g_llsc.val;
-                    uint64_t nv = ((uint64_t)(uint32_t)((rt2 == 31) ? 0 : X[rt2]) << 32) |
-                                  (uint32_t)((rt == 31) ? 0 : X[rt]);
+                    uint64_t nv =
+                        ((uint64_t)(uint32_t)((rt2 == 31) ? 0 : X[rt2]) << 32) | (uint32_t)((rt == 31) ? 0 : X[rt]);
                     ok = __atomic_compare_exchange_n((uint64_t *)real, &exp, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                 }
                 if (rs != 31) X[rs] = ok ? 0 : 1;
@@ -361,7 +361,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             unsigned __int128 exp = ((unsigned __int128)NP_XR(rs + 1) << 64) | NP_XR(rs);
             unsigned __int128 nv = ((unsigned __int128)NP_XR(rt + 1) << 64) | NP_XR(rt);
             __atomic_compare_exchange_n((unsigned __int128 *)real, &exp, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-            if (rs != 31) X[rs] = (uint64_t)exp;                    // old value written back to Rs:Rs+1
+            if (rs != 31) X[rs] = (uint64_t)exp; // old value written back to Rs:Rs+1
             if ((rs + 1) != 31) X[rs + 1] = (uint64_t)(exp >> 64);
         } else { // 8-byte pair (two 32-bit words)
             uint64_t exp = ((uint64_t)(uint32_t)NP_XR(rs + 1) << 32) | (uint32_t)NP_XR(rs);
@@ -588,10 +588,12 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
         o = 15;
         b[o++] = '0' + (sig / 10 % 10);
         b[o++] = '0' + (sig % 10);
+
         struct {
             const char *l;
             uint64_t v;
         } F[] = {{" hpc=0x", hpc}, {" fault=0x", (uint64_t)si->si_addr}, {" hsp=0x", hsp}, {" rxbase=0x", rxb}};
+
         for (int f = 0; f < 4; f++) {
             for (const char *L = F[f].l; *L;)
                 b[o++] = *L++;
@@ -712,9 +714,7 @@ static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char
         } else {
             r = mprotect(addr, len, prot);
         }
-        if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) {
-            return;
-        }
+        if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) { return; }
         usleep(2000u << t); // transient pressure: back off and re-tighten
     }
 }
@@ -924,8 +924,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     g_stack_lo = (uint64_t)stk;
     g_stack_hi = (uint64_t)(stk + SZ);
     uint8_t *top = stk + SZ;
-    uint64_t argp[DD_MAXARGV], envp_[256]; // argv can be large post-exec (ARG_MAX); env stays small
-    set_guest_cmdline(argc, argv); // capture the full argv for /proc/self/cmdline (bare-mode fallback)
+    uint64_t argp[HL_MAXARGV], envp_[256]; // argv can be large post-exec (ARG_MAX); env stays small
+    set_guest_cmdline(argc, argv);         // capture the full argv for /proc/self/cmdline (bare-mode fallback)
     int envc = 0;
     // Resolve the env string list WITHOUT placing it yet (the placement order below is what matters). The
     // container's env arrives as HL_GUEST_ENV="K=V\nK=V\n…" (set by the launcher) -- forward EXACTLY these to

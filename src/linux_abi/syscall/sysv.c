@@ -246,25 +246,25 @@ static int g_ipc_atexit_armed;
 static int g_ipc_ctor_pid;                                        // engine-root pid (constructor; COW-inherited)
 static pthread_mutex_t g_ipc_local_m = PTHREAD_MUTEX_INITIALIZER; // guards the in-process caches below
 
-#define DD_SHMAT_MAX 256
+#define HL_SHMAT_MAX 256
 
 static struct {
     int used;
     void *addr;
     uint32_t idx;
     size_t len;
-} g_shmat[DD_SHMAT_MAX];
+} g_shmat[HL_SHMAT_MAX];
 
-#define DD_MSGCACHE_MAX 256
+#define HL_MSGCACHE_MAX 256
 
 static struct {
     int used;
     uint32_t idx;
     uint32_t seq;
     struct ddmsg_store *p;
-} g_msgcache[DD_MSGCACHE_MAX];
+} g_msgcache[HL_MSGCACHE_MAX];
 
-#define DD_UNDO_MAX 256
+#define HL_UNDO_MAX 256
 
 static struct {
     int used;
@@ -272,7 +272,7 @@ static struct {
     uint32_t seq; // set's seq (guard against slot reuse)
     uint16_t semnum;
     int adj; // accumulated undo adjustment (subtract on process exit)
-} g_undo[DD_UNDO_MAX];
+} g_undo[HL_UNDO_MAX];
 
 __attribute__((constructor)) static void ipc_ctor(void) {
     g_ipc_ctor_pid = (int)getpid();
@@ -393,7 +393,7 @@ static struct ddipc_ctrl *dd_ctrl(void) {
 // Cache the per-queue mapping in-process (keyed by idx+seq so a reused slot never serves a stale store).
 static struct ddmsg_store *dd_msg_store(uint32_t idx, uint32_t seq, int create) {
     pthread_mutex_lock(&g_ipc_local_m);
-    for (int i = 0; i < DD_MSGCACHE_MAX; i++)
+    for (int i = 0; i < HL_MSGCACHE_MAX; i++)
         if (g_msgcache[i].used && g_msgcache[i].idx == idx && g_msgcache[i].seq == seq) {
             struct ddmsg_store *r = g_msgcache[i].p;
             pthread_mutex_unlock(&g_ipc_local_m);
@@ -435,7 +435,7 @@ static struct ddmsg_store *dd_msg_store(uint32_t idx, uint32_t seq, int create) 
         }
     }
     pthread_mutex_lock(&g_ipc_local_m);
-    for (int i = 0; i < DD_MSGCACHE_MAX; i++)
+    for (int i = 0; i < HL_MSGCACHE_MAX; i++)
         if (!g_msgcache[i].used) {
             g_msgcache[i].used = 1;
             g_msgcache[i].idx = idx;
@@ -449,7 +449,7 @@ static struct ddmsg_store *dd_msg_store(uint32_t idx, uint32_t seq, int create) 
 
 static void dd_msg_uncache(uint32_t idx) {
     pthread_mutex_lock(&g_ipc_local_m);
-    for (int i = 0; i < DD_MSGCACHE_MAX; i++)
+    for (int i = 0; i < HL_MSGCACHE_MAX; i++)
         if (g_msgcache[i].used && g_msgcache[i].idx == idx) {
             munmap(g_msgcache[i].p, sizeof(struct ddmsg_store));
             g_msgcache[i].used = 0;
@@ -578,7 +578,7 @@ static uint64_t sem_stat_to_guest(struct ddipc_ctrl *C, uint32_t idx, uint64_t g
 
 // Drop this process's undo record for (idx,semnum) -- SETVAL/SETALL clear the semadj (Linux semantics).
 static void sem_undo_clear(uint32_t idx, uint32_t seq, int semnum /* -1 == whole set */) {
-    for (int i = 0; i < DD_UNDO_MAX; i++)
+    for (int i = 0; i < HL_UNDO_MAX; i++)
         if (g_undo[i].used && g_undo[i].idx == idx && g_undo[i].seq == seq &&
             (semnum < 0 || g_undo[i].semnum == (uint16_t)semnum))
             g_undo[i].used = 0;
@@ -586,12 +586,12 @@ static void sem_undo_clear(uint32_t idx, uint32_t seq, int semnum /* -1 == whole
 
 static void sem_undo_add(uint32_t idx, uint32_t seq, uint16_t semnum, int adj) {
     if (adj == 0) return;
-    for (int i = 0; i < DD_UNDO_MAX; i++)
+    for (int i = 0; i < HL_UNDO_MAX; i++)
         if (g_undo[i].used && g_undo[i].idx == idx && g_undo[i].seq == seq && g_undo[i].semnum == semnum) {
             g_undo[i].adj += adj;
             return;
         }
-    for (int i = 0; i < DD_UNDO_MAX; i++)
+    for (int i = 0; i < HL_UNDO_MAX; i++)
         if (!g_undo[i].used) {
             g_undo[i].used = 1;
             g_undo[i].idx = idx;
@@ -698,7 +698,7 @@ static void sysv_after_fork(void) {
     g_ipc_did_exit = 0;               // the child gets its own exit pass
     if (g_ctrl) {                     // inherited attachments bump nattch (Linux VM_SHM fork)
         dd_lock(&g_ctrl->lock);
-        for (int i = 0; i < DD_SHMAT_MAX; i++)
+        for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (g_shmat[i].used) {
                 struct ddshm *s = &g_ctrl->shm[g_shmat[i].idx];
                 if (s->inuse) s->nattch++;
@@ -720,7 +720,7 @@ static void sysv_after_exec(void) {
     struct ddipc_ctrl *C = g_ctrl;
     if (C) {
         dd_lock(&C->lock);
-        for (int i = 0; i < DD_SHMAT_MAX; i++)
+        for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (g_shmat[i].used) {
                 struct ddshm *s = &C->shm[g_shmat[i].idx];
                 munmap(g_shmat[i].addr, g_shmat[i].len);
@@ -745,7 +745,7 @@ static void sysv_on_exit(void) {
     dd_lock(&C->lock);
     // Process exit detaches every segment this process still holds (Linux: shm_nattch drops, and a segment
     // already marked for deletion is destroyed once nattch hits 0).
-    for (int i = 0; i < DD_SHMAT_MAX; i++)
+    for (int i = 0; i < HL_SHMAT_MAX; i++)
         if (g_shmat[i].used) {
             struct ddshm *s = &C->shm[g_shmat[i].idx];
             if (s->inuse) {
@@ -754,7 +754,7 @@ static void sysv_on_exit(void) {
             }
             g_shmat[i].used = 0;
         }
-    for (int i = 0; i < DD_UNDO_MAX; i++)
+    for (int i = 0; i < HL_UNDO_MAX; i++)
         if (g_undo[i].used) {
             uint32_t idx = g_undo[i].idx;
             if (idx < DDIPC_SEMMNI && C->sem[idx].inuse && C->sem[idx].perm.seq == g_undo[i].seq &&
@@ -944,7 +944,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         pthread_mutex_lock(&g_ipc_local_m);
-        for (int i = 0; i < DD_SHMAT_MAX; i++)
+        for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (!g_shmat[i].used) {
                 g_shmat[i].used = 1;
                 g_shmat[i].addr = p;
@@ -969,7 +969,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         C = dd_ctrl();
         pthread_mutex_lock(&g_ipc_local_m);
         int slot = -1;
-        for (int i = 0; i < DD_SHMAT_MAX; i++)
+        for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (g_shmat[i].used && g_shmat[i].addr == addr) {
                 slot = i;
                 break;

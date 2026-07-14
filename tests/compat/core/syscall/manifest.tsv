@@ -37,7 +37,7 @@ pipepacket	edge	edge_pipepacket.c	edge_pipepacket.c	aarch64,x86_64	-static-pie -
 msgflags	edge	edge_msgpeek.c	edge_msgpeek.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_msgpeek.out	linux-libc,syscall	active	exact source; deterministic checked golden
 abstract	edge	edge_abstract.c	edge_abstract.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_abstract.out	linux-libc,syscall	active	exact source; deterministic checked golden
 pipesz	edge	edge_pipesz.c	edge_pipesz.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_pipesz.out	linux-libc,syscall	active	exact source; deterministic checked golden
-mprotect	edge	edge_mprotect.c	edge_mprotect.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_mprotect.out	linux-libc,syscall	excluded-known-gap	exact source; legacy engine xfail remains open
+mprotect	edge	edge_mprotect.c	edge_mprotect.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_mprotect.out	linux-libc,syscall	active	exact source; guest page protections enforced by production memory mapping
 clockabstime	edge	edge_clockabstime.c	edge_clockabstime.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_clockabstime.out	linux-libc,syscall	active	exact source; deterministic checked golden
 sigpipe	edge	edge_sigpipe.c	edge_sigpipe.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_sigpipe.out	linux-libc,syscall	active	exact source; deterministic checked golden
 procfd	edge	edge_procfd.c	edge_procfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_procfd.out	linux-libc,syscall	active	exact source; deterministic checked golden

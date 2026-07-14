@@ -226,19 +226,20 @@ static __thread uint64_t g_force_deliver;
 // pipe is torn down only when the last alias closes). The read end is a normal guest fd; only the write end
 // is engine-private (relocated out of the guest's low fd range at create, protected from the guest's
 // close/exec sweep). `g_sigfd_slot[fdnum]` maps a guest fd NUMBER to its OFD slot (+1); 0 = not a signalfd.
-#define DD_SFD_MAX 64
+#define HL_SFD_MAX 64
+
 struct sfd_ofd {
     int rd;                 // read end (a guest fd number)
     int wr;                 // write end (engine-private, poked on signal delivery)
     volatile uint64_t mask; // signals routed to THIS signalfd (1<<signo)
     int refs;               // fd aliases referring to this OFD (dup bumps); 0 = free slot
 };
-static struct sfd_ofd g_sfd[DD_SFD_MAX];
-static uint8_t g_sigfd_slot[DD_NFD]; // guest fd number -> OFD slot index + 1 (0 = not a signalfd)
+static struct sfd_ofd g_sfd[HL_SFD_MAX];
+static uint8_t g_sigfd_slot[HL_NFD]; // guest fd number -> OFD slot index + 1 (0 = not a signalfd)
 
 // Allocate a free OFD slot (refs==0). Returns the slot index or -1 if the pool is exhausted.
 static int sfd_alloc(void) {
-    for (int i = 0; i < DD_SFD_MAX; i++)
+    for (int i = 0; i < HL_SFD_MAX; i++)
         if (g_sfd[i].refs == 0) {
             g_sfd[i].rd = g_sfd[i].wr = -1;
             g_sfd[i].mask = 0;
@@ -253,7 +254,7 @@ static int sfd_alloc(void) {
 static void sfd_deliver(int ls) {
     if (ls < 1 || ls > 63) return;
     uint64_t bit = 1ull << ls;
-    for (int i = 0; i < DD_SFD_MAX; i++)
+    for (int i = 0; i < HL_SFD_MAX; i++)
         if (g_sfd[i].refs > 0 && g_sfd[i].wr >= 0 && (g_sfd[i].mask & bit)) {
             char b = (char)ls;
             if (write(g_sfd[i].wr, &b, 1) < 0) {}
@@ -263,7 +264,7 @@ static void sfd_deliver(int ls) {
 // Is host fd `fd` a signalfd write end? (engine-private -- must survive the guest's close/exec sweep.)
 static int sfd_wr_is(int fd) {
     if (fd < 0) return 0;
-    for (int i = 0; i < DD_SFD_MAX; i++)
+    for (int i = 0; i < HL_SFD_MAX; i++)
         if (g_sfd[i].refs > 0 && g_sfd[i].wr == fd) return 1;
     return 0;
 }
@@ -304,8 +305,7 @@ static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
     // guest handler still runs (host_sig_pend below) and a later wait() sees ECHILD. Gated on the guest opt-in.
     if (ls == 17 && (g_sigact[17].flags & 0x2)) {
         int wst;
-        while (waitpid(-1, &wst, WNOHANG) > 0) {
-        }
+        while (waitpid(-1, &wst, WNOHANG) > 0) {}
     }
     host_sig_pend(ls);
 }
@@ -579,7 +579,8 @@ static void sig_diag_hex16(char *p, uint64_t v) {
 }
 
 static int sig_diag_put(char *b, int n, const char *s) {
-    while (*s) b[n++] = *s++;
+    while (*s)
+        b[n++] = *s++;
     return n;
 }
 

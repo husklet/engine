@@ -5,7 +5,7 @@
 // calls) and before service() -- same TU scope.
 
 // ---- POSIX message-queue helpers (mq_timed{send,receive} timeout + blocking; backing state in dispatch.c)
-#define DD_SI_MESGQ (-3) // Linux si_code SI_MESGQ: an mq_notify(SIGEV_SIGNAL) delivery (what the guest expects)
+#define HL_SI_MESGQ (-3) // Linux si_code SI_MESGQ: an mq_notify(SIGEV_SIGNAL) delivery (what the guest expects)
 
 // Validate an mq_timed{send,receive} abs_timeout argument (a4/a5 depending on the op). Mirrors the kernel
 // wrapper's prepare_timeout, which runs BEFORE the fd lookup: EFAULT for an unreadable pointer, EINVAL for
@@ -122,7 +122,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // Track it as a memfd so F_ADD_SEALS/F_GET_SEALS (io.c fcntl) and the F_SEAL_WRITE write-guard
             // apply. Without MFD_ALLOW_SEALING (2) the file is born F_SEAL_SEAL'd -> later F_ADD_SEALS EPERMs,
             // exactly as on Linux.
-            if (fd < DD_NFD) {
+            if (fd < HL_NFD) {
                 g_memfd_is[fd] = 1;
                 g_memfd_seal[fd] = (a1 & 2) ? 0 : 0x1 /*F_SEAL_SEAL*/;
                 memfd_reg_set_fd(fd, g_memfd_seal[fd]);
@@ -399,7 +399,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // the single-process emulation tracks no such blocked receiver, so it always fires on the edge.
         if (was_empty && q->notify_set) {
             if (q->notify_notify == 0 /*SIGEV_SIGNAL*/ && q->notify_signo >= 1 && q->notify_signo <= 64) {
-                g_sigcode[q->notify_signo] = DD_SI_MESGQ;
+                g_sigcode[q->notify_signo] = HL_SI_MESGQ;
                 g_sigval[q->notify_signo] = q->notify_val;
                 g_sigpid[q->notify_signo] = container_pid(); // si_pid: the sender (this process, self-notify)
                 g_siguid[q->notify_signo] = cuid();          // si_uid
@@ -693,7 +693,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     }
     case 287: {
-        if ((int)a0 >= 0 && (int)a0 < DD_NFD && (memfd_seals_fd((int)a0) & 0x8)) {
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && (memfd_seals_fd((int)a0) & 0x8)) {
             G_RET(c) = (uint64_t)(-EPERM);
             break;
         } // F_SEAL_WRITE

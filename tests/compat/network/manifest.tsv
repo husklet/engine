@@ -28,3 +28,12 @@ unix-dgram-abstract	network	net_unix_dgram_abstract.c	ext_net/net_unix_dgram_abs
 unix-stream	network	net_unix_stream.c	ext_net/net_unix_stream.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_stream.out	linux-libc	active	exact source and behavioral registration transfer
 v6-unreach	network	net_v6_unreach.c	ext_net/net_v6_unreach.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_v6_unreach.out	linux-libc	active	exact source and behavioral registration transfer
 writev	network	net_writev.c	ext_net/net_writev.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_writev.out	linux-libc	active	exact source and behavioral registration transfer
+ltp_neterr	network	ltp_neterr.c	ltp_neterr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_neterr.out	linux-libc	active	exact source; deterministic checked registration
+net_nonblock	network	net_nonblock.c	net_nonblock.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_nonblock.out	linux-libc	active	exact source; deterministic checked registration
+net_sendmsg	network	net_sendmsg.c	net_sendmsg.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_sendmsg.out	linux-libc	active	exact source; deterministic checked registration
+net_sockopt	network	net_sockopt.c	net_sockopt.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_sockopt.out	linux-libc	active	exact source; deterministic checked registration
+net_tcp	network	net_tcp.c	net_tcp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_tcp.out	linux-libc	active	exact source; deterministic checked registration
+net_udp	network	net_udp.c	net_udp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_udp.out	linux-libc	active	exact source; deterministic checked registration
+net_unix	network	net_unix.c	net_unix.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_unix.out	linux-libc	active	exact source; deterministic checked registration
+sentry_net	network	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_net.out	linux-libc	active	exact source; deterministic checked registration
+sentry-net-untrusted	sandbox	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_net.out	linux-libc	active	exact typed untrusted registration

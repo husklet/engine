@@ -57,3 +57,10 @@ varfloat.c	hl-jit-darwin/testdata/guests/ext_abi/varargs_float.c	aarch64,x86_64	
 varmix.c	hl-jit-darwin/testdata/guests/ext_abi/varargs_mixed.c	aarch64,x86_64	0	golden/varmix.out	sha256:0047cd5d4b30ce85a64d091078ea29b0f740f8ef6f42b10dac107b5748462469;bytes:43	portable-c
 vla.c	hl-jit-darwin/testdata/guests/ext_abi/vla.c	aarch64,x86_64	0	golden/vla.out	sha256:ad9c9665686c63329e6a9a9fb2811d2ffd40b92cf30226697563256e0ff0a979;bytes:11	portable-c
 vtable.c	hl-jit-darwin/testdata/guests/ext_abi/vtable.c	aarch64,x86_64	0	golden/vtable.out	sha256:95b183d291856cc574c55a563ccf4bb04724418fc6943d7a1c1bc008704575bb;bytes:12	portable-c
+atomic-builtins	atomics	atomics_builtins.c	atomics_builtins.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/atomics_builtins.out	linux-libc	active	exact source; deterministic checked registration
+cpuid-features	cpu	cpuid_features.c	cpuid_features.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/cpuid_features.out	linux-libc	active	exact source; deterministic checked registration
+lse-atomics	atomics	lse_atomics.c	lse_atomics.c	aarch64	-static-pie -O2 -pthread -lm -march=armv8.2-a+lse -mno-outline-atomics	-	-	0	expected/lse_atomics.out	linux-libc	active	exact source; LSE ISA build retained
+rflags-identity	cpu	rflags_id.c	rflags_id.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/rflags_id.out	linux-libc	active	exact source; deterministic checked registration
+tls-basic	tls	tls.c	tls.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tls.out	linux-libc	active	exact source; deterministic checked registration
+tls-models	tls	tlsmodels.c	tlsmodels.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels.out	linux-libc	active	exact source; deterministic checked registration
+tls-models-main	tls	tlsmodels_main.c	tlsmodels_main.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels_main.out	linux-libc	active	exact source; static non-PIE variant retained

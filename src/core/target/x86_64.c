@@ -203,7 +203,7 @@ static void container_init(const char *rootfs) {
             snprintf(tmp, sizeof tmp, "%s", ls);
             char *sv;
             // colon-separated (highest first), UNIFIED with linux_aarch64.c and the Rust
-            // launch-wire joiner (dd-jit-darwin/src/launch/wire.rs `lowers.join(":")`). This
+            // engine launch-wire joiner (`src/launch/wire.rs`, `lowers.join(":")`). This
             // target historically split on ',', so multi-lower typed launches mis-split here.
             for (char *t = strtok_r(tmp, ":", &sv); t; t = strtok_r(NULL, ":", &sv))
                 add_lower(t);

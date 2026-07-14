@@ -341,8 +341,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // Gate on THIS image being the non-PIE ET_EXEC (etype==2), not on the persistent g_nonpie_lo: the
     // interpreter (ld.so, a DYN loaded by a SECOND load_elf in the same process) has no v8 symbol and would
     // otherwise reset the value the main image just recorded. Only the main non-PIE exe carries the blob.
-    if (etype == 2)
-        g_nonpie_blob_code = go_symval(f, st.st_size, "v8_Default_embedded_blob_code_");
+    if (etype == 2) g_nonpie_blob_code = go_symval(f, st.st_size, "v8_Default_embedded_blob_code_");
     // a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
     // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
     // runtime relocation entry. After we bias the image high (macOS __PAGEZERO blocks the low link range)
@@ -375,8 +374,7 @@ static void load_elf(const char *path, struct loaded *out) {
             has_interp = 1;
             break;
         } // PT_INTERP
-    if (g_nonpie_lo && !has_interp &&
-        !go_section_by_name(f, st.st_size, ".gopclntab", NULL, NULL, NULL)) {
+    if (g_nonpie_lo && !has_interp && !go_section_by_name(f, st.st_size, ".gopclntab", NULL, NULL, NULL)) {
         uint64_t shoff = rd64(f + 40);
         uint16_t shentsize = rd16(f + 58), shnum = rd16(f + 60), shstrndx = rd16(f + 62);
         if (shoff && shnum && shstrndx < shnum) {
@@ -433,8 +431,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     extern uint64_t g_stack_lo, g_stack_hi; // publish for /proc/self/maps [stack] synthesis (vfs.c)
     g_stack_lo = (uint64_t)stk;
     g_stack_hi = (uint64_t)(stk + SZ + GUARD);
-    uint64_t argp[DD_MAXARGV], envp_[256]; // argv can be large post-exec (ARG_MAX); env stays small
-    set_guest_cmdline(argc, argv); // capture the full argv for /proc/self/cmdline (bare-mode fallback)
+    uint64_t argp[HL_MAXARGV], envp_[256]; // argv can be large post-exec (ARG_MAX); env stays small
+    set_guest_cmdline(argc, argv);         // capture the full argv for /proc/self/cmdline (bare-mode fallback)
     int envc = 0;
     for (int i = 0; i < argc; i++) {
         size_t l = strlen(argv[i]) + 1;
@@ -603,11 +601,16 @@ static int lazy_neighbor_mapped(uintptr_t pg) {
     return 0;
 }
 
-static int lazy_budget(void) { return 4096; }
+static int lazy_budget(void) {
+    return 4096;
+}
 
-static int lazy_nofix(void) { return 0; }
+static int lazy_nofix(void) {
+    return 0;
+}
 
-static void lazy_diag(void) {}
+static void lazy_diag(void) {
+}
 
 // W6A item 1: emulate a faulting host load/store against the biased non-PIE image. A non-PIE guest's
 // absolute ref resolves to the original low link vaddr (in [g_nonpie_lo,g_nonpie_hi)); the real data

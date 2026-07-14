@@ -11,3 +11,5 @@ compute-preemption	preemption	sigspin.c	ext_sig/sigspin.c	aarch64,x86_64	-static
 suspend-mask-restore	masking	sigsuspendmask.c	ext_sig/sigsuspendmask.c	aarch64,x86_64	-static-pie -O2 -std=gnu11 -pthread	-	-	0	expected/sigsuspendmask.out	linux-libc,signals,timers	active	exact source; legacy port registration
 synchronous-wait	waiting	sigwait.c	ext_sig/sigwait.c	aarch64,x86_64	-static-pie -O2 -std=gnu11 -pthread	-	-	0	expected/sigwait.out	linux-libc,signals,fork/wait	active	exact source; legacy port registration
 thread-directed-kill	delivery	tgkill.c	ext_sig/tgkill.c	aarch64,x86_64	-static-pie -O2 -std=gnu11 -pthread	-	-	0	expected/tgkill.out	linux-libc,signals,raw-syscalls	active	exact source; legacy Linux-oracle registration converted to explicit golden
+signals-core	signals	signals_core.c	signals_core.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/signals_core.out	linux-libc	active	exact source; deterministic checked registration
+sigurg-preempt	signals	sigurg_preempt.c	sigurg_preempt.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigurg_preempt.out	linux-libc	active	exact source; deterministic checked registration

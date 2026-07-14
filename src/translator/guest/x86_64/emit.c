@@ -77,8 +77,13 @@ static void emit_host_ptr(int rd, uint64_t v, int kind) {
 // x86 TSO has three ordered edges (LoadLoad, LoadStore, StoreStore) and permits StoreLoad.  DMB
 // ISHLD after guest loads and DMB ISH before guest stores provide exactly those required edges while
 // retaining x86's unaligned-access behavior.  Engine-private e_ldr/e_str accesses remain relaxed.
-static void e_dmb_ish(void) { emit32(0xD5033BBFu); }
-static void e_dmb_ishld(void) { emit32(0xD50339BFu); }
+static void e_dmb_ish(void) {
+    emit32(0xD5033BBFu);
+}
+
+static void e_dmb_ishld(void) {
+    emit32(0xD50339BFu);
+}
 
 // Guest width-typed load/store at [rn, #0]. w = 1/2/4/8 bytes. (zero-extends on load)
 static void e_load(int w, int rt, int rn) {
@@ -462,12 +467,35 @@ static void e_str_s(int t, int rn) {
 } // str s,[xn]
 
 // Guest SIMD/x87 accesses. Keep these distinct from relaxed engine spills to cpu/scratch storage.
-static void g_ldr_q(int t, int rn, int off) { e_ldr_q(t, rn, off); e_dmb_ishld(); }
-static void g_str_q(int t, int rn, int off) { e_dmb_ish(); e_str_q(t, rn, off); }
-static void g_ldr_d(int t, int rn) { e_ldr_d(t, rn); e_dmb_ishld(); }
-static void g_str_d(int t, int rn) { e_dmb_ish(); e_str_d(t, rn); }
-static void g_ldr_s(int t, int rn) { e_ldr_s(t, rn); e_dmb_ishld(); }
-static void g_str_s(int t, int rn) { e_dmb_ish(); e_str_s(t, rn); }
+static void g_ldr_q(int t, int rn, int off) {
+    e_ldr_q(t, rn, off);
+    e_dmb_ishld();
+}
+
+static void g_str_q(int t, int rn, int off) {
+    e_dmb_ish();
+    e_str_q(t, rn, off);
+}
+
+static void g_ldr_d(int t, int rn) {
+    e_ldr_d(t, rn);
+    e_dmb_ishld();
+}
+
+static void g_str_d(int t, int rn) {
+    e_dmb_ish();
+    e_str_d(t, rn);
+}
+
+static void g_ldr_s(int t, int rn) {
+    e_ldr_s(t, rn);
+    e_dmb_ishld();
+}
+
+static void g_str_s(int t, int rn) {
+    e_dmb_ish();
+    e_str_s(t, rn);
+}
 
 static void e_fmov_to_d(int vd, int xn) {
     emit32(0x9E670000u | (xn << 5) | vd);
@@ -715,7 +743,7 @@ static uint64_t g_cal_real_ns;    // CLOCK_REALTIME  ns at calibration
 static uint64_t g_cal_mult;       // tick->ns multiplier (Q30): round(1e9 * 2^FAST_SHIFT / cntfrq)
 #define FAST_SHIFT 30
 // ---------------- W4F: inline pure-userspace-state syscalls (rt_sigprocmask / sched_yield) --------
-// Some guest syscalls touch ONLY dd-jit's own per-cpu state and need no host syscall, yet still pay
+// Some guest syscalls touch ONLY the engine's own per-cpu state and need no host syscall, yet still pay
 // the full spill->block_return->service()->run_block round-trip. We serve them inline at the `0F 05`
 // site (reusing S1's emit_fast_syscall ladder) and fall through without exiting the block.
 // g_pending is the async-signal pending bitmask owned by os/linux/signal.c (included LATER in this
@@ -917,7 +945,7 @@ static void emit_fast_syscall(uint64_t next) {
 
     // ===================== W4F: pure-userspace-state syscalls (no host syscall) ==================
     // rt_sigprocmask (read/update the per-cpu guest signal mask) + sched_yield (return 0). These
-    // touch ONLY dd-jit's own state, so we serve them inline and fall through -- no spill, no
+    // touch ONLY the engine's own state, so we serve them inline and fall through -- no spill, no
     // dispatch, no service(). Same ladder/contract as S1: guest nzcv saved in x17 + restored on
     // EVERY path, guest GPRs untouched except rax(=return); scratch in x16/x19-x22.
     if (g_siginline) {
@@ -934,15 +962,14 @@ static void emit_fast_syscall(uint64_t next) {
         // mutate the mask or report inline success.
         e_subi_s(20, 10, 8, 1); // r10 == sigsetsize == 8?
         to_slow[nsl++] = (uint32_t *)g_cp;
-        e_bcond(1, 0);          // b.ne -> slow (-EINVAL)
+        e_bcond(1, 0);         // b.ne -> slow (-EINVAL)
         e_subi_s(20, 6, 0, 1); // set == NULL skips how validation
         uint32_t *valid_no_set = (uint32_t *)g_cp;
-        e_bcond(0, 0);          // b.eq -> validated
+        e_bcond(0, 0);         // b.eq -> validated
         e_subi_s(20, 7, 2, 1); // how > SIG_SETMASK?
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(8, 0); // b.hi -> slow (-EINVAL), unsigned also rejects negative values
-        *valid_no_set = (*valid_no_set & 0xFF00001Fu) |
-                        ((uint32_t)(((uint32_t *)g_cp - valid_no_set) & 0x7FFFF) << 5);
+        *valid_no_set = (*valid_no_set & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - valid_no_set) & 0x7FFFF) << 5);
         // Pending-signal fallback: if g_pending != 0 take the UNCHANGED slow exit, so the
         // dispatcher's maybe_deliver_signal runs with the post-update mask at the SAME block
         // boundary, against the SAME mask, as the unmodified engine. When nothing is pending the

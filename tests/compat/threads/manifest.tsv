@@ -26,3 +26,8 @@ self	threads	self.c	ext_threads/th_self.c	aarch64,x86_64	-static -O2 -std=gnu11 
 sem-named	threads	sem_named.c	ext_threads/th_sem_named.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/shared/sem_named.out	linux-libc,pthreads	active	ported Rust registration
 sem-unnamed	threads	sem_unnamed.c	ext_threads/th_sem_unnamed.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/shared/sem_unnamed.out	linux-libc,pthreads	active	ported Rust registration
 spinlock	threads	spinlock.c	ext_threads/th_spinlock.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/shared/spinlock.out	linux-libc,pthreads	active	ported Rust registration
+threads-basic	threads	threads_basic.c	threads_basic.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_basic.out	linux-libc	active	exact source; deterministic checked registration
+threads-many	threads	threads_many.c	threads_many.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_many.out	linux-libc	active	exact source; deterministic checked registration
+threads-mutex-queue	threads	threads_mutex_queue.c	threads_mutex_queue.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_mutex_queue.out	linux-libc	active	exact source; deterministic checked registration
+threads-nopie-tls	threads	threads_nopie_tls.c	threads_nopie_tls.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/threads_nopie_tls.out	linux-libc,pthreads	active	exact static non-PIE TLS registration
+threads-nopie-variant	variant	threads_mutex_queue.c	threads_mutex_queue.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_mutex_queue.out	linux-libc	excluded-unsupported-registration	duplicate source requires distinct static non-PIE artifact

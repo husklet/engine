@@ -21,14 +21,14 @@
 // macOS kqueue EV_CLEAR filter, by contrast, reports only a *subsequent* transition, so an already-ready fd
 // is never delivered and a Go HTTP server accepts the connection but never responds. So when we arm an edge
 // filter on a fd that currently polls ready, stash a synthetic readiness event here and deliver it on the
-// next epoll_wait -- once (edge semantics). Tables are indexed by epoll fd (<DD_NFD); larger fds use the
+// next epoll_wait -- once (edge semantics). Tables are indexed by epoll fd (<HL_NFD); larger fds use the
 // immediate path and simply don't get primed. Level-triggered fds need no prime (kqueue without EV_CLEAR
 // already reports current readiness), so only EPOLLET arms reach here -- level semantics are untouched.
-static struct kevent *g_ep_prime[DD_NFD];
-static int g_ep_primen[DD_NFD], g_ep_primecap[DD_NFD];
+static struct kevent *g_ep_prime[HL_NFD];
+static int g_ep_primen[HL_NFD], g_ep_primecap[HL_NFD];
 
 static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
-    if (ep < 0 || ep >= DD_NFD) return;
+    if (ep < 0 || ep >= HL_NFD) return;
     struct kevent *a = g_ep_prime[ep];
     for (int i = 0; i < g_ep_primen[ep]; i++)
         if (a[i].ident == ident && a[i].filter == filt) {
@@ -48,7 +48,7 @@ static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
 
 // If `fd` currently polls ready for the direction `filt` covers, record a one-shot prime on `ep`.
 static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
-    if (ep < 0 || ep >= DD_NFD || fd < 0) return;
+    if (ep < 0 || ep >= HL_NFD || fd < 0) return;
     short want = (filt == EVFILT_READ) ? POLLIN : POLLOUT;
     struct pollfd pfd = {.fd = fd, .events = want, .revents = 0};
     if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (want | POLLHUP | POLLERR)))
@@ -70,18 +70,18 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
 // A single mutex serializes the W3E per-instance state (changelist/prime/armed maps) whenever guest
 // threads exist; the single-threaded path is untouched (g_threaded == 0 -> no lock, no wake, no change).
 #define EP_WAKE_IDENT ((uintptr_t)0x7fffffe0u) // EVFILT_USER ident, disjoint from any real fd number
-static uint8_t g_ep_wake_armed[DD_NFD];        // per epoll fd: EVFILT_USER wake knote installed on its kqueue
+static uint8_t g_ep_wake_armed[HL_NFD];        // per epoll fd: EVFILT_USER wake knote installed on its kqueue
 static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
-// per-epoll-instance registered-fd membership (lazily allocated DD_NFD-bit bitmap indexed by the
-// watched fd -- the bitmap must span the SAME index range as the fd < DD_NFD guard on ep_mem_test/
-// ep_mem_set and the sibling [DD_NFD] interest tables; large event loops register hundreds of fds,
+// per-epoll-instance registered-fd membership (lazily allocated HL_NFD-bit bitmap indexed by the
+// watched fd -- the bitmap must span the SAME index range as the fd < HL_NFD guard on ep_mem_test/
+// ep_mem_set and the sibling [HL_NFD] interest tables; large event loops register hundreds of fds,
 // so the watched-fd number routinely exceeds 1024 and any narrower bitmap would be indexed out of
 // bounds -- a heap overflow whose corrupted/garbage membership bit spuriously returns EEXIST and drops
 // the real registration, stranding that fd's readiness (a load-dependent node-connect stall).
 // watched fd). kqueue silently accepts an EV_ADD of an already-armed filter and an EV_DELETE of an
 // absent one, but Linux epoll_ctl returns EEXIST / ENOENT respectively, so track membership to serve
 // those (plus EINVAL for adding the epoll fd to itself and EPERM for a regular file / directory). Only
-// dd-tracked epoll fds (< DD_NFD, g_epoll set) get this surface -- a dup'd/large epfd keeps the existing
+// engine-tracked epoll fds (< HL_NFD, g_epoll set) get this surface -- a dup'd/large epfd keeps the existing
 // best-effort immediate path, so correct software's readiness path is byte-unchanged.
 // A guest that shares ONE epoll instance across threads (Go's netpoller, node's worker pool) issues
 // concurrent epoll_ctl from different threads, so the membership bitmap is touched cross-thread: the byte
@@ -91,21 +91,21 @@ static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
 // fd X's number is later reused a fresh EPOLL_CTL_ADD wrongly returns EEXIST (Linux never does: its
 // epoll_ctl is internally serialized and close() auto-removes). Atomic OR/AND on the byte + a CAS-installed
 // bitmap close that race without a lock (the single-threaded path is unchanged: uncontended atomics).
-static uint8_t *g_ep_member[DD_NFD];
+static uint8_t *g_ep_member[HL_NFD];
 
 static int ep_mem_test(int ep, int fd) {
-    if (ep < 0 || ep >= DD_NFD || fd < 0 || fd >= DD_NFD) return 0;
+    if (ep < 0 || ep >= HL_NFD || fd < 0 || fd >= HL_NFD) return 0;
     uint8_t *m = __atomic_load_n(&g_ep_member[ep], __ATOMIC_ACQUIRE);
     if (!m) return 0;
     return (__atomic_load_n(&m[fd >> 3], __ATOMIC_SEQ_CST) >> (fd & 7)) & 1;
 }
 
 static void ep_mem_set(int ep, int fd, int on) {
-    if (ep < 0 || ep >= DD_NFD || fd < 0 || fd >= DD_NFD) return;
+    if (ep < 0 || ep >= HL_NFD || fd < 0 || fd >= HL_NFD) return;
     uint8_t *m = __atomic_load_n(&g_ep_member[ep], __ATOMIC_ACQUIRE);
     if (!m) {
         if (!on) return;
-        uint8_t *nm = calloc(DD_NFD / 8, 1);
+        uint8_t *nm = calloc(HL_NFD / 8, 1);
         if (!nm) return;
         uint8_t *expect = NULL;
         // publish atomically; if a peer installed one first, adopt theirs and free ours (the bit RMW below
@@ -125,7 +125,7 @@ static void ep_mem_set(int ep, int fd, int on) {
 }
 
 static void ep_mem_clear(int ep) {
-    if (ep < 0 || ep >= DD_NFD) return;
+    if (ep < 0 || ep >= HL_NFD) return;
     if (g_ep_member[ep]) {
         free(g_ep_member[ep]);
         g_ep_member[ep] = NULL;
@@ -159,11 +159,11 @@ static void ep_rearm_from_interest(int ep, int ident, int slot) {
 // udata. Called from fd_reset_emul BEFORE the interest table + ofd id are cleared, and before the real
 // close(). No-op unless the closing fd is both watched (g_ep_owner) and has a dup alias (g_ofd_id).
 static void ep_close_rehome(int fd) {
-    if (fd < 0 || fd >= DD_NFD || !g_ep_owner[fd] || !g_ofd_id[fd]) return;
+    if (fd < 0 || fd >= HL_NFD || !g_ep_owner[fd] || !g_ofd_id[fd]) return;
     int ep = g_ep_owner[fd] - 1;
-    if (ep < 0 || ep >= DD_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1) return; // epoll instance gone
+    if (ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1) return; // epoll instance gone
     int y = ofd_surviving_alias(fd);
-    if (y < 0 || y >= DD_NFD || y == fd) return; // last OFD reference is closing -> let the knote die
+    if (y < 0 || y >= HL_NFD || y == fd) return; // last OFD reference is closing -> let the knote die
     if (g_ep_owner[y]) return;                   // the alias is already a watched fd of its own -> don't clobber
     ep_rearm_from_interest(ep, y, fd);           // arm the surviving alias with the closing fd's events+udata
     g_ep_owner[y] = ep + 1;
@@ -192,7 +192,7 @@ static inline void ep_unlock(int lk) {
 // auto-consumed on delivery, so a trigger raised while no peer is blocked simply makes that peer's next
 // kevent() return immediately -- it re-scans primes and re-blocks, so no wakeup is ever lost.
 static void ep_wake_arm(int ep) {
-    if (ep < 0 || ep >= DD_NFD || g_ep_wake_armed[ep]) return;
+    if (ep < 0 || ep >= HL_NFD || g_ep_wake_armed[ep]) return;
     struct kevent kv;
     EV_SET(&kv, EP_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
     if (kevent(ep, &kv, 1, NULL, 0, NULL) == 0) g_ep_wake_armed[ep] = 1;
@@ -203,7 +203,7 @@ static void ep_wake_arm(int ep) {
 // NOTE_TRIGGER the wake knote so that blocked peer returns and re-scans primes for an already-ready fd.
 // Caller holds g_ep_mtx. Only used when g_threaded, so the W3E batching still applies single-threaded.
 static void ep_flush(int ep, int wake) {
-    if (ep < 0 || ep >= DD_NFD) return;
+    if (ep < 0 || ep >= HL_NFD) return;
     if (g_ep_chgn[ep] > 0) {
         kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL); // registrations only; ignore EV_ERROR echoes
         g_ep_chgn[ep] = 0;
@@ -224,7 +224,7 @@ static void ep_flush(int ep, int wake) {
 // that are actually dead are rebuilt -- a stale marker on an fd the parent closed and reused for a live
 // (inherited) file leaves that file untouched. Called from the fork child in proc.c, before the guest runs.
 static void kqueue_rebuild_after_fork(void) {
-    for (int fd = 0; fd < DD_NFD; fd++) {
+    for (int fd = 0; fd < HL_NFD; fd++) {
         if (!(g_epoll[fd] || g_timerfd[fd] || g_inotify[fd])) continue;
         if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue; // still a live inherited fd -> leave it
         int kq = kqueue();
@@ -293,10 +293,10 @@ static void kqueue_rebuild_after_fork(void) {
     // recorded registration on its owning (rebuilt, empty) epoll kqueue and restore the armed maps + the
     // membership we just cleared. A child that epoll_waits WITHOUT re-registering now sees inherited events
     // (the timerfd/inotify halves are re-armed in the rebuild loop above).
-    for (int fd = 0; fd < DD_NFD; fd++) {
+    for (int fd = 0; fd < HL_NFD; fd++) {
         if (!g_ep_owner[fd]) continue;
         int ep = g_ep_owner[fd] - 1;
-        int drop = (ep < 0 || ep >= DD_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 || fcntl(fd, F_GETFD) == -1);
+        int drop = (ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 || fcntl(fd, F_GETFD) == -1);
         if (drop) { // owner epoll or watched fd did not survive into the child -> drop the stale entry
             g_ep_owner[fd] = 0;
             g_ep_events[fd] = 0;
@@ -385,7 +385,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // g_eventfd_gnb note in vfs.c.
         fcntl(fds[0], F_SETFL, O_NONBLOCK);
         // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
-        if (fds[0] >= 0 && fds[0] < DD_NFD) {
+        if (fds[0] >= 0 && fds[0] < HL_NFD) {
             g_eventfd_peer[fds[0]] = peer + 1;
             g_eventfd_cslot[fds[0]] = fds[0] + 1;
             g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
@@ -414,7 +414,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (r >= 0) fcntl(r, F_SETFD, (a0 & 0x80000) ? FD_CLOEXEC : 0);
         // a reused fd number must start with an empty prime buffer + no stale wake knote + no stale membership
         // (close() doesn't clear ours -- this is how an epoll fd's per-instance state is reset on reuse)
-        if (r >= 0 && r < DD_NFD) {
+        if (r >= 0 && r < HL_NFD) {
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
@@ -438,9 +438,9 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        // (2) EBADF: epfd must be an open fd. A dd-tracked epoll (g_epoll set) is known-valid -> only an
+        // (2) EBADF: epfd must be an open fd. A engine-tracked epoll (g_epoll set) is known-valid -> only an
         // untracked epfd is probed (a dup'd/large epoll fd keeps the best-effort immediate path).
-        if (!(epfd >= 0 && epfd < DD_NFD && g_epoll[epfd]) && fcntl(epfd, F_GETFD) == -1) {
+        if (!(epfd >= 0 && epfd < HL_NFD && g_epoll[epfd]) && fcntl(epfd, F_GETFD) == -1) {
             G_RET(c) = (uint64_t)(-EBADF);
             break;
         }
@@ -475,9 +475,9 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             memcpy(&data, (void *)(a3 + G_EPEV_DOFF), 8);
             // struct epoll_event {u32 events; [pad;] u64 data} -- layout per guest arch (see G_EPEV_*)
         }
-        // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a dd-tracked epoll
-        // instance (membership bitmap). Confined to fd < DD_NFD, matching the readiness path below.
-        if (epfd >= 0 && epfd < DD_NFD && g_epoll[epfd] && fd >= 0 && fd < DD_NFD) {
+        // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a engine-tracked epoll
+        // instance (membership bitmap). Confined to fd < HL_NFD, matching the readiness path below.
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
             int ep = epfd;
             int member = ep_mem_test(ep, fd);
             if (op == 1 && member) {
@@ -494,7 +494,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // survives fork (re-armed on the rebuilt child kqueue) and a watched-fd close whose OFD lives on via a
         // dup (re-homed onto the surviving alias). DEL drops the entry. Confined to in-range epfd/fd, matching
         // the readiness path; a couple of fd-indexed stores, so the epoll_ctl hot path is essentially unchanged.
-        if (epfd >= 0 && epfd < DD_NFD && g_epoll[epfd] && fd >= 0 && fd < DD_NFD) {
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
             if (op == 2) { // DEL
                 g_ep_owner[fd] = 0;
                 g_ep_events[fd] = 0;
@@ -509,7 +509,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         uint16_t xf = (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
         int want_rd = (op != 2) && (ev & 0x1); // EPOLLIN
         int want_wr = (op != 2) && (ev & 0x4); // EPOLLOUT
-        if (epopt_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && !g_ep_dupd[(int)a0] && fd >= 0 && fd < DD_NFD) {
+        if (epopt_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && !g_ep_dupd[(int)a0] && fd >= 0 && fd < HL_NFD) {
             // W3E fast path: track armed filters, defer the change to the next epoll_wait kevent(). A dup'd
             // instance is excluded (g_ep_dupd) so its interest is submitted immediately to the shared kqueue.
             int ep = (int)a0;
@@ -594,7 +594,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int ep = (int)a0;
         // A dup'd instance opts out of the deferred-changelist machinery (its interest was submitted straight
         // to the shared kqueue), so it just blocks on the kqueue like the immediate path.
-        int opt = epopt_on() && ep >= 0 && ep < DD_NFD && !g_ep_dupd[ep];
+        int opt = epopt_on() && ep >= 0 && ep < HL_NFD && !g_ep_dupd[ep];
         int32_t tmo = (int32_t)a3; // guest timeout ms: <0 = infinite (must NEVER return 0), 0 = poll, >0 = finite
         // regression fix: a cross-thread epoll_ctl fires the internal EVFILT_USER wake knote, which
         // returns us from kevent() with ONLY that nudge and no guest event -> oi==0. On real Linux epoll_wait
@@ -687,7 +687,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
                 memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
                 // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
-                if (opt && kv[i].ident < DD_NFD && g_ep_os[kv[i].ident]) {
+                if (opt && kv[i].ident < HL_NFD && g_ep_os[kv[i].ident]) {
                     if (kv[i].filter == EVFILT_READ)
                         g_ep_rd[kv[i].ident] = 0;
                     else if (kv[i].filter == EVFILT_WRITE)
@@ -698,7 +698,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             // Deliver edge-triggered primes that kqueue didn't surface (fds already ready at registration).
             // This is the cross-thread-readiness delivery: a peer M that registered an already-ready fd
             // stashed a prime here, so a wake that carried no kqueue edge still hands the guest the ready fd.
-            if (ep >= 0 && ep < DD_NFD && g_ep_primen[ep] > 0) {
+            if (ep >= 0 && ep < HL_NFD && g_ep_primen[ep] > 0) {
                 int kept = 0;
                 for (int i = 0; i < g_ep_primen[ep]; i++) {
                     struct kevent *pk = &g_ep_prime[ep][i];
@@ -753,7 +753,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         int r = kqueue();
         if (r >= 0) {
-            if (r < DD_NFD) {
+            if (r < HL_NFD) {
                 g_inotify[r] = 1;
                 g_inotify_nb[r] = (a0 & 0x800) ? 1 : 0; // remember IN_NONBLOCK for the fork-child kqueue rebuild
             }
@@ -787,7 +787,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         // a directory watch: remember the path + a snapshot so read() can diff into IN_CREATE/IN_DELETE+name
         struct stat dst;
-        if (wfd >= 0 && wfd < DD_NFD && stat(p, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+        if (wfd >= 0 && wfd < HL_NFD && stat(p, &dst) == 0 && S_ISDIR(dst.st_mode)) {
             snprintf(g_inotify_wpath[wfd], sizeof g_inotify_wpath[wfd], "%s", p);
             free(g_inotify_snap[wfd]);
             g_inotify_snap[wfd] = dir_snapshot(p);
@@ -1036,7 +1036,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             // The signalfd read end OR any dup of it (g_sigfd_slot) updates the SAME OFD; Linux accepts a mask
             // update on a dup'd signalfd, so resolve the fd number to its pool slot rather than the original.
-            if (!((int)a0 >= 0 && (int)a0 < DD_NFD && g_sigfd_slot[(int)a0])) {
+            if (!((int)a0 >= 0 && (int)a0 < HL_NFD && g_sigfd_slot[(int)a0])) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
@@ -1068,7 +1068,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             g_sfd[sslot].rd = fds[0];
             g_sfd[sslot].wr = fds[1];
-            if (fds[0] >= 0 && fds[0] < DD_NFD) g_sigfd_slot[fds[0]] = (uint8_t)(sslot + 1);
+            if (fds[0] >= 0 && fds[0] < HL_NFD) g_sigfd_slot[fds[0]] = (uint8_t)(sslot + 1);
         }
         // Linux signalfd(fd != -1, mask): UPDATE replaces this OFD's mask EXACTLY (a narrowed mask drops the
         // signals it removed). A fresh create sets the new OFD's mask. Masks never cross between OFDs.
@@ -1109,7 +1109,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         int r = kqueue();
         if (r >= 0) {
-            if (r < DD_NFD) {
+            if (r < HL_NFD) {
                 g_timerfd[r] = 1;
                 g_tfd_clock[r] = (int)a0; // remember the clockid for TFD_TIMER_ABSTIME conversion
             }
@@ -1147,7 +1147,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         // (4) EBADF if fd is not an open descriptor; EINVAL if it is open but not a timerfd (e.g. a plain
-        // file). Our timerfds are dd-tracked kqueues (< DD_NFD, g_timerfd set); a larger valid fd is left to
+        // file). Our timerfds are engine-tracked kqueues (< HL_NFD, g_timerfd set); a larger valid fd is left to
         // the best-effort path below.
         {
             int fd = (int)a0;
@@ -1155,7 +1155,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 G_RET(c) = (uint64_t)(-EBADF);
                 break;
             }
-            if (fd >= 0 && fd < DD_NFD && !g_timerfd[fd]) {
+            if (fd >= 0 && fd < HL_NFD && !g_timerfd[fd]) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
@@ -1170,8 +1170,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (a3) {
             memset((void *)a3, 0, 32);
             int ofd = (int)a0;
-            int64_t odl = (ofd >= 0 && ofd < DD_NFD) ? g_tfd_deadline[ofd] : 0;
-            int64_t oiv = (ofd >= 0 && ofd < DD_NFD) ? g_tfd_interval[ofd] : 0;
+            int64_t odl = (ofd >= 0 && ofd < HL_NFD) ? g_tfd_deadline[ofd] : 0;
+            int64_t oiv = (ofd >= 0 && ofd < HL_NFD) ? g_tfd_interval[ofd] : 0;
             if (odl > 0) {
                 struct timespec onow;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &onow);
@@ -1191,7 +1191,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (value_ns <= 0) {
             EV_SET(&kv, 1, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
             kevent((int)a0, &kv, 1, NULL, 0, NULL);
-            if ((int)a0 >= 0 && (int)a0 < DD_NFD) {
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD) {
                 g_tfd_deadline[(int)a0] = 0;
                 g_tfd_interval[(int)a0] = 0;
                 g_tfd_first_oneshot[(int)a0] = 0;
@@ -1210,7 +1210,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // fired). A past deadline fires asap (0).
         int64_t first_delay;
         if ((int)a1 & 1) {
-            int clkid = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_tfd_clock[(int)a0] : 1;
+            int clkid = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_tfd_clock[(int)a0] : 1;
             // Linux CLOCK_REALTIME(0)/REALTIME_ALARM(8) are wall-clock; everything else is monotonic-scale.
             struct timespec tnow;
             int service_clock =
@@ -1223,7 +1223,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         if (first_delay < 0) first_delay = 0;
         // Record the absolute next-expiry deadline + interval so timerfd_gettime can report the remaining time.
-        if ((int)a0 >= 0 && (int)a0 < DD_NFD) {
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD) {
             g_tfd_deadline[(int)a0] = now_ns + first_delay;
             g_tfd_interval[(int)a0] = interval_ns;
         }
@@ -1237,7 +1237,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         //     to a full interval (a periodic timerfd with a short it_value + long it_interval never fired early).
         int periodic = (iv_s || iv_n);
         int first_distinct = periodic && (first_delay != interval_ns);
-        if ((int)a0 >= 0 && (int)a0 < DD_NFD) g_tfd_first_oneshot[(int)a0] = first_distinct ? 1 : 0;
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_tfd_first_oneshot[(int)a0] = first_distinct ? 1 : 0;
         uint16_t fl = EV_ADD | ((periodic && !first_distinct) ? 0 : EV_ONESHOT);
         int64_t arm_ns = (periodic && !first_distinct) ? interval_ns : first_delay;
         EV_SET(&kv, 1, EVFILT_TIMER, fl, NOTE_NSECONDS, arm_ns, NULL);
@@ -1256,7 +1256,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 G_RET(c) = (uint64_t)(-EBADF);
                 break;
             }
-            if (fd >= 0 && fd < DD_NFD && !g_timerfd[fd]) {
+            if (fd >= 0 && fd < HL_NFD && !g_timerfd[fd]) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
@@ -1268,8 +1268,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             memset((void *)a1, 0, 32);
             int fd = (int)a0;
-            int64_t deadline = (fd >= 0 && fd < DD_NFD) ? g_tfd_deadline[fd] : 0;
-            int64_t interval = (fd >= 0 && fd < DD_NFD) ? g_tfd_interval[fd] : 0;
+            int64_t deadline = (fd >= 0 && fd < HL_NFD) ? g_tfd_deadline[fd] : 0;
+            int64_t interval = (fd >= 0 && fd < HL_NFD) ? g_tfd_interval[fd] : 0;
             if (deadline > 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
