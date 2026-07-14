@@ -81,7 +81,7 @@ static void fd_carry_virt(int newfd, int oldfd) {
 
 // In hl's in-process exec model the guest shares the host descriptor table (fds are 1:1), and the engine
 // pins private host fds at LOW numbers (g_root_fd -- every path resolution openat()s off it -- plus the
-// timer kqueue, the signalfd pipe, and each bind-mount volume fd). A guest dup2/dup3 onto one of those low
+// signalfd pipe and each bind-mount volume fd). A guest dup2/dup3 onto one of those low
 // numbers (e.g. BEAM's erl_child_setup does dup3(controlpipe, 3), landing on g_root_fd) would silently
 // clobber the engine's fd. engine_fd_vacate() relocates any engine-private fd sitting on the about-to-be-
 // reused target to a fresh high descriptor first, so the guest still gets the exact fd it asked for while
@@ -226,7 +226,6 @@ static void engine_fd_vacate(int newfd) {
     if (newfd < 0) return;
     eventfd_peer_vacate(newfd);
     engine_fd_reloc(&g_root_fd, newfd);
-    engine_fd_reloc(&g_gtimer_kq, newfd);
     // signalfd write ends are engine-private; a guest dup2/dup3 onto one must relocate it (the read ends are
     // guest fds and are NOT relocated -- a dup2 onto a signalfd read end legitimately replaces that signalfd).
     for (int i = 0; i < HL_SFD_MAX; i++)
@@ -239,8 +238,8 @@ static void engine_fd_vacate(int newfd) {
 // Vacate every engine-private fd whose NUMBER falls in [first,last] -- for a guest close_range() that would
 // otherwise close the runtime's descriptors (g_root_fd etc.). Visible to fs.c/rare.c (io.c is #included first).
 static void engine_fd_vacate_range(unsigned first, unsigned last) {
-    int fds[3] = {g_root_fd, g_gtimer_kq, g_dn_kq};
-    for (int i = 0; i < 3; i++)
+    int fds[2] = {g_root_fd, g_dn_kq};
+    for (int i = 0; i < 2; i++)
         if (fds[i] >= 0 && (unsigned)fds[i] >= first && (unsigned)fds[i] <= last) engine_fd_vacate(fds[i]);
     for (int i = 0; i < HL_SFD_MAX; i++) // signalfd write ends (engine-private)
         if (g_sfd[i].refs > 0 && g_sfd[i].wr >= 0 && (unsigned)g_sfd[i].wr >= first && (unsigned)g_sfd[i].wr <= last)

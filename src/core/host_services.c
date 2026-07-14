@@ -60,6 +60,11 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->event->create == NULL || services->event->control == NULL || services->event->wait == NULL ||
          services->event->wake == NULL || services->event->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_EVENT_TIMER) != 0 &&
+        (!hl_valid_group(services->event, HL_HOST_EVENT_ABI, sizeof(*services->event)) ||
+         services->event->create == NULL || services->event->wait == NULL || services->event->wake == NULL ||
+         services->event->close == NULL || services->event->arm_timer == NULL || services->event->disarm_timer == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_NETWORK) != 0 &&
         (!hl_valid_group(services->network, HL_HOST_NETWORK_ABI, sizeof(*services->network)) ||
          services->network->socket == NULL || services->network->bind == NULL || services->network->connect == NULL ||

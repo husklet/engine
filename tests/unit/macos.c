@@ -74,8 +74,36 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
-                                                      HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING |
-                                                      HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+                                                      HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
+                                                      HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+    {
+        hl_host_result pollset = services.event->create(services.context);
+        hl_host_event_record event;
+        uint64_t deadline;
+        HL_CHECK(pollset.status == HL_STATUS_OK);
+        deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(5000000);
+        HL_CHECK(services.event->arm_timer(services.context, pollset.value, 91, deadline, 0).status == HL_STATUS_OK);
+        {
+            hl_host_result ready =
+                services.event->wait(services.context, pollset.value, &event, 1, deadline + UINT64_C(1000000000));
+            HL_CHECK(ready.status == HL_STATUS_OK && ready.value == 1 && event.token == 91 &&
+                     (event.readiness & HL_HOST_READY_TIMER) != 0);
+        }
+        deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(5000000);
+        HL_CHECK(services.event->arm_timer(services.context, pollset.value, 92, deadline, UINT64_C(5000000)).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(
+            services.event->wait(services.context, pollset.value, &event, 1, deadline + UINT64_C(1000000000)).value ==
+            1);
+        HL_CHECK(services.event->disarm_timer(services.context, pollset.value, 92).status == HL_STATUS_OK);
+        HL_CHECK(services.event->disarm_timer(services.context, pollset.value, 92).status == HL_STATUS_NOT_FOUND);
+        HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_OK);
+        HL_CHECK(services.event
+                     ->wait(services.context, pollset.value, &event, 1,
+                            services.clock->monotonic_ns(services.context).value + UINT64_C(100000000))
+                     .value == 0);
+        HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+    }
     {
         static const char payload[] = "shared-memory";
         char readback[sizeof(payload)] = {0};

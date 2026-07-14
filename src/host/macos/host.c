@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -25,6 +26,8 @@
 #define HL_MACOS_MAPPING_CAPACITY 4096u
 #define HL_MACOS_FILE_CAPACITY 1024u
 #define HL_MACOS_PROCESS_CAPACITY 1024u
+#define HL_MACOS_EVENT_CAPACITY 64u
+#define HL_MACOS_TIMER_CAPACITY 32u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -53,6 +56,19 @@ typedef struct hl_macos_process {
     uint32_t exit_value;
 } hl_macos_process;
 
+typedef struct hl_macos_timer {
+    uint64_t token;
+    uint64_t interval_ns;
+    uint32_t active;
+} hl_macos_timer;
+
+typedef struct hl_macos_event {
+    uint32_t generation;
+    uint32_t active;
+    int descriptor;
+    hl_macos_timer timers[HL_MACOS_TIMER_CAPACITY];
+} hl_macos_event;
+
 struct hl_host_macos {
     pthread_mutex_t lock;
     pthread_mutex_t fork_gate;
@@ -62,6 +78,7 @@ struct hl_host_macos {
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
+    hl_macos_event events[HL_MACOS_EVENT_CAPACITY];
 };
 
 static hl_host_result hl_macos_fork_complete(void *context);
@@ -799,6 +816,209 @@ static hl_host_result hl_macos_shared_resize(void *context, hl_host_handle objec
     return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_macos_event *hl_macos_event_lookup(hl_host_macos *host, hl_host_handle handle) {
+    uint32_t low = (uint32_t)handle;
+    uint32_t index;
+    if (low == 0) return NULL;
+    index = low - 1u;
+    if (index >= HL_MACOS_EVENT_CAPACITY || !host->events[index].active ||
+        host->events[index].generation != (uint32_t)(handle >> 32))
+        return NULL;
+    return &host->events[index];
+}
+
+static hl_host_result hl_macos_event_create(void *context) {
+    hl_host_macos *host = context;
+    struct kevent wake;
+    hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+    uint32_t index;
+    int descriptor = kqueue();
+    if (descriptor < 0) return hl_macos_errno();
+    EV_SET(&wake, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(descriptor, &wake, 1, NULL, 0, NULL) != 0) {
+        hl_host_result error = hl_macos_errno();
+        close(descriptor);
+        return error;
+    }
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index) {
+        hl_macos_event *event = &host->events[index];
+        if (event->active) continue;
+        event->generation++;
+        if (event->generation == 0) event->generation = 1;
+        event->active = 1;
+        event->descriptor = descriptor;
+        memset(event->timers, 0, sizeof(event->timers));
+        handle = hl_macos_handle(index, event->generation);
+        break;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (handle == HL_HOST_HANDLE_INVALID) {
+        close(descriptor);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    return hl_macos_result(HL_STATUS_OK, handle, 0);
+}
+
+static hl_macos_timer *hl_macos_event_timer(hl_macos_event *event, uint64_t token) {
+    uint32_t index;
+    for (index = 0; index < HL_MACOS_TIMER_CAPACITY; ++index)
+        if (event->timers[index].active && event->timers[index].token == token) return &event->timers[index];
+    return NULL;
+}
+
+static int hl_macos_event_submit_timer(int descriptor, uint64_t token, uint64_t delay_ns) {
+    struct kevent change;
+    if (delay_ns == 0) delay_ns = 1;
+    if (delay_ns > INT64_MAX) delay_ns = INT64_MAX;
+    EV_SET(&change, (uintptr_t)token, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, (intptr_t)delay_ns,
+           (void *)(uintptr_t)token);
+    return kevent(descriptor, &change, 1, NULL, 0, NULL);
+}
+
+static hl_host_result hl_macos_event_arm_timer(void *context, hl_host_handle pollset, uint64_t token,
+                                               uint64_t deadline_ns, uint64_t interval_ns) {
+    hl_host_macos *host = context;
+    hl_macos_event *event;
+    hl_macos_timer *timer;
+    uint32_t index;
+    uint64_t now;
+    int result;
+    if (token == 0 || deadline_ns == HL_HOST_DEADLINE_INFINITE)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    if (event == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    timer = hl_macos_event_timer(event, token);
+    if (timer == NULL) {
+        for (index = 0; index < HL_MACOS_TIMER_CAPACITY; ++index)
+            if (!event->timers[index].active) {
+                timer = &event->timers[index];
+                break;
+            }
+    }
+    if (timer == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    now = hl_macos_monotonic_value();
+    result = hl_macos_event_submit_timer(event->descriptor, token, deadline_ns > now ? deadline_ns - now : 1);
+    if (result == 0) {
+        timer->active = 1;
+        timer->token = token;
+        timer->interval_ns = interval_ns;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_event_disarm_timer(void *context, hl_host_handle pollset, uint64_t token) {
+    hl_host_macos *host = context;
+    hl_macos_event *event;
+    hl_macos_timer *timer;
+    struct kevent change;
+    if (token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    timer = event == NULL ? NULL : hl_macos_event_timer(event, token);
+    if (timer == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_NOT_FOUND, 0, 0);
+    }
+    EV_SET(&change, (uintptr_t)token, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    (void)kevent(event->descriptor, &change, 1, NULL, 0, NULL);
+    memset(timer, 0, sizeof(*timer));
+    pthread_mutex_unlock(&host->lock);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_event_wait(void *context, hl_host_handle pollset, hl_host_event_record *events,
+                                          size_t event_capacity, uint64_t deadline_ns) {
+    hl_host_macos *host = context;
+    struct kevent native[64];
+    struct timespec timeout;
+    struct timespec *timeout_pointer = NULL;
+    hl_macos_event *event;
+    int descriptor;
+    int count;
+    int index;
+    size_t output_count = 0;
+    if (events == NULL || event_capacity == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (event_capacity > HL_ARRAY_COUNT(native)) event_capacity = HL_ARRAY_COUNT(native);
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    descriptor = event == NULL ? -1 : event->descriptor;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (deadline_ns != HL_HOST_DEADLINE_INFINITE) {
+        uint64_t now = hl_macos_monotonic_value();
+        uint64_t remaining = deadline_ns > now ? deadline_ns - now : 0;
+        timeout.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
+        timeout.tv_nsec = (long)(remaining % UINT64_C(1000000000));
+        timeout_pointer = &timeout;
+    }
+    count = kevent(descriptor, NULL, 0, native, (int)event_capacity, timeout_pointer);
+    if (count < 0) return hl_macos_errno();
+    for (index = 0; index < count; ++index) {
+        uint32_t readiness = 0;
+        uint64_t token = (uint64_t)(uintptr_t)native[index].udata;
+        if (native[index].filter == EVFILT_USER) continue;
+        if (native[index].filter == EVFILT_READ) readiness |= HL_HOST_READY_READ;
+        if (native[index].filter == EVFILT_WRITE) readiness |= HL_HOST_READY_WRITE;
+        if ((native[index].flags & EV_ERROR) != 0) readiness |= HL_HOST_READY_ERROR;
+        if ((native[index].flags & EV_EOF) != 0) readiness |= HL_HOST_READY_HANGUP;
+        if (native[index].filter == EVFILT_TIMER) {
+            readiness |= HL_HOST_READY_TIMER;
+            token = (uint64_t)native[index].ident;
+            pthread_mutex_lock(&host->lock);
+            event = hl_macos_event_lookup(host, pollset);
+            hl_macos_timer *timer = event == NULL ? NULL : hl_macos_event_timer(event, token);
+            if (timer != NULL && timer->interval_ns != 0)
+                (void)hl_macos_event_submit_timer(event->descriptor, token, timer->interval_ns);
+            else if (timer != NULL)
+                memset(timer, 0, sizeof(*timer));
+            pthread_mutex_unlock(&host->lock);
+        }
+        events[output_count++] = (hl_host_event_record){token, readiness, 0};
+    }
+    return hl_macos_result(HL_STATUS_OK, output_count, 0);
+}
+
+static hl_host_result hl_macos_event_wake(void *context, hl_host_handle pollset) {
+    hl_host_macos *host = context;
+    hl_macos_event *event;
+    struct kevent trigger;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    descriptor = event == NULL ? -1 : event->descriptor;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    EV_SET(&trigger, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    return kevent(descriptor, &trigger, 1, NULL, 0, NULL) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_event_close(void *context, hl_host_handle pollset) {
+    hl_host_macos *host = context;
+    hl_macos_event *event;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    if (event == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = event->descriptor;
+    event->active = 0;
+    event->descriptor = -1;
+    memset(event->timers, 0, sizeof(event->timers));
+    pthread_mutex_unlock(&host->lock);
+    return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
 static hl_macos_process *hl_macos_process_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t low = (uint32_t)handle;
     uint32_t index;
@@ -1080,6 +1300,10 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
+    static const hl_host_event_services event = {
+        HL_HOST_EVENT_ABI,          sizeof(event),       hl_macos_event_create, NULL,
+        hl_macos_event_wait,        hl_macos_event_wake, hl_macos_event_close,  hl_macos_event_arm_timer,
+        hl_macos_event_disarm_timer};
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_macos_shared_create,    hl_macos_shared_open,
                                                                  hl_macos_shared_resize,    hl_macos_file_close};
@@ -1117,14 +1341,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
-                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING |
-                                 HL_HOST_CAP_SYNC;
+                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
+                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
     out_services->log = &log;
     out_services->file = &file;
     out_services->process = &process;
+    out_services->event = &event;
     out_services->shared_memory = &shared_memory;
     out_services->sync = &sync;
     *out_host = host;
@@ -1140,6 +1365,8 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         hl_macos_process *process = &host->processes[index];
         if (process->active && !process->reaped) kill(process->pid, SIGKILL);
     }
+    for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index)
+        if (host->events[index].active) close(host->events[index].descriptor);
     hl_host_sync_registry_destroy(host->sync);
     for (;;) {
         uint32_t waiters = 0;

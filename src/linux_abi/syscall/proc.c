@@ -114,14 +114,14 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
 // child dup2()s the read end onto stdin and execs, expecting its inherited (CLOEXEC) copy of the WRITE end
 // to vanish on exec. Without this sweep that copy survives, so the pipe still has a writer after initdb
 // closes its end -> the child's read(stdin) never sees EOF and `running bootstrap script ...` hangs forever.
-// Engine-private host fds (the rootfs/volume dir-fds, the timer kqueue, the signal self-pipe) are skipped:
+// Engine-private host fds (the rootfs/volume dir-fds and signal self-pipe) are skipped:
 // they back the runtime itself and must survive the emulated exec; closing them would leave dangling fd
 // numbers the new guest could reuse, corrupting timer/signal delivery and path confinement.
 static int exec_fd_is_engine(int fd) {
     if (fd < 0) return 1;
     if (eventfd_peer_is_engine_fd(fd)) return 1;
     if (sfd_wr_is(fd)) return 1; // signalfd write ends are engine-private (read ends are ordinary guest fds)
-    if (fd == g_root_fd || fd == g_gtimer_kq) return 1;
+    if (fd == g_root_fd) return 1;
     for (int i = 0; i < g_nvols; i++)
         if (fd == g_vols[i].fd) return 1;
     return 0;

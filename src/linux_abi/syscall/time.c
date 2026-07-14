@@ -2,15 +2,13 @@
 // otherwise. Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
 
 // ===================== POSIX per-process timers (timer_create/_settime/_gettime/_delete/_getoverrun)
-// macOS has no timer_create(2). Emulate Linux POSIX timers with a single shared kqueue holding one
-// EVFILT_TIMER per armed timer (kevent ident = our small-int timer id) plus ONE background thread
-// blocked in kevent(). On expiry that thread raises the guest signal through the engine's own
+// Hosts provide timer sources through the event service. One private pollset carries every armed timer,
+// identified by its small timer id, while ONE background thread waits for expirations. On expiry it raises
+// the guest signal through the engine's own
 // async-signal path -- set the g_pending bit + poke the signalfd self-pipe, byte-for-byte what
 // host_sigh() does for a real host signal -- so maybe_deliver_signal() builds the rt_sigframe at the
-// next dispatcher boundary. We NEVER raise a real host signal into the MAP_JIT thread. kqueue can't
-// express "first fire at it_value, then every it_interval" in one entry, so when those differ we arm
-// a one-shot for it_value and the thread re-arms it periodic on the first fire (two-phase). Remaining
-// time (timer_gettime) and overrun are tracked in software from the recorded deadline + kevent .data.
+// next dispatcher boundary. We NEVER raise a real host signal into the JIT thread. Remaining time
+// (timer_gettime) and overrun are tracked in software from the recorded monotonic deadline.
 #define GTIMER_MAX 32
 #define HL_SI_TIMER (-2) // Linux si_code SI_TIMER (the value the guest's siginfo expects)
 
@@ -28,7 +26,6 @@ struct gtimer {
                                 // regardless of whether the guest (or the drain thread) was running between expiries.
     uint64_t reported_expiries; // # expirations already folded into prior timer_getoverrun deliveries; the next
                                 // delivery's overrun is the count of expirations that piled up since this mark.
-    int periodic_armed;         // the kqueue entry is already periodic (no re-arm needed on fire)
 };
 
 // Total expirations that have occurred by absolute monotonic time `now` for an armed timer: expiry #0 at
@@ -52,7 +49,7 @@ static int gtimer_take_overrun(struct gtimer *t, uint64_t now) {
     return extra > 2147483647ull ? 2147483647 : (int)extra;
 }
 static struct gtimer g_gtimer[GTIMER_MAX];
-static int g_gtimer_kq = -1;
+static hl_host_handle g_gtimer_events = HL_HOST_HANDLE_INVALID;
 static pthread_t g_gtimer_thr;
 static int g_gtimer_thr_up;
 static pthread_mutex_t g_gtimer_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -86,29 +83,23 @@ static int engine_sleep_until_monotonic(const struct timespec *deadline) {
     return hl_production_clock_sleep_until(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, nanoseconds);
 }
 
-// arm/re-arm slot `id`'s EVFILT_TIMER. Caller holds g_gtimer_lk. value_ns = delay to the next fire
-// (0 => fire asap), interval_ns 0 => one-shot. When value==interval we arm a native periodic timer;
-// otherwise a one-shot the drain thread promotes to periodic on the first fire.
+// Arm/re-arm slot `id` through the host event service. Caller holds g_gtimer_lk. value_ns is relative
+// to the current monotonic clock (zero means fire as soon as the host can schedule it).
 static int gtimer_arm(int id, uint64_t value_ns, uint64_t interval_ns) {
-    struct kevent kv;
-    int periodic = (interval_ns > 0 && value_ns == interval_ns);
-    uint16_t fl = EV_ADD | (periodic ? 0 : EV_ONESHOT);
-    int64_t d = (int64_t)value_ns;
-    if (d < 0) d = 0;
-    EV_SET(&kv, (uintptr_t)id, EVFILT_TIMER, fl, NOTE_NSECONDS, d, NULL);
-    if (kevent(g_gtimer_kq, &kv, 1, NULL, 0, NULL) < 0) return -errno;
-    g_gtimer[id].periodic_armed = periodic;
-    return 0;
+    const hl_host_services *host = effective_host_services();
+    uint64_t now = gtimer_now_ns();
+    uint64_t deadline = value_ns > UINT64_MAX - now ? UINT64_MAX - 1 : now + value_ns;
+    hl_host_result result =
+        host->event->arm_timer(host->context, g_gtimer_events, (uint64_t)id + 1, deadline, interval_ns);
+    return result.status == HL_STATUS_OK ? 0 : -EIO;
 }
 
 static void gtimer_disarm(int id) {
-    struct kevent kv;
-    EV_SET(&kv, (uintptr_t)id, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-    kevent(g_gtimer_kq, &kv, 1, NULL, 0, NULL); // ENOENT if the one-shot already fired -> ignore
+    const hl_host_services *host = effective_host_services();
+    (void)host->event->disarm_timer(host->context, g_gtimer_events, (uint64_t)id + 1);
     g_gtimer[id].next_ns = 0;
     g_gtimer[id].first_ns = 0;
     g_gtimer[id].reported_expiries = 0;
-    g_gtimer[id].periodic_armed = 0;
 }
 
 // fill an itimerspec at `out`: it_interval [0..16), it_value=remaining [16..32). A disarmed timer
@@ -134,14 +125,15 @@ static void gtimer_fill_curr(struct gtimer *t, void *out) {
 static void *gtimer_loop(void *arg) {
     (void)arg;
     for (;;) {
-        struct kevent ev;
-        int n = kevent(g_gtimer_kq, NULL, 0, &ev, 1, NULL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        const hl_host_services *host = effective_host_services();
+        hl_host_event_record event;
+        hl_host_result waited = host->event->wait(host->context, g_gtimer_events, &event, 1, HL_HOST_DEADLINE_INFINITE);
+        if (waited.status != HL_STATUS_OK) {
+            if (waited.status == HL_STATUS_INTERRUPTED) continue;
             break;
-        } // kq closed -> thread exits
-        if (n == 0) continue;
-        int id = (int)ev.ident;
+        }
+        if (waited.value == 0 || (event.readiness & HL_HOST_READY_TIMER) == 0) continue;
+        int id = (int)event.token - 1;
         if (id < 0 || id >= GTIMER_MAX) continue;
         struct gtimer *t = &g_gtimer[id];
         pthread_mutex_lock(&g_gtimer_lk);
@@ -152,14 +144,10 @@ static void *gtimer_loop(void *arg) {
         // The overrun COUNT is not computed here: it is derived from elapsed monotonic time against the fixed
         // first_ns anchor at delivery/timer_getoverrun (gtimer_take_overrun), so it stays correct even when the
         // drain thread is starved or the guest is descheduled in a blocking sleep and misses whole periods.
-        // This loop just advances the gettime bookkeeping deadline and (re)delivers the signal. For a one-shot
-        // (interval 0) that means disarm; for a two-phase periodic (it_value != it_interval) it promotes the
-        // kqueue entry to native periodic on the first fire.
+        // This loop advances the gettime bookkeeping deadline and (re)delivers the signal. The host event
+        // service owns periodic rearming, including a first deadline distinct from the interval.
         uint64_t now = gtimer_now_ns();
-        if (!t->periodic_armed && t->interval_ns > 0) {
-            gtimer_arm(id, t->interval_ns, t->interval_ns); // two-phase: promote to periodic now
-            t->next_ns = now + t->interval_ns;
-        } else if (t->periodic_armed) {
+        if (t->interval_ns > 0) {
             t->next_ns = now + t->interval_ns; // advance bookkeeping deadline
         } else {
             t->next_ns = 0; // pure one-shot is done -> disarmed
@@ -182,25 +170,27 @@ static void *gtimer_loop(void *arg) {
 }
 
 // POSIX: per-process timers are NOT inherited across fork(). Drop the inherited table + the now-dead
-// kqueue/drain thread so a forked child starts clean (lazy-recreated on its own first timer_create).
+// host-event pollset/drain thread so a forked child starts clean (lazy-recreated on its own first timer_create).
 static void gtimer_atfork_child(void) {
     memset(g_gtimer, 0, sizeof g_gtimer);
-    g_gtimer_kq = -1;
+    g_gtimer_events = HL_HOST_HANDLE_INVALID;
     g_gtimer_thr_up = 0;
     pthread_mutex_init(&g_gtimer_lk, NULL);
 }
 
-// lazily bring up the shared kqueue + drain thread. Caller holds g_gtimer_lk.
+// Lazily bring up the shared host-event pollset + drain thread. Caller holds g_gtimer_lk.
 static int gtimer_init(void) {
     static int reg = 0;
     if (!reg) {
         pthread_atfork(NULL, NULL, gtimer_atfork_child);
         reg = 1;
     }
-    if (g_gtimer_kq < 0) {
-        g_gtimer_kq = kqueue();
-        if (g_gtimer_kq < 0) return -errno;
-        fcntl(g_gtimer_kq, F_SETFD, FD_CLOEXEC);
+    const hl_host_services *host = effective_host_services();
+    if (hl_host_services_validate(host, HL_HOST_CAP_EVENT_TIMER) != HL_STATUS_OK) return -ENOSYS;
+    if (g_gtimer_events == HL_HOST_HANDLE_INVALID) {
+        hl_host_result created = host->event->create(host->context);
+        if (created.status != HL_STATUS_OK) return -EIO;
+        g_gtimer_events = created.value;
     }
     if (!g_gtimer_thr_up) {
         if (pthread_create(&g_gtimer_thr, NULL, gtimer_loop, NULL) != 0) return -EAGAIN;
@@ -679,7 +669,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         uint64_t interval_ns = ivs * 1000000000ull + ivn;
         uint64_t value_ns;
         // Track the SIGNED offset to the first expiry too: a TIMER_ABSTIME deadline already in the past has a
-        // negative offset, which the kqueue arm clamps to 0 (fire asap) but the overrun count must NOT clamp
+        // negative offset, which the host timer arm clamps to 0 (fire asap) but the overrun count must NOT clamp
         // -- a periodic timer whose start is far in the past has already "overrun" (now-deadline)/interval
         // times by its first delivery (LTP timer_settime03: overrun capped at INT_MAX). first_ns preserves
         // that true (possibly-past) absolute deadline so overrun counts every elapsed period from it.

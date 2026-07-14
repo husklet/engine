@@ -11,7 +11,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI 8u
 #define HL_HOST_PROCESS_ABI 3u
-#define HL_HOST_EVENT_ABI 1u
+#define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_SYNC_ABI 2u
@@ -30,7 +30,8 @@ enum {
     HL_HOST_CAP_NETWORK = UINT64_C(1) << 7,
     HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 8,
     HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 9,
-    HL_HOST_CAP_SYNC = UINT64_C(1) << 10
+    HL_HOST_CAP_SYNC = UINT64_C(1) << 10,
+    HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11
 };
 
 enum {
@@ -84,7 +85,8 @@ enum {
     HL_HOST_READY_ERROR = 1u << 2,
     HL_HOST_READY_HANGUP = 1u << 3,
     HL_HOST_READY_EDGE = 1u << 4,
-    HL_HOST_READY_ONESHOT = 1u << 5
+    HL_HOST_READY_ONESHOT = 1u << 5,
+    HL_HOST_READY_TIMER = 1u << 6
 };
 
 typedef struct hl_host_bytes {
@@ -247,6 +249,10 @@ typedef struct hl_host_event_services {
                            uint64_t deadline_ns);
     hl_host_result (*wake)(void *context, hl_host_handle pollset);
     hl_host_result (*close)(void *context, hl_host_handle pollset);
+    /* Timers use absolute host-monotonic deadlines. interval_ns zero selects one-shot delivery. */
+    hl_host_result (*arm_timer)(void *context, hl_host_handle pollset, uint64_t token, uint64_t deadline_ns,
+                                uint64_t interval_ns);
+    hl_host_result (*disarm_timer)(void *context, hl_host_handle pollset, uint64_t token);
 } hl_host_event_services;
 
 typedef struct hl_host_network_services {
