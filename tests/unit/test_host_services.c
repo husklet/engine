@@ -50,6 +50,7 @@ int main(void) {
     hl_host_sync_services malformed_sync;
     hl_host_memory_services malformed_memory;
     hl_host_transfer_services malformed_transfer;
+    hl_host_file_services malformed_file;
     hl_host_result directory;
     hl_host_result directory_copy;
     hl_host_result pollset;
@@ -129,6 +130,22 @@ int main(void) {
     truncated = services;
     truncated.transfer = &malformed_transfer;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TRANSFER) == HL_STATUS_ABI_MISMATCH);
+    /* Validator-only mock: every callback slot starts as a non-null sentinel;
+     * no callback is invoked. This isolates each mandatory ABI12 tail field. */
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.sync_range = NULL;
+    truncated = services;
+    truncated.capabilities |= HL_HOST_CAP_FILE;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.sync_filesystem = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
 
     truncated = services;
     truncated.size = 8;
