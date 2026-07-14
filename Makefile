@@ -298,6 +298,14 @@ $(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
+$(BUILD)/tests/native-capacity: tests/unit/test_native_capacity.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
+
+test-native-capacity: $(BUILD)/tests/native-capacity
+	$(BUILD)/tests/native-capacity
+
 $(BUILD)/tests/test_directory_services: tests/unit/test_directory_services.c $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
@@ -1184,7 +1192,7 @@ perf-compat: e2e-compat $(BUILD)/tools/perf-runner
 	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/syscall/x86_64/gettid) 0 25
 
-unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST)
+unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity
 
 define HL_UNIT_RULE
 run-unit-$(1): $(BUILD)/tests/test_$(1)
@@ -1245,12 +1253,19 @@ $(BUILD)/tests/native-macos: tests/unit/test_native.c $(MAC_LIBS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
 
+$(BUILD)/tests/native-capacity-macos: tests/unit/test_native_capacity.c $(MAC_LIBS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
+
+test-native-capacity-macos: $(BUILD)/tests/native-capacity-macos
+	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
+
 $(BUILD)/tests/resolve-services-macos: tests/unit/test_resolve_services.c $(BUILD)/mac/lib/libhl-host-macos.a
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_HOST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< \
 		$(BUILD)/mac/lib/libhl-host-macos.a -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/resolve-services-macos
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
@@ -1259,6 +1274,7 @@ test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/direc
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 	$(MAC) $(abspath $(BUILD)/tests/system-macos)
 	$(MAC) $(abspath $(BUILD)/tests/native-macos)
+	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
 	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c

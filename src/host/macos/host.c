@@ -169,12 +169,14 @@ struct hl_host_macos {
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
-    hl_macos_event events[HL_MACOS_EVENT_CAPACITY];
+    hl_macos_event *events;
+    uint32_t event_capacity;
     hl_macos_counter counters[HL_MACOS_COUNTER_CAPACITY];
     hl_macos_counter_subscription counter_subscriptions[HL_MACOS_COUNTER_SUBSCRIPTIONS];
     hl_macos_transfer transfers[HL_MACOS_TRANSFER_CAPACITY];
     hl_macos_directory directories[HL_MACOS_DIRECTORY_CAPACITY];
-    hl_macos_watch watches[HL_MACOS_WATCH_CAPACITY];
+    hl_macos_watch *watches;
+    uint32_t watch_capacity;
 };
 
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append);
@@ -1901,7 +1903,7 @@ static hl_macos_event *hl_macos_event_lookup(hl_host_macos *host, hl_host_handle
     uint32_t index;
     if (low == 0) return NULL;
     index = low - 1u;
-    if (index >= HL_MACOS_EVENT_CAPACITY || !host->events[index].active ||
+    if (index >= host->event_capacity || !host->events[index].active ||
         host->events[index].generation != (uint32_t)(handle >> 32))
         return NULL;
     return &host->events[index];
@@ -2728,7 +2730,7 @@ static hl_macos_watch *hl_macos_watch_lookup(hl_host_macos *host, hl_host_handle
     uint32_t low = (uint32_t)handle;
     if ((low & UINT32_C(0x80000000)) == 0) return NULL;
     uint32_t index = (low & UINT32_C(0x7fffffff)) - 1u;
-    if (index >= HL_MACOS_WATCH_CAPACITY || !host->watches[index].active ||
+    if (index >= host->watch_capacity || !host->watches[index].active ||
         host->watches[index].generation != (uint32_t)(handle >> 32))
         return NULL;
     return &host->watches[index];
@@ -2787,11 +2789,25 @@ static hl_host_result hl_macos_watch_open(void *context, hl_host_handle file) {
         return error;
     }
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_WATCH_CAPACITY && host->watches[index].active; ++index) {}
-    if (index == HL_MACOS_WATCH_CAPACITY) {
-        pthread_mutex_unlock(&host->lock);
-        close(descriptor);
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    for (index = 0; index < host->watch_capacity && host->watches[index].active; ++index) {}
+    if (index == host->watch_capacity) {
+        uint32_t capacity = host->watch_capacity > UINT32_C(0x7fffffff) / 2u
+                                ? UINT32_C(0x7fffffff)
+                                : host->watch_capacity * 2u;
+        hl_macos_watch *grown = capacity > host->watch_capacity
+                                    ? realloc(host->watches, (size_t)capacity * sizeof(*grown))
+                                    : NULL;
+        if (grown == NULL) {
+            pthread_mutex_unlock(&host->lock);
+            close(descriptor);
+            return hl_macos_result(capacity > host->watch_capacity ? HL_STATUS_OUT_OF_MEMORY
+                                                                    : HL_STATUS_RESOURCE_LIMIT,
+                                   0, 0);
+        }
+        memset(grown + host->watch_capacity, 0,
+               (size_t)(capacity - host->watch_capacity) * sizeof(*grown));
+        host->watches = grown;
+        host->watch_capacity = capacity;
     }
     hl_macos_watch *watch = &host->watches[index];
     watch->generation++;
@@ -2862,7 +2878,7 @@ static hl_host_result hl_macos_watch_close(void *context, hl_host_handle handle)
 }
 
 static void hl_macos_watch_note(hl_host_macos *host, uintptr_t descriptor, uint32_t native_changes) {
-    for (uint32_t index = 0; index < HL_MACOS_WATCH_CAPACITY; ++index) {
+    for (uint32_t index = 0; index < host->watch_capacity; ++index) {
         hl_macos_watch *watch = &host->watches[index];
         if (!watch->active || (uintptr_t)watch->descriptor != descriptor) continue;
         uint32_t changes = 0;
@@ -2883,6 +2899,7 @@ static hl_host_result hl_macos_event_create(void *context) {
     hl_host_macos *host = context;
     struct kevent wake;
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+    hl_status exhausted = HL_STATUS_RESOURCE_LIMIT;
     uint32_t index;
     int descriptor = kqueue();
     if (descriptor < 0) return hl_macos_errno();
@@ -2895,7 +2912,7 @@ static hl_host_result hl_macos_event_create(void *context) {
         return error;
     }
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index) {
+    for (index = 0; index < host->event_capacity; ++index) {
         hl_macos_event *event = &host->events[index];
         if (event->active) continue;
         event->generation++;
@@ -2906,11 +2923,30 @@ static hl_host_result hl_macos_event_create(void *context) {
         handle = hl_macos_handle(index, event->generation);
         break;
     }
+    if (handle == HL_HOST_HANDLE_INVALID) {
+        uint32_t capacity = host->event_capacity > UINT32_MAX / 2u ? UINT32_MAX : host->event_capacity * 2u;
+        hl_macos_event *grown = capacity > host->event_capacity
+                                    ? realloc(host->events, (size_t)capacity * sizeof(*grown))
+                                    : NULL;
+        if (grown != NULL) {
+            memset(grown + host->event_capacity, 0,
+                   (size_t)(capacity - host->event_capacity) * sizeof(*grown));
+            index = host->event_capacity;
+            host->events = grown;
+            host->event_capacity = capacity;
+            hl_macos_event *event = &host->events[index];
+            event->generation = 1;
+            event->active = 1;
+            event->descriptor = descriptor;
+            handle = hl_macos_handle(index, event->generation);
+        } else if (capacity > host->event_capacity)
+            exhausted = HL_STATUS_OUT_OF_MEMORY;
+    }
     pthread_mutex_unlock(&host->lock);
     if (handle == HL_HOST_HANDLE_INVALID) {
         hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        return hl_macos_result(exhausted, 0, 0);
     }
     return hl_macos_result(HL_STATUS_OK, handle, 0);
 }
@@ -3551,18 +3587,34 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     memset(out_services, 0, sizeof(*out_services));
     host = calloc(1, sizeof(*host));
     if (host == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    host->events = calloc(HL_MACOS_EVENT_CAPACITY, sizeof(*host->events));
+    host->watches = calloc(HL_MACOS_WATCH_CAPACITY, sizeof(*host->watches));
+    if (host->events == NULL || host->watches == NULL) {
+        free(host->watches);
+        free(host->events);
+        free(host);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
+    host->event_capacity = HL_MACOS_EVENT_CAPACITY;
+    host->watch_capacity = HL_MACOS_WATCH_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
+        free(host->watches);
+        free(host->events);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (pthread_mutex_init(&host->fork_gate, NULL) != 0) {
         pthread_mutex_destroy(&host->lock);
+        free(host->watches);
+        free(host->events);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (pthread_cond_init(&host->process_changed, NULL) != 0) {
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->watches);
+        free(host->events);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3570,6 +3622,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         pthread_cond_destroy(&host->process_changed);
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->watches);
+        free(host->events);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3639,9 +3693,9 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_close(host, handle);
     }
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index)
+    for (index = 0; index < host->event_capacity; ++index)
         if (host->events[index].active) close(host->events[index].descriptor);
-    for (index = 0; index < HL_MACOS_WATCH_CAPACITY; ++index)
+    for (index = 0; index < host->watch_capacity; ++index)
         if (host->watches[index].active) close(host->watches[index].descriptor);
     hl_host_sync_registry_destroy(host->sync);
     for (;;) {
@@ -3675,5 +3729,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
+    free(host->watches);
+    free(host->events);
     free(host);
 }
