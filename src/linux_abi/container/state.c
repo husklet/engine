@@ -422,6 +422,69 @@ static int cgid(void) {
 #include <sys/xattr.h>
 #define HL_OWNER_XATTR_UID "user.hl.owner.uid"
 #define HL_OWNER_XATTR_GID "user.hl.owner.gid"
+#define HL_OWNER_DIR "/tmp/.hl-owner"
+
+typedef struct hl_owner_record {
+    uint32_t magic;
+    int32_t uid;
+    int32_t gid;
+    uint64_t birth_ns;
+} hl_owner_record;
+
+static uint64_t owner_birth_ns(const struct stat *metadata) {
+#if defined(__APPLE__)
+    return (uint64_t)metadata->st_birthtimespec.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)metadata->st_birthtimespec.tv_nsec;
+#else
+    return (uint64_t)metadata->st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)metadata->st_ctim.tv_nsec;
+#endif
+}
+
+static int owner_sidecar_open(uint64_t dev, uint64_t ino) {
+    char path[96];
+    (void)mkdir(HL_OWNER_DIR, 0700);
+    (void)chmod(HL_OWNER_DIR, 0700);
+    struct stat directory;
+    if (lstat(HL_OWNER_DIR, &directory) != 0 || !S_ISDIR(directory.st_mode) || directory.st_uid != getuid())
+        return -1;
+    snprintf(path, sizeof(path), HL_OWNER_DIR "/%llx.%llx", (unsigned long long)dev, (unsigned long long)ino);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct stat metadata;
+    if (fd >= 0 && (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode))) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void owner_sidecar_set(uint64_t dev, uint64_t ino, uint64_t birth_ns, int uid, int gid) {
+    int fd = owner_sidecar_open(dev, ino);
+    if (fd < 0) return;
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    while (fcntl(fd, F_SETLKW, &lock) < 0 && errno == EINTR) {}
+    hl_owner_record record = {0x484c4f57u, -1, -1, birth_ns};
+    (void)pread(fd, &record, sizeof(record), 0);
+    if (record.magic != 0x484c4f57u || record.birth_ns != birth_ns)
+        record = (hl_owner_record){0x484c4f57u, -1, -1, birth_ns};
+    if (uid >= 0) record.uid = uid;
+    if (gid >= 0) record.gid = gid;
+    (void)pwrite(fd, &record, sizeof(record), 0);
+    lock.l_type = F_UNLCK;
+    (void)fcntl(fd, F_SETLK, &lock);
+    close(fd);
+}
+
+static int owner_sidecar_get(uint64_t dev, uint64_t ino, uint64_t birth_ns, int *uid, int *gid) {
+    int fd = owner_sidecar_open(dev, ino);
+    if (fd < 0) return 0;
+    hl_owner_record record;
+    ssize_t count = pread(fd, &record, sizeof(record), 0);
+    close(fd);
+    if (count != (ssize_t)sizeof(record) || record.magic != 0x484c4f57u || record.birth_ns != birth_ns) return 0;
+    *uid = record.uid;
+    *gid = record.gid;
+    return record.uid >= 0 || record.gid >= 0;
+}
 
 // PERF (sqlite-select / any stat-heavy workload): reading the guest-chown xattr back on EVERY stat cost
 // two macOS fgetxattr/getxattr per stat (~2.5us each on APFS even for a MISS -> ~5us/stat, 40-50x native
@@ -444,6 +507,9 @@ static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nof
         uint32_t v = (uint32_t)gid;
         setxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, opt);
     }
+    struct stat metadata;
+    if ((nofollow ? lstat(hostpath, &metadata) : stat(hostpath, &metadata)) == 0)
+        owner_sidecar_set((uint64_t)metadata.st_dev, (uint64_t)metadata.st_ino, owner_birth_ns(&metadata), uid, gid);
     if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
 }
 
@@ -456,6 +522,9 @@ static void chown_xattr_set_fd(int fd, int uid, int gid) {
         uint32_t v = (uint32_t)gid;
         fsetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0);
     }
+    struct stat metadata;
+    if (fstat(fd, &metadata) == 0)
+        owner_sidecar_set((uint64_t)metadata.st_dev, (uint64_t)metadata.st_ino, owner_birth_ns(&metadata), uid, gid);
     if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
 }
 
@@ -489,7 +558,12 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
             present = 1;
         }
     }
-    if (use_cache && !present) { // record the confirmed miss so a repeat stat of this inode skips the reads
+    if (!present) {
+        struct stat metadata;
+        int have_metadata = fd >= 0 ? fstat(fd, &metadata) == 0 : hostpath != NULL && stat(hostpath, &metadata) == 0;
+        if (have_metadata && owner_sidecar_get(dev, ino, owner_birth_ns(&metadata), uid, gid)) present = 1;
+    }
+    if (use_cache && !present) { // record the confirmed miss so a repeat stat skips both backing stores
         hl_xattr_cache_record_negative(dev, ino);
     }
     return present;

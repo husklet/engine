@@ -33,7 +33,7 @@ static void fill_linux_bound_stat(uint8_t *destination, const hl_linux_file_stat
     hl_linux_stat_record record = {0};
     record.device = status->device;
     record.object = status->object;
-    record.links = 1;
+    record.links = status->link_count;
     record.size = status->size;
     record.blocks_512 = status->blocks_512;
     record.modified_seconds = (int64_t)(status->modified_ns / UINT64_C(1000000000));
@@ -41,7 +41,7 @@ static void fill_linux_bound_stat(uint8_t *destination, const hl_linux_file_stat
     record.changed_seconds = record.modified_seconds;
     record.changed_nanoseconds = record.modified_nanoseconds;
     record.mode = status->mode;
-    record.user = (uint32_t)cuid();
-    record.group = (uint32_t)cgid();
+    record.user = status->user;
+    record.group = status->group;
     (void)hl_linux_stat_encode_aarch64(&record, destination, 128);
 }

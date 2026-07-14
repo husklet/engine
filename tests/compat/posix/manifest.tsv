@@ -2,7 +2,7 @@
 access	portable	access.c	ext_posix/access.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/access.out	linux-libc	active	exact source and behavioral registration transfer
 apt-pty	portable	apt_pty.c	ext_posix/apt_pty.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/apt_pty.out	linux-libc	active	exact source and behavioral registration transfer
 apt-pty-devpts	portable	apt_pty_devpts.c	ext_posix/apt_pty_devpts.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/apt_pty_devpts.out	linux-libc	active	exact source and behavioral registration transfer
-chmodchown	portable	chmodchown.c	ext_posix/chmodchown.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/chmodchown.out	linux-libc	active	exact source and behavioral registration transfer
+chmodchown	portable	chmodchown.c	ext_posix/chmodchown.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/chmodchown.out	linux-libc	active	extended typed-fd ownership persistence coverage
 clockid	portable	clockid.c	ext_posix/clockid.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/clockid.out	linux-libc	active	exact source and behavioral registration transfer
 dup	portable	dup.c	ext_posix/dup.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/dup.out	linux-libc	active	exact source and behavioral registration transfer
 dup3	linux-form	dup3.c	ext_posix/dup3.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/dup3.out	linux-libc	active	exact source and behavioral registration transfer
