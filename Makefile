@@ -75,7 +75,8 @@ MAC_AUX_OBJECTS := $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/target/x86_64.o \
 	$(BUILD)/mac/lifecycle/aarch64-runner.o $(BUILD)/mac/lifecycle/x86_64-runner.o
 
 BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/binding/x86_64-runner.o \
-	$(BUILD)/mac/stdio/aarch64-runner.o $(BUILD)/mac/stdio/x86_64-runner.o
+	$(BUILD)/mac/stdio/aarch64-runner.o $(BUILD)/mac/stdio/x86_64-runner.o \
+	$(BUILD)/mac/dir/aarch64-runner.o $(BUILD)/mac/dir/x86_64-runner.o
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
@@ -267,6 +268,14 @@ $(BUILD)/e2e/stdio-binding-x86_64: tests/e2e/stdio_binding.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static $< -o $@
 
+$(BUILD)/e2e/dir-binding-aarch64: tests/e2e/dir_binding.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+
+$(BUILD)/e2e/dir-binding-x86_64: tests/e2e/dir_binding.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+
 $(BUILD)/mac/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
@@ -329,6 +338,14 @@ $(BUILD)/mac/stdio/x86_64-runner.o: tools/stdio_e2e_runner.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/mac/dir/aarch64-runner.o: tools/dir_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/mac/dir/x86_64-runner.o: tools/dir_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/tools/lifecycle-aarch64: $(BUILD)/mac/lifecycle/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -357,6 +374,20 @@ $(BUILD)/tools/binding-x86_64: $(BUILD)/mac/binding/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
+$(BUILD)/tools/dir-aarch64: $(BUILD)/mac/dir/aarch64-runner.o \
+	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+
+$(BUILD)/tools/dir-x86_64: $(BUILD)/mac/dir/x86_64-runner.o \
+	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+
 $(BUILD)/tools/stdio-aarch64: $(BUILD)/mac/stdio/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -376,6 +407,8 @@ e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
 	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
+	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
+	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
@@ -404,6 +437,8 @@ e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/
 	$(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)
 	$(MAC) $(abspath $(BUILD)/tools/stdio-aarch64) $(abspath $(BUILD)/e2e/stdio-binding-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/stdio-x86_64) $(abspath $(BUILD)/e2e/stdio-binding-x86_64)
+	$(MAC) $(abspath $(BUILD)/tools/dir-aarch64) $(abspath $(BUILD)/e2e/dir-binding-aarch64)
+	$(MAC) $(abspath $(BUILD)/tools/dir-x86_64) $(abspath $(BUILD)/e2e/dir-binding-x86_64)
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \

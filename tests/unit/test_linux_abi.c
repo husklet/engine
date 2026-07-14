@@ -232,6 +232,27 @@ int main(void) {
     HL_CHECK(hl_linux_abi_init(&linux_abi, &services, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) ==
              HL_STATUS_OK);
     HL_CHECK(file_host.fake.live_mutexes == 0);
+    {
+        hl_linux_fd_reservation reservation;
+        hl_linux_fork_plan plan = {.abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan)};
+        HL_CHECK(hl_linux_fd_reserve_at(&linux_abi, 6, &reservation) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, 6, &snapshot) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_fd_install_at(&linux_abi, 6, 55, 0, 0) == HL_STATUS_ALREADY_EXISTS);
+        HL_CHECK(hl_linux_abi_fork_prepare(&linux_abi, &plan) == HL_STATUS_BUSY);
+        HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_BUSY);
+        file_host.next_status = HL_STATUS_NOT_FOUND;
+        HL_CHECK(hl_linux_openat_reserved(&linux_abi, &reservation, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY,
+                                          0) == -HL_LINUX_ENOENT);
+        HL_CHECK(hl_linux_fd_cancel(&linux_abi, &reservation) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_cancel(&linux_abi, &reservation) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_fd_reserve_at(&linux_abi, 6, &reservation) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_openat_reserved(&linux_abi, &reservation, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY,
+                                          0) == 6);
+        HL_CHECK(hl_linux_fd_cancel(&linux_abi, &reservation) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_close(&linux_abi, 6) == 0);
+        file_host.closes = 0;
+        file_host.opens = 0;
+    }
     hl_fake_host_fail_next(&file_host.fake, HL_STATUS_IO);
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0, 0, &original) == HL_STATUS_IO);
     HL_CHECK(file_host.fake.live_mutexes == 0);
@@ -429,6 +450,23 @@ int main(void) {
     }
     file_host.next_status = HL_STATUS_NOT_FOUND;
     HL_CHECK(hl_linux_openat(&linux_abi, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY, 0) == -HL_LINUX_ENOENT);
+    {
+        const struct {
+            hl_status status;
+            int64_t result;
+        } errors[] = {{HL_STATUS_NOT_DIRECTORY, -HL_LINUX_ENOTDIR},
+                      {HL_STATUS_IS_DIRECTORY, -HL_LINUX_EISDIR},
+                      {HL_STATUS_NAME_TOO_LONG, -HL_LINUX_ENAMETOOLONG},
+                      {HL_STATUS_SYMLINK_LOOP, -HL_LINUX_ELOOP},
+                      {HL_STATUS_READ_ONLY, -HL_LINUX_EROFS}};
+
+        size_t i;
+        for (i = 0; i < HL_ARRAY_COUNT(errors); ++i) {
+            file_host.next_status = errors[i].status;
+            HL_CHECK(hl_linux_openat(&linux_abi, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY, 0) ==
+                     errors[i].result);
+        }
+    }
 
     {
         read_thread_args first = {&linux_abi, 0, {0}};

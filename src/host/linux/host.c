@@ -119,6 +119,11 @@ static hl_status hl_linux_status_from_errno(int error) {
     case ENOTSUP:
     case ENOSYS: return HL_STATUS_NOT_SUPPORTED;
     case EBUSY: return HL_STATUS_BUSY;
+    case ENOTDIR: return HL_STATUS_NOT_DIRECTORY;
+    case EISDIR: return HL_STATUS_IS_DIRECTORY;
+    case ENAMETOOLONG: return HL_STATUS_NAME_TOO_LONG;
+    case ELOOP: return HL_STATUS_SYMLINK_LOOP;
+    case EROFS: return HL_STATUS_READ_ONLY;
     default: return HL_STATUS_IO;
     }
 }

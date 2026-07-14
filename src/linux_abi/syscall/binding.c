@@ -147,6 +147,23 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
     return result;
 }
 
+static int bound_path_copy(uint64_t address, char path[HL_LINUX_PATH_MAX + 1], size_t *path_size) {
+    size_t index;
+    if (address == 0 || path == NULL || path_size == NULL) return -HL_LINUX_EFAULT;
+    for (index = 0; index < HL_LINUX_PATH_MAX; ++index) {
+        if (address > UINTPTR_MAX - index) return -HL_LINUX_EFAULT;
+        const char *byte = (const char *)(uintptr_t)(address + index);
+        if (!host_range_mapped((uintptr_t)byte, 1)) return -HL_LINUX_EFAULT;
+        path[index] = *byte;
+        if (path[index] == 0) {
+            if (index == 0) return -HL_LINUX_ENOENT;
+            *path_size = index;
+            return 0;
+        }
+    }
+    return -HL_LINUX_ENAMETOOLONG;
+}
+
 static int bound_poll_references(uint64_t address, uint64_t count) {
     struct pollfd *fds;
     uint64_t index;
@@ -267,6 +284,51 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
+    case 56: {
+        const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
+                                   HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
+        size_t path_size;
+        char path[HL_LINUX_PATH_MAX + 1];
+        int shadow;
+        hl_linux_fd_reservation reservation;
+        hl_status status;
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        if ((a2 & ~(uint64_t)supported) != 0) {
+            result = -HL_LINUX_EINVAL;
+            break;
+        }
+        shadow = bound_shadow_reserve(0, (a2 & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+        if (shadow < 0) {
+            result = -(int64_t)errno;
+            break;
+        }
+        if (shadow >= guest_nofile_cur()) {
+            close(shadow);
+            result = -HL_LINUX_EMFILE;
+            break;
+        }
+        for (;;) {
+            status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
+            if (status != HL_STATUS_ALREADY_EXISTS) break;
+            close(shadow);
+            shadow = bound_shadow_reserve(shadow + 1, (a2 & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+            if (shadow < 0 || shadow >= guest_nofile_cur()) break;
+        }
+        if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
+            if (shadow >= 0) close(shadow);
+            result = -HL_LINUX_EMFILE;
+            break;
+        }
+        result = hl_linux_openat_reserved(g_linux_box, &reservation, (int32_t)source.fd, path, path_size, (uint32_t)a2,
+                                          (uint32_t)a3);
+        if (result < 0) {
+            (void)hl_linux_fd_cancel(g_linux_box, &reservation);
+            close(shadow);
+        }
+        break;
+    }
     case 57: /* close */
         result = hl_linux_close(g_linux_box, source.fd);
         (void)close((int)source.fd);
@@ -358,7 +420,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 46:           /* ftruncate */
     case 52:           /* fchmod */
     case 55:           /* fchown */
-    case 56:           /* openat directory */
     case 61:           /* getdents64 */
     case 65:           /* readv */
     case 66:           /* writev */

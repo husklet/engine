@@ -117,6 +117,11 @@ static hl_status hl_macos_status(int error) {
     case EPERM: return HL_STATUS_PERMISSION_DENIED;
     case EAGAIN: return HL_STATUS_WOULD_BLOCK;
     case EINTR: return HL_STATUS_INTERRUPTED;
+    case ENOTDIR: return HL_STATUS_NOT_DIRECTORY;
+    case EISDIR: return HL_STATUS_IS_DIRECTORY;
+    case ENAMETOOLONG: return HL_STATUS_NAME_TOO_LONG;
+    case ELOOP: return HL_STATUS_SYMLINK_LOOP;
+    case EROFS: return HL_STATUS_READ_ONLY;
     default: return HL_STATUS_PLATFORM_FAILURE;
     }
 }

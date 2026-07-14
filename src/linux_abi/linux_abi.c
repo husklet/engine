@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#define HL_LINUX_FD_RESERVED UINT32_MAX
+
 static void hl_linux_lock(hl_linux_abi *linux_abi) {
     while (atomic_flag_test_and_set_explicit(&linux_abi->table_lock, memory_order_acquire)) {}
 }
@@ -35,6 +37,11 @@ static int64_t hl_linux_error(hl_status status) {
     case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
     case HL_STATUS_PERMISSION_DENIED: return -HL_LINUX_EACCES;
     case HL_STATUS_BUSY: return -HL_LINUX_EBUSY;
+    case HL_STATUS_NOT_DIRECTORY: return -HL_LINUX_ENOTDIR;
+    case HL_STATUS_IS_DIRECTORY: return -HL_LINUX_EISDIR;
+    case HL_STATUS_NAME_TOO_LONG: return -HL_LINUX_ENAMETOOLONG;
+    case HL_STATUS_SYMLINK_LOOP: return -HL_LINUX_ELOOP;
+    case HL_STATUS_READ_ONLY: return -HL_LINUX_EROFS;
     case HL_STATUS_ALREADY_EXISTS: return -HL_LINUX_EEXIST;
     case HL_STATUS_RESOURCE_LIMIT: return -HL_LINUX_ENFILE;
     case HL_STATUS_INVALID_ARGUMENT:
@@ -94,7 +101,8 @@ static hl_status hl_linux_find_ofd(const hl_linux_abi *linux_abi, hl_linux_ofd *
 static hl_status hl_linux_fd_get_unlocked(const hl_linux_abi *linux_abi, hl_linux_fd fd,
                                           const hl_linux_fd_entry **fd_entry, const hl_linux_ofd_entry **ofd_entry) {
     hl_linux_ofd ofd;
-    if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0) return HL_STATUS_NOT_FOUND;
+    if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0 || linux_abi->fds[fd].ofd == HL_LINUX_FD_RESERVED)
+        return HL_STATUS_NOT_FOUND;
     ofd = linux_abi->fds[fd].ofd;
     if (ofd >= linux_abi->ofd_capacity || linux_abi->ofds[ofd].references == 0) return HL_STATUS_CORRUPT;
     if (fd_entry != NULL) *fd_entry = &linux_abi->fds[fd];
@@ -128,9 +136,16 @@ hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_services *hos
 }
 
 hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi) {
+    uint32_t fd;
     uint32_t ofd;
     if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION) return HL_STATUS_INVALID_ARGUMENT;
     hl_linux_lock(linux_abi);
+    for (fd = 0; fd < linux_abi->fd_capacity; ++fd) {
+        if (linux_abi->fds[fd].ofd == HL_LINUX_FD_RESERVED) {
+            hl_linux_unlock(linux_abi);
+            return HL_STATUS_BUSY;
+        }
+    }
     for (ofd = 1; ofd < linux_abi->ofd_capacity; ++ofd) {
         if (linux_abi->ofds[ofd].references != 0 || linux_abi->ofds[ofd].active_operations != 0 ||
             linux_abi->ofds[ofd].closing != 0) {
@@ -160,6 +175,12 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     plan->armed = 0;
     plan->host_completed = 0;
     hl_linux_lock(linux_abi);
+    for (index = 0; index < linux_abi->fd_capacity; ++index) {
+        if (linux_abi->fds[index].ofd == HL_LINUX_FD_RESERVED) {
+            hl_linux_unlock(linux_abi);
+            return HL_STATUS_BUSY;
+        }
+    }
     for (index = 1; index < linux_abi->ofd_capacity; ++index) {
         hl_linux_ofd_entry *entry = &linux_abi->ofds[index];
         if (entry->references == 0) continue;
@@ -379,6 +400,72 @@ hl_status hl_linux_fd_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_hos
 done:
     hl_linux_unlock(linux_abi);
     if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, mutex);
+    return status;
+}
+
+hl_status hl_linux_fd_reserve_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_fd_reservation *reservation) {
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || reservation == NULL ||
+        fd >= linux_abi->fd_capacity)
+        return HL_STATUS_INVALID_ARGUMENT;
+    hl_linux_lock(linux_abi);
+    if (linux_abi->fds[fd].ofd != 0) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_ALREADY_EXISTS;
+    }
+    linux_abi->fds[fd].generation++;
+    linux_abi->fds[fd].ofd = HL_LINUX_FD_RESERVED;
+    linux_abi->fds[fd].descriptor_flags = 0;
+    *reservation = (hl_linux_fd_reservation){fd, linux_abi->fds[fd].generation};
+    hl_linux_unlock(linux_abi);
+    return HL_STATUS_OK;
+}
+
+hl_status hl_linux_fd_cancel(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation) {
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || reservation == NULL ||
+        reservation->fd >= linux_abi->fd_capacity)
+        return HL_STATUS_INVALID_ARGUMENT;
+    hl_linux_lock(linux_abi);
+    if (linux_abi->fds[reservation->fd].ofd != HL_LINUX_FD_RESERVED ||
+        linux_abi->fds[reservation->fd].generation != reservation->generation) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_NOT_FOUND;
+    }
+    linux_abi->fds[reservation->fd].ofd = 0;
+    hl_linux_unlock(linux_abi);
+    return HL_STATUS_OK;
+}
+
+static hl_status hl_linux_fd_commit(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                    hl_host_handle host_handle, uint32_t status_flags, uint32_t descriptor_flags) {
+    const hl_host_sync_services *sync;
+    hl_host_result created;
+    hl_linux_ofd ofd;
+    hl_status status;
+    if (linux_abi == NULL || reservation == NULL || host_handle == HL_HOST_HANDLE_INVALID)
+        return HL_STATUS_INVALID_ARGUMENT;
+    sync = hl_linux_sync(linux_abi);
+    if (sync == NULL || sync->mutex_create == NULL || sync->mutex_close == NULL) return HL_STATUS_NOT_SUPPORTED;
+    created = sync->mutex_create(linux_abi->host->context);
+    if (created.status != HL_STATUS_OK || created.value == HL_HOST_HANDLE_INVALID)
+        return created.status == HL_STATUS_OK ? HL_STATUS_RESOURCE_LIMIT : (hl_status)created.status;
+    hl_linux_lock(linux_abi);
+    if (reservation->fd >= linux_abi->fd_capacity || linux_abi->fds[reservation->fd].ofd != HL_LINUX_FD_RESERVED ||
+        linux_abi->fds[reservation->fd].generation != reservation->generation) {
+        status = HL_STATUS_NOT_FOUND;
+        goto done;
+    }
+    status = hl_linux_find_ofd(linux_abi, &ofd);
+    if (status != HL_STATUS_OK) goto done;
+    linux_abi->ofds[ofd].host_handle = host_handle;
+    linux_abi->ofds[ofd].status_flags = status_flags;
+    linux_abi->ofds[ofd].io_mutex = created.value;
+    linux_abi->ofds[ofd].references = 1;
+    linux_abi->ofds[ofd].generation++;
+    linux_abi->fds[reservation->fd].ofd = ofd;
+    linux_abi->fds[reservation->fd].descriptor_flags = descriptor_flags;
+done:
+    hl_linux_unlock(linux_abi);
+    if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, created.value);
     return status;
 }
 
@@ -700,8 +787,9 @@ int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buff
     return result;
 }
 
-int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
-                        uint32_t flags, uint32_t mode) {
+static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                       int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
+                                       uint32_t mode) {
     const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
                                HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
     const hl_host_file_services *files;
@@ -752,13 +840,31 @@ int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const cha
     }
     if (opened.status != HL_STATUS_OK)
         return opened.status == HL_STATUS_NOT_FOUND ? -HL_LINUX_ENOENT : hl_linux_error((hl_status)opened.status);
-    status = hl_linux_fd_install(linux_abi, opened.value, flags & ~(uint32_t)HL_LINUX_O_CLOEXEC,
-                                 (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0, &installed);
+    if (reservation != NULL) {
+        status = hl_linux_fd_commit(linux_abi, reservation, opened.value, flags & ~(uint32_t)HL_LINUX_O_CLOEXEC,
+                                    (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+        installed = reservation->fd;
+    } else {
+        status = hl_linux_fd_install(linux_abi, opened.value, flags & ~(uint32_t)HL_LINUX_O_CLOEXEC,
+                                     (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0, &installed);
+    }
     if (status != HL_STATUS_OK) {
         if (files->close != NULL) (void)files->close(linux_abi->host->context, opened.value);
-        return hl_linux_error(status);
+        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : hl_linux_error(status);
     }
     return (int64_t)installed;
+}
+
+int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
+                        uint32_t flags, uint32_t mode) {
+    return hl_linux_openat_install(linux_abi, NULL, directory_fd, path, path_size, flags, mode);
+}
+
+int64_t hl_linux_openat_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                 int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
+                                 uint32_t mode) {
+    if (reservation == NULL) return -HL_LINUX_EINVAL;
+    return hl_linux_openat_install(linux_abi, reservation, directory_fd, path, path_size, flags, mode);
 }
 
 int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {

@@ -83,7 +83,7 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
             }
         }
         engine->box_fds = calloc(fd_capacity, sizeof(*engine->box_fds));
-        engine->box_ofds = calloc(config->fd_binding_count + 2u, sizeof(*engine->box_ofds));
+        engine->box_ofds = calloc(HL_LINUX_OFD_LIMIT, sizeof(*engine->box_ofds));
         if (engine->box_fds == NULL || engine->box_ofds == NULL) {
             status = HL_STATUS_OUT_OF_MEMORY;
             goto fail;
@@ -96,7 +96,7 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
         for (index = 0; index < config->fd_binding_count; ++index)
             candidate_handles[index] = HL_HOST_HANDLE_INVALID;
         status = hl_linux_abi_init(&engine->box, &engine->host, engine->box_fds, fd_capacity, engine->box_ofds,
-                                   config->fd_binding_count + 2u);
+                                   HL_LINUX_OFD_LIMIT);
         if (status != HL_STATUS_OK) goto fail;
         engine->box_initialized = 1;
         for (index = 0; index < config->fd_binding_count; ++index) {

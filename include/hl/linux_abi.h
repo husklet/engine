@@ -24,15 +24,23 @@ typedef enum hl_linux_errno {
     HL_LINUX_EAGAIN = 11,
     HL_LINUX_ENOMEM = 12,
     HL_LINUX_EACCES = 13,
+    HL_LINUX_EFAULT = 14,
     HL_LINUX_EBUSY = 16,
     HL_LINUX_EEXIST = 17,
+    HL_LINUX_ENOTDIR = 20,
+    HL_LINUX_EISDIR = 21,
     HL_LINUX_EINVAL = 22,
     HL_LINUX_ENFILE = 23,
     HL_LINUX_EMFILE = 24,
     HL_LINUX_ESPIPE = 29,
+    HL_LINUX_EROFS = 30,
+    HL_LINUX_ENAMETOOLONG = 36,
     HL_LINUX_ENOSYS = 38,
+    HL_LINUX_ELOOP = 40,
     HL_LINUX_EOVERFLOW = 75
 } hl_linux_errno;
+
+enum { HL_LINUX_PATH_MAX = 4096 };
 
 enum {
     HL_LINUX_O_ACCMODE = 00000003u,
@@ -97,6 +105,11 @@ typedef struct hl_linux_fd_entry {
     uint32_t descriptor_flags;
     uint32_t generation;
 } hl_linux_fd_entry;
+
+typedef struct hl_linux_fd_reservation {
+    hl_linux_fd fd;
+    uint32_t generation;
+} hl_linux_fd_reservation;
 
 /* Copyable descriptor metadata captured atomically under table ownership. */
 typedef struct hl_linux_fd_snapshot {
@@ -181,6 +194,8 @@ HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle hos
 /* Installs only at the requested vacant guest descriptor; never exposes or duplicates a native descriptor. */
 HL_API hl_status hl_linux_fd_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle host_handle,
                                         uint32_t status_flags, uint32_t descriptor_flags);
+HL_API hl_status hl_linux_fd_reserve_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_fd_reservation *reservation);
+HL_API hl_status hl_linux_fd_cancel(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation);
 HL_API hl_status hl_linux_fd_dup(hl_linux_abi *linux_abi, hl_linux_fd source, uint32_t descriptor_flags,
                                  hl_linux_fd *out_fd);
 HL_API hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle);
@@ -204,6 +219,10 @@ HL_API int64_t hl_linux_pwrite64(hl_linux_abi *linux_abi, hl_linux_fd fd, const 
 /* path is translated guest memory; mode is used only with O_CREAT. */
 HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
                                uint32_t flags, uint32_t mode);
+/* Opens through directory_fd and publishes only at the requested vacant descriptor. */
+HL_API int64_t hl_linux_openat_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                        int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
+                                        uint32_t mode);
 /* close() invalidates this descriptor even if the host reports a late close error. */
 HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
 /* dup and supported fcntl commands operate only on the guest fd/OFD tables. */
