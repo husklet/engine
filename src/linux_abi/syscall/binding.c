@@ -1834,6 +1834,49 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                      : 0;
         break;
     }
+    case 29: {
+        uint32_t request = (uint32_t)a1;
+        if (request == 0x5451u || request == 0x5450u) { /* FIOCLEX / FIONCLEX */
+            result = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFD,
+                                    request == 0x5451u ? HL_LINUX_FD_CLOEXEC : 0);
+        } else if (request == 0x5421u) { /* FIONBIO */
+            if (!host_range_mapped((uintptr_t)a2, sizeof(int))) {
+                result = -EFAULT;
+                break;
+            }
+            int64_t flags = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_GETFL, 0);
+            if (flags < 0) {
+                result = flags;
+                break;
+            }
+            if (*(const int *)(uintptr_t)a2)
+                flags |= HL_LINUX_O_NONBLOCK;
+            else
+                flags &= ~(int64_t)HL_LINUX_O_NONBLOCK;
+            result = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFL, (uint64_t)flags);
+        } else if (request == 0x541bu) { /* FIONREAD */
+            if (!host_range_mapped((uintptr_t)a2, sizeof(int))) {
+                result = -EFAULT;
+                break;
+            }
+            hl_host_file_metadata metadata;
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            int64_t offset = hl_linux_lseek(g_linux_box, source.fd, 0, SEEK_CUR);
+            if (status.status != HL_STATUS_OK)
+                result = bound_host_error(status.status);
+            else if (metadata.type != HL_HOST_FILE_TYPE_REGULAR || offset < 0)
+                result = metadata.type != HL_HOST_FILE_TYPE_REGULAR ? -ENOTTY : offset;
+            else {
+                uint64_t available = metadata.size > (uint64_t)offset ? metadata.size - (uint64_t)offset : 0;
+                *(int *)(uintptr_t)a2 = available > INT_MAX ? INT_MAX : (int)available;
+                result = 0;
+            }
+        } else {
+            result = -ENOTTY;
+        }
+        break;
+    }
     case 23: result = bound_dup_at_least(source.fd, 0, 0); break;
     case 24: {
         uint32_t flags = (uint32_t)a2;
@@ -1970,7 +2013,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 20: return 0; /* epoll_create1: a0 is flags, not an fd */
     case 21:           /* epoll_ctl */
     case 22:           /* epoll_pwait */
-    case 29:           /* ioctl */
     case 61:           /* getdents64 */
     case 71:           /* sendfile */
     case 75:           /* vmsplice */
