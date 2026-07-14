@@ -36,6 +36,7 @@
 #define HL_MACOS_TRANSFER_CAPACITY 64u
 #define HL_MACOS_DIRECTORY_CAPACITY 128u
 #define HL_MACOS_DIRECTORY_WATCH_CAPACITY 256u
+#define HL_MACOS_COUNTER_SUBSCRIPTIONS 128u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -98,6 +99,18 @@ typedef struct hl_macos_counter {
     uint32_t rights;
 } hl_macos_counter;
 
+typedef struct hl_macos_counter_subscription {
+    uint32_t generation;
+    uint32_t active;
+    hl_host_handle counter;
+    int descriptor;
+    int wake[2];
+    pthread_t thread;
+    void (*notify)(void *, uint64_t);
+    void *observer;
+    uint64_t token;
+} hl_macos_counter_subscription;
+
 typedef struct hl_macos_transfer {
     uint32_t generation;
     uint32_t active;
@@ -134,11 +147,14 @@ struct hl_host_macos {
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
     hl_macos_event events[HL_MACOS_EVENT_CAPACITY];
     hl_macos_counter counters[HL_MACOS_COUNTER_CAPACITY];
+    hl_macos_counter_subscription counter_subscriptions[HL_MACOS_COUNTER_SUBSCRIPTIONS];
     hl_macos_transfer transfers[HL_MACOS_TRANSFER_CAPACITY];
     hl_macos_directory directories[HL_MACOS_DIRECTORY_CAPACITY];
 };
 
 static hl_host_result hl_macos_fork_complete(void *context);
+static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle subscription);
+static void hl_macos_counter_unsubscribe_all(hl_host_macos *host, hl_host_handle counter);
 
 static uint64_t hl_macos_monotonic_value(void) {
     struct timespec now;
@@ -1562,11 +1578,139 @@ static hl_host_result hl_macos_counter_duplicate(void *context, hl_host_handle c
     }
 }
 
+static hl_host_result hl_macos_counter_readiness(void *context, hl_host_handle counter, uint32_t interests) {
+    hl_host_macos *host = context;
+    hl_macos_counter *entry;
+    struct pollfd descriptor;
+    int result;
+    if ((interests & ~(uint32_t)HL_HOST_READY_READ) != 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_macos_counter_lookup(host, counter);
+    if (entry != NULL && (entry->rights & HL_HOST_TRANSFER_WAIT) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = (struct pollfd){entry == NULL ? -1 : entry->object->readable, POLLIN, 0};
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor.fd < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = poll(&descriptor, 1, 0);
+    return result < 0 ? hl_macos_errno()
+                      : hl_macos_result(HL_STATUS_OK, result == 1 ? HL_HOST_READY_READ & interests : 0, 0);
+}
+
+static void *hl_macos_counter_subscription_main(void *opaque) {
+    hl_macos_counter_subscription *subscription = opaque;
+    int notified = 0;
+    for (;;) {
+        struct pollfd descriptors[2] = {{subscription->descriptor, POLLIN, 0}, {subscription->wake[0], POLLIN, 0}};
+        int result = poll(descriptors, 2, notified ? 1 : -1);
+        if (result < 0 && errno == EINTR) continue;
+        if (descriptors[1].revents != 0) break;
+        if (descriptors[0].revents & POLLIN) {
+            if (!notified) subscription->notify(subscription->observer, subscription->token);
+            notified = 1;
+        } else if (result == 0) {
+            struct pollfd probe = {subscription->descriptor, POLLIN, 0};
+            notified = poll(&probe, 1, 0) == 1;
+        }
+    }
+    return NULL;
+}
+
+static hl_host_result hl_macos_counter_subscribe(void *context, hl_host_handle counter,
+                                                 void (*notify)(void *, uint64_t), void *observer, uint64_t token) {
+    hl_host_macos *host = context;
+    hl_macos_counter *entry;
+    hl_macos_counter_subscription *subscription = NULL;
+    uint32_t index;
+    int descriptor;
+    if (notify == NULL || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_macos_counter_lookup(host, counter);
+    if (entry != NULL && (entry->rights & HL_HOST_TRANSFER_WAIT) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = entry == NULL ? -1 : dup(entry->object->readable);
+    for (index = 0; descriptor >= 0 && index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index)
+        if (!host->counter_subscriptions[index].active) {
+            subscription = &host->counter_subscriptions[index];
+            break;
+        }
+    if (subscription != NULL) {
+        subscription->generation++;
+        if (subscription->generation == 0) subscription->generation = 1;
+        subscription->active = 1;
+        subscription->counter = counter;
+        subscription->descriptor = descriptor;
+        subscription->notify = notify;
+        subscription->observer = observer;
+        subscription->token = token;
+        subscription->wake[0] = -1;
+        subscription->wake[1] = -1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (subscription == NULL) {
+        close(descriptor);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    if (pipe(subscription->wake) != 0 ||
+        pthread_create(&subscription->thread, NULL, hl_macos_counter_subscription_main, subscription) != 0) {
+        if (subscription->wake[0] >= 0) close(subscription->wake[0]);
+        if (subscription->wake[1] >= 0) close(subscription->wake[1]);
+        close(descriptor);
+        pthread_mutex_lock(&host->lock);
+        subscription->active = 0;
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
+    return hl_macos_result(HL_STATUS_OK, ((uint64_t)subscription->generation << 32) | (uint64_t)(index + 1u), 0);
+}
+
+static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    uint32_t low = (uint32_t)handle;
+    hl_macos_counter_subscription *subscription;
+    uint8_t byte = 1;
+    if (low == 0 || low > HL_MACOS_COUNTER_SUBSCRIPTIONS) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    subscription = &host->counter_subscriptions[low - 1u];
+    if (!subscription->active || subscription->generation != (uint32_t)(handle >> 32)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    subscription->active = 0;
+    pthread_mutex_unlock(&host->lock);
+    (void)write(subscription->wake[1], &byte, 1);
+    (void)pthread_join(subscription->thread, NULL);
+    close(subscription->wake[0]);
+    close(subscription->wake[1]);
+    close(subscription->descriptor);
+    subscription->counter = HL_HOST_HANDLE_INVALID;
+    subscription->notify = NULL;
+    subscription->observer = NULL;
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static void hl_macos_counter_unsubscribe_all(hl_host_macos *host, hl_host_handle counter) {
+    uint32_t index;
+    for (index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
+        hl_host_handle subscription = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->counter_subscriptions[index].active && host->counter_subscriptions[index].counter == counter)
+            subscription = ((uint64_t)host->counter_subscriptions[index].generation << 32) | (uint64_t)(index + 1u);
+        pthread_mutex_unlock(&host->lock);
+        if (subscription != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_unsubscribe(host, subscription);
+    }
+}
+
 static hl_host_result hl_macos_counter_close(void *context, hl_host_handle handle) {
     hl_host_macos *host = context;
     hl_macos_counter *counter;
     hl_macos_counter_object *object;
     int final;
+    hl_macos_counter_unsubscribe_all(host, handle);
     pthread_mutex_lock(&host->lock);
     counter = hl_macos_counter_lookup(host, handle);
     if (counter == NULL) {
@@ -2164,11 +2308,14 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
                                                hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
                                                hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_child};
-    static const hl_host_counter_services counter = {HL_HOST_COUNTER_ABI,        sizeof(counter),
-                                                     hl_macos_counter_create,    hl_macos_counter_read,
-                                                     hl_macos_counter_write,     hl_macos_counter_get_flags,
-                                                     hl_macos_counter_set_flags, hl_macos_counter_duplicate,
-                                                     hl_macos_counter_close};
+    static const hl_host_counter_services counter = {
+        HL_HOST_COUNTER_ABI,          sizeof(counter),
+        hl_macos_counter_create,      hl_macos_counter_read,
+        hl_macos_counter_write,       hl_macos_counter_get_flags,
+        hl_macos_counter_set_flags,   hl_macos_counter_duplicate,
+        hl_macos_counter_readiness,   hl_macos_counter_subscribe,
+        hl_macos_counter_unsubscribe, hl_macos_counter_close,
+    };
     static const hl_host_transfer_services transfer = {
         HL_HOST_TRANSFER_ABI,    sizeof(transfer),          hl_macos_transfer_channel_pair,
         hl_macos_transfer_send,  hl_macos_transfer_receive, hl_macos_transfer_duplicate,

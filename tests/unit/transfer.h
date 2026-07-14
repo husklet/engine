@@ -2,9 +2,16 @@
 #define HL_TEST_TRANSFER_H
 
 #include <string.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static void counter_notification(void *observer, uint64_t token) {
+    int descriptor = *(int *)observer;
+    ssize_t ignored = write(descriptor, &token, sizeof(token));
+    (void)ignored;
+}
 
 static int check_transfer_fork(const hl_host_services *services) {
     static const char payload[] = "fork-transfer";
@@ -50,6 +57,37 @@ static int check_transfer_fork(const hl_host_services *services) {
     HL_CHECK(services->counter->get_flags(services->context, attachment.object).status == HL_STATUS_PERMISSION_DENIED);
     HL_CHECK(services->counter->close(services->context, attachment.object).status == HL_STATUS_OK);
     HL_CHECK(services->transfer->close(services->context, channels.detail).status == HL_STATUS_OK);
+
+    /* A remote post-fork write must wake a subscription without consuming the counter. */
+    {
+        int notification[2];
+        uint64_t token = 0;
+        hl_host_result counter = services->counter->create(services->context, 0, HL_HOST_COUNTER_NONBLOCK);
+        hl_host_result subscription;
+        struct pollfd ready;
+        HL_CHECK(counter.status == HL_STATUS_OK && pipe(notification) == 0);
+        subscription =
+            services->counter->subscribe(services->context, counter.value, counter_notification, &notification[1], 93);
+        HL_CHECK(subscription.status == HL_STATUS_OK);
+        child = fork();
+        HL_CHECK(child >= 0);
+        if (child == 0) {
+            close(notification[0]);
+            close(notification[1]);
+            _exit(services->counter->write(services->context, counter.value, 5).status == HL_STATUS_OK ? 0 : 51);
+        }
+        ready = (struct pollfd){notification[0], POLLIN, 0};
+        HL_CHECK(poll(&ready, 1, 2000) == 1 && read(notification[0], &token, sizeof(token)) == sizeof(token) &&
+                 token == 93);
+        HL_CHECK(services->counter->readiness(services->context, counter.value, HL_HOST_READY_READ).value ==
+                 HL_HOST_READY_READ);
+        HL_CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        HL_CHECK(services->counter->unsubscribe(services->context, subscription.value).status == HL_STATUS_OK);
+        HL_CHECK(services->counter->read(services->context, counter.value).value == 5);
+        HL_CHECK(services->counter->close(services->context, counter.value).status == HL_STATUS_OK);
+        close(notification[0]);
+        close(notification[1]);
+    }
 
     /* Endpoint aliases share one queue and remain pollable after the original alias closes. */
     channels = services->transfer->channel_pair(services->context);

@@ -267,6 +267,11 @@ static hl_host_result hl_fake_counter_write(void *context, hl_host_handle handle
     result = hl_fake_result(fake, 0);
     if (result.status != HL_STATUS_OK) return result;
     fake->counter_values[object] += value;
+    for (uint32_t subscription = 0; subscription < 64; ++subscription)
+        if (fake->counter_subscription_handles[subscription] != 0 &&
+            fake->counter_subscription_counters[subscription] == handle)
+            fake->counter_subscription_notify[subscription](fake->counter_subscription_observers[subscription],
+                                                            fake->counter_subscription_tokens[subscription]);
     return result;
 }
 
@@ -322,6 +327,14 @@ static hl_host_result hl_fake_counter_close(void *context, hl_host_handle handle
     if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     result = hl_fake_result(fake, 0);
     if (result.status != HL_STATUS_OK) return result;
+    for (uint32_t subscription = 0; subscription < 64; ++subscription)
+        if (fake->counter_subscription_counters[subscription] == handle) {
+            fake->counter_subscription_handles[subscription] = 0;
+            fake->counter_subscription_counters[subscription] = 0;
+            fake->counter_subscription_notify[subscription] = NULL;
+            fake->counter_subscription_observers[subscription] = NULL;
+            fake->counter_subscription_tokens[subscription] = 0;
+        }
     object = fake->counter_objects[index];
     fake->counter_handles[index] = 0;
     fake->counter_objects[index] = 0;
@@ -332,6 +345,53 @@ static hl_host_result hl_fake_counter_close(void *context, hl_host_handle handle
         fake->live_counters--;
     }
     return result;
+}
+
+static hl_host_result hl_fake_counter_readiness(void *context, hl_host_handle handle, uint32_t interests) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t readiness = 0;
+    if (index < 0 || (interests & ~(uint32_t)HL_HOST_READY_READ) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_WAIT) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
+    if (fake->counter_values[fake->counter_objects[index]] != 0) readiness = HL_HOST_READY_READ;
+    return hl_fake_result(fake, readiness & interests);
+}
+
+static hl_host_result hl_fake_counter_subscribe(void *context, hl_host_handle handle, void (*notify)(void *, uint64_t),
+                                                void *observer, uint64_t token) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t slot;
+    hl_host_result result;
+    if (index < 0 || notify == NULL || token == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_WAIT) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
+    for (slot = 0; slot < 64 && fake->counter_subscription_handles[slot] != 0; ++slot) {}
+    if (slot == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status == HL_STATUS_OK) {
+        fake->counter_subscription_handles[slot] = result.value;
+        fake->counter_subscription_counters[slot] = handle;
+        fake->counter_subscription_notify[slot] = notify;
+        fake->counter_subscription_observers[slot] = observer;
+        fake->counter_subscription_tokens[slot] = token;
+    }
+    return result;
+}
+
+static hl_host_result hl_fake_counter_unsubscribe(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    uint32_t slot;
+    for (slot = 0; slot < 64 && fake->counter_subscription_handles[slot] != handle; ++slot) {}
+    if (slot == 64) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->counter_subscription_handles[slot] = 0;
+    fake->counter_subscription_counters[slot] = 0;
+    fake->counter_subscription_notify[slot] = NULL;
+    fake->counter_subscription_observers[slot] = NULL;
+    fake->counter_subscription_tokens[slot] = 0;
+    return hl_fake_result(fake, 0);
 }
 
 static int hl_fake_transfer_channel_index(const hl_fake_host *fake, hl_host_handle channel) {
@@ -734,9 +794,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
                                                hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle};
     static const hl_host_counter_services counter = {
-        HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,
-        hl_fake_counter_read,      hl_fake_counter_write,     hl_fake_counter_get_flags,
-        hl_fake_counter_set_flags, hl_fake_counter_duplicate, hl_fake_counter_close};
+        HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,      hl_fake_counter_read,
+        hl_fake_counter_write,     hl_fake_counter_get_flags, hl_fake_counter_set_flags,   hl_fake_counter_duplicate,
+        hl_fake_counter_readiness, hl_fake_counter_subscribe, hl_fake_counter_unsubscribe, hl_fake_counter_close,
+    };
     static const hl_host_transfer_services transfer = {
         HL_HOST_TRANSFER_ABI,     sizeof(transfer),           hl_fake_transfer_channel_pair, hl_fake_transfer_send,
         hl_fake_transfer_receive, hl_fake_transfer_duplicate, hl_fake_transfer_close,

@@ -25,6 +25,11 @@ static hl_host_result fake_repair_code(void *context, hl_host_code_mapping *mapp
     return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
 }
 
+static void fake_counter_notify(void *observer, uint64_t token) {
+    uint64_t *value = observer;
+    *value = token;
+}
+
 int main(void) {
     hl_fake_host fake;
     hl_host_services services;
@@ -188,6 +193,21 @@ int main(void) {
 
     counter = services.counter->create(services.context, 7, 0);
     HL_CHECK(counter.status == HL_STATUS_OK);
+    {
+        uint64_t notified = 0;
+        hl_host_result subscription =
+            services.counter->subscribe(services.context, counter.value, fake_counter_notify, &notified, 41);
+        HL_CHECK(subscription.status == HL_STATUS_OK);
+        HL_CHECK(services.counter->readiness(services.context, counter.value, HL_HOST_READY_READ).value ==
+                 HL_HOST_READY_READ);
+        HL_CHECK(services.counter->write(services.context, counter.value, 1).status == HL_STATUS_OK && notified == 41);
+        HL_CHECK(services.counter->unsubscribe(services.context, subscription.value).status == HL_STATUS_OK);
+        notified = 0;
+        HL_CHECK(services.counter->write(services.context, counter.value, 1).status == HL_STATUS_OK && notified == 0);
+        HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK);
+        counter = services.counter->create(services.context, 7, 0);
+        HL_CHECK(counter.status == HL_STATUS_OK);
+    }
     channels = services.transfer->channel_pair(services.context);
     HL_CHECK(channels.status == HL_STATUS_OK && channels.value != 0 && channels.detail != 0 &&
              fake.live_transfer_channels == 2);

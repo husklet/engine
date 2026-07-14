@@ -14,9 +14,9 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
-#define HL_HOST_COUNTER_ABI 1u
+#define HL_HOST_COUNTER_ABI 2u
 #define HL_HOST_SYNC_ABI 2u
-#define HL_HOST_TRANSFER_ABI 1u
+#define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u
 
 typedef uint64_t hl_host_handle;
@@ -295,6 +295,13 @@ typedef struct hl_host_counter_services {
     hl_host_result (*get_flags)(void *context, hl_host_handle counter);
     hl_host_result (*set_flags)(void *context, hl_host_handle counter, uint32_t flags);
     hl_host_result (*duplicate)(void *context, hl_host_handle counter);
+    /* Non-consuming readiness; value is a HL_HOST_READY_* mask. */
+    hl_host_result (*readiness)(void *context, hl_host_handle counter, uint32_t interests);
+    /* subscribe returns an independently closeable subscription handle. */
+    hl_host_result (*subscribe)(void *context, hl_host_handle counter, void (*notify)(void *, uint64_t), void *observer,
+                                uint64_t token);
+    /* Synchronously quiesces the callback before returning. */
+    hl_host_result (*unsubscribe)(void *context, hl_host_handle subscription);
     hl_host_result (*close)(void *context, hl_host_handle counter);
 } hl_host_counter_services;
 

@@ -88,13 +88,16 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          !hl_valid_group(services->counter, HL_HOST_COUNTER_ABI, sizeof(*services->counter)) ||
          services->counter->create == NULL || services->counter->read == NULL || services->counter->write == NULL ||
          services->counter->get_flags == NULL || services->counter->set_flags == NULL ||
-         services->counter->duplicate == NULL || services->counter->close == NULL))
+         services->counter->duplicate == NULL || services->counter->readiness == NULL ||
+         services->counter->subscribe == NULL || services->counter->unsubscribe == NULL ||
+         services->counter->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_TRANSFER) != 0 &&
         (!hl_has_field(services->size, offsetof(hl_host_services, transfer), sizeof(services->transfer)) ||
          !hl_valid_group(services->transfer, HL_HOST_TRANSFER_ABI, sizeof(*services->transfer)) ||
          services->transfer->channel_pair == NULL || services->transfer->send == NULL ||
-         services->transfer->receive == NULL || services->transfer->close == NULL))
+         services->transfer->receive == NULL || services->transfer->duplicate == NULL ||
+         services->transfer->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_DIRECTORY) != 0 &&
         (!hl_has_field(services->size, offsetof(hl_host_services, directory), sizeof(services->directory)) ||

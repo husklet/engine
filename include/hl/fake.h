@@ -29,6 +29,11 @@ typedef struct hl_fake_host {
     uint32_t counter_references[64];
     uint32_t counter_rights[64];
     uint32_t live_counters;
+    uint64_t counter_subscription_handles[64];
+    uint64_t counter_subscription_counters[64];
+    void (*counter_subscription_notify[64])(void *, uint64_t);
+    void *counter_subscription_observers[64];
+    uint64_t counter_subscription_tokens[64];
     uint64_t transfer_channels[64];
     uint8_t transfer_endpoints[64];
     uint8_t transfer_peers[64];

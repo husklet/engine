@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -29,6 +30,7 @@
 
 #define HL_LINUX_HANDLE_CAPACITY 4096u
 #define HL_LINUX_TIMER_CAPACITY 256u
+#define HL_LINUX_COUNTER_SUBSCRIPTIONS 128u
 
 typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_NONE = 0,
@@ -65,6 +67,19 @@ typedef struct hl_linux_timer_entry {
     int descriptor;
 } hl_linux_timer_entry;
 
+typedef struct hl_linux_counter_subscription {
+    struct hl_host_linux *host;
+    uint32_t generation;
+    uint32_t active;
+    hl_host_handle counter;
+    int descriptor;
+    int wake[2];
+    pthread_t thread;
+    void (*notify)(void *, uint64_t);
+    void *observer;
+    uint64_t token;
+} hl_linux_counter_subscription;
+
 #define HL_LINUX_DIRECTORY_WATCHES 256u
 
 typedef struct hl_linux_directory_watch {
@@ -91,9 +106,12 @@ struct hl_host_linux {
     hl_host_sync_registry *sync;
     hl_linux_handle_entry handles[HL_LINUX_HANDLE_CAPACITY];
     hl_linux_timer_entry timers[HL_LINUX_TIMER_CAPACITY];
+    hl_linux_counter_subscription counter_subscriptions[HL_LINUX_COUNTER_SUBSCRIPTIONS];
 };
 
 static hl_host_result hl_linux_fork_complete(void *context);
+static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle subscription);
+static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter);
 
 static uint64_t hl_linux_monotonic_value(void) {
     struct timespec now;
@@ -832,6 +850,7 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     int wake_descriptor;
     int result;
     if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    hl_linux_counter_unsubscribe_all(host, handle);
     pthread_mutex_lock(&host->lock);
     entry = &host->handles[low - 1u];
     if (entry->generation != (uint32_t)(handle >> 32) || entry->kind == HL_LINUX_HANDLE_NONE ||
@@ -1489,6 +1508,136 @@ static hl_host_result hl_linux_counter_duplicate(void *context, hl_host_handle c
     }
 }
 
+static hl_host_result hl_linux_counter_readiness(void *context, hl_host_handle counter, uint32_t interests) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    struct pollfd descriptor;
+    int result;
+    if ((interests & ~(uint32_t)HL_HOST_READY_READ) != 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_WAIT) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = (struct pollfd){entry == NULL ? -1 : entry->descriptor, POLLIN, 0};
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor.fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = poll(&descriptor, 1, 0);
+    return result < 0 ? hl_linux_errno_result()
+                      : hl_linux_result(HL_STATUS_OK, result == 1 ? HL_HOST_READY_READ & interests : 0, 0);
+}
+
+static void *hl_linux_counter_subscription_main(void *opaque) {
+    hl_linux_counter_subscription *subscription = opaque;
+    int notified = 0;
+    for (;;) {
+        struct pollfd descriptors[2] = {{subscription->descriptor, POLLIN, 0}, {subscription->wake[0], POLLIN, 0}};
+        int result = poll(descriptors, 2, notified ? 1 : -1);
+        if (result < 0 && errno == EINTR) continue;
+        if (descriptors[1].revents != 0) break;
+        if (descriptors[0].revents & POLLIN) {
+            if (!notified) subscription->notify(subscription->observer, subscription->token);
+            notified = 1;
+        } else if (result == 0) {
+            struct pollfd probe = {subscription->descriptor, POLLIN, 0};
+            notified = poll(&probe, 1, 0) == 1;
+        }
+    }
+    return NULL;
+}
+
+static hl_host_result hl_linux_counter_subscribe(void *context, hl_host_handle counter,
+                                                 void (*notify)(void *, uint64_t), void *observer, uint64_t token) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_counter_subscription *subscription = NULL;
+    uint32_t index;
+    int descriptor;
+    if (notify == NULL || token == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_WAIT) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = entry == NULL ? -1 : dup(entry->descriptor);
+    for (index = 0; descriptor >= 0 && index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index)
+        if (!host->counter_subscriptions[index].active) {
+            subscription = &host->counter_subscriptions[index];
+            break;
+        }
+    if (subscription != NULL) {
+        subscription->generation++;
+        if (subscription->generation == 0) subscription->generation = 1;
+        subscription->active = 1;
+        subscription->host = host;
+        subscription->counter = counter;
+        subscription->descriptor = descriptor;
+        subscription->notify = notify;
+        subscription->observer = observer;
+        subscription->token = token;
+        subscription->wake[0] = -1;
+        subscription->wake[1] = -1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (subscription == NULL) {
+        close(descriptor);
+        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    if (pipe2(subscription->wake, O_CLOEXEC | O_NONBLOCK) != 0 ||
+        pthread_create(&subscription->thread, NULL, hl_linux_counter_subscription_main, subscription) != 0) {
+        if (subscription->wake[0] >= 0) close(subscription->wake[0]);
+        if (subscription->wake[1] >= 0) close(subscription->wake[1]);
+        close(descriptor);
+        pthread_mutex_lock(&host->lock);
+        subscription->active = 0;
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
+    return hl_linux_result(HL_STATUS_OK, ((uint64_t)subscription->generation << 32) | (uint64_t)(index + 1u), 0);
+}
+
+static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    uint32_t low = (uint32_t)handle;
+    hl_linux_counter_subscription *subscription;
+    uint8_t byte = 1;
+    ssize_t ignored;
+    if (low == 0 || low > HL_LINUX_COUNTER_SUBSCRIPTIONS) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    subscription = &host->counter_subscriptions[low - 1u];
+    if (!subscription->active || subscription->generation != (uint32_t)(handle >> 32)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    subscription->active = 0;
+    pthread_mutex_unlock(&host->lock);
+    ignored = write(subscription->wake[1], &byte, 1);
+    (void)ignored;
+    (void)pthread_join(subscription->thread, NULL);
+    close(subscription->wake[0]);
+    close(subscription->wake[1]);
+    close(subscription->descriptor);
+    subscription->counter = HL_HOST_HANDLE_INVALID;
+    subscription->notify = NULL;
+    subscription->observer = NULL;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter) {
+    uint32_t index;
+    for (index = 0; index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index) {
+        hl_host_handle subscription = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->counter_subscriptions[index].active && host->counter_subscriptions[index].counter == counter)
+            subscription = ((uint64_t)host->counter_subscriptions[index].generation << 32) | (uint64_t)(index + 1u);
+        pthread_mutex_unlock(&host->lock);
+        if (subscription != HL_HOST_HANDLE_INVALID) (void)hl_linux_counter_unsubscribe(host, subscription);
+    }
+}
+
 typedef struct hl_linux_transfer_wire {
     uint32_t data_size;
     uint32_t attachment_count;
@@ -2049,11 +2198,14 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_linux_shared_create,    hl_linux_shared_open,
                                                                  hl_linux_shared_resize,    hl_linux_close_descriptor};
-    static const hl_host_counter_services counter = {HL_HOST_COUNTER_ABI,        sizeof(counter),
-                                                     hl_linux_counter_create,    hl_linux_counter_read,
-                                                     hl_linux_counter_write,     hl_linux_counter_get_flags,
-                                                     hl_linux_counter_set_flags, hl_linux_counter_duplicate,
-                                                     hl_linux_close_descriptor};
+    static const hl_host_counter_services counter = {
+        HL_HOST_COUNTER_ABI,          sizeof(counter),
+        hl_linux_counter_create,      hl_linux_counter_read,
+        hl_linux_counter_write,       hl_linux_counter_get_flags,
+        hl_linux_counter_set_flags,   hl_linux_counter_duplicate,
+        hl_linux_counter_readiness,   hl_linux_counter_subscribe,
+        hl_linux_counter_unsubscribe, hl_linux_close_descriptor,
+    };
     static const hl_host_transfer_services transfer = {
         HL_HOST_TRANSFER_ABI,      sizeof(transfer),          hl_linux_transfer_channel_pair,
         hl_linux_transfer_send,    hl_linux_transfer_receive, hl_linux_transfer_duplicate,
