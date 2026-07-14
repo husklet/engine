@@ -44,17 +44,19 @@ typedef struct hl_engine_fd_binding {
 typedef struct hl_engine_config {
     HL_ABI_HEADER;
     uint32_t guest_isa;
+    /* Must be zero. No public engine flags are currently defined. */
     uint32_t flags;
     uint64_t memory_limit;
     uint32_t pid_limit;
     uint32_t cpu_limit;
-    /* Optional opaque program image/state owned by the caller for the engine lifetime. */
+    /* Reserved for a future executable-image API. Nonempty payloads are not currently supported. */
     const void *payload;
     size_t payload_size;
     /* Optional Linux root filesystem path owned by the caller for the engine lifetime. */
     const char *rootfs;
     const hl_engine_fd_binding *fd_bindings;
     uint32_t fd_binding_count;
+    /* Must be zero. */
     uint32_t reserved;
 } hl_engine_config;
 

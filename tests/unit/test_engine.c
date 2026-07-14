@@ -14,15 +14,16 @@ static int32_t fake_entry(void *context) {
 }
 
 static uint32_t fake_box_seen;
+static hl_engine_config fake_config_seen;
 
-static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
-                            const char *const argv[], hl_host_handle *process) {
+static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, const hl_engine_config *config,
+                            uint32_t argc, const char *const argv[], hl_host_handle *process) {
     hl_host_result spawned;
-    (void)rootfs;
     (void)argc;
     (void)argv;
     if (box == NULL || hl_linux_abi_validate_fds(box) != HL_STATUS_OK) return HL_STATUS_CORRUPT;
     fake_box_seen++;
+    fake_config_seen = *config;
     spawned = host->process->spawn_cloned(host->context, fake_entry, NULL);
     if (spawned.status != HL_STATUS_OK) return (hl_status)spawned.status;
     *process = spawned.value;
@@ -79,6 +80,17 @@ int main(void) {
     config.abi = HL_ENGINE_ABI;
     config.size = sizeof(config);
     config.guest_isa = HL_GUEST_ISA_AARCH64;
+    config.flags = 1;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    config.flags = 0;
+    config.reserved = 1;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    config.reserved = 0;
+    config.payload = "program";
+    config.payload_size = 7;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_NOT_SUPPORTED && engine == NULL);
+    config.payload = NULL;
+    config.payload_size = 0;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
     HL_CHECK(hl_engine_request(engine, UINT32_MAX, NULL, 0) == HL_STATUS_NOT_SUPPORTED);
     HL_CHECK(hl_engine_request(engine, HL_ENGINE_REQUEST_FORCE_STOP, "x", 1) == HL_STATUS_INVALID_ARGUMENT);
@@ -89,9 +101,25 @@ int main(void) {
     HL_CHECK(engine_exit.kind == HL_ENGINE_EXIT_ENGINE_ERROR);
     hl_engine_destroy(engine);
 
+    config.memory_limit = UINT64_C(536870912);
+    config.pid_limit = 37;
+    config.cpu_limit = 3;
+    hl_engine_backend_register(&fake_backend);
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
+    memset(&engine_exit, 0, sizeof(engine_exit));
+    engine_exit.abi = HL_ENGINE_ABI;
+    engine_exit.size = sizeof(engine_exit);
+    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    HL_CHECK(fake_config_seen.memory_limit == config.memory_limit && fake_config_seen.pid_limit == config.pid_limit &&
+             fake_config_seen.cpu_limit == config.cpu_limit);
+    hl_engine_destroy(engine);
+    config.memory_limit = 0;
+    config.pid_limit = 0;
+    config.cpu_limit = 0;
+
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 2);
+    HL_CHECK(fake_box_seen == 3);
 
     config.abi++;
     engine = (hl_engine *)(uintptr_t)1;

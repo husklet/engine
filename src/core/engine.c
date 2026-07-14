@@ -53,7 +53,9 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     if (config->abi != HL_ENGINE_ABI || config->size < sizeof(*config)) return HL_STATUS_ABI_MISMATCH;
     if (config->guest_isa != HL_GUEST_ISA_AARCH64 && config->guest_isa != HL_GUEST_ISA_X86_64)
         return HL_STATUS_INVALID_ARGUMENT;
+    if (config->flags != 0 || config->reserved != 0) return HL_STATUS_INVALID_ARGUMENT;
     if (config->payload_size != 0 && config->payload == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    if (config->payload_size != 0) return HL_STATUS_NOT_SUPPORTED;
     if (config->fd_binding_count != 0 && config->fd_bindings == NULL) return HL_STATUS_INVALID_ARGUMENT;
     status = hl_host_services_validate(host, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_SYNC);
     if (status != HL_STATUS_OK) return status;
@@ -177,7 +179,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         return HL_STATUS_NOT_SUPPORTED;
     }
     status = engine->backend->start_process(&engine->host, engine->box_initialized ? &engine->box : NULL,
-                                            engine->config.rootfs, (uint32_t)argc, argv, &process);
+                                            &engine->config, (uint32_t)argc, argv, &process);
     if (status != HL_STATUS_OK) {
         hl_engine_lock(engine);
         engine->state = HL_ENGINE_FINISHED;

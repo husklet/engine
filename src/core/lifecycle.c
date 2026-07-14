@@ -1,4 +1,7 @@
 #include "engine_backend.h"
+#include "options.h"
+
+#include <stdio.h>
 
 #ifndef HL_PRODUCTION_GUEST_ISA
 #error HL_PRODUCTION_GUEST_ISA is required
@@ -8,7 +11,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
                        char *const argv[]);
 
 typedef struct hl_production_entry_context {
-    const char *rootfs;
+    const hl_engine_config *config;
     uint32_t argc;
     const char *const *argv;
     const hl_host_services *host;
@@ -17,16 +20,30 @@ typedef struct hl_production_entry_context {
 
 static int32_t hl_production_entry(void *opaque) {
     hl_production_entry_context *context = opaque;
-    return hl_run_linux_guest(context->host, context->box, context->rootfs, context->argc,
+    char value[32];
+    if (context->config->memory_limit != 0) {
+        snprintf(value, sizeof(value), "%llu", (unsigned long long)context->config->memory_limit);
+        if (hl_option_set("HL_MEM_MAX", value, 1) != 0) return 78;
+    }
+    if (context->config->pid_limit != 0) {
+        snprintf(value, sizeof(value), "%u", context->config->pid_limit);
+        if (hl_option_set("HL_PIDS_MAX", value, 1) != 0) return 78;
+    }
+    if (context->config->cpu_limit != 0) {
+        snprintf(value, sizeof(value), "%u", context->config->cpu_limit);
+        if (hl_option_set("HL_CPUS", value, 1) != 0) return 78;
+    }
+    return hl_run_linux_guest(context->host, context->box, context->config->rootfs, context->argc,
                               (char *const *)(uintptr_t)context->argv);
 }
 
-static hl_status hl_production_start_process(const hl_host_services *host, hl_linux_abi *box, const char *rootfs,
-                                             uint32_t argc, const char *const argv[], hl_host_handle *process) {
+static hl_status hl_production_start_process(const hl_host_services *host, hl_linux_abi *box,
+                                             const hl_engine_config *config, uint32_t argc,
+                                             const char *const argv[], hl_host_handle *process) {
     hl_production_entry_context entry = {0};
     hl_host_result spawned;
     if (hl_host_services_validate(host, HL_HOST_CAP_PROCESS) != HL_STATUS_OK) return HL_STATUS_NOT_SUPPORTED;
-    entry.rootfs = rootfs;
+    entry.config = config;
     entry.argc = argc;
     entry.argv = argv;
     entry.host = host;
