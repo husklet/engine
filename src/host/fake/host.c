@@ -103,6 +103,69 @@ static hl_host_result hl_fake_process_close(void *context, hl_host_handle proces
     return result;
 }
 
+static hl_host_result hl_fake_mutex_create(void *context) {
+    hl_fake_host *fake = context;
+    uint32_t index;
+    for (index = 0; index < 64 && fake->mutex_handles[index] != 0; ++index) {}
+    if (index == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    hl_host_result result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status == HL_STATUS_OK) {
+        fake->mutex_handles[index] = result.value;
+        fake->live_mutexes++;
+    }
+    return result;
+}
+
+static int hl_fake_mutex_index(const hl_fake_host *fake, hl_host_handle mutex) {
+    uint32_t index;
+    if (mutex == HL_HOST_HANDLE_INVALID) return -1;
+    for (index = 0; index < 64; ++index)
+        if (fake->mutex_handles[index] == mutex) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_mutex_lock(void *context, hl_host_handle mutex) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_mutex_index(fake, mutex);
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK) {
+        uint8_t expected;
+        do {
+            expected = 0;
+            if (__atomic_compare_exchange_n(&fake->mutex_locked[index], &expected, 1, 0, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED))
+                break;
+            sched_yield();
+        } while (1);
+    }
+    return result;
+}
+
+static hl_host_result hl_fake_mutex_unlock(void *context, hl_host_handle mutex) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_mutex_index(fake, mutex);
+    if (index < 0 || __atomic_load_n(&fake->mutex_locked[index], __ATOMIC_ACQUIRE) == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK) __atomic_store_n(&fake->mutex_locked[index], 0, __ATOMIC_RELEASE);
+    return result;
+}
+
+static hl_host_result hl_fake_mutex_close(void *context, hl_host_handle mutex) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_mutex_index(fake, mutex);
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (__atomic_load_n(&fake->mutex_locked[index], __ATOMIC_ACQUIRE) != 0)
+        return (hl_host_result){HL_STATUS_BUSY, 0, 0, 0};
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK) {
+        fake->mutex_handles[index] = 0;
+        fake->live_mutexes--;
+    }
+    return result;
+}
+
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
                                                    sizeof(memory),
@@ -116,6 +179,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,       sizeof(process),
                                                      hl_fake_spawn_cloned,      hl_fake_process_wait,
                                                      hl_fake_process_terminate, hl_fake_process_close};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,   sizeof(sync),         hl_fake_mutex_create,
+                                               hl_fake_mutex_lock, hl_fake_mutex_unlock, hl_fake_mutex_close};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -123,11 +188,12 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_CODE;
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);
-    services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS;
+    services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
     services->process = &process;
+    services->sync = &sync;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

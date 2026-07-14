@@ -31,7 +31,8 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_SOCKET = 3,
     HL_LINUX_HANDLE_POLLSET = 4,
     HL_LINUX_HANDLE_SHARED_MEMORY = 5,
-    HL_LINUX_HANDLE_PROCESS = 6
+    HL_LINUX_HANDLE_PROCESS = 6,
+    HL_LINUX_HANDLE_MUTEX = 7
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -48,6 +49,7 @@ typedef struct hl_linux_handle_entry {
     uint32_t process_waiters;
     uint32_t process_exit_kind;
     uint32_t process_exit_value;
+    uint32_t sync_users;
 } hl_linux_handle_entry;
 
 struct hl_host_linux {
@@ -918,6 +920,89 @@ static hl_host_result hl_linux_process_close(void *context, hl_host_handle handl
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static pthread_mutex_t *hl_linux_mutex_ref(hl_host_linux *host, hl_host_handle handle) {
+    pthread_mutex_t *mutex = NULL;
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
+    if (entry != NULL && !host->destroying) {
+        entry->sync_users++;
+        mutex = entry->address;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return mutex;
+}
+
+static void hl_linux_mutex_unref(hl_host_linux *host, hl_host_handle handle) {
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
+    if (entry != NULL && entry->sync_users != 0) entry->sync_users--;
+    pthread_mutex_unlock(&host->lock);
+}
+
+static hl_host_result hl_linux_mutex_create(void *context) {
+    hl_host_linux *host = context;
+    pthread_mutex_t *mutex = malloc(sizeof(*mutex));
+    pthread_mutexattr_t attributes;
+    int error;
+    if (mutex == NULL) return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    error = pthread_mutexattr_init(&attributes);
+    if (error == 0) {
+        error = pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_ERRORCHECK);
+        if (error == 0) error = pthread_mutex_init(mutex, &attributes);
+        pthread_mutexattr_destroy(&attributes);
+    }
+    if (error != 0) {
+        free(mutex);
+        return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
+    }
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MUTEX, -1, mutex, NULL, sizeof(*mutex), -1);
+    if (result.status != HL_STATUS_OK) {
+        pthread_mutex_destroy(mutex);
+        free(mutex);
+    }
+    return result;
+}
+
+static hl_host_result hl_linux_mutex_lock(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    pthread_mutex_t *mutex = hl_linux_mutex_ref(host, handle);
+    if (mutex == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int error = pthread_mutex_lock(mutex);
+    hl_linux_mutex_unref(host, handle);
+    return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
+}
+
+static hl_host_result hl_linux_mutex_unlock(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    pthread_mutex_t *mutex = hl_linux_mutex_ref(host, handle);
+    if (mutex == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int error = pthread_mutex_unlock(mutex);
+    hl_linux_mutex_unref(host, handle);
+    return hl_linux_result(hl_linux_status_from_errno(error), 0, (uint64_t)(unsigned int)error);
+}
+
+static hl_host_result hl_linux_mutex_close(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_MUTEX);
+    if (entry == NULL || host->destroying) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if (entry->sync_users != 0 || pthread_mutex_trylock(entry->address) != 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_BUSY, 0, 0);
+    }
+    pthread_mutex_t *mutex = entry->address;
+    pthread_mutex_unlock(mutex);
+    pthread_mutex_destroy(mutex);
+    free(mutex);
+    entry->address = NULL;
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    pthread_mutex_unlock(&host->lock);
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
@@ -940,6 +1025,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
                                                      hl_linux_process_spawn,     hl_linux_process_wait,
                                                      hl_linux_process_terminate, hl_linux_process_close};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,    sizeof(sync),          hl_linux_mutex_create,
+                                               hl_linux_mutex_lock, hl_linux_mutex_unlock, hl_linux_mutex_close};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
@@ -964,7 +1051,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY |
-                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING;
+                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -974,6 +1061,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->network = &network;
     out_services->shared_memory = &shared_memory;
     out_services->process = &process;
+    out_services->sync = &sync;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -1007,6 +1095,9 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             if (entry->process_reaped) continue;
             kill(entry->descriptor, SIGKILL);
             while (waitpid(entry->descriptor, &status, 0) < 0 && errno == EINTR) {}
+        } else if (entry->kind == HL_LINUX_HANDLE_MUTEX) {
+            pthread_mutex_destroy(entry->address);
+            free(entry->address);
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);

@@ -14,6 +14,9 @@ typedef struct hl_fake_host {
     uint32_t process_waited;
     uint32_t process_block_wait;
     uint32_t process_exit_kind;
+    uint32_t live_mutexes;
+    uint64_t mutex_handles[64];
+    uint8_t mutex_locked[64];
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;

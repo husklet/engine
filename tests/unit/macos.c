@@ -57,7 +57,20 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
-                                                      HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
+                                                      HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+    {
+        hl_host_result first = services.sync->mutex_create(services.context);
+        hl_host_result second = services.sync->mutex_create(services.context);
+        HL_CHECK(first.status == HL_STATUS_OK && second.status == HL_STATUS_OK && first.value != second.value);
+        HL_CHECK(services.sync->mutex_lock(services.context, first.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_lock(services.context, second.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_close(services.context, first.value).status == HL_STATUS_BUSY);
+        HL_CHECK(services.sync->mutex_unlock(services.context, first.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_unlock(services.context, second.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_close(services.context, first.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_close(services.context, second.value).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->mutex_lock(services.context, first.value).status == HL_STATUS_INVALID_ARGUMENT);
+    }
     {
         struct timespec realtime;
         struct timespec monotonic;

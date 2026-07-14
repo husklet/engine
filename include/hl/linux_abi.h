@@ -5,7 +5,6 @@
 #include "hl/host_services.h"
 
 #include <stdatomic.h>
-#include <threads.h>
 
 HL_EXTERN_C_BEGIN
 
@@ -87,7 +86,7 @@ typedef struct hl_linux_ofd_entry {
     uint32_t generation;
     uint32_t kind;
     /* Serializes the shared offset and final close for this OFD only. */
-    mtx_t io_lock;
+    hl_host_handle io_mutex;
 } hl_linux_ofd_entry;
 
 typedef struct hl_linux_fd_entry {
@@ -141,14 +140,14 @@ typedef struct hl_linux_abi {
 /*
  * An initialized hl_linux_abi owns its synchronization state and must not be
  * copied. Host service callbacks invoked by it must not re-enter the same
- * hl_linux_abi instance. Contending operations use C11 synchronization only;
+ * hl_linux_abi instance. Contending operations use host synchronization;
  * unrelated OFDs never wait for one another's host I/O.
  */
 
 HL_API hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_services *host, hl_linux_fd_entry *fd_storage,
                                    uint32_t fd_capacity, hl_linux_ofd_entry *ofd_storage, uint32_t ofd_capacity);
 /*
- * Requires every descriptor to be closed and releases the per-OFD C11 mutexes.
+ * Requires every descriptor to be closed and releases the per-OFD host mutexes.
  * The owner must externally exclude every concurrent call on this instance from
  * destroy's entry onward; after success the instance may only be initialized.
  */

@@ -34,6 +34,16 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 LINUX_ABI_SOURCES := src/linux_abi/encode.c src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
+MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES) src/linux_abi/affinity.c src/linux_abi/device.c src/linux_abi/errno.c \
+	src/linux_abi/limits.c src/linux_abi/number.c src/linux_abi/readonly.c \
+	src/linux_abi/xattr.c
+MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) src/host/clock.c src/host/file.c
+MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
+MAC_TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/mac/%.o)
+MAC_LINUX_ABI_OBJECTS := $(MAC_LINUX_ABI_SOURCES:%.c=$(BUILD)/mac/%.o)
+MAC_HOST_OBJECTS := $(MAC_HOST_SOURCES:%.c=$(BUILD)/mac/%.o)
+MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
+	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/%.o)
 TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
@@ -69,6 +79,26 @@ $(BUILD)/src/%.o: src/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) -c $< -o $@
 
+$(BUILD)/mac/%.o: %.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) -c $< -o $@
+
+$(BUILD)/mac/lib/libhl-engine.a: $(MAC_CORE_OBJECTS)
+	@mkdir -p $(@D)
+	$(MAC) ar rcs $@ $^
+
+$(BUILD)/mac/lib/libhl-translator.a: $(MAC_TRANSLATOR_OBJECTS)
+	@mkdir -p $(@D)
+	$(MAC) ar rcs $@ $^
+
+$(BUILD)/mac/lib/libhl-linux-abi.a: $(MAC_LINUX_ABI_OBJECTS)
+	@mkdir -p $(@D)
+	$(MAC) ar rcs $@ $^
+
+$(BUILD)/mac/lib/libhl-host-macos.a: $(MAC_HOST_OBJECTS)
+	@mkdir -p $(@D)
+	$(MAC) ar rcs $@ $^
+
 $(BUILD)/lib/libhl-engine.a: $(CORE_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
@@ -99,6 +129,12 @@ $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
+
+$(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
 
 $(BUILD)/tests/test_xattr_cache: tests/unit/test_xattr_cache.c src/linux_abi/xattr.c
@@ -185,108 +221,64 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
-$(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/launch.c src/core/log.c src/core/options.c src/host/macos/host.c \
+$(BUILD)/mac/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -O2 -c $< -o $@
+
+$(BUILD)/mac/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -O2 -c $< -o $@
+
+$(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c src/core/launch.c src/core/options.c \
-		src/linux_abi/xattr.c \
-		src/linux_abi/readonly.c \
-		src/linux_abi/limits.c \
-		src/linux_abi/affinity.c \
-		src/linux_abi/device.c \
-		src/linux_abi/errno.c \
-		src/linux_abi/number.c \
-		src/linux_abi/parse.c \
-		src/linux_abi/encode.c \
-		src/host/clock.c \
-		src/host/file.c \
-		src/translator/reloc.c \
-		src/translator/arena.c \
-		src/translator/digest.c \
-		src/translator/identity.c \
-		src/translator/window.c \
-		src/core/host_services.c src/core/log.c src/host/macos/host.c
+	$(MAC) clang -o $@ $< $(MAC_LIBS) -framework IOSurface -framework CoreFoundation
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/launch.c src/core/log.c src/core/options.c src/host/macos/host.c \
+$(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c src/core/launch.c src/core/options.c \
-		src/linux_abi/xattr.c \
-		src/linux_abi/readonly.c \
-		src/linux_abi/limits.c \
-		src/linux_abi/affinity.c \
-		src/linux_abi/device.c \
-		src/linux_abi/errno.c \
-		src/linux_abi/number.c \
-		src/linux_abi/parse.c \
-		src/linux_abi/encode.c \
-		src/host/clock.c \
-		src/host/file.c \
-		src/translator/reloc.c \
-		src/translator/arena.c \
-		src/translator/digest.c \
-		src/translator/identity.c \
-		src/translator/window.c \
-		src/core/host_services.c src/core/log.c src/host/macos/host.c
+	$(MAC) clang -o $@ $< $(MAC_LIBS) -framework IOSurface -framework CoreFoundation
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
-$(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/aarch64.c \
-	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c src/core/options.c \
-	src/host/macos/host.c packaging/macos/jit.entitlements
+$(BUILD)/mac/lifecycle/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
-		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/core/target/aarch64.c src/core/config.c src/core/launch.c src/core/options.c \
-		src/linux_abi/xattr.c \
-		src/linux_abi/readonly.c \
-		src/linux_abi/limits.c \
-		src/linux_abi/affinity.c \
-		src/linux_abi/device.c \
-		src/linux_abi/errno.c \
-		src/linux_abi/number.c \
-		src/linux_abi/parse.c \
-		src/linux_abi/encode.c \
-		src/host/clock.c \
-		src/host/file.c \
-		src/translator/reloc.c \
-		src/translator/arena.c \
-		src/translator/digest.c \
-		src/translator/identity.c \
-		src/translator/window.c \
-		src/core/lifecycle.c \
-		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
+	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 -c $< -o $@
+
+$(BUILD)/mac/lifecycle/x86_64-target.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 -c $< -o $@
+
+$(BUILD)/mac/lifecycle/aarch64-core.o: src/core/lifecycle.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -c $< -o $@
+
+$(BUILD)/mac/lifecycle/x86_64-core.o: src/core/lifecycle.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -c $< -o $@
+
+$(BUILD)/mac/lifecycle/aarch64-runner.o: tools/lifecycle_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -c $< -o $@
+
+$(BUILD)/mac/lifecycle/x86_64-runner.o: tools/lifecycle_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -c $< -o $@
+
+$(BUILD)/tools/lifecycle-aarch64: $(BUILD)/mac/lifecycle/aarch64-runner.o \
+	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -o $@ $(filter %.o %.a,$^) -framework IOSurface -framework CoreFoundation
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/core/target/x86_64.c \
-	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c src/core/options.c \
-	src/host/macos/host.c packaging/macos/jit.entitlements
+$(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
+	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
-		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/core/target/x86_64.c src/core/config.c src/core/launch.c src/core/options.c \
-		src/linux_abi/xattr.c \
-		src/linux_abi/readonly.c \
-		src/linux_abi/limits.c \
-		src/linux_abi/affinity.c \
-		src/linux_abi/device.c \
-		src/linux_abi/errno.c \
-		src/linux_abi/number.c \
-		src/linux_abi/parse.c \
-		src/linux_abi/encode.c \
-		src/host/clock.c \
-		src/host/file.c \
-		src/translator/reloc.c \
-		src/translator/arena.c \
-		src/translator/digest.c \
-		src/translator/identity.c \
-		src/translator/window.c \
-		src/core/lifecycle.c \
-		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
+	$(MAC) clang -o $@ $(filter %.o %.a,$^) -framework IOSurface -framework CoreFoundation
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \

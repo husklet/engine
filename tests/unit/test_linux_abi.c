@@ -3,12 +3,12 @@
 #include "hl/fake.h"
 #include "hl/linux_abi.h"
 
+#include <pthread.h>
 #include <string.h>
-#if !defined(__STDC_NO_THREADS__)
-#include <threads.h>
-#endif
 
 typedef struct test_file_host {
+    /* First so the shared host context is also a valid fake-host context. */
+    hl_fake_host fake;
     char bytes[32];
     size_t size;
     _Atomic uint32_t reads;
@@ -132,30 +132,28 @@ static hl_host_result test_metadata(void *context, hl_host_handle file, hl_host_
     return file_result(HL_STATUS_OK, 0);
 }
 
-#if !defined(__STDC_NO_THREADS__)
 typedef struct read_thread_args {
     hl_linux_abi *linux_abi;
     hl_linux_fd fd;
     char bytes[3];
 } read_thread_args;
 
-static int read_three_bytes(void *opaque) {
+static void *read_three_bytes(void *opaque) {
     read_thread_args *args = opaque;
     size_t i;
     for (i = 0; i < sizeof(args->bytes); ++i) {
-        if (hl_linux_read(args->linux_abi, args->fd, &args->bytes[i], 1) != 1) return EXIT_FAILURE;
+        if (hl_linux_read(args->linux_abi, args->fd, &args->bytes[i], 1) != 1) return (void *)(uintptr_t)EXIT_FAILURE;
     }
-    return EXIT_SUCCESS;
+    return (void *)(uintptr_t)EXIT_SUCCESS;
 }
 
-static int read_one_byte(void *opaque) {
+static void *read_one_byte(void *opaque) {
     read_thread_args *args = opaque;
-    return hl_linux_read(args->linux_abi, args->fd, &args->bytes[0], 1) == 1 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return (void *)(uintptr_t)(hl_linux_read(args->linux_abi, args->fd, &args->bytes[0], 1) == 1 ? EXIT_SUCCESS
+                                                                                                 : EXIT_FAILURE);
 }
-#endif
 
 int main(void) {
-    hl_fake_host fake;
     hl_host_services services;
     hl_linux_abi linux_abi;
     hl_linux_fd_entry fds[8];
@@ -164,7 +162,7 @@ int main(void) {
     hl_linux_fd duplicate;
     hl_linux_fd_snapshot snapshot;
     hl_host_handle closed;
-    test_file_host file_host = {{0}, 6, 0, 0, 0, HL_STATUS_OK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    test_file_host file_host = {0};
     hl_host_file_services files = {.abi = HL_HOST_FILE_ABI,
                                    .size = sizeof(files),
                                    .open_relative = test_open,
@@ -175,13 +173,22 @@ int main(void) {
                                    .close = test_close};
     char buffer[8] = {0};
 
-    hl_fake_host_init(&fake, &services);
+    file_host.size = 6;
+    hl_fake_host_init(&file_host.fake, &services);
     memcpy(file_host.bytes, "abcdef", 6);
     services.capabilities |= HL_HOST_CAP_FILE;
     services.context = &file_host;
     services.file = &files;
+    {
+        hl_host_services without_sync = services;
+        without_sync.capabilities &= ~(uint64_t)HL_HOST_CAP_SYNC;
+        HL_CHECK(hl_linux_abi_init(&linux_abi, &without_sync, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) ==
+                 HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(file_host.fake.live_mutexes == 0);
+    }
     HL_CHECK(hl_linux_abi_init(&linux_abi, &services, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) ==
              HL_STATUS_OK);
+    HL_CHECK(file_host.fake.live_mutexes == HL_ARRAY_COUNT(ofds));
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0123, 1, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
     HL_CHECK(original != duplicate);
@@ -345,15 +352,14 @@ int main(void) {
     file_host.next_status = HL_STATUS_NOT_FOUND;
     HL_CHECK(hl_linux_openat(&linux_abi, HL_LINUX_AT_FDCWD, "file", 4, HL_LINUX_O_RDONLY, 0) == -HL_LINUX_ENOENT);
 
-#if !defined(__STDC_NO_THREADS__)
     {
         read_thread_args first = {&linux_abi, 0, {0}};
         read_thread_args second = {&linux_abi, 0, {0}};
         uint32_t seen[6] = {0};
-        thrd_t first_thread;
-        thrd_t second_thread;
-        int first_result;
-        int second_result;
+        pthread_t first_thread;
+        pthread_t second_thread;
+        void *first_result;
+        void *second_result;
         size_t i;
 
         /* Concurrent reads through duplicated fds consume one shared OFD offset atomically. */
@@ -361,11 +367,11 @@ int main(void) {
         file_host.size = 6;
         HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &first.fd) == HL_STATUS_OK);
         HL_CHECK(hl_linux_fd_dup(&linux_abi, first.fd, 0, &second.fd) == HL_STATUS_OK);
-        HL_CHECK(thrd_create(&first_thread, read_three_bytes, &first) == thrd_success);
-        HL_CHECK(thrd_create(&second_thread, read_three_bytes, &second) == thrd_success);
-        HL_CHECK(thrd_join(first_thread, &first_result) == thrd_success);
-        HL_CHECK(thrd_join(second_thread, &second_result) == thrd_success);
-        HL_CHECK(first_result == EXIT_SUCCESS && second_result == EXIT_SUCCESS);
+        HL_CHECK(pthread_create(&first_thread, NULL, read_three_bytes, &first) == 0);
+        HL_CHECK(pthread_create(&second_thread, NULL, read_three_bytes, &second) == 0);
+        HL_CHECK(pthread_join(first_thread, &first_result) == 0);
+        HL_CHECK(pthread_join(second_thread, &second_result) == 0);
+        HL_CHECK((uintptr_t)first_result == EXIT_SUCCESS && (uintptr_t)second_result == EXIT_SUCCESS);
         for (i = 0; i < sizeof(first.bytes); ++i) {
             HL_CHECK(first.bytes[i] >= 'a' && first.bytes[i] <= 'f');
             HL_CHECK(second.bytes[i] >= 'a' && second.bytes[i] <= 'f');
@@ -382,17 +388,17 @@ int main(void) {
         HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_HOST_FILE_READ, 0, &second.fd) == HL_STATUS_OK);
         atomic_store_explicit(&file_host.concurrent_calls, 0, memory_order_relaxed);
         atomic_store_explicit(&file_host.barrier_enabled, 1, memory_order_release);
-        HL_CHECK(thrd_create(&first_thread, read_one_byte, &first) == thrd_success);
-        HL_CHECK(thrd_create(&second_thread, read_one_byte, &second) == thrd_success);
-        HL_CHECK(thrd_join(first_thread, &first_result) == thrd_success);
-        HL_CHECK(thrd_join(second_thread, &second_result) == thrd_success);
+        HL_CHECK(pthread_create(&first_thread, NULL, read_one_byte, &first) == 0);
+        HL_CHECK(pthread_create(&second_thread, NULL, read_one_byte, &second) == 0);
+        HL_CHECK(pthread_join(first_thread, &first_result) == 0);
+        HL_CHECK(pthread_join(second_thread, &second_result) == 0);
         atomic_store_explicit(&file_host.barrier_enabled, 0, memory_order_release);
-        HL_CHECK(first_result == EXIT_SUCCESS && second_result == EXIT_SUCCESS);
+        HL_CHECK((uintptr_t)first_result == EXIT_SUCCESS && (uintptr_t)second_result == EXIT_SUCCESS);
         HL_CHECK(atomic_load_explicit(&file_host.concurrent_calls, memory_order_acquire) == 2);
         HL_CHECK(hl_linux_close(&linux_abi, first.fd) == 0);
         HL_CHECK(hl_linux_close(&linux_abi, second.fd) == 0);
     }
-#endif
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
+    HL_CHECK(file_host.fake.live_mutexes == 0);
     return EXIT_SUCCESS;
 }

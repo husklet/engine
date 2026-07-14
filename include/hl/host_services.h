@@ -15,6 +15,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_GPU_ABI 1u
+#define HL_HOST_SYNC_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -30,7 +31,8 @@ enum {
     HL_HOST_CAP_EVENT = UINT64_C(1) << 7,
     HL_HOST_CAP_NETWORK = UINT64_C(1) << 8,
     HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 9,
-    HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 10
+    HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 10,
+    HL_HOST_CAP_SYNC = UINT64_C(1) << 11
 };
 
 enum {
@@ -229,6 +231,15 @@ typedef struct hl_host_gpu_services {
     hl_host_result (*close)(void *context, hl_host_handle allocation);
 } hl_host_gpu_services;
 
+/* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
+typedef struct hl_host_sync_services {
+    HL_ABI_HEADER;
+    hl_host_result (*mutex_create)(void *context);
+    hl_host_result (*mutex_lock)(void *context, hl_host_handle mutex);
+    hl_host_result (*mutex_unlock)(void *context, hl_host_handle mutex);
+    hl_host_result (*mutex_close)(void *context, hl_host_handle mutex);
+} hl_host_sync_services;
+
 typedef struct hl_host_services {
     HL_ABI_HEADER;
     uint64_t capabilities;
@@ -242,6 +253,7 @@ typedef struct hl_host_services {
     const hl_host_network_services *network;
     const hl_host_shared_memory_services *shared_memory;
     const hl_host_gpu_services *gpu;
+    const hl_host_sync_services *sync;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

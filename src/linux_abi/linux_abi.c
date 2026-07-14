@@ -10,12 +10,20 @@ static void hl_linux_unlock(hl_linux_abi *linux_abi) {
     atomic_flag_clear_explicit(&linux_abi->table_lock, memory_order_release);
 }
 
-static void hl_linux_ofd_lock(hl_linux_ofd_entry *ofd) {
-    (void)mtx_lock(&ofd->io_lock);
+static const hl_host_sync_services *hl_linux_sync(const hl_linux_abi *linux_abi) {
+    const hl_host_services *host;
+    if (linux_abi == NULL || (host = linux_abi->host) == NULL || (host->capabilities & HL_HOST_CAP_SYNC) == 0 ||
+        host->sync == NULL || host->sync->abi != HL_HOST_SYNC_ABI || host->sync->size < sizeof(*host->sync))
+        return NULL;
+    return host->sync;
 }
 
-static void hl_linux_ofd_unlock(hl_linux_ofd_entry *ofd) {
-    (void)mtx_unlock(&ofd->io_lock);
+static void hl_linux_ofd_lock(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd) {
+    (void)hl_linux_sync(linux_abi)->mutex_lock(linux_abi->host->context, ofd->io_mutex);
+}
+
+static void hl_linux_ofd_unlock(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd) {
+    (void)hl_linux_sync(linux_abi)->mutex_unlock(linux_abi->host->context, ofd->io_mutex);
 }
 
 static int64_t hl_linux_error(hl_status status) {
@@ -102,13 +110,6 @@ hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_services *hos
     memset(linux_abi, 0, sizeof(*linux_abi));
     memset(fd_storage, 0, sizeof(*fd_storage) * fd_capacity);
     memset(ofd_storage, 0, sizeof(*ofd_storage) * ofd_capacity);
-    for (uint32_t ofd = 0; ofd < ofd_capacity; ++ofd) {
-        if (mtx_init(&ofd_storage[ofd].io_lock, mtx_plain) != thrd_success) {
-            while (ofd != 0)
-                mtx_destroy(&ofd_storage[--ofd].io_lock);
-            return HL_STATUS_RESOURCE_LIMIT;
-        }
-    }
     linux_abi->abi = HL_LINUX_ABI_VERSION;
     linux_abi->size = sizeof(*linux_abi);
     linux_abi->host = host;
@@ -116,6 +117,22 @@ hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_services *hos
     linux_abi->fd_capacity = fd_capacity;
     linux_abi->ofds = ofd_storage;
     linux_abi->ofd_capacity = ofd_capacity;
+    const hl_host_sync_services *sync = hl_linux_sync(linux_abi);
+    if (sync == NULL || sync->mutex_create == NULL || sync->mutex_lock == NULL || sync->mutex_unlock == NULL ||
+        sync->mutex_close == NULL) {
+        linux_abi->abi = 0;
+        return HL_STATUS_NOT_SUPPORTED;
+    }
+    for (uint32_t ofd = 0; ofd < ofd_capacity; ++ofd) {
+        hl_host_result result = sync->mutex_create(host->context);
+        if (result.status != HL_STATUS_OK || result.value == HL_HOST_HANDLE_INVALID) {
+            while (ofd != 0)
+                (void)sync->mutex_close(host->context, ofd_storage[--ofd].io_mutex);
+            linux_abi->abi = 0;
+            return result.status == HL_STATUS_OK ? HL_STATUS_RESOURCE_LIMIT : result.status;
+        }
+        ofd_storage[ofd].io_mutex = result.value;
+    }
     atomic_flag_clear(&linux_abi->table_lock);
     return HL_STATUS_OK;
 }
@@ -132,8 +149,13 @@ hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi) {
         }
     }
     hl_linux_unlock(linux_abi);
-    for (ofd = 0; ofd < linux_abi->ofd_capacity; ++ofd)
-        mtx_destroy(&linux_abi->ofds[ofd].io_lock);
+    const hl_host_sync_services *sync = hl_linux_sync(linux_abi);
+    if (sync == NULL || sync->mutex_close == NULL) return HL_STATUS_NOT_SUPPORTED;
+    for (ofd = 0; ofd < linux_abi->ofd_capacity; ++ofd) {
+        hl_host_result result = sync->mutex_close(linux_abi->host->context, linux_abi->ofds[ofd].io_mutex);
+        if (result.status != HL_STATUS_OK) return result.status;
+        linux_abi->ofds[ofd].io_mutex = HL_HOST_HANDLE_INVALID;
+    }
     linux_abi->abi = 0;
     return HL_STATUS_OK;
 }
@@ -232,11 +254,11 @@ static int64_t hl_linux_fd_dup_at_least(hl_linux_abi *linux_abi, hl_linux_fd sou
 static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd_entry,
                                        hl_host_handle *last_host_handle) {
     /* Wait only for this OFD. Operations drop their pin before releasing io_lock. */
-    hl_linux_ofd_lock(ofd_entry);
+    hl_linux_ofd_lock(linux_abi, ofd_entry);
     hl_linux_lock(linux_abi);
     if (ofd_entry->references != 0 || ofd_entry->active_operations != 0 || ofd_entry->closing == 0) {
         hl_linux_unlock(linux_abi);
-        hl_linux_ofd_unlock(ofd_entry);
+        hl_linux_ofd_unlock(linux_abi, ofd_entry);
         return HL_STATUS_CORRUPT;
     }
     if (last_host_handle != NULL) *last_host_handle = ofd_entry->host_handle;
@@ -247,7 +269,7 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     ofd_entry->generation++;
     ofd_entry->kind = 0;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd_entry);
+    hl_linux_ofd_unlock(linux_abi, ofd_entry);
     return HL_STATUS_OK;
 }
 
@@ -309,12 +331,12 @@ int64_t hl_linux_pread64(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, 
     ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_pread64_owned(linux_abi, ofd, buffer, size, offset);
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     return result;
 }
 
@@ -337,7 +359,7 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
     ofd = &linux_abi->ofds[ofd_index];
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_pread64_owned(linux_abi, ofd, buffer, size, ofd->offset);
     if (result > 0) {
         uint64_t count = (uint64_t)result;
@@ -351,7 +373,7 @@ io_done:
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     return result;
 done:
     hl_linux_unlock(linux_abi);
@@ -403,12 +425,12 @@ int64_t hl_linux_pwrite64(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *b
     }
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_write_owned(linux_abi, ofd, buffer, size, offset, 0, &ignored_offset);
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     return result;
 }
 
@@ -436,7 +458,7 @@ int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buff
     append = (ofd->status_flags & HL_LINUX_O_APPEND) != 0;
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_write_owned(linux_abi, ofd, buffer, size, ofd->offset, append, &resulting_offset);
     if (result > 0) {
         uint64_t count = (uint64_t)result;
@@ -450,7 +472,7 @@ int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buff
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     return result;
 }
 
@@ -493,7 +515,7 @@ int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const cha
         directory_ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
         directory_ofd->active_operations++;
         hl_linux_unlock(linux_abi);
-        hl_linux_ofd_lock(directory_ofd);
+        hl_linux_ofd_lock(linux_abi, directory_ofd);
         directory = directory_ofd->host_handle;
     }
 
@@ -502,7 +524,7 @@ int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const cha
         hl_linux_lock(linux_abi);
         directory_ofd->active_operations--;
         hl_linux_unlock(linux_abi);
-        hl_linux_ofd_unlock(directory_ofd);
+        hl_linux_ofd_unlock(linux_abi, directory_ofd);
     }
     if (opened.status != HL_STATUS_OK)
         return opened.status == HL_STATUS_NOT_FOUND ? -HL_LINUX_ENOENT : hl_linux_error((hl_status)opened.status);
@@ -664,12 +686,12 @@ int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_st
     ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     if (result != 0) return result;
     output->device = metadata.stable_device;
     output->object = metadata.stable_object;
@@ -697,7 +719,7 @@ int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, 
     ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_lock(ofd);
+    hl_linux_ofd_lock(linux_abi, ofd);
     result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
     if (result != 0) goto done;
     if (metadata.type != HL_HOST_FILE_TYPE_REGULAR && metadata.type != HL_HOST_FILE_TYPE_BLOCK) {
@@ -737,6 +759,6 @@ done:
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd);
+    hl_linux_ofd_unlock(linux_abi, ofd);
     return result;
 }
