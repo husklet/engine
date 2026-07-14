@@ -354,6 +354,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // forked child collides on guest pid 1 and peer-node merging hangs.
                 if (sv[0] >= 0 && sv[0] < HL_NFD) g_sock_seqpacket[sv[0]] = 1;
                 if (sv[1] >= 0 && sv[1] < HL_NFD) g_sock_seqpacket[sv[1]] = 1;
+                if (seq_ref_pair(sv[0], sv[1]) != 0) {
+                    int e = errno;
+                    g_sock_seqpacket[sv[0]] = 0;
+                    g_sock_seqpacket[sv[1]] = 0;
+                    close(sv[0]);
+                    close(sv[1]);
+                    G_RET(c) = (uint64_t)(-e);
+                    break;
+                }
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -961,7 +970,6 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         do {
             r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl);
         } while (r < 0 && SVC_EINTR_RESTART(c));
-        if (r >= 0) seq_mark_wrote((int)a0); // genuine writer: may inject peer-EOF on its close (see netns.c)
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1291,6 +1299,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
             if (hn < 0) {
                 cmsg_tmpfds_close();
+                cmsg_seq_finish(0);
                 if (hctl != hstack) free(hctl);
                 G_RET(c) = (uint64_t)(-(cerr ? cerr : EINVAL));
                 break;
@@ -1329,7 +1338,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                             : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (nr == 211) cmsg_tmpfds_close();
-        if (nr == 211 && r >= 0) seq_mark_wrote((int)a0); // genuine writer: may inject peer-EOF on its close
+        if (nr == 211) cmsg_seq_finish(r >= 0);
         if (r > 0 && peekaddr) r = 0; // guest supplied no data room; only the source address was wanted
         // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
@@ -1515,6 +1524,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
                 if (hn < 0) {
                     cmsg_tmpfds_close();
+                    cmsg_seq_finish(0);
                     if (hctl != hstack) free(hctl);
                     err = cerr ? cerr : EINVAL;
                     break;

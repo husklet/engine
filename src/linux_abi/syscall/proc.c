@@ -237,9 +237,6 @@ static void fork_child_hooks(struct cpu *c) {
                                  // rebuild them so the child doesn't EBADF on its inherited event fds
                                  // (also reinits g_ep_mtx, inherited-locked if a peer forked mid-epoll)
     thread_after_fork();         // reset process-private thread/futex locks a dead peer may have held at fork
-    seq_wrote_after_fork();      // a forked child has WRITTEN to none of its inherited SEQPACKET/pipe ends yet:
-                                 // clear the "wrote" table so a bystander child closing an inherited IPC channel
-                                 // end injects no spurious peer-EOF into another process's live channel (see netns.c)
     sysv_after_fork();           // reset the SysV-shm lock (same fork-unsafe-mutex class)
     eventfd_after_fork();        // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
     ts_after_fork();             // drop the inherited task-state slot cache so the child re-claims its own
@@ -258,6 +255,7 @@ typedef struct bound_fork_state {
     int private_prepared;
     struct fdvis_fork_plan fdvis_plan;
     int fdvis_prepared;
+    int seq_prepared;
 } bound_fork_state;
 
 static int bound_fork_prepare(bound_fork_state *state) {
@@ -274,6 +272,8 @@ static int bound_fork_prepare(bound_fork_state *state) {
             return fdvis_status == -ENOSPC ? -ENOMEM : fdvis_status;
         }
         state->fdvis_prepared = 1;
+        seq_ref_fork_prepare();
+        state->seq_prepared = 1;
         return 0;
     }
     state->watch_plan.capacity = bound_mapping_watch_capacity();
@@ -337,11 +337,14 @@ static int bound_fork_prepare(bound_fork_state *state) {
         }
     }
     state->fdvis_prepared = 1;
+    seq_ref_fork_prepare();
+    state->seq_prepared = 1;
     return 0;
 }
 
 static int bound_fork_complete(bound_fork_state *state, int child, int child_pid) {
     hl_status status;
+    if (state->seq_prepared && child_pid < 0) seq_ref_fork_cancel();
     if (state->fdvis_prepared) {
         if (child_pid > 0)
             proc_fdvis_after_fork(&state->fdvis_plan, child_pid, child);

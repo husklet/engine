@@ -190,6 +190,18 @@ static int msgflags_m2l(int mf) {
 #endif
 }
 
+// Shared ownership metadata for macOS's DGRAM-backed Linux SOCK_SEQPACKET emulation. Definitions live
+// ahead of ancillary translation because SCM_RIGHTS send/receive participates in the same lifetime.
+#define SEQ_REF_N 4096
+struct seq_ref {
+    volatile uint32_t used;
+    volatile uint32_t refs[2];
+    volatile uint32_t pending[2];
+};
+static struct seq_ref *g_seq_refs;
+static uint16_t g_seq_ref[HL_NFD];
+static uint8_t g_seq_end[HL_NFD];
+
 // ---- SCM ancillary data: Linux<->macOS cmsg framing translation (SOL_SOCKET/SCM_RIGHTS fd passing).
 // hl uses host fds directly as guest fds, so the fd integers in an SCM_RIGHTS payload need no remap --
 // only the cmsg framing differs: Linux hdr=16B (8B len @0, int level @8, int type @12), 8-byte align,
@@ -198,6 +210,7 @@ static int msgflags_m2l(int mf) {
 #define LX_CMSGHDR 16u                              // Linux cmsg header: 8(len)+4(level)+4(type)
 #define LX_SOL_SOCKET 1
 #define HL_CMSG_EVENTFD_MAGIC 0xddefd001u
+#define HL_CMSG_SEQ_MAGIC 0xdd5e9001u
 
 struct hl_cmsg_eventfd_meta {
     uint32_t magic;
@@ -206,10 +219,19 @@ struct hl_cmsg_eventfd_meta {
     uint32_t sema;
     uint32_t nb; // guest EFD_NONBLOCK intent (g_eventfd_gnb) — the host fd is always O_NONBLOCK internally
 };
+struct hl_cmsg_seq_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    uint32_t slot;
+    uint32_t end;
+};
 
 static __thread int g_cmsg_tmpfds[1024];
 static __thread uint8_t g_cmsg_tmpfd_borrowed[1024];
 static __thread int g_cmsg_ntmpfds;
+static __thread uint16_t g_cmsg_seq_slot[253];
+static __thread uint8_t g_cmsg_seq_end[253];
+static __thread int g_cmsg_nseq;
 static int bound_attachment_borrow(int guest_fd, int *native_fd);
 static void bound_attachment_release(int native_fd);
 
@@ -230,6 +252,18 @@ static void cmsg_tmpfds_close(void) {
                 close(g_cmsg_tmpfds[i]);
         }
     g_cmsg_ntmpfds = 0;
+}
+
+static void cmsg_seq_finish(int sent) {
+    if (!sent && g_seq_refs) {
+        for (int i = 0; i < g_cmsg_nseq; i++) {
+            uint32_t slot = g_cmsg_seq_slot[i];
+            uint32_t end = g_cmsg_seq_end[i];
+            __atomic_sub_fetch(&g_seq_refs[slot].pending[end], 1, __ATOMIC_ACQ_REL);
+            __atomic_sub_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL);
+        }
+    }
+    g_cmsg_nseq = 0;
 }
 
 static int cmsg_level_l2m(int lv) {
@@ -257,6 +291,49 @@ static int cmsg_eventfd_marker(const struct hl_cmsg_eventfd_meta *m) {
         return -1;
     }
     return fd;
+}
+
+static int cmsg_seq_marker(const struct hl_cmsg_seq_meta *m) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char tn[] = "/tmp/.hl-seqXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd < 0) return -1;
+    unlink(tn);
+    if (write(fd, m, sizeof *m) != (ssize_t)sizeof *m) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int cmsg_import_seq_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_seq_meta m;
+        int marker = fds[visible - 1];
+        memset(&m, 0, sizeof m);
+        if (pread(marker, &m, sizeof m, 0) != (ssize_t)sizeof m || m.magic != HL_CMSG_SEQ_MAGIC) break;
+        if (m.ordinal >= (uint32_t)(visible - 1) || m.slot >= SEQ_REF_N || m.end > 1) break;
+        int fd = fds[m.ordinal];
+        uint32_t pending = __atomic_load_n(&g_seq_refs[m.slot].pending[m.end], __ATOMIC_ACQUIRE);
+        while (pending != 0 && !__atomic_compare_exchange_n(&g_seq_refs[m.slot].pending[m.end], &pending,
+                                                             pending - 1, 0, __ATOMIC_ACQ_REL,
+                                                             __ATOMIC_ACQUIRE)) {}
+        if (pending == 0) __atomic_add_fetch(&g_seq_refs[m.slot].refs[m.end], 1, __ATOMIC_ACQ_REL);
+        if (fd >= 0 && fd < HL_NFD) {
+            g_seq_ref[fd] = (uint16_t)(m.slot + 1);
+            g_seq_end[fd] = (uint8_t)m.end;
+        }
+        close(marker);
+        visible--;
+    }
+    return visible;
 }
 
 static int cmsg_fd_is_write_sideband(int fd) {
@@ -351,6 +428,7 @@ static void cmsg_note_recv_sock_fd(int fd);
 static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, int *errp) {
     if (errp) *errp = 0;
     cmsg_tmpfds_close();
+    cmsg_seq_finish(0);
     size_t go = 0, ho = 0;
     while (go + LX_CMSGHDR <= glen) {
         uint64_t clen = *(const uint64_t *)(g + go); // Linux cmsg_len (8B)
@@ -371,7 +449,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 if (errp) *errp = EINVAL;
                 return -1;
             }
-            combo_cap = nfds * 3; // visible fd + possible eventfd write-side fd + marker fd
+            combo_cap = nfds * 4; // visible fd + seq marker + possible eventfd write-side fd + marker fd
             combo = malloc((size_t)combo_cap * sizeof(int));
             if (!combo) {
                 if (errp) *errp = ENOMEM;
@@ -387,6 +465,32 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     return -1;
                 }
                 combo[combo_n++] = native;
+                if (fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] && g_cmsg_nseq < 253) {
+                    uint32_t slot = g_seq_ref[fds[i]] - 1;
+                    uint32_t end = g_seq_end[fds[i]];
+                    __atomic_add_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL);
+                    __atomic_add_fetch(&g_seq_refs[slot].pending[end], 1, __ATOMIC_ACQ_REL);
+                    g_cmsg_seq_slot[g_cmsg_nseq] = (uint16_t)slot;
+                    g_cmsg_seq_end[g_cmsg_nseq++] = (uint8_t)end;
+                }
+            }
+            for (int i = 0; i < nfds; i++) {
+                int fd = fds[i];
+                if (fd >= 0 && fd < HL_NFD && g_seq_ref[fd]) {
+                    struct hl_cmsg_seq_meta sm = {
+                        .magic = HL_CMSG_SEQ_MAGIC,
+                        .ordinal = (uint32_t)i,
+                        .slot = (uint32_t)(g_seq_ref[fd] - 1),
+                        .end = (uint32_t)g_seq_end[fd],
+                    };
+                    int marker = cmsg_seq_marker(&sm);
+                    if (marker < 0) {
+                        free(combo);
+                        if (errp) *errp = EMSGSIZE;
+                        return -1;
+                    }
+                    combo[combo_n++] = marker;
+                }
             }
             for (int i = 0; i < nfds; i++) {
                 int fd = fds[i];
@@ -454,6 +558,7 @@ static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t 
             int nfds = (int)(dlen / sizeof(int));
             int *fds = (int *)CMSG_DATA(c);
             int visible = cmsg_import_eventfd_trailer(fds, nfds);
+            visible = cmsg_import_seq_trailer(fds, visible);
             for (int i = 0; i < visible; i++) {
                 cmsg_note_recv_sock_fd(fds[i]);
             }
@@ -598,6 +703,82 @@ static uint16_t g_sock_fam[HL_NFD];
 // peer close, so close() injects a zero-length EOF datagram and recv/read coerce ECONNRESET -> 0 for these.
 static uint8_t g_sock_seqpacket[HL_NFD];
 
+// macOS backs Linux SOCK_SEQPACKET (and O_DIRECT packet pipes) with AF_UNIX DGRAM. DGRAM preserves
+// records but has no connection lifetime: when the last copy of one endpoint closes, its peer receives
+// neither EOF nor a wakeup. Keep endpoint ownership in shared memory so fork/dup/close/exec reproduce the
+// Linux last-open-file-description rule. The arena is inherited by every guest descendant; dead pairs are
+// recycled only after both endpoint reference counts reach zero.
+static int seq_ref_arena(void) {
+    if (__atomic_load_n(&g_seq_refs, __ATOMIC_ACQUIRE)) return 0;
+    void *p = mmap(NULL, sizeof(struct seq_ref) * SEQ_REF_N, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    struct seq_ref *expected = NULL;
+    if (!__atomic_compare_exchange_n(&g_seq_refs, &expected, p, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+        munmap(p, sizeof(struct seq_ref) * SEQ_REF_N);
+    return 0;
+}
+
+static int seq_ref_pair(int first, int second) {
+    if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD || seq_ref_arena() != 0) return -1;
+    for (uint32_t i = 0; i < SEQ_REF_N; i++) {
+        if (!__sync_bool_compare_and_swap(&g_seq_refs[i].used, 0, 1)) continue;
+        __atomic_store_n(&g_seq_refs[i].refs[0], 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_seq_refs[i].refs[1], 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_seq_refs[i].pending[0], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_seq_refs[i].pending[1], 0, __ATOMIC_RELAXED);
+        g_seq_ref[first] = (uint16_t)(i + 1);
+        g_seq_end[first] = 0;
+        g_seq_ref[second] = (uint16_t)(i + 1);
+        g_seq_end[second] = 1;
+        return 0;
+    }
+    errno = ENFILE;
+    return -1;
+}
+
+static void seq_ref_dup(int dst, int src) {
+    if (!g_seq_refs || src < 0 || src >= HL_NFD || dst < 0 || dst >= HL_NFD || !g_seq_ref[src]) return;
+    uint32_t slot = g_seq_ref[src] - 1;
+    uint32_t end = g_seq_end[src];
+    __atomic_add_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL);
+    g_seq_ref[dst] = g_seq_ref[src];
+    g_seq_end[dst] = (uint8_t)end;
+}
+
+static void seq_ref_drop(int fd) {
+    if (!g_seq_refs || fd < 0 || fd >= HL_NFD || !g_seq_ref[fd]) return;
+    uint32_t slot = g_seq_ref[fd] - 1;
+    uint32_t end = g_seq_end[fd];
+    g_seq_ref[fd] = 0;
+    g_seq_end[fd] = 0;
+    if (__atomic_sub_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL) == 0)
+        (void)send(fd, "", 0, MSG_DONTWAIT);
+    if (__atomic_load_n(&g_seq_refs[slot].refs[0], __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&g_seq_refs[slot].refs[1], __ATOMIC_ACQUIRE) == 0)
+        __atomic_store_n(&g_seq_refs[slot].used, 0, __ATOMIC_RELEASE);
+}
+
+// Reserve the references the child will inherit before fork. A failed fork rolls them back; a successful
+// fork consumes the reservation, requiring no allocation or lock in the post-fork child.
+static void seq_ref_fork_prepare(void) {
+    if (seq_ref_arena() != 0) return;
+    for (int fd = 0; fd < HL_NFD; fd++) {
+        if (!g_seq_ref[fd]) continue;
+        uint32_t slot = g_seq_ref[fd] - 1;
+        __atomic_add_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
+    }
+}
+
+static void seq_ref_fork_cancel(void) {
+    if (!g_seq_refs) return;
+    for (int fd = 0; fd < HL_NFD; fd++) {
+        if (!g_seq_ref[fd]) continue;
+        uint32_t slot = g_seq_ref[fd] - 1;
+        __atomic_sub_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
+    }
+}
+
 // fd -> (its socketpair/O_DIRECT-pipe PARTNER fd + 1); 0 = no known partner. Recorded for both ends at
 // socketpair(SEQPACKET)/pipe2(O_DIRECT) so close() can tell a genuine last-local close (inject the synthetic
 // EOF) from a parent dropping the child's fork-inherited peer end while it still holds its OWN end (must NOT
@@ -618,31 +799,6 @@ static int g_sock_pair_peer[HL_NFD];
 // pid the protocol also tracks) gives every child a distinct, non-self node identity whenever LOCAL_PEERPID
 // degenerates to self. Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
 static int g_sock_peer_pid[HL_NFD];
-
-// fd -> 1 if THIS process has actually SENT on this SEQPACKET/O_DIRECT-pipe endpoint (0 = never used it).
-// The synthetic peer-EOF injected on close (seq_send_eof) may fire ONLY for an endpoint this process wrote
-// to -- never for one it merely inherited across fork and never used. Rationale:
-// when a parent forks a child, that child inherits ALL the parent's open fds, including the
-// parent's SEND end of an IPC channel meant for a DIFFERENT child. The bystander never sends on it, but on
-// startup it CLOSES the inherited copy -- and the old close-time EOF injection then delivered a spurious
-// zero-length "EOF" datagram into the peer end, which is the REAL target child's LIVE recv queue. That child
-// read the premature 0 as end-of-channel and gave up ("Terminating after 15 seconds with no connection"),
-// which in turn dropped its channel ref so the parent's next invitation send got ECONNRESET. A per-fd
-// "did I ever write here" gate makes a never-used inherited end silent (correct: a bystander's close signals
-// nothing on Linux either), while a genuine writer's close still injects the EOF a blocked reader needs
-// (rustc/make jobserver, O_DIRECT pipe). RESET on fork (a child starts having-written nothing -- seq_wrote_
-// after_fork), carried on dup (fd_carry_sock), cleared on close (fd_reset_emul).
-static uint8_t g_sock_seq_wrote[HL_NFD];
-
-static void seq_mark_wrote(int fd) {
-    if (fd >= 0 && fd < HL_NFD && g_sock_seqpacket[fd]) g_sock_seq_wrote[fd] = 1;
-}
-
-// A forked child inherits the parent's open channel ends but has WRITTEN to none of them yet: clear the
-// whole "wrote" table so a bystander child that closes inherited channel fds injects no spurious peer-EOF.
-static void seq_wrote_after_fork(void) {
-    memset(g_sock_seq_wrote, 0, sizeof g_sock_seq_wrote);
-}
 
 static int sock_alloc_synth_peer(void) {
     static int ctr = 0x40000000; // 1<<30
@@ -692,32 +848,6 @@ static uint32_t g_tcp_laddr[HL_NFD];     // fd -> raw __be32 v4 bind addr (0.0.0
 static uint8_t g_tcp_l6[HL_NFD];         // fd -> 1 if the bind was AF_INET6 (row goes in /proc/net/tcp6)
 static uint8_t g_tcp_laddr6[HL_NFD][16]; // fd -> 16-byte v6 bind addr
 static uint8_t g_tcp_listen[HL_NFD];     // fd -> 1 once listen(2) succeeded (row is emitted only then)
-
-// Wake any peer blocked on this DGRAM endpoint with a zero-length EOF datagram (queued after pending data,
-// so order is preserved). Best-effort: a no-op for non-SEQPACKET fds and harmless if the peer is gone.
-static void seq_send_eof(int fd) {
-    if (!seq_is(fd)) return;
-    // Only a genuine WRITER on this endpoint may synthesize the peer's EOF on close. An endpoint this process
-    // merely inherited across fork and never wrote to belongs to another process's channel topology -- a
-    // bystander child closing the parent's inherited IPC channel-send end must NOT dump a
-    // zero-length "EOF" into the real target child's live recv queue. On
-    // Linux a bystander's close signals nothing to the peer either, so staying silent is Linux-exact; a real
-    // writer's last close still injects the EOF a blocked reader needs (jobserver / O_DIRECT pipe). See
-    // g_sock_seq_wrote for the full rationale.
-    if (fd < 0 || fd >= HL_NFD || !g_sock_seq_wrote[fd]) return;
-    // Suppress the synthetic EOF when this pair's OTHER end is still open in THIS process: we're a parent
-    // dropping a fork-inherited peer copy (Linux delivers no EOF while the fork child still holds that end),
-    // and injecting our zero-length "EOF" datagram here would deliver it to our OWN retained end -- a later
-    // recv there would misread it as a premature end-of-stream.
-    // A real last-local close -- where we no longer hold the partner -- still injects, so a blocked peer recv
-    // (e.g. a jobserver/O_DIRECT-pipe reader that never gets ECONNRESET on macOS) still wakes and returns 0.
-    int p = g_sock_pair_peer[fd];
-    if (p > 0) {
-        int peer = p - 1;
-        if (peer >= 0 && peer < HL_NFD && g_sock_seqpacket[peer]) return; // partner still held here -> no self-EOF
-    }
-    send(fd, "", 0, 0);
-}
 
 static int lo_on(void) {
     return g_netns[0] != 0;
@@ -865,8 +995,8 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_stream[dst] = g_sock_stream[src];
     g_sock_dgram[dst] = g_sock_dgram[src];
     g_sock_seqpacket[dst] = g_sock_seqpacket[src];
+    seq_ref_dup(dst, src);
     g_sock_pair_peer[dst] = g_sock_pair_peer[src]; // dup aliases the same end -> same partner
-    g_sock_seq_wrote[dst] = g_sock_seq_wrote[src]; // ... and the "did this process write here" EOF-gate
     g_sock_peer_pid[dst] = g_sock_peer_pid[src];   // ... and the same synthetic peer node identity
     g_sock_passcred[dst] = g_sock_passcred[src];
     g_sock_conn[dst] = g_sock_conn[src];

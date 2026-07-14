@@ -793,7 +793,6 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         do {
             r = write(wfd, (void *)a1, (size_t)a2);
         } while (r < 0 && SVC_EINTR_RESTART(c));
-        if (r >= 0) seq_mark_wrote(wfd); // genuine writer on a SEQPACKET/O_DIRECT-pipe end: may EOF its peer on close
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -877,7 +876,6 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         do {
             r = writev((int)a0, (void *)a1, (int)a2);
         } while (r < 0 && SVC_EINTR_RESTART(c));
-        if (r >= 0) seq_mark_wrote((int)a0); // genuine writer on a SEQPACKET/O_DIRECT-pipe end (see netns.c)
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
         // writev
@@ -1545,9 +1543,18 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // when the write end closes, but macOS DGRAM sockets don't -- mark both ends so close() sends a
         // zero-length EOF datagram and read() coerces the peer-closed ECONNRESET to 0. (See netns.c.)
         if ((fl & G_O_DIRECT)) {
+            if (seq_ref_pair(fds[0], fds[1]) != 0) {
+                int e = errno;
+                proc_fdvis_close(fds[0]);
+                proc_fdvis_close(fds[1]);
+                close(fds[0]);
+                close(fds[1]);
+                G_RET(c) = (uint64_t)(-e);
+                break;
+            }
             if (fds[0] >= 0 && fds[0] < HL_NFD) {
                 g_sock_seqpacket[fds[0]] = 1;
-                g_sock_pair_peer[fds[0]] = fds[1] + 1; // partner end (see seq_send_eof)
+                g_sock_pair_peer[fds[0]] = fds[1] + 1;
             }
             if (fds[1] >= 0 && fds[1] < HL_NFD) {
                 g_sock_seqpacket[fds[1]] = 1;

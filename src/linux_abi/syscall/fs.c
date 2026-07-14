@@ -286,10 +286,9 @@ static void fd_reset_emul(int fd) {
         g_sock_conn[fd] = 0;
         g_sock_fam[fd] = 0;
         g_sock_dgram[fd] = 0;
-        seq_send_eof(fd);
+        seq_ref_drop(fd);
         g_sock_seqpacket[fd] = 0;
         g_sock_pair_peer[fd] = 0;
-        g_sock_seq_wrote[fd] = 0;
         g_sock_peer_pid[fd] = 0;
         g_sock_passcred[fd] = 0;
         g_br_port[fd] = 0;
@@ -2633,8 +2632,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         engine_fd_vacate(cf); // guest close must not clobber an engine-private fd (g_root_fd etc.) on this number
         // Drop every engine-side emulation-table entry for this fd (eventfd peer/timerfd/overlay-dir/socket/epoll/
         // flock/pidfd/memf/getdents caches/path) BEFORE the real close, so a reused number can't be misrouted.
-        // SEQPACKET/O_DIRECT-pipe EOF is injected here (inside fd_reset_emul's seq_send_eof) while this end is
-        // still open, so a blocked peer recv wakes and returns 0. Shared with the execve CLOEXEC sweep.
+        // SEQPACKET/O_DIRECT-pipe last-close is recorded here while this end is still open, so the shared
+        // ownership tracker can wake a blocked peer with EOF. Shared with the execve CLOEXEC sweep.
         fd_reset_emul(cf);
         int r = close(cf);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
