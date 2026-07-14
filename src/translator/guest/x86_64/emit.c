@@ -467,32 +467,39 @@ static void e_str_s(int t, int rn) {
 } // str s,[xn]
 
 // Guest SIMD/x87 accesses. Keep these distinct from relaxed engine spills to cpu/scratch storage.
+static void emit_bus_guard_mem17(uint64_t size, int offset);
 static void g_ldr_q(int t, int rn, int off) {
+    if (rn == 17) emit_bus_guard_mem17(16, off);
     e_ldr_q(t, rn, off);
     e_dmb_ishld();
 }
 
 static void g_str_q(int t, int rn, int off) {
+    if (rn == 17) emit_bus_guard_mem17(16, off);
     e_dmb_ish();
     e_str_q(t, rn, off);
 }
 
 static void g_ldr_d(int t, int rn) {
+    if (rn == 17) emit_bus_guard_mem17(8, 0);
     e_ldr_d(t, rn);
     e_dmb_ishld();
 }
 
 static void g_str_d(int t, int rn) {
+    if (rn == 17) emit_bus_guard_mem17(8, 0);
     e_dmb_ish();
     e_str_d(t, rn);
 }
 
 static void g_ldr_s(int t, int rn) {
+    if (rn == 17) emit_bus_guard_mem17(4, 0);
     e_ldr_s(t, rn);
     e_dmb_ishld();
 }
 
 static void g_str_s(int t, int rn) {
+    if (rn == 17) emit_bus_guard_mem17(4, 0);
     e_dmb_ish();
     e_str_s(t, rn);
 }
@@ -728,6 +735,23 @@ static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7FFFF) << 5);
     emit_reload_full();
     e_ldr(address_register, 28, OFF_FAULT_ADDR);
+}
+
+static void emit_bus_guard_mem17(uint64_t size, int offset) {
+    if (!jit_guest_bus_active()) return;
+    if (offset == 0) {
+        emit_bus_guard(17, size, g_emit_gpc);
+        return;
+    }
+    if (offset > 0)
+        e_addi(16, 17, (unsigned)offset, 1);
+    else
+        e_subi(16, 17, (unsigned)-offset, 1);
+    emit_bus_guard(16, size, g_emit_gpc);
+    if (offset > 0)
+        e_subi(17, 16, (unsigned)offset, 1);
+    else
+        e_addi(17, 16, (unsigned)-offset, 1);
 }
 
 static void emit_exit_const(uint64_t rip, uint64_t reason) {
