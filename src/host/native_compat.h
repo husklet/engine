@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -28,6 +29,10 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/statfs.h>
@@ -74,24 +79,164 @@ struct kevent {
     (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),          \
                                 (uint32_t)(event_fflags), (intptr_t)(event_data), (void *)(event_udata)})
 
-/* This vocabulary is still required by the inherited macOS event implementation.
-   On Linux it is deliberately unavailable: an epoll/inotify/timerfd backend must
-   replace that implementation before those guest syscalls are advertised. */
+typedef struct hl_native_kregistration {
+    dev_t device;
+    ino_t inode;
+    int target;
+    int wake;
+    uint32_t read;
+    uint32_t write;
+    uint16_t flags;
+    void *udata;
+    struct hl_native_kregistration *next;
+} hl_native_kregistration;
+
+static pthread_mutex_t hl_native_klock = PTHREAD_MUTEX_INITIALIZER;
+static hl_native_kregistration *hl_native_kregistrations;
+
+static inline int hl_native_kidentity(int descriptor, dev_t *device, ino_t *inode) {
+    struct stat status;
+    if (fstat(descriptor, &status) != 0) return -1;
+    *device = status.st_dev;
+    *inode = status.st_ino;
+    return 0;
+}
+
+static inline hl_native_kregistration *hl_native_kfind(dev_t device, ino_t inode, int target) {
+    hl_native_kregistration *entry;
+    for (entry = hl_native_kregistrations; entry != NULL; entry = entry->next)
+        if (entry->device == device && entry->inode == inode && entry->target == target) return entry;
+    return NULL;
+}
+
 static inline int kqueue(void) {
-    errno = ENOTSUP;
-    return -1;
+    return epoll_create1(EPOLL_CLOEXEC);
 }
 
 static inline int kevent(int descriptor, const struct kevent *changes, int change_count, struct kevent *events,
                          int event_count, const struct timespec *timeout) {
-    (void)descriptor;
-    (void)changes;
-    (void)change_count;
-    (void)events;
-    (void)event_count;
-    (void)timeout;
-    errno = ENOTSUP;
-    return -1;
+    dev_t device;
+    ino_t inode;
+    int index;
+    if (hl_native_kidentity(descriptor, &device, &inode) != 0) return -1;
+    if (change_count < 0 || event_count < 0 || (change_count != 0 && changes == NULL) ||
+        (event_count != 0 && events == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&hl_native_klock);
+    for (index = 0; index < change_count; ++index) {
+        const struct kevent *change = &changes[index];
+        hl_native_kregistration *entry;
+        struct epoll_event event = {0};
+        int operation;
+        int target;
+        if (change->filter == EVFILT_VNODE || change->filter == EVFILT_TIMER) {
+            pthread_mutex_unlock(&hl_native_klock);
+            errno = ENOTSUP;
+            return -1;
+        }
+        if (change->filter != EVFILT_READ && change->filter != EVFILT_WRITE && change->filter != EVFILT_USER) {
+            pthread_mutex_unlock(&hl_native_klock);
+            errno = ENOTSUP;
+            return -1;
+        }
+        target = change->filter == EVFILT_USER ? -1 : (int)change->ident;
+        entry = hl_native_kfind(device, inode, target);
+        if (change->filter == EVFILT_USER && (change->fflags & NOTE_TRIGGER) != 0) {
+            uint64_t one = 1;
+            if (entry == NULL || write(entry->wake, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+                pthread_mutex_unlock(&hl_native_klock);
+                errno = entry == NULL ? ENOENT : errno;
+                return -1;
+            }
+            continue;
+        }
+        if ((change->flags & EV_DELETE) != 0) {
+            if (entry == NULL) {
+                pthread_mutex_unlock(&hl_native_klock);
+                errno = ENOENT;
+                return -1;
+            }
+            if (change->filter == EVFILT_READ) entry->read = 0;
+            else if (change->filter == EVFILT_WRITE) entry->write = 0;
+            else entry->read = 0;
+        } else if ((change->flags & EV_ADD) != 0) {
+            if (entry == NULL) {
+                entry = calloc(1, sizeof(*entry));
+                if (entry == NULL) {
+                    pthread_mutex_unlock(&hl_native_klock);
+                    errno = ENOMEM;
+                    return -1;
+                }
+                entry->device = device;
+                entry->inode = inode;
+                entry->target = target;
+                entry->wake = -1;
+                entry->next = hl_native_kregistrations;
+                hl_native_kregistrations = entry;
+            }
+            entry->flags = change->flags;
+            entry->udata = change->udata;
+            if (change->filter == EVFILT_READ) entry->read = 1;
+            else if (change->filter == EVFILT_WRITE) entry->write = 1;
+            else {
+                if (entry->wake < 0) entry->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                if (entry->wake < 0) {
+                    pthread_mutex_unlock(&hl_native_klock);
+                    return -1;
+                }
+                entry->read = 1;
+            }
+        } else {
+            continue;
+        }
+        event.events = (entry->read ? EPOLLIN : 0u) | (entry->write ? EPOLLOUT : 0u);
+        if ((entry->flags & EV_CLEAR) != 0) event.events |= EPOLLET;
+        if ((entry->flags & EV_ONESHOT) != 0) event.events |= EPOLLONESHOT;
+        event.data.ptr = entry;
+        operation = event.events == 0 ? EPOLL_CTL_DEL : EPOLL_CTL_MOD;
+        if (entry->wake >= 0) target = entry->wake;
+        int control = epoll_ctl(descriptor, operation, target, operation == EPOLL_CTL_DEL ? NULL : &event);
+        if (control != 0 && operation == EPOLL_CTL_MOD && errno == ENOENT) {
+            operation = EPOLL_CTL_ADD;
+            control = epoll_ctl(descriptor, operation, target, &event);
+        }
+        if (control != 0 && operation == EPOLL_CTL_ADD && errno == EEXIST) control = 0;
+        if (control != 0 && !(operation == EPOLL_CTL_DEL && errno == ENOENT)) {
+            pthread_mutex_unlock(&hl_native_klock);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&hl_native_klock);
+    if (event_count == 0) return 0;
+    {
+        struct epoll_event native_events[256];
+        int timeout_ms = -1;
+        int count;
+        if (event_count > 256) event_count = 256;
+        if (timeout != NULL) {
+            int64_t milliseconds = (int64_t)timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
+            timeout_ms = milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
+        }
+        count = epoll_wait(descriptor, native_events, event_count, timeout_ms);
+        if (count < 0) return -1;
+        for (index = 0; index < count; ++index) {
+            hl_native_kregistration *entry = native_events[index].data.ptr;
+            uint32_t ready = native_events[index].events;
+            int16_t filter = (ready & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0 ? EVFILT_READ : EVFILT_WRITE;
+            events[index] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target), filter, 0, 0,
+                                            0, entry->udata};
+            if ((ready & (EPOLLHUP | EPOLLRDHUP)) != 0) events[index].flags |= EV_EOF;
+            if ((ready & EPOLLERR) != 0) events[index].flags |= EV_ERROR;
+            if (entry->target < 0) {
+                uint64_t value;
+                (void)read(entry->wake, &value, sizeof(value));
+                events[index].filter = EVFILT_USER;
+            }
+        }
+        return count;
+    }
 }
 #define st_atimespec st_atim
 #define st_mtimespec st_mtim

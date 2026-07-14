@@ -845,7 +845,10 @@ LINUX_PRODUCTION_MATRIX_CASES := \
 	$(BUILD)/compat/posix/x86_64/waitstatus \
 	$(BUILD)/compat/signals/x86_64/signals_core \
 	$(BUILD)/compat/memory/x86_64/mprotect_enforce \
-	$(BUILD)/compat/posix/x86_64/mmapfile
+	$(BUILD)/compat/posix/x86_64/mmapfile \
+	$(BUILD)/compat/core/syscall/x86_64/epoll \
+	$(BUILD)/compat/core/syscall/x86_64/epoll_edge \
+	$(BUILD)/e2e/epoll_oneshot-x86_64
 
 $(BUILD)/tools/linux-matrix: tools/linux_matrix.c
 	@mkdir -p $(@D)
@@ -863,7 +866,10 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/posix/x86_64/waitstatus tests/compat/posix/expected/waitstatus.out 0 \
 		$(BUILD)/compat/signals/x86_64/signals_core tests/compat/signals/expected/signals_core.out 0 \
 		$(BUILD)/compat/memory/x86_64/mprotect_enforce tests/compat/memory/expected/mprotect_enforce.out 0 \
-		$(BUILD)/compat/posix/x86_64/mmapfile tests/compat/posix/expected/mmapfile.out 0
+		$(BUILD)/compat/posix/x86_64/mmapfile tests/compat/posix/expected/mmapfile.out 0 \
+		$(BUILD)/compat/core/syscall/x86_64/epoll tests/compat/core/syscall/expected/epoll.out 0 \
+		$(BUILD)/compat/core/syscall/x86_64/epoll_edge tests/compat/core/syscall/expected/epoll_edge.out 0 \
+		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
 	$(BUILD)/production/hl-remote-supervisor
