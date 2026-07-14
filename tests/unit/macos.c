@@ -6,6 +6,7 @@
 #include "transfer.h"
 #include "../../src/host/clock.h"
 #include "../../src/host/file.h"
+#include "../../src/host/system.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -66,6 +67,17 @@ static void *wait_for_process(void *opaque) {
     return NULL;
 }
 
+static size_t private_descriptor_count(void) {
+    hl_host_process_fd entries[1024];
+    size_t count = 0;
+    size_t private_count = 0;
+    HL_CHECK(hl_host_process_fds(getpid(), entries, 1024, &count));
+    HL_CHECK(count <= 1024);
+    for (size_t index = 0; index < count; ++index)
+        if ((entries[index].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0) private_count++;
+    return private_count;
+}
+
 int main(void) {
     hl_host_macos *host;
     hl_host_services services;
@@ -110,7 +122,10 @@ int main(void) {
                                                       HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
                                                       HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     {
+        size_t private_before = private_descriptor_count();
         hl_host_result pollset = services.event->create(services.context);
+        HL_CHECK(pollset.status == HL_STATUS_OK);
+        HL_CHECK(private_descriptor_count() == private_before + 1);
         hl_host_event_record event;
         uint64_t deadline;
         HL_CHECK(pollset.status == HL_STATUS_OK);
@@ -136,6 +151,7 @@ int main(void) {
                             services.clock->monotonic_ns(services.context).value + UINT64_C(100000000))
                      .value == 0);
         HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+        HL_CHECK(private_descriptor_count() == private_before);
     }
     {
         static const char payload[] = "shared-memory";

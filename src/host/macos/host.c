@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "hl/macos.h"
+#include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
 
@@ -634,6 +635,8 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
                                              uint32_t shared) {
     uint32_t index;
     hl_host_handle handle = 0;
+    if (descriptor >= 0) hl_host_process_fd_private_add(descriptor);
+    if (append_descriptor >= 0) hl_host_process_fd_private_add(append_descriptor);
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < HL_MACOS_FILE_CAPACITY; ++index) {
         hl_macos_file *file = &host->files[index];
@@ -649,6 +652,10 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
         }
     }
     pthread_mutex_unlock(&host->lock);
+    if (handle == 0) {
+        hl_host_process_fd_private_remove(descriptor);
+        hl_host_process_fd_private_remove(append_descriptor);
+    }
     return handle != 0 ? hl_macos_result(HL_STATUS_OK, handle, 0) : hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
 }
 
@@ -1117,6 +1124,8 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     }
     descriptor = file->descriptor;
     append_descriptor = file->append_descriptor;
+    hl_host_process_fd_private_remove(descriptor);
+    hl_host_process_fd_private_remove(append_descriptor);
     file->active = 0;
     file->shared = 0;
     file->descriptor = -1;
@@ -1246,8 +1255,10 @@ static hl_host_result hl_macos_directory_create(void *context) {
         return hl_macos_errno();
     }
     (void)fcntl(object->descriptor, F_SETFD, FD_CLOEXEC);
+    hl_host_process_fd_private_add(object->descriptor);
     hl_host_result result = hl_macos_directory_register(host, object);
     if (result.status != HL_STATUS_OK) {
+        hl_host_process_fd_private_remove(object->descriptor);
         close(object->descriptor);
         free(object);
     }
@@ -1393,6 +1404,7 @@ static hl_host_result hl_macos_directory_close(void *context, hl_host_handle ins
     final = --object->references == 0;
     pthread_mutex_unlock(&host->lock);
     if (final) {
+        hl_host_process_fd_private_remove(object->descriptor);
         close(object->descriptor);
         free(object);
     }
@@ -1420,6 +1432,7 @@ static hl_host_result hl_macos_transfer_register(hl_host_macos *host, int descri
         if (transfer->generation == 0) transfer->generation = 1;
         transfer->active = 1;
         transfer->descriptor = descriptor;
+        hl_host_process_fd_private_add(descriptor);
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_OK, hl_macos_handle(index, transfer->generation), 0);
     }
@@ -1436,6 +1449,7 @@ typedef struct hl_macos_transfer_wire {
 } hl_macos_transfer_wire;
 
 static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_counter_object *object, uint32_t rights);
+static hl_host_result hl_macos_transfer_close(void *context, hl_host_handle handle);
 
 static hl_host_result hl_macos_transfer_channel_pair(void *context) {
     hl_host_macos *host = context;
@@ -1455,6 +1469,7 @@ static hl_host_result hl_macos_transfer_channel_pair(void *context) {
     second = hl_macos_transfer_register(host, pair[1]);
     if (second.status != HL_STATUS_OK) {
         close(pair[1]);
+        (void)hl_macos_transfer_close(host, first.value);
         return second;
     }
     return hl_macos_result(HL_STATUS_OK, first.value, second.value);
@@ -1565,11 +1580,21 @@ static hl_host_result hl_macos_transfer_receive(void *context, hl_host_handle ch
         object->signal = received[index * 3u + 2u];
         object->shared = mmap(NULL, sizeof(*object->shared), PROT_READ | PROT_WRITE, MAP_SHARED, object->backing, 0);
         if (object->shared == MAP_FAILED) {
+            close(object->backing);
+            close(object->readable);
+            close(object->signal);
             free(object);
             return hl_macos_errno();
         }
         installed = hl_macos_counter_register(host, object, wire.rights[index]);
-        if (installed.status != HL_STATUS_OK) return installed;
+        if (installed.status != HL_STATUS_OK) {
+            munmap(object->shared, sizeof(*object->shared));
+            close(object->backing);
+            close(object->readable);
+            close(object->signal);
+            free(object);
+            return installed;
+        }
         attachments[index] =
             (hl_host_transfer_attachment){installed.value, HL_HOST_TRANSFER_KIND_COUNTER, wire.rights[index]};
     }
@@ -1591,6 +1616,7 @@ static hl_host_result hl_macos_transfer_close(void *context, hl_host_handle hand
     transfer->active = 0;
     transfer->descriptor = -1;
     pthread_mutex_unlock(&host->lock);
+    hl_host_process_fd_private_remove(descriptor);
     return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
@@ -1622,6 +1648,11 @@ static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_co
         counter->active = 1;
         counter->object = object;
         counter->rights = rights;
+        if (object->shared->references == 0) {
+            hl_host_process_fd_private_add(object->readable);
+            hl_host_process_fd_private_add(object->signal);
+            hl_host_process_fd_private_add(object->backing);
+        }
         object->shared->references++;
         handle = hl_macos_handle(index, counter->generation);
         break;
@@ -1909,6 +1940,9 @@ static hl_host_result hl_macos_counter_subscribe(void *context, hl_host_handle c
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     }
+    hl_host_process_fd_private_add(subscription->descriptor);
+    hl_host_process_fd_private_add(subscription->wake[0]);
+    hl_host_process_fd_private_add(subscription->wake[1]);
     return hl_macos_result(HL_STATUS_OK, ((uint64_t)subscription->generation << 32) | (uint64_t)(index + 1u), 0);
 }
 
@@ -1928,6 +1962,9 @@ static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle
     pthread_mutex_unlock(&host->lock);
     (void)write(subscription->wake[1], &byte, 1);
     (void)pthread_join(subscription->thread, NULL);
+    hl_host_process_fd_private_remove(subscription->wake[0]);
+    hl_host_process_fd_private_remove(subscription->wake[1]);
+    hl_host_process_fd_private_remove(subscription->descriptor);
     close(subscription->wake[0]);
     close(subscription->wake[1]);
     close(subscription->descriptor);
@@ -1968,6 +2005,9 @@ static hl_host_result hl_macos_counter_close(void *context, hl_host_handle handl
     final = --object->shared->references == 0;
     pthread_mutex_unlock(&host->lock);
     if (final) {
+        hl_host_process_fd_private_remove(object->readable);
+        hl_host_process_fd_private_remove(object->signal);
+        hl_host_process_fd_private_remove(object->backing);
         close(object->readable);
         close(object->signal);
         /* A descriptor already queued through SCM_RIGHTS may still map this object. */
@@ -1985,9 +2025,11 @@ static hl_host_result hl_macos_event_create(void *context) {
     uint32_t index;
     int descriptor = kqueue();
     if (descriptor < 0) return hl_macos_errno();
+    hl_host_process_fd_private_add(descriptor);
     EV_SET(&wake, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
     if (kevent(descriptor, &wake, 1, NULL, 0, NULL) != 0) {
         hl_host_result error = hl_macos_errno();
+        hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
         return error;
     }
@@ -2005,6 +2047,7 @@ static hl_host_result hl_macos_event_create(void *context) {
     }
     pthread_mutex_unlock(&host->lock);
     if (handle == HL_HOST_HANDLE_INVALID) {
+        hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
@@ -2203,6 +2246,7 @@ static hl_host_result hl_macos_event_close(void *context, hl_host_handle pollset
     event->descriptor = -1;
     memset(event->timers, 0, sizeof(event->timers));
     pthread_mutex_unlock(&host->lock);
+    hl_host_process_fd_private_remove(descriptor);
     return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
@@ -2458,6 +2502,9 @@ static hl_host_result hl_macos_fork_child(void *context) {
     for (uint32_t index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
         hl_macos_counter_subscription *subscription = &host->counter_subscriptions[index];
         if (!subscription->active) continue;
+        hl_host_process_fd_private_remove(subscription->descriptor);
+        hl_host_process_fd_private_remove(subscription->wake[0]);
+        hl_host_process_fd_private_remove(subscription->wake[1]);
         close(subscription->descriptor);
         close(subscription->wake[0]);
         close(subscription->wake[1]);
@@ -2480,6 +2527,7 @@ static hl_host_result hl_macos_fork_child(void *context) {
             break;
         }
         (void)fcntl(replacement, F_SETFD, FD_CLOEXEC);
+        hl_host_process_fd_private_add(replacement);
         for (uint32_t watch_index = 0; watch_index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++watch_index) {
             hl_macos_directory_watch *watch = &object->watches[watch_index];
             if (!watch->active) continue;
@@ -2489,12 +2537,14 @@ static hl_host_result hl_macos_fork_child(void *context) {
             EV_SET(&change, watch->descriptor, EVFILT_VNODE, flags, hl_macos_directory_native(watch->interests), 0,
                    (void *)(uintptr_t)watch->token);
             if (kevent(replacement, &change, 1, NULL, 0, NULL) != 0) {
+                hl_host_process_fd_private_remove(replacement);
                 close(replacement);
                 result = hl_macos_errno();
                 break;
             }
         }
         if (result.status != HL_STATUS_OK) break;
+        hl_host_process_fd_private_remove(object->descriptor);
         close(object->descriptor);
         object->descriptor = replacement;
     }

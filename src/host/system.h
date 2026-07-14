@@ -42,10 +42,12 @@ enum {
     HL_HOST_FD_PIPE = 2,
     HL_HOST_FD_SOCKET = 3,
 };
+enum { HL_HOST_PROCESS_FD_ENGINE_PRIVATE = 1u << 0 };
 
 typedef struct hl_host_process_fd {
     int32_t descriptor;
     uint32_t kind;
+    uint32_t flags;
 } hl_host_process_fd;
 
 typedef struct hl_host_process_peer {
@@ -60,6 +62,8 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info);
 
 /* Enumerate descriptor numbers. kind may remain OTHER until fd_read; count includes truncated entries. */
 int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count);
+void hl_host_process_fd_private_add(int descriptor);
+void hl_host_process_fd_private_remove(int descriptor);
 
 /* Query one open descriptor and, for files, copy its native absolute path without a trailing NUL. */
 int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,

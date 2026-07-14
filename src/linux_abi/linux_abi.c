@@ -1090,6 +1090,7 @@ static int64_t hl_linux_pread64_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entr
     const hl_host_file_services *files;
     hl_host_result result;
     if (ofd->status_flags & HL_LINUX_O_PATH) return -HL_LINUX_EBADF;
+    if ((ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_WRONLY) return -HL_LINUX_EBADF;
     if (size != 0 && buffer == NULL) return -HL_LINUX_EINVAL;
     files = hl_linux_files(linux_abi);
     if (files == NULL || files->read_at == NULL) return -HL_LINUX_ENOSYS;
@@ -1145,7 +1146,8 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_lock(linux_abi, ofd);
     files = hl_linux_files(linux_abi);
-    if (ofd->status_flags & HL_LINUX_O_PATH)
+    if ((ofd->status_flags & HL_LINUX_O_PATH) ||
+        (ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_WRONLY)
         result = -HL_LINUX_EBADF;
     else if (size != 0 && buffer == NULL)
         result = -HL_LINUX_EINVAL;

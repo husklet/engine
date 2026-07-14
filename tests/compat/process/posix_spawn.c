@@ -12,7 +12,7 @@ extern char **environ;
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "child") == 0) {
-        write(1, "spawned-child\n", 14);
+        if (write(1, "spawned-child\n", 14) != 14) return 8;
         return 7;
     }
     char out[128];

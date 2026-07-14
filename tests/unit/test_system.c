@@ -53,6 +53,7 @@ int main(void) {
     HL_CHECK(strstr(target, strrchr(temporary, '/') + 1) != NULL);
     HL_CHECK(hl_host_process_fd_read(getpid(), pipes[0], &descriptor, NULL, 0, &target_size));
     HL_CHECK(descriptor.kind == HL_HOST_FD_PIPE && target_size == 0);
+    hl_host_process_fd_private_add(pipes[0]);
     size_t descriptor_count = 0;
     HL_CHECK(hl_host_process_fds(getpid(), NULL, 0, &descriptor_count) && descriptor_count >= 3);
     hl_host_process_fd one_descriptor;
@@ -62,13 +63,17 @@ int main(void) {
     HL_CHECK(descriptors != NULL);
     HL_CHECK(hl_host_process_fds(getpid(), descriptors, descriptor_count, &observed_count));
     size_t visible = observed_count < descriptor_count ? observed_count : descriptor_count;
-    int saw_file = 0, saw_pipe = 0;
+    int saw_file = 0, saw_pipe = 0, saw_private = 0;
     for (size_t index = 0; index < visible; ++index) {
         if (descriptors[index].descriptor == file) saw_file = 1;
-        if (descriptors[index].descriptor == pipes[0]) saw_pipe = 1;
+        if (descriptors[index].descriptor == pipes[0]) {
+            saw_pipe = 1;
+            saw_private = (descriptors[index].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0;
+        }
     }
     free(descriptors);
-    HL_CHECK(saw_file && saw_pipe);
+    HL_CHECK(saw_file && saw_pipe && saw_private);
+    hl_host_process_fd_private_remove(pipes[0]);
     pid_t child = fork();
     HL_CHECK(child >= 0);
     if (child == 0) {

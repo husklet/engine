@@ -188,6 +188,7 @@ static void exec_close_cloexec(void) {
     for (size_t i = 0; i < got; i++) {
         int fd = fds[i].descriptor;
         if (exec_close_bound_cloexec(fd)) continue;
+        if ((fds[i].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0) continue;
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {

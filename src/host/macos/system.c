@@ -1,5 +1,20 @@
 #include "../system.h"
 
+#include <stdatomic.h>
+
+static _Atomic uint16_t hl_private_fds[1 << 20];
+void hl_host_process_fd_private_add(int fd) {
+    if (fd >= 0 && fd < (int)(sizeof hl_private_fds / sizeof *hl_private_fds))
+        (void)atomic_fetch_add_explicit(&hl_private_fds[fd], 1, memory_order_relaxed);
+}
+void hl_host_process_fd_private_remove(int fd) {
+    uint16_t value;
+    if (fd < 0 || fd >= (int)(sizeof hl_private_fds / sizeof *hl_private_fds)) return;
+    value = atomic_load_explicit(&hl_private_fds[fd], memory_order_relaxed);
+    while (value != 0 && !atomic_compare_exchange_weak_explicit(&hl_private_fds[fd], &value, value - 1,
+                                                                memory_order_relaxed, memory_order_relaxed)) {}
+}
+
 #include <libproc.h>
 #include <mach/host_info.h>
 #include <mach/mach_host.h>
@@ -139,6 +154,8 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     for (size_t index = 0; index < total && index < capacity; ++index) {
         entries[index].descriptor = native[index].proc_fd;
         entries[index].kind = hl_macos_fd_kind(native[index].proc_fdtype);
+        entries[index].flags = native[index].proc_fd < (int)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[native[index].proc_fd]
+                                   ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
     }
     free(native);
     *count = total;
@@ -162,6 +179,8 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
         if (length != 0) memcpy(path, info.pvip.vip_path, length);
         entry->descriptor = descriptor;
         entry->kind = HL_HOST_FD_FILE;
+        entry->flags = descriptor < (int32_t)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[descriptor]
+                           ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
         *path_size = length;
         return 1;
     }

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "hl/linux.h"
+#include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
 
@@ -212,6 +213,8 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
                                                int wake_descriptor) {
     uint32_t index;
     hl_host_handle handle = 0;
+    if (descriptor >= 0) hl_host_process_fd_private_add(descriptor);
+    if (wake_descriptor >= 0) hl_host_process_fd_private_add(wake_descriptor);
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < HL_LINUX_HANDLE_CAPACITY; ++index) {
         hl_linux_handle_entry *entry = &host->handles[index];
@@ -229,7 +232,11 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
         }
     }
     pthread_mutex_unlock(&host->lock);
-    if (handle == 0) return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    if (handle == 0) {
+        hl_host_process_fd_private_remove(descriptor);
+        hl_host_process_fd_private_remove(wake_descriptor);
+        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
     return hl_linux_result(HL_STATUS_OK, handle, 0);
 }
 
@@ -1128,6 +1135,8 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     entry->descriptor = -1;
     entry->wake_descriptor = -1;
     pthread_mutex_unlock(&host->lock);
+    hl_host_process_fd_private_remove(descriptor);
+    hl_host_process_fd_private_remove(wake_descriptor);
     result = close(descriptor);
     if (wake_descriptor >= 0) close(wake_descriptor);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
