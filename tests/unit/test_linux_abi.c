@@ -563,6 +563,10 @@ int main(void) {
     HL_CHECK(hl_linux_read(&linux_abi, duplicate, buffer, 1) == -HL_LINUX_EIO);
     HL_CHECK(file_host.offset == 4);
 
+    /* A host-side broken output stream must remain EPIPE at the public Linux API. */
+    file_host.next_status = HL_STATUS_DISCONNECTED;
+    HL_CHECK(hl_linux_write(&linux_abi, original, "x", 1) == -HL_LINUX_EPIPE);
+
     closed = HL_HOST_HANDLE_INVALID;
     HL_CHECK(hl_linux_fd_close(&linux_abi, original, &closed) == HL_STATUS_OK);
     HL_CHECK(closed == HL_HOST_HANDLE_INVALID);
@@ -723,7 +727,19 @@ int main(void) {
                       {HL_STATUS_IS_DIRECTORY, -HL_LINUX_EISDIR},
                       {HL_STATUS_NAME_TOO_LONG, -HL_LINUX_ENAMETOOLONG},
                       {HL_STATUS_SYMLINK_LOOP, -HL_LINUX_ELOOP},
-                      {HL_STATUS_READ_ONLY, -HL_LINUX_EROFS}};
+                      {HL_STATUS_READ_ONLY, -HL_LINUX_EROFS},
+                      {HL_STATUS_PROCESS_LIMIT, -HL_LINUX_EMFILE},
+                      {HL_STATUS_RESOURCE_LIMIT, -HL_LINUX_ENFILE},
+                      {HL_STATUS_CROSS_DEVICE, -HL_LINUX_EXDEV},
+                      {HL_STATUS_NOT_EMPTY, -HL_LINUX_ENOTEMPTY},
+                      {HL_STATUS_NO_SPACE, -HL_LINUX_ENOSPC},
+                      {HL_STATUS_QUOTA, -HL_LINUX_EDQUOT},
+                      {HL_STATUS_FILE_TOO_LARGE, -HL_LINUX_EFBIG},
+                      {HL_STATUS_TIMED_OUT, -HL_LINUX_ETIMEDOUT},
+                      {HL_STATUS_CONNECTION_REFUSED, -HL_LINUX_ECONNREFUSED},
+                      {HL_STATUS_CONNECTION_RESET, -HL_LINUX_ECONNRESET},
+                      {HL_STATUS_NETWORK_UNREACHABLE, -HL_LINUX_ENETUNREACH},
+                      {HL_STATUS_ADDRESS_IN_USE, -HL_LINUX_EADDRINUSE}};
 
         size_t i;
         for (i = 0; i < HL_ARRAY_COUNT(errors); ++i) {

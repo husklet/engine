@@ -311,7 +311,8 @@ static int vfs_host_error(hl_status status) {
     case HL_STATUS_NOT_FOUND: return -ENOENT;
     case HL_STATUS_PERMISSION_DENIED: return -EACCES;
     case HL_STATUS_ALREADY_EXISTS: return -EEXIST;
-    case HL_STATUS_RESOURCE_LIMIT: return -EMFILE;
+    case HL_STATUS_RESOURCE_LIMIT: return -ENFILE;
+    case HL_STATUS_PROCESS_LIMIT: return -EMFILE;
     case HL_STATUS_OUT_OF_MEMORY: return -ENOMEM;
     case HL_STATUS_INVALID_ARGUMENT: return -EINVAL;
     case HL_STATUS_NOT_DIRECTORY: return -ENOTDIR;

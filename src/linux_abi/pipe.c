@@ -18,6 +18,7 @@ static int64_t pipe_error(hl_host_result result) {
     case HL_STATUS_INTERRUPTED: return -HL_LINUX_EINTR;
     case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
     case HL_STATUS_RESOURCE_LIMIT: return -HL_LINUX_ENFILE;
+    case HL_STATUS_PROCESS_LIMIT: return -HL_LINUX_EMFILE;
     case HL_STATUS_INVALID_ARGUMENT: return -HL_LINUX_EINVAL;
     case HL_STATUS_NOT_SUPPORTED: return -HL_LINUX_ENOSYS;
     default: return -HL_LINUX_EIO;

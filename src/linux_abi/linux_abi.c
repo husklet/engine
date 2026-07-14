@@ -108,6 +108,18 @@ static int64_t hl_linux_error(hl_status status) {
     case HL_STATUS_READ_ONLY: return -HL_LINUX_EROFS;
     case HL_STATUS_ALREADY_EXISTS: return -HL_LINUX_EEXIST;
     case HL_STATUS_RESOURCE_LIMIT: return -HL_LINUX_ENFILE;
+    case HL_STATUS_PROCESS_LIMIT: return -HL_LINUX_EMFILE;
+    case HL_STATUS_DISCONNECTED: return -HL_LINUX_EPIPE;
+    case HL_STATUS_CROSS_DEVICE: return -HL_LINUX_EXDEV;
+    case HL_STATUS_NOT_EMPTY: return -HL_LINUX_ENOTEMPTY;
+    case HL_STATUS_NO_SPACE: return -HL_LINUX_ENOSPC;
+    case HL_STATUS_QUOTA: return -HL_LINUX_EDQUOT;
+    case HL_STATUS_FILE_TOO_LARGE: return -HL_LINUX_EFBIG;
+    case HL_STATUS_TIMED_OUT: return -HL_LINUX_ETIMEDOUT;
+    case HL_STATUS_CONNECTION_REFUSED: return -HL_LINUX_ECONNREFUSED;
+    case HL_STATUS_CONNECTION_RESET: return -HL_LINUX_ECONNRESET;
+    case HL_STATUS_NETWORK_UNREACHABLE: return -HL_LINUX_ENETUNREACH;
+    case HL_STATUS_ADDRESS_IN_USE: return -HL_LINUX_EADDRINUSE;
     case HL_STATUS_INVALID_ARGUMENT:
     case HL_STATUS_ABI_MISMATCH:
     case HL_STATUS_CORRUPT: return -HL_LINUX_EINVAL;
@@ -121,7 +133,10 @@ static int64_t hl_linux_error(hl_status status) {
 static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi) {
     const hl_host_services *host;
     if (linux_abi == NULL || (host = linux_abi->host) == NULL || (host->capabilities & HL_HOST_CAP_FILE) == 0 ||
-        host->file == NULL || host->file->abi != HL_HOST_FILE_ABI || host->file->size < sizeof(*host->file))
+        host->file == NULL ||
+        !((host->file->abi == HL_HOST_FILE_ABI_13 &&
+           host->file->size >= offsetof(hl_host_file_services, allocate_range)) ||
+          (host->file->abi == HL_HOST_FILE_ABI && host->file->size >= sizeof(*host->file))))
         return NULL;
     return host->file;
 }

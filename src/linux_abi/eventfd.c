@@ -25,6 +25,7 @@ static int64_t eventfd_error(hl_status status) {
     case HL_STATUS_PERMISSION_DENIED: return -HL_LINUX_EACCES;
     case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
     case HL_STATUS_RESOURCE_LIMIT: return -HL_LINUX_ENFILE;
+    case HL_STATUS_PROCESS_LIMIT: return -HL_LINUX_EMFILE;
     case HL_STATUS_NOT_SUPPORTED: return -HL_LINUX_ENOSYS;
     case HL_STATUS_INVALID_ARGUMENT: return -HL_LINUX_EINVAL;
     default: return -HL_LINUX_EIO;
