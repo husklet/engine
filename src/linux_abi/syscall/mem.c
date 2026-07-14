@@ -688,6 +688,11 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 gro_add(glo, ghi);
             else
                 gro_clear(glo, ghi);
+            // Making translated code writable is itself the guest's declaration that the bytes may change.
+            // Drop translations while the SMC page is still tracked, before the host protection below makes
+            // the store silent. This also covers 4K guest subpages where a 16K host mprotect is unsafe: the
+            // later lazy write fault may open the host page, but the stale translation is already gone.
+            if ((int)a2 & PROT_WRITE) G_SMC_UNMAP(physical_a0, physical_a0 + a1);
             // Enforce protections physically when the requested guest range starts at an independently
             // tracked mmap and host-page rounding stays inside that mapping's private guard allocation.
             // This is the safe 4K-guest/16K-host case: rounding a standalone 4K mmap to one 16K host page
