@@ -1,6 +1,7 @@
 /* Bridge opaque host-file bindings into the legacy native-fd guest runtime. */
 
 #include "../object.h"
+#include "../epoll.h"
 
 static int g_bound_sentinel = -1;
 
@@ -801,7 +802,17 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     if (nr == 21 && !source_bound) {
         hl_linux_fd_snapshot watched;
         if (bound_snapshot(a2, &watched)) {
-            G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+            int64_t epoll_result = -ENOSYS;
+            if (a1 == HL_LINUX_EPOLL_ADD && g_host_services != NULL && g_host_services->file != NULL &&
+                g_host_services->file->metadata != NULL) {
+                hl_host_file_metadata metadata;
+                hl_host_result status =
+                    g_host_services->file->metadata(g_host_services->context, watched.host_handle, &metadata);
+                if (status.status == HL_STATUS_OK &&
+                    (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY))
+                    epoll_result = -EPERM;
+            }
+            G_RET(c) = (uint64_t)epoll_result;
             return 1;
         }
     }
