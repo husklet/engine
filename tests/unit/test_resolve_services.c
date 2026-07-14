@@ -55,6 +55,15 @@ int main(void) {
     HL_CHECK(read.status == HL_STATUS_OK && read.value == 1 && value == 'x');
     HL_CHECK(services.file->close(services.context, resolved.target).status == HL_STATUS_OK);
     HL_CHECK(services.file->close(services.context, resolved.parent).status == HL_STATUS_OK);
+    /* open_beneath resolves an existing target before reopening it from the
+       pinned parent. Both temporary handles must be released on every call;
+       this count exceeds the handle capacity of both host implementations. */
+    for (size_t iteration = 0; iteration < 5000; ++iteration) {
+        read = services.file->open_beneath(services.context, root.value, "a/file", 6,
+                                           HL_HOST_FILE_READ, 0, 0, 0);
+        HL_CHECK(read.status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
+    }
     /* Resolving a FIFO is a metadata operation and must neither wait for a peer nor consume data. */
     alarm(2);
     HL_CHECK(services.file->resolve_beneath(services.context, root.value, "a/fifo", 6, 0, &resolved).status ==

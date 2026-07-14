@@ -1310,6 +1310,8 @@ static hl_host_result hl_linux_file_open_beneath(void *context, hl_host_handle r
     if (result.status != HL_STATUS_OK) return result;
     result = hl_linux_file_open(context, resolved.parent, resolved.final, resolved.final_size,
                                 access | HL_HOST_FILE_NOFOLLOW, creation, permissions);
+    if (resolved.target != HL_HOST_HANDLE_INVALID)
+        (void)hl_linux_close_descriptor(context, resolved.target);
     (void)hl_linux_close_descriptor(context, resolved.parent);
     return result;
 }

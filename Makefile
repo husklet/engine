@@ -1192,7 +1192,12 @@ $(BUILD)/tests/native-macos: tests/unit/test_native.c $(MAC_LIBS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos
+$(BUILD)/tests/resolve-services-macos: tests/unit/test_resolve_services.c $(BUILD)/mac/lib/libhl-host-macos.a
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_HOST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< \
+		$(BUILD)/mac/lib/libhl-host-macos.a -o $@
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/resolve-services-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
@@ -1201,6 +1206,7 @@ test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/direc
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 	$(MAC) $(abspath $(BUILD)/tests/system-macos)
 	$(MAC) $(abspath $(BUILD)/tests/native-macos)
+	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)
