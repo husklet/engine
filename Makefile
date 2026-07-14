@@ -5,6 +5,12 @@ BUILD ?= build
 HOST ?= linux
 DEBUG ?= 0
 MAC ?= mac
+PERF_WARMUPS ?= 3
+PERF_SAMPLES ?= 25
+PERF_HEAVY_SAMPLES ?= 7
+PERF_MAC_OS = $(shell $(MAC) uname -s)
+PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
+PERF_MAC_ARCH = $(shell $(MAC) uname -m)
 AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
 AARCH64_DYNAMIC_LOADER ?= /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
@@ -214,7 +220,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all linux-compile clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -1314,19 +1320,58 @@ $(BUILD)/tools/perf-runner: tools/perf_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
-perf-compat: e2e-compat $(BUILD)/tools/perf-runner
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/atomics-aarch64) 0 25
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/atomics-x86_64) 0 25
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/core/workload/aarch64/busyloop) 0 15
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/core/workload/x86_64/busyloop) 0 15
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/syscall/aarch64/gettid) 0 25
-	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/syscall/x86_64/gettid) 0 25
+$(BUILD)/perf/syscall-aarch64: tests/perf/syscall.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie $< -o $@
+
+$(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie $< -o $@
+
+define HL_PERF_ENGINE
+	$(BUILD)/tools/perf-runner --label $(1)-$(2) --host-os $(PERF_MAC_OS) \
+		--host-release $(PERF_MAC_RELEASE) --host-arch $(PERF_MAC_ARCH) \
+		--warmups $(3) --samples $(4) --expect $(6) -- \
+		$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-$(2)) $(abspath $(5))
+endef
+
+define HL_PERF_NATIVE
+	$(BUILD)/tools/perf-runner --label native-$(1)-aarch64 --warmups $(2) --samples $(3) --expect $(5) -- \
+		$(abspath $(4))
+endef
+
+# Keep the correctness gate explicit: standalone performance runs remain quick, while this target
+# proves the measured binaries still pass the complete compatibility matrix first.
+perf-compat: e2e-compat perf-macos
+
+perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
+	$(BUILD)/e2e/guest-exit-x86_64 $(BUILD)/compat/core/workload/aarch64/busyloop \
+	$(BUILD)/compat/core/workload/x86_64/busyloop $(BUILD)/compat/syscall/aarch64/gettid \
+	$(BUILD)/compat/syscall/x86_64/gettid $(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
+	$(BUILD)/compat/process/aarch64/forkstorm \
+	$(BUILD)/compat/process/x86_64/forkstorm
+	$(call HL_PERF_ENGINE,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
+	$(call HL_PERF_ENGINE,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
+	$(call HL_PERF_ENGINE,compute,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
+	$(call HL_PERF_ENGINE,compute,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/x86_64/busyloop,0)
+	$(call HL_PERF_ENGINE,syscall-startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/compat/syscall/aarch64/gettid,0)
+	$(call HL_PERF_ENGINE,syscall-startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/compat/syscall/x86_64/gettid,0)
+	$(call HL_PERF_ENGINE,syscall-1m,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-aarch64,0)
+	$(call HL_PERF_ENGINE,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
+	$(call HL_PERF_ENGINE,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
+	$(call HL_PERF_ENGINE,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
+
+# Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
+perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
+	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/syscall/aarch64/gettid \
+	$(BUILD)/perf/syscall-aarch64 $(BUILD)/compat/process/aarch64/forkstorm
+	@test "$$(uname -s)" = Linux && test "$$(uname -m)" = aarch64 || \
+		{ echo 'perf-native-aarch64 requires a Linux AArch64 host' >&2; exit 2; }
+	$(call HL_PERF_NATIVE,startup,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
+	$(call HL_PERF_NATIVE,compute,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
+	$(call HL_PERF_NATIVE,syscall-startup,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/compat/syscall/aarch64/gettid,0)
+	$(call HL_PERF_NATIVE,syscall-1m,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-aarch64,0)
+	$(call HL_PERF_NATIVE,fork-stress,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
 
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity
 
@@ -1452,6 +1497,8 @@ help:
 	@echo 'make compat-build  compile every Linux behavior fixture'
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
+	@echo 'make perf-macos    measure macOS-host engine startup, compute, syscall, and fork distributions'
+	@echo 'make perf-native-aarch64  measure matching native fixtures on Linux AArch64'
 	@echo 'make format-check  enforce the repository clang-format policy'
 
 # Compiler-generated prerequisites keep standalone objects synchronized with public and private headers.
