@@ -223,26 +223,39 @@ void hl_linux_watch_shutdown(hl_linux_watch_set *set) {
     pthread_mutex_unlock(&state->lock);
 }
 
-void hl_linux_watch_fork_prepare(hl_linux_watch_set *set) {
-    if (set != NULL && set->state != NULL) pthread_mutex_lock(&((watch_state *)set->state)->lock);
+hl_status hl_linux_watch_fork_prepare(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan) {
+    watch_state *state;
+    size_t index;
+    if (set == NULL || set->state == NULL || plan == NULL || (plan->capacity != 0 && plan->records == NULL))
+        return HL_STATUS_INVALID_ARGUMENT;
+    state = set->state;
+    pthread_mutex_lock(&state->lock);
+    plan->count = 0;
+    for (index = 0; index < state->count; ++index) {
+        watch_slot *slot = &state->slots[index];
+        if (slot->references == 0) continue;
+        if (plan->count == plan->capacity) {
+            pthread_mutex_unlock(&state->lock);
+            return HL_STATUS_RESOURCE_LIMIT;
+        }
+        plan->records[plan->count++] = (hl_linux_watch_fork_record){watch_token(index, slot->generation),
+                                                                    slot->device, slot->object};
+    }
+    return HL_STATUS_OK;
 }
 
 void hl_linux_watch_fork_parent(hl_linux_watch_set *set) {
     if (set != NULL && set->state != NULL) pthread_mutex_unlock(&((watch_state *)set->state)->lock);
 }
 
-hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_fn rebuild, void *opaque) {
+hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan,
+                                    hl_linux_watch_rebuild_fn rebuild, void *opaque) {
     watch_state *state;
-    hl_linux_watch_change *active;
-    size_t count = 0;
     size_t index;
-    if (set == NULL || set->state == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    if (set == NULL || set->state == NULL || plan == NULL || (plan->count != 0 && plan->records == NULL))
+        return HL_STATUS_INVALID_ARGUMENT;
     state = set->state;
-    active = state->count == 0 ? NULL : calloc(state->count, sizeof(*active));
-    if (state->count != 0 && active == NULL) {
-        pthread_mutex_unlock(&state->lock);
-        return HL_STATUS_OUT_OF_MEMORY;
-    }
     state->queued = 0;
     state->shutdown = 0;
     for (index = 0; index < state->count; ++index) {
@@ -253,13 +266,18 @@ hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebu
         if (slot->references == 0) continue;
         slot->generation++;
         if (slot->generation == 0) slot->generation = 1;
-        active[count++] = (hl_linux_watch_change){.token = watch_token(index, slot->generation),
-                                                  .device = slot->device, .object = slot->object};
     }
-    pthread_mutex_unlock(&state->lock);
+    /* Only the fork-preparing thread owned this mutex. Replace the inherited
+       locked bytes without calling pthread or allocator code in the child. */
+    memcpy(&state->lock, &fresh, sizeof(fresh));
+    for (index = 0; index < plan->count; ++index) {
+        uint32_t low = (uint32_t)plan->records[index].token;
+        size_t position = low == 0 ? SIZE_MAX : (size_t)(low - 1u);
+        if (position >= state->count || state->slots[position].references == 0) return HL_STATUS_PLATFORM_FAILURE;
+        plan->records[index].token = watch_token(position, state->slots[position].generation);
+    }
     if (rebuild != NULL)
-        for (index = 0; index < count; ++index)
-            rebuild(opaque, active[index].token, active[index].device, active[index].object);
-    free(active);
+        for (index = 0; index < plan->count; ++index)
+            rebuild(opaque, plan->records[index].token, plan->records[index].device, plan->records[index].object);
     return HL_STATUS_OK;
 }
