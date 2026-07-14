@@ -148,7 +148,7 @@ static void fdcache_unlock(void) {
 // Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
 // runs on the result, so existence/contents are never cached). A global epoch -- bumped by
 // service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
-// it in the fork child so a child never serves the parent's stale mappings. Kill: DD_NOPATHCACHE=1.
+// it in the fork child so a child never serves the parent's stale mappings.
 int rc_lookup(const char *g, char *out, size_t n);
 void rc_store(const char *g, const char *host);
 void res_bump(void);
@@ -371,12 +371,6 @@ void ac_evict(const char *p) {
 //     mapping the parent populated before the FS diverged.
 // g_res_epoch is defined up with the FS-metadata cache (the metadata caches' negative-entry gating
 // references it too); it is shared by these path-string caches and the metadata caches alike.
-// kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization. This gates
-// the rc_/ud_/udv_/dc_ path caches (and, via oc_enabled below, the oc_ open-resolution cache too).
-static int res_enabled(void) {
-    return 1;
-}
-
 // Bump the epoch -> the whole cache misses. Skip 0 (the reserved "never matches" stamp).
 // Locked under threads (same model as mc_*) so a bump can't race a concurrent lookup's epoch read.
 void res_bump(void) {
@@ -398,9 +392,8 @@ void res_bump(void) {
 //     so another engine process (docker exec) creating upper dirs invalidates this process's memo too.
 //   * fork/chroot hard reset via rc_reset() below.
 //   * volume paths are never stored (host-mutable backing; enforced at the overlay_lookup call site).
-//   * kill switch: DD_NOPATHCACHE=1 disables it together with the other path caches (res_enabled).
 int updirneg_lookup(const char *d) {
-    if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
+    if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
     uint64_t h = mc_hash(d);
@@ -411,7 +404,7 @@ int updirneg_lookup(const char *d) {
 }
 
 void updirneg_store(const char *d) {
-    if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return;
+    if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);
     struct udent *e = &g_ud[h & (UDCACHE_N - 1)];
@@ -436,10 +429,9 @@ void updirneg_store(const char *d) {
 // was removed, and a merged readdir/rmdir under an opaque-recreated parent leaks stale lower
 // entries. Correctness model is identical to the updirneg memo above: epoch-gated on the
 // container-shared g_res_epoch (every unlink/rmdir/rename/mkdir/whiteout/opaque bumps it, so a removal
-// instantly invalidates the memo), fork/chroot hard reset via rc_reset(), and DD_NOPATHCACHE=1 disables
-// it (overlay_dir_verdict then recomputes every call -- correct, just uncached).
+// instantly invalidates the memo), with a fork/chroot hard reset via rc_reset().
 int updirverdict_lookup(const char *d, int *verdict) {
-    if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
+    if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
     uint64_t h = mc_hash(d);
@@ -453,7 +445,7 @@ int updirverdict_lookup(const char *d, int *verdict) {
 }
 
 void updirverdict_store(const char *d, int verdict) {
-    if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return;
+    if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);
     struct udvent *e = &g_udv[h & (UDVCACHE_N - 1)];
@@ -491,14 +483,12 @@ void updirverdict_store(const char *d, int verdict) {
 //     entry -- same discipline as rc_/oc_/mc_ (COW/re-root hazard).
 //   * volume jails are NEVER cached (host-mutable backing): enforced by dc_jail_cacheable, which
 //     recognizes only the rootfs upper + the read-only image lowers by pointer identity.
-//   * kill switch: DD_NOPATHCACHE=1 (res_enabled), same switch as the other path caches.
 // resolve_at (the TOCTOU-safe open walk) additionally CONSUMES entries with canon == key && nmiss == 0:
 // such an entry proves every component of the key existed as a real, non-symlink directory (realpath
 // returning its input verbatim admits no symlink hop), which is precisely the condition under which
 // the lexical fast path and the per-component walk agree -- see the guard comments at that site.
 // No dir-fds are cached (path strings only), so there is no fd-exhaustion/LRU concern.
 int dc_jail_cacheable(const char *jcanon) {
-    if (!res_enabled()) return 0;
     const struct hl_linux_vfs_namespace *vfs = g_fdcache.binding.vfs;
     if (!vfs) return 0;
     if (jcanon == vfs->root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)
@@ -508,7 +498,7 @@ int dc_jail_cacheable(const char *jcanon) {
 }
 
 int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
-    if (!res_enabled() || !key || !key[0] || strlen(key) >= DC_KEYMAX) return 0;
+    if (!key || !key[0] || strlen(key) >= DC_KEYMAX) return 0;
     CLK;
     int hit = 0;
     uint64_t h = mc_hash(key);
@@ -525,7 +515,7 @@ int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
 }
 
 void dc_store(const char *key, const char *canon, int nmiss) {
-    if (!res_enabled() || !key || !key[0] || !canon || nmiss < 0 || nmiss > 0xffff) return;
+    if (!key || !key[0] || !canon || nmiss < 0 || nmiss > 0xffff) return;
     size_t cl = strlen(canon);
     if (strlen(key) >= DC_KEYMAX || cl >= DC_KEYMAX) return; // over-length: bypass, re-resolved safely
     CLK;
@@ -577,7 +567,7 @@ void rc_reset(void) {
 }
 
 int rc_lookup(const char *g, char *out, size_t n) {
-    if (!res_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct rcent *)0)->guest)) return 0;
+    if (!g || g[0] != '/' || strlen(g) >= sizeof(((struct rcent *)0)->guest)) return 0;
     CLK;
     int hit = 0;
     uint64_t h = mc_hash(g);
@@ -596,7 +586,7 @@ int rc_lookup(const char *g, char *out, size_t n) {
 }
 
 void rc_store(const char *g, const char *host) {
-    if (!res_enabled() || !g || g[0] != '/' || !host) return;
+    if (!g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
     size_t hl = strlen(host);
     if (strlen(g) >= sizeof(((struct rcent *)0)->guest) || hl >= sizeof(((struct rcent *)0)->host)) return;
@@ -692,7 +682,7 @@ static void oc_reset(void) {
 //
 // Mechanism: the daemon owns a 4-byte generation file, <dd-home>/containers/<cid>/fsgen, created before
 // the first engine of the container spawns and handed to EVERY engine of that container (run + exec +
-// health probe) as DD_FSGEN_FILE. The daemon atomically increments the mapped u32 AFTER completing any
+// health probe) as HL_FSGEN_FILE. The daemon atomically increments the mapped u32 AFTER completing any
 // external write; each engine process maps the SAME file MAP_SHARED (ctor below; fork children inherit
 // the mapping) and polls it once per syscall (dispatch.c service_local, before any handler can consult a
 // cache). On a change it drops ALL its caches via rc_reset() -- the same conservative fork-grade full

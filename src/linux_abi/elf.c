@@ -685,7 +685,7 @@ static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const 
         }
         if (p != MAP_FAILED) return p;
         if (t >= ELF_MAP_RETRIES) {
-            fprintf(stderr, "dd: load_elf: cannot map %s (%zu bytes) for the guest image: %s\n", what, len,
+            fprintf(stderr, "hl-engine: load_elf: cannot map %s (%zu bytes) for the guest image: %s\n", what, len,
                     strerror(errno));
             exit(1);
         }
@@ -792,7 +792,8 @@ static void load_elf(const char *path, struct loaded *out) {
     // (The x86-64 image is the x86_64 engine's job; the daemon/test harness route by the rootfs's arch.)
     uint16_t e_machine = rd16(f + 18);
     if (e_machine != 0xB7) { // EM_AARCH64
-        fprintf(stderr, "dd: %s: ELF e_machine=0x%x is not aarch64 (EM_AARCH64=0xb7) -- wrong engine for this image\n",
+        fprintf(stderr,
+                "hl-engine: %s: ELF e_machine=0x%x is not aarch64 (EM_AARCH64=0xb7) -- wrong engine for this image\n",
                 path, e_machine);
         exit(1);
     }
@@ -893,7 +894,7 @@ static void load_elf(const char *path, struct loaded *out) {
 extern char **environ;
 static char *g_guest_env[] = {
     // No TERM default: docker leaves TERM unset for a non-tty container and injects TERM=xterm (via the
-    // daemon's DD_GUEST_ENV) for a `-t` one. A hardcoded TERM=dumb here shadowed both -> node/debconf/ncurses
+    // daemon's HL_GUEST_ENV) for a `-t` one. A hardcoded TERM=dumb here shadowed both -> node/debconf/ncurses
     // degraded. Keep PATH/HOME/LANG as harmless fallbacks the image usually overrides.
     "PATH=/usr/bin:/bin", "HOME=/root", "LANG=C", "GLIBC_TUNABLES=glibc.cpu.aarch64_gcs=0", NULL,
 };
@@ -998,7 +999,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, argv[i], l);
         argp[i] = (uint64_t)top;
     }
-    free(gecopy); // the DD_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
+    free(gecopy); // the HL_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
     top -= 8;
     memcpy(top, "aarch64", 8);
     uint64_t plat = (uint64_t)top;

@@ -327,7 +327,7 @@ static int pidmap_to_guest(int live) {
     return live;
 }
 
-// `docker run --network none`: the daemon sets DD_NET_ISOLATE=1. The container is then LOOPBACK-ONLY — no
+// HL_NET_ISOLATE makes the guest loopback-only: no
 // eth0 is presented in the interface model (netlink RTM_GETLINK/GETADDR/GETROUTE dumps + SIOCGIFCONF in
 // netns.c, and /proc/net/dev·route + /sys/class/net in vfs.c), matching docker's `none` network (only lo).
 // Defined here (state.c is the FIRST container TU include) so both vfs.c and netns.c can consume it. Lazily
@@ -345,7 +345,7 @@ static int net_isolate(void) {
 // go-sockaddr / netlink (consul, minio, `ip`, ifconfig). To fix that coherently we model exactly two
 // interfaces -- lo (127.0.0.1/8, ::1) and eth0 (the container's bridge IP, or a stable synthetic
 // 172.17.0.2/16). This ONE model is consumed by the RTNETLINK responder (netns.c) and the procfs /
-// sysfs synthesis (vfs.c) so every path agrees. eth0's IPv4 is the bridge IP from DD_IP (set by the
+// sysfs synthesis (vfs.c) so every path agrees. eth0's IPv4 is the bridge IP from HL_IP (set by the
 // daemon for a bridged container); with no bridge (--network none/host) it falls back to the synthetic.
 // Returns the address as a network-order u32 held in host byte order (a | b<<8 | c<<16 | d<<24), the
 // same encoding netns.c's br_parse_ip produces and /proc/net/route prints with %08X.
@@ -687,7 +687,7 @@ static uint16_t pm_host(uint16_t c) {
 static void parse_publish(const char *s) {
     while (s && *s) {
         if (g_nportmap >= 32) {
-            fprintf(stderr, "dd: too many DD_PUBLISH entries (max 32)\n");
+            fprintf(stderr, "hl-engine: too many HL_PUBLISH entries (max 32)\n");
             exit(2);
         }
         const char *colon = strchr(s, ':');

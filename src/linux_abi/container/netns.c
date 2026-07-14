@@ -797,8 +797,8 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // ---- NET bridge (2A "virtual switch"): per-USER-NETWORK rendezvous for container<->container traffic.
 // Generalizes the loopback redirect from "127/8 -> per-container dir" to "this user network's subnet ->
 // SHARED per-network dir". A guest TCP socket whose peer is ANOTHER container's IP on the same user
-// network (same /16 as our own DD_IP, and not 127/8) is routed to an AF_UNIX socket at
-//   /tmp/.ddbr-<DD_NETBR>/<ip>:<port>
+// network (same /16 as our own HL_IP, and not 127/8) is routed to an AF_UNIX socket at
+//   /tmp/.ddbr-<HL_NETBR>/<ip>:<port>
 // The listening container (bind 0.0.0.0:<port> or its own IP) LISTENS on /tmp/.ddbr-<netid>/<ownip>:<port>;
 // a peer connect(<ownip>:<port>) dials the same path. Because every container on the host is a JIT
 // process under the same user, the two AF_UNIX endpoints rendezvous with no bridge / TUN / root. The dir
@@ -900,7 +900,7 @@ static uint32_t br_parse_ip(const char *s) {
 }
 
 // Lazy, self-contained env ingestion (mirrors the net_isolate getenv pattern in service.c case 203), so
-// the bridge needs no edit to the per-target startup code: DD_NETBR=<netid>, DD_IP=<dotted-quad>.
+// the bridge needs no edit to the per-target startup code: HL_NETBR=<netid>, HL_IP=<dotted-quad>.
 static void br_init(void) {
     if (g_br_init) return;
     g_br_init = 1;
@@ -1177,7 +1177,7 @@ static int switch_dial(const char *path) {
 }
 
 // Is the daemon owning the process-independent host->container TCP forwarder? When set
-// (DD_PUBLISH_DAEMON=1), the engine must NOT open its own in-process host AF_INET listener — that listener
+// (HL_PUBLISH_DAEMON=1), the engine must NOT open its own in-process host AF_INET listener — that listener
 // lived in whichever guest process called listen(), so a prefork / re-listening server tore it down on
 // every rebind and two guest processes raced EADDRINUSE. The daemon's listener (dd-daemon/containers/
 // ports.rs) outlives every guest process and dials this container's switch inode per connection instead.
@@ -1562,7 +1562,7 @@ static int sa_m2l(const struct sockaddr *m, uint8_t *g, socklen_t gcap) {
 }
 
 // ---- Per-workspace VPN egress redirect (docs/VPN.md option b) ---------------------------------------
-// When DD_EGRESS_SOCKS="host:port" is armed, the guest's genuine external TCP connect()s are funneled
+// When HL_EGRESS_SOCKS="host:port" is armed, the guest's genuine external TCP connect()s are funneled
 // through that SOCKS5 proxy (the front-end of a per-workspace userspace tunnel) instead of dialing the
 // destination directly from the host's default routing domain. When the env var is ABSENT the whole
 // feature is inert: egress_should_redirect() returns 0 up front and net.c runs its normal, byte-for-byte
@@ -1607,7 +1607,7 @@ static int egress_should_redirect(const struct sockaddr *m) {
 // embedded DNS which also serves AAAA on a v4-only network — the guest learns the v6 addr, tries it, and is
 // bounced instantly. Loopback (::1 -> private lo), link-local, unspecified, and the bridge/DNS classes are
 // all peeled off before the direct-connect site, so only true external v6 reaches this predicate.
-// Gate NOV6UNREACH=1 restores the old host-passthrough for A/B. When DD_EGRESS_SOCKS is armed the v6 dest is
+// When HL_EGRESS_SOCKS is armed the v6 destination is
 // tunneled through the proxy instead (egress_should_redirect handles AF_INET6), so this is consulted only on
 // the direct path, after that redirect has had its chance.
 static int v6_no_route(const struct sockaddr *m) {
@@ -1641,7 +1641,7 @@ static int egress_io_read(int fd, void *buf, size_t n) {
     return 0;
 }
 // Perform a SOCKS5 CONNECT to the macOS destination `m` over the guest socket `fd`, dialing the proxy in
-// DD_EGRESS_SOCKS. Returns 0 (fd now relayed to the real dest through the tunnel) or -1/errno mirroring
+// HL_EGRESS_SOCKS. Returns 0 (fd now relayed to the real dest through the tunnel) or -1/errno mirroring
 // connect(). The guest fd is put in blocking mode for the short handshake and its O_NONBLOCK is restored
 // after (a non-blocking guest that we return 0 to simply sees connect() complete immediately — legal).
 static int egress_connect(int fd, const struct sockaddr *m, socklen_t mlen) {
@@ -1774,7 +1774,7 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
 }
 
 // ---- abstract-namespace AF_UNIX (sun_path[0]=='\0'): macOS has no abstract namespace, so map the
-// abstract name to a real filesystem socket under a per-namespace dir keyed by DD_NETNS (same key as
+// abstract name to a real filesystem socket under a per-namespace dir keyed by HL_NETNS (same key as
 // ipc_ns_key), so two guests in one container rendezvous and different containers stay isolated. The
 // guest socket is already a real host AF_UNIX socket (case 198), so only the ADDRESS is rewritten.
 static char g_absdir[200];
@@ -2359,7 +2359,7 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 static uint8_t g_dns_sock[DD_NFD]; // fd -> 1 if this fd is an intercepted, socketpair-backed DNS socket
 static int g_dns_peer[DD_NFD];     // fd -> engine-held socketpair end we write synthesized responses into
 
-// DNS interception is off under --network none (DD_NET_ISOLATE): Docker's null network has no resolver, so
+// DNS interception is off under HL_NET_ISOLATE: the isolated network has no resolver, so
 // :53 to 127.0.0.11 is left to fall through to the (dead) host loopback and name resolution fails, matching.
 static int g_dns_off = -1;
 
@@ -2547,7 +2547,7 @@ static int dns_answer_ptr(const char *qname, uint8_t *a, int ao, int cap, int *p
 // Returns 1 + fills *ip_be (network byte order) on a case-insensitive name match; 0 otherwise.
 static int dns_local_lookup(const char *qname, uint32_t *ip_be) {
     if (!qname || !qname[0]) return 0;
-    br_init(); // ensure g_netbr is populated from DD_NETBR (idempotent)
+    br_init(); // ensure g_netbr is populated from HL_NETBR (idempotent)
     if (!g_netbr[0]) return 0;
     char path[256];
     snprintf(path, sizeof path, "%s/.names", g_netbr);

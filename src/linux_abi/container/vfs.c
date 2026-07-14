@@ -924,7 +924,7 @@ static int jail_pick(const char *abs, const char **canon, size_t *clen, const ch
 // Memoizes confine_in_m's realpath climb per DIRECTORY: key = the exact pre-realpath host string
 // (jail canon + normalized rel, final component peeled in nofollow mode); value = (canonical deepest
 // EXISTING prefix, #trailing components missing). Epoch-gated on the container-shared g_res_epoch,
-// hard-reset on fork/chroot (rc_reset), volumes never cached, DD_NOPATHCACHE=1 kills it. See the full
+// hard-reset on fork/chroot (rc_reset), and volumes are never cached. See the full
 // correctness model at the impl. DC_KEYMAX bounds the fixed-size slots (longer paths bypass, safely).
 #define DC_KEYMAX 320
 
@@ -1714,7 +1714,7 @@ static void set_guest_environ(const char *const *env, int envc) {
 static int proc_environ_text(char *b, size_t n) {
     int o = 0;
     // Prefer the FINAL environment build_stack placed (== getenv), so procfs and getenv agree; this includes
-    // the engine defaults (HOME/LANG/GLIBC_TUNABLES) the raw DD_GUEST_ENV path below omitted.
+    // the engine defaults (HOME/LANG/GLIBC_TUNABLES) the raw HL_GUEST_ENV path below omitted.
     if (g_self_environ_len > 0) {
         int L = g_self_environ_len > (int)n ? (int)n : g_self_environ_len;
         memcpy(b, g_self_environ, (size_t)L);
@@ -5073,7 +5073,7 @@ static void container_populate_dev(void) {
     // GPU rung 2 (opt-in): a /dev/dri directory with card0 + renderD128 placeholder nodes so opendir/
     // readdir (libdrm's drmGetDevices2 enumeration) lists them via the real overlay; stat()/open() of the
     // two nodes are intercepted (drm_synth_stat -> char dev 226:0/226:128, fs.c open -> render-node tag).
-    // Inert unless DD_GPU_IOSURFACE is set (existing workloads never see /dev/dri).
+    // Inert unless HL_GPU_IOSURFACE is set (other workloads never see /dev/dri).
     if (gpu_iosurface_on()) {
         mkdir(DEVP("dri"), 0755);
         static const char *const dri[] = {"card0", "renderD128"};

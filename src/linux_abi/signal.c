@@ -21,12 +21,12 @@ static struct {
 // Go's scheduler asynchronously preempts a running goroutine by sending itself SIGURG (23) and injecting a
 // call to runtime.asyncPreempt from the signal handler. For an EXTERNALLY-LINKED / cgo (runtime.iscgo==1)
 // aarch64 Go binary, delivering SIGURG into the guest crashes it -- but NOT via a sigframe/SP overlap (that
-// hypothesis was investigated with the go_cgo_stackgrow_arm fixture under DD_SIGURG=deliver + CRASHDBG and
+// hypothesis was investigated with the go_cgo_stackgrow_arm fixture and
 // DISPROVEN: build_signal_frame captures a correct, consistent guest SP/PC/LR and the frame sits strictly
-// below SP). The real defect is ASYNC-PREEMPT SAFETY: dd delivers the caught signal at TRANSLATION-BLOCK
+// below SP). The real defect is ASYNC-PREEMPT SAFETY: the engine delivers the caught signal at translation-block
 // boundaries (the cpu->irq poll), which do NOT coincide with Go's compiler-inserted async-safe points. Go's
 // own guard (doSigPreempt -> isAsyncSafePoint / canPreemptM) is meant to no-op an unsafe delivery, but under
-// dd's non-PIE HIGH-bias translation the interaction with Go's stack-growth machinery corrupts state: the
+// the engine's non-PIE high-bias translation the interaction with Go's stack-growth machinery corrupts state: the
 // fixture's crash lands squarely in runtime.copystack / runtime.adjustframe / (*stkframe).getStackMap with
 // `fatal error: wirep: already in go` and `untyped locals` (a stack-map/scheduler invariant violation), i.e.
 // an async preempt injected around a stack copy rewrites a frame's return address / pointer. A correct fix
@@ -39,12 +39,11 @@ static struct {
 // Scoped TIGHTLY on purpose: g_go_iscgo (set once by the aarch64 load_elf in os/linux/elf.c) is 1 ONLY for a
 // cgo-enabled aarch64 Go main image. It stays 0 for non-Go guests (some legitimately use SIGURG for OOB TCP
 // data), for internal-linked / CGO_ENABLED=0 Go, and for the entire x86 engine (that TU never includes the
-// aarch64 elf.c, and no x86 path sets it). Env override DD_SIGURG forces it: `drop`/`off` = always suppress,
-// `deliver`/`async`/`on` = always deliver (disable the mitigation); legacy DDDBG_DROPURG=1 = force suppress.
+// aarch64 elf.c, and no x86 path sets it).
 int g_go_iscgo; // 1 iff the loaded aarch64 main image is a cgo (iscgo) Go binary; owned here, set by load_elf
 
-// Should SIGURG (Go async-preempt) delivery be dropped for this process? Env override wins; else auto on the
-// detected iscgo class. Env is parsed once (it never changes); g_go_iscgo is fixed before any signal fires.
+// Should SIGURG (Go async-preempt) delivery be dropped for this process? The detected iscgo class is fixed
+// before any signal fires.
 static int sigurg_drop_enabled(void) {
     return g_go_iscgo ? 1 : 0;
 }

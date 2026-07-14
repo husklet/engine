@@ -40,7 +40,7 @@ static void exec_forward_env(uint64_t envp_guest) {
         size_t el = strlen(e);
         // '\n' is HL_GUEST_ENV's record separator, but Linux permits newline (and any non-NUL byte) inside an
         // env value. Escape '\\'->"\\\\" and '\n'->"\\n" so a raw '\n' only ever marks a record boundary;
-        // build_stack unescapes when DD_GUEST_ENV_ESC=1. Worst case each byte becomes 2 -> reserve 2*el+2.
+        // build_stack unescapes when HL_GUEST_ENV_ESC=1. Worst case each byte becomes 2 -> reserve 2*el+2.
         if (len + 2 * el + 2 > cap) {
             cap = (len + 2 * el + 2) * 2;
             char *nb = realloc(buf, cap);
@@ -189,17 +189,9 @@ static void exec_close_cloexec(void) {
 
 // ---- fork child-side engine hooks (shared by clone/case-220 and clone3/case-435) -----------------
 // Everything the CHILD must reset before it re-enters guest code. Factored so the two fork sites can
-// never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop), and instrumented:
-// fork-cost histogram (DD_FORKPROF=1, read once) prints one stderr line per fork with per-hook wall-ns
-// deltas so a regression in the fork path is measurable, at zero cost when unset.
-static int forkprof_on(void) {
-    return 0;
-}
+// never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop).
 
 static void fork_child_hooks(struct cpu *c) {
-    uint64_t t[6] = {0};
-    int fp = forkprof_on();
-    if (fp) t[0] = now_ns();
     // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
     // so the child's first run_block can instruction-abort fetching from the (non-executable) code
     // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
@@ -221,16 +213,13 @@ static void fork_child_hooks(struct cpu *c) {
     // path (single-threaded parent, or the MAP_JIT fallback) the cache VA and content are unchanged,
     // so the inherited g_xibtc stays valid and is kept warm.
     if (g_dualmap && !g_fork_preserved) G_SHADOW_CLEAR(c);
-    if (fp) t[1] = now_ns();
     rc_reset(); // S2: invalidate the inherited (COW) path/metadata caches so the child can never serve
                 // an entry the parent populated before the FS diverged (generation bump; see fscache.c)
-    if (fp) t[2] = now_ns();
     g_ndirs = 0;                 // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                                  // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
     kqueue_rebuild_after_fork(); // macOS kqueue() fds (epoll/timerfd/inotify) don't survive fork ->
                                  // rebuild them so the child doesn't EBADF on its inherited event fds
                                  // (also reinits g_ep_mtx, inherited-locked if a peer forked mid-epoll)
-    if (fp) t[3] = now_ns();
     thread_after_fork();    // reset process-private thread/futex locks a dead peer may have held at fork
     seq_wrote_after_fork(); // a forked child has WRITTEN to none of its inherited SEQPACKET/pipe ends yet:
                             // clear the "wrote" table so a bystander child closing an inherited IPC channel
@@ -245,14 +234,6 @@ static void fork_child_hooks(struct cpu *c) {
     mlk_reset();            // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
     dd_gpu_after_fork();    // GPU rung 2: this child can no longer create/map an IOSurface (fork-unsafe) —
                             // it may only reuse the pre-fork, VM_INHERIT_SHARE'd IOSurface pool it inherited
-    if (fp) t[4] = now_ns();
-    if (fp) {
-        t[5] = now_ns();
-        fprintf(stderr, "[forkprof] child jit=%llu rc=%llu kq=%llu locks=%llu total=%llu ns preserved=%d rw=%p rx=%p\n",
-                (unsigned long long)(t[1] - t[0]), (unsigned long long)(t[2] - t[1]), (unsigned long long)(t[3] - t[2]),
-                (unsigned long long)(t[4] - t[3]), (unsigned long long)(t[5] - t[0]), g_fork_preserved, (void *)g_cache,
-                J_RX(g_cache));
-    }
 }
 
 // ---- runtime credential overlay (USER ns) -------------------------------------------------------
@@ -1379,7 +1360,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         memf_materialize_all();
         sigexit_init(); // create the shared guest-signal-death relay in the PARENT before forking, so
                         // this child (and its descendants) inherit the same MAP_SHARED page it may die into.
-        uint64_t fk0 = forkprof_on() ? now_ns() : 0; // parent-side fork latency (DD_FORKPROF=1)
         pid_t pid = fork();
         if (pid == 0) {
             // clone(CLONE_VM, child_stack): glibc posix_spawn/popen/vfork pass a separate child stack in a1
@@ -1394,8 +1374,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // that read the child tid from these slots saw stale memory.
             if ((a0 & 0x01000000) && a4) *(int *)a4 = (int)getpid();
             if (a0 & 0x00200000) c->ctid = a4;
-        } else if (fk0) {
-            fprintf(stderr, "[forkprof] parent fork()=%llu ns\n", (unsigned long long)(now_ns() - fk0));
         }
         // CLONE_PIDFD(0x1000): the kernel stores a pidfd for the new child at the address in `parent_tid`
         // (a2, the aarch64 clone slot). macOS has no pidfd, so mint a kqueue that fires on the child's exit
@@ -1534,9 +1512,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         argv[ac] = NULL;
         // Forward the guest's ACTUAL environment across the exec: build_stack rebuilds the new process env
-        // from DD_GUEST_ENV, so serialize envp (a2) into it NOW while guest memory is still mapped. A guest
+        // from HL_GUEST_ENV, so serialize envp (a2) into it NOW while guest memory is still mapped. A guest
         // that set/modified env vars (FOO=bar, a tweaked PATH) thus sees them survive; a NULL envp keeps the
-        // container's DD_GUEST_ENV defaults (a2 is NOT rebased by the dispatch redirect, unlike a0/a1).
+        // container's HL_GUEST_ENV defaults (a2 is NOT rebased by the dispatch redirect, unlike a0/a1).
         exec_forward_env(a2);
         // Capture the guest-absolute exec path NOW (a0 is still mapped) so /proc/self/exe can name the new
         // image after the teardown below. ld.so resolves a binary's $ORIGIN (DT_RUNPATH) via readlink of
