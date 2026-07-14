@@ -794,6 +794,142 @@ static hl_host_result hl_fake_watch_close(void *context, hl_host_handle handle) 
     return hl_fake_result(fake, 0);
 }
 
+static int hl_fake_stream_index(const hl_fake_host *fake, hl_host_handle handle) {
+    uint32_t index;
+    for (index = 0; index < 16; ++index)
+        if (fake->stream_handles[index] == handle) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_stream_pipe_pair(void *context, uint32_t flags) {
+    hl_fake_host *fake = context;
+    uint32_t first, second, object;
+    if ((flags & ~(uint32_t)HL_HOST_STREAM_NONBLOCK) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (first = 0; first < 16 && fake->stream_handles[first] != 0; ++first) {}
+    for (second = first + 1; second < 16 && fake->stream_handles[second] != 0; ++second) {}
+    for (object = 0; object < 8 && fake->stream_sizes[object] != 0; ++object) {}
+    if (first == 16 || second == 16 || object == 8)
+        return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->stream_handles[first] = ++fake->next_handle;
+    fake->stream_handles[second] = ++fake->next_handle;
+    fake->stream_objects[first] = (uint8_t)object;
+    fake->stream_objects[second] = (uint8_t)object;
+    fake->stream_write_ends[second] = 1;
+    fake->stream_flags[first] = flags;
+    fake->stream_flags[second] = flags;
+    /* UINT16_MAX marks an allocated empty stream. */
+    fake->stream_sizes[object] = UINT16_MAX;
+    return (hl_host_result){HL_STATUS_OK, 0, fake->stream_handles[first], fake->stream_handles[second]};
+}
+
+static hl_host_result hl_fake_stream_set_status_flags(void *context, hl_host_handle stream, uint32_t flags) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_stream_index(fake, stream);
+    if (index < 0 || (flags & ~(uint32_t)HL_HOST_STREAM_NONBLOCK) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->stream_flags[index] = flags;
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_stream_read(void *context, hl_host_handle stream, hl_host_bytes output) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_stream_index(fake, stream);
+    uint32_t size, count;
+    if (index < 0 || fake->stream_write_ends[index] || (output.size != 0 && output.data == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    size = fake->stream_sizes[fake->stream_objects[index]];
+    size = size == UINT16_MAX ? 0 : size;
+    if (size == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    count = output.size < size ? (uint32_t)output.size : size;
+    memcpy(output.data, fake->stream_data[fake->stream_objects[index]], count);
+    memmove(fake->stream_data[fake->stream_objects[index]], fake->stream_data[fake->stream_objects[index]] + count,
+            size - count);
+    fake->stream_sizes[fake->stream_objects[index]] = size == count ? UINT16_MAX : (uint16_t)(size - count);
+    return hl_fake_result(fake, count);
+}
+
+static hl_host_result hl_fake_stream_write(void *context, hl_host_handle stream, hl_host_const_bytes input) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_stream_index(fake, stream);
+    uint32_t size, count;
+    if (index < 0 || !fake->stream_write_ends[index] || (input.size != 0 && input.data == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    size = fake->stream_sizes[fake->stream_objects[index]];
+    size = size == UINT16_MAX ? 0 : size;
+    count = input.size < 1024u - size ? (uint32_t)input.size : 1024u - size;
+    if (count == 0 && input.size != 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    memcpy(fake->stream_data[fake->stream_objects[index]] + size, input.data, count);
+    fake->stream_sizes[fake->stream_objects[index]] = (uint16_t)(size + count);
+    return hl_fake_result(fake, count);
+}
+
+static hl_host_result hl_fake_stream_duplicate(void *context, hl_host_handle stream) {
+    hl_fake_host *fake = context;
+    int source = hl_fake_stream_index(fake, stream);
+    uint32_t slot;
+    if (source < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (slot = 0; slot < 16 && fake->stream_handles[slot] != 0; ++slot) {}
+    if (slot == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->stream_handles[slot] = ++fake->next_handle;
+    fake->stream_objects[slot] = fake->stream_objects[source];
+    fake->stream_write_ends[slot] = fake->stream_write_ends[source];
+    fake->stream_flags[slot] = fake->stream_flags[source];
+    return hl_fake_result(fake, fake->stream_handles[slot]);
+}
+
+static hl_host_result hl_fake_stream_close(void *context, hl_host_handle stream) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_stream_index(fake, stream);
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    uint8_t object = fake->stream_objects[index];
+    fake->stream_handles[index] = 0;
+    fake->stream_objects[index] = 0;
+    fake->stream_write_ends[index] = 0;
+    for (uint32_t rest = 0; rest < 16; ++rest)
+        if (fake->stream_handles[rest] != 0 && fake->stream_objects[rest] == object) return hl_fake_result(fake, 0);
+    fake->stream_sizes[object] = 0;
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_stream_readiness(void *context, hl_host_handle stream, uint32_t interests) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_stream_index(fake, stream);
+    uint32_t ready = 0, size;
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    size = fake->stream_sizes[fake->stream_objects[index]];
+    size = size == UINT16_MAX ? 0 : size;
+    if (!fake->stream_write_ends[index] && size != 0) ready |= HL_HOST_READY_READ;
+    if (fake->stream_write_ends[index] && size < 1024) ready |= HL_HOST_READY_WRITE;
+    return hl_fake_result(fake, ready & interests);
+}
+
+static hl_host_result hl_fake_stream_move(void *context, hl_host_handle source, uint64_t source_offset,
+                                          hl_host_handle destination, uint64_t destination_offset, uint64_t size,
+                                          uint32_t flags) {
+    hl_fake_host *fake = context;
+    int input = hl_fake_stream_index(fake, source), output = hl_fake_stream_index(fake, destination);
+    uint32_t input_size, output_size, count;
+    (void)source_offset;
+    (void)destination_offset;
+    if (input < 0 || output < 0 || fake->stream_write_ends[input] || !fake->stream_write_ends[output] || flags != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    input_size = fake->stream_sizes[fake->stream_objects[input]];
+    output_size = fake->stream_sizes[fake->stream_objects[output]];
+    input_size = input_size == UINT16_MAX ? 0 : input_size;
+    output_size = output_size == UINT16_MAX ? 0 : output_size;
+    count = size < input_size ? (uint32_t)size : input_size;
+    if (count > 1024u - output_size) count = 1024u - output_size;
+    if (count == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    memcpy(fake->stream_data[fake->stream_objects[output]] + output_size,
+           fake->stream_data[fake->stream_objects[input]], count);
+    memmove(fake->stream_data[fake->stream_objects[input]], fake->stream_data[fake->stream_objects[input]] + count,
+            input_size - count);
+    fake->stream_sizes[fake->stream_objects[input]] = input_size == count ? UINT16_MAX : (uint16_t)(input_size - count);
+    fake->stream_sizes[fake->stream_objects[output]] = (uint16_t)(output_size + count);
+    return hl_fake_result(fake, count);
+}
+
 void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object,
                              uint64_t size, uint32_t changes) {
     for (uint32_t index = 0; index < 16; ++index) {
@@ -930,6 +1066,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                  NULL};
     static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), hl_fake_watch_open,
                                                   hl_fake_watch_query, hl_fake_watch_drain, hl_fake_watch_close};
+    static const hl_host_stream_services stream = {
+        HL_HOST_STREAM_ABI, sizeof(stream), hl_fake_stream_pipe_pair, hl_fake_stream_read,
+        hl_fake_stream_write, hl_fake_stream_duplicate, hl_fake_stream_close,
+        hl_fake_stream_set_status_flags, hl_fake_stream_readiness, hl_fake_stream_move};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -942,7 +1082,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->size = sizeof(*services);
     services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
                              HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT |
-                             HL_HOST_CAP_WATCH;
+                             HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
@@ -953,6 +1093,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->directory = &directory;
     services->event = &event;
     services->watch = &watch;
+    services->stream = &stream;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

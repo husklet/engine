@@ -53,6 +53,18 @@ typedef struct clock_interrupt_context {
     pthread_t target;
 } clock_interrupt_context;
 
+typedef struct stream_close_context {
+    const hl_host_services *services;
+    hl_host_handle stream;
+    hl_host_result result;
+} stream_close_context;
+
+static void *close_stream(void *opaque) {
+    stream_close_context *closer = opaque;
+    closer->result = closer->services->stream->close(closer->services->context, closer->stream);
+    return NULL;
+}
+
 static void clock_interrupt_handler(int signal_number) {
     (void)signal_number;
 }
@@ -103,6 +115,66 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    {
+        hl_host_result source = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        hl_host_result destination = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        char bytes[16] = {0};
+        HL_CHECK(source.status == HL_STATUS_OK && destination.status == HL_STATUS_OK);
+        HL_CHECK(services.stream->write(services.context, source.detail, (hl_host_const_bytes){"stream", 6}).value ==
+                 6);
+        HL_CHECK(services.stream->move(services.context, source.value, 0, destination.detail, 0, 6, 0).value == 6);
+        HL_CHECK(services.stream->read(services.context, destination.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 6);
+        HL_CHECK(memcmp(bytes, "stream", 6) == 0);
+        HL_CHECK(services.stream->set_status_flags(services.context, source.value, 0).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, source.value).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, source.detail).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, destination.value).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, destination.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        struct sigaction original, defaults = {0};
+        hl_host_result broken;
+        defaults.sa_handler = SIG_DFL;
+        sigemptyset(&defaults.sa_mask);
+        HL_CHECK(sigaction(SIGPIPE, &defaults, &original) == 0);
+        HL_CHECK(services.stream->close(services.context, pipe.value).status == HL_STATUS_OK);
+        broken = services.stream->write(services.context, pipe.detail, (hl_host_const_bytes){"x", 1});
+        HL_CHECK(broken.status == HL_STATUS_IO && broken.detail == EPIPE);
+        HL_CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
+        HL_CHECK(services.stream->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result source = services.stream->pipe_pair(services.context, 0);
+        hl_host_result destination = services.stream->pipe_pair(services.context, 0);
+        struct sigaction original, defaults = {0};
+        char retained = 0;
+        defaults.sa_handler = SIG_DFL;
+        sigemptyset(&defaults.sa_mask);
+        HL_CHECK(sigaction(SIGPIPE, &defaults, &original) == 0);
+        HL_CHECK(services.stream->write(services.context, source.detail, (hl_host_const_bytes){"m", 1}).value == 1);
+        HL_CHECK(services.stream->close(services.context, destination.value).status == HL_STATUS_OK);
+        hl_host_result moved = services.stream->move(services.context, source.value, 0, destination.detail, 0, 1, 0);
+        HL_CHECK(moved.status == HL_STATUS_IO && moved.detail == EPIPE);
+        HL_CHECK(services.stream->read(services.context, source.value, (hl_host_bytes){&retained, 1}).value == 1 &&
+                 retained == 'm');
+        HL_CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
+        HL_CHECK(services.stream->close(services.context, source.value).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, source.detail).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, destination.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        stream_close_context first = {&services, pipe.value, {0}}, second = {&services, pipe.value, {0}};
+        pthread_t first_thread, second_thread;
+        HL_CHECK(pthread_create(&first_thread, NULL, close_stream, &first) == 0);
+        HL_CHECK(pthread_create(&second_thread, NULL, close_stream, &second) == 0);
+        HL_CHECK(pthread_join(first_thread, NULL) == 0 && pthread_join(second_thread, NULL) == 0);
+        HL_CHECK((first.result.status == HL_STATUS_OK && second.result.status == HL_STATUS_INVALID_ARGUMENT) ||
+                 (second.result.status == HL_STATUS_OK && first.result.status == HL_STATUS_INVALID_ARGUMENT));
+        HL_CHECK(services.stream->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
     {
         long page = sysconf(_SC_PAGESIZE);
         char map_path[128];

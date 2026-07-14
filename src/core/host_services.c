@@ -116,5 +116,13 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->watch->open == NULL || services->watch->query == NULL || services->watch->drain == NULL ||
          services->watch->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_STREAM) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, stream), sizeof(services->stream)) ||
+         !hl_valid_group(services->stream, HL_HOST_STREAM_ABI, sizeof(*services->stream)) ||
+         services->stream->pipe_pair == NULL || services->stream->read == NULL || services->stream->write == NULL ||
+         services->stream->duplicate == NULL || services->stream->close == NULL ||
+         services->stream->set_status_flags == NULL || services->stream->readiness == NULL ||
+         services->stream->move == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

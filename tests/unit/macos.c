@@ -43,6 +43,43 @@ static int32_t child_pause(void *context) {
     return 0;
 }
 
+typedef struct stream_read_context {
+    const hl_host_services *services;
+    hl_host_handle handle;
+    unsigned char bytes[256];
+    hl_host_result result;
+} stream_read_context;
+
+static void *stream_read_thread(void *opaque) {
+    stream_read_context *reader = opaque;
+    reader->result = reader->services->file->read(reader->services->context, reader->handle, reader->bytes,
+                                                   sizeof(reader->bytes));
+    return NULL;
+}
+
+typedef struct stream_writer_context {
+    const hl_host_services *services;
+    hl_host_handle handle;
+    unsigned char byte;
+    uint32_t records;
+    uint32_t failed;
+} stream_writer_context;
+
+static void *stream_writer_thread(void *opaque) {
+    stream_writer_context *writer = opaque;
+    unsigned char record[64];
+    memset(record, writer->byte, sizeof record);
+    for (uint32_t index = 0; index < writer->records; ++index) {
+        hl_host_result result = writer->services->stream->write(
+            writer->services->context, writer->handle, (hl_host_const_bytes){record, sizeof record});
+        if (result.status != HL_STATUS_OK || result.value != sizeof record) {
+            writer->failed = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
 typedef struct process_wait_context {
     const hl_host_services *services;
     hl_host_handle process;
@@ -564,6 +601,166 @@ int main(void) {
     }
     HL_CHECK(services.file->unlink_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path)).status ==
              HL_STATUS_OK);
+    {
+        hl_host_services standalone = services;
+        standalone.capabilities &= ~(uint64_t)HL_HOST_CAP_FILE;
+        standalone.file = NULL;
+        HL_CHECK(hl_host_services_validate(&standalone, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        char bytes[16] = {0};
+        HL_CHECK(pipe.status == HL_STATUS_OK && pipe.value != 0 && pipe.detail != 0);
+        HL_CHECK((standalone.stream->readiness(standalone.context, pipe.value, HL_HOST_READY_READ).value &
+                  HL_HOST_READY_READ) == 0);
+        HL_CHECK((standalone.stream->readiness(standalone.context, pipe.detail, HL_HOST_READY_WRITE).value &
+                  HL_HOST_READY_WRITE) != 0);
+        HL_CHECK(standalone.stream->write(standalone.context, pipe.detail, (hl_host_const_bytes){"stream", 6}).value ==
+                 6);
+        {
+            hl_host_result pollset = services.event->create(services.context);
+            hl_host_event_record event_record = {0};
+            HL_CHECK(pollset.status == HL_STATUS_OK);
+            HL_CHECK(services.event
+                         ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, pipe.value, 73,
+                                   HL_HOST_READY_READ)
+                         .status == HL_STATUS_OK);
+            HL_CHECK(services.event
+                         ->wait(services.context, pollset.value, &event_record, 1, HL_HOST_DEADLINE_INFINITE)
+                         .value == 1);
+            HL_CHECK(event_record.token == 73 && (event_record.readiness & HL_HOST_READY_READ) != 0);
+            HL_CHECK(services.event
+                         ->control(services.context, pollset.value, HL_HOST_EVENT_DELETE, pipe.value, 73,
+                                   HL_HOST_READY_READ)
+                         .status == HL_STATUS_OK);
+            HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+        }
+        HL_CHECK((standalone.stream->readiness(standalone.context, pipe.value, HL_HOST_READY_READ).value &
+                  HL_HOST_READY_READ) != 0);
+        HL_CHECK(standalone.stream->read(standalone.context, pipe.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 6);
+        HL_CHECK(memcmp(bytes, "stream", 6) == 0);
+        HL_CHECK(services.stream->set_status_flags(services.context, pipe.value, HL_HOST_STREAM_NONBLOCK).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->read(services.context, pipe.value, bytes, sizeof bytes).status ==
+                 HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.stream->set_status_flags(services.context, pipe.value, 0).status == HL_STATUS_OK);
+        {
+            pid_t blocked = fork();
+            int blocked_status = 0;
+            struct timespec settle = {0, 10000000};
+            HL_CHECK(blocked >= 0);
+            if (blocked == 0) {
+                char byte;
+                (void)services.file->read(services.context, pipe.value, &byte, 1);
+                _exit(20);
+            }
+            nanosleep(&settle, NULL);
+            HL_CHECK(kill(blocked, SIGKILL) == 0);
+            HL_CHECK(waitpid(blocked, &blocked_status, 0) == blocked && WIFSIGNALED(blocked_status));
+            HL_CHECK(services.file->write(services.context, pipe.detail, "r", 1).value == 1);
+            HL_CHECK(services.file->read(services.context, pipe.value, bytes, 1).value == 1 && bytes[0] == 'r');
+        }
+        HL_CHECK(services.file->close(services.context, pipe.value).status == HL_STATUS_OK);
+        {
+            hl_host_result broken = services.file->write(services.context, pipe.detail, "x", 1);
+            HL_CHECK(broken.status == HL_STATUS_PLATFORM_FAILURE && broken.detail == EPIPE);
+        }
+        HL_CHECK(services.file->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        hl_host_result clone = services.file->clone_for_fork(services.context, pipe.value);
+        char byte = 0;
+        HL_CHECK(pipe.status == HL_STATUS_OK && clone.status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, pipe.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->write(services.context, pipe.detail, "d", 1).value == 1);
+        HL_CHECK(services.file->read(services.context, clone.value, &byte, 1).value == 1 && byte == 'd');
+        HL_CHECK(services.file->close(services.context, clone.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        stream_read_context reader = {&services, pipe.value, {0}, {0}};
+        pthread_t thread;
+        struct timespec settle = {0, 10000000};
+        HL_CHECK(pipe.status == HL_STATUS_OK && pthread_create(&thread, NULL, stream_read_thread, &reader) == 0);
+        nanosleep(&settle, NULL);
+        HL_CHECK(services.file->close(services.context, pipe.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->write(services.context, pipe.detail, "p", 1).value == 1);
+        HL_CHECK(pthread_join(thread, NULL) == 0 && reader.result.value == 1 && reader.bytes[0] == 'p');
+        HL_CHECK(services.file->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result source = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        hl_host_result destination = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        stream_read_context reader = {&services, source.value, {0}, {0}};
+        pthread_t thread;
+        hl_host_result moved;
+        char delivered[256];
+        hl_host_result received;
+        unsigned char payload[100];
+        memset(payload, 0x5a, sizeof payload);
+        HL_CHECK(source.status == HL_STATUS_OK && destination.status == HL_STATUS_OK);
+        HL_CHECK(services.file->write(services.context, source.detail, payload, sizeof payload).value == sizeof payload);
+        HL_CHECK(pthread_create(&thread, NULL, stream_read_thread, &reader) == 0);
+        moved = services.stream->move(services.context, source.value, 0, destination.detail, 0, sizeof payload, 0);
+        HL_CHECK(pthread_join(thread, NULL) == 0);
+        received = services.file->read(services.context, destination.value, delivered, sizeof delivered);
+        HL_CHECK((reader.result.status == HL_STATUS_OK ? reader.result.value : 0) +
+                     (received.status == HL_STATUS_OK ? received.value : 0) ==
+                 sizeof payload);
+        HL_CHECK(moved.status == HL_STATUS_OK || moved.status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.file->close(services.context, source.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, source.detail).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, destination.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, destination.detail).status == HL_STATUS_OK);
+    }
+    {
+        enum { RECORDS = 100, RECORD_SIZE = 64, TOTAL = 2 * RECORDS * RECORD_SIZE };
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        stream_writer_context first = {&services, pipe.detail, 'A', RECORDS, 0};
+        stream_writer_context second = {&services, pipe.detail, 'B', RECORDS, 0};
+        pthread_t first_thread, second_thread;
+        unsigned char received[TOTAL];
+        size_t total = 0;
+        HL_CHECK(pipe.status == HL_STATUS_OK);
+        HL_CHECK(pthread_create(&first_thread, NULL, stream_writer_thread, &first) == 0);
+        HL_CHECK(pthread_create(&second_thread, NULL, stream_writer_thread, &second) == 0);
+        while (total < sizeof received) {
+            hl_host_result result = services.stream->read(
+                services.context, pipe.value, (hl_host_bytes){received + total, sizeof received - total});
+            HL_CHECK(result.status == HL_STATUS_OK && result.value != 0 && result.value <= sizeof received - total);
+            total += (size_t)result.value;
+        }
+        HL_CHECK(pthread_join(first_thread, NULL) == 0 && pthread_join(second_thread, NULL) == 0);
+        HL_CHECK(!first.failed && !second.failed);
+        for (size_t offset = 0; offset < sizeof received; offset += RECORD_SIZE) {
+            HL_CHECK(received[offset] == 'A' || received[offset] == 'B');
+            for (size_t index = 1; index < RECORD_SIZE; ++index)
+                HL_CHECK(received[offset + index] == received[offset]);
+        }
+        HL_CHECK(services.stream->close(services.context, pipe.value).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result source = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        hl_host_result destination = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
+        unsigned char fill[4096];
+        char retained[8] = {0};
+        hl_host_result written;
+        memset(fill, 0xa5, sizeof fill);
+        do written = services.file->write(services.context, destination.detail, fill, sizeof fill);
+        while (written.status == HL_STATUS_OK && written.value != 0);
+        HL_CHECK(written.status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.file->write(services.context, source.detail, "retain", 6).value == 6);
+        HL_CHECK(services.stream->move(services.context, source.value, 0, destination.detail, 0, 6, 0).status ==
+                 HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.file->read(services.context, source.value, retained, sizeof retained).value == 6);
+        HL_CHECK(memcmp(retained, "retain", 6) == 0);
+        HL_CHECK(services.file->close(services.context, source.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, source.detail).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, destination.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, destination.detail).status == HL_STATUS_OK);
+    }
     {
         char target[32] = {0};
         hl_host_file_metadata metadata;

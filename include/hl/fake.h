@@ -60,6 +60,12 @@ typedef struct hl_fake_host {
     uint64_t watch_files[16];
     uint64_t watch_delivered[16];
     hl_host_watch_record watch_records[16];
+    uint64_t stream_handles[16];
+    uint8_t stream_objects[16];
+    uint8_t stream_write_ends[16];
+    uint32_t stream_flags[16];
+    uint16_t stream_sizes[8];
+    uint8_t stream_data[8][1024];
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;

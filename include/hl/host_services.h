@@ -20,6 +20,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u
 #define HL_HOST_WATCH_ABI 1u
+#define HL_HOST_STREAM_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -40,7 +41,8 @@ enum {
     HL_HOST_CAP_COUNTER = UINT64_C(1) << 12,
     HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13,
     HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14,
-    HL_HOST_CAP_WATCH = UINT64_C(1) << 15
+    HL_HOST_CAP_WATCH = UINT64_C(1) << 15,
+    HL_HOST_CAP_STREAM = UINT64_C(1) << 16
 };
 
 enum {
@@ -470,6 +472,32 @@ typedef struct hl_host_watch_services {
     hl_host_result (*close)(void *context, hl_host_handle watch);
 } hl_host_watch_services;
 
+enum {
+    HL_HOST_STREAM_NONBLOCK = 1u << 0,
+    HL_HOST_STREAM_SOURCE_POSITIONED = 1u << 1,
+    HL_HOST_STREAM_DESTINATION_POSITIONED = 1u << 2
+};
+
+/* Opaque byte streams. move consumes exactly the bytes reported in value and never consumes bytes
+ * which the destination did not accept. source_offset/destination_offset are used only with their
+ * corresponding POSITIONED flag; sequential endpoints advance their owned position atomically. */
+typedef struct hl_host_stream_services {
+    HL_ABI_HEADER;
+    /* value is the read endpoint and detail is the write endpoint. */
+    hl_host_result (*pipe_pair)(void *context, uint32_t flags);
+    hl_host_result (*read)(void *context, hl_host_handle stream, hl_host_bytes output);
+    hl_host_result (*write)(void *context, hl_host_handle stream, hl_host_const_bytes input);
+    hl_host_result (*duplicate)(void *context, hl_host_handle stream);
+    hl_host_result (*close)(void *context, hl_host_handle stream);
+    hl_host_result (*set_status_flags)(void *context, hl_host_handle stream, uint32_t flags);
+    /* value is a HL_HOST_READY_* mask. */
+    hl_host_result (*readiness)(void *context, hl_host_handle stream, uint32_t interests);
+    /* Endpoint kinds come from the host handle table. File endpoints must be POSITIONED so this
+     * operation never races or mutates a file OFD offset; file-to-file movement is rejected. */
+    hl_host_result (*move)(void *context, hl_host_handle source, uint64_t source_offset,
+                           hl_host_handle destination, uint64_t destination_offset, uint64_t size, uint32_t flags);
+} hl_host_stream_services;
+
 typedef struct hl_host_services {
     HL_ABI_HEADER;
     uint64_t capabilities;
@@ -487,6 +515,7 @@ typedef struct hl_host_services {
     const hl_host_transfer_services *transfer;
     const hl_host_directory_services *directory;
     const hl_host_watch_services *watch;
+    const hl_host_stream_services *stream;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

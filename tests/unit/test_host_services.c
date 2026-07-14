@@ -83,10 +83,30 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
+    {
+        hl_host_services standalone = services;
+        hl_host_result pipe;
+        char bytes[8] = {0};
+        standalone.file = NULL;
+        standalone.capabilities &= ~(uint64_t)HL_HOST_CAP_FILE;
+        HL_CHECK(hl_host_services_validate(&standalone, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
+        pipe = standalone.stream->pipe_pair(standalone.context, HL_HOST_STREAM_NONBLOCK);
+        HL_CHECK(pipe.status == HL_STATUS_OK);
+        HL_CHECK(standalone.stream->write(standalone.context, pipe.detail, (hl_host_const_bytes){"fake", 4}).value == 4);
+        HL_CHECK(standalone.stream->read(standalone.context, pipe.value, (hl_host_bytes){bytes, sizeof bytes}).value == 4);
+        HL_CHECK(memcmp(bytes, "fake", 4) == 0);
+        HL_CHECK(standalone.stream->close(standalone.context, pipe.value).status == HL_STATUS_OK);
+        HL_CHECK(standalone.stream->close(standalone.context, pipe.detail).status == HL_STATUS_OK);
+    }
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT) == HL_STATUS_OK);
     truncated = services;
     truncated.watch = NULL;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
+    truncated = services;
+    truncated.stream = NULL;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_STREAM) == HL_STATUS_ABI_MISMATCH);
+    truncated = services;
     truncated.watch = &watch;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_OK);
     truncated.size = (uint32_t)offsetof(hl_host_services, watch);
