@@ -3935,7 +3935,7 @@ static void tier2_promote(uint64_t gpc) {
 
 static void report_unimpl(uint64_t pc, struct insn *I) {
     const uint8_t *p = (const uint8_t *)pc;
-    fprintf(stderr, "[dd] UNIMPL %s opcode 0x%02x at rip=%llx  bytes:", I->two ? "0F" : "1B", I->op,
+    fprintf(stderr, "[hl] UNIMPL %s opcode 0x%02x at rip=%llx  bytes:", I->two ? "0F" : "1B", I->op,
             (unsigned long long)pc);
     for (int i = 0; i < (I->len ? I->len : 8); i++)
         fprintf(stderr, " %02x", p[i]);
