@@ -15,21 +15,25 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
 // stat-family syscall reports identical ownership for the same file.
 static void stat_virt_ids(const struct stat *s, const char *hostpath, int fd, uint32_t *uid, uint32_t *gid);
 
+#include "../../../linux_abi/encode.h"
+
 static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpath, int fd) {
-    memset(d, 0, 144);
-    *(uint64_t *)(d + 0) = s->st_dev;
-    *(uint64_t *)(d + 8) = s->st_ino;
-    *(uint64_t *)(d + 16) = s->st_nlink;
-    *(uint32_t *)(d + 24) = s->st_mode;
     uint32_t uid, gid;
     stat_virt_ids(s, hostpath, fd, &uid, &gid);
-    *(uint32_t *)(d + 28) = uid;
-    *(uint32_t *)(d + 32) = gid;
-    *(uint64_t *)(d + 40) = s->st_rdev;
-    *(uint64_t *)(d + 48) = s->st_size;
-    *(uint64_t *)(d + 56) = 4096;
-    *(uint64_t *)(d + 64) = s->st_blocks;
-    *(uint64_t *)(d + 72) = s->st_atime;  // atime sec
-    *(uint64_t *)(d + 88) = s->st_mtime;  // mtime sec
-    *(uint64_t *)(d + 104) = s->st_ctime; // ctime sec
+    hl_linux_stat_record record = {s->st_dev,
+                                   s->st_ino,
+                                   s->st_nlink,
+                                   s->st_rdev,
+                                   (uint64_t)s->st_size,
+                                   (uint64_t)s->st_blocks,
+                                   s->st_atimespec.tv_sec,
+                                   (uint64_t)s->st_atimespec.tv_nsec,
+                                   s->st_mtimespec.tv_sec,
+                                   (uint64_t)s->st_mtimespec.tv_nsec,
+                                   s->st_ctimespec.tv_sec,
+                                   (uint64_t)s->st_ctimespec.tv_nsec,
+                                   s->st_mode,
+                                   uid,
+                                   gid};
+    (void)hl_linux_stat_encode_x86_64(&record, d, 144);
 }

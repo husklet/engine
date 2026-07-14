@@ -5829,3 +5829,5 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
 }
 
 // (synth_stat wrapper removed: dead — all callers use synth_stat_raw directly)
+
+#include "route.c"

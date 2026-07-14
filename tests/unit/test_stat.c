@@ -1,6 +1,7 @@
 #include "test.h"
 
 #include "hl/linux_abi.h"
+#include "../../src/linux_abi/encode.h"
 
 #include <string.h>
 
@@ -30,6 +31,21 @@ int main(void) {
     uint8_t aarch64[HL_LINUX_STAT_AARCH64_SIZE];
     uint8_t x86_64[HL_LINUX_STAT_X86_64_SIZE];
     size_t index;
+    hl_linux_stat_record record = {UINT64_C(0x101),
+                                   UINT64_C(0x202),
+                                   3,
+                                   UINT64_C(0x404),
+                                   505,
+                                   6,
+                                   7,
+                                   8,
+                                   9,
+                                   10,
+                                   11,
+                                   12,
+                                   HL_LINUX_S_IFREG | 0640u,
+                                   1001,
+                                   1002};
 
     memset(aarch64, 0xa5, sizeof(aarch64));
     HL_CHECK(hl_linux_stat_aarch64(&status, aarch64, sizeof(aarch64)) == 0);
@@ -58,5 +74,24 @@ int main(void) {
     HL_CHECK(hl_linux_stat_x86_64(&status, x86_64, sizeof(x86_64)) == -HL_LINUX_EOVERFLOW);
     for (index = 0; index < sizeof(x86_64); index++)
         HL_CHECK(x86_64[index] == 0x5a);
+
+    HL_CHECK(hl_linux_stat_encode_aarch64(&record, aarch64, sizeof(aarch64)) == 0);
+    HL_CHECK(load_u64(aarch64, 8) == 0x202 && load_u32(aarch64, 20) == 3);
+    HL_CHECK(load_u32(aarch64, 24) == 1001 && load_u32(aarch64, 28) == 1002);
+    HL_CHECK(load_u64(aarch64, 32) == 0x404 && load_u32(aarch64, 56) == 4096);
+    HL_CHECK(load_u64(aarch64, 72) == 7 && load_u64(aarch64, 80) == 8);
+    HL_CHECK(load_u64(aarch64, 104) == 11 && load_u64(aarch64, 112) == 12);
+
+    HL_CHECK(hl_linux_stat_encode_x86_64(&record, x86_64, sizeof(x86_64)) == 0);
+    HL_CHECK(load_u64(x86_64, 16) == 3 && load_u32(x86_64, 28) == 1001 && load_u32(x86_64, 32) == 1002);
+    HL_CHECK(load_u64(x86_64, 40) == 0x404 && load_u64(x86_64, 56) == 4096);
+    HL_CHECK(load_u64(x86_64, 72) == 7 && load_u64(x86_64, 80) == 8);
+    HL_CHECK(load_u64(x86_64, 104) == 11 && load_u64(x86_64, 112) == 12);
+
+    record.modified_nanoseconds = 1000000000;
+    memset(aarch64, 0xa5, sizeof(aarch64));
+    HL_CHECK(hl_linux_stat_encode_aarch64(&record, aarch64, sizeof(aarch64)) == -HL_LINUX_EOVERFLOW);
+    for (index = 0; index < sizeof(aarch64); index++)
+        HL_CHECK(aarch64[index] == 0xa5);
     return EXIT_SUCCESS;
 }

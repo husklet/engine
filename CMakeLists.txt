@@ -11,6 +11,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 add_library(hl-translator STATIC
+    src/translator/arena.c
     src/translator/codegen.c
     src/translator/digest.c
     src/translator/identity.c
@@ -22,7 +23,7 @@ add_library(hl-translator STATIC
     src/translator/ir/ir.c)
 target_include_directories(hl-translator PUBLIC include)
 
-add_library(hl-linux-abi STATIC src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c)
+add_library(hl-linux-abi STATIC src/linux_abi/encode.c src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c)
 target_include_directories(hl-linux-abi PUBLIC include)
 
 add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c
@@ -103,7 +104,7 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name codegen config emit host_services identity ir launch linux_abi stat engine log namespace options profile)
+    foreach(test_name arena codegen config emit host_services identity ir launch linux_abi stat engine log namespace options profile)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)

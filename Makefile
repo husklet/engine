@@ -12,7 +12,7 @@ CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
-PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
+PRIVATE_HEADERS := src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
 # translator, and Linux-personality implementation. Make cannot discover those nested includes from the
@@ -28,10 +28,10 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c
-IR_SOURCES := src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
+IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
 	src/translator/window.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c
+LINUX_ABI_SOURCES := src/linux_abi/encode.c src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
@@ -47,7 +47,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := affinity clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -198,9 +198,11 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCT
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
 		src/linux_abi/parse.c \
+		src/linux_abi/encode.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
+		src/translator/arena.c \
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \
@@ -220,9 +222,11 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTIO
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
 		src/linux_abi/parse.c \
+		src/linux_abi/encode.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
+		src/translator/arena.c \
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \
@@ -246,9 +250,11 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/a
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
 		src/linux_abi/parse.c \
+		src/linux_abi/encode.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
+		src/translator/arena.c \
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \
@@ -271,9 +277,11 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/core/target/x8
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
 		src/linux_abi/parse.c \
+		src/linux_abi/encode.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
+		src/translator/arena.c \
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \

@@ -6,6 +6,7 @@
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
 #include "../host/file.h"
+#include "arena.h"
 #include "emit.h"
 
 #define CACHE_SZ (64u << 20)
@@ -50,28 +51,20 @@ static inline void jit_wprot(int enable_exec) {
 }
 
 static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
-    memset(mapping, 0, sizeof(*mapping));
     if (g_jit_host == NULL &&
         (hl_host_macos_create(&g_jit_host, &g_jit_services) != HL_STATUS_OK ||
          hl_host_services_validate(&g_jit_services,
                                    HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK))
         return -1;
     if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
-    return g_jit_services.memory
-                       ->reserve_code(g_jit_services.context, CACHE_SZ, 16384, dual_alias ? HL_HOST_CODE_DUAL_ALIAS : 0,
-                                      mapping)
-                       .status == HL_STATUS_OK
-               ? 0
-               : -1;
+    return hl_arena_reserve(&g_jit_services, CACHE_SZ, 16384, dual_alias, mapping);
 }
 
 static int jit_cache_init(void) {
     // Dual aliases avoid global W^X flips. Hosts that cannot create them still have a correct MAP_JIT
     // path; this is a capability fallback, not a user-facing mode switch.
     if (code_mapping_reserve(&g_code_mapping, 1) != 0 && code_mapping_reserve(&g_code_mapping, 0) != 0) return -1;
-    g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
-    g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
-    g_dualmap = g_rw2rx != 0;
+    hl_arena_bind(&g_emit, &g_code_mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache reserve rw=%p rx=%p bytes=%u dual=%d", (void *)g_cache, J_RX(g_cache),
             CACHE_SZ, g_dualmap);
     return 0;
@@ -829,7 +822,7 @@ static void cache_unmap(hl_host_handle handle, uint8_t *rw, ptrdiff_t rw2rx) {
     g_freed[slot].rw = rw;
     g_freed[slot].rw2rx = rw2rx;
     g_freed[slot].gen = 0;
-    (void)g_jit_services.memory->release(g_jit_services.context, handle);
+    hl_arena_release(&g_jit_services, handle);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache release rw=%p rx=%p", (void *)rw, (void *)(rw + rw2rx));
 }
 
@@ -892,9 +885,7 @@ static void jit_flush_to_fresh(void) {
     reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
     if (code_mapping_reserve(&mapping, g_dualmap) != 0) cache_oom_abort();
     retire_current();
-    g_code_mapping = mapping;
-    g_cache = g_cp = (uint8_t *)(uintptr_t)mapping.writable_address;
-    g_rw2rx = (uint8_t *)(uintptr_t)mapping.executable_address - g_cache;
+    hl_arena_bind(&g_emit, &mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache rotate generation=%llu rw=%p rx=%p",
             (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache));
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
@@ -1009,9 +1000,7 @@ static void jit_after_fork(void) {
     pthread_mutex_init(&g_jit_lock, NULL);
     pthread_mutex_init(&g_cache_lock, NULL);
     preserve = !g_threaded || !g_dualmap;
-    if (g_jit_services.memory->repair_code_after_fork(g_jit_services.context, &g_code_mapping, (uint32_t)preserve)
-            .status != HL_STATUS_OK)
-        cache_oom_abort();
+    if (hl_arena_repair(&g_jit_services, &g_emit, preserve) != 0) cache_oom_abort();
     // The child inherited the parent's retired-cache list as COW copies but will never resume a parent peer
     // into them; drop the bookkeeping and unmap them so the child does not carry the parent's retired VA.
     for (int i = 0; i < g_nretired; i++)
@@ -1019,8 +1008,6 @@ static void jit_after_fork(void) {
     g_nretired = 0;
     g_fork_preserved = preserve;
     if (!preserve) {
-        g_cache = g_cp = (uint8_t *)(uintptr_t)g_code_mapping.writable_address;
-        g_rw2rx = (uint8_t *)(uintptr_t)g_code_mapping.executable_address - g_cache;
         memset(g_map, 0, sizeof g_map);
         memset(g_ibtc, 0, sizeof g_ibtc);
         g_npend = 0;
