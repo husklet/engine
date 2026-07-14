@@ -51,6 +51,8 @@
 #include <sys/sysctl.h> // KERN_PROC_SESSION: enumerate the container's whole process tree
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
 
+#include "../host/file.h"
+
 #define CKPT_MAGIC 0x325450434b444444ull          // "DDDKCPT2" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC 0x324e414d504b4444ull // "DDKPMAN2" (LE) -- workspace manifest
 #define CKPT_VERSION 4 // v4: meta carries the guest signal-disposition table (sig_*), re-installed on restore
@@ -350,7 +352,7 @@ static int ckpt_dump_self(struct cpu *c, const char *procdir) {
         return -1;
     }
     char pf[1400];
-    FILE *fp = NULL, *fc = NULL, *ff = NULL, *fm = NULL;
+    FILE *fp = NULL, *ff = NULL;
     int ok = 0;
     size_t pagesz = (size_t)getpagesize();
 
@@ -385,8 +387,7 @@ static int ckpt_dump_self(struct cpu *c, const char *procdir) {
     if (!fp || ckpt_dump_pages(fp, pagesz, &m.n_regions) != 0) goto done;
 
     snprintf(pf, sizeof pf, "%s/cpu", tmp);
-    fc = fopen(pf, "wb");
-    if (!fc || ckpt_wr_all(fc, c, sizeof *c) != 0) goto done;
+    if (hl_host_file_store(&g_jit_services, pf, 0600, c, sizeof *c) != 0) goto done;
 
     snprintf(pf, sizeof pf, "%s/fds", tmp);
     ff = fopen(pf, "wb");
@@ -395,15 +396,12 @@ static int ckpt_dump_self(struct cpu *c, const char *procdir) {
         if (ckpt_wr_all(ff, &fdrecs[i], sizeof fdrecs[i]) != 0) goto done;
 
     snprintf(pf, sizeof pf, "%s/meta", tmp); // meta written LAST (carries the section counts)
-    fm = fopen(pf, "wb");
-    if (!fm || ckpt_wr_all(fm, &m, sizeof m) != 0) goto done;
+    if (hl_host_file_store(&g_jit_services, pf, 0600, &m, sizeof m) != 0) goto done;
     ok = 1;
 
 done:
     if (fp) fclose(fp);
-    if (fc) fclose(fc);
     if (ff) fclose(ff);
-    if (fm) fclose(fm);
     if (!ok) {
         ckpt_rmrf(tmp);
         return -1;
@@ -520,10 +518,9 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     }
     char mp[1200];
     snprintf(mp, sizeof mp, "%s/MANIFEST", base);
-    FILE *mf = fopen(mp, "wb");
-    if (mf) {
-        ckpt_wr_all(mf, &man, sizeof man);
-        fclose(mf);
+    if (hl_host_file_store(&g_jit_services, mp, 0600, &man, sizeof man) != 0) {
+        fprintf(stderr, "[ckpt] cannot publish workspace manifest: %s\n", strerror(errno));
+        _exit(70);
     }
     fprintf(stderr, "[ckpt] workspace checkpoint OK: %d process(es) -> %s\n", nproc, base);
     int st;
@@ -536,14 +533,11 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
 static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
     char pf[1200];
     snprintf(pf, sizeof pf, "%s/MANIFEST", dir);
-    FILE *f = fopen(pf, "rb");
-    if (!f) {
+    if (hl_host_file_load(&g_jit_services, pf, man, sizeof *man) != 0) {
         fprintf(stderr, "[restore] %s has no MANIFEST (not a complete checkpoint)\n", dir);
         return -1;
     }
-    int r = ckpt_rd_all(f, man, sizeof *man);
-    fclose(f);
-    if (r != 0 || man->magic != CKPT_MANIFEST_MAGIC) {
+    if (man->magic != CKPT_MANIFEST_MAGIC) {
         fprintf(stderr, "[restore] %s: bad manifest magic\n", dir);
         return -1;
     }
@@ -557,14 +551,11 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
 static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/meta", procdir);
-    FILE *f = fopen(pf, "rb");
-    if (!f) {
+    if (hl_host_file_load(&g_jit_services, pf, m, sizeof *m) != 0) {
         fprintf(stderr, "[restore] open %s: %s\n", pf, strerror(errno));
         return -1;
     }
-    int r = ckpt_rd_all(f, m, sizeof *m);
-    fclose(f);
-    if (r != 0 || m->magic != CKPT_MAGIC) {
+    if (m->magic != CKPT_MAGIC) {
         fprintf(stderr, "[restore] %s is not a checkpoint (bad magic/short read)\n", procdir);
         return -1;
     }
@@ -702,13 +693,10 @@ static int ckpt_restore_fds_dir(const char *procdir) {
 static int ckpt_restore_cpu_dir(const char *procdir, struct cpu *c) {
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/cpu", procdir);
-    FILE *f = fopen(pf, "rb");
-    if (!f || ckpt_rd_all(f, c, sizeof *c) != 0) {
-        if (f) fclose(f);
+    if (hl_host_file_load(&g_jit_services, pf, c, sizeof *c) != 0) {
         fprintf(stderr, "[restore] cannot read cpu state\n");
         return -1;
     }
-    fclose(f);
     // Zero host-transient fields (meaningful only WHILE a block runs; run_block re-populates them). The
     // architectural state (x[],sp,pc,tls,nzcv,v[],sigmask,tpending,alt_*,tid,ctid) + shadow stack are verbatim.
     memset(c->host_save, 0, sizeof c->host_save);

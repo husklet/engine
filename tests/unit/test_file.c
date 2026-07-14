@@ -15,10 +15,15 @@ typedef struct file_test {
     hl_host_handle closed;
     hl_status open_status;
     hl_status write_status;
+    hl_status read_status;
     hl_status close_status;
     unsigned char written[64];
     size_t written_size;
     size_t write_limit;
+    const unsigned char *read_data;
+    size_t read_size;
+    size_t read_offset;
+    size_t read_limit;
     char old_path[64];
     char new_path[64];
     char unlinked_path[64];
@@ -56,6 +61,18 @@ static hl_host_result file_write(void *context, hl_host_handle file, const void 
     return (hl_host_result){HL_STATUS_OK, 0, count, 0};
 }
 
+static hl_host_result file_read(void *context, hl_host_handle file, void *output, uint64_t output_size) {
+    file_test *test = context;
+    size_t count = (size_t)output_size;
+    if (file != 77) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (test->read_status != HL_STATUS_OK) return (hl_host_result){test->read_status, 0, 0, 0};
+    if (count > test->read_size - test->read_offset) count = test->read_size - test->read_offset;
+    if (test->read_limit != 0 && count > test->read_limit) count = test->read_limit;
+    if (count != 0) memcpy(output, test->read_data + test->read_offset, count);
+    test->read_offset += count;
+    return (hl_host_result){HL_STATUS_OK, 0, count, 0};
+}
+
 static hl_host_result file_rename(void *context, hl_host_handle old_directory, const char *old_path,
                                   size_t old_path_size, hl_host_handle new_directory, const char *new_path,
                                   size_t new_path_size) {
@@ -84,6 +101,7 @@ int main(void) {
                                                .size = sizeof(file),
                                                .open_relative = file_open,
                                                .close = file_close,
+                                               .read = file_read,
                                                .write = file_write,
                                                .rename_relative = file_rename,
                                                .unlink_relative = file_unlink};
@@ -127,6 +145,22 @@ int main(void) {
     HL_CHECK(test.creation == (HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE));
     HL_CHECK(test.permissions == 0640 && test.closed == 77);
     HL_CHECK(test.written_size == 7 && memcmp(test.written, "payload", 7) == 0);
+
+    memset(&test, 0, sizeof(test));
+    test.read_data = (const unsigned char *)"checkpoint";
+    test.read_size = 10;
+    test.read_limit = 3;
+    char loaded[10];
+    HL_CHECK(hl_host_file_load(&services, "meta", loaded, sizeof loaded) == 0);
+    HL_CHECK(test.access == HL_HOST_FILE_READ && test.creation == 0 && test.closed == 77);
+    HL_CHECK(memcmp(loaded, "checkpoint", sizeof loaded) == 0);
+
+    memset(&test, 0, sizeof(test));
+    test.read_data = (const unsigned char *)"short";
+    test.read_size = 5;
+    errno = 0;
+    HL_CHECK(hl_host_file_load(&services, "meta", loaded, sizeof loaded) == -1 && errno == EIO);
+    HL_CHECK(test.closed == 77);
 
     memset(&test, 0, sizeof(test));
     test.write_status = HL_STATUS_PLATFORM_FAILURE;
