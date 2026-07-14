@@ -129,7 +129,8 @@ static void run_guest(struct cpu *c) {
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
         void *code = map_host(G_PC(c));
         if (!code) {
-            uint64_t _t0 = g_prof ? now_ns() : 0;
+            uint64_t _t0 =
+                g_dispatch_profile.enabled ? hl_dispatch_profile_begin(&g_dispatch_profile, now_ns()) : 0;
             // near full -> wholesale flush
             if (g_cp + (1u << 16) > g_cache + CACHE_SZ) {
                 if (g_threaded && stw_peers_live()) {
@@ -167,7 +168,7 @@ static void run_guest(struct cpu *c) {
                     emit32(0xD503201Fu); // nop
             g_emit_start = g_cp;
             code = translate_block(G_PC(c));
-            g_prof_xlate++;
+            hl_dispatch_profile_translation(&g_dispatch_profile);
             // new block coherent on all cores FIRST (icache is on the RX alias under dual map)
             sys_icache_invalidate(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start));
             // THEN chain existing blocks to it (still write mode). Frontend hook: aarch64 chains here;
@@ -179,7 +180,8 @@ static void run_guest(struct cpu *c) {
             jit_wprot(1);
             // Frontend hook: post-translate per-arch step (x86 W6A SMC source-page write-protect; empty aarch64).
             G_AFTER_TRANSLATE(c);
-            if (g_prof) g_xlate_ns += now_ns() - _t0;
+            if (g_dispatch_profile.enabled)
+                hl_dispatch_profile_translation_end(&g_dispatch_profile, _t0, now_ns());
         }
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
@@ -198,7 +200,7 @@ static void run_guest(struct cpu *c) {
         // Frontend hook: per-block JT trace dump (per-arch register/flag layout). See §A.3 (5th divergence).
         G_TRACE_DUMP(c);
         c->reason = 0;
-        if (g_prof) g_prof_cross++;
+        hl_dispatch_profile_crossing(&g_dispatch_profile);
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
         run_block(c, rxcode);
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;

@@ -26,11 +26,7 @@ static const char *xresolve_exec(const char *p, char *buf,
                                  // fwd (defined below; overlay uses it for the upper)
                                  size_t n);
 
-struct olayer {
-    char canon[1024];
-    size_t clen;
-};
-static struct olayer g_lower[8];
+static struct hl_linux_vfs_lower g_lower[HL_LINUX_VFS_LOWER_CAPACITY];
 // [0] = highest-priority lower (searched first)
 static int g_nlower = 0;
 

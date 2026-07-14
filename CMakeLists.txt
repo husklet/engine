@@ -103,7 +103,7 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name codegen config emit host_services identity ir launch linux_abi stat engine log options)
+    foreach(test_name codegen config emit host_services identity ir launch linux_abi stat engine log namespace options profile)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)

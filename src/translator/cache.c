@@ -16,6 +16,9 @@ static hl_emit_state g_emit;
 #define g_cp g_emit.cursor
 #define g_emit_start g_emit.start
 #define g_rw2rx g_emit.rx_delta
+#define g_dualmap g_emit.dual_alias
+#define g_wx_toggles g_emit.wx_toggles
+#define g_code_mapping g_emit.mapping
 
 // ---- dual-mapped (W^X-toggle-free) code cache ----
 // g_cache/g_cp are the RW (writer) alias; the engine EXECUTES through an RX alias of the
@@ -25,11 +28,8 @@ static hl_emit_state g_emit;
 // only the few ABSOLUTE handoffs (run_block target, IBTC/IC body literals, icache flush)
 // convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
 // region's W^X per translation/IC-fill (NODUALMAP=1).
-static int g_dualmap;         // 1 when the RW/RX dual mapping is active
-static uint64_t g_wx_toggles; // # of pthread_jit_write_protect_np() calls actually made (PROF)
 static hl_host_macos *g_jit_host;
 static hl_host_services g_jit_services;
-static hl_host_code_mapping g_code_mapping;
 static hl_log_context g_jit_log;
 #define J_RX(p) hl_emit_rx(&g_emit, (const void *)(uintptr_t)(p)) // RW alias addr -> RX alias addr
 #define J_RW(p) hl_emit_rw(&g_emit, (const void *)(uintptr_t)(p)) // RX alias addr -> RW alias addr
@@ -77,8 +77,15 @@ static int jit_cache_init(void) {
     return 0;
 }
 
-// PROF-only: accumulated wall time spent in the translate region (the part the W^X toggles bracket).
-static uint64_t g_xlate_ns;
+#include "../core/profile.h"
+
+// Dispatcher profiling is one state object. Compatibility aliases keep the wider profiling/reporting
+// code source-compatible while that ownership is progressively narrowed.
+static hl_dispatch_profile g_dispatch_profile;
+#define g_prof (g_dispatch_profile.enabled)
+#define g_prof_cross (g_dispatch_profile.crossings)
+#define g_prof_xlate (g_dispatch_profile.translations)
+#define g_xlate_ns (g_dispatch_profile.translation_ns)
 
 static inline uint64_t now_ns(void) {
     hl_host_result result = g_jit_services.clock->monotonic_ns(g_jit_services.context);
@@ -376,9 +383,8 @@ static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
                      : "memory");
 }
 
-static uint64_t g_prof_cross, g_prof_miss, g_prof_xlate, g_prof_sys, g_lse_n;
+static uint64_t g_prof_miss, g_prof_sys, g_lse_n;
 // PROF=1: dispatcher crossings / IBTC misses / translations
-static int g_prof;
 // A3 §B instrumentation (PROF=1). Runtime: shadow pushes executed, predicted-return FAST hits (host
 // ret, RAS), and returns that fell through emit_shadow_ret to the IBTC fallback. Translate-time:
 // how many guest `bl` sites the depth-gate steered to §B (shadow push) vs the cheap leaf Stage-B path.

@@ -47,7 +47,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := affinity clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log number options parse readonly reloc window xattr_cache
+UNIT_NAMES := affinity clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 

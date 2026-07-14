@@ -37,7 +37,8 @@ static void oc_reset(void);
 static const char *shm_backing_path(const char *guest, char *buf, size_t n) {
     if (!guest || guest[0] != '/' || strncmp(guest, "/dev/shm/", 9)) return NULL;
     const char *name = guest + 9;
-    int pfx = g_rootfs_canon[0] ? snprintf(buf, n, "%s/dev/shm/", g_rootfs_canon) : snprintf(buf, n, "/tmp/.ddshm-");
+    int pfx = g_vfs_namespace.root_canonical[0] ? snprintf(buf, n, "%s/dev/shm/", g_vfs_namespace.root_canonical)
+                                                : snprintf(buf, n, "/tmp/.ddshm-");
     if (pfx < 0 || pfx >= (int)n - 1) return NULL;
     int m = pfx + snprintf(buf + pfx, n - (size_t)pfx, "%s", name);
     if (m > (int)n - 1) m = (int)n - 1;
@@ -536,9 +537,9 @@ static struct dcent {
 
 static int dc_jail_cacheable(const char *jcanon) {
     if (!res_enabled()) return 0;
-    if (jcanon == g_rootfs_canon) return 1; // the writable upper (mutations bump g_res_epoch)
-    for (int i = 0; i < g_nlower; i++)
-        if (jcanon == g_lower[i].canon) return 1; // read-only image lowers
+    if (jcanon == g_vfs_namespace.root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)
+    for (int i = 0; i < hl_linux_vfs_lower_count(&g_vfs_namespace); i++)
+        if (jcanon == g_vfs_namespace.lowers[i].canon) return 1; // read-only image lowers
     return 0; // anything else (bind-mount volumes, unknown roots): host-mutable -> never cache
 }
 
@@ -703,7 +704,8 @@ static void oc_store(const char *g, const char *host) {
     size_t hl = strlen(host);
     if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || hl >= sizeof(((struct ocent *)0)->host)) return;
     // defensive: never cache a host path that resolved OUTSIDE the rootfs jail (item-9-style confinement).
-    if (g_rootfs_canon_len && strncmp(host, g_rootfs_canon, g_rootfs_canon_len)) return;
+    size_t root_length = hl_linux_vfs_root_length(&g_vfs_namespace);
+    if (root_length && strncmp(host, g_vfs_namespace.root_canonical, root_length)) return;
     CLK;
     uint64_t h = mc_hash(g);
     struct ocent *e = &g_oc[h & (OCACHE_N - 1)];

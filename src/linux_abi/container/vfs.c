@@ -88,6 +88,8 @@ static void chroot_strip(char *guest, size_t n) {
     }
 }
 
+#include "namespace.h"
+
 // realpath(g_rootfs) -- the true rootfs boundary
 static char g_rootfs_canon[4200];
 static size_t g_rootfs_canon_len;
@@ -1062,6 +1064,13 @@ static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) 
 }
 
 #include "vfs/overlay.c"
+
+static const struct hl_linux_vfs_namespace g_vfs_namespace = {
+    g_rootfs_canon,
+    &g_rootfs_canon_len,
+    g_lower,
+    &g_nlower,
+};
 
 // final NOT followed (readlink/lstat)
 static const char *xlate(const char *p, char *buf, size_t n) {
