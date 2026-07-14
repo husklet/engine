@@ -1,9 +1,12 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>       // mach_vm_region: probe whether a guest address is still mapped (see cleartid)
 #include <mach/mach_time.h>     // mach_timebase_info: ns<->mach-abs for the precise-sleep RT window
 #include <mach/thread_policy.h> // THREAD_TIME_CONSTRAINT_POLICY: precise (uncoalesced) timer wakeups
+#endif
+#include "../host/range.h"
 
 // macOS coalesces ordinary timer wakeups by ~1-2.5ms to save power (nanosleep/mach_wait_until alike),
 // which blows LTP nanosleep01's 450us threshold -- Linux hrtimers are exact. A THREAD_TIME_CONSTRAINT
@@ -11,6 +14,7 @@
 // duration of a guest sleep and drop back to the standard timeshare policy after, so the thread's normal
 // scheduling is unchanged outside the sleep and no thread is left permanently real-time.
 static void sleep_precise_begin(void) {
+#if defined(__APPLE__)
     mach_timebase_info_data_t tb;
     if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) return;
     double ns2abs = (double)tb.denom / (double)tb.numer; // nanoseconds -> mach abs ticks
@@ -21,11 +25,14 @@ static void sleep_precise_begin(void) {
     p.preemptible = 1;                             // fully preemptible: never starves other threads
     thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p,
                       THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+#endif
 }
 
 static void sleep_precise_end(void) {
+#if defined(__APPLE__)
     thread_standard_policy_data_t sp = {0}; // back to the default timeshare scheduling
     thread_policy_set(mach_thread_self(), THREAD_STANDARD_POLICY, (thread_policy_t)&sp, THREAD_STANDARD_POLICY_COUNT);
+#endif
 }
 
 // ---------------- syscalls ----------------
@@ -448,17 +455,7 @@ static void gna_reset(void) {
 // address), so query the VM map directly: mach_vm_region returns the first region at-or-above `a`, and `a`
 // is mapped iff it falls inside [start, start+size). Same technique as the x86 loader's lazy_addr_mapped.
 // Used to mirror the kernel's fault-tolerant put_user() on the CLEARTID teardown path (futex_wake_addr).
-static int host_addr_mapped(uintptr_t a) {
-    mach_vm_address_t addr = a;
-    mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) !=
-        KERN_SUCCESS)
-        return 0; // nothing at/above -> unmapped
-    return a >= (uintptr_t)addr && a < (uintptr_t)addr + (uintptr_t)size;
-}
+static int host_addr_mapped(uintptr_t a) { return hl_host_address_mapped(a); }
 
 // per-thread ALTERNATE signal stack for the synchronous-fault guards. On the aarch64 frontend the
 // host SP == the guest SP while a translated block runs, so a guest STACK OVERFLOW leaves no room for the
