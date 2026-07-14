@@ -85,7 +85,7 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT) == HL_STATUS_OK);
     truncated = services;
-    truncated.capabilities |= HL_HOST_CAP_WATCH;
+    truncated.watch = NULL;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
     truncated.watch = &watch;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_OK);
@@ -95,6 +95,25 @@ int main(void) {
     watch.size = sizeof(watch) - 1;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_WATCH) == HL_STATUS_ABI_MISMATCH);
     watch.size = sizeof(watch);
+    {
+        hl_host_result watched = services.watch->open(services.context, 77);
+        hl_host_result watch_pollset = services.event->create(services.context);
+        hl_host_watch_record record = {0};
+        HL_CHECK(watched.status == HL_STATUS_OK && watch_pollset.status == HL_STATUS_OK);
+        HL_CHECK(services.event
+                     ->control(services.context, watch_pollset.value, HL_HOST_EVENT_ADD, watched.value, 88,
+                               HL_HOST_READY_READ)
+                     .status == HL_STATUS_OK);
+        hl_fake_host_watch_emit(&fake, 77, 3, 4, 99, HL_HOST_WATCH_SIZE | HL_HOST_WATCH_DATA);
+        HL_CHECK(services.event->wait(services.context, watch_pollset.value, &ready, 1, 0).value == 1 &&
+                 ready.token == 88);
+        HL_CHECK(services.watch->drain(services.context, watched.value, &record, 1).value == 1 &&
+                 record.stable_device == 3 && record.stable_object == 4 && record.size == 99 &&
+                 record.changes == (HL_HOST_WATCH_SIZE | HL_HOST_WATCH_DATA));
+        HL_CHECK(services.watch->drain(services.context, watched.value, &record, 1).status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.watch->close(services.context, watched.value).status == HL_STATUS_OK);
+        HL_CHECK(services.event->close(services.context, watch_pollset.value).status == HL_STATUS_OK);
+    }
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);

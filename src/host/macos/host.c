@@ -39,6 +39,7 @@
 #define HL_MACOS_TRANSFER_CAPACITY 64u
 #define HL_MACOS_DIRECTORY_CAPACITY 128u
 #define HL_MACOS_DIRECTORY_WATCH_CAPACITY 256u
+#define HL_MACOS_WATCH_CAPACITY 128u
 #define HL_MACOS_COUNTER_SUBSCRIPTIONS 128u
 
 typedef struct hl_macos_mapping {
@@ -80,6 +81,17 @@ typedef struct hl_macos_event {
     int descriptor;
     hl_macos_timer timers[HL_MACOS_TIMER_CAPACITY];
 } hl_macos_event;
+
+typedef struct hl_macos_watch {
+    uint32_t generation;
+    uint32_t active;
+    int descriptor;
+    uint64_t delivered_generation;
+    uint64_t modified_ns;
+    uint64_t changed_ns;
+    nlink_t links;
+    hl_host_watch_record record;
+} hl_macos_watch;
 
 typedef struct hl_macos_counter_shared {
     pthread_mutex_t lock;
@@ -153,6 +165,7 @@ struct hl_host_macos {
     hl_macos_counter_subscription counter_subscriptions[HL_MACOS_COUNTER_SUBSCRIPTIONS];
     hl_macos_transfer transfers[HL_MACOS_TRANSFER_CAPACITY];
     hl_macos_directory directories[HL_MACOS_DIRECTORY_CAPACITY];
+    hl_macos_watch watches[HL_MACOS_WATCH_CAPACITY];
 };
 
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append);
@@ -2114,6 +2127,165 @@ static hl_host_result hl_macos_counter_close(void *context, hl_host_handle handl
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_handle hl_macos_watch_handle(uint32_t index, uint32_t generation) {
+    return ((uint64_t)generation << 32) | UINT64_C(0x80000000) | (uint64_t)(index + 1u);
+}
+
+static hl_macos_watch *hl_macos_watch_lookup(hl_host_macos *host, hl_host_handle handle) {
+    uint32_t low = (uint32_t)handle;
+    if ((low & UINT32_C(0x80000000)) == 0) return NULL;
+    uint32_t index = (low & UINT32_C(0x7fffffff)) - 1u;
+    if (index >= HL_MACOS_WATCH_CAPACITY || !host->watches[index].active ||
+        host->watches[index].generation != (uint32_t)(handle >> 32))
+        return NULL;
+    return &host->watches[index];
+}
+
+static int hl_macos_watch_refresh(hl_macos_watch *watch) {
+    struct stat status;
+    hl_host_watch_record next = watch->record;
+    uint32_t changes = 0;
+    if (fstat(watch->descriptor, &status) != 0) {
+        if (errno != ENOENT) return -1;
+        changes = HL_HOST_WATCH_DELETED;
+    } else {
+        uint64_t device = (uint64_t)status.st_dev, object = (uint64_t)status.st_ino;
+        uint64_t size = status.st_size < 0 ? 0 : (uint64_t)status.st_size;
+        uint64_t modified = (uint64_t)status.st_mtimespec.tv_sec * UINT64_C(1000000000) +
+                            (uint64_t)status.st_mtimespec.tv_nsec;
+        uint64_t changed = (uint64_t)status.st_ctimespec.tv_sec * UINT64_C(1000000000) +
+                           (uint64_t)status.st_ctimespec.tv_nsec;
+        if (device != next.stable_device || object != next.stable_object) changes |= HL_HOST_WATCH_IDENTITY;
+        if (size != next.size) changes |= HL_HOST_WATCH_SIZE;
+        if (modified != watch->modified_ns) changes |= HL_HOST_WATCH_DATA;
+        if (changed != watch->changed_ns) changes |= HL_HOST_WATCH_DATA;
+        if (status.st_nlink == 0 && watch->links != 0) changes |= HL_HOST_WATCH_DELETED;
+        next.stable_device = device;
+        next.stable_object = object;
+        next.size = size;
+        watch->modified_ns = modified;
+        watch->changed_ns = changed;
+        watch->links = status.st_nlink;
+    }
+    if (changes != 0) {
+        if (watch->record.generation != watch->delivered_generation) changes |= next.changes;
+        next.generation++;
+        if (next.generation == 0) next.generation = 1;
+        next.changes = changes;
+        watch->record = next;
+    }
+    return 0;
+}
+
+static hl_host_result hl_macos_watch_open(void *context, hl_host_handle file) {
+    hl_host_macos *host = context;
+    hl_macos_file *entry;
+    int descriptor = -1;
+    uint32_t index;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_macos_file_lookup(host, file);
+    if (entry != NULL) descriptor = fcntl(entry->descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return entry == NULL ? hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0) : hl_macos_errno();
+    struct stat status;
+    if (fstat(descriptor, &status) != 0) {
+        hl_host_result error = hl_macos_errno();
+        close(descriptor);
+        return error;
+    }
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < HL_MACOS_WATCH_CAPACITY && host->watches[index].active; ++index) {}
+    if (index == HL_MACOS_WATCH_CAPACITY) {
+        pthread_mutex_unlock(&host->lock);
+        close(descriptor);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    hl_macos_watch *watch = &host->watches[index];
+    watch->generation++;
+    if (watch->generation == 0) watch->generation = 1;
+    watch->active = 1;
+    watch->descriptor = descriptor;
+    watch->record = (hl_host_watch_record){1, (uint64_t)status.st_dev, (uint64_t)status.st_ino,
+                                           status.st_size < 0 ? 0 : (uint64_t)status.st_size, 0, 0};
+    watch->modified_ns = (uint64_t)status.st_mtimespec.tv_sec * UINT64_C(1000000000) +
+                         (uint64_t)status.st_mtimespec.tv_nsec;
+    watch->changed_ns = (uint64_t)status.st_ctimespec.tv_sec * UINT64_C(1000000000) +
+                        (uint64_t)status.st_ctimespec.tv_nsec;
+    watch->links = status.st_nlink;
+    watch->delivered_generation = 1;
+    hl_host_handle handle = hl_macos_watch_handle(index, watch->generation);
+    hl_host_process_fd_private_add(descriptor);
+    pthread_mutex_unlock(&host->lock);
+    return hl_macos_result(HL_STATUS_OK, handle, 0);
+}
+
+static hl_host_result hl_macos_watch_query(void *context, hl_host_handle handle, hl_host_watch_record *record) {
+    hl_host_macos *host = context;
+    int result;
+    if (record == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_macos_watch *watch = hl_macos_watch_lookup(host, handle);
+    result = watch == NULL ? -2 : hl_macos_watch_refresh(watch);
+    if (result == 0) *record = watch->record;
+    pthread_mutex_unlock(&host->lock);
+    if (result == -2) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_watch_drain(void *context, hl_host_handle handle, hl_host_watch_record *records,
+                                           size_t capacity) {
+    hl_host_macos *host = context;
+    int result;
+    if (records == NULL || capacity == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_macos_watch *watch = hl_macos_watch_lookup(host, handle);
+    result = watch == NULL ? -2 : hl_macos_watch_refresh(watch);
+    if (result == 0 && watch->record.generation != watch->delivered_generation) {
+        records[0] = watch->record;
+        watch->delivered_generation = watch->record.generation;
+        result = 1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (result == -2) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (result < 0) return hl_macos_errno();
+    return result == 0 ? hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0) : hl_macos_result(HL_STATUS_OK, 1, 0);
+}
+
+static hl_host_result hl_macos_watch_close(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    hl_macos_watch *watch = hl_macos_watch_lookup(host, handle);
+    if (watch == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = watch->descriptor;
+    watch->active = 0;
+    watch->descriptor = -1;
+    pthread_mutex_unlock(&host->lock);
+    hl_host_process_fd_private_remove(descriptor);
+    return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static void hl_macos_watch_note(hl_host_macos *host, uintptr_t descriptor, uint32_t native_changes) {
+    for (uint32_t index = 0; index < HL_MACOS_WATCH_CAPACITY; ++index) {
+        hl_macos_watch *watch = &host->watches[index];
+        if (!watch->active || (uintptr_t)watch->descriptor != descriptor) continue;
+        uint32_t changes = 0;
+        if ((native_changes & (NOTE_WRITE | NOTE_EXTEND)) != 0) changes |= HL_HOST_WATCH_DATA;
+        if ((native_changes & NOTE_EXTEND) != 0) changes |= HL_HOST_WATCH_SIZE;
+        if ((native_changes & NOTE_DELETE) != 0) changes |= HL_HOST_WATCH_DELETED;
+        if ((native_changes & NOTE_RENAME) != 0) changes |= HL_HOST_WATCH_IDENTITY;
+        if (changes != 0) {
+            watch->record.generation++;
+            if (watch->record.generation == 0) watch->record.generation = 1;
+            watch->record.changes = changes;
+        }
+        break;
+    }
+}
+
 static hl_host_result hl_macos_event_create(void *context) {
     hl_host_macos *host = context;
     struct kevent wake;
@@ -2164,6 +2336,7 @@ static hl_host_result hl_macos_event_control(void *context, hl_host_handle polls
     hl_macos_counter *counter;
     hl_macos_directory *directory;
     hl_macos_transfer *transfer;
+    hl_macos_watch *watch;
     struct kevent changes[2];
     int count = 0;
     int descriptor;
@@ -2173,24 +2346,43 @@ static hl_host_result hl_macos_event_control(void *context, hl_host_handle polls
     counter = hl_macos_counter_lookup(host, object_handle);
     directory = hl_macos_directory_lookup(host, object_handle);
     transfer = hl_macos_transfer_lookup(host, object_handle);
-    descriptor = event == NULL || (counter == NULL && directory == NULL && transfer == NULL) ? -1 : event->descriptor;
+    watch = hl_macos_watch_lookup(host, object_handle);
+    descriptor = event == NULL || (counter == NULL && directory == NULL && transfer == NULL && watch == NULL)
+                     ? -1
+                     : event->descriptor;
     if (descriptor >= 0 && counter != NULL) object_handle = (hl_host_handle)counter->object->readable;
     if (descriptor >= 0 && directory != NULL) object_handle = (hl_host_handle)directory->object->descriptor;
     if (descriptor >= 0 && transfer != NULL) object_handle = (hl_host_handle)transfer->descriptor;
-    pthread_mutex_unlock(&host->lock);
-    if (descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (descriptor >= 0 && watch != NULL) object_handle = (hl_host_handle)watch->descriptor;
+    if (descriptor < 0 || token == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     if (operation == HL_HOST_EVENT_DELETE)
         flags = EV_DELETE;
     else if (operation == HL_HOST_EVENT_ADD || operation == HL_HOST_EVENT_MODIFY)
         flags = (uint16_t)(EV_ADD | EV_ENABLE | ((interests & HL_HOST_READY_EDGE) ? EV_CLEAR : 0) |
                            ((interests & HL_HOST_READY_ONESHOT) ? EV_ONESHOT : 0));
-    else
+    else {
+        pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if ((interests & HL_HOST_READY_READ) != 0 || operation == HL_HOST_EVENT_DELETE)
-        EV_SET(&changes[count++], (uintptr_t)object_handle, EVFILT_READ, flags, 0, 0, (void *)(uintptr_t)token);
-    if (count == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    return kevent(descriptor, changes, count, NULL, 0, NULL) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
-                                                                  : hl_macos_errno();
+    }
+    if ((interests & HL_HOST_READY_READ) != 0 || operation == HL_HOST_EVENT_DELETE) {
+        if (watch != NULL)
+            EV_SET(&changes[count++], (uintptr_t)object_handle, EVFILT_VNODE, flags,
+                   NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME, 0, (void *)(uintptr_t)token);
+        else
+            EV_SET(&changes[count++], (uintptr_t)object_handle, EVFILT_READ, flags, 0, 0,
+                   (void *)(uintptr_t)token);
+    }
+    if (count == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    int result = kevent(descriptor, changes, count, NULL, 0, NULL);
+    hl_host_result output = result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+    pthread_mutex_unlock(&host->lock);
+    return output;
 }
 
 static int hl_macos_event_submit_timer(int descriptor, uint64_t token, uint64_t delay_ns) {
@@ -2293,9 +2485,15 @@ static hl_host_result hl_macos_event_wait(void *context, hl_host_handle pollset,
         uint64_t token = (uint64_t)(uintptr_t)native[index].udata;
         if (native[index].filter == EVFILT_USER) continue;
         if (native[index].filter == EVFILT_READ) readiness |= HL_HOST_READY_READ;
+        if (native[index].filter == EVFILT_VNODE) readiness |= HL_HOST_READY_READ;
         if (native[index].filter == EVFILT_WRITE) readiness |= HL_HOST_READY_WRITE;
         if ((native[index].flags & EV_ERROR) != 0) readiness |= HL_HOST_READY_ERROR;
         if ((native[index].flags & EV_EOF) != 0) readiness |= HL_HOST_READY_HANGUP;
+        if (native[index].filter == EVFILT_VNODE) {
+            pthread_mutex_lock(&host->lock);
+            hl_macos_watch_note(host, native[index].ident, native[index].fflags);
+            pthread_mutex_unlock(&host->lock);
+        }
         if (native[index].filter == EVFILT_TIMER) {
             readiness |= HL_HOST_READY_TIMER;
             token = (uint64_t)native[index].ident;
@@ -2735,6 +2933,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_macos_directory_create, hl_macos_directory_add,
         hl_macos_directory_modify, hl_macos_directory_remove, hl_macos_directory_read,   hl_macos_directory_duplicate,
         hl_macos_directory_close};
+    static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), hl_macos_watch_open,
+                                                  hl_macos_watch_query, hl_macos_watch_drain,
+                                                  hl_macos_watch_close};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -2768,7 +2969,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_PROCESS | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
                                  HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC | HL_HOST_CAP_EVENT | HL_HOST_CAP_COUNTER |
-                                 HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_TRANSFER;
+                                 HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_WATCH;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -2781,6 +2982,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->counter = &counter;
     out_services->transfer = &transfer;
     out_services->directory = &directory;
+    out_services->watch = &watch;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -2796,6 +2998,8 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     }
     for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index)
         if (host->events[index].active) close(host->events[index].descriptor);
+    for (index = 0; index < HL_MACOS_WATCH_CAPACITY; ++index)
+        if (host->watches[index].active) close(host->watches[index].descriptor);
     for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
         hl_macos_counter *counter = &host->counters[index];
         hl_macos_counter_object *object;

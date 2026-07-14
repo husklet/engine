@@ -744,6 +744,69 @@ void hl_fake_host_directory_emit(hl_fake_host *fake, uint64_t token, uint32_t ch
     }
 }
 
+static int hl_fake_watch_index(const hl_fake_host *fake, hl_host_handle handle) {
+    for (uint32_t index = 0; index < 16; ++index)
+        if (fake->watch_handles[index] == handle) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_watch_open(void *context, hl_host_handle file) {
+    hl_fake_host *fake = context;
+    uint32_t index;
+    if (file == HL_HOST_HANDLE_INVALID) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (index = 0; index < 16 && fake->watch_handles[index] != 0; ++index) {}
+    if (index == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->watch_handles[index] = ++fake->next_handle;
+    fake->watch_files[index] = file;
+    fake->watch_records[index].generation = 1;
+    fake->watch_delivered[index] = 1;
+    return hl_fake_result(fake, fake->watch_handles[index]);
+}
+
+static hl_host_result hl_fake_watch_query(void *context, hl_host_handle handle, hl_host_watch_record *record) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_watch_index(fake, handle);
+    if (index < 0 || record == NULL) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    *record = fake->watch_records[index];
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_watch_drain(void *context, hl_host_handle handle, hl_host_watch_record *records,
+                                          size_t capacity) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_watch_index(fake, handle);
+    if (index < 0 || records == NULL || capacity == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (fake->watch_delivered[index] == fake->watch_records[index].generation)
+        return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    records[0] = fake->watch_records[index];
+    fake->watch_delivered[index] = fake->watch_records[index].generation;
+    return hl_fake_result(fake, 1);
+}
+
+static hl_host_result hl_fake_watch_close(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_watch_index(fake, handle);
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->watch_handles[index] = 0;
+    fake->watch_files[index] = 0;
+    memset(&fake->watch_records[index], 0, sizeof(fake->watch_records[index]));
+    return hl_fake_result(fake, 0);
+}
+
+void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object,
+                             uint64_t size, uint32_t changes) {
+    for (uint32_t index = 0; index < 16; ++index) {
+        if (fake->watch_handles[index] == 0 || fake->watch_files[index] != file) continue;
+        hl_host_watch_record *record = &fake->watch_records[index];
+        record->generation++;
+        record->stable_device = device;
+        record->stable_object = object;
+        record->size = size;
+        record->changes = changes;
+    }
+}
+
 static int hl_fake_event_index(const hl_fake_host *fake, hl_host_handle handle) {
     uint32_t index;
     for (index = 0; index < 16; ++index)
@@ -765,16 +828,19 @@ static hl_host_result hl_fake_event_control(void *context, hl_host_handle pollse
     hl_fake_host *fake = context;
     int event = hl_fake_event_index(fake, pollset);
     int directory = hl_fake_directory_handle(fake, object);
+    int watch = hl_fake_watch_index(fake, object);
     if (event < 0 || token == 0 || (interests & HL_HOST_READY_READ) == 0)
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     if (operation == HL_HOST_EVENT_DELETE) {
         fake->event_directories[event] = 0;
+        fake->event_watches[event] = 0;
         fake->event_tokens[event] = 0;
         return hl_fake_result(fake, 0);
     }
-    if ((operation != HL_HOST_EVENT_ADD && operation != HL_HOST_EVENT_MODIFY) || directory < 0)
+    if ((operation != HL_HOST_EVENT_ADD && operation != HL_HOST_EVENT_MODIFY) || (directory < 0 && watch < 0))
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
-    fake->event_directories[event] = (uint8_t)(fake->directory_objects[directory] + 1u);
+    fake->event_directories[event] = directory < 0 ? 0 : (uint8_t)(fake->directory_objects[directory] + 1u);
+    fake->event_watches[event] = watch < 0 ? 0 : (uint8_t)(watch + 1);
     fake->event_tokens[event] = token;
     return hl_fake_result(fake, 0);
 }
@@ -786,9 +852,16 @@ static hl_host_result hl_fake_event_wait(void *context, hl_host_handle pollset, 
     uint32_t object;
     (void)deadline;
     if (event < 0 || events == NULL || capacity == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
-    if (fake->event_directories[event] == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
-    object = fake->event_directories[event] - 1u;
-    if (fake->directory_record_counts[object] == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    if (fake->event_directories[event] != 0) {
+        object = fake->event_directories[event] - 1u;
+        if (fake->directory_record_counts[object] == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    } else if (fake->event_watches[event] != 0) {
+        object = fake->event_watches[event] - 1u;
+        if (fake->watch_records[object].generation == fake->watch_delivered[object])
+            return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    } else {
+        return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    }
     events[0] = (hl_host_event_record){fake->event_tokens[event], HL_HOST_READY_READ, 0};
     return hl_fake_result(fake, 1);
 }
@@ -805,6 +878,7 @@ static hl_host_result hl_fake_event_close(void *context, hl_host_handle pollset)
     if (event < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     fake->event_handles[event] = 0;
     fake->event_directories[event] = 0;
+    fake->event_watches[event] = 0;
     fake->event_tokens[event] = 0;
     return hl_fake_result(fake, 0);
 }
@@ -854,6 +928,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                  hl_fake_event_close,
                                                  NULL,
                                                  NULL};
+    static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), hl_fake_watch_open,
+                                                  hl_fake_watch_query, hl_fake_watch_drain, hl_fake_watch_close};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -865,7 +941,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);
     services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
-                             HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT;
+                             HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT |
+                             HL_HOST_CAP_WATCH;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
@@ -875,6 +952,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->transfer = &transfer;
     services->directory = &directory;
     services->event = &event;
+    services->watch = &watch;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

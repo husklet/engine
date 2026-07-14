@@ -54,7 +54,12 @@ typedef struct hl_fake_host {
     uint8_t directory_record_counts[16];
     uint64_t event_handles[16];
     uint8_t event_directories[16];
+    uint8_t event_watches[16];
     uint64_t event_tokens[16];
+    uint64_t watch_handles[16];
+    uint64_t watch_files[16];
+    uint64_t watch_delivered[16];
+    hl_host_watch_record watch_records[16];
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;
@@ -63,6 +68,8 @@ HL_API void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services);
 HL_API void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status);
 HL_API void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block);
 HL_API void hl_fake_host_directory_emit(hl_fake_host *fake, uint64_t token, uint32_t changes);
+HL_API void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object,
+                                    uint64_t size, uint32_t changes);
 
 HL_EXTERN_C_END
 

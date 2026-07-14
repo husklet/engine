@@ -463,6 +463,78 @@ int main(void) {
         HL_CHECK(services.file->truncate(services.context, clone.value, 2).status == HL_STATUS_OK);
         HL_CHECK(services.file->truncate(services.context, clone.value, 3).status == HL_STATUS_OK);
         HL_CHECK(services.file->write_at(services.context, clone.value, 2, (hl_host_const_bytes){"c", 1}).value == 1);
+        {
+            hl_host_result watch = services.watch->open(services.context, clone.value);
+            hl_host_result watched_pollset = services.event->create(services.context);
+            hl_host_watch_record current = {0}, changed = {0};
+            hl_host_event_record notification = {0};
+            HL_CHECK(watch.status == HL_STATUS_OK && watched_pollset.status == HL_STATUS_OK);
+            HL_CHECK(services.watch->query(services.context, watch.value, &current).status == HL_STATUS_OK &&
+                     current.size == 3);
+            HL_CHECK(services.event
+                         ->control(services.context, watched_pollset.value, HL_HOST_EVENT_ADD, watch.value, 313,
+                                   HL_HOST_READY_READ)
+                         .status == HL_STATUS_OK);
+            HL_CHECK(services.file->truncate(services.context, clone.value, 9).status == HL_STATUS_OK);
+            uint64_t watch_deadline =
+                services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(services.event
+                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
+                         .value == 1 &&
+                     notification.token == 313 && (notification.readiness & HL_HOST_READY_READ) != 0);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
+                     changed.generation > current.generation && changed.size == 9 &&
+                     (changed.changes & HL_HOST_WATCH_SIZE) != 0);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).status ==
+                     HL_STATUS_WOULD_BLOCK);
+            HL_CHECK(services.file->write_at(services.context, clone.value, 0,
+                                             (hl_host_const_bytes){"q", 1}).value == 1);
+            watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(services.event
+                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
+                         .value == 1);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
+                     changed.size == 9 && (changed.changes & HL_HOST_WATCH_DATA) != 0);
+            pid_t watch_child = fork();
+            HL_CHECK(watch_child >= 0);
+            if (watch_child == 0) {
+                hl_host_watch_record inherited = {0};
+                _exit(services.watch->query(services.context, watch.value, &inherited).status == HL_STATUS_OK &&
+                              inherited.size == 9
+                          ? 0
+                          : 30);
+            }
+            int watch_status = 0;
+            HL_CHECK(waitpid(watch_child, &watch_status, 0) == watch_child && WIFEXITED(watch_status) &&
+                     WEXITSTATUS(watch_status) == 0);
+            snprintf(moved_path, sizeof(moved_path), "%s.watch", path);
+            (void)unlink(moved_path);
+            HL_CHECK(rename(path, moved_path) == 0);
+            watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(services.event
+                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
+                         .value == 1);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
+                     (changed.changes & HL_HOST_WATCH_IDENTITY) != 0);
+            HL_CHECK(rename(moved_path, path) == 0);
+            watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(services.event
+                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
+                         .value == 1);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1);
+            HL_CHECK(unlink(path) == 0);
+            watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(services.event
+                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
+                         .value == 1);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
+                     (changed.changes & HL_HOST_WATCH_DELETED) != 0);
+            int replacement = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+            HL_CHECK(replacement >= 0 && ftruncate(replacement, 3) == 0 && close(replacement) == 0);
+            HL_CHECK(services.event->close(services.context, watched_pollset.value).status == HL_STATUS_OK);
+            HL_CHECK(services.watch->close(services.context, watch.value).status == HL_STATUS_OK);
+            HL_CHECK(services.file->truncate(services.context, clone.value, 3).status == HL_STATUS_OK);
+        }
         HL_CHECK(services.file->close(services.context, clone.value).status == HL_STATUS_OK);
     }
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
