@@ -74,7 +74,38 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
-                                                      HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+                                                      HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING |
+                                                      HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+    {
+        static const char payload[] = "shared-memory";
+        char readback[sizeof(payload)] = {0};
+        hl_host_file_metadata metadata;
+        hl_host_result shared = services.shared_memory->create(services.context, 4096, 0);
+        hl_host_result copy;
+        HL_CHECK(shared.status == HL_STATUS_OK && shared.value != HL_HOST_HANDLE_INVALID &&
+                 shared.detail == shared.value);
+        HL_CHECK(services.shared_memory->create(services.context, 4096, 1).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.shared_memory->open(services.context, shared.detail, 1).status == HL_STATUS_INVALID_ARGUMENT);
+        copy = services.shared_memory->open(services.context, shared.detail, 0);
+        HL_CHECK(copy.status == HL_STATUS_OK && copy.value != shared.value && copy.detail == shared.detail);
+        HL_CHECK(
+            services.file->write_at(services.context, shared.value, 17, (hl_host_const_bytes){payload, sizeof(payload)})
+                .value == sizeof(payload));
+        HL_CHECK(services.file->read_at(services.context, copy.value, 17, (hl_host_bytes){readback, sizeof(readback)})
+                     .value == sizeof(readback));
+        HL_CHECK(memcmp(readback, payload, sizeof(payload)) == 0);
+        HL_CHECK(services.shared_memory->resize(services.context, copy.value, 8192).status == HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, shared.value, &metadata).status == HL_STATUS_OK &&
+                 metadata.type == HL_HOST_FILE_TYPE_REGULAR && metadata.size == 8192);
+        HL_CHECK(services.shared_memory->close(services.context, shared.value).status == HL_STATUS_OK);
+        HL_CHECK(services.shared_memory->open(services.context, shared.detail, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.shared_memory->resize(services.context, copy.value, 12288).status == HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, copy.value, &metadata).status == HL_STATUS_OK &&
+                 metadata.size == 12288);
+        HL_CHECK(services.shared_memory->close(services.context, copy.value).status == HL_STATUS_OK);
+        HL_CHECK(services.shared_memory->resize(services.context, copy.value, 4096).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+    }
     {
         hl_host_result raw_before = services.clock->raw_monotonic_ns(services.context);
         hl_host_result process_before = services.clock->process_cpu_ns(services.context);

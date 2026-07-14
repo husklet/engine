@@ -37,6 +37,7 @@ typedef struct hl_macos_mapping {
 typedef struct hl_macos_file {
     uint32_t generation;
     uint32_t active;
+    uint32_t shared;
     int descriptor;
     int append_descriptor;
 } hl_macos_file;
@@ -399,7 +400,8 @@ static hl_macos_file *hl_macos_file_lookup(hl_host_macos *host, hl_host_handle h
     return &host->files[index];
 }
 
-static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor, int append_descriptor) {
+static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor, int append_descriptor,
+                                             uint32_t shared) {
     uint32_t index;
     hl_host_handle handle = 0;
     pthread_mutex_lock(&host->lock);
@@ -409,6 +411,7 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
             file->generation++;
             if (file->generation == 0) file->generation = 1;
             file->active = 1;
+            file->shared = shared;
             file->descriptor = descriptor;
             file->append_descriptor = append_descriptor;
             handle = ((uint64_t)file->generation << 32) | (HL_MACOS_MAPPING_CAPACITY + index + 1u);
@@ -463,7 +466,7 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
             return error;
         }
     }
-    hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor);
+    hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor, 0);
     if (result.status != HL_STATUS_OK) {
         close(descriptor);
         if (append_descriptor >= 0) close(append_descriptor);
@@ -526,10 +529,12 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
     int descriptor = -1;
     int append_descriptor = -1;
     int needs_append = 0;
+    uint32_t shared = 0;
     pthread_mutex_lock(&host->lock);
     entry = hl_macos_file_lookup(host, file);
     if (entry != NULL) {
         needs_append = entry->append_descriptor >= 0;
+        shared = entry->shared;
         descriptor = dup(entry->descriptor);
         if (descriptor >= 0 && needs_append) append_descriptor = dup(entry->append_descriptor);
     }
@@ -540,7 +545,7 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
         return error;
     }
     {
-        hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor);
+        hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor, shared);
         if (result.status != HL_STATUS_OK) {
             close(descriptor);
             if (append_descriptor >= 0) close(append_descriptor);
@@ -715,12 +720,71 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     descriptor = file->descriptor;
     append_descriptor = file->append_descriptor;
     file->active = 0;
+    file->shared = 0;
     file->descriptor = -1;
     file->append_descriptor = -1;
     pthread_mutex_unlock(&host->lock);
     if (close(descriptor) != 0) return hl_macos_errno();
     if (append_descriptor >= 0 && close(append_descriptor) != 0) return hl_macos_errno();
     return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_shared_create(void *context, uint64_t size, uint32_t flags) {
+    hl_host_macos *host = context;
+    char path[] = "/tmp/hl-engine-shared-XXXXXX";
+    int descriptor;
+    hl_host_result result;
+    if (size > INT64_MAX || flags != 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = mkstemp(path);
+    if (descriptor < 0) return hl_macos_errno();
+    if (unlink(path) != 0 || fcntl(descriptor, F_SETFD, FD_CLOEXEC) != 0 || ftruncate(descriptor, (off_t)size) != 0) {
+        hl_host_result error = hl_macos_errno();
+        close(descriptor);
+        return error;
+    }
+    result = hl_macos_file_register(host, descriptor, -1, 1);
+    if (result.status != HL_STATUS_OK)
+        close(descriptor);
+    else
+        result.detail = result.value;
+    return result;
+}
+
+static hl_host_result hl_macos_shared_open(void *context, uint64_t identity, uint32_t flags) {
+    hl_host_macos *host = context;
+    hl_macos_file *source;
+    int descriptor;
+    int valid;
+    hl_host_result result;
+    if (flags != 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    source = hl_macos_file_lookup(host, identity);
+    valid = source != NULL && source->shared;
+    descriptor = valid ? fcntl(source->descriptor, F_DUPFD_CLOEXEC, 0) : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return valid ? hl_macos_errno() : hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = hl_macos_file_register(host, descriptor, -1, 1);
+    if (result.status != HL_STATUS_OK)
+        close(descriptor);
+    else
+        result.detail = identity;
+    return result;
+}
+
+static hl_host_result hl_macos_shared_resize(void *context, hl_host_handle object, uint64_t size) {
+    hl_host_macos *host = context;
+    hl_macos_file *entry;
+    int result;
+    if (size > INT64_MAX) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_macos_file_lookup(host, object);
+    if (entry == NULL || !entry->shared) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    result = ftruncate(entry->descriptor, (off_t)size);
+    pthread_mutex_unlock(&host->lock);
+    return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
 static hl_macos_process *hl_macos_process_lookup(hl_host_macos *host, hl_host_handle handle) {
@@ -1003,6 +1067,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
+    static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
+                                                                 hl_macos_shared_create,    hl_macos_shared_open,
+                                                                 hl_macos_shared_resize,    hl_macos_file_close};
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
                                                hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
                                                hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_complete};
@@ -1037,13 +1104,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
-                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC;
+                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING |
+                                 HL_HOST_CAP_SYNC;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
     out_services->log = &log;
     out_services->file = &file;
     out_services->process = &process;
+    out_services->shared_memory = &shared_memory;
     out_services->sync = &sync;
     *out_host = host;
     return HL_STATUS_OK;
