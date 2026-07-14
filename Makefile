@@ -272,7 +272,7 @@ clean:
 help:
 	@echo 'make all           build pure-C static libraries and runner'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
-	@echo 'make compat-build  compile every imported compatibility fixture'
+	@echo 'make compat-build  compile every Linux behavior fixture'
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
 	@echo 'make format-check  enforce the repository clang-format policy'
