@@ -8,6 +8,8 @@
 #include <mach/mach_vm.h>
 #include <sys/ucontext.h>
 
+#include "../../../linux_abi/page.h"
+
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
 static uint16_t rd16(const uint8_t *p) {
     return p[0] | (p[1] << 8);
@@ -498,7 +500,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {3, lm->phdr},
         {4, (uint64_t)lm->phent},
         {5, (uint64_t)lm->phnum},
-        {6, 4096},
+        {6, HL_LINUX_GUEST_PAGE_SIZE},
         {7, at_base},
         {8, 0},
         {9, lm->entry},

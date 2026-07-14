@@ -1,5 +1,6 @@
 // Extracted from service(): Memory — mmap/brk/mprotect/madvise syscalls. Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
+#include "../page.h"
 // process_vm_readv/writev between two iovec arrays. In this single-address-space DBT the "remote"
 // process is always the guest itself, so both vectors point into directly-dereferenceable guest memory
 // and the transfer is a scatter/gather memcpy -- exactly the kernel's stream semantics: bytes flow from
@@ -100,9 +101,9 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
     return 0;
 }
 
-// The guest's page size (as it sees via AT_PAGESZ / sysconf(_SC_PAGESIZE)): 4 KB for x86_64 guests,
-// 16 KB for aarch64. Read straight from the auxv the loader built (type 6 = AT_PAGESZ), so this shared
-// TU needs no per-arch macro. Falls back to the host granularity if the auxv isn't populated yet.
+// The guest's page size (as it sees via AT_PAGESZ / sysconf(_SC_PAGESIZE)).  Read it from auxv after
+// stack construction; before that exists, fall back to the Linux ABI constant, never the host mapping
+// granularity.  Host mmap alignment paths use getpagesize() explicitly.
 static size_t guest_pagesz(void) {
     for (int i = 0; i + 16 <= g_auxv_len; i += 16) {
         uint64_t t, v;
@@ -110,7 +111,7 @@ static size_t guest_pagesz(void) {
         memcpy(&v, g_auxv_data + i + 8, 8);
         if (t == 6 && v) return (size_t)v;
     }
-    return (size_t)getpagesize();
+    return HL_LINUX_GUEST_PAGE_SIZE;
 }
 
 static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,

@@ -1,5 +1,7 @@
 // hl/linux_abi -- the ELF loader (map PT_LOAD high; static-PIE + dynamic via ld.so; build stack).
 
+#include "page.h"
+
 // ---------------- minimal ELF loader (load segments HIGH; PC-relative stays valid) ----------------
 static uint16_t rd16(const uint8_t *p) {
     return p[0] | (p[1] << 8);
@@ -1007,18 +1009,14 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     arc4random_buf(top, 16);
     uint64_t rnd = (uint64_t)top;
     top = (uint8_t *)((uint64_t)top & ~15ull);
-    // AT_PAGESZ must be the HOST mmap granularity (16 KB on Apple Silicon), not the guest's nominal 4 KB.
-    // ld.so rounds every PT_LOAD segment map to AT_PAGESZ; aarch64 .so segments use a 64 KB p_align, so a
-    // 16 KB page keeps each segment's MAP_FIXED address host-page-aligned and the kernel maps it directly.
-    // A 4 KB AT_PAGESZ instead yields 4 KB- but not 16 KB-aligned fixed maps that macOS rejects (EINVAL),
-    // forcing the syscall layer's fallback to copy from the reserved-but-past-EOF tail of the file map ->
-    // SIGBUS in the host's memmove. (64 KB-aligned segments stay congruent under a 16 KB page, so ld.so's
-    // p_vaddr/p_offset page-alignment check still passes.)
+    // AT_PAGESZ describes the Linux GUEST ABI, never the host VM granularity.  The syscall mmap layer
+    // separately reconciles 4 KiB guest MAP_FIXED requests with a 16 KiB Apple Silicon host, including
+    // dynamic-linker segment placement and past-EOF tails.
     uint64_t aux[][2] = {
         {3, lm->phdr},
         {4, (uint64_t)lm->phent},
         {5, (uint64_t)lm->phnum},
-        {6, (uint64_t)getpagesize()},
+        {6, HL_LINUX_GUEST_PAGE_SIZE},
         {7, at_base},
         {8, 0},
         {9, lm->entry},
