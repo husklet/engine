@@ -202,6 +202,8 @@ int main(void) {
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 4).status == HL_STATUS_OK);
     HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "jit", 4) == 0);
     HL_CHECK(services.memory->repair_code_after_fork(services.context, &code, 1).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->release(services.context, code.handle).status == HL_STATUS_OK);
 
     snprintf(path, sizeof(path), "/tmp/hl_host_linux_%ld", (long)getpid());

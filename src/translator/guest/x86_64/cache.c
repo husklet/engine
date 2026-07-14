@@ -417,9 +417,9 @@ static int pcache_load(uint64_t entry_jump) {
         g_pc_nlib = 0;
         return 0;
     }
-    pthread_jit_write_protect_np(0);
+    jit_wprot(0);
     memcpy(g_cache, abuf, h.arena_used);
-    pthread_jit_write_protect_np(1);
+    jit_wprot(1);
     free(abuf);
     // rebuild the engine state from the offset-relative records. fixed-image blocks (main+interp,
     // identity-validated by the cache key itself) go live NOW; manifest (library) blocks are DEFERRED
@@ -456,9 +456,9 @@ static int pcache_load(uint64_t entry_jump) {
     free(me);
     free(pe);
     // re-slide every baked PIE host pointer for THIS process + publish the restored code to the i-cache
-    pthread_jit_write_protect_np(0);
+    jit_wprot(0);
     pcache_relocate(h.block_return_at);
-    pthread_jit_write_protect_np(1);
+    jit_wprot(1);
     jit_publish_code(g_cache, h.arena_used);
     memset(g_ibtc, 0, sizeof g_ibtc); // runtime cache: repopulates lazily
     g_pcache_loaded = 1;

@@ -11,7 +11,7 @@
 //
 //   2. DUAL-MAPPED W^X arena. The engine writes g_cache (RW alias) and executes g_cache+g_rw2rx (RX
 //      alias). We memcpy the persisted bytes through the RW alias inside the single jit_wprot() write
-//      window (a no-op under dual mapping) and sys_icache_invalidate() the RX alias.
+//      window (a no-op under dual mapping) and publish the RX alias through host memory services.
 //
 // WHAT MAKES THE BYTES REUSABLE ACROSS PROCESSES (esp. the go-build fork+execve storm, where each
 // forked child re-loads a toolchain binary IN-PROCESS -- proc.c case 221 -- from a COLD, freshly

@@ -206,9 +206,9 @@ static void exec_close_cloexec(void) {
 static void fork_child_hooks(struct cpu *c) {
     // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
     // so the child's first run_block can instruction-abort fetching from the (non-executable) code
-    // cache -> the intermittent fork+exec SIGBUS. pthread_jit_write_protect_np(1) = RX (executable).
+    // cache -> the intermittent fork+exec SIGBUS. The host end-write gate re-asserts RX execution.
     // (No-op under the dual map, which never toggles W^X.)
-    pthread_jit_write_protect_np(1);
+    jit_wprot(1);
     install_host_sigaltstack(); // the altstack registration doesn't survive fork on Apple Silicon --
                                 // re-arm it (COW-inherited region) so the child can still take a stack-overflow
                                 // guard fault (host SP == guest SP) instead of double-faulting into SIGILL.

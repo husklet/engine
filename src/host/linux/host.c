@@ -256,6 +256,11 @@ static hl_host_result hl_linux_memory_publish(void *context, hl_host_handle mapp
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_linux_memory_code_write(void *context) {
+    (void)context;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                                    hl_host_code_mapping *output) {
     hl_host_linux *host = context;
@@ -1276,9 +1281,11 @@ static hl_host_result hl_linux_fork_complete(void *context) {
 }
 
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
-    static const hl_host_memory_services memory = {
-        HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
-        hl_linux_memory_release, hl_linux_memory_publish, hl_linux_memory_reserve_code, hl_linux_memory_repair_code};
+    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,           sizeof(memory),
+                                                   hl_linux_memory_reserve,      hl_linux_memory_protect,
+                                                   hl_linux_memory_release,      hl_linux_memory_publish,
+                                                   hl_linux_memory_reserve_code, hl_linux_memory_repair_code,
+                                                   hl_linux_memory_code_write,   hl_linux_memory_code_write};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};

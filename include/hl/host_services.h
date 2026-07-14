@@ -6,7 +6,7 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 2u
-#define HL_HOST_MEMORY_ABI 1u
+#define HL_HOST_MEMORY_ABI 2u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI 8u
@@ -122,6 +122,9 @@ typedef struct hl_host_memory_services {
     hl_host_result (*reserve_code)(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                    hl_host_code_mapping *output);
     hl_host_result (*repair_code_after_fork)(void *context, hl_host_code_mapping *mapping, uint32_t preserve);
+    /* Per-thread W^X gate. begin enables writes; end restores execution. Dual-alias hosts may no-op. */
+    hl_host_result (*begin_code_write)(void *context);
+    hl_host_result (*end_code_write)(void *context);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

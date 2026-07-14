@@ -200,6 +200,16 @@ static hl_host_result hl_fake_fork_lifecycle(void *context) {
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
+static hl_host_result hl_fake_begin_code_write(void *context) {
+    ((hl_fake_host *)context)->code_write_begins++;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_end_code_write(void *context) {
+    ((hl_fake_host *)context)->code_write_ends++;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
                                                    sizeof(memory),
@@ -208,7 +218,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_release,
                                                    hl_fake_publish,
                                                    NULL,
-                                                   NULL};
+                                                   NULL,
+                                                   hl_fake_begin_code_write,
+                                                   hl_fake_end_code_write};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI,  sizeof(clock),         hl_fake_monotonic,
                                                  hl_fake_realtime,   hl_fake_raw_monotonic, hl_fake_process_cpu,
                                                  hl_fake_thread_cpu, hl_fake_sleep_until};

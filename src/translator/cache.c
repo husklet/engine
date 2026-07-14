@@ -42,9 +42,15 @@ int jit_pc_in_cache(uint64_t pc, uint64_t *base) {
 // The single W^X gate. Under dual mapping it is a no-op: writes land on the RW alias and
 // execution reads the RX alias, so no per-region permission flip (and no peer-thread race).
 static inline void jit_wprot(int enable_exec) {
+    hl_host_result result;
     if (g_dualmap) return;
     g_wx_toggles++;
-    pthread_jit_write_protect_np(enable_exec);
+    result = enable_exec ? g_jit_services.memory->end_code_write(g_jit_services.context)
+                         : g_jit_services.memory->begin_code_write(g_jit_services.context);
+    if (result.status != HL_STATUS_OK) {
+        fprintf(stderr, "hl-engine: unable to change JIT write protection\n");
+        _exit(70);
+    }
 }
 
 static void jit_publish_code(const void *address, size_t size) {

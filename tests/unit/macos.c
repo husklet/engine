@@ -365,7 +365,9 @@ int main(void) {
     memset(&code, 0, sizeof code);
     HL_CHECK(services.memory->reserve_code(services.context, 16384, 16384, HL_HOST_CODE_DUAL_ALIAS, &code).status ==
              HL_STATUS_OK);
+    HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     memcpy((void *)(uintptr_t)code.writable_address, "code", 5);
+    HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 5).status == HL_STATUS_OK);
     HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "code", 5) == 0);
     pid_t child = fork();
@@ -379,6 +381,15 @@ int main(void) {
     int status = 0;
     HL_CHECK(waitpid(child, &status, 0) == child);
     HL_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    HL_CHECK(services.memory->release(services.context, code.handle).status == HL_STATUS_OK);
+    memset(&code, 0, sizeof code);
+    HL_CHECK(services.memory->reserve_code(services.context, 16384, 16384, 0, &code).status == HL_STATUS_OK);
+    HL_CHECK(code.writable_address == code.executable_address);
+    HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
+    memcpy((void *)(uintptr_t)code.writable_address, "single", 7);
+    HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 7).status == HL_STATUS_OK);
+    HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "single", 7) == 0);
     HL_CHECK(services.memory->release(services.context, code.handle).status == HL_STATUS_OK);
     {
         process_wait_context cleanup_waiter = {&services, 0, {0}};

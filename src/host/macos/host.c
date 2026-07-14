@@ -267,6 +267,18 @@ static hl_host_result hl_macos_publish(void *context, hl_host_handle handle, uin
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_macos_begin_code_write(void *context) {
+    (void)context;
+    pthread_jit_write_protect_np(0);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_end_code_write(void *context) {
+    (void)context;
+    pthread_jit_write_protect_np(1);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_macos_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                             hl_host_code_mapping *output) {
     hl_host_macos *host = context;
@@ -1035,9 +1047,10 @@ static void hl_macos_log(void *context, uint32_t event, const char *message, siz
 }
 
 hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_services) {
-    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,    sizeof(memory),      hl_macos_reserve,
-                                                   hl_macos_protect,      hl_macos_release,    hl_macos_publish,
-                                                   hl_macos_reserve_code, hl_macos_repair_code};
+    static const hl_host_memory_services memory = {
+        HL_HOST_MEMORY_ABI,        sizeof(memory),         hl_macos_reserve,      hl_macos_protect,
+        hl_macos_release,          hl_macos_publish,       hl_macos_reserve_code, hl_macos_repair_code,
+        hl_macos_begin_code_write, hl_macos_end_code_write};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_macos_monotonic,  hl_macos_realtime,
         hl_macos_raw_monotonic, hl_macos_process_cpu, hl_macos_thread_cpu, hl_macos_clock_sleep_until};

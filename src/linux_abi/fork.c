@@ -309,7 +309,7 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     // W^X / APRR per-thread execute state is NOT reliably inherited across fork() on Apple Silicon
     // (see the proc.c fork path) -- re-assert RX so the first run_block can fetch executable code
     // (no-op under the dual map, which never toggles W^X).
-    pthread_jit_write_protect_np(1);
+    jit_wprot(1);
     // preserved-arena fork: re-couple the dual map's RX alias to THIS child's COW RW pages at the
     // same VA (single-threaded parent: ~1us preserve; threaded parent: rebuild fresh), so the
     // COW-inherited warm arena + block maps stay valid and this runner executes real code instead of

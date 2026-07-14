@@ -8,6 +8,23 @@ static int32_t fake_process_entry(void *context) {
     return context == NULL ? 23 : 24;
 }
 
+static hl_host_result fake_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
+                                        hl_host_code_mapping *mapping) {
+    (void)context;
+    (void)size;
+    (void)alignment;
+    (void)flags;
+    (void)mapping;
+    return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+}
+
+static hl_host_result fake_repair_code(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
+    (void)context;
+    (void)mapping;
+    (void)preserve;
+    return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+}
+
 int main(void) {
     hl_fake_host fake;
     hl_host_services services;
@@ -19,11 +36,23 @@ int main(void) {
     hl_host_result other_mutex;
     hl_host_clock_services malformed_clock;
     hl_host_sync_services malformed_sync;
+    hl_host_memory_services malformed_memory;
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_PROCESS) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+    HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
+    HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);
+    malformed_memory = *services.memory;
+    malformed_memory.reserve_code = fake_reserve_code;
+    malformed_memory.repair_code_after_fork = fake_repair_code;
+    malformed_memory.begin_code_write = NULL;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    truncated.capabilities |= HL_HOST_CAP_CODE_MAPPING;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_ABI_MISMATCH);
     malformed_clock = *services.clock;
     malformed_clock.raw_monotonic_ns = NULL;
     truncated = services;
