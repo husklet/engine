@@ -801,7 +801,29 @@ $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD
 	$(MAC) clang -o $@ $< $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
+# First native-Linux production lane: AArch64 host executing an x86-64 Linux
+# guest through the production JIT. This target is smoke-scoped until the
+# remaining event/path personality seams have native Linux implementations.
+$(BUILD)/linux-production/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-production/lifecycle/x86_64-core.o: src/core/lifecycle.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-production/hl-engine-linux-x86_64: $(BUILD)/linux-production/target/x86_64.o \
+	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) -o $@ $^ -pthread
+
+compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
+	$(BUILD)/production/hl-remote-supervisor
+
+$(BUILD)/production/hl-remote-supervisor: tools/remote_supervisor.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CFLAGS) $(WARNINGS) $< -o $@
 
 $(BUILD)/mac/lifecycle/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
@@ -979,6 +1001,18 @@ $(BUILD)/tools/matrix-runner: tools/matrix_runner.c
 		-DAARCH64_DYNAMIC_LIBC='"$(AARCH64_DYNAMIC_LIBC)"' \
 		-DX86_64_DYNAMIC_LOADER='"$(X86_64_DYNAMIC_LOADER)"' \
 		-DX86_64_DYNAMIC_LIBC='"$(X86_64_DYNAMIC_LIBC)"' $< -o $@
+
+$(BUILD)/tools/remote-supervisor: tools/remote_supervisor.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tests/remote-supervisor: tests/integration/remote_supervisor.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+.PHONY: remote-supervisor-test
+remote-supervisor-test: $(BUILD)/tools/remote-supervisor $(BUILD)/tests/remote-supervisor
+	$(BUILD)/tests/remote-supervisor $(BUILD)/tools/remote-supervisor
 
 compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \

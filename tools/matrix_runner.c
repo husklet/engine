@@ -384,7 +384,7 @@ static int make_config(const char *binary_root, const char *guest, const char *a
 static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
                      const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
-    char config_path[1024], scratch[1024];
+    char config_path[1024], scratch[1024], supervisor[1024];
     uint64_t deadline;
     pid_t child;
     memset(result, 0, sizeof(*result));
@@ -397,6 +397,17 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     if (make_config(binary_root, guest, argument, rootfs, environment, scratch, config_path) != 0) {
         remove_tree(scratch);
         return 1;
+    }
+    {
+        const char *slash = strrchr(engine, '/');
+        size_t directory_size = slash == NULL ? 0 : (size_t)(slash - engine);
+        if (directory_size == 0 || directory_size + sizeof("/hl-remote-supervisor") > sizeof supervisor) {
+            (void)unlink(config_path);
+            remove_tree(scratch);
+            return 1;
+        }
+        memcpy(supervisor, engine, directory_size);
+        memcpy(supervisor + directory_size, "/hl-remote-supervisor", sizeof("/hl-remote-supervisor"));
     }
     child = fork();
     if (child < 0) {
@@ -411,7 +422,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]);
         close(error_pipe[1]);
-        execlp(bridge, bridge, engine, "--configfile", config_path, (char *)NULL);
+        execlp(bridge, bridge, supervisor, engine, "--configfile", config_path, (char *)NULL);
         _exit(127);
     }
     (void)setpgid(child, child);
