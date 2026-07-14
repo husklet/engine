@@ -22,6 +22,12 @@ typedef struct hl_fake_host {
     uint32_t code_write_ends;
     uint64_t mutex_handles[64];
     uint8_t mutex_locked[64];
+    uint64_t counter_handles[64];
+    uint8_t counter_objects[64];
+    uint64_t counter_values[64];
+    uint32_t counter_flags[64];
+    uint32_t counter_references[64];
+    uint32_t live_counters;
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;

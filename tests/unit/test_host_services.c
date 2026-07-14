@@ -34,6 +34,8 @@ int main(void) {
     hl_host_result process_exit;
     hl_host_result mutex;
     hl_host_result other_mutex;
+    hl_host_result counter;
+    hl_host_result duplicate;
     hl_host_clock_services malformed_clock;
     hl_host_sync_services malformed_sync;
     hl_host_memory_services malformed_memory;
@@ -42,6 +44,7 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_PROCESS) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);
@@ -109,6 +112,33 @@ int main(void) {
     HL_CHECK(services.sync->mutex_close(services.context, other_mutex.value).status == HL_STATUS_OK);
     HL_CHECK(fake.live_mutexes == 0);
     HL_CHECK(services.sync->mutex_lock(services.context, HL_HOST_HANDLE_INVALID).status == HL_STATUS_INVALID_ARGUMENT);
+
+    counter = services.counter->create(services.context, 2, HL_HOST_COUNTER_NONBLOCK);
+    HL_CHECK(counter.status == HL_STATUS_OK && counter.value != 0 && fake.live_counters == 1);
+    duplicate = services.counter->duplicate(services.context, counter.value);
+    HL_CHECK(duplicate.status == HL_STATUS_OK && duplicate.value != counter.value && fake.live_counters == 1);
+    HL_CHECK(services.counter->write(services.context, duplicate.value, 3).status == HL_STATUS_OK);
+    HL_CHECK(services.counter->read(services.context, counter.value).value == 5);
+    HL_CHECK(services.counter->read(services.context, duplicate.value).status == HL_STATUS_WOULD_BLOCK);
+    HL_CHECK(services.counter->get_flags(services.context, duplicate.value).value == HL_HOST_COUNTER_NONBLOCK);
+    HL_CHECK(services.counter->set_flags(services.context, duplicate.value, 0).status == HL_STATUS_OK);
+    HL_CHECK(services.counter->get_flags(services.context, counter.value).value == 0);
+    HL_CHECK(services.counter->write(services.context, counter.value, UINT64_MAX).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.counter->write(services.context, counter.value, UINT64_MAX - 1).status == HL_STATUS_OK);
+    HL_CHECK(services.counter->write(services.context, counter.value, 1).status == HL_STATUS_WOULD_BLOCK);
+    HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK &&
+             fake.live_counters == 1);
+    HL_CHECK(services.counter->read(services.context, duplicate.value).value == UINT64_MAX - 1);
+    HL_CHECK(services.counter->close(services.context, duplicate.value).status == HL_STATUS_OK &&
+             fake.live_counters == 0);
+
+    counter = services.counter->create(services.context, 2, HL_HOST_COUNTER_SEMAPHORE);
+    HL_CHECK(counter.status == HL_STATUS_OK);
+    HL_CHECK(services.counter->read(services.context, counter.value).value == 1);
+    HL_CHECK(services.counter->read(services.context, counter.value).value == 1);
+    HL_CHECK(services.counter->read(services.context, counter.value).status == HL_STATUS_WOULD_BLOCK);
+    HL_CHECK(services.counter->set_flags(services.context, counter.value, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK);
 
     hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);
     HL_CHECK(services.memory->reserve(services.context, 4096, 4096, 0).status == HL_STATUS_OUT_OF_MEMORY);

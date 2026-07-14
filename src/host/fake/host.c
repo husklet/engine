@@ -200,6 +200,128 @@ static hl_host_result hl_fake_fork_lifecycle(void *context) {
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
+static int hl_fake_counter_handle_index(const hl_fake_host *fake, hl_host_handle handle) {
+    uint32_t index;
+    for (index = 0; index < 64; ++index)
+        if (fake->counter_handles[index] == handle) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_counter_create(void *context, uint64_t initial, uint32_t flags) {
+    hl_fake_host *fake = context;
+    uint32_t handle_index;
+    uint32_t object_index;
+    hl_host_result result;
+    if (initial == UINT64_MAX || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (handle_index = 0; handle_index < 64 && fake->counter_handles[handle_index] != 0; ++handle_index) {}
+    for (object_index = 0; object_index < 64 && fake->counter_references[object_index] != 0; ++object_index) {}
+    if (handle_index == 64 || object_index == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status == HL_STATUS_OK) {
+        fake->counter_handles[handle_index] = result.value;
+        fake->counter_objects[handle_index] = (uint8_t)object_index;
+        fake->counter_values[object_index] = initial;
+        fake->counter_flags[object_index] = flags;
+        fake->counter_references[object_index] = 1;
+        fake->live_counters++;
+    }
+    return result;
+}
+
+static hl_host_result hl_fake_counter_read(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t object;
+    uint64_t value;
+    hl_host_result result;
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->counter_objects[index];
+    value = fake->counter_values[object];
+    if (value == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    result = hl_fake_result(fake, value);
+    if (result.status != HL_STATUS_OK) return result;
+    if ((fake->counter_flags[object] & HL_HOST_COUNTER_SEMAPHORE) != 0) {
+        fake->counter_values[object]--;
+        result.value = 1;
+    } else {
+        fake->counter_values[object] = 0;
+    }
+    return result;
+}
+
+static hl_host_result hl_fake_counter_write(void *context, hl_host_handle handle, uint64_t value) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t object;
+    hl_host_result result;
+    if (index < 0 || value == UINT64_MAX) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->counter_objects[index];
+    if (value > UINT64_MAX - 1 - fake->counter_values[object]) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    result = hl_fake_result(fake, 0);
+    if (result.status != HL_STATUS_OK) return result;
+    fake->counter_values[object] += value;
+    return result;
+}
+
+static hl_host_result hl_fake_counter_get_flags(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_result(fake, fake->counter_flags[fake->counter_objects[index]]);
+}
+
+static hl_host_result hl_fake_counter_set_flags(void *context, hl_host_handle handle, uint32_t flags) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t object;
+    if (index < 0 || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->counter_objects[index];
+    if ((flags & HL_HOST_COUNTER_SEMAPHORE) != (fake->counter_flags[object] & HL_HOST_COUNTER_SEMAPHORE))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->counter_flags[object] = flags;
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_counter_duplicate(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    int source = hl_fake_counter_handle_index(fake, handle);
+    uint32_t index;
+    uint32_t object;
+    hl_host_result result;
+    if (source < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (index = 0; index < 64 && fake->counter_handles[index] != 0; ++index) {}
+    if (index == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status == HL_STATUS_OK) {
+        object = fake->counter_objects[source];
+        fake->counter_handles[index] = result.value;
+        fake->counter_objects[index] = (uint8_t)object;
+        fake->counter_references[object]++;
+    }
+    return result;
+}
+
+static hl_host_result hl_fake_counter_close(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_counter_handle_index(fake, handle);
+    uint32_t object;
+    hl_host_result result;
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    result = hl_fake_result(fake, 0);
+    if (result.status != HL_STATUS_OK) return result;
+    object = fake->counter_objects[index];
+    fake->counter_handles[index] = 0;
+    fake->counter_objects[index] = 0;
+    if (--fake->counter_references[object] == 0) {
+        fake->counter_values[object] = 0;
+        fake->counter_flags[object] = 0;
+        fake->live_counters--;
+    }
+    return result;
+}
+
 static hl_host_result hl_fake_begin_code_write(void *context) {
     ((hl_fake_host *)context)->code_write_begins++;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
@@ -230,6 +352,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,
                                                hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
                                                hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle};
+    static const hl_host_counter_services counter = {
+        HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,
+        hl_fake_counter_read,      hl_fake_counter_write,     hl_fake_counter_get_flags,
+        hl_fake_counter_set_flags, hl_fake_counter_duplicate, hl_fake_counter_close};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -240,12 +366,14 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_CODE;
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);
-    services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC;
+    services->capabilities =
+        HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
     services->process = &process;
     services->sync = &sync;
+    services->counter = &counter;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {
