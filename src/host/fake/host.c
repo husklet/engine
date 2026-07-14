@@ -476,6 +476,213 @@ static hl_host_result hl_fake_end_code_write(void *context) {
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
+static int hl_fake_directory_handle(const hl_fake_host *fake, hl_host_handle handle) {
+    uint32_t index;
+    for (index = 0; index < 16; ++index)
+        if (fake->directory_handles[index] == handle) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_directory_create(void *context) {
+    hl_fake_host *fake = context;
+    uint32_t handle;
+    uint32_t object;
+    for (handle = 0; handle < 16 && fake->directory_handles[handle] != 0; ++handle) {}
+    for (object = 0; object < 16 && fake->directory_references[object] != 0; ++object) {}
+    if (handle == 16 || object == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->directory_handles[handle] = ++fake->next_handle;
+    fake->directory_objects[handle] = (uint8_t)object;
+    fake->directory_references[object] = 1;
+    return hl_fake_result(fake, fake->directory_handles[handle]);
+}
+
+static hl_host_result hl_fake_directory_add(void *context, hl_host_handle instance, hl_host_handle file, uint64_t token,
+                                            uint32_t interests) {
+    hl_fake_host *fake = context;
+    int handle = hl_fake_directory_handle(fake, instance);
+    uint32_t watch;
+    uint32_t object;
+    if (handle < 0 || file == 0 || token == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->directory_objects[handle];
+    for (watch = 0; watch < 16 && fake->directory_tokens[object][watch] != 0; ++watch) {
+        if (fake->directory_tokens[object][watch] == token) return (hl_host_result){HL_STATUS_ALREADY_EXISTS, 0, 0, 0};
+    }
+    if (watch == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->directory_tokens[object][watch] = token;
+    fake->directory_interests[object][watch] = interests;
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_directory_modify(void *context, hl_host_handle instance, uint64_t token,
+                                               uint32_t interests) {
+    hl_fake_host *fake = context;
+    int handle = hl_fake_directory_handle(fake, instance);
+    uint32_t watch;
+    uint32_t object;
+    if (handle < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->directory_objects[handle];
+    for (watch = 0; watch < 16; ++watch)
+        if (fake->directory_tokens[object][watch] == token) {
+            fake->directory_interests[object][watch] = interests;
+            return hl_fake_result(fake, 0);
+        }
+    return (hl_host_result){HL_STATUS_NOT_FOUND, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_directory_remove(void *context, hl_host_handle instance, uint64_t token) {
+    hl_fake_host *fake = context;
+    int handle = hl_fake_directory_handle(fake, instance);
+    uint32_t watch;
+    uint32_t object;
+    if (handle < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->directory_objects[handle];
+    for (watch = 0; watch < 16; ++watch)
+        if (fake->directory_tokens[object][watch] == token) {
+            fake->directory_tokens[object][watch] = 0;
+            fake->directory_interests[object][watch] = 0;
+            return hl_fake_result(fake, 0);
+        }
+    return (hl_host_result){HL_STATUS_NOT_FOUND, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_directory_read(void *context, hl_host_handle instance, hl_host_directory_record *records,
+                                             uint32_t capacity) {
+    hl_fake_host *fake = context;
+    int handle = hl_fake_directory_handle(fake, instance);
+    uint32_t object;
+    uint32_t count;
+    if (handle < 0 || records == NULL || capacity == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->directory_objects[handle];
+    count = capacity < fake->directory_record_counts[object] ? capacity : fake->directory_record_counts[object];
+    if (count == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    memcpy(records, fake->directory_records[object], count * sizeof(*records));
+    fake->directory_record_counts[object] = (uint8_t)(fake->directory_record_counts[object] - count);
+    memmove(fake->directory_records[object], fake->directory_records[object] + count,
+            fake->directory_record_counts[object] * sizeof(*records));
+    return hl_fake_result(fake, count);
+}
+
+static hl_host_result hl_fake_directory_duplicate(void *context, hl_host_handle instance) {
+    hl_fake_host *fake = context;
+    int source = hl_fake_directory_handle(fake, instance);
+    uint32_t handle;
+    uint32_t object;
+    if (source < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (handle = 0; handle < 16 && fake->directory_handles[handle] != 0; ++handle) {}
+    if (handle == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    object = fake->directory_objects[source];
+    fake->directory_handles[handle] = ++fake->next_handle;
+    fake->directory_objects[handle] = (uint8_t)object;
+    fake->directory_references[object]++;
+    return hl_fake_result(fake, fake->directory_handles[handle]);
+}
+
+static hl_host_result hl_fake_directory_close(void *context, hl_host_handle instance) {
+    hl_fake_host *fake = context;
+    int handle = hl_fake_directory_handle(fake, instance);
+    uint32_t object;
+    if (handle < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    object = fake->directory_objects[handle];
+    fake->directory_handles[handle] = 0;
+    if (--fake->directory_references[object] == 0) {
+        memset(fake->directory_tokens[object], 0, sizeof(fake->directory_tokens[object]));
+        memset(fake->directory_interests[object], 0, sizeof(fake->directory_interests[object]));
+        fake->directory_record_counts[object] = 0;
+    }
+    return hl_fake_result(fake, 0);
+}
+
+void hl_fake_host_directory_emit(hl_fake_host *fake, uint64_t token, uint32_t changes) {
+    uint32_t object;
+    for (object = 0; object < 16; ++object) {
+        uint32_t watch;
+        for (watch = 0; watch < 16; ++watch) {
+            uint8_t count;
+            uint32_t delivered;
+            if (fake->directory_tokens[object][watch] != token) continue;
+            delivered = changes & fake->directory_interests[object][watch] & ~HL_HOST_DIRECTORY_ONESHOT;
+            count = fake->directory_record_counts[object];
+            if (delivered != 0 && count < 64)
+                fake->directory_records[object][fake->directory_record_counts[object]++] =
+                    (hl_host_directory_record){token, delivered, 0};
+            if ((fake->directory_interests[object][watch] & HL_HOST_DIRECTORY_ONESHOT) != 0) {
+                count = fake->directory_record_counts[object];
+                if (count < 64)
+                    fake->directory_records[object][fake->directory_record_counts[object]++] =
+                        (hl_host_directory_record){token, HL_HOST_DIRECTORY_IGNORED, 0};
+                fake->directory_tokens[object][watch] = 0;
+                fake->directory_interests[object][watch] = 0;
+            }
+            break;
+        }
+    }
+}
+
+static int hl_fake_event_index(const hl_fake_host *fake, hl_host_handle handle) {
+    uint32_t index;
+    for (index = 0; index < 16; ++index)
+        if (fake->event_handles[index] == handle) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_event_create(void *context) {
+    hl_fake_host *fake = context;
+    uint32_t index;
+    for (index = 0; index < 16 && fake->event_handles[index] != 0; ++index) {}
+    if (index == 16) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    fake->event_handles[index] = ++fake->next_handle;
+    return hl_fake_result(fake, fake->event_handles[index]);
+}
+
+static hl_host_result hl_fake_event_control(void *context, hl_host_handle pollset, uint32_t operation,
+                                            hl_host_handle object, uint64_t token, uint32_t interests) {
+    hl_fake_host *fake = context;
+    int event = hl_fake_event_index(fake, pollset);
+    int directory = hl_fake_directory_handle(fake, object);
+    if (event < 0 || token == 0 || (interests & HL_HOST_READY_READ) == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (operation == HL_HOST_EVENT_DELETE) {
+        fake->event_directories[event] = 0;
+        fake->event_tokens[event] = 0;
+        return hl_fake_result(fake, 0);
+    }
+    if ((operation != HL_HOST_EVENT_ADD && operation != HL_HOST_EVENT_MODIFY) || directory < 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->event_directories[event] = (uint8_t)(fake->directory_objects[directory] + 1u);
+    fake->event_tokens[event] = token;
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_event_wait(void *context, hl_host_handle pollset, hl_host_event_record *events,
+                                         size_t capacity, uint64_t deadline) {
+    hl_fake_host *fake = context;
+    int event = hl_fake_event_index(fake, pollset);
+    uint32_t object;
+    (void)deadline;
+    if (event < 0 || events == NULL || capacity == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (fake->event_directories[event] == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    object = fake->event_directories[event] - 1u;
+    if (fake->directory_record_counts[object] == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    events[0] = (hl_host_event_record){fake->event_tokens[event], HL_HOST_READY_READ, 0};
+    return hl_fake_result(fake, 1);
+}
+
+static hl_host_result hl_fake_event_wake(void *context, hl_host_handle pollset) {
+    hl_fake_host *fake = context;
+    return hl_fake_event_index(fake, pollset) < 0 ? (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0}
+                                                  : hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_event_close(void *context, hl_host_handle pollset) {
+    hl_fake_host *fake = context;
+    int event = hl_fake_event_index(fake, pollset);
+    if (event < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    fake->event_handles[event] = 0;
+    fake->event_directories[event] = 0;
+    fake->event_tokens[event] = 0;
+    return hl_fake_result(fake, 0);
+}
+
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
                                                    sizeof(memory),
@@ -503,6 +710,19 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_transfer_services transfer = {HL_HOST_TRANSFER_ABI,          sizeof(transfer),
                                                        hl_fake_transfer_channel_pair, hl_fake_transfer_send,
                                                        hl_fake_transfer_receive,      hl_fake_transfer_close};
+    static const hl_host_directory_services directory = {
+        HL_HOST_DIRECTORY_ABI,  sizeof(directory),           hl_fake_directory_create,
+        hl_fake_directory_add,  hl_fake_directory_modify,    hl_fake_directory_remove,
+        hl_fake_directory_read, hl_fake_directory_duplicate, hl_fake_directory_close};
+    static const hl_host_event_services event = {HL_HOST_EVENT_ABI,
+                                                 sizeof(event),
+                                                 hl_fake_event_create,
+                                                 hl_fake_event_control,
+                                                 hl_fake_event_wait,
+                                                 hl_fake_event_wake,
+                                                 hl_fake_event_close,
+                                                 NULL,
+                                                 NULL};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -514,7 +734,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);
     services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
-                             HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER;
+                             HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
@@ -522,6 +742,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->sync = &sync;
     services->counter = &counter;
     services->transfer = &transfer;
+    services->directory = &directory;
+    services->event = &event;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

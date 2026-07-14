@@ -45,6 +45,11 @@ int main(void) {
     hl_host_sync_services malformed_sync;
     hl_host_memory_services malformed_memory;
     hl_host_transfer_services malformed_transfer;
+    hl_host_result directory;
+    hl_host_result directory_copy;
+    hl_host_result pollset;
+    hl_host_directory_record directory_record;
+    hl_host_event_record ready;
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
@@ -52,9 +57,38 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT) == HL_STATUS_OK);
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);
+    directory = services.directory->create(services.context);
+    HL_CHECK(directory.status == HL_STATUS_OK);
+    directory_copy = services.directory->duplicate(services.context, directory.value);
+    HL_CHECK(directory_copy.status == HL_STATUS_OK);
+    HL_CHECK(services.directory
+                 ->add(services.context, directory.value, 999, 41, HL_HOST_DIRECTORY_CREATE | HL_HOST_DIRECTORY_ONESHOT)
+                 .status == HL_STATUS_OK);
+    pollset = services.event->create(services.context);
+    HL_CHECK(pollset.status == HL_STATUS_OK);
+    HL_CHECK(
+        services.event
+            ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, directory_copy.value, 77, HL_HOST_READY_READ)
+            .status == HL_STATUS_OK);
+    HL_CHECK(services.directory->close(services.context, directory.value).status == HL_STATUS_OK);
+    hl_fake_host_directory_emit(&fake, 41, HL_HOST_DIRECTORY_CREATE);
+    HL_CHECK(services.event->wait(services.context, pollset.value, &ready, 1, 0).status == HL_STATUS_OK &&
+             ready.token == 77);
+    HL_CHECK(services.directory->read(services.context, directory_copy.value, &directory_record, 1).status ==
+                 HL_STATUS_OK &&
+             directory_record.token == 41 && directory_record.changes == HL_HOST_DIRECTORY_CREATE);
+    HL_CHECK(services.directory->read(services.context, directory_copy.value, &directory_record, 1).status ==
+                 HL_STATUS_OK &&
+             directory_record.changes == HL_HOST_DIRECTORY_IGNORED);
+    hl_fake_host_directory_emit(&fake, 41, HL_HOST_DIRECTORY_CREATE);
+    HL_CHECK(services.directory->read(services.context, directory_copy.value, &directory_record, 1).status ==
+             HL_STATUS_WOULD_BLOCK);
+    HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+    HL_CHECK(services.directory->close(services.context, directory_copy.value).status == HL_STATUS_OK);
     malformed_memory = *services.memory;
     malformed_memory.reserve_code = fake_reserve_code;
     malformed_memory.repair_code_after_fork = fake_repair_code;

@@ -96,5 +96,13 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->transfer->channel_pair == NULL || services->transfer->send == NULL ||
          services->transfer->receive == NULL || services->transfer->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_DIRECTORY) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, directory), sizeof(services->directory)) ||
+         !hl_valid_group(services->directory, HL_HOST_DIRECTORY_ABI, sizeof(*services->directory)) ||
+         services->directory->create == NULL || services->directory->add == NULL ||
+         services->directory->modify == NULL || services->directory->remove == NULL ||
+         services->directory->read == NULL || services->directory->duplicate == NULL ||
+         services->directory->close == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

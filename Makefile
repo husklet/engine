@@ -84,7 +84,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory emit fdcache file gmap host_services identity ir launch linux_abi linux_fork native process range system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit fdcache file gmap host_services identity ir launch linux_abi linux_fork native process range system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -290,6 +290,12 @@ $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-en
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
 
 $(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
+
+$(BUILD)/tests/test_directory_services: tests/unit/test_directory_services.c $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
@@ -1150,6 +1156,10 @@ $(BUILD)/tests/directory-macos: tests/unit/test_directory.c src/host/macos/direc
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
+$(BUILD)/tests/directory-services-macos: tests/unit/test_directory_services.c $(MAC_LIBS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
+
 $(BUILD)/tests/process-macos: tests/unit/test_process.c src/host/macos/process.c
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
@@ -1158,10 +1168,11 @@ $(BUILD)/tests/native-macos: tests/unit/test_native.c $(MAC_LIBS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
+	$(MAC) $(abspath $(BUILD)/tests/directory-services-macos)
 	$(MAC) $(abspath $(BUILD)/tests/process-macos)
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 	$(MAC) $(abspath $(BUILD)/tests/system-macos)

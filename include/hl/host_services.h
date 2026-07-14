@@ -17,6 +17,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_COUNTER_ABI 1u
 #define HL_HOST_SYNC_ABI 2u
 #define HL_HOST_TRANSFER_ABI 1u
+#define HL_HOST_DIRECTORY_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -35,7 +36,8 @@ enum {
     HL_HOST_CAP_SYNC = UINT64_C(1) << 10,
     HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11,
     HL_HOST_CAP_COUNTER = UINT64_C(1) << 12,
-    HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13
+    HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13,
+    HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14
 };
 
 enum {
@@ -327,6 +329,38 @@ typedef struct hl_host_transfer_services {
     hl_host_result (*close)(void *context, hl_host_handle channel);
 } hl_host_transfer_services;
 
+enum {
+    HL_HOST_DIRECTORY_ACCESS = 1u << 0,
+    HL_HOST_DIRECTORY_MODIFY = 1u << 1,
+    HL_HOST_DIRECTORY_CREATE = 1u << 2,
+    HL_HOST_DIRECTORY_DELETE = 1u << 3,
+    HL_HOST_DIRECTORY_RENAME = 1u << 4,
+    HL_HOST_DIRECTORY_ATTRIB = 1u << 5,
+    HL_HOST_DIRECTORY_IGNORED = 1u << 6
+};
+
+#define HL_HOST_DIRECTORY_ONESHOT UINT32_C(0x80000000)
+
+typedef struct hl_host_directory_record {
+    uint64_t token;
+    uint32_t changes;
+    uint32_t flags;
+} hl_host_directory_record;
+
+/* Host-owned, pollable directory-change queue. read consumes complete records only. */
+typedef struct hl_host_directory_services {
+    HL_ABI_HEADER;
+    hl_host_result (*create)(void *context);
+    hl_host_result (*add)(void *context, hl_host_handle instance, hl_host_handle file, uint64_t token,
+                          uint32_t interests);
+    hl_host_result (*modify)(void *context, hl_host_handle instance, uint64_t token, uint32_t interests);
+    hl_host_result (*remove)(void *context, hl_host_handle instance, uint64_t token);
+    hl_host_result (*read)(void *context, hl_host_handle instance, hl_host_directory_record *records,
+                           uint32_t capacity);
+    hl_host_result (*duplicate)(void *context, hl_host_handle instance);
+    hl_host_result (*close)(void *context, hl_host_handle instance);
+} hl_host_directory_services;
+
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -354,6 +388,7 @@ typedef struct hl_host_services {
     const hl_host_sync_services *sync;
     const hl_host_counter_services *counter;
     const hl_host_transfer_services *transfer;
+    const hl_host_directory_services *directory;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

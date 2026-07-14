@@ -38,6 +38,16 @@ typedef struct hl_fake_host {
     uint8_t transfer_objects[64][HL_HOST_TRANSFER_MAX_ATTACHMENTS];
     uint32_t transfer_rights[64][HL_HOST_TRANSFER_MAX_ATTACHMENTS];
     uint32_t live_transfer_channels;
+    uint64_t directory_handles[16];
+    uint8_t directory_objects[16];
+    uint32_t directory_references[16];
+    uint64_t directory_tokens[16][16];
+    uint32_t directory_interests[16][16];
+    hl_host_directory_record directory_records[16][64];
+    uint8_t directory_record_counts[16];
+    uint64_t event_handles[16];
+    uint8_t event_directories[16];
+    uint64_t event_tokens[16];
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;
@@ -45,6 +55,7 @@ typedef struct hl_fake_host {
 HL_API void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services);
 HL_API void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status);
 HL_API void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block);
+HL_API void hl_fake_host_directory_emit(hl_fake_host *fake, uint64_t token, uint32_t changes);
 
 HL_EXTERN_C_END
 

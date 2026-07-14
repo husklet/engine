@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -37,7 +38,9 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_POLLSET = 4,
     HL_LINUX_HANDLE_SHARED_MEMORY = 5,
     HL_LINUX_HANDLE_PROCESS = 6,
-    HL_LINUX_HANDLE_COUNTER = 7
+    HL_LINUX_HANDLE_COUNTER = 7,
+    HL_LINUX_HANDLE_TRANSFER = 8,
+    HL_LINUX_HANDLE_DIRECTORY = 9
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -61,6 +64,24 @@ typedef struct hl_linux_timer_entry {
     uint64_t token;
     int descriptor;
 } hl_linux_timer_entry;
+
+#define HL_LINUX_DIRECTORY_WATCHES 256u
+
+typedef struct hl_linux_directory_watch {
+    int watch;
+    int descriptor;
+    uint64_t token;
+    uint32_t interests;
+    uint32_t active;
+} hl_linux_directory_watch;
+
+typedef struct hl_linux_directory_object {
+    uint32_t references;
+    uint32_t pending_count;
+    uint32_t pending_capacity;
+    hl_linux_directory_watch watches[HL_LINUX_DIRECTORY_WATCHES];
+    hl_host_directory_record *pending;
+} hl_linux_directory_object;
 
 struct hl_host_linux {
     pthread_mutex_t lock;
@@ -829,6 +850,273 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static uint32_t hl_linux_directory_mask(uint32_t interests) {
+    uint32_t mask = 0;
+    if ((interests & HL_HOST_DIRECTORY_ACCESS) != 0) mask |= IN_ACCESS | IN_OPEN | IN_CLOSE;
+    if ((interests & HL_HOST_DIRECTORY_MODIFY) != 0) mask |= IN_MODIFY | IN_CLOSE_WRITE;
+    if ((interests & HL_HOST_DIRECTORY_CREATE) != 0) mask |= IN_CREATE;
+    if ((interests & HL_HOST_DIRECTORY_DELETE) != 0) mask |= IN_DELETE | IN_DELETE_SELF;
+    if ((interests & HL_HOST_DIRECTORY_RENAME) != 0) mask |= IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF;
+    if ((interests & HL_HOST_DIRECTORY_ATTRIB) != 0) mask |= IN_ATTRIB;
+    if ((interests & HL_HOST_DIRECTORY_ONESHOT) != 0) mask |= IN_ONESHOT;
+    return mask;
+}
+
+static hl_linux_directory_watch *hl_linux_directory_watch_for_token(hl_linux_directory_object *object, uint64_t token) {
+    uint32_t index;
+    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+        if (object->watches[index].active != 0 && object->watches[index].token == token) return &object->watches[index];
+    return NULL;
+}
+
+static hl_linux_directory_watch *hl_linux_directory_watch_for_id(hl_linux_directory_object *object, int watch) {
+    uint32_t index;
+    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+        if (object->watches[index].watch == watch) return &object->watches[index];
+    return NULL;
+}
+
+static hl_host_result hl_linux_directory_create(void *context) {
+    hl_host_linux *host = context;
+    hl_linux_directory_object *object = calloc(1, sizeof(*object));
+    hl_host_result result;
+    uint32_t index;
+    int descriptor;
+    if (object == NULL) return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    descriptor = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (descriptor < 0) {
+        free(object);
+        return hl_linux_errno_result();
+    }
+    object->references = 1;
+    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index) {
+        object->watches[index].watch = -1;
+        object->watches[index].descriptor = -1;
+    }
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_DIRECTORY, descriptor, object, NULL, 0, -1);
+    if (result.status != HL_STATUS_OK) {
+        close(descriptor);
+        free(object);
+    }
+    return result;
+}
+
+static hl_host_result hl_linux_directory_add(void *context, hl_host_handle instance, hl_host_handle file,
+                                             uint64_t token, uint32_t interests) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *instance_entry;
+    hl_linux_directory_object *object;
+    hl_linux_directory_watch *slot = NULL;
+    char path[64];
+    int file_descriptor;
+    int retained;
+    int watch;
+    uint32_t index;
+    uint32_t valid = UINT32_C(0x8000007f);
+    if (token == 0 || (interests & ~valid) != 0 || (interests & ~HL_HOST_DIRECTORY_ONESHOT) == 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    instance_entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    object = instance_entry == NULL ? NULL : instance_entry->address;
+    file_descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    if (object != NULL && hl_linux_directory_watch_for_token(object, token) == NULL) {
+        for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+            if (object->watches[index].watch < 0) {
+                slot = &object->watches[index];
+                break;
+            }
+    }
+    retained = file_descriptor < 0 ? -1 : fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+    if (instance_entry == NULL || slot == NULL || retained < 0) {
+        pthread_mutex_unlock(&host->lock);
+        if (retained >= 0) close(retained);
+        return hl_linux_result(slot == NULL && object != NULL ? HL_STATUS_RESOURCE_LIMIT : HL_STATUS_INVALID_ARGUMENT,
+                               0, 0);
+    }
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", retained);
+    watch = inotify_add_watch(instance_entry->descriptor, path, hl_linux_directory_mask(interests));
+    if (watch >= 0) *slot = (hl_linux_directory_watch){watch, retained, token, interests, 1};
+    pthread_mutex_unlock(&host->lock);
+    if (watch < 0) {
+        close(retained);
+        return hl_linux_errno_result();
+    }
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_directory_modify(void *context, hl_host_handle instance, uint64_t token,
+                                                uint32_t interests) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_directory_object *object;
+    hl_linux_directory_watch *slot;
+    char path[64];
+    int watch;
+    uint32_t valid = UINT32_C(0x8000007f);
+    if (token == 0 || (interests & ~valid) != 0 || (interests & ~HL_HOST_DIRECTORY_ONESHOT) == 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    object = entry == NULL ? NULL : entry->address;
+    slot = object == NULL ? NULL : hl_linux_directory_watch_for_token(object, token);
+    if (slot == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_NOT_FOUND, 0, 0);
+    }
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", slot->descriptor);
+    watch = inotify_add_watch(entry->descriptor, path, hl_linux_directory_mask(interests));
+    if (watch >= 0) {
+        slot->watch = watch;
+        slot->interests = interests;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return watch >= 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_directory_remove(void *context, hl_host_handle instance, uint64_t token) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_directory_object *object;
+    hl_linux_directory_watch *slot;
+    int result;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    object = entry == NULL ? NULL : entry->address;
+    slot = object == NULL ? NULL : hl_linux_directory_watch_for_token(object, token);
+    if (slot == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_NOT_FOUND, 0, 0);
+    }
+    result = inotify_rm_watch(entry->descriptor, slot->watch);
+    close(slot->descriptor);
+    slot->descriptor = -1;
+    slot->active = 0;
+    pthread_mutex_unlock(&host->lock);
+    return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static uint32_t hl_linux_directory_changes(uint32_t mask) {
+    uint32_t changes = 0;
+    if ((mask & (IN_ACCESS | IN_OPEN | IN_CLOSE)) != 0) changes |= HL_HOST_DIRECTORY_ACCESS;
+    if ((mask & (IN_MODIFY | IN_CLOSE_WRITE)) != 0) changes |= HL_HOST_DIRECTORY_MODIFY;
+    if ((mask & IN_CREATE) != 0) changes |= HL_HOST_DIRECTORY_CREATE;
+    if ((mask & (IN_DELETE | IN_DELETE_SELF)) != 0) changes |= HL_HOST_DIRECTORY_DELETE;
+    if ((mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_MOVE_SELF)) != 0) changes |= HL_HOST_DIRECTORY_RENAME;
+    if ((mask & IN_ATTRIB) != 0) changes |= HL_HOST_DIRECTORY_ATTRIB;
+    if ((mask & (IN_IGNORED | IN_Q_OVERFLOW)) != 0) changes |= HL_HOST_DIRECTORY_IGNORED;
+    return changes;
+}
+
+static int hl_linux_directory_append(hl_linux_directory_object *object, hl_host_directory_record record) {
+    if (object->pending_count == object->pending_capacity) {
+        uint32_t capacity = object->pending_capacity == 0 ? 32u : object->pending_capacity * 2u;
+        hl_host_directory_record *pending = realloc(object->pending, capacity * sizeof(*pending));
+        if (pending == NULL) return -1;
+        object->pending = pending;
+        object->pending_capacity = capacity;
+    }
+    object->pending[object->pending_count++] = record;
+    return 0;
+}
+
+static hl_host_result hl_linux_directory_read(void *context, hl_host_handle instance, hl_host_directory_record *records,
+                                              uint32_t capacity) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_directory_object *object;
+    _Alignas(struct inotify_event) char buffer[16384];
+    ssize_t size;
+    size_t offset;
+    uint32_t count;
+    if (records == NULL || capacity == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    object = entry == NULL ? NULL : entry->address;
+    if (object == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if (object->pending_count == 0) {
+        size = read(entry->descriptor, buffer, sizeof(buffer));
+        if (size < 0) {
+            pthread_mutex_unlock(&host->lock);
+            return hl_linux_errno_result();
+        }
+        for (offset = 0; offset < (size_t)size;) {
+            const struct inotify_event *event = (const struct inotify_event *)(buffer + offset);
+            hl_linux_directory_watch *watch = hl_linux_directory_watch_for_id(object, event->wd);
+            uint64_t token = watch == NULL ? 0 : watch->token;
+            uint32_t changes = hl_linux_directory_changes(event->mask);
+            if (changes != 0 && hl_linux_directory_append(object, (hl_host_directory_record){token, changes, 0}) != 0) {
+                pthread_mutex_unlock(&host->lock);
+                return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+            }
+            if ((event->mask & IN_IGNORED) != 0 && watch != NULL) {
+                close(watch->descriptor);
+                *watch = (hl_linux_directory_watch){-1, -1, 0, 0, 0};
+            }
+            offset += sizeof(*event) + event->len;
+        }
+    }
+    count = capacity < object->pending_count ? capacity : object->pending_count;
+    if (count != 0) memcpy(records, object->pending, count * sizeof(*records));
+    object->pending_count -= count;
+    if (object->pending_count != 0)
+        memmove(object->pending, object->pending + count, object->pending_count * sizeof(*object->pending));
+    pthread_mutex_unlock(&host->lock);
+    return count == 0 ? hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0) : hl_linux_result(HL_STATUS_OK, count, 0);
+}
+
+static hl_host_result hl_linux_directory_duplicate(void *context, hl_host_handle instance) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_directory_object *object;
+    int descriptor;
+    hl_host_result result;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    object = entry == NULL ? NULL : entry->address;
+    descriptor = entry == NULL ? -1 : fcntl(entry->descriptor, F_DUPFD_CLOEXEC, 0);
+    if (descriptor >= 0) object->references++;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_DIRECTORY, descriptor, object, NULL, 0, -1);
+    if (result.status != HL_STATUS_OK) {
+        pthread_mutex_lock(&host->lock);
+        object->references--;
+        pthread_mutex_unlock(&host->lock);
+        close(descriptor);
+    }
+    return result;
+}
+
+static hl_host_result hl_linux_directory_close(void *context, hl_host_handle instance) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    hl_linux_directory_object *object;
+    int descriptor;
+    uint32_t index;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = entry->descriptor;
+    object = entry->address;
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    entry->descriptor = -1;
+    entry->address = NULL;
+    if (--object->references == 0) {
+        for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+            if (object->watches[index].descriptor >= 0) close(object->watches[index].descriptor);
+        free(object->pending);
+        free(object);
+    }
+    pthread_mutex_unlock(&host->lock);
+    return close(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_event_create(void *context) {
     hl_host_linux *host = context;
     struct epoll_event event = {0};
@@ -877,6 +1165,8 @@ static hl_host_result hl_linux_event_control(void *context, hl_host_handle polls
     pollset_fd = hl_linux_descriptor(host, pollset, HL_LINUX_HANDLE_POLLSET, HL_LINUX_HANDLE_POLLSET);
     object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SOCKET);
     if (object_fd < 0) object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
+    if (object_fd < 0)
+        object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_DIRECTORY, HL_LINUX_HANDLE_DIRECTORY);
     pthread_mutex_unlock(&host->lock);
     if (pollset_fd < 0 || object_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (token == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -1080,6 +1370,13 @@ static hl_host_result hl_linux_counter_create(void *context, uint64_t initial, u
         return error;
     }
     result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_COUNTER, descriptor, NULL, NULL, flags, -1);
+    if (result.status == HL_STATUS_OK) {
+        pthread_mutex_lock(&host->lock);
+        hl_linux_lookup_locked(host, result.value, HL_LINUX_HANDLE_COUNTER)->reserved =
+            (uint16_t)(HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT |
+                       HL_HOST_TRANSFER_CONTROL);
+        pthread_mutex_unlock(&host->lock);
+    }
     if (result.status != HL_STATUS_OK) close(descriptor);
     return result;
 }
@@ -1149,18 +1446,163 @@ static hl_host_result hl_linux_counter_duplicate(void *context, hl_host_handle c
     hl_linux_handle_entry *entry;
     int descriptor;
     uint64_t flags;
+    uint16_t rights;
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
     descriptor = entry == NULL ? -1 : dup(entry->descriptor);
     flags = entry == NULL ? 0 : entry->size;
+    rights = entry == NULL ? 0 : entry->reserved;
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_errno_result();
     {
         hl_host_result result =
             hl_linux_allocate_handle(host, HL_LINUX_HANDLE_COUNTER, descriptor, NULL, NULL, flags, -1);
         if (result.status != HL_STATUS_OK) close(descriptor);
+        if (result.status == HL_STATUS_OK) {
+            pthread_mutex_lock(&host->lock);
+            hl_linux_lookup_locked(host, result.value, HL_LINUX_HANDLE_COUNTER)->reserved = rights;
+            pthread_mutex_unlock(&host->lock);
+        }
         return result;
     }
+}
+
+typedef struct hl_linux_transfer_wire {
+    uint32_t data_size;
+    uint32_t attachment_count;
+    uint32_t flags[HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint32_t rights[HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint8_t data[HL_HOST_TRANSFER_MAX_DATA];
+} hl_linux_transfer_wire;
+
+static hl_host_result hl_linux_transfer_channel_pair(void *context) {
+    hl_host_linux *host = context;
+    int pair[2];
+    hl_host_result first;
+    hl_host_result second;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) return hl_linux_errno_result();
+    first = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_TRANSFER, pair[0], NULL, NULL, 0, -1);
+    if (first.status != HL_STATUS_OK) {
+        close(pair[0]);
+        close(pair[1]);
+        return first;
+    }
+    second = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_TRANSFER, pair[1], NULL, NULL, 0, -1);
+    if (second.status != HL_STATUS_OK) {
+        (void)hl_linux_close_descriptor(host, first.value);
+        close(pair[1]);
+        return second;
+    }
+    return hl_linux_result(HL_STATUS_OK, first.value, second.value);
+}
+
+static hl_host_result hl_linux_transfer_send(void *context, hl_host_handle channel, hl_host_const_bytes data,
+                                             const hl_host_transfer_attachment *attachments, uint32_t count) {
+    hl_host_linux *host = context;
+    hl_linux_transfer_wire wire = {0};
+    uint8_t control[CMSG_SPACE(sizeof(int) * HL_HOST_TRANSFER_MAX_ATTACHMENTS)] = {0};
+    struct iovec vector = {&wire, sizeof(wire)};
+    struct msghdr message = {0};
+    int descriptors[HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    int channel_fd;
+    uint32_t index;
+    if (data.size > HL_HOST_TRANSFER_MAX_DATA || (data.size != 0 && data.data == NULL) ||
+        count > HL_HOST_TRANSFER_MAX_ATTACHMENTS || (count != 0 && attachments == NULL))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    channel_fd = hl_linux_descriptor(host, channel, HL_LINUX_HANDLE_TRANSFER, HL_LINUX_HANDLE_TRANSFER);
+    for (index = 0; index < count && channel_fd >= 0; ++index) {
+        hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, attachments[index].object, HL_LINUX_HANDLE_COUNTER);
+        uint32_t valid =
+            HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT | HL_HOST_TRANSFER_CONTROL;
+        if (entry == NULL || attachments[index].kind != HL_HOST_TRANSFER_KIND_COUNTER ||
+            (attachments[index].rights & ~valid) != 0 ||
+            (attachments[index].rights & entry->reserved) != attachments[index].rights) {
+            channel_fd = -1;
+            break;
+        }
+        descriptors[index] = entry->descriptor;
+        wire.flags[index] = (uint32_t)entry->size;
+        wire.rights[index] = attachments[index].rights;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (channel_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    wire.data_size = (uint32_t)data.size;
+    wire.attachment_count = count;
+    if (data.size != 0) memcpy(wire.data, data.data, data.size);
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    if (count != 0) {
+        struct cmsghdr *header;
+        message.msg_control = control;
+        message.msg_controllen = CMSG_SPACE(sizeof(int) * count);
+        header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int) * count);
+        memcpy(CMSG_DATA(header), descriptors, sizeof(int) * count);
+    }
+    return sendmsg(channel_fd, &message, 0) == (ssize_t)sizeof(wire) ? hl_linux_result(HL_STATUS_OK, 0, 0)
+                                                                     : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_transfer_receive(void *context, hl_host_handle channel, hl_host_bytes data,
+                                                hl_host_transfer_attachment *attachments, uint32_t capacity) {
+    hl_host_linux *host = context;
+    hl_linux_transfer_wire wire;
+    uint8_t control[CMSG_SPACE(sizeof(int) * HL_HOST_TRANSFER_MAX_ATTACHMENTS)] = {0};
+    struct iovec vector = {&wire, sizeof(wire)};
+    struct msghdr message = {0};
+    int channel_fd;
+    int received[HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint32_t index;
+    ssize_t bytes;
+    pthread_mutex_lock(&host->lock);
+    channel_fd = hl_linux_descriptor(host, channel, HL_LINUX_HANDLE_TRANSFER, HL_LINUX_HANDLE_TRANSFER);
+    pthread_mutex_unlock(&host->lock);
+    if (channel_fd < 0 || (data.size != 0 && data.data == NULL) || (capacity != 0 && attachments == NULL))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    bytes = recv(channel_fd, &wire, sizeof(wire), MSG_PEEK);
+    if (bytes < 0) return hl_linux_errno_result();
+    if (bytes != (ssize_t)sizeof(wire) || wire.data_size > HL_HOST_TRANSFER_MAX_DATA ||
+        wire.attachment_count > HL_HOST_TRANSFER_MAX_ATTACHMENTS)
+        return hl_linux_result(HL_STATUS_CORRUPT, 0, 0);
+    if (wire.data_size > data.size || wire.attachment_count > capacity)
+        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, wire.data_size, wire.attachment_count);
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    bytes = recvmsg(channel_fd, &message, MSG_CMSG_CLOEXEC);
+    if (bytes != (ssize_t)sizeof(wire))
+        return bytes < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_CORRUPT, 0, 0);
+    if (wire.attachment_count != 0) {
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        if (header == NULL || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len != CMSG_LEN(sizeof(int) * wire.attachment_count))
+            return hl_linux_result(HL_STATUS_CORRUPT, 0, 0);
+        memcpy(received, CMSG_DATA(header), sizeof(int) * wire.attachment_count);
+    }
+    for (index = 0; index < wire.attachment_count; ++index) {
+        hl_host_result installed =
+            hl_linux_allocate_handle(host, HL_LINUX_HANDLE_COUNTER, received[index], NULL, NULL, wire.flags[index], -1);
+        if (installed.status != HL_STATUS_OK) {
+            uint32_t rest;
+            close(received[index]);
+            for (rest = index + 1; rest < wire.attachment_count; ++rest)
+                close(received[rest]);
+            for (rest = 0; rest < index; ++rest)
+                (void)hl_linux_close_descriptor(host, attachments[rest].object);
+            return installed;
+        }
+        pthread_mutex_lock(&host->lock);
+        hl_linux_lookup_locked(host, installed.value, HL_LINUX_HANDLE_COUNTER)->reserved = (uint16_t)wire.rights[index];
+        pthread_mutex_unlock(&host->lock);
+        attachments[index] =
+            (hl_host_transfer_attachment){installed.value, HL_HOST_TRANSFER_KIND_COUNTER, wire.rights[index]};
+    }
+    if (wire.data_size != 0) memcpy(data.data, wire.data, wire.data_size);
+    return hl_linux_result(HL_STATUS_OK, wire.data_size, wire.attachment_count);
 }
 
 static hl_host_result hl_linux_network_socket(void *context, uint32_t family, uint32_t type, uint32_t protocol) {
@@ -1576,6 +2018,13 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                      hl_linux_counter_write,     hl_linux_counter_get_flags,
                                                      hl_linux_counter_set_flags, hl_linux_counter_duplicate,
                                                      hl_linux_close_descriptor};
+    static const hl_host_transfer_services transfer = {HL_HOST_TRANSFER_ABI,           sizeof(transfer),
+                                                       hl_linux_transfer_channel_pair, hl_linux_transfer_send,
+                                                       hl_linux_transfer_receive,      hl_linux_close_descriptor};
+    static const hl_host_directory_services directory = {
+        HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_linux_directory_create, hl_linux_directory_add,
+        hl_linux_directory_modify, hl_linux_directory_remove, hl_linux_directory_read,   hl_linux_directory_duplicate,
+        hl_linux_directory_close};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
@@ -1622,7 +2071,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_NETWORK |
                                  HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING |
-                                 HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER;
+                                 HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -1634,6 +2083,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->process = &process;
     out_services->sync = &sync;
     out_services->counter = &counter;
+    out_services->transfer = &transfer;
+    out_services->directory = &directory;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -1667,6 +2118,16 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             if (entry->process_reaped) continue;
             kill(entry->descriptor, SIGKILL);
             while (waitpid(entry->descriptor, &status, 0) < 0 && errno == EINTR) {}
+        } else if (entry->kind == HL_LINUX_HANDLE_DIRECTORY) {
+            hl_linux_directory_object *object = entry->address;
+            close(entry->descriptor);
+            if (--object->references == 0) {
+                uint32_t watch;
+                for (watch = 0; watch < HL_LINUX_DIRECTORY_WATCHES; ++watch)
+                    if (object->watches[watch].descriptor >= 0) close(object->watches[watch].descriptor);
+                free(object->pending);
+                free(object);
+            }
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);
