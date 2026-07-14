@@ -856,6 +856,7 @@ LINUX_PRODUCTION_MATRIX_CASES := \
 	$(BUILD)/compat/syscall/x86_64/epoll_pwait \
 	$(BUILD)/compat/core/syscall/x86_64/eventfd \
 	$(BUILD)/compat/core/syscall/x86_64/eventfd_sema \
+	$(BUILD)/e2e/eventfd_nonblock-x86_64 \
 	$(BUILD)/e2e/epoll_oneshot-x86_64
 
 $(BUILD)/tools/linux-matrix: tools/linux_matrix.c
@@ -885,6 +886,7 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/syscall/x86_64/epoll_pwait tests/compat/syscall/expected/epoll_pwait.out 0 \
 		$(BUILD)/compat/core/syscall/x86_64/eventfd tests/compat/core/syscall/expected/eventfd.out 0 \
 		$(BUILD)/compat/core/syscall/x86_64/eventfd_sema tests/compat/core/syscall/expected/eventfd_sema.out 0 \
+		$(BUILD)/e2e/eventfd_nonblock-x86_64 tests/compat/syscall/expected/eventfd_nonblock.out 0 \
 		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \

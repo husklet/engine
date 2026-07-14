@@ -1,6 +1,10 @@
 #include "errno.h"
 
 int hl_linux_errno_from_macos(int host_errno) {
+#if defined(__linux__)
+    /* The native Linux host already uses the guest errno namespace. */
+    return host_errno;
+#else
     /* Indexed by Darwin errno; values are Linux errno numbers. Unknown values pass through. */
     static const short linux_errno[107] = {
         0,  1,   2,  3,   4,   5,  6,   7,   8,   9,   10,  35,  12,  13,  14,  15,  16,  17,  18, 19, 20,  21,
@@ -11,4 +15,5 @@ int hl_linux_errno_from_macos(int host_errno) {
     };
     return host_errno >= 0 && host_errno < (int)(sizeof(linux_errno) / sizeof(linux_errno[0])) ? linux_errno[host_errno]
                                                                                                : host_errno;
+#endif
 }
