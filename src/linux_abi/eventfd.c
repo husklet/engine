@@ -66,6 +66,18 @@ static int64_t eventfd_status(void *opaque, hl_linux_file_status *status) {
     return 0;
 }
 
+static int64_t eventfd_set_status_flags(void *opaque, uint32_t flags) {
+    eventfd_object *object = opaque;
+    hl_host_result current = object->host->counter->get_flags(object->host->context, object->counter);
+    uint32_t host_flags;
+    hl_host_result result;
+    if (current.status != HL_STATUS_OK) return eventfd_error((hl_status)current.status);
+    host_flags = (uint32_t)current.value & HL_HOST_COUNTER_SEMAPHORE;
+    if ((flags & HL_LINUX_O_NONBLOCK) != 0) host_flags |= HL_HOST_COUNTER_NONBLOCK;
+    result = object->host->counter->set_flags(object->host->context, object->counter, host_flags);
+    return eventfd_error((hl_status)result.status);
+}
+
 static uint32_t eventfd_readiness(void *opaque, uint32_t interests) {
     eventfd_object *object = opaque;
     hl_host_result result = object->host->counter->readiness(object->host->context, object->counter,
@@ -156,6 +168,7 @@ static const hl_linux_object_ops eventfd_ops = {
     .read = eventfd_read,
     .write = eventfd_write,
     .status = eventfd_status,
+    .set_status_flags = eventfd_set_status_flags,
     .readiness = eventfd_readiness,
     .subscribe = eventfd_subscribe,
     .unsubscribe = eventfd_unsubscribe,
@@ -181,14 +194,14 @@ static int64_t eventfd_install(hl_linux_abi *linux_abi, hl_linux_fd requested, h
     object->lock = lock.value;
     if (requested == UINT32_MAX) {
         hl_linux_fd fd;
-        status = hl_linux_object_install(linux_abi, &eventfd_ops, object, HL_LINUX_OBJECT_EVENTFD,
-                                         HL_LINUX_O_RDWR | ((flags & HL_LINUX_EVENTFD_NONBLOCK) ? 0x800u : 0),
-                                         descriptor_flags, &fd);
+        status = hl_linux_object_install(
+            linux_abi, &eventfd_ops, object, HL_LINUX_OBJECT_EVENTFD,
+            HL_LINUX_O_RDWR | ((flags & HL_LINUX_EVENTFD_NONBLOCK) ? HL_LINUX_O_NONBLOCK : 0), descriptor_flags, &fd);
         if (status == HL_STATUS_OK) return (int64_t)fd;
     } else {
-        status = hl_linux_object_install_at(linux_abi, requested, &eventfd_ops, object, HL_LINUX_OBJECT_EVENTFD,
-                                            HL_LINUX_O_RDWR | ((flags & HL_LINUX_EVENTFD_NONBLOCK) ? 0x800u : 0),
-                                            descriptor_flags);
+        status = hl_linux_object_install_at(
+            linux_abi, requested, &eventfd_ops, object, HL_LINUX_OBJECT_EVENTFD,
+            HL_LINUX_O_RDWR | ((flags & HL_LINUX_EVENTFD_NONBLOCK) ? HL_LINUX_O_NONBLOCK : 0), descriptor_flags);
         if (status == HL_STATUS_OK) return (int64_t)requested;
     }
     (void)eventfd_close(object);

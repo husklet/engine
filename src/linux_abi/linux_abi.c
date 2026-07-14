@@ -1555,11 +1555,27 @@ int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command,
         argument = 0;
         break;
     case HL_LINUX_F_GETFL: argument = ofd_entry->status_flags; break;
-    case HL_LINUX_F_SETFL:
-        linux_abi->ofds[fd_entry->ofd].status_flags =
-            (ofd_entry->status_flags & HL_LINUX_O_ACCMODE) | ((uint32_t)argument & HL_LINUX_O_APPEND);
+    case HL_LINUX_F_SETFL: {
+        hl_linux_ofd_entry *ofd = &linux_abi->ofds[fd_entry->ofd];
+        uint32_t flags = (ofd_entry->status_flags & HL_LINUX_O_ACCMODE) |
+                         ((uint32_t)argument & (HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK));
+        if (ofd->object_ops != NULL && ofd->object_ops->set_status_flags != NULL) {
+            int64_t result;
+            ofd->active_operations++;
+            hl_linux_unlock(linux_abi);
+            hl_linux_ofd_lock(linux_abi, ofd);
+            result = ofd->object_ops->set_status_flags(ofd->object_context, flags);
+            hl_linux_lock(linux_abi);
+            if (result == 0) ofd->status_flags = flags;
+            ofd->active_operations--;
+            hl_linux_unlock(linux_abi);
+            hl_linux_ofd_unlock(linux_abi, ofd);
+            return result;
+        }
+        ofd->status_flags = flags;
         argument = 0;
         break;
+    }
     default: hl_linux_unlock(linux_abi); return -HL_LINUX_EINVAL;
     }
     hl_linux_unlock(linux_abi);

@@ -28,6 +28,9 @@ int main(void) {
     HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, &value, sizeof(value)) == 8 && value == 1);
     HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)copy, &value, sizeof(value)) == 8 && value == 1);
     HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, &value, sizeof(value)) == -HL_LINUX_EAGAIN);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, (hl_linux_fd)fd, HL_LINUX_F_SETFL, 0) == 0);
+    HL_CHECK((hl_linux_fcntl(&linux_abi, (hl_linux_fd)copy, HL_LINUX_F_GETFL, 0) & HL_LINUX_O_NONBLOCK) == 0);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, (hl_linux_fd)copy, HL_LINUX_F_SETFL, HL_LINUX_O_NONBLOCK) == 0);
     value = 9;
     HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)copy, &value, sizeof(value)) == 8);
     {
