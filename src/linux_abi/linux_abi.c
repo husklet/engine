@@ -600,6 +600,35 @@ hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_lin
     return status;
 }
 
+hl_status hl_linux_object_pin_ofd(hl_linux_abi *linux_abi, hl_linux_ofd ofd_index, uint32_t generation,
+                                  hl_linux_object_pin *pin) {
+    hl_linux_ofd_entry *ofd;
+    hl_host_result locked;
+    if (linux_abi == NULL || pin == NULL || ofd_index == 0 || ofd_index >= linux_abi->ofd_capacity)
+        return HL_STATUS_INVALID_ARGUMENT;
+    memset(pin, 0, sizeof(*pin));
+    hl_linux_lock(linux_abi);
+    ofd = &linux_abi->ofds[ofd_index];
+    if (ofd->generation != generation || ofd->references == 0 || ofd->closing != 0 || ofd->object_ops == NULL) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_NOT_FOUND;
+    }
+    ofd->active_operations++;
+    pin->linux_abi = linux_abi;
+    pin->ofd = ofd_index;
+    pin->generation = generation;
+    pin->ops = ofd->object_ops;
+    pin->context = ofd->object_context;
+    hl_linux_unlock(linux_abi);
+    locked = hl_linux_sync(linux_abi)->mutex_lock(linux_abi->host->context, ofd->io_mutex);
+    if (locked.status == HL_STATUS_OK) return HL_STATUS_OK;
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    memset(pin, 0, sizeof(*pin));
+    return (hl_status)locked.status;
+}
+
 void hl_linux_object_unpin(hl_linux_object_pin *pin) {
     hl_linux_ofd_entry *ofd;
     int finalize = 0;
@@ -614,6 +643,48 @@ void hl_linux_object_unpin(hl_linux_object_pin *pin) {
     (void)hl_linux_sync(pin->linux_abi)->mutex_unlock(pin->linux_abi->host->context, ofd->io_mutex);
     if (finalize) (void)hl_linux_ofd_finalize(pin->linux_abi, ofd, NULL);
     memset(pin, 0, sizeof(*pin));
+}
+
+hl_status hl_linux_object_unlock(hl_linux_object_pin *pin) {
+    hl_host_result result;
+    if (pin == NULL || pin->linux_abi == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    result = hl_linux_sync(pin->linux_abi)
+                 ->mutex_unlock(pin->linux_abi->host->context, pin->linux_abi->ofds[pin->ofd].io_mutex);
+    return (hl_status)result.status;
+}
+
+hl_status hl_linux_object_relock(hl_linux_object_pin *pin) {
+    hl_host_result result;
+    if (pin == NULL || pin->linux_abi == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    result = hl_linux_sync(pin->linux_abi)
+                 ->mutex_lock(pin->linux_abi->host->context, pin->linux_abi->ofds[pin->ofd].io_mutex);
+    return (hl_status)result.status;
+}
+
+void hl_linux_object_abandon(hl_linux_object_pin *pin) {
+    hl_linux_ofd_entry *ofd;
+    int finalize = 0;
+    if (pin == NULL || pin->linux_abi == NULL) return;
+    hl_linux_lock(pin->linux_abi);
+    ofd = &pin->linux_abi->ofds[pin->ofd];
+    if (ofd->generation == pin->generation && ofd->active_operations != 0) {
+        ofd->active_operations--;
+        finalize = ofd->active_operations == 0 && ofd->references == 0 && ofd->closing != 0;
+    }
+    hl_linux_unlock(pin->linux_abi);
+    if (finalize) (void)hl_linux_ofd_finalize(pin->linux_abi, ofd, NULL);
+    memset(pin, 0, sizeof(*pin));
+}
+
+int hl_linux_object_retired(hl_linux_object_pin *pin) {
+    int retired;
+    if (pin == NULL || pin->linux_abi == NULL) return 1;
+    hl_linux_lock(pin->linux_abi);
+    retired = pin->ofd >= pin->linux_abi->ofd_capacity ||
+              pin->linux_abi->ofds[pin->ofd].generation != pin->generation ||
+              pin->linux_abi->ofds[pin->ofd].references == 0 || pin->linux_abi->ofds[pin->ofd].closing != 0;
+    hl_linux_unlock(pin->linux_abi);
+    return retired;
 }
 
 uint32_t hl_linux_object_ready(hl_linux_object_pin *pin, uint32_t interests) {
@@ -859,6 +930,8 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     hl_linux_ofd_entry *ofd_entry;
     int final_reference;
     int defer_finalization;
+    const hl_linux_object_ops *retire_ops = NULL;
+    void *retire_context = NULL;
     if (last_host_handle != NULL) *last_host_handle = HL_HOST_HANDLE_INVALID;
     if (linux_abi == NULL) return HL_STATUS_NOT_FOUND;
     hl_linux_lock(linux_abi);
@@ -881,9 +954,14 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     linux_abi->fds[fd].generation++;
     ofd_entry->references--;
     final_reference = ofd_entry->references == 0;
-    if (final_reference) ofd_entry->closing = 1;
+    if (final_reference) {
+        ofd_entry->closing = 1;
+        retire_ops = ofd_entry->object_ops;
+        retire_context = ofd_entry->object_context;
+    }
     defer_finalization = final_reference && ofd_entry->active_operations != 0;
     hl_linux_unlock(linux_abi);
+    if (retire_ops != NULL && retire_ops->retire != NULL) retire_ops->retire(retire_context);
     return final_reference && !defer_finalization ? hl_linux_ofd_finalize(linux_abi, ofd_entry, last_host_handle)
                                                   : HL_STATUS_OK;
 }

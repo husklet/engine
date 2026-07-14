@@ -16,7 +16,14 @@ typedef struct hl_linux_object_ops {
     int64_t (*write)(void *context, const void *buffer, size_t size);
     int64_t (*status)(void *context, hl_linux_file_status *status);
     uint32_t (*readiness)(void *context, uint32_t interests);
+    /* subscribe never calls notify inline; unsubscribe quiesces the token before returning. */
+    hl_status (*subscribe)(void *context, void (*notify)(void *observer, uint64_t token), void *observer,
+                           uint64_t token);
+    void (*unsubscribe)(void *context, void *observer, uint64_t token);
+    /* Descriptor retirement notification; must not block. Used to interrupt object waiters. */
+    void (*retire)(void *context);
     hl_status (*clone)(void *context, void **child_context);
+    /* Before returning, close synchronously quiesces and forgets every subscription callback. */
     hl_status (*close)(void *context);
 } hl_linux_object_ops;
 
@@ -33,7 +40,13 @@ hl_status hl_linux_object_install(hl_linux_abi *linux_abi, const hl_linux_object
 hl_status hl_linux_object_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_linux_object_ops *ops,
                                      void *context, uint32_t kind, uint32_t status_flags, uint32_t descriptor_flags);
 hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_object_pin *pin);
+hl_status hl_linux_object_pin_ofd(hl_linux_abi *linux_abi, hl_linux_ofd ofd, uint32_t generation,
+                                  hl_linux_object_pin *pin);
 void hl_linux_object_unpin(hl_linux_object_pin *pin);
+hl_status hl_linux_object_unlock(hl_linux_object_pin *pin);
+hl_status hl_linux_object_relock(hl_linux_object_pin *pin);
+void hl_linux_object_abandon(hl_linux_object_pin *pin);
+int hl_linux_object_retired(hl_linux_object_pin *pin);
 uint32_t hl_linux_object_ready(hl_linux_object_pin *pin, uint32_t interests);
 
 typedef struct hl_linux_poll_entry {
