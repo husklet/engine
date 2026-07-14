@@ -60,6 +60,8 @@ typedef struct hl_open_plan {
     hl_open_overlay overlay;
     hl_status error;
     hl_host_handle directory;
+    hl_host_handle target;
+    uint32_t target_type;
     uint32_t intent;
     uint32_t names_symlink;
     char path[4097];

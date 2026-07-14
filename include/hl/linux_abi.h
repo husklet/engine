@@ -258,6 +258,10 @@ HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, co
 HL_API int64_t hl_linux_openat_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
                                         int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
                                         uint32_t mode);
+/* Opens relative to an opaque host directory without exposing or adopting its native descriptor. */
+HL_API int64_t hl_linux_openat_handle_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                               hl_host_handle directory, const char *path, size_t path_size,
+                                               uint32_t flags, uint32_t mode);
 /* close() invalidates this descriptor even if the host reports a late close error. */
 HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
 /* dup and supported fcntl commands operate only on the guest fd/OFD tables. */

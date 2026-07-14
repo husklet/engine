@@ -1372,15 +1372,15 @@ int64_t hl_linux_fdatasync(hl_linux_abi *linux_abi, hl_linux_fd fd) {
 }
 
 static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
-                                       int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
-                                       uint32_t mode) {
+                                       int32_t directory_fd, hl_host_handle direct_directory, const char *path,
+                                       size_t path_size, uint32_t flags, uint32_t mode) {
     const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
                                HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK | HL_LINUX_O_NOFOLLOW | HL_LINUX_O_DIRECTORY |
                                HL_LINUX_O_PATH | HL_LINUX_O_CLOEXEC;
     const hl_host_file_services *files;
     const hl_linux_ofd_entry *found;
     hl_linux_ofd_entry *directory_ofd = NULL;
-    hl_host_handle directory = HL_HOST_HANDLE_CWD;
+    hl_host_handle directory = direct_directory == HL_HOST_HANDLE_INVALID ? HL_HOST_HANDLE_CWD : direct_directory;
     hl_host_result opened;
     hl_linux_fd installed;
     uint32_t access;
@@ -1404,7 +1404,7 @@ static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_f
     files = hl_linux_files(linux_abi);
     if (files == NULL || files->open_relative == NULL) return -HL_LINUX_ENOSYS;
 
-    if (directory_fd != HL_LINUX_AT_FDCWD) {
+    if (direct_directory == HL_HOST_HANDLE_INVALID && directory_fd != HL_LINUX_AT_FDCWD) {
         if (directory_fd < 0) return -HL_LINUX_EBADF;
         hl_linux_lock(linux_abi);
         status = hl_linux_fd_get_unlocked(linux_abi, (hl_linux_fd)directory_fd, NULL, &found);
@@ -1445,14 +1445,22 @@ static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_f
 
 int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,
                         uint32_t flags, uint32_t mode) {
-    return hl_linux_openat_install(linux_abi, NULL, directory_fd, path, path_size, flags, mode);
+    return hl_linux_openat_install(linux_abi, NULL, directory_fd, HL_HOST_HANDLE_INVALID, path, path_size, flags, mode);
 }
 
 int64_t hl_linux_openat_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
                                  int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
                                  uint32_t mode) {
     if (reservation == NULL) return -HL_LINUX_EINVAL;
-    return hl_linux_openat_install(linux_abi, reservation, directory_fd, path, path_size, flags, mode);
+    return hl_linux_openat_install(linux_abi, reservation, directory_fd, HL_HOST_HANDLE_INVALID, path, path_size, flags,
+                                   mode);
+}
+
+int64_t hl_linux_openat_handle_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                        hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
+                                        uint32_t mode) {
+    if (reservation == NULL || directory == HL_HOST_HANDLE_INVALID) return -HL_LINUX_EINVAL;
+    return hl_linux_openat_install(linux_abi, reservation, HL_LINUX_AT_FDCWD, directory, path, path_size, flags, mode);
 }
 
 int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {
