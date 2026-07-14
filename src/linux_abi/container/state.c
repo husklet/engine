@@ -3,7 +3,7 @@
 #include "../xattr.h"
 #include "../readonly.h"
 #include "../limits.h"
-#include <sys/sysctl.h> // sysctlbyname("hw.activecpu") -- true host core count (see container_online_cpus)
+#include "../../host/system.h"
 
 // HL_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
@@ -750,15 +750,8 @@ static int container_online_cpus(void) {
     // pin every unconstrained container to a single CPU (nproc=1, affinity mask=1 bit, /sys .../cpu/online="0")
     // and stop guests scaling. hw.activecpu is what Go / the JVM / most runtimes read anyway; mirror the darwin
     // Linux guest CPU reporting. Fallbacks: hw.logicalcpu -> hw.ncpu -> sysconf.
-    long n = 0;
-    int v = 0;
-    size_t sz = sizeof v;
-    if (sysctlbyname("hw.activecpu", &v, &sz, NULL, 0) == 0 && v > 0)
-        n = v;
-    else if (sz = sizeof v, sysctlbyname("hw.logicalcpu", &v, &sz, NULL, 0) == 0 && v > 0)
-        n = v;
-    else if (sz = sizeof v, sysctlbyname("hw.ncpu", &v, &sz, NULL, 0) == 0 && v > 0)
-        n = v;
+    hl_host_system_info info;
+    long n = hl_host_system_read(&info, NULL, 0) ? (long)info.online_cpus : 0;
     if (n < 1) n = sysconf(_SC_NPROCESSORS_ONLN); // last-resort (non-darwin build / sysctl failure)
     if (n < 1) n = 1;
     if (g_cpu_max > 0 && (long)g_cpu_max < n) n = g_cpu_max; // docker --cpus allotment clamp

@@ -2021,18 +2021,12 @@ static int proc_mountinfo_text(char *b, size_t n) {
 // (getpid() returns exactly that). macOS has no /proc, and one DBT process cannot see another's
 // address space, so we (1) keep a tiny on-disk REGISTRY where each container process publishes its
 // guest identity (comm + full argv), keyed by a per-container tmp dir, and (2) read LIVE per-process
-// stats (rss, cpu time, state, ppid) from the host kernel via libproc (proc_pidinfo). The union --
-// registry identity + libproc liveness -- lets any process (e.g. `ps`) enumerate the whole container
+// stats (rss, cpu time, state, ppid) from the host system interface. The union -- registry identity +
+// native-process liveness -- lets any process (e.g. `ps`) enumerate the whole container
 // and synthesize /proc/<pid>/{stat,status,cmdline,comm} for its peers, with GUEST pids throughout.
 #include <libproc.h>
 #include <sys/proc_info.h>
-#include <sys/sysctl.h>
-#include <mach/mach_host.h>
-#include <mach/host_info.h>
-#include <mach/vm_statistics.h>
-#include <mach/machine.h>
-#include <mach/processor_info.h> // host_processor_info(PROCESSOR_CPU_LOAD_INFO) — real PER-CORE ticks
-#include <mach/vm_map.h>         // vm_deallocate for the processor_info array
+#include "../../host/system.h"
 
 // The registry directory is keyed per-container (HL_NETNS / HL_HOSTNAME are set once at launch and
 // inherited across fork + survive guest execve), so two containers on the same host never collide; a
@@ -2224,7 +2218,7 @@ static int proc_reg_read(int hostpid, char *comm, size_t csz, char *cmd, size_t 
     return 1;
 }
 
-// Live per-process stats from the host kernel (libproc). rss/cpu-times/state are REAL (coarse beats
+// Live per-process stats from the host backend. rss/cpu-times/state are REAL (coarse beats
 // zero); comm here is the HOST comm (the DBT binary) -- the guest comm comes from the registry instead.
 struct hl_procinfo {
     int ppid_host, pgid_host, nthreads;
@@ -2235,29 +2229,18 @@ struct hl_procinfo {
 };
 
 static int hl_get_procinfo(int pid, struct hl_procinfo *pi) {
-    struct proc_bsdinfo bsd;
-    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof bsd) != (int)sizeof bsd) return 0;
-    pi->ppid_host = (int)bsd.pbi_ppid;
-    pi->pgid_host = (int)bsd.pbi_pgid;
-    pi->start_sec = (long)bsd.pbi_start_tvsec;
-    snprintf(pi->hostcomm, sizeof pi->hostcomm, "%s", bsd.pbi_comm);
-    switch (bsd.pbi_status) { // SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
-    case 2: pi->state = 'R'; break;
-    case 4: pi->state = 'T'; break;
-    case 5: pi->state = 'Z'; break;
-    default: pi->state = 'S'; break;
-    }
-    struct proc_taskinfo ti;
-    if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof ti) == (int)sizeof ti) {
-        pi->rss = ti.pti_resident_size;
-        pi->vsize = ti.pti_virtual_size;
-        pi->utime_ns = ti.pti_total_user;
-        pi->stime_ns = ti.pti_total_system;
-        pi->nthreads = ti.pti_threadnum > 0 ? ti.pti_threadnum : 1;
-    } else {
-        pi->rss = pi->vsize = pi->utime_ns = pi->stime_ns = 0;
-        pi->nthreads = 1;
-    }
+    hl_host_process_info host;
+    if (!hl_host_process_read(pid, &host)) return 0;
+    pi->ppid_host = (int)host.parent_pid;
+    pi->pgid_host = (int)host.process_group;
+    pi->start_sec = (long)host.start_time_seconds;
+    pi->state = host.state;
+    pi->rss = host.resident_bytes;
+    pi->vsize = host.virtual_bytes;
+    pi->utime_ns = host.user_time_ns;
+    pi->stime_ns = host.system_time_ns;
+    pi->nthreads = host.threads > 0 ? (int)host.threads : 1;
+    snprintf(pi->hostcomm, sizeof pi->hostcomm, "%s", host.name);
     return 1;
 }
 
@@ -2413,23 +2396,21 @@ static unsigned long long self_rss_bytes(void) {
 static long host_btime(void) {
     static long bt = 0;
     if (bt) return bt;
-    struct timeval tv;
-    size_t len = sizeof tv;
-    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
-    bt = (sysctl(mib, 2, &tv, &len, NULL, 0) == 0 && tv.tv_sec) ? tv.tv_sec : time(NULL);
+    hl_host_system_info info;
+    bt = hl_host_system_read(&info, NULL, 0) && info.boot_time_seconds <= LONG_MAX
+             ? (long)info.boot_time_seconds
+             : time(NULL);
     return bt;
 }
 
-// Aggregate host CPU jiffies (user, system, idle, nice) -- monotonically increasing, so htop/top meters
-// move. HOST_CPU_LOAD_INFO ticks are already in USER_HZ and summed across cores.
+// Aggregate host CPU jiffies (user, system, idle, nice) -- monotonically increasing, so htop/top meters move.
 static void host_cpu_ticks(unsigned long long t[4]) {
-    host_cpu_load_info_data_t info;
-    mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
-    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&info, &cnt) == KERN_SUCCESS) {
-        t[0] = info.cpu_ticks[CPU_STATE_USER];
-        t[1] = info.cpu_ticks[CPU_STATE_SYSTEM];
-        t[2] = info.cpu_ticks[CPU_STATE_IDLE];
-        t[3] = info.cpu_ticks[CPU_STATE_NICE];
+    hl_host_system_info info;
+    if (hl_host_system_read(&info, NULL, 0)) {
+        t[0] = info.aggregate.user;
+        t[1] = info.aggregate.system;
+        t[2] = info.aggregate.idle;
+        t[3] = info.aggregate.nice;
     } else {
         t[0] = t[1] = t[2] = t[3] = 0;
     }
@@ -2438,21 +2419,13 @@ static void host_cpu_ticks(unsigned long long t[4]) {
 // Real host memory picture (kB): total from hw.memsize, free/available/cached from the Mach VM stats.
 static void host_mem(unsigned long long *total, unsigned long long *fre, unsigned long long *avail,
                      unsigned long long *cached) {
-    uint64_t memsize = 0;
-    size_t len = sizeof memsize;
-    sysctlbyname("hw.memsize", &memsize, &len, NULL, 0);
-    *total = memsize / 1024;
-    vm_size_t pgsz = 4096;
-    host_page_size(mach_host_self(), &pgsz);
-    vm_statistics64_data_t vm;
-    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info_t)&vm, &cnt) == KERN_SUCCESS) {
-        unsigned long long freep = (unsigned long long)vm.free_count * pgsz;
-        unsigned long long inact = (unsigned long long)vm.inactive_count * pgsz;
-        unsigned long long spec = (unsigned long long)vm.speculative_count * pgsz;
-        *fre = (freep + spec) / 1024;
-        *cached = inact / 1024;
-        *avail = (freep + inact + spec) / 1024;
+    hl_host_system_info info;
+    *total = 0;
+    if (hl_host_system_read(&info, NULL, 0)) {
+        *total = info.memory_total / 1024;
+        *fre = info.memory_free / 1024;
+        *avail = info.memory_available / 1024;
+        *cached = info.memory_cached / 1024;
     } else {
         *fre = *avail = *total / 4;
         *cached = 0;
@@ -2843,7 +2816,7 @@ static int proc_statm_text(char *b, size_t n) { // our own pid
     return proc_statm_common(b, n, size_pg, rss_pg);
 }
 
-static int proc_statm_pid_text(char *b, size_t n, int host) { // a peer -- REAL rss from libproc
+static int proc_statm_pid_text(char *b, size_t n, int host) { // a peer -- real host-backed RSS
     struct hl_procinfo pi;
     long pg = sysconf(_SC_PAGESIZE);
     unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
@@ -3766,7 +3739,8 @@ static int proc_open(const char *rp) {
     }
     // A PEER container process: /proc/<otherpid>/{stat,status,cmdline,comm}. proc_self_leaf matched only
     // our own pid above, so a numeric pid reaching here is a peer -- synthesize from the registry (guest
-    // comm/argv) + libproc (live rss/cpu/state). This is what makes ps/top/htop show the whole container.
+    // comm/argv) + host process stats (live rss/cpu/state). This is what makes ps/top/htop show the whole
+    // container.
     {
         int gp2;
         const char *fl = proc_any_leaf(rp, &gp2);
@@ -3825,8 +3799,8 @@ static int proc_open(const char *rp) {
         return proc_text_fd(cib, cn);
     } else if (!strcmp(rp, "/proc/meminfo")) {
         // Real-ish figures: a cgroup memory.max caps MemTotal (used = the tracked anon charge); otherwise
-        // report the host machine's memory (total from hw.memsize, free/available/cached from the Mach VM
-        // stats) so htop's memory meter reflects a believable, non-zero footprint instead of "0K used".
+        // report the host backend's memory snapshot so htop's memory meter reflects a believable,
+        // non-zero footprint instead of "0K used".
         unsigned long long tot, fre, avail, cached;
         if (g_mem_max) {
             tot = g_mem_max / 1024;
@@ -3855,8 +3829,7 @@ static int proc_open(const char *rp) {
                      tot, fre, avail, cached, tot);
     } else if (!strcmp(rp, "/proc/stat")) {
         // Real host CPU jiffies -> the cpu line increments between reads, so htop/top meters move. The
-        // aggregate `cpu` line comes from HOST_CPU_LOAD_INFO; each per-core `cpuN` line comes from that
-        // core's OWN ticks via host_processor_info(PROCESSOR_CPU_LOAD_INFO). part 3: the old code
+        // aggregate `cpu` line and each per-core `cpuN` line come from the host system snapshot. The old code
         // split the aggregate EVENLY across cores (aggregate/ncpu), so every cpuN line was byte-identical
         // and htop/top showed every core meter moving in lockstep at the same %. Per-core real ticks make
         // the deltas differ, so a busy core reads hot while idle cores read cold -- exactly like Linux.
@@ -3864,19 +3837,16 @@ static int proc_open(const char *rp) {
         host_cpu_ticks(t);
         int nc = container_online_cpus(); // docker --cpus cap (state.c), else all host cores
         n = snprintf(buf, sizeof buf, "cpu  %llu %llu %llu %llu 0 0 0 0 0 0\n", t[0], t[3], t[1], t[2]);
-        processor_info_array_t pinfo = NULL;
-        mach_msg_type_number_t picnt = 0;
-        natural_t pncpu = 0;
-        processor_cpu_load_info_t pl = NULL;
-        if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &pncpu, &pinfo, &picnt) == KERN_SUCCESS)
-            pl = (processor_cpu_load_info_t)pinfo;
+        hl_host_cpu_ticks cores[64];
+        hl_host_system_info system_info;
+        int have_cores = hl_host_system_read(&system_info, cores, sizeof cores / sizeof cores[0]);
         for (int i = 0; i < nc; i++) {
             unsigned long long u, ni, sy, id;
-            if (pl && i < (int)pncpu) { // this core's real ticks (order: user nice system idle)
-                u = pl[i].cpu_ticks[CPU_STATE_USER];
-                ni = pl[i].cpu_ticks[CPU_STATE_NICE];
-                sy = pl[i].cpu_ticks[CPU_STATE_SYSTEM];
-                id = pl[i].cpu_ticks[CPU_STATE_IDLE];
+            if (have_cores && i < (int)system_info.reported_cores) {
+                u = cores[i].user;
+                ni = cores[i].nice;
+                sy = cores[i].system;
+                id = cores[i].idle;
             } else { // API failed, or --cpus capped ABOVE the host core count: fall back to the even split
                 u = t[0] / (unsigned)nc;
                 ni = t[3] / (unsigned)nc;
@@ -3885,7 +3855,6 @@ static int proc_open(const char *rp) {
             }
             n += snprintf(buf + n, sizeof buf - (size_t)n, "cpu%d %llu %llu %llu %llu 0 0 0 0 0 0\n", i, u, ni, sy, id);
         }
-        if (pl) vm_deallocate(mach_task_self(), (vm_address_t)pinfo, picnt * sizeof(integer_t));
         // intr/ctxt are cumulative-since-boot counters; monitoring heuristics divide by the interval and
         // treat a flat 0 as a dead system. Derive a monotone nonzero from host jiffies so consumers see live
         // counters. `processes` is cumulative forks since boot (Linux), not the live registry count.
