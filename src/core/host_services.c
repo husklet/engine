@@ -47,7 +47,9 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL ||
          services->file->read == NULL || services->file->write == NULL || services->file->clone_for_fork == NULL ||
          services->file->seek == NULL || services->file->rename_relative == NULL ||
-         services->file->unlink_relative == NULL || services->file->path == NULL))
+         services->file->unlink_relative == NULL || services->file->path == NULL ||
+         services->file->standard_stream == NULL || services->file->readlink == NULL ||
+         services->file->set_owner == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

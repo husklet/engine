@@ -486,7 +486,9 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
     pthread_mutex_unlock(&host->lock);
     if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     int flags;
-    if ((access & HL_HOST_FILE_READ) != 0 && (access & HL_HOST_FILE_WRITE) != 0)
+    if ((access & HL_HOST_FILE_PATH_ONLY) != 0)
+        flags = O_PATH;
+    else if ((access & HL_HOST_FILE_READ) != 0 && (access & HL_HOST_FILE_WRITE) != 0)
         flags = O_RDWR;
     else if ((access & HL_HOST_FILE_WRITE) != 0)
         flags = O_WRONLY;
@@ -494,6 +496,7 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
         flags = O_RDONLY;
     else
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if ((access & HL_HOST_FILE_NOFOLLOW) != 0) flags |= O_NOFOLLOW;
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
     if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
     if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
@@ -533,6 +536,74 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
         if (append_descriptor >= 0) close(append_descriptor);
     }
     return result;
+}
+
+static hl_host_result hl_linux_file_standard_stream(void *context, uint32_t stream) {
+    hl_host_linux *host = context;
+    int flags;
+    int descriptor;
+    int append_descriptor = -1;
+    uint32_t detail = 0;
+    hl_host_result result;
+    if (stream > HL_HOST_STANDARD_ERROR) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    flags = fcntl((int)stream, F_GETFL);
+    if (flags < 0) return hl_linux_errno_result();
+    descriptor = fcntl((int)stream, F_DUPFD_CLOEXEC, 0);
+    if (descriptor < 0) return hl_linux_errno_result();
+    if ((flags & O_ACCMODE) == O_RDONLY)
+        detail |= HL_HOST_FILE_READ;
+    else if ((flags & O_ACCMODE) == O_WRONLY)
+        detail |= HL_HOST_FILE_WRITE;
+    else if ((flags & O_ACCMODE) == O_RDWR)
+        detail |= HL_HOST_FILE_READ | HL_HOST_FILE_WRITE;
+    if ((flags & O_APPEND) != 0) {
+        detail |= HL_HOST_FILE_APPEND;
+        append_descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+        if (append_descriptor < 0) {
+            hl_host_result error = hl_linux_errno_result();
+            close(descriptor);
+            return error;
+        }
+    }
+    if ((flags & O_NONBLOCK) != 0) detail |= HL_HOST_FILE_NONBLOCK;
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, NULL, 0, append_descriptor);
+    if (result.status != HL_STATUS_OK) {
+        close(descriptor);
+        if (append_descriptor >= 0) close(append_descriptor);
+        return result;
+    }
+    result.detail = detail;
+    return result;
+}
+
+static hl_host_result hl_linux_file_readlink(void *context, hl_host_handle file, hl_host_bytes output) {
+    hl_host_linux *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((output.size != 0 && output.data == NULL) || output.size > SSIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    do
+        count = readlinkat(descriptor, "", output.data, output.size);
+    while (count < 0 && errno == EINTR);
+    return count < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_linux_file_set_owner(void *context, hl_host_handle file, uint32_t uid, uint32_t gid) {
+    hl_host_linux *host = context;
+    int descriptor;
+    int status;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    do
+        status = fchownat(descriptor, "", (uid_t)uid, (gid_t)gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
 static hl_host_result hl_linux_file_read(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {
@@ -2213,7 +2284,10 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_data_sync,
                                                hl_linux_file_rename,
                                                hl_linux_file_unlink,
-                                               hl_linux_file_path};
+                                               hl_linux_file_path,
+                                               hl_linux_file_standard_stream,
+                                               hl_linux_file_readlink,
+                                               hl_linux_file_set_owner};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

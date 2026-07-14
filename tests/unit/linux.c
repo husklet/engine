@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "test.h"
 
 #include "hl/linux.h"
@@ -102,6 +103,33 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    {
+        hl_host_result stream = services.file->standard_stream(services.context, HL_HOST_STANDARD_OUTPUT);
+        HL_CHECK(stream.status == HL_STATUS_OK && (stream.detail & HL_HOST_FILE_WRITE) != 0);
+        HL_CHECK(services.file->close(services.context, stream.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->standard_stream(services.context, 3).status == HL_STATUS_INVALID_ARGUMENT);
+    }
+    {
+        char probe_path[128];
+        char first = 0;
+        char second = 0;
+        int saved = dup(STDIN_FILENO);
+        int descriptor;
+        hl_host_result stream;
+        snprintf(probe_path, sizeof(probe_path), "/tmp/hl_stdio_linux_%ld", (long)getpid());
+        descriptor = open(probe_path, O_CREAT | O_EXCL | O_RDWR | O_APPEND | O_NONBLOCK, 0600);
+        HL_CHECK(saved >= 0 && descriptor >= 0 && write(descriptor, "ab", 2) == 2 &&
+                 lseek(descriptor, 0, SEEK_SET) == 0 && dup2(descriptor, STDIN_FILENO) == STDIN_FILENO);
+        stream = services.file->standard_stream(services.context, HL_HOST_STANDARD_INPUT);
+        HL_CHECK(stream.status == HL_STATUS_OK && (stream.detail & HL_HOST_FILE_READ) != 0 &&
+                 (stream.detail & (HL_HOST_FILE_APPEND | HL_HOST_FILE_NONBLOCK)) ==
+                     (HL_HOST_FILE_APPEND | HL_HOST_FILE_NONBLOCK));
+        HL_CHECK(services.file->read(services.context, stream.value, &first, 1).value == 1 && first == 'a');
+        HL_CHECK(read(STDIN_FILENO, &second, 1) == 1 && second == 'b');
+        HL_CHECK(services.file->close(services.context, stream.value).status == HL_STATUS_OK);
+        HL_CHECK(dup2(saved, STDIN_FILENO) == STDIN_FILENO && close(saved) == 0 && close(descriptor) == 0 &&
+                 unlink(probe_path) == 0);
+    }
     HL_CHECK(check_counter(&services) == 0);
     HL_CHECK(check_transfer_fork(&services) == 0);
     HL_CHECK(hl_host_services_validate(
@@ -273,6 +301,29 @@ int main(void) {
     HL_CHECK(
         services.file->unlink_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path)).status ==
         HL_STATUS_NOT_FOUND);
+    {
+        char target[32] = {0};
+        hl_host_result link;
+        snprintf(moved_path, sizeof(moved_path), "%s.link", path);
+        HL_CHECK(symlink("portable-target", moved_path) == 0);
+        HL_CHECK(services.file
+                     ->open_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path),
+                                     HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0)
+                     .status != HL_STATUS_OK);
+        link = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path),
+                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        HL_CHECK(link.status == HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, link.value, &metadata).status == HL_STATUS_OK &&
+                 metadata.type == HL_HOST_FILE_TYPE_SYMLINK);
+        HL_CHECK(services.file->readlink(services.context, link.value, (hl_host_bytes){target, sizeof target}).value ==
+                 strlen("portable-target"));
+        HL_CHECK(memcmp(target, "portable-target", strlen("portable-target")) == 0);
+        HL_CHECK(
+            services.file->set_owner(services.context, link.value, (uint32_t)getuid(), (uint32_t)getgid()).status ==
+            HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, link.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(moved_path) == 0);
+    }
 
     HL_CHECK(services.network->socket(services.context, 99, HL_HOST_NETWORK_DATAGRAM, 0).status ==
              HL_STATUS_INVALID_ARGUMENT);

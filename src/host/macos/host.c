@@ -571,7 +571,13 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
         pthread_mutex_unlock(&host->lock);
         if (directory_fd < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    if ((access & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)) == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE))
+    if ((access & HL_HOST_FILE_PATH_ONLY) != 0)
+#ifdef O_SYMLINK
+        flags = (access & HL_HOST_FILE_NOFOLLOW) != 0 ? O_SYMLINK : O_RDONLY;
+#else
+        flags = O_RDONLY;
+#endif
+    else if ((access & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)) == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE))
         flags = O_RDWR;
     else if ((access & HL_HOST_FILE_WRITE) != 0)
         flags = O_WRONLY;
@@ -579,6 +585,9 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
         flags = O_RDONLY;
     else
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+#ifdef O_NOFOLLOW
+    if ((access & HL_HOST_FILE_NOFOLLOW) != 0 && (access & HL_HOST_FILE_PATH_ONLY) == 0) flags |= O_NOFOLLOW;
+#endif
 #ifdef O_DIRECTORY
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
 #endif
@@ -602,6 +611,69 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
         if (append_descriptor >= 0) close(append_descriptor);
     }
     return result;
+}
+
+static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append);
+
+static hl_host_result hl_macos_file_standard_stream(void *context, uint32_t stream) {
+    hl_host_macos *host = context;
+    int flags;
+    int descriptor;
+    int append_descriptor = -1;
+    uint32_t detail = 0;
+    hl_host_result result;
+    if (stream > HL_HOST_STANDARD_ERROR) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    flags = fcntl((int)stream, F_GETFL);
+    if (flags < 0) return hl_macos_errno();
+    descriptor = fcntl((int)stream, F_DUPFD_CLOEXEC, 0);
+    if (descriptor < 0) return hl_macos_errno();
+    if ((flags & O_ACCMODE) == O_RDONLY)
+        detail |= HL_HOST_FILE_READ;
+    else if ((flags & O_ACCMODE) == O_WRONLY)
+        detail |= HL_HOST_FILE_WRITE;
+    else if ((flags & O_ACCMODE) == O_RDWR)
+        detail |= HL_HOST_FILE_READ | HL_HOST_FILE_WRITE;
+    if ((flags & O_APPEND) != 0) {
+        detail |= HL_HOST_FILE_APPEND;
+        append_descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+        if (append_descriptor < 0) {
+            hl_host_result error = hl_macos_errno();
+            close(descriptor);
+            return error;
+        }
+    }
+    if ((flags & O_NONBLOCK) != 0) detail |= HL_HOST_FILE_NONBLOCK;
+    result = hl_macos_file_register(host, descriptor, append_descriptor, 0);
+    if (result.status != HL_STATUS_OK) {
+        close(descriptor);
+        if (append_descriptor >= 0) close(append_descriptor);
+        return result;
+    }
+    result.detail = detail;
+    return result;
+}
+
+static hl_host_result hl_macos_file_readlink(void *context, hl_host_handle file, hl_host_bytes output) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    char path[PATH_MAX];
+    ssize_t count;
+    if ((output.size != 0 && output.data == NULL) || output.size > SSIZE_MAX || descriptor < 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (fcntl(descriptor, F_GETPATH, path) != 0) return hl_macos_errno();
+    do
+        count = readlink(path, output.data, output.size);
+    while (count < 0 && errno == EINTR);
+    return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_macos_file_set_owner(void *context, hl_host_handle file, uint32_t uid, uint32_t gid) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    int status;
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    do
+        status = fchown(descriptor, (uid_t)uid, (gid_t)gid);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append) {
@@ -2308,7 +2380,10 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_sync,
                                                hl_macos_file_rename,
                                                hl_macos_file_unlink,
-                                               hl_macos_file_path};
+                                               hl_macos_file_path,
+                                               hl_macos_file_standard_stream,
+                                               hl_macos_file_readlink,
+                                               hl_macos_file_set_owner};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

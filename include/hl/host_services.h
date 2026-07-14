@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 2u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 9u
+#define HL_HOST_FILE_ABI 10u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -44,8 +44,13 @@ enum {
     HL_HOST_FILE_READ = 1u << 0,
     HL_HOST_FILE_WRITE = 1u << 1,
     HL_HOST_FILE_APPEND = 1u << 2,
-    HL_HOST_FILE_DIRECTORY = 1u << 3
+    HL_HOST_FILE_DIRECTORY = 1u << 3,
+    HL_HOST_FILE_NONBLOCK = 1u << 4,
+    HL_HOST_FILE_NOFOLLOW = 1u << 5,
+    HL_HOST_FILE_PATH_ONLY = 1u << 6
 };
+
+enum { HL_HOST_STANDARD_INPUT = 0, HL_HOST_STANDARD_OUTPUT = 1, HL_HOST_STANDARD_ERROR = 2 };
 
 enum { HL_HOST_COUNTER_SEMAPHORE = 1u << 0, HL_HOST_COUNTER_NONBLOCK = 1u << 1 };
 
@@ -214,6 +219,12 @@ typedef struct hl_host_file_services {
     hl_host_result (*unlink_relative)(void *context, hl_host_handle directory, const char *path, size_t path_size);
     /* Copy the native absolute path of an open path-backed file. value is the bytes copied, without a NUL. */
     hl_host_result (*path)(void *context, hl_host_handle file, hl_host_bytes output);
+    /* Duplicate a process standard stream into an opaque handle. detail contains HL_HOST_FILE_* state. */
+    hl_host_result (*standard_stream)(void *context, uint32_t stream);
+    /* Read the target of a link-node handle opened with PATH_ONLY|NOFOLLOW. */
+    hl_host_result (*readlink)(void *context, hl_host_handle file, hl_host_bytes output);
+    /* Apply guest ownership after creation without exposing a native descriptor. */
+    hl_host_result (*set_owner)(void *context, hl_host_handle file, uint32_t uid, uint32_t gid);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX
