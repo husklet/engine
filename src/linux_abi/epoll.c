@@ -27,11 +27,12 @@ typedef struct hl_linux_epoll_watch {
     uint32_t previous;
     uint32_t disabled;
     uint32_t subscribed;
+    hl_host_handle wait_handle;
     uint64_t data;
     uint64_t token;
 } hl_linux_epoll_watch;
 
-enum { EPOLL_UNSUBSCRIBED = 0, EPOLL_ACTIVE = 1, EPOLL_STALE = 2 };
+enum { EPOLL_UNSUBSCRIBED = 0, EPOLL_CALLBACK = 1, EPOLL_HOST = 2, EPOLL_STALE = 3 };
 
 typedef struct hl_linux_epoll {
     hl_linux_abi *linux_abi;
@@ -50,7 +51,13 @@ static void epoll_notify(void *opaque, uint64_t token) {
 
 static void epoll_unsubscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *watch) {
     hl_linux_object_pin target;
-    if (watch->subscribed != EPOLL_ACTIVE) return;
+    if (watch->subscribed == EPOLL_HOST) {
+        (void)epoll->linux_abi->host->event->control(epoll->linux_abi->host->context, epoll->wake, HL_HOST_EVENT_DELETE,
+                                                     watch->wait_handle, watch->token, HL_HOST_READY_READ);
+        watch->subscribed = EPOLL_STALE;
+        return;
+    }
+    if (watch->subscribed != EPOLL_CALLBACK) return;
     if (hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target) == HL_STATUS_OK) {
         if (target.ops->unsubscribe != NULL) target.ops->unsubscribe(target.context, epoll, watch->token);
         hl_linux_object_unpin(&target);
@@ -97,7 +104,8 @@ static hl_status epoll_clone(void *opaque, void **out_context) {
         }
         memcpy(copy->watches, source->watches, (size_t)source->count * sizeof(*copy->watches));
         for (uint32_t index = 0; index < copy->count; ++index)
-            if (copy->watches[index].subscribed == EPOLL_ACTIVE) copy->watches[index].subscribed = EPOLL_UNSUBSCRIBED;
+            if (copy->watches[index].subscribed == EPOLL_CALLBACK || copy->watches[index].subscribed == EPOLL_HOST)
+                copy->watches[index].subscribed = EPOLL_UNSUBSCRIBED;
     }
     *out_context = copy;
     return HL_STATUS_OK;
@@ -131,12 +139,26 @@ static hl_status epoll_subscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *wa
     hl_linux_object_pin target;
     hl_status status = hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target);
     if (status != HL_STATUS_OK) return status;
-    if (target.ops->subscribe == NULL || target.ops->unsubscribe == NULL)
+    if (target.ops->wait_handle != NULL) {
+        hl_host_result handle = target.ops->wait_handle(target.context);
+        status = (hl_status)handle.status;
+        if (status == HL_STATUS_OK) {
+            hl_host_result registered =
+                epoll->linux_abi->host->event->control(epoll->linux_abi->host->context, epoll->wake, HL_HOST_EVENT_ADD,
+                                                       handle.value, watch->token, HL_HOST_READY_READ);
+            status = (hl_status)registered.status;
+            if (status == HL_STATUS_OK) {
+                watch->wait_handle = handle.value;
+                watch->subscribed = EPOLL_HOST;
+            }
+        }
+    } else if (target.ops->subscribe == NULL || target.ops->unsubscribe == NULL)
         status = HL_STATUS_NOT_SUPPORTED;
-    else
+    else {
         status = target.ops->subscribe(target.context, epoll_notify, epoll, watch->token);
+        if (status == HL_STATUS_OK) watch->subscribed = EPOLL_CALLBACK;
+    }
     hl_linux_object_unpin(&target);
-    if (status == HL_STATUS_OK) watch->subscribed = EPOLL_ACTIVE;
     return status;
 }
 
@@ -228,9 +250,14 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
         }
         epoll->next_token++;
         if (epoll->next_token == 0) epoll->next_token++;
-        epoll->watches[epoll->count] = (hl_linux_epoll_watch){
-            target.fd, target.ofd,       target.descriptor_generation, target.ofd_generation, interests, 0, 0, 0,
-            data,      epoll->next_token};
+        epoll->watches[epoll->count] = (hl_linux_epoll_watch){.fd = target.fd,
+                                                              .ofd = target.ofd,
+                                                              .descriptor_generation = target.descriptor_generation,
+                                                              .ofd_generation = target.ofd_generation,
+                                                              .interests = interests,
+                                                              .wait_handle = HL_HOST_HANDLE_INVALID,
+                                                              .data = data,
+                                                              .token = epoll->next_token};
         status = epoll_subscribe(epoll, &epoll->watches[epoll->count]);
         if (status != HL_STATUS_OK) {
             hl_linux_object_unpin(&pin);

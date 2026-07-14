@@ -16,6 +16,8 @@ typedef struct hl_linux_object_ops {
     int64_t (*write)(void *context, const void *buffer, size_t size);
     int64_t (*status)(void *context, hl_linux_file_status *status);
     uint32_t (*readiness)(void *context, uint32_t interests);
+    /* Optional borrowed host object used for event-driven readiness. Never a guest/native descriptor. */
+    hl_host_result (*wait_handle)(void *context);
     /* subscribe never calls notify inline; unsubscribe quiesces the token before returning. */
     hl_status (*subscribe)(void *context, void (*notify)(void *observer, uint64_t token), void *observer,
                            uint64_t token);
