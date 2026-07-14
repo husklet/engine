@@ -5,7 +5,7 @@
 //
 // Some x86-only syscalls have no canonical (aarch64) form at all (arch_prctl = the x86 TLS register);
 // those are handled HERE and return 1 ("done, don't run the shared switch"). The rest are rewritten in
-// place and return 0 to fall through to the shared service.
+// place and return 0 to fall through to the shared service's ISA-aware number mapping.
 //
 // x86-64 ABI reg map: rax=r[0], rdi=r[7], rsi=r[6], rdx=r[2], r10=r[10], r8=r[8], r9=r[9].
 static const uint64_t ATFD = (uint64_t)-100; // Linux AT_FDCWD
@@ -178,7 +178,7 @@ static int x86_normalize(struct cpu *c) {
         r[0] = 259;
         return 0;
     // --- legacy time-setters: no aarch64 canonical form (arm64 261 is prlimit64, 132/235 are absent), so
-    //     canon_x86 biases them into the x86-only range and they returned ENOSYS-by-normalization. Rewrite
+    //     number mapping biases them into the x86-only range and they returned ENOSYS-by-normalization. Rewrite
     //     each to x86 utimensat(280) [-> canonical 88], converting the legacy struct utimbuf / struct
     //     timeval[2] into the struct timespec[2] the shared handler wants. The times buffer is a static
     //     __thread scratch (a high engine address, so dispatch.c's nonpie_p leaves it untouched); the PATH
@@ -268,7 +268,7 @@ static int x86_normalize(struct cpu *c) {
         }
         r[10] = 0;
         r[0] = 271;
-        return 0; // -> x86 ppoll (271), which canon_x86 maps to canonical 73
+        return 0; // -> x86 ppoll (271), which the number component maps to canonical 73
     }
     // select(nfds, readfds, writefds, exceptfds, timeval*) -> pselect6(nfds, rd, wr, ex, timespec*, NULL):
     // nfds + the three fd_set pointers already sit in the pselect6 arg slots (rdi/rsi/rdx/r10), and the

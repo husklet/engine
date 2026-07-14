@@ -51,6 +51,8 @@
 // advisory only: it never gates correctness, only the restore/skip decision, and it is written with the
 // same atomic temp+rename protocol (the .pcache file itself is NEVER modified after publication).
 
+#include "../digest.h"
+
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
 #define PC_VERSION 7 // v7 retires mode-dependent A/B cache identities; production codegen is fixed.
 #define PC_VERSION_EFF PC_VERSION
@@ -75,23 +77,6 @@ struct pc_hdr {
     uint64_t block_return_at; // block_return's host addr at save time -> the image-slide anchor on load
     uint64_t ibtc_at;         // g_ibtc host addr at save time (diagnostic)
 };
-
-// word-wise FNV-1a (8 bytes/step): runs over multi-MB arenas on every load AND save; same detection
-// strength as byte-wise for the threat model (accidental truncation/corruption, torn writers).
-static uint64_t pc_fnv(uint64_t h, const void *buf, size_t n) {
-    const uint8_t *p = (const uint8_t *)buf;
-    for (; n >= 8; p += 8, n -= 8) {
-        uint64_t w;
-        memcpy(&w, p, 8);
-        h ^= w;
-        h *= 1099511628211ull;
-    }
-    for (; n; p++, n--) {
-        h ^= *p;
-        h *= 1099511628211ull;
-    }
-    return h;
-}
 
 struct pc_mapent {
     uint64_t gpc, host_off, body_off;
@@ -415,13 +400,14 @@ static int pcache_load(uint64_t entry_jump) {
     // v6: whole-payload checksum BEFORE trusting any record (bit rot / short file / foreign writer) --
     // the same validation-before-trust discipline as the aarch64 pcache.
     if (ok) {
-        uint64_t cs = 1469598103934665603ull;
-        cs = pc_fnv(cs, g_reloc, h.n_reloc * sizeof g_reloc[0]);
-        cs = pc_fnv(cs, me, h.n_mapent * sizeof *me);
-        cs = pc_fnv(cs, pe, h.n_pend * sizeof *pe);
-        cs = pc_fnv(cs, g_pc_libs, h.n_lib * sizeof g_pc_libs[0]);
-        cs = pc_fnv(cs, abuf, h.arena_used);
-        ok = cs == h.csum;
+        hl_digest digest;
+        hl_digest_init(&digest, HL_DIGEST_SEED);
+        hl_digest_update(&digest, g_reloc, h.n_reloc * sizeof g_reloc[0]);
+        hl_digest_update(&digest, me, h.n_mapent * sizeof *me);
+        hl_digest_update(&digest, pe, h.n_pend * sizeof *pe);
+        hl_digest_update(&digest, g_pc_libs, h.n_lib * sizeof g_pc_libs[0]);
+        hl_digest_update(&digest, abuf, h.arena_used);
+        ok = hl_digest_value(&digest) == h.csum;
     }
     // Bounds-validate every record whose offset a later pass writes or branches through.
     for (uint64_t i = 0; ok && i < h.n_reloc; i++)
@@ -578,7 +564,7 @@ static void pcache_save(void) {
         w += (size_t)g_pc_nlib * sizeof(struct pc_lib);
         memcpy(w, g_cache, h.arena_used); // read from W^X arena is always permitted
         w += h.arena_used;
-        h.csum = pc_fnv(1469598103934665603ull, buf + sizeof h, total - sizeof h);
+        h.csum = hl_digest_bytes(HL_DIGEST_SEED, buf + sizeof h, total - sizeof h);
         memcpy(buf, &h, sizeof h);
         ok = write(fd, buf, total) == (ssize_t)total;
     }

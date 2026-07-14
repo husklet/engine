@@ -540,7 +540,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 kevent(rfd, &rkv, 1, NULL, 0, NULL);
                 g_tfd_first_oneshot[rfd] = 0;
                 struct timespec tnow;
-                clock_gettime(CLOCK_MONOTONIC, &tnow);
+                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
                 g_tfd_deadline[rfd] = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec + g_tfd_interval[rfd];
             }
             G_RET(c) = 8;

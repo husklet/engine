@@ -28,7 +28,7 @@
 // PORTABILITY. This file is #included into BOTH target unity TUs (linux_x86_64.c, linux_aarch64.c),
 // next to service.c. It uses only the frontend-agnostic G_* ABI macros (G_NR/G_A0..G_A5/G_RET/
 // G_NORMALIZE), so the marshaling is identical on either guest arch. The one register without an
-// lvalue accessor is the raw syscall-number register (G_NR wraps it in canon_x86() on x86), so we
+// lvalue accessor is the raw syscall-number register (G_NR maps it through the number component on x86), so we
 // add G_RAWNR, discriminated by G_PROF_EXTRA -- the same x86-vs-aarch64 switch service.c already uses.
 //
 // Gate: everything here is dormant unless the HL_UNTRUSTED option is set. With the gate off
@@ -44,7 +44,7 @@ static int g_sentry_sandbox = 0; // HL_SANDBOX: wrap the worker in a deny-defaul
 
 // The raw syscall-number register. G_NR is not an lvalue on x86 (it wraps the rax read in canon_x86),
 // so to RECONSTRUCT the call in the sentry we marshal the raw number register verbatim; the sentry's
-// G_NR then re-derives the canonical number identically (canon_x86 on x86, identity on aarch64).
+// G_NR then re-derives the canonical number identically (table mapping on x86, identity on aarch64).
 #ifdef G_PROF_EXTRA
 #define G_RAWNR(c) ((c)->r[0]) // x86-64 guest: rax (post-normalize: the *at number / native number)
 #else

@@ -98,7 +98,7 @@ struct shmid64_ds_guest {
 // identical across x86-64 and aarch64). x86-64's `struct semid64_ds` carries a reserved slot after each
 // time field (otime_high/ctime_high, an old x86 quirk), pushing sem_nsems to offset 80 in a 104-byte
 // struct; the aarch64 asm-generic form has neither, with sem_nsems at 64 in an 88-byte struct. Verified by
-// raw-syscall probe on both arches. CANON_X86ONLY is defined only in the x86_64 engine (translate/x86_64).
+// raw-syscall probe on both arches. CANON_X86ONLY is defined only in the x86_64 engine.
 #ifdef CANON_X86ONLY
 struct semid64_ds_guest {
     struct ipc64_perm_guest sem_perm;     // 0   (48)
@@ -1215,7 +1215,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
-            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += to->tv_sec;
             deadline.tv_nsec += to->tv_nsec;
             if (deadline.tv_nsec >= 1000000000L) {
@@ -1310,7 +1310,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             did_wait = 1;
             if (have_deadline) {
                 struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 if (now.tv_sec > deadline.tv_sec ||
                     (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
                     dd_lock(&C->lock);

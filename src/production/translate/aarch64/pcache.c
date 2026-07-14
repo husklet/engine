@@ -77,6 +77,7 @@
 #define PC_RELOC_CAP (1u << 20)              // recorded baked-host-pointer slots (poison if exceeded)
 
 #include "../reloc.h"
+#include "../digest.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
 #define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`
@@ -179,31 +180,13 @@ struct pc_t2 {
     uint64_t gpc, cnt;
 };
 
-static uint64_t pc_fnv(uint64_t h, const void *buf, size_t n) {
-    const uint8_t *p = (const uint8_t *)buf;
-    // word-wise FNV-1a (8 bytes per step): the payload checksum runs over multi-MB arenas on every load
-    // AND save, and the byte-wise loop was a measurable slice of the warm start it exists to protect.
-    // Same detection strength for our threat model (accidental truncation/corruption, torn writers).
-    for (; n >= 8; p += 8, n -= 8) {
-        uint64_t w;
-        memcpy(&w, p, 8);
-        h ^= w;
-        h *= 1099511628211ull;
-    }
-    for (; n; p++, n--) {
-        h ^= *p;
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
 static uint64_t pcache_id_of(const char *path) {
     struct stat st;
     if (!path || stat(path, &st) != 0) return 0;
     uint64_t fields[5] = {(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
                           (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec};
-    uint64_t h = pc_fnv(1469598103934665603ull, fields, sizeof fields);
-    return pc_fnv(h, path, strlen(path));
+    uint64_t h = hl_digest_bytes(HL_DIGEST_SEED, fields, sizeof fields);
+    return hl_digest_bytes(h, path, strlen(path));
 }
 
 // Per-engine-build tag so the cache self-invalidates across dd rebuilds (host bytes from a different build
@@ -211,7 +194,7 @@ static uint64_t pcache_id_of(const char *path) {
 // transparently (old files just go unreferenced; harmless cruft in the cache dir).
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
-    return pc_fnv(1469598103934665603ull, tag, sizeof tag - 1);
+    return hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
 }
 
 // Hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs DIFFERENT code
@@ -224,7 +207,7 @@ static uint64_t pcache_argv0_id(const char *argv0) {
     const char *base = argv0;
     for (const char *p = argv0; *p; p++)
         if (*p == '/') base = p + 1;
-    return pc_fnv(1469598103934665603ull, base, strlen(base));
+    return hl_digest_bytes(HL_DIGEST_SEED, base, strlen(base));
 }
 
 static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, const char *argv0) {
@@ -334,14 +317,15 @@ static int pcache_load(uint64_t entry_jump) {
     close(fd);
     // Whole-payload checksum BEFORE trusting any record (bit rot / short file / foreign writer).
     if (ok) {
-        uint64_t cs = 1469598103934665603ull;
-        cs = pc_fnv(cs, re, h.n_reloc * sizeof *re);
-        cs = pc_fnv(cs, me, h.n_mapent * sizeof *me);
-        cs = pc_fnv(cs, pe, h.n_pend * sizeof *pe);
-        cs = pc_fnv(cs, te, h.n_t2 * sizeof *te);
-        cs = pc_fnv(cs, tx, h.n_txpg * sizeof *tx);
-        cs = pc_fnv(cs, abuf, h.arena_used);
-        ok = cs == h.csum;
+        hl_digest digest;
+        hl_digest_init(&digest, HL_DIGEST_SEED);
+        hl_digest_update(&digest, re, h.n_reloc * sizeof *re);
+        hl_digest_update(&digest, me, h.n_mapent * sizeof *me);
+        hl_digest_update(&digest, pe, h.n_pend * sizeof *pe);
+        hl_digest_update(&digest, te, h.n_t2 * sizeof *te);
+        hl_digest_update(&digest, tx, h.n_txpg * sizeof *tx);
+        hl_digest_update(&digest, abuf, h.arena_used);
+        ok = hl_digest_value(&digest) == h.csum;
     }
     // Per-record bounds: every offset a later pass will WRITE or BRANCH through must be inside the arena.
     for (uint64_t i = 0; ok && i < h.n_reloc; i++)
@@ -486,7 +470,7 @@ static void pcache_save(void) {
                 w += 8;
             }
         memcpy(w, g_cache, arena_used); // read from the RW alias is always permitted
-        h.csum = pc_fnv(1469598103934665603ull, buf + sizeof h, total - sizeof h);
+        h.csum = hl_digest_bytes(HL_DIGEST_SEED, buf + sizeof h, total - sizeof h);
         memcpy(buf, &h, sizeof h);
     }
     pthread_mutex_unlock(&g_jit_lock);

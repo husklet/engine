@@ -46,12 +46,21 @@ target_include_directories(hl-production-reloc PRIVATE src/production/translate)
 target_compile_options(hl-production-reloc PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                   -Wstrict-prototypes -Wmissing-prototypes)
 
+add_library(hl-production-digest OBJECT src/production/translate/digest.c)
+target_include_directories(hl-production-digest PRIVATE src/production/translate)
+target_compile_options(hl-production-digest PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                   -Wstrict-prototypes -Wmissing-prototypes)
+
 add_library(hl-production-clock OBJECT src/production/host/clock.c)
 
 add_library(hl-production-errno OBJECT src/production/os/linux/syscall/errno.c)
 target_include_directories(hl-production-errno PRIVATE src/production/os/linux/syscall)
 target_compile_options(hl-production-errno PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                   -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-production-number OBJECT src/production/os/linux/syscall/number.c)
+target_include_directories(hl-production-number PRIVATE src/production/os/linux/syscall)
+target_compile_options(hl-production-number PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                   -Wstrict-prototypes -Wmissing-prototypes)
 target_include_directories(hl-production-clock PRIVATE include src/production/host)
 target_compile_options(hl-production-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                   -Wstrict-prototypes -Wmissing-prototypes)
@@ -105,9 +114,15 @@ if(BUILD_TESTING)
     add_executable(test-reloc tests/unit/test_reloc.c $<TARGET_OBJECTS:hl-production-reloc>)
     target_include_directories(test-reloc PRIVATE include tests/unit src/production/translate)
     add_test(NAME reloc COMMAND test-reloc)
+    add_executable(test-digest tests/unit/test_digest.c $<TARGET_OBJECTS:hl-production-digest>)
+    target_include_directories(test-digest PRIVATE include tests/unit src/production/translate)
+    add_test(NAME digest COMMAND test-digest)
     add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-production-errno>)
     target_include_directories(test-errno PRIVATE include tests/unit)
     add_test(NAME errno COMMAND test-errno)
+    add_executable(test-number tests/unit/test_number.c $<TARGET_OBJECTS:hl-production-number>)
+    target_include_directories(test-number PRIVATE include tests/unit)
+    add_test(NAME number COMMAND test-number)
     add_executable(test-clock tests/unit/test_clock.c $<TARGET_OBJECTS:hl-production-clock>)
     target_include_directories(test-clock PRIVATE include tests/unit)
     target_link_libraries(test-clock PRIVATE hl-host-fake)

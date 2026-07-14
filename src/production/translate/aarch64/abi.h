@@ -13,7 +13,8 @@
 // stack (`ssp`, aarch64-only), TLS, and sigaltstack.
 //
 // aarch64 is the reference: syscall regs are x8 / x0..x5 / x0, and its ABI numbers ARE canonical.
-#define G_NR(c) ((c)->x[8])
+#include "../../os/linux/syscall/number.h"
+#define G_NR(c) hl_linux_syscall_number(HL_LINUX_GUEST_AARCH64, (c)->x[8])
 #define G_A0(c) ((c)->x[0])
 #define G_A1(c) ((c)->x[1])
 #define G_A2(c) ((c)->x[2])

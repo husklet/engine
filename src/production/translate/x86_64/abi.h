@@ -4,19 +4,20 @@
 //
 // x86-64 cpu: r[16] = rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15. Linux x86-64 syscall ABI:
 //   number = rax ; args = rdi,rsi,rdx,r10,r8,r9 ; return = rax.
-#include "sysmap.h" // canon_x86(): x86 syscall number -> canonical (aarch64) number
+#include "../../os/linux/syscall/number.h"
 
-#define G_NR(c) canon_x86((long)(c)->r[0]) // rax -> canonical number os/linux/service.c switches on
-#define G_A0(c) ((c)->r[7])                // rdi
-#define G_A1(c) ((c)->r[6])                // rsi
-#define G_A2(c) ((c)->r[2])                // rdx
-#define G_A3(c) ((c)->r[10])               // r10
-#define G_A4(c) ((c)->r[8])                // r8
-#define G_A5(c) ((c)->r[9])                // r9
-#define G_RET(c) ((c)->r[0])               // rax
+#define G_NR(c) hl_linux_syscall_number(HL_LINUX_GUEST_X86_64, (c)->r[0])
+#define CANON_X86ONLY HL_LINUX_SYSCALL_X86_ONLY
+#define G_A0(c) ((c)->r[7])  // rdi
+#define G_A1(c) ((c)->r[6])  // rsi
+#define G_A2(c) ((c)->r[2])  // rdx
+#define G_A3(c) ((c)->r[10]) // r10
+#define G_A4(c) ((c)->r[8])  // r8
+#define G_A5(c) ((c)->r[9])  // r9
+#define G_RET(c) ((c)->r[0]) // rax
 
 // seccomp seam: the NATIVE audit arch + the RAW guest syscall number the seccomp cBPF program is run
-// against (os/linux/seccomp.c). The filter expects the x86-64 syscall number (rax), NOT dd's canonical
+// against (os/linux/seccomp.c). The filter expects the x86-64 syscall number (rax), not the engine's canonical
 // mapping -- a guest's own filter is written against its ISA's numbers. AUDIT_ARCH_X86_64 = EM_X86_64(62)
 // | __AUDIT_ARCH_64BIT | _LE = 0xC000003E.
 #define G_SECCOMP_ARCH 0xC000003Eu
@@ -27,8 +28,8 @@
 #define G_GPC_HASH_SHIFT 0
 
 #define G_PC(c) ((c)->rip)
-#define G_SP(c) ((c)->r[4])         // rsp
-#define G_TLS(c) ((c)->fs_base)     // x86 TLS base (arch_prctl SET_FS)
+#define G_SP(c) ((c)->r[4])     // rsp
+#define G_TLS(c) ((c)->fs_base) // x86 TLS base (arch_prctl SET_FS)
 // A JIT guest unmapped / remapped an executable VA range [lo,hi) -> drop stale cached translations for it
 // (jit86_drop_range_translations, defined in translate.c). Expanded in the shared os/linux munmap / MAP_FIXED
 // / mremap paths. Inert unless a JIT guest is present (g_rwx_guest). See the "stale translation after
@@ -61,4 +62,6 @@
 // g_prof_t2 lives in the shared jit/cache.c, g_prof_t2fold in frontend/x86_64/engine_glue.c -- both
 // defined before the shared service.c is #included in the x86 unity TU.
 static void xs_dump(void); // EXITSTAT diagnostic histogram (defined in avx.c; no-op unless EXITSTAT set)
-#define G_PROF_EXTRA do {} while (0)
+#define G_PROF_EXTRA                                                                                                   \
+    do {                                                                                                               \
+    } while (0)
