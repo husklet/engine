@@ -112,7 +112,7 @@ static uint8_t g_devfull[HL_NFD];
 // success -- entropy-seeding probes (libgcrypt, some init scripts) then behave as on Linux.
 static uint8_t g_devseed[HL_NFD];
 // /dev/tty (and the console we back with /dev/null): a controlling terminal NEVER reports EOF because it
-// has no input -- a nonblocking read with nothing pending returns EAGAIN, and a blocking read waits. But dd
+// has no input -- a nonblocking read with nothing pending returns EAGAIN, and a blocking read waits. But hl
 // may back /dev/tty with a host device (or /dev/null for /dev/console) that returns 0 (EOF) when empty, so
 // readline/TUI/event-loop code treats "no input" as terminal closure and tears down. 1 = this fd carries
 // tty read semantics: a 0-byte (EOF) read on a NONBLOCKING such fd is reported as EAGAIN instead (svc_io).
@@ -137,7 +137,7 @@ static void ovldents_rewind(int fd, int pos);
 static int g_eventfd_peer[HL_NFD];
 // eventfd accumulating counter: write() adds, read() returns + resets (the pipe is only readiness).
 // _xproc-eventfd-lockf_: the counter array lives in a MAP_SHARED anonymous region so a child created by
-// dd's real host fork() updates the SAME physical counters the parent reads -- the readiness pipe is
+// hl's real host fork() updates the SAME physical counters the parent reads -- the readiness pipe is
 // already fork-shared (inherited fds), but the accumulating count must be too, or the parent reads 0
 // while the child's write()s land in its COW-private copy. Created ONCE at startup (constructor, before
 // any guest fork) so every forked worker inherits the same physical array. All g_eventfd_count[fd]
@@ -162,7 +162,7 @@ static void eventfd_count_init(void) {
 }
 
 // Guest-requested O_NONBLOCK for an eventfd. The backing pipe's read end is kept PERMANENTLY O_NONBLOCK at
-// the host level so dd's internal counter/pipe drains never toggle the fd's flags — an eventfd is shared
+// the host level so hl's internal counter/pipe drains never toggle the fd's flags — an eventfd is shared
 // across processes (fork / SCM_RIGHTS) as one open file description, so a transient host O_NONBLOCK flip in
 // one process's drain is observed by a concurrent reader in ANOTHER process (g_eventfd_lock is process-
 // private and cannot serialize it), which then wrongly takes the nonblocking path and returns a spurious
@@ -223,7 +223,7 @@ static int eventfd_hidden_peer_fd(int fd) {
 static uint8_t g_pagemap_fd[HL_NFD];
 
 // ===================== cross-process guest task-state table =====================
-// Linux's /proc/<pid>/stat field 3 is the task run state (R/S/D/T/Z). dd used to synthesize it from the
+// Linux's /proc/<pid>/stat field 3 is the task run state (R/S/D/T/Z). hl used to synthesize it from the
 // macOS process status (proc_bsdinfo.pbi_status): but that BSD p_stat only ever reports SRUN/SSTOP/SZOMB
 // for the whole PROCESS -- it has NO way to express "every thread is asleep in a blocking syscall". A
 // guest parked in pause()/ppoll()/wait4() therefore showed 'R' (running) where real Linux shows 'S'
@@ -707,10 +707,10 @@ static size_t g_fd_pb_len[HL_NFD];
 static int g_root_fd = -1;
 
 // Engine-private host fds (the rootfs dir-fd + each bind-mount volume dir-fd) share the guest's descriptor
-// table in dd's in-process model. Opened at startup, right after stdio, they otherwise squat the LOW numbers
+// table in hl's in-process model. Opened at startup, right after stdio, they otherwise squat the LOW numbers
 // Linux would leave free for the guest: g_root_fd lands on fd 3, shifting every guest fd allocation up by one
 // AND becoming visible to the guest at a number a native run has free. s6-linux-init reads its
-// notification pipe on the by-convention-lowest fd 3, which under dd was g_root_fd -- a DIRECTORY -> the
+// notification pipe on the by-convention-lowest fd 3, which under hl was g_root_fd -- a DIRECTORY -> the
 // read returns EISDIR ("unable to read from fd 3: Is a directory") and stage 1 aborts. Hoist each startup
 // engine fd above a high floor so the guest's low fd space is exactly as on Linux (only 0/1/2 taken). Mirrors
 // engine_fd_reloc's F_DUPFD floor (io.c) but relocates unconditionally, not just off a collision. Lazily
@@ -1595,7 +1595,7 @@ static int proc_maps_fd(int smaps) {
         MAPROW_ADD(lo, hi, "rw-p", "[stack]");
     }
     // The heap: emit exactly [brk_lo, brk_cur) as [heap], like the kernel (whose heap VMA ends at the
-    // break). dd reserves a large brk arena up front (one gmap entry [brk_lo,brk_hi)); the reserved tail
+    // break). hl reserves a large brk arena up front (one gmap entry [brk_lo,brk_hi)); the reserved tail
     // above brk_cur is NOT part of the guest-visible heap, so it is dropped -- otherwise maps would show a
     // 256 MB anon region no real container has. jemalloc/glibc-malloc/redis/pmap look for this [heap] line.
     int have_heap = brk_hi && brk_cur > brk_lo;
@@ -1604,7 +1604,7 @@ static int proc_maps_fd(int smaps) {
         hl_gmap_entry mapping;
         if (!hl_gmap_get(i, &mapping)) continue;
         // report the guest-VISIBLE length (glen) so a mapping's Size/Rss matches the guest's mmap length,
-        // not dd's full extent including the 64 KB guard tail it reserves past anon maps (LTP mlock05 Rss).
+        // not hl's full extent including the 64 KB guard tail it reserves past anon maps (LTP mlock05 Rss).
         unsigned long lo = (unsigned long)mapping.address, hi = lo + (unsigned long)mapping.guest_length;
         if (g_stack_hi && lo >= (unsigned long)g_stack_lo && hi <= (unsigned long)g_stack_hi)
             continue; // already emitted as [stack]
@@ -1633,7 +1633,7 @@ static int proc_maps_fd(int smaps) {
 
 // /proc/[pid]/status -- the Name:/State:/VmRSS: key:value format (NOT the stat one-liner). VmRSS/VmSize
 // reflect the cgroup memory charge so a reader sees a plausible footprint.
-static unsigned long long self_rss_bytes(void); // defined after dd_get_procinfo (real engine resident floor)
+static unsigned long long self_rss_bytes(void); // defined after hl_get_procinfo (real engine resident floor)
 
 // /proc/[pid]/status Cpus_allowed / Cpus_allowed_list. A default container is allowed to run on ALL of its
 // online CPUs (contiguous 0..N-1, N = container_online_cpus()), so this MUST agree with sched_getaffinity
@@ -2016,7 +2016,7 @@ static int proc_mountinfo_text(char *b, size_t n) {
 }
 
 // ================= REAL /proc process table (top/htop/ps) =====================================
-// dd's process model: every guest process is its OWN host (macOS) process running this DBT; the
+// hl's process model: every guest process is its OWN host (macOS) process running this DBT; the
 // container init is guest pid 1 (g_init_hostpid<->1), children keep their host pid as the guest pid
 // (getpid() returns exactly that). macOS has no /proc, and one DBT process cannot see another's
 // address space, so we (1) keep a tiny on-disk REGISTRY where each container process publishes its
@@ -2177,7 +2177,7 @@ static int proc_reg_exe_read(int hostpid, char *out, size_t n) {
     return 1;
 }
 
-// /proc/<peer>/maps for another process in the same container. dd cannot inspect a peer engine process's
+// /proc/<peer>/maps for another process in the same container. hl cannot inspect a peer engine process's
 // guest VMA registry from here, but Linux software is allowed to open this file and expects structured maps
 // text rather than ENOENT. Publish a conservative non-empty shape using the peer's registered exe path plus
 // plausible heap/stack rows; self reads still use the exact gmap-backed proc_maps_fd() above.
@@ -2226,7 +2226,7 @@ static int proc_reg_read(int hostpid, char *comm, size_t csz, char *cmd, size_t 
 
 // Live per-process stats from the host kernel (libproc). rss/cpu-times/state are REAL (coarse beats
 // zero); comm here is the HOST comm (the DBT binary) -- the guest comm comes from the registry instead.
-struct dd_procinfo {
+struct hl_procinfo {
     int ppid_host, pgid_host, nthreads;
     char state;
     unsigned long long rss, vsize, utime_ns, stime_ns;
@@ -2234,7 +2234,7 @@ struct dd_procinfo {
     char hostcomm[32];
 };
 
-static int dd_get_procinfo(int pid, struct dd_procinfo *pi) {
+static int hl_get_procinfo(int pid, struct hl_procinfo *pi) {
     struct proc_bsdinfo bsd;
     if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof bsd) != (int)sizeof bsd) return 0;
     pi->ppid_host = (int)bsd.pbi_ppid;
@@ -2404,8 +2404,8 @@ static int proc_fd_dir_pid_open(int host) {
 // charge with this engine process's real resident size so the reported RSS is non-zero and plausible.
 static unsigned long long self_rss_bytes(void) {
     unsigned long long charged = (unsigned long long)atomic_load(&g_mem_charged);
-    struct dd_procinfo pi;
-    unsigned long long real = dd_get_procinfo((int)getpid(), &pi) ? pi.rss : 0;
+    struct hl_procinfo pi;
+    unsigned long long real = hl_get_procinfo((int)getpid(), &pi) ? pi.rss : 0;
     return real > charged ? real : charged;
 }
 
@@ -2538,8 +2538,8 @@ static unsigned long long cgroup_mem_current(void) {
                 continue;
             }
             if (kill(host, 0) != 0 && errno == ESRCH) continue; // stale registry entry
-            struct dd_procinfo pi;
-            if (dd_get_procinfo(host, &pi)) total += pi.rss;
+            struct hl_procinfo pi;
+            if (hl_get_procinfo(host, &pi)) total += pi.rss;
         }
         closedir(d);
     }
@@ -2602,9 +2602,9 @@ static int ns_link_target(const char *name, char *out, size_t cap) {
 }
 
 // ================= guest-pid namespace (kill/pidfd host-authority containment) =================
-// dd runs every guest process as a real host (macOS) process, and historically used the host pid 1:1 as
+// hl runs every guest process as a real host (macOS) process, and historically used the host pid 1:1 as
 // the guest pid. That let a guest kill(2)/pidfd_send_signal an ARBITRARY same-user HOST pid -- a sibling
-// engine (another container), the launcher, or any of the dd user's processes -- because the target was
+// engine (another container), the launcher, or any of the hl user's processes -- because the target was
 // resolved straight to the host with no namespace boundary. The per-container process REGISTRY (proc_reg_*,
 // keyed by HL_NETNS/HL_HOSTNAME so every engine process of one guest agrees and two guests never
 // collide) is that boundary: a host pid belongs to this container iff it published a `<dir>/<hostpid>`
@@ -2669,7 +2669,7 @@ static void proc_reg_reap(int hostpid) {
 }
 
 // kill(0,sig) / own-process-group delivery, contained to this engine's container. Linux kill(0,sig) signals
-// every process in the CALLER's process group; dd forwards setpgid to the host so the host process group
+// every process in the CALLER's process group; hl forwards setpgid to the host so the host process group
 // MIRRORS the guest's, but the engine shares its host group/session with the launcher + sibling engines --
 // so a raw kill(-getpgrp()) would escape the container. Instead enumerate the container registry and signal
 // each MEMBER whose host process-group == want_hpgid, skipping self (the caller delivers to itself via
@@ -2685,8 +2685,8 @@ static int container_group_kill(int want_hpgid, int msig, int self_hpid) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue; // pid records only (skip the x<pid> exe recs)
         int h = atoi(e->d_name);
         if (h <= 0 || h == self_hpid) continue;
-        struct dd_procinfo pi;
-        if (!dd_get_procinfo(h, &pi)) continue;   // dead/unknown host pid -> skip
+        struct hl_procinfo pi;
+        if (!hl_get_procinfo(h, &pi)) continue;   // dead/unknown host pid -> skip
         if (pi.pgid_host != want_hpgid) continue; // not in the caller's process group
         if (kill(h, msig) == 0) n++;
     }
@@ -2696,8 +2696,8 @@ static int container_group_kill(int want_hpgid, int msig, int self_hpid) {
 
 // /proc/<pid>/stat for a peer -- the 52-field line with GUEST pid/ppid and REAL rss/cpu/state/starttime.
 static int proc_stat_pid_text(char *b, size_t n, int gp, int host) {
-    struct dd_procinfo pi;
-    int ok = dd_get_procinfo(host, &pi);
+    struct hl_procinfo pi;
+    int ok = hl_get_procinfo(host, &pi);
     char comm[32], cmd[4096];
     int cl;
     if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl))
@@ -2743,8 +2743,8 @@ static int proc_stat_pid_text(char *b, size_t n, int gp, int host) {
 
 // /proc/<pid>/status for a peer -- the key:value form with GUEST Pid/PPid and REAL VmRSS.
 static int proc_status_pid_text(char *b, size_t n, int gp, int host) {
-    struct dd_procinfo pi;
-    int ok = dd_get_procinfo(host, &pi);
+    struct hl_procinfo pi;
+    int ok = hl_get_procinfo(host, &pi);
     char comm[32], cmd[4096];
     int cl;
     if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl))
@@ -2808,8 +2808,8 @@ static int proc_cmdline_pid_text(char *b, size_t n, int host) {
         }
         return L;
     }
-    struct dd_procinfo pi;
-    const char *c = dd_get_procinfo(host, &pi) ? pi.hostcomm : "proc";
+    struct hl_procinfo pi;
+    const char *c = hl_get_procinfo(host, &pi) ? pi.hostcomm : "proc";
     int L = (int)strlen(c);
     if (L + 1 > (int)n) L = (int)n - 1;
     memcpy(b, c, (size_t)L);
@@ -2822,8 +2822,8 @@ static int proc_comm_pid_text(char *b, size_t n, int host) {
     char comm[32], cmd[4096];
     int cl;
     if (!proc_reg_read(host, comm, sizeof comm, cmd, sizeof cmd, &cl)) {
-        struct dd_procinfo pi;
-        snprintf(comm, sizeof comm, "%.15s", dd_get_procinfo(host, &pi) ? pi.hostcomm : "proc");
+        struct hl_procinfo pi;
+        snprintf(comm, sizeof comm, "%.15s", hl_get_procinfo(host, &pi) ? pi.hostcomm : "proc");
     }
     return snprintf(b, n, "%s\n", comm);
 }
@@ -2844,10 +2844,10 @@ static int proc_statm_text(char *b, size_t n) { // our own pid
 }
 
 static int proc_statm_pid_text(char *b, size_t n, int host) { // a peer -- REAL rss from libproc
-    struct dd_procinfo pi;
+    struct hl_procinfo pi;
     long pg = sysconf(_SC_PAGESIZE);
     unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
-    unsigned long rss_pg = dd_get_procinfo(host, &pi) ? (unsigned long)(pi.rss / pgsz) : 0;
+    unsigned long rss_pg = hl_get_procinfo(host, &pi) ? (unsigned long)(pi.rss / pgsz) : 0;
     unsigned long overhead_pg = (unsigned long)((128ULL << 20) / pgsz);
     return proc_statm_common(b, n, rss_pg + overhead_pg, rss_pg);
 }
@@ -3140,7 +3140,7 @@ static int sysnet_dir_open(const char *gp) {
 // materialize the CPU-topology sysfs DIRECTORY so getdents enumerates one cpuN subdir per online
 // CPU. htop's LinuxMachine_updateCPUcount opendir()s /sys/devices/system/cpu, counts the cpuN subdirs
 // (reading each cpuN/online to mark it active), and -- crucially -- when it finds NO cpuN dir it early-
-// returns keeping its built-in default of ONE CPU. macOS has no /sys, and dd previously served only the
+// returns keeping its built-in default of ONE CPU. macOS has no /sys, and hl previously served only the
 // online/possible/present FILES (absolute-path reads), never the directory, so htop's opendir hit the
 // (missing) host /sys and htop showed 1 CPU on a many-core host. glibc __get_nprocs_conf and tcmalloc
 // NumPossibleCPUs likewise count these cpuN dirs. Two shapes:
@@ -3391,7 +3391,7 @@ static void cpumask_hex(char *out, size_t n, int nc, int all, int bit, int ndig)
     snprintf(out, n, "%0*x,%08x", hidig, (unsigned)(v >> 32), (unsigned)(v & 0xffffffffULL));
 }
 
-// The CONTENT of one /sys/devices/system/cpu/cpuN/topology/<leaf> attribute. dd advertises a FLAT topology:
+// The CONTENT of one /sys/devices/system/cpu/cpuN/topology/<leaf> attribute. hl advertises a FLAT topology:
 // single socket (physical_package_id 0), no SMT (each logical CPU is its own core -> core_id = cpuN, thread
 // siblings = {cpuN}), all online CPUs in one package. lscpu/util-linux reconstruct sockets/cores/threads
 // from exactly these files; real docker always serves them, so an ENOENT here is a engine-specific divergence that
@@ -3594,7 +3594,7 @@ static int empty_dir_fd(const char *guestpath) {
 }
 
 // Serve a masked / read-only-dir proc path as an open fd (empty file or empty dir). Returns the fd, or -2 if
-// `rp` is not one dd masks (so the caller falls through to the normal path). Reserved for READ opens; the
+// `rp` is not one hl masks (so the caller falls through to the normal path). Reserved for READ opens; the
 // write-intent EROFS for ReadonlyPaths is enforced in openat before this is reached.
 static int proc_masked_open(const char *rp) {
     int mk = proc_masked_kind(rp);
@@ -3622,8 +3622,8 @@ static int guest_is_x86(void) {
 }
 
 // x86-64 /proc/cpuinfo block for one logical CPU. The `flags` list mirrors EXACTLY the feature set the JIT's
-// CPUID leaf reports (guest/x86_64/ops.c do_cpuid) -- every token here is backed by a CPUID bit dd actually sets, and
-// every CPUID bit dd sets appears here, so a guest gets the SAME answer from `cpuid` and from /proc:
+// CPUID leaf reports (guest/x86_64/ops.c do_cpuid) -- every token here is backed by a CPUID bit hl actually sets, and
+// every CPUID bit hl sets appears here, so a guest gets the SAME answer from `cpuid` and from /proc:
 //   leaf 1 EDX:   fpu tsc cx8 sep pge cmov clflush mmx fxsr sse sse2
 //   leaf 1 ECX:   pni(sse3) pclmulqdq ssse3 cx16 sse4_1 sse4_2 popcnt aes  (movbe is deliberately WITHHELD --
 //                 see do_cpuid: the "movbe && !xsave" Atom fingerprint pessimizes openssl -- so it is absent here too)
@@ -3635,7 +3635,7 @@ static int cpuinfo_x86_block(char *b, size_t n, int idx, int ncpu) {
     return snprintf(
         b, n,
         "processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 44\n"
-        "model name\t: dd JIT x86-64 processor\nstepping\t: 2\nmicrocode\t: 0x1\ncpu MHz\t\t: 2500.000\n"
+        "model name\t: hl JIT x86-64 processor\nstepping\t: 2\nmicrocode\t: 0x1\ncpu MHz\t\t: 2500.000\n"
         "cache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %d\ncore id\t\t: %d\ncpu cores\t: %d\n"
         "apicid\t\t: %d\ninitial apicid\t: %d\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 7\nwp\t\t: yes\n"
         "flags\t\t: fpu tsc cx8 sep pge cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm constant_tsc "
@@ -3689,7 +3689,7 @@ static int proc_open(const char *rp) {
     }
     // the per-process network files are namespaced but a container is one net-namespace, so
     // /proc/[self|<pid>]/net/<leaf> mirrors the shared /proc/net/<leaf>. Fold it (ss/some Go/netlink
-    // fallbacks read /proc/self/net/*). Without this those reads ENOENT'd under dd.
+    // fallbacks read /proc/self/net/*). Without this those reads ENOENT'd under hl.
     char netbuf[4200];
     if (!strncmp(rp, "/proc/", 6)) {
         const char *q = rp + 6;
@@ -3753,7 +3753,7 @@ static int proc_open(const char *rp) {
             n = snprintf(buf, sizeof buf, "4294967295\n"); // unset (pam)
         else if (!strcmp(leaf, "io"))
             // Per-process IO accounting. Monitoring agents (cAdvisor, language runtimes) read it
-            // opportunistically; dd tracks no real per-process byte counters, so present the canonical
+            // opportunistically; hl tracks no real per-process byte counters, so present the canonical
             // key set with a deterministic baseline (structural fidelity, like memory.stat/cpu.stat).
             n = snprintf(buf, sizeof buf,
                          "rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\n"
@@ -3838,7 +3838,7 @@ static int proc_open(const char *rp) {
             host_mem(&tot, &fre, &avail, &cached);
         }
         // Present the standard field set common procfs consumers read (Active/Inactive/Dirty/AnonPages/…);
-        // omitting them disabled monitoring heuristics. Accounting figures dd does not track are zero.
+        // omitting them disabled monitoring heuristics. Accounting figures hl does not track are zero.
         n = snprintf(buf, sizeof buf,
                      "MemTotal:    %11llu kB\nMemFree:     %11llu kB\n"
                      "MemAvailable:%11llu kB\nBuffers:               0 kB\nCached:      %11llu kB\n"
@@ -3927,7 +3927,7 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/proc/sys/vm/overcommit_memory")) {
         // OrbStack/docker default is 1 (heuristic-off, "always overcommit"). redis-server prints
         // "WARNING overcommit_memory is set to 0! Background save may fail..." when it reads anything but 1,
-        // so serving 0 made dd emit a startup warning a real-docker user never sees. Match the oracle: 1.
+        // so serving 0 made hl emit a startup warning a real-docker user never sees. Match the oracle: 1.
         n = snprintf(buf, sizeof buf, "1\n");
     } else if (!strcmp(rp, "/proc/sys/kernel/hostname")) {
         // UTS ns (hostname cmd reads this)
@@ -3949,17 +3949,17 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/proc/sys/kernel/osrelease")) {
         n = snprintf(buf, sizeof buf, "6.1.0\n");
     } else if (!strcmp(rp, "/proc/sys/kernel/version")) {
-        n = snprintf(buf, sizeof buf, "#1 SMP ddockerd\n");
+        n = snprintf(buf, sizeof buf, "#1 SMP hl-engine\n");
     } else if (!strcmp(rp, "/proc/self/cgroup")) {
         // cgroup v2 unified
         n = snprintf(buf, sizeof buf, "0::/\n");
     } else if (!strcmp(rp, "/proc/version")) {
         // The version banner embeds the build ISA; x86_64 guests see `uname -m`=x86_64, so /proc/version
         // must agree (a mismatched aarch64 token here confuses platform probes and diagnostics).
-        n = snprintf(buf, sizeof buf, "Linux version 6.1.0 (ddockerd) %s\n", guest_is_x86() ? "x86_64" : "aarch64");
+        n = snprintf(buf, sizeof buf, "Linux version 6.1.0 (hl-engine) %s\n", guest_is_x86() ? "x86_64" : "aarch64");
         // ---- container network introspection: lo + eth0 (see netif_* in state.c) --------------
     } else if (!strcmp(rp, "/proc/net/dev")) {
-        // per-interface counters; zeros are fine (dd runs no real stack -- this is introspection only).
+        // per-interface counters; zeros are fine (hl runs no real stack -- this is introspection only).
         // --network none: loopback-only, so eth0 is omitted (only the lo counters line).
         n = snprintf(buf, sizeof buf,
                      "Inter-|   Receive                                                |  Transmit\n"
@@ -4053,7 +4053,7 @@ static int proc_open(const char *rp) {
                 n = snprintf(buf, sizeof buf, "unknown\n");
             else if (!strcmp(file, "carrier_changes"))
                 n = snprintf(buf, sizeof buf, "0\n");
-            // statistics/<counter>: dd runs no real IP stack -> zero counters (consistent with /proc/net/dev).
+            // statistics/<counter>: hl runs no real IP stack -> zero counters (consistent with /proc/net/dev).
             // node_exporter/ifstat read these per-interface files directly. Any known counter name -> "0\n".
             else if (!strncmp(file, "statistics/", 11) && file[11])
                 n = snprintf(buf, sizeof buf, "0\n");
@@ -4137,7 +4137,7 @@ static int proc_open(const char *rp) {
         else
             n = snprintf(buf, sizeof buf, "max\n");
     } else if (!strcmp(rp, "/sys/fs/cgroup/memory.swap.current")) {
-        n = snprintf(buf, sizeof buf, "0\n"); // no swap accounted (dd runs no swap)
+        n = snprintf(buf, sizeof buf, "0\n"); // no swap accounted (hl runs no swap)
     } else if (!strcmp(rp, "/sys/fs/cgroup/memory.swap.high")) {
         n = snprintf(buf, sizeof buf, "max\n");
     } else if (!strcmp(rp, "/sys/fs/cgroup/memory.peak")) {
@@ -4176,7 +4176,7 @@ static int proc_open(const char *rp) {
         n = snprintf(buf, sizeof buf, "0\n");
     } else if (!strcmp(rp, "/sys/fs/cgroup/cpu.stat")) {
         // usage/throttling counters. The KEY NAMES are what a runtime/systemd parse; the values are
-        // host-variant accounting, so zeros are a correct deterministic baseline (dd tracks no per-cgroup
+        // host-variant accounting, so zeros are a correct deterministic baseline (hl tracks no per-cgroup
         // cpu accounting). nr_throttled/throttled_usec present so a throttle-aware scheduler sees "0".
         n = snprintf(buf, sizeof buf,
                      "usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\n"
@@ -4233,7 +4233,7 @@ static int proc_open(const char *rp) {
                      "nr_dirty 0\nnr_writeback 0\nnr_slab_reclaimable 0\nnr_slab_unreclaimable 0\n"
                      "pgpgin 0\npgpgout 0\npswpin 0\npswpout 0\npgfault 0\npgmajfault 0\n");
     } else if (!strcmp(rp, "/proc/net/sockstat")) {
-        // Socket accounting (`ss -s`, monitoring agents). dd runs no real IP stack, so the counters are a
+        // Socket accounting (`ss -s`, monitoring agents). hl runs no real IP stack, so the counters are a
         // deterministic zero baseline -- but the SECTIONS must exist with the exact kernel key names.
         n = snprintf(buf, sizeof buf,
                      "sockets: used 1\nTCP: inuse 0 orphan 0 tw 0 alloc 0 mem 0\n"
@@ -4257,7 +4257,7 @@ static int proc_open(const char *rp) {
         }
     } else if (!strcmp(rp, "/proc/net/snmp")) {
         // The full protocol-counter table `netstat -s` / `ss -s` parse: paired header+value lines for
-        // Ip/Icmp/IcmpMsg/Tcp/Udp/UdpLite. dd runs no real IP stack, so the counters are zero -- but the
+        // Ip/Icmp/IcmpMsg/Tcp/Udp/UdpLite. hl runs no real IP stack, so the counters are zero -- but the
         // SECTIONS must exist with the exact kernel column names or the parser aborts. Tcp's RtoAlgorithm/
         // RtoMin/RtoMax/MaxConn carry the conventional 1/200/120000/-1 the kernel reports.
         n = snprintf(
@@ -4282,7 +4282,7 @@ static int proc_open(const char *rp) {
             "IgnoredMulti MemErrors\n"
             "UdpLite: 0 0 0 0 0 0 0 0 0\n");
     } else if (!strcmp(rp, "/proc/net/netstat")) {
-        // `netstat -s` / `ss -s` parse the TcpExt + IpExt extended-counter tables. dd runs no IP stack, so
+        // `netstat -s` / `ss -s` parse the TcpExt + IpExt extended-counter tables. hl runs no IP stack, so
         // every counter is zero -- but the SECTIONS with the exact kernel column names must exist (a missing
         // file makes those stats silently vanish). The zero value-line is generated with exactly as many
         // fields as its header (one " 0" per space) so a positional parser stays aligned.
@@ -4397,13 +4397,13 @@ static int proc_open(const char *rp) {
             {"/proc/sys/kernel/printk", "4\t4\t1\t7\n"},
             {"/proc/sys/kernel/panic", "10\n"}, // oracle: 10s reboot-on-panic (was 0)
             // ASLR posture. A guest/security probe (Go's runtime, glibc, hardening scanners) reads this to
-            // learn whether the kernel randomizes mmap/stack/brk; dd omitted it -> ENOENT where real docker
+            // learn whether the kernel randomizes mmap/stack/brk; hl omitted it -> ENOENT where real docker
             // serves 2 (full ASLR: mmap + stack + brk + VDSO). Oracle: 2.
             {"/proc/sys/kernel/randomize_va_space", "2\n"},
             // vm
             {"/proc/sys/vm/overcommit_ratio", "50\n"},
             {"/proc/sys/vm/overcommit_kbytes", "0\n"},
-            // elasticsearch REFUSES to start if max_map_count < 262144. dd served 65530 -> ES bootstrap
+            // elasticsearch REFUSES to start if max_map_count < 262144. hl served 65530 -> ES bootstrap
             // check fails, a warning/refusal a real-docker user never sees. Oracle: 1048576.
             {"/proc/sys/vm/max_map_count", "1048576\n"},
             {"/proc/sys/vm/mmap_min_addr", "32768\n"}, // oracle (was 65536)
@@ -4456,7 +4456,7 @@ static int proc_open(const char *rp) {
             // limit reached" when they are low. Oracle bumps both far above the old 128 / 16384.
             {"/proc/sys/fs/inotify/max_user_instances", "524288\n"}, // oracle (was 128)
             {"/proc/sys/fs/inotify/max_queued_events", "1048576\n"}, // oracle (was 16384)
-            // POSIX message-queue limits (fs/mqueue/*) -- dd omitted these entirely, so a reader (glibc
+            // POSIX message-queue limits (fs/mqueue/*) -- hl omitted these entirely, so a reader (glibc
             // mq_* tuning, systemd) got ENOENT where real docker serves a value. Oracle kernel defaults.
             {"/proc/sys/fs/mqueue/msg_max", "10\n"},
             {"/proc/sys/fs/mqueue/msgsize_max", "8192\n"},
@@ -4464,7 +4464,7 @@ static int proc_open(const char *rp) {
             {"/proc/sys/fs/mqueue/msg_default", "10\n"},
             {"/proc/sys/fs/mqueue/msgsize_default", "8192\n"},
             // Transparent-hugepage policy. jemalloc/tcmalloc, the JVM (-XX:+UseTransparentHugePages), redis
-            // (THP warning), and mongod all read this; dd omitted it -> ENOENT, where real docker exposes the
+            // (THP warning), and mongod all read this; hl omitted it -> ENOENT, where real docker exposes the
             // host's setting with the active mode bracketed. Oracle: "always [madvise] never".
             {"/sys/kernel/mm/transparent_hugepage/enabled", "always [madvise] never\n"},
         };
@@ -4488,7 +4488,7 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpa
 // character devices -- e.g. libgcrypt detects its RNG via access("/dev/urandom",R_OK); an ENOENT there
 // makes it abort ("no entropy gathering module detected"), which breaks gpgv and thus `apt-get update`.
 // The container's controlling terminal. `docker run -t` makes the daemon call login_tty, which hands the
-// guest fd 0/1/2 as ONE pty slave. On Linux/devpts that slave is /dev/pts/0, but dd's host pty is a mac
+// guest fd 0/1/2 as ONE pty slave. On Linux/devpts that slave is /dev/pts/0, but hl's host pty is a mac
 // /dev/ttysNNN (or a host /dev/pts/N) whose raw name would otherwise leak into the guest via
 // F_GETPATH -- so `tty`, ttyname(3), the `ps` TTY column, and any program that reopens open(ttyname(0))
 // would see a device that doesn't exist in the container. We present it uniformly as /dev/pts/0.
@@ -4513,7 +4513,7 @@ static int fd_is_ctty(int pfn) {
 // ---- devpts: a guest-created pty must look like /dev/pts/<N> everywhere  --------------
 // Real Linux/devpts numbers pty slaves sequentially from the lowest free index. `docker run -t` takes
 // index 0 for the container's controlling terminal, so a guest that then openpty()s gets 1, 2, ...; with
-// no controlling terminal the guest may take 0. dd's host pty is a macOS /dev/ttysNNN (or a host
+// no controlling terminal the guest may take 0. hl's host pty is a macOS /dev/ttysNNN (or a host
 // /dev/pts/M) whose raw name must NEVER leak into the guest -- the slave has to appear as /dev/pts/<N>
 // everywhere: open (ahead of the overlay resolver), ptsname(3)/ttyname(3), readlink(/proc/self/
 // fd/K), `ls /dev/pts`, and stat as a char device whose dev/ino/rdev match the real slave (glibc/musl
@@ -4650,7 +4650,7 @@ static const char *dev_node_hostpath(const char *gp) {
                                          : NULL;
 }
 
-// Populate the container's /dev at start-up. dd flattens the image into one rootfs (no per-container
+// Populate the container's /dev at start-up. hl flattens the image into one rootfs (no per-container
 // devtmpfs) and the OCI unpacker strips every `dev/*` node (unprivileged mknod fails on macOS), so the
 // rootfs /dev is empty. Docker mounts a fresh /dev with these standard entries; we materialize the ones
 // that don't need a privileged mknod straight in the writable upper so they appear in `ls /dev`, stat,
@@ -4819,7 +4819,7 @@ static void container_populate_machine_id(void) {
 // ---- renameat2(RENAME_WHITEOUT) whiteout markers -------------------------------------------------
 // Linux renameat2(...,RENAME_WHITEOUT) renames src->dst AND leaves a whiteout at the source: a character
 // device with rdev 0,0 (the same on-disk token overlayfs uses to mask a lower entry). macOS cannot mknod a
-// device node rootless, so dd records the source GUEST path here and the stat layer (synth_stat_raw)
+// device node rootless, so hl records the source GUEST path here and the stat layer (synth_stat_raw)
 // fabricates the S_IFCHR/0,0 whiteout inode for it -- so lstat(src) reports a char device exactly like
 // Linux (the finding's observable). The marker is self-cleaning: whiteout_present() re-checks the backing
 // file and forgets the entry once a real file exists at the path again (create-over / a later rename onto

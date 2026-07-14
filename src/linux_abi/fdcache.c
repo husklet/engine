@@ -185,8 +185,8 @@ static void oc_reset(void);
 // keeps serving ENOENT forever (its own private g_res_epoch never moved), so the file looks "vanished" and
 // apt's split rename fails ENOENT. With the counter shared, the child's O_CREAT/rename res_bump() invalidates
 // the negative entry in the parent too. The page is created in a constructor BEFORE any guest fork, so every
-// fork descendant AND in-process execve (dd keeps its own mappings across the guest execve) share one physical
-// counter; a fresh `docker exec` is a NEW dd process = its own tree = its own counter (correct per-container
+// fork descendant AND in-process execve (hl keeps its own mappings across the guest execve) share one physical
+// counter; a fresh `docker exec` is a NEW hl process = its own tree = its own counter (correct per-container
 // isolation). Falls back to a private local counter if the mmap fails (degrades to the old per-process
 // behaviour, never crashes). Positive entries are still served epoch-independently, unchanged.
 __attribute__((constructor)) static void res_epoch_ctor(void) {
@@ -680,7 +680,7 @@ static void oc_reset(void) {
 // (a) its page is MAP_ANON, shared only by THIS engine's fork tree, unreachable from the daemon; and
 // (b) it wouldn't invalidate the positives anyway.
 //
-// Mechanism: the daemon owns a 4-byte generation file, <dd-home>/containers/<cid>/fsgen, created before
+// Mechanism: the daemon owns a 4-byte generation file, <hl-home>/containers/<cid>/fsgen, created before
 // the first engine of the container spawns and handed to EVERY engine of that container (run + exec +
 // health probe) as HL_FSGEN_FILE. The daemon atomically increments the mapped u32 AFTER completing any
 // external write; each engine process maps the SAME file MAP_SHARED (ctor below; fork children inherit

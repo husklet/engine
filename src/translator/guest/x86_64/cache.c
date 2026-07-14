@@ -10,7 +10,7 @@
 //     PCs (the block-map keys) and any guest address baked into host code are stable, and arena-internal
 //     absolute pointers (g_map host/body, g_pend slots) + PC-relative chaining are valid as-is on reload.
 //   * The host addresses baked into emitted blocks (block_return, &g_ibtc, &g_fast_count, &g_pending,
-//     &g_sig_inline_count, &g_yield_inline_count, &dd_rep_movs/stos, ...) ALL live in this one PIE binary,
+//     &g_sig_inline_count, &g_yield_inline_count, &hl_rep_movs/stos, ...) ALL live in this one PIE binary,
 //     which dyld slides as a unit; each baked site is emitted as a fixed 4-insn movz/movk slot and recorded
 //     in g_reloc, and rewritten on load by the single image slide. if the g_reloc table ever fills we
 //     poison the arena (g_pcache_poison) so save() refuses -- a persisted arena has EVERY baked site
@@ -144,9 +144,9 @@ static uint64_t pcache_id_of(const char *path) {
     return h;
 }
 
-// A per-engine-build tag mixed into every cache id so the cache self-invalidates across dd versions:
+// A per-engine-build tag mixed into every cache id so the cache self-invalidates across hl versions:
 // host code emitted by a DIFFERENT engine build is never loaded (loading it would crash). __DATE__/
-// __TIME__ change on every (re)build, so a user who updates dd transparently gets a fresh cache --
+// __TIME__ change on every (re)build, so a user who updates hl transparently gets a fresh cache --
 // stale files become unreferenced automatically when the engine build changes.
 static uint64_t pcache_engine_id(void) {
     uint64_t h = 1469598103934665603ull;

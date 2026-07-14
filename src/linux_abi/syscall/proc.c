@@ -79,7 +79,7 @@ static void exec_forward_env(uint64_t envp_guest) {
 static void svc_fill_rlimit(int resource, uint64_t *o) {
     // Docker --ulimit override wins (g_limits, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
-    // requested value, not the dd default. `set` gates each resource so unspecified ones keep the defaults.
+    // requested value, not the hl default. `set` gates each resource so unspecified ones keep the defaults.
     if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) { return; }
     switch (resource) {
     case 3: // RLIMIT_STACK
@@ -150,7 +150,7 @@ static void exec_close_cloexec_scan(int maxfd) {
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {
-            fd_reset_emul(fd); // drop dd's emulation tables for this fd so a reused number isn't misrouted
+            fd_reset_emul(fd); // drop hl's emulation tables for this fd so a reused number isn't misrouted
             close(fd);
         }
     }
@@ -192,7 +192,7 @@ static void exec_close_cloexec(void) {
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {
-            fd_reset_emul(fd); // drop dd's emulation tables for this fd so a reused number isn't misrouted
+            fd_reset_emul(fd); // drop hl's emulation tables for this fd so a reused number isn't misrouted
             close(fd);
         }
     }
@@ -304,7 +304,7 @@ static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reap
 static unsigned g_persona;
 
 // ===================== sched_setscheduler / sched_*param family =====================
-// macOS has no Linux scheduling policies, so dd does not actually change host scheduling; it validates the
+// macOS has no Linux scheduling policies, so hl does not actually change host scheduling; it validates the
 // arguments exactly as the Linux kernel does (policy/priority/pid/pointer -> EINVAL/ESRCH/EFAULT) and keeps
 // a per-process record of the requested policy+priority so sched_getscheduler/sched_getparam round-trip.
 static int g_sched_policy = 0; // SCHED_OTHER
@@ -626,7 +626,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     // sched_yield
     case 124: G_RET(c) = 0; break;
-    // ---- sched_setscheduler / sched_*param arg-validation family (LTP sched_*01..03). dd has no real
+    // ---- sched_setscheduler / sched_*param arg-validation family (LTP sched_*01..03). hl has no real
     // Linux scheduling classes, so these validate exactly like the kernel and record the requested
     // policy/priority for round-trip reads; the errno ORDER matches the kernel line-for-line.
     // sched_setparam(pid, param)
@@ -1198,7 +1198,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // PR_SET_CHILD_SUBREAPER(36)/PR_GET_CHILD_SUBREAPER(37): the subreaper flag round-trips. SET stores
         // arg2 as a boolean; GET writes it through the int* in arg2 (LTP prctl03). NOTE: only the flag itself
         // round-trips here -- the ACTUAL reparenting of an orphaned descendant onto a subreaper is a
-        // process-tree feature dd's 1:1 host-fork model does not implement (an orphaned guest grandchild is
+        // process-tree feature hl's 1:1 host-fork model does not implement (an orphaned guest grandchild is
         // reparented by the host kernel, not routed back to the guest subreaper), so prctl03's reparent/
         // SIGCHLD/wait subtests are a known process-model gap, out of this syscall layer's scope.
         if ((int)a0 == 36) {
@@ -1308,7 +1308,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         // PR_SET_PTRACER (0x59616d61, "Yama"): a process may allow a specific helper pid to ptrace it
-        // when Linux's Yama LSM is present. dd has no Yama policy to enforce, so accept the request as a no-op.
+        // when Linux's Yama LSM is present. hl has no Yama policy to enforce, so accept the request as a no-op.
         if ((int)a0 == 1499557217) {
             G_RET(c) = 0;
             break;
@@ -1898,7 +1898,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int res = (int)a1;
         // Linux validates BEFORE touching the limits: the task lookup runs first (a negative or dead target
         // pid -> ESRCH), then the resource number is range-checked (>= RLIM_NLIMITS(16) -> EINVAL). Without
-        // these dd reports success for dead pids and unsupported resources, so probes see them as valid.
+        // these hl reports success for dead pids and unsupported resources, so probes see them as valid.
         if ((int)a0 < 0 || sched_pid_live((int)a0) < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
             break;

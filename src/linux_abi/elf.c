@@ -625,8 +625,8 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
         }
     }
     // no guest handler -> a fatal, unmaskable synchronous fault. Terminate the guest process through
-    // dd's fatal-signal machinery so its parent's wait4 sees WIFSIGNALED/WTERMSIG=sig (a raw host raise()
-    // degrades to exit(255) across dd's fork). Declines (returns 0) for a genuine ENGINE fault -> re-raise.
+    // hl's fatal-signal machinery so its parent's wait4 sees WIFSIGNALED/WTERMSIG=sig (a raw host raise()
+    // degrades to exit(255) across hl's fork). Declines (returns 0) for a genuine ENGINE fault -> re-raise.
     if (deliver_guest_fatal_fault(sig, si, uc)) return;
     signal(sig, SIG_DFL);
     raise(sig);
@@ -730,7 +730,7 @@ static int elf_mem_has(const uint8_t *f, size_t n, const char *needle, size_t nl
 // INTERIM: is `f` (an aarch64 ELF, size `sz`) a cgo-enabled (iscgo) Go image? Every Go binary carries a
 // linker-embedded build-info blob (magic "\xff Go buildinf:"); its recorded build settings include
 // CGO_ENABLED=<0|1>, and CGO_ENABLED=1 is exactly the runtime.iscgo==1 class whose SIGURG async-preempt
-// delivery dd must suppress (see os/linux/signal.c, g_go_iscgo). We GATE on the Go magic first so a non-Go
+// delivery hl must suppress (see os/linux/signal.c, g_go_iscgo). We GATE on the Go magic first so a non-Go
 // guest is NEVER matched, then decode the two inline strings (Go >=1.18 stores version + modinfo inline when
 // the flags byte has bit 0x2 set, starting at blob offset 32) and scan ONLY the modinfo for the setting. A
 // blob without the inline flag (older linkers) falls back to a bounded scan just past the magic.

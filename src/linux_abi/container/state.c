@@ -12,7 +12,7 @@
 // RLIMIT_NOFILE; the tables are zero-init BSS so the cost is a few MB of never-resident address space.
 #define HL_NFD 65536
 
-// ---- container namespace + cgroup state (SentryConfig: ddockerd -> jit) ----
+// ---- container namespace + cgroup state (SentryConfig: hl-engine -> jit) ----
 // UTS ns: container hostname (uname/sethostname); "" = host default
 static char g_hostname[65] = "";
 // cgroup memory.max bytes (0 = unlimited); charged in mmap
@@ -66,13 +66,13 @@ static int g_init_hostpid = 0;
 // container-init isolates sibling forkserver workers (each is its own container).
 #define HL_ACCT_SLOTS 1024
 
-struct dd_acct_slot {
+struct hl_acct_slot {
     _Atomic int pid;                // host pid owning this slot (0 = free)
     _Atomic int tasks;              // this process's live guest-task (thread) count
     _Atomic unsigned long long mem; // this process's charged anon bytes (memory.current aggregate)
 };
-static struct dd_acct_slot *g_acct;      // shared slot table (NULL if unavailable -> local fallback)
-static struct dd_acct_slot *g_acct_self; // this process's own slot (re-found after fork)
+static struct hl_acct_slot *g_acct;      // shared slot table (NULL if unavailable -> local fallback)
+static struct hl_acct_slot *g_acct_self; // this process's own slot (re-found after fork)
 static void acct_proc_leave(void);       // (defined below; atexit'd from acct_container_reset)
 // g_mem_charged INHERITED at fork: a child COW-inherits the parent's charge, so its memory.current
 // contribution must be only what IT allocates AFTER the fork -- else the parent's charge is counted twice
@@ -119,9 +119,9 @@ static void acct_claim_self(void) {
 // (Re)create the shared accounting table for a NEW container init and claim this process's slot. Called
 // from container_init (normal launch + cold forkserver) and the forkserver warm re-anchor point.
 static void acct_container_reset(void) {
-    size_t sz = sizeof(struct dd_acct_slot) * HL_ACCT_SLOTS;
+    size_t sz = sizeof(struct hl_acct_slot) * HL_ACCT_SLOTS;
     void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    g_acct = (m == MAP_FAILED) ? NULL : (struct dd_acct_slot *)m; // kernel zero-fills -> all slots free
+    g_acct = (m == MAP_FAILED) ? NULL : (struct hl_acct_slot *)m; // kernel zero-fills -> all slots free
     g_acct_self = NULL;
     acct_claim_self();
     static int reg = 0; // free our slot on a normal exit (fork children inherit this atexit registration)
@@ -278,7 +278,7 @@ static int container_pid(void) {
 }
 
 // ---- checkpoint/restore PID virtualization (INACTIVE on a normal launch) --------------------------------
-// dd normally uses the REAL host pid as a guest child's pid (only the init is virtualized). A restore assigns
+// hl normally uses the REAL host pid as a guest child's pid (only the init is virtualized). A restore assigns
 // NEW host pids to the re-forked tree, so this table maps each restored process's checkpoint-time guest pid
 // <-> its new live host pid, keeping guest-visible pids stable across a restore (a blocked wait4's target, a
 // reaped-child pid, bash's job table, kill(pid)). It is EMPTY on every normal launch (g_pidmap_n==0 => every
@@ -348,7 +348,7 @@ static int net_isolate(void) {
 }
 
 // ---- container network-interface model --------------------------------------------------
-// dd runs no real network stack, so a container had NO interface introspection at all: /sys/class/net
+// hl runs no real network stack, so a container had NO interface introspection at all: /sys/class/net
 // and /proc/net/* were absent and AF_NETLINK sockets failed EAFNOSUPPORT, breaking getifaddrs /
 // go-sockaddr / netlink (consul, minio, `ip`, ifconfig). To fix that coherently we model exactly two
 // interfaces -- lo (127.0.0.1/8, ::1) and eth0 (the container's bridge IP, or a stable synthetic
@@ -427,7 +427,7 @@ static int cgid(void) {
 // two macOS fgetxattr/getxattr per stat (~2.5us each on APFS even for a MISS -> ~5us/stat, 40-50x native
 // fstat). But the owner uid/gid xattr is set ONLY by an explicit guest chown or a cred-dropped create
 // (chown_xattr_set_*); the overwhelmingly common file has none. So keep a per-inode NEGATIVE cache: once
-// we confirm an inode carries no dd xattr, skip the syscalls on repeat stats of the same inode. A global
+// we confirm an inode carries no hl xattr, skip the syscalls on repeat stats of the same inode. A global
 // generation counter (bumped on every set) invalidates the whole cache the instant any chown xattr is
 // written, so a stale "no xattr" verdict can never outlive the xattr appearing. Cross-process correctness
 // is free: a new engine process starts with an empty cache, so its first stat of any inode does the real
@@ -593,7 +593,7 @@ static int gid_permitted(int id) {
 // operations on their effective/bounding set. Defined here (state.c is the first container TU include) so
 // both vfs.c (the /proc/self/status builder) and proc.c (capget/prctl handlers) consume ONE source of
 // truth. Effective narrows when a guest capset()s a smaller set; the bounding set narrows on
-// PR_CAPBSET_DROP; inheritable/ambient stay empty (the docker default). Previously dd reported all-ones
+// PR_CAPBSET_DROP; inheritable/ambient stay empty (the docker default). Previously hl reported all-ones
 // (0xffffffffffffffff) — grossly over-reporting caps vs real docker.
 #define HL_CAP_DEFAULT                                                                                                 \
     0x00000000a80425fbull                   // chown,dac_override,fowner,fsetid,kill,setgid,setuid,setpcap,
@@ -645,7 +645,7 @@ static int groups_status_str(char *b, size_t n) {
 // EXPLICIT chown(2); a plain create left no xattr, so a new file re-appeared as the container id (0),
 // which broke initdb ("data directory has wrong ownership"). fsuid/fsgid follow the overlay's
 // euid/egid unless setfsuid/setfsgid override them (g_fs*_ovr >= 0); any subsequent set*id resets the
-// override (POSIX: fsuid tracks euid). We persist the intended owner as the SAME dd.uid/gid xattr the
+// override (POSIX: fsuid tracks euid). We persist the intended owner as the SAME hl.uid/gid xattr the
 // chown path uses, so a later stat reports it. The create sites in fs.c call the helpers below.
 static int g_fsuid_ovr = -1, g_fsgid_ovr = -1; // -1 = follow euid/egid
 
@@ -738,7 +738,7 @@ static uint64_t parse_size(const char *s) {
     }
 }
 
-// ---- resource fidelity: docker --cpus / --read-only / --ulimit (SentryConfig: ddockerd -> jit) ----
+// ---- resource fidelity: docker --cpus / --read-only / --ulimit (SentryConfig: hl-engine -> jit) ----
 // The online-CPU count the container advertises to the guest: the host's online cores, capped by the
 // container's --cpus allotment (ceil(NanoCpus/1e9)) and the 64-CPU mask ceiling. A guest's nproc / glibc
 // __get_nprocs / GOMAXPROCS / JVM availableProcessors all derive from this (via sched_getaffinity, the

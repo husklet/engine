@@ -1,4 +1,4 @@
-// dd/runtime -- ddjit_aarch64: the aarch64-Linux-guest JIT runner (unity translation unit).
+// hl/runtime -- ddjit_aarch64: the aarch64-Linux-guest JIT runner (unity translation unit).
 //
 // A same-ISA aarch64->aarch64 JIT services the guest's Linux syscalls in userspace (no VM). This TU
 // pulls in the engine (jit/), the aarch64 guest frontend (frontend/aarch64/), the Linux personality +
@@ -537,7 +537,7 @@ static void container_init(const char *rootfs) {
     if (rootfs) acct_container_reset();
     {
         const char *h = hl_option_get("HL_HOSTNAME");
-        // ddockerd -> jit config
+        // hl-engine -> jit config
         if (h && !g_hostname[0]) { strncpy(g_hostname, h, 64); }
         const char *m = hl_option_get("HL_MEM_MAX");
         if (m && !g_mem_max) g_mem_max = parse_size(m);

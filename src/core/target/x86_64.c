@@ -1,4 +1,4 @@
-// dd/runtime/frontend/x86_64 -- the x86-64-Linux-guest JIT (jit86), brought in WHOLE.
+// hl/runtime/frontend/x86_64 -- the x86-64-Linux-guest JIT (jit86), brought in WHOLE.
 //
 // jit86 is under active improvement upstream (poc/runtime/jit86/jit86.c) and has a DIFFERENT cpu
 // struct + its own (basic) container runtime, so it is not yet decomposed onto the shared jit/ +

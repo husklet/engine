@@ -98,7 +98,7 @@ static int unix_dgram_dest(const uint8_t *sa, socklen_t l, char *host, size_t hn
     return 0;
 }
 
-// Linux-faithful errno pre-screen for bind(200)/connect(203). macOS hands dd's translated (or raw)
+// Linux-faithful errno pre-screen for bind(200)/connect(203). macOS hands hl's translated (or raw)
 // sockaddr to its own bind()/connect(), which then reports the WRONG errno for several inputs the LTP
 // net-errno suite (bind01/connect01) checks — a bad sockaddr pointer, a wrong sa_family, an
 // already-connected socket. Replicate the kernel's ORDER + values here, up front, so every path (real

@@ -21,7 +21,7 @@ static void e_mul_set_oc(int cfreg) {
 // imul reg<-a*b (two-/three-operand forms 0F AF, 69, 6B): truncated product into dst, and x86
 // CF=OF = (the full signed product differs from the sign-extension of the truncated result).
 // Scratch x21..x25 (x21 carries the 0/1 CF into e_mul_set_oc); callers must not pass a/b in those.
-// x86-xflags: when `co_live`==0 the caller proved the WHOLE NZCV word imul defines (dd sets N=Z=0,
+// x86-xflags: when `co_live`==0 the caller proved the WHOLE NZCV word imul defines (hl sets N=Z=0,
 // C=NOT CF, V=OF) is dead before any read -> skip the entire overflow/flag synthesis (incl. the extra
 // smulh, a real multiply that contends with the product mul on a dependent chain) and emit product-only.
 static void e_imul2(int dst, int a, int b, int w, int co_live) {
@@ -216,7 +216,7 @@ static void byte_wb(struct insn *I, int regnum, int val) {
 // images -> the rewrite is inert.
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_nonpie_types_hi;
 // V8's embedded-builtins CODE base (symbol v8_Default_embedded_blob_code_) -- a baked LOW.text
-// address the binary loads via `mov r32,imm32`. dd runs the code at the HIGH mapping (+bias), so V8's
+// address the binary loads via `mov r32,imm32`. hl runs the code at the HIGH mapping (+bias), so V8's
 // InnerPointerToCodeCache range check compares its LOW registered base against a HIGH frame return address
 // and MISSES -> V8_Fatal "maybe_code.has_value()" (node:20 `new Error().stack` / mongosh). We record the
 // symbol's LOW link value at load (0 if absent / PIE / non-V8) and bias just THIS one materialization to the
@@ -3004,7 +3004,7 @@ static void *translate_block(uint64_t gpc) {
                         e_vmov(vd, 17);
                     } else {
                         e_v3(0x2E601C00u, 17, vd, s); // BSL v17.8b (low lane) -> mask?dst:src2
-                        // FMOV Dd/Sd, v17: keep only the low lane, zero the upper bits (matches the scalar
+                        // FMOV hl/Sd, v17: keep only the low lane, zero the upper bits (matches the scalar
                         // arithmetic path's upper-lane convention).
                         emit32((I.repne ? 0x1E604000u : 0x1E204000u) | (17 << 5) | vd);
                     }

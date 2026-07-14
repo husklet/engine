@@ -17,7 +17,7 @@ static const int CC_L2M[17] = {VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, -
                                VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT, VEOL2};
 
 // bind()/connect() an AF_UNIX socket at host path `host`. macOS sun_path is only 104 bytes, but a container
-// overlay upper socket path ($HOME/.dd/containers/<64-hex>/upper/.../.s.PGSQL.5432) can exceed that -- a
+// overlay upper socket path ($HOME/.hl/containers/<64-hex>/upper/.../.s.PGSQL.5432) can exceed that -- a
 // plain snprintf into sun_path SILENTLY TRUNCATES, so bind creates the inode at the wrong (short) path and
 // the guest's later stat/chmod/connect (which resolve the FULL path) ENOENT it. When `host` fits, bind/
 // connect directly (byte-identical to before). When it overflows, split dir/base, fchdir into the parent,
@@ -183,7 +183,7 @@ static int msgflags_m2l(int mf) {
 }
 
 // ---- SCM ancillary data: Linux<->macOS cmsg framing translation (SOL_SOCKET/SCM_RIGHTS fd passing).
-// dd uses host fds directly as guest fds, so the fd integers in an SCM_RIGHTS payload need no remap --
+// hl uses host fds directly as guest fds, so the fd integers in an SCM_RIGHTS payload need no remap --
 // only the cmsg framing differs: Linux hdr=16B (8B len @0, int level @8, int type @12), 8-byte align,
 // SOL_SOCKET=1; macOS hdr=12B (4B len @0, int level @4, int type @8), 4-byte align, SOL_SOCKET=0xffff.
 #define LX_CMSG_ALIGN(n) (((n) + 7u) & ~(size_t)7u) // Linux: 8-byte align
@@ -191,7 +191,7 @@ static int msgflags_m2l(int mf) {
 #define LX_SOL_SOCKET 1
 #define HL_CMSG_EVENTFD_MAGIC 0xddefd001u
 
-struct dd_cmsg_eventfd_meta {
+struct hl_cmsg_eventfd_meta {
     uint32_t magic;
     uint32_t ordinal;
     uint32_t slot;
@@ -216,7 +216,7 @@ static int cmsg_level_m2l(int lv) {
     return lv == SOL_SOCKET ? LX_SOL_SOCKET : lv;
 }
 
-static int cmsg_eventfd_marker(const struct dd_cmsg_eventfd_meta *m) {
+static int cmsg_eventfd_marker(const struct hl_cmsg_eventfd_meta *m) {
     if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
     char tn[] = "/tmp/.hl-cmsgXXXXXX";
     int fd = mkstemp(tn);
@@ -243,7 +243,7 @@ static int cmsg_fd_is_write_sideband(int fd) {
     return S_ISFIFO(st.st_mode);
 }
 
-static int cmsg_read_eventfd_marker(int fd, struct dd_cmsg_eventfd_meta *m) {
+static int cmsg_read_eventfd_marker(int fd, struct hl_cmsg_eventfd_meta *m) {
     if (fd < 0 || !m) return 0;
     memset(m, 0, sizeof *m);
     if (pread(fd, m, sizeof *m, 0) != (ssize_t)sizeof *m) return 0;
@@ -255,7 +255,7 @@ static int cmsg_import_eventfd_trailer(int *fds, int nfds) {
     int cap = nfds / 3 + 1;
     int *hidden = calloc((size_t)cap, sizeof(int));
     int *marker_fd = calloc((size_t)cap, sizeof(int));
-    struct dd_cmsg_eventfd_meta *metas = calloc((size_t)cap, sizeof(*metas));
+    struct hl_cmsg_eventfd_meta *metas = calloc((size_t)cap, sizeof(*metas));
     if (!hidden || !marker_fd || !metas) {
         free(hidden);
         free(marker_fd);
@@ -267,7 +267,7 @@ static int cmsg_import_eventfd_trailer(int *fds, int nfds) {
     while (visible >= 3 && nmeta < cap) {
         int h = fds[visible - 2];
         int marker = fds[visible - 1];
-        struct dd_cmsg_eventfd_meta m;
+        struct hl_cmsg_eventfd_meta m;
         if (!cmsg_fd_is_write_sideband(h)) break;
         if (!cmsg_read_eventfd_marker(marker, &m)) break;
         hidden[nmeta] = h;
@@ -292,7 +292,7 @@ static int cmsg_import_eventfd_trailer(int *fds, int nfds) {
     for (int i = 0; i < nmeta; i++) {
         int h = hidden[i];
         int marker = marker_fd[i];
-        struct dd_cmsg_eventfd_meta *m = &metas[i];
+        struct hl_cmsg_eventfd_meta *m = &metas[i];
         int pub = fds[m->ordinal];
         if (pub >= 0 && pub < HL_NFD) {
             g_eventfd_peer[pub] = h + 1;
@@ -365,7 +365,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 int fl = fcntl(hidden, F_GETFL);
                 if (fl >= 0) fcntl(hidden, F_SETFL, fl | O_NONBLOCK);
                 fcntl(hidden, F_SETFD, FD_CLOEXEC);
-                struct dd_cmsg_eventfd_meta m = {
+                struct hl_cmsg_eventfd_meta m = {
                     .magic = HL_CMSG_EVENTFD_MAGIC,
                     .ordinal = (uint32_t)i,
                     .slot = (uint32_t)eventfd_counter_slot(fd),
@@ -840,7 +840,7 @@ static void fd_carry_sock(int dst, int src) {
 }
 
 // ---- listening-TCP introspection (ss/netstat -l): a socket the guest bind()+listen()s MUST appear in
-// /proc/net/tcp[6] with state 0A (TCP_LISTEN). dd translates the guest's AF_INET(6) bind onto a host
+// /proc/net/tcp[6] with state 0A (TCP_LISTEN). hl translates the guest's AF_INET(6) bind onto a host
 // AF_UNIX switch (or a real host bind in passthrough), so the synthesized /proc/net/tcp table -- which
 // runs no real IP stack -- has to remember the guest-requested (addr,port) itself. bind(200) records it;
 // listen(201) arms g_tcp_listen; the vfs synth walks these to emit the LISTEN rows. Cleared on
@@ -1180,7 +1180,7 @@ static int switch_dial(const char *path) {
 // Is the daemon owning the process-independent host->container TCP forwarder? When set
 // (HL_PUBLISH_DAEMON=1), the engine must NOT open its own in-process host AF_INET listener — that listener
 // lived in whichever guest process called listen(), so a prefork / re-listening server tore it down on
-// every rebind and two guest processes raced EADDRINUSE. The daemon's listener (dd-daemon/containers/
+// every rebind and two guest processes raced EADDRINUSE. The daemon's listener (hl-daemon/containers/
 // ports.rs) outlives every guest process and dials this container's switch inode per connection instead.
 // The guest-side bind/listen->switch redirect + getsockname->cport reporting below are UNCHANGED (the
 // daemon relies on them). Cached (env is fixed for the process).
@@ -1600,11 +1600,11 @@ static int egress_should_redirect(const struct sockaddr *m) {
     return 0;
 }
 
-// #261 — IPv4-only container network: dd models eth0 exactly like Docker's default bridge does — one IPv4
+// #261 — IPv4-only container network: hl models eth0 exactly like Docker's default bridge does — one IPv4
 // address, NO global IPv6 address, and an empty IPv6 routing table (see the RTM_GETADDR/RTM_GETROUTE dumps
 // in nl_emit_dump: eth0 gets only an AF_INET addr, and the only v6 addr is ::1 on lo). So a genuine external
 // (global-unicast) IPv6 destination has NO ROUTE and, on a real container kernel, connect()/sendto() to it
-// fails *immediately* with ENETUNREACH. dd must reproduce that instead of forwarding the dial to the
+// fails *immediately* with ENETUNREACH. hl must reproduce that instead of forwarding the dial to the
 // underlying host's v6 stack: on a mac whose v6 path to the destination is black-holed (orbstack NAT is
 // v4-only), that forward hangs the guest for the full ~2-minute connect timeout, and a happy-eyeballs client
 // (apt, curl, glibc) that tried the AAAA first never falls back — the exact #261 stall. Failing fast is what
@@ -1897,7 +1897,7 @@ static void abs_path(const uint8_t *sa, socklen_t l, char *out, size_t n) {
 // ===== AF_NETLINK / NETLINK_ROUTE: a minimal RTNETLINK responder ==========================
 // macOS has no AF_NETLINK, so socket(AF_NETLINK,...) returned EAFNOSUPPORT and every interface-
 // enumeration path (getifaddrs via glibc/musl, go-sockaddr, `ip`, ifconfig, minio, consul)
-// failed with "Address family not supported". dd models exactly two interfaces (lo + eth0; see
+// failed with "Address family not supported". hl models exactly two interfaces (lo + eth0; see
 // netif_* in state.c). A guest netlink socket is backed by an AF_UNIX SOCK_DGRAM socketpair: the
 // guest holds one end; when it sends an RTM_GET* dump request we parse the nlmsghdr and WRITE the
 // synthesized dump into OUR peer end, which queues on the guest end so the guest's ordinary
@@ -2186,7 +2186,7 @@ static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
         uint16_t ntype = *(const uint16_t *)(buf + off + 4);
         uint32_t nseq = *(const uint32_t *)(buf + off + 8);
         // RTM message groups run base+0=NEW, +1=DEL, +2=GET, +3=SET. A GET (type%4==2) is a read the dump
-        // responder answers; a NEW/DEL/SET (type%4!=2) is a MODIFICATION dd has no writable netlink stack to
+        // responder answers; a NEW/DEL/SET (type%4!=2) is a MODIFICATION hl has no writable netlink stack to
         // apply. Reply to modifications with a real NLMSG_ERROR (-EPERM) instead of the old phantom empty
         // NLMSG_DONE, so `ip addr/route add`/SETLINK fail loudly rather than silently succeeding unchanged.
         if (ntype >= 16 && (ntype % 4) != 2)
@@ -2400,7 +2400,7 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 }
 
 // ============================ Container DNS (embedded nameserver -> host resolver) ============================
-// The container's /etc/resolv.conf (provisioned by the daemon) points at 127.0.0.11 -- dd's embedded
+// The container's /etc/resolv.conf (provisioned by the daemon) points at 127.0.0.11 -- hl's embedded
 // nameserver, the same address Docker uses. glibc/musl in the guest then send DNS as UDP (default) or TCP
 // (fallback) to 127.0.0.11:53. We intercept those sends here, parse the query, resolve it via the macOS
 // host resolver (getaddrinfo / getnameinfo -- which honor the host's system DNS, INCLUDING a corporate

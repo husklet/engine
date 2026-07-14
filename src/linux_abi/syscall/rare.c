@@ -78,7 +78,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // against a real struct seccomp_data on every syscall (os/linux/seccomp.c, gated in service()), honouring
     // the program's return action (ALLOW/ERRNO/KILL_PROCESS/KILL_THREAD/TRAP/TRACE/LOG). SET_MODE_STRICT is
     // likewise enforced (only read/write/exit/rt_sigreturn). Filters are per-thread, stacked, inherited across
-    // fork and preserved across dd's in-process execve -- matching Linux's SECCOMP_FILTER semantics.
+    // fork and preserved across hl's in-process execve -- matching Linux's SECCOMP_FILTER semantics.
     case 277: { // seccomp(op, flags, args)
         unsigned op = (unsigned)a0;
         if (op == HL_LINUX_SECCOMP_SET_MODE_FILTER) {
@@ -91,8 +91,8 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         break;
     }
-    // ptrace(2): real in-dd tracer/tracee coordination. dd emulates the ptrace relationship
-    // BETWEEN two guest processes (both run translated under dd) over a shared arena keyed on guest pids;
+    // ptrace(2): real in-hl tracer/tracee coordination. hl emulates the ptrace relationship
+    // BETWEEN two guest processes (both run translated under hl) over a shared arena keyed on guest pids;
     // see os/linux/syscall/ptrace.c. svc_ptrace sets G_RET (0 / -errno) itself.
     case 117: // ptrace(request, pid, addr, data)
         G_RET(c) = (uint64_t)(int64_t)svc_ptrace(c, a0, a1, a2, a3);
@@ -131,10 +131,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = fd < 0 ? (uint64_t)(-errno) : (uint64_t)fd;
         break;
     }
-    // flock(fd, op): BSD whole-file advisory lock. Serviced on a private companion file (see dd_flock in
+    // flock(fd, op): BSD whole-file advisory lock. Serviced on a private companion file (see hl_flock in
     // helpers.c) so it stays INDEPENDENT of fcntl POSIX record locks -- on macOS both would otherwise share
     // one per-vnode lock list and spuriously conflict with each other. Linux LOCK_SH/EX/UN/NB match the host.
-    case 32: G_RET(c) = dd_flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
+    case 32: G_RET(c) = hl_flock((int)a0, (int)a1) < 0 ? (uint64_t)(-errno) : 0; break;
     // close_range(first, last, flags): close every fd in [first,last]. CLOSE_RANGE_CLOEXEC(4) sets
     // FD_CLOEXEC instead of closing; CLOSE_RANGE_UNSHARE(2) (file-table unshare) is a no-op here.
     case 436: {
@@ -171,7 +171,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 if (fl >= 0) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);
             } else {
                 if (exec_fd_is_engine((int)fd)) continue; // never close a (relocated) live engine fd
-                fd_reset_emul((int)fd); // drop dd's emulation tables so a reused fd number isn't misrouted
+                fd_reset_emul((int)fd); // drop hl's emulation tables so a reused fd number isn't misrouted
                 close((int)fd);
             }
         }
@@ -250,7 +250,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
                 break;
             }
-            // Cross-process: translate Linux->macOS signo (the target dd engine listens on the macOS number;
+            // Cross-process: translate Linux->macOS signo (the target hl engine listens on the macOS number;
             // see kill, case 129). Untranslated, a divergent signal (SIGUSR1/2, SIGURG, ...) is lost.
             G_RET(c) = kill(pid, sig_l2m(sig)) < 0 ? (uint64_t)(-errno) : 0;
         }

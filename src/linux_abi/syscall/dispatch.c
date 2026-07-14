@@ -10,7 +10,7 @@ int g_noexit;
 // SMC write-fault invalidation path (frontend/x86_64) stays completely inert for the whole existing
 // test matrix (g_rwx_guest==0 -> smc_protect()/smc_on_write() are no-ops -> bit-exact).
 int g_rwx_guest;
-// dd/runtime/os/linux -- service(): the Linux syscall layer (the "kernel" the guest talks to).
+// hl/runtime/os/linux -- service(): the Linux syscall layer (the "kernel" the guest talks to).
 // Dispatches the guest syscall number to the host, translating the ABI (errno, struct layouts, flags,
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
@@ -38,14 +38,14 @@ int g_rwx_guest;
 #ifndef RENAME_EXCL
 #define RENAME_EXCL 0x00000004 // fail if dst exists <- Linux RENAME_NOREPLACE(1)
 #endif
-// ================= ptrace(2) — in-dd tracer/tracee coordination ========================
-// dd runs each guest PROCESS as its own host process (fork(2) is a real host fork; see proc.c case 220),
+// ================= ptrace(2) — in-hl tracer/tracee coordination ========================
+// hl runs each guest PROCESS as its own host process (fork(2) is a real host fork; see proc.c case 220),
 // so a guest tracer ptracing a guest tracee is TWO host processes. We CANNOT proxy to the host macOS
 // ptrace: macOS ptrace has no Linux semantics and cannot see the tracee's GUEST register file (which
 // lives in the tracee's own `struct cpu`). Instead we emulate the ptrace relationship *between* the two
 // guest processes over a shared-memory arena (MAP_SHARED|ANON, mmap'd ONCE at engine_global_init BEFORE
 // any guest fork, so every descendant guest process inherits the same physical pages). Keyed on guest
-// pids (dd already maps guest<->host pids via g_init_hostpid/container_pid). The tracee publishes its
+// pids (hl already maps guest<->host pids via g_init_hostpid/container_pid). The tracee publishes its
 // marshalled GUEST registers into its slot whenever it enters a ptrace-stop; the tracer's ptrace()
 // calls read/steer that slot; PEEK/POKE of tracee memory are serviced by the (stopped) tracee itself
 // over a request/response channel in the slot (the tracer's own address space holds a COW copy, not the
