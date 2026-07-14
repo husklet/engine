@@ -18,6 +18,7 @@ proc-self-exe-comm	procexe	procexe/selfexe.c	procexe/selfexe.c	aarch64,x86_64	-s
 execfault	process	execfault.c	execfault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/execfault.out	linux-libc	active	exact source; deterministic checked registration
 forkstorm	process	forkstorm.c	forkstorm.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/forkstorm.out	linux-libc	active	exact source; deterministic checked registration
 forkwait	process	forkwait.c	forkwait.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/forkwait.out	linux-libc	active	exact source; deterministic checked registration
+fork-blocked-io	process	fork_blocked_io.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread	-	-	0	expected/fork_blocked_io.out	linux-libc,pthreads,pipe,fork/wait	active	fork completes while a sibling is blocked in a typed pipe read; parent wake remains live
 ltp_checkpoint	process	ltp_checkpoint.c	ltp_checkpoint.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_checkpoint.out	linux-libc	active	exact source; deterministic checked registration
 ltp_procmisc	process	ltp_procmisc.c	ltp_procmisc.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_procmisc.out	linux-libc	active	exact source; deterministic checked registration
 pipeproc	process	pipeproc.c	pipeproc.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pipeproc.out	linux-libc	active	exact source; deterministic checked registration

@@ -12,6 +12,9 @@ enum {
 };
 
 typedef struct hl_linux_object_ops {
+    /* clone may run while this OFD has an active operation.  Set only when
+       clone snapshots immutable state or uses the object's own synchronization. */
+    uint32_t fork_while_active_safe;
     int64_t (*read)(void *context, void *buffer, size_t size);
     int64_t (*write)(void *context, const void *buffer, size_t size);
     int64_t (*status)(void *context, hl_linux_file_status *status);

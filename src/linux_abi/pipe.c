@@ -102,6 +102,7 @@ static hl_status pipe_close(void *opaque) {
 }
 
 static const hl_linux_object_ops pipe_ops = {
+    .fork_while_active_safe = 1,
     .read = pipe_read,
     .write = pipe_write,
     .status = pipe_status,

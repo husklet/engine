@@ -223,7 +223,17 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     for (index = 1; index < linux_abi->ofd_capacity; ++index) {
         hl_linux_ofd_entry *entry = &linux_abi->ofds[index];
         if (entry->references == 0) continue;
-        if (entry->active_operations != 0 || entry->closing != 0) {
+        /* A live operation retains the OFD and its host handle.  Host fork
+           clones duplicate/share that same open-file description, so a
+           blocked read is not a snapshot conflict and must not make fork
+           spuriously fail EAGAIN.  Closing still changes ownership. */
+        if (entry->active_operations != 0 && entry->object_ops != NULL &&
+            entry->object_ops->fork_while_active_safe == 0) {
+            hl_linux_unlock(linux_abi);
+            plan->count = 0;
+            return HL_STATUS_BUSY;
+        }
+        if (entry->closing != 0) {
             hl_linux_unlock(linux_abi);
             plan->count = 0;
             return HL_STATUS_BUSY;
@@ -289,7 +299,12 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
                 record->parent_context == entry->object_context)
                 matches++;
         }
-        if (matches != 1 || entry->active_operations != 0 || entry->closing != 0) goto arm_failed;
+        if (entry->active_operations != 0 && entry->object_ops != NULL &&
+            entry->object_ops->fork_while_active_safe == 0) {
+            goto arm_failed;
+        }
+        if (matches != 1 || entry->closing != 0)
+            goto arm_failed;
     }
     for (index = 0; index < plan->count; ++index) {
         hl_linux_fork_record *record = &plan->records[index];

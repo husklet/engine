@@ -165,6 +165,7 @@ static hl_status eventfd_close(void *opaque) {
 }
 
 static const hl_linux_object_ops eventfd_ops = {
+    .fork_while_active_safe = 1,
     .read = eventfd_read,
     .write = eventfd_write,
     .status = eventfd_status,
