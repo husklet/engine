@@ -47,16 +47,17 @@ static int bound_private_dup(int source, int minimum) {
 /* Called once in the isolated worker, before any guest-visible native descriptor allocation. */
 static int bound_shadow_activate(void) {
     hl_linux_fd_snapshot snapshot;
-    int stdio_backup[3] = {-1, -1, -1};
-    int stdio_flags[3] = {0, 0, 0};
-    uint8_t stdio_open[3] = {0, 0, 0};
-    uint8_t stdio_installed[3] = {0, 0, 0};
     uint32_t fd;
     int opened;
     if (g_linux_box == NULL) return 0;
+    for (fd = 3; fd < g_linux_box->fd_capacity; ++fd)
+        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK) break;
+    /* Native stdio remains the host backing for the typed 0/1/2 OFDs and for the sentry helper. */
+    if (fd == g_linux_box->fd_capacity) return 0;
     if (g_bound_sentinel >= 0) {
         for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
-            if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK && !bound_shadow_matches((int)fd))
+            if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK && fd >= 3 &&
+                !bound_shadow_matches((int)fd))
                 return -1;
         }
         return 0;
@@ -71,30 +72,11 @@ static int bound_shadow_activate(void) {
         return -1;
     }
     close(opened);
-    for (fd = 0; fd < 3; ++fd) {
-        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
-        engine_fd_vacate((int)fd);
-        stdio_flags[fd] = fcntl((int)fd, F_GETFD);
-        stdio_backup[fd] = bound_private_dup((int)fd, 64);
-        if (stdio_backup[fd] >= 0) {
-            stdio_open[fd] = 1;
-        } else if (errno != EBADF) {
-            goto activation_failed;
-        }
-    }
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
-        if (fd < 3) {
-            shadow = dup2(g_bound_sentinel, (int)fd);
-            if (shadow == (int)fd) {
-                stdio_installed[fd] = 1;
-                /* Shadows are engine containment fds; guest CLOEXEC lives only in the Linux fd table. */
-                if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) shadow = -1;
-            }
-        } else {
-            shadow = bound_shadow_reserve((int)fd);
-        }
+        if (fd < 3) continue;
+        shadow = bound_shadow_reserve((int)fd);
         if (shadow != (int)fd) {
             int error = shadow < 0 ? errno : EBUSY;
             if (shadow >= 0) close(shadow);
@@ -102,8 +84,6 @@ static int bound_shadow_activate(void) {
             goto activation_failed;
         }
     }
-    for (fd = 0; fd < 3; ++fd)
-        if (stdio_backup[fd] >= 0) close(stdio_backup[fd]);
     return 0;
 
 activation_failed: {
@@ -111,16 +91,6 @@ activation_failed: {
     uint32_t rollback;
     for (rollback = 3; rollback < fd; ++rollback)
         if (hl_linux_fd_snapshot_get(g_linux_box, rollback, &snapshot) == HL_STATUS_OK) close((int)rollback);
-    for (rollback = 0; rollback < 3; ++rollback) {
-        if (stdio_installed[rollback]) {
-            if (stdio_open[rollback])
-                (void)dup2(stdio_backup[rollback], (int)rollback);
-            else
-                close((int)rollback);
-            if (stdio_open[rollback]) (void)fcntl((int)rollback, F_SETFD, stdio_flags[rollback]);
-        }
-        if (stdio_backup[rollback] >= 0) close(stdio_backup[rollback]);
-    }
     close(g_bound_sentinel);
     g_bound_sentinel = -1;
     errno = error;
