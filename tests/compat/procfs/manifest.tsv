@@ -19,5 +19,5 @@ pf-netnone-direct	sysfs	netnone.c	ext_procfs/netnone.c	aarch64,x86_64	-static -O
 pf-mountinfo-bind	proc	bindmount.c	ext_procfs/bindmount.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	HL_VOLUMES=/mnt:/tmp	0	expected/shared/bindmount.out	linux-libc,procfs	active	legacy env HL_VOL=/mnt:/tmp normalized to production HL_VOLUMES=/mnt:/tmp
 pf-peer-ns	proc	peerns.c	ext_procfs/peerns.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/peerns.out	linux-libc,procfs	active	byte-preserving transfer
 pf-peer-fd	proc	peerfd.c	ext_procfs/peerfd.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/peerfd.out	linux-libc,procfs	active	byte-preserving transfer
-pf-ttynonblock	device	tynonblock.c	ext_procfs/ttynonblock.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/ttynonblock.out	linux-libc,procfs	active	byte-preserving transfer
+pf-ttynonblock	device	ttynonblock.c	ext_procfs/ttynonblock.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/ttynonblock.out	linux-libc,procfs	active	byte-preserving transfer
 pf-permbits	permission	permbits.c	ext_procfs/permbits.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/permbits.out	linux-libc	active	byte-preserving transfer

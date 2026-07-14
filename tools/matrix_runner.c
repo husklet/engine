@@ -14,6 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "hl/config.h"
+
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 30000 };
 
 typedef enum case_isa { ISA_AARCH64, ISA_X86_64, ISA_BOTH } case_isa;
@@ -179,75 +181,151 @@ static void terminate(pid_t child) {
     while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
 }
 
-static int install_environment(const char *encoded) {
-    char copy[256], names[256] = {0}, *cursor;
-    size_t names_size = 0;
-    if (*encoded == 0) return 0;
-    memcpy(copy, encoded, strlen(encoded) + 1);
-    cursor = copy;
-    while (cursor != NULL) {
-        char *next = strchr(cursor, ';');
-        char *equals = strchr(cursor, '=');
-        if (next != NULL) *next++ = 0;
-        if (equals == NULL) return 1;
-        *equals++ = 0;
-        if (setenv(cursor, equals, 1) != 0) return 1;
-        if (names_size != 0) names[names_size++] = ':';
-        if (names_size + strlen(cursor) >= sizeof names) return 1;
-        memcpy(names + names_size, cursor, strlen(cursor));
-        names_size += strlen(cursor);
-        names[names_size] = 0;
-        cursor = next;
+typedef struct config_wire {
+    hl_launch_config config;
+    char pool[2048];
+    size_t used;
+} config_wire;
+
+static int write_full(int fd, const void *buffer, size_t size) {
+    const unsigned char *cursor = buffer;
+    while (size != 0) {
+        ssize_t written = write(fd, cursor, size);
+        if (written < 0) { if (errno == EINTR) continue; return 1; }
+        cursor += (size_t)written;
+        size -= (size_t)written;
     }
-    /* OrbStack's mac bridge forwards only variables named by ORBENV. */
-    return setenv("ORBENV", names, 1) != 0;
+    return 0;
+}
+
+static int pool_string(config_wire *wire, const char *value, uint32_t *offset) {
+    size_t size = strlen(value) + 1;
+    if (wire->used + size > sizeof wire->pool || wire->used > UINT32_MAX) return 1;
+    *offset = (uint32_t)wire->used;
+    memcpy(wire->pool + wire->used, value, size);
+    wire->used += size;
+    return 0;
+}
+
+static int config_option(config_wire *wire, const char *name, const char *value) {
+    if (strcmp(name, "HL_NET_ISOLATE") == 0) {
+        if (strcmp(value, "1") != 0) return 1;
+        wire->config.network_isolated = 1;
+    } else if (strcmp(name, "HL_VOLUMES") == 0) {
+        return pool_string(wire, value, &wire->config.volumes_offset);
+    } else if (strcmp(name, "HL_NETNS") == 0) {
+        return pool_string(wire, value, &wire->config.network_namespace_offset);
+    } else if (strcmp(name, "HL_NETBR") == 0) {
+        return pool_string(wire, value, &wire->config.network_bridge_offset);
+    } else if (strcmp(name, "HL_IP") == 0) {
+        return pool_string(wire, value, &wire->config.ip_offset);
+    } else {
+        return 2;
+    }
+    return 0;
+}
+
+static int make_config(const char *binary_root, const char *guest, const char *rootfs, const char *encoded,
+                       char path[1024]) {
+    config_wire wire;
+    char copy[256], guest_environment[512] = {0}, *cursor;
+    size_t environment_size = 0;
+    int fd = -1, result = 1;
+    memset(&wire, 0, sizeof wire);
+    wire.used = 1; /* Offset zero is the canonical absent string. */
+    wire.config.magic = HL_CONFIG_MAGIC;
+    wire.config.header_size = sizeof wire.config;
+    wire.config.abi = HL_CONFIG_ABI;
+    wire.config.uid = -1;
+    wire.config.gid = -1;
+    if (rootfs != NULL && pool_string(&wire, rootfs, &wire.config.rootfs_offset) != 0) return 1;
+    if (*encoded != 0) {
+        memcpy(copy, encoded, strlen(encoded) + 1);
+        cursor = copy;
+        while (cursor != NULL) {
+            char *next = strchr(cursor, ';'), *equals = strchr(cursor, '=');
+            int option;
+            if (next != NULL) *next++ = 0;
+            if (equals == NULL) return 1;
+            *equals++ = 0;
+            option = config_option(&wire, cursor, equals);
+            if (option == 1 || (option == 2 && strncmp(cursor, "HL_", 3) == 0)) return 1;
+            if (option == 2) {
+                size_t record = strlen(cursor) + 1 + strlen(equals);
+                if (environment_size != 0) guest_environment[environment_size++] = '\n';
+                if (environment_size + record + 1 > sizeof guest_environment) return 1;
+                memcpy(guest_environment + environment_size, cursor, strlen(cursor));
+                environment_size += strlen(cursor);
+                guest_environment[environment_size++] = '=';
+                memcpy(guest_environment + environment_size, equals, strlen(equals));
+                environment_size += strlen(equals);
+                guest_environment[environment_size] = 0;
+            }
+            cursor = next;
+        }
+    }
+    if (environment_size != 0 && pool_string(&wire, guest_environment, &wire.config.environment_offset) != 0) return 1;
+    /* argv is a NUL-separated vector terminated by an additional NUL. */
+    if (pool_string(&wire, guest, &wire.config.arguments_offset) != 0 || wire.used == sizeof wire.pool) return 1;
+    wire.pool[wire.used++] = 0;
+    wire.config.pool_size = (uint32_t)wire.used;
+    if (snprintf(path, 1024, "%s/.matrix-config-XXXXXX", binary_root) >= 1024) return 1;
+    fd = mkstemp(path);
+    if (fd < 0) return 1;
+    if (fchmod(fd, 0600) == 0 && write_full(fd, &wire.config, sizeof wire.config) == 0 &&
+        write_full(fd, wire.pool, wire.used) == 0 && close(fd) == 0)
+        return 0;
+    result = errno;
+    if (fd >= 0) (void)close(fd);
+    (void)unlink(path);
+    errno = result;
+    return 1;
 }
 
 static int run_guest(const char *bridge, const char *engine, const char *guest, const char *rootfs,
-                     const char *environment, capture *result) {
+                     const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
+    char config_path[1024];
     uint64_t deadline;
     pid_t child;
     memset(result, 0, sizeof(*result));
     result->output = malloc(OUTPUT_MAX);
     result->error = malloc(ERROR_MAX);
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
+    if (make_config(binary_root, guest, rootfs, environment, config_path) != 0) return 1;
     child = fork();
-    if (child < 0) return 1;
+    if (child < 0) { (void)unlink(config_path); return 1; }
     if (child == 0) {
         (void)setpgid(0, 0);
         close(output_pipe[0]); close(error_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]); close(error_pipe[1]);
-        if (install_environment(environment) != 0) _exit(127);
-        if (rootfs != NULL)
-            execlp(bridge, bridge, engine, "--rootfs", rootfs, guest, (char *)NULL);
-        else
-            execlp(bridge, bridge, engine, guest, (char *)NULL);
+        execlp(bridge, bridge, engine, "--configfile", config_path, (char *)NULL);
         _exit(127);
     }
     (void)setpgid(child, child);
     close(output_pipe[1]); close(error_pipe[1]);
     if (fcntl(output_pipe[0], F_SETFL, O_NONBLOCK) < 0 || fcntl(error_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
-        terminate(child); return 1;
+        terminate(child); (void)unlink(config_path); return 1;
     }
     deadline = monotonic_ms() + TIMEOUT_MS;
     while (!exited || !output_eof || !error_eof) {
         struct pollfd descriptors[2] = {{output_pipe[0], POLLIN | POLLHUP, 0}, {error_pipe[0], POLLIN | POLLHUP, 0}};
         pid_t waited;
-        if (monotonic_ms() >= deadline) { terminate(child); close(output_pipe[0]); close(error_pipe[0]); return 2; }
-        if (poll(descriptors, 2, 10) < 0 && errno != EINTR) { terminate(child); return 1; }
+        if (monotonic_ms() >= deadline) { terminate(child); close(output_pipe[0]); close(error_pipe[0]); unlink(config_path); return 2; }
+        if (poll(descriptors, 2, 10) < 0 && errno != EINTR) { terminate(child); (void)unlink(config_path); return 1; }
         if (drain(output_pipe[0], result->output, &result->output_size, OUTPUT_MAX, &output_eof) != 0 ||
             drain(error_pipe[0], result->error, &result->error_size, ERROR_MAX, &error_eof) != 0) {
-            terminate(child); return 1;
+            terminate(child); (void)unlink(config_path); return 1;
         }
         if (!exited) {
             waited = waitpid(child, &result->wait_status, WNOHANG);
             if (waited == child) exited = 1;
-            else if (waited < 0 && errno != EINTR) { terminate(child); return 1; }
+            else if (waited < 0 && errno != EINTR) { terminate(child); (void)unlink(config_path); return 1; }
         }
     }
     close(output_pipe[0]); close(error_pipe[0]);
+    (void)unlink(config_path); /* Engine normally unlinks immediately; covers pre-exec failure. */
     return 0;
 }
 
@@ -344,7 +422,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
     status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest,
-                       item->needs_rootfs ? rootfs : NULL, item->environment, result);
+                       item->needs_rootfs ? rootfs : NULL, item->environment, binary_root, result);
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {

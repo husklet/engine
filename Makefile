@@ -541,7 +541,7 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 
 $(BUILD)/tools/matrix-runner: tools/matrix_runner.c
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< -o $@
 
 compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
