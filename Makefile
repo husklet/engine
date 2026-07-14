@@ -1064,6 +1064,14 @@ perf-compat: e2e-compat $(BUILD)/tools/perf-runner
 		$(abspath $(BUILD)/e2e/atomics-aarch64) 0 25
 	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/atomics-x86_64) 0 25
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/core/workload/aarch64/busyloop) 0 15
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/core/workload/x86_64/busyloop) 0 15
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/syscall/aarch64/gettid) 0 25
+	$(BUILD)/tools/perf-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/syscall/x86_64/gettid) 0 25
 
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST)
 

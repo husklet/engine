@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,11 @@ static int run_once(const char *bridge, const char *engine, const char *guest, i
     int status;
     if (child < 0) return 1;
     if (child == 0) {
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+            close(null_fd);
+        }
         execlp(bridge, bridge, engine, guest, (char *)NULL);
         _exit(127);
     }
@@ -40,6 +46,7 @@ static int run_once(const char *bridge, const char *engine, const char *guest, i
 int main(int argc, char **argv) {
     uint64_t *samples;
     uint64_t sum = 0;
+    uint64_t cold_ns;
     unsigned long iterations;
     unsigned long i;
     int expected;
@@ -52,6 +59,10 @@ int main(int argc, char **argv) {
     if (iterations < 3 || iterations > 10000) return 2;
     samples = calloc(iterations, sizeof(*samples));
     if (samples == NULL) return 1;
+    if (run_once(argv[1], argv[2], argv[3], expected, &cold_ns)) {
+        free(samples);
+        return 1;
+    }
     for (i = 0; i < iterations; ++i) {
         if (run_once(argv[1], argv[2], argv[3], expected, &samples[i])) {
             free(samples);
@@ -60,8 +71,9 @@ int main(int argc, char **argv) {
         sum += samples[i];
     }
     qsort(samples, iterations, sizeof(*samples), compare_u64);
-    printf("engine=%s guest=%s iterations=%lu min_us=%llu median_us=%llu p95_us=%llu mean_us=%llu\n", argv[2], argv[3],
-           iterations, (unsigned long long)(samples[0] / 1000), (unsigned long long)(samples[iterations / 2] / 1000),
+    printf("engine=%s guest=%s iterations=%lu cold_us=%llu min_us=%llu median_us=%llu p95_us=%llu mean_us=%llu\n",
+           argv[2], argv[3], iterations, (unsigned long long)(cold_ns / 1000), (unsigned long long)(samples[0] / 1000),
+           (unsigned long long)(samples[iterations / 2] / 1000),
            (unsigned long long)(samples[(iterations * 95) / 100] / 1000),
            (unsigned long long)((sum / iterations) / 1000));
     free(samples);
