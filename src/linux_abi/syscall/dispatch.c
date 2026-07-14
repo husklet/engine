@@ -791,6 +791,9 @@ static void service_local(struct cpu *c) {
         case 21: // epoll_ctl(epfd, op, fd, EVENT)           -- epoll_event read directly
             a3 = nonpie_p(a3);
             break;
+        case 27: // inotify_add_watch(fd, PATH, mask)        -- path consumed directly by atpath
+            a1 = nonpie_p(a1);
+            break;
         case 86:  // timerfd_settime(fd, flags, NEW, OLD)     -- new read / old written
         case 110: // timer_settime(timerid, flags, NEW, OLD)
             a2 = nonpie_p(a2);

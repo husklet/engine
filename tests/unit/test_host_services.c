@@ -21,7 +21,6 @@ int main(void) {
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
-    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_GPU) == HL_STATUS_NOT_SUPPORTED);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_PROCESS) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     malformed_sync = *services.sync;

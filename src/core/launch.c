@@ -63,8 +63,6 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->debug_log_offset,
         config->checkpoint_directory_offset,
         config->restore_directory_offset,
-        config->gpu_bridge_name_offset,
-        config->gpu_pool_offset,
     };
     size_t i;
     for (i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
@@ -137,14 +135,6 @@ static int hl_read_config_file(int fd) {
     if (cfg.rootfs_read_only) hl_option_set("HL_ROOTFS_RO", "1", 1);
     if (cfg.network_isolated) hl_option_set("HL_NET_ISOLATE", "1", 1);
     if (cfg.publish_external) hl_option_set("HL_PUBLISH_DAEMON", "1", 1);
-    // Opt in to the configured host presentation path. Carrying this in the typed config,
-    // rather than the ambient host environment, makes it reach the engine reliably because the embedding bridge
-    // does not forward the launcher's ambient environment.
-    if (cfg.gpu_enabled) hl_option_set("HL_GPU_IOSURFACE", "1", 1);
-    if (cfg.gpu_pool_capacity) {
-        snprintf(num, sizeof num, "%u", cfg.gpu_pool_capacity);
-        hl_option_set("HL_GPU_POOL_N", num, 1);
-    }
     if (cfg.uid >= 0) {
         snprintf(num, sizeof num, "%d", cfg.uid);
         hl_option_set("HL_UID", num, 1);
@@ -186,10 +176,6 @@ static int hl_read_config_file(int fd) {
     if (s[0]) hl_option_set("HL_CHECKPOINT_DIR", s, 1);
     s = launch_string(&cfg, pool, cfg.restore_directory_offset);
     if (s[0]) hl_option_set("HL_RESTORE_DIR", s, 1);
-    s = launch_string(&cfg, pool, cfg.gpu_bridge_name_offset);
-    if (s[0]) hl_option_set("HL_GPU_BRIDGE_NAME", s, 1);
-    s = launch_string(&cfg, pool, cfg.gpu_pool_offset);
-    if (s[0]) hl_option_set("HL_GPU_POOL", s, 1);
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     s = launch_string(&cfg, pool, cfg.debug_log_offset);
     if (s[0]) hl_option_set("HL_LOG", s, 1);

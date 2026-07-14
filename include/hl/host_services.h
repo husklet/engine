@@ -5,7 +5,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_HOST_SERVICES_ABI 1u
+#define HL_HOST_SERVICES_ABI 2u
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
@@ -14,7 +14,6 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
-#define HL_HOST_GPU_ABI 1u
 #define HL_HOST_SYNC_ABI 1u
 
 typedef uint64_t hl_host_handle;
@@ -25,14 +24,13 @@ enum {
     HL_HOST_CAP_CLOCK = UINT64_C(1) << 1,
     HL_HOST_CAP_LOG = UINT64_C(1) << 2,
     HL_HOST_CAP_FAST_CLONE = UINT64_C(1) << 3,
-    HL_HOST_CAP_GPU = UINT64_C(1) << 4,
-    HL_HOST_CAP_FILE = UINT64_C(1) << 5,
-    HL_HOST_CAP_PROCESS = UINT64_C(1) << 6,
-    HL_HOST_CAP_EVENT = UINT64_C(1) << 7,
-    HL_HOST_CAP_NETWORK = UINT64_C(1) << 8,
-    HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 9,
-    HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 10,
-    HL_HOST_CAP_SYNC = UINT64_C(1) << 11
+    HL_HOST_CAP_FILE = UINT64_C(1) << 4,
+    HL_HOST_CAP_PROCESS = UINT64_C(1) << 5,
+    HL_HOST_CAP_EVENT = UINT64_C(1) << 6,
+    HL_HOST_CAP_NETWORK = UINT64_C(1) << 7,
+    HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 8,
+    HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 9,
+    HL_HOST_CAP_SYNC = UINT64_C(1) << 10
 };
 
 enum {
@@ -224,13 +222,6 @@ typedef struct hl_host_shared_memory_services {
     hl_host_result (*close)(void *context, hl_host_handle object);
 } hl_host_shared_memory_services;
 
-typedef struct hl_host_gpu_services {
-    HL_ABI_HEADER;
-    hl_host_result (*allocate)(void *context, uint32_t width, uint32_t height, uint32_t format, uint32_t usage);
-    hl_host_result (*identity)(void *context, hl_host_handle allocation);
-    hl_host_result (*close)(void *context, hl_host_handle allocation);
-} hl_host_gpu_services;
-
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -252,7 +243,6 @@ typedef struct hl_host_services {
     const hl_host_event_services *event;
     const hl_host_network_services *network;
     const hl_host_shared_memory_services *shared_memory;
-    const hl_host_gpu_services *gpu;
     const hl_host_sync_services *sync;
 } hl_host_services;
 

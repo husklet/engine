@@ -3,99 +3,32 @@
 // Guests self-sandbox with seccomp(2) / prctl(PR_SET_SECCOMP): they install a cBPF program that the
 // kernel runs against a `struct seccomp_data` on EVERY syscall and honours the program's return action
 // (ALLOW / ERRNO / KILL_PROCESS / KILL_THREAD / TRAP / TRACE / LOG), or SECCOMP_MODE_STRICT (only
-// read/write/exit/rt_sigreturn permitted). dd previously accepted the install as a no-op and enforced
-// nothing -- a guest believed a syscall was blocked/trapped/killed while dd kept servicing it (a
+// read/write/exit/rt_sigreturn permitted). The engine previously accepted installation as a no-op and
+// enforced nothing, so a guest believed a syscall was blocked/trapped/killed while it was still serviced (a
 // compatibility AND security fail-open). This module closes that: it stores the installed program(s) and
 // runs a small cBPF virtual machine on the syscall entry path (service()), applying the resulting action.
 //
 // Storage is PER-THREAD (Linux seccomp is per-thread) via __thread, stacked newest-first (multiple
 // installs compose; the most restrictive action wins). It is inherited across fork(2) for free (a real
 // host fork COW-copies the calling thread's __thread head + the malloc'd program nodes) and preserved
-// across execve(2) for free (dd's execve re-enters IN-process -- it never host-execve's -- so __thread
+// across execve(2) for free (the engine's execve re-enters in-process rather than calling host execve, so thread
 // state survives, exactly as the kernel keeps filters across a non-setuid exec).
 //
 // HOT PATH: g_seccomp_active is a plain global that stays 0 until the first install anywhere, so a guest
 // that never touches seccomp pays a single predicted-not-taken load per syscall and nothing else. Only
 // once a filter/strict mode is installed does the per-thread mode gate the interpreter.
 //
-// Included from os/linux/syscall/dispatch.c BEFORE fs.c/proc.c/rare.c (so proc.c's PR_SET_SECCOMP and
-// rare.c's seccomp(2) can call the installers) and AFTER os/linux/signal.c in the unity TU (so it can use
+// Included from syscall/dispatch.c before fs.c/proc.c/rare.c (so proc.c's PR_SET_SECCOMP and rare.c's
+// seccomp(2) can call the installers) and after signal.c in the unity TU (so it can use
 // raise_guest_signal / sigexit_record / sig_coredumps / svc_core_rlimit_cur / g_sigcode) and thread.c
 // (gna_hit, the guest-PROT_NONE readability probe). The G_SECCOMP_ARCH / G_SECCOMP_NR seam is provided
-// per guest frontend in translate/<arch>/abi.h (native AUDIT_ARCH + the raw guest syscall number).
+// per guest frontend in its ABI header (native AUDIT_ARCH + the raw guest syscall number).
 
-// ---- classic-BPF ISA (subset the kernel's seccomp accepts; we implement the full cBPF for robustness) --
-#define HL_LINUX_BPF_CLASS(code) ((code) & 0x07)
-#define HL_LINUX_BPF_LD 0x00
-#define HL_LINUX_BPF_LDX 0x01
-#define HL_LINUX_BPF_ST 0x02
-#define HL_LINUX_BPF_STX 0x03
-#define HL_LINUX_BPF_ALU 0x04
-#define HL_LINUX_BPF_JMP 0x05
-#define HL_LINUX_BPF_RET 0x06
-#define HL_LINUX_BPF_MISC 0x07
-
-#define HL_LINUX_BPF_SIZE(code) ((code) & 0x18)
-#define HL_LINUX_BPF_W 0x00
-#define HL_LINUX_BPF_H 0x08
-#define HL_LINUX_BPF_B 0x10
-
-#define HL_LINUX_BPF_MODE(code) ((code) & 0xe0)
-#define HL_LINUX_BPF_IMM 0x00
-#define HL_LINUX_BPF_ABS 0x20
-#define HL_LINUX_BPF_IND 0x40
-#define HL_LINUX_BPF_MEM 0x60
-#define HL_LINUX_BPF_LEN 0x80
-#define HL_LINUX_BPF_MSH 0xa0
-
-#define HL_LINUX_BPF_OP(code) ((code) & 0xf0)
-#define HL_LINUX_BPF_ADD 0x00
-#define HL_LINUX_BPF_SUB 0x10
-#define HL_LINUX_BPF_MUL 0x20
-#define HL_LINUX_BPF_DIV 0x30
-#define HL_LINUX_BPF_OR 0x40
-#define HL_LINUX_BPF_AND 0x50
-#define HL_LINUX_BPF_LSH 0x60
-#define HL_LINUX_BPF_RSH 0x70
-#define HL_LINUX_BPF_NEG 0x80
-#define HL_LINUX_BPF_MOD 0x90
-#define HL_LINUX_BPF_XOR 0xa0
-#define HL_LINUX_BPF_JA 0x00
-#define HL_LINUX_BPF_JEQ 0x10
-#define HL_LINUX_BPF_JGT 0x20
-#define HL_LINUX_BPF_JGE 0x30
-#define HL_LINUX_BPF_JSET 0x40
-
-#define HL_LINUX_BPF_SRC(code) ((code) & 0x08)
-#define HL_LINUX_BPF_K 0x00
-#define HL_LINUX_BPF_X 0x08
-
-#define HL_LINUX_BPF_RVAL(code) ((code) & 0x18)
-#define HL_LINUX_BPF_A 0x10
-
-#define HL_LINUX_BPF_MISCOP(code) ((code) & 0xf8)
-#define HL_LINUX_BPF_TAX 0x00
-#define HL_LINUX_BPF_TXA 0x80
-
-#define HL_LINUX_BPF_MAXINSNS 4096
-#define HL_LINUX_BPF_MEMWORDS 16
-
-// ---- seccomp return actions (linux/seccomp.h) ----
-#define HL_LINUX_SECCOMP_RET_KILL_PROCESS 0x80000000u
-#define HL_LINUX_SECCOMP_RET_KILL_THREAD 0x00000000u
-#define HL_LINUX_SECCOMP_RET_TRAP 0x00030000u
-#define HL_LINUX_SECCOMP_RET_ERRNO 0x00050000u
-#define HL_LINUX_SECCOMP_RET_USER_NOTIF 0x7fc00000u
-#define HL_LINUX_SECCOMP_RET_TRACE 0x7ff00000u
-#define HL_LINUX_SECCOMP_RET_LOG 0x7ffc0000u
-#define HL_LINUX_SECCOMP_RET_ALLOW 0x7fff0000u
-#define HL_LINUX_SECCOMP_RET_ACTION_FULL 0xffff0000u
-#define HL_LINUX_SECCOMP_RET_DATA 0x0000ffffu
+#include "seccomp_vm.h"
 
 // seccomp(2) operations
 #define HL_LINUX_SECCOMP_SET_MODE_STRICT 0u
 #define HL_LINUX_SECCOMP_SET_MODE_FILTER 1u
-// seccomp(2) filter flags
 #define HL_LINUX_SECCOMP_FILTER_FLAG_TSYNC 0x01u
 #define HL_LINUX_SECCOMP_FILTER_FLAG_LOG 0x02u
 #define HL_LINUX_SECCOMP_FILTER_FLAG_SPEC_ALLOW 0x04u
@@ -104,8 +37,6 @@
 #define HL_LINUX_SECCOMP_FILTER_FLAGS_KNOWN                                                                            \
     (HL_LINUX_SECCOMP_FILTER_FLAG_TSYNC | HL_LINUX_SECCOMP_FILTER_FLAG_LOG | HL_LINUX_SECCOMP_FILTER_FLAG_SPEC_ALLOW | \
      HL_LINUX_SECCOMP_FILTER_FLAG_NEW_LISTENER | HL_LINUX_SECCOMP_FILTER_FLAG_TSYNC_ESRCH)
-
-// prctl PR_SET_SECCOMP modes (differ from seccomp(2) op numbers!)
 #define HL_LINUX_SECCOMP_MODE_STRICT 1u
 #define HL_LINUX_SECCOMP_MODE_FILTER 2u
 
@@ -113,192 +44,23 @@
 #define CAP_SYS_ADMIN 21
 #endif
 
-// The seccomp classic-BPF instruction, byte-identical to the guest's `struct sock_filter`.
-struct hl_linux_sock_filter {
-    uint16_t code;
-    uint8_t jt;
-    uint8_t jf;
-    uint32_t k;
-};
-
-// The read-only data buffer the cBPF program is run against, byte-identical to the kernel's
-// `struct seccomp_data`: nr (native syscall number), arch (AUDIT_ARCH_*), the userspace IP, and the six
-// syscall arguments -- all little-endian on both guest ISAs, so BPF_LD|W|ABS reads a native u32/u16/u8.
-struct hl_linux_seccomp_data {
-    int32_t nr;
-    uint32_t arch;
-    uint64_t instruction_pointer;
-    uint64_t args[6];
-};
-
-// One installed program on a thread's stacked filter chain (newest first).
 struct hl_linux_bpf_filter {
     struct hl_linux_sock_filter *insns;
     uint16_t len;
     struct hl_linux_bpf_filter *prev;
 };
 
-// 0 = no seccomp anywhere (never installed); flips to 1 on the first install and never resets. A plain
-// global load short-circuits the whole gate for the common case (guests that never call seccomp).
 static volatile int g_seccomp_active;
-
-// Per-thread mode: 0 = none, 1 = SECCOMP_MODE_STRICT, 2 = SECCOMP_MODE_FILTER. Sticky (a thread cannot
-// leave seccomp). Inherited across fork (COW) and preserved across dd's in-process execve.
 static __thread unsigned char t_seccomp_mode;
-static __thread struct hl_linux_bpf_filter *t_seccomp_filters; // stacked, newest first
-
-// Run one cBPF program against `sd`, returning its 32-bit action word. A malformed/out-of-bounds memory
-// access aborts the program with 0 (== SECCOMP_RET_KILL_THREAD), exactly as classic BPF (sk_run_filter)
-// returns 0 on an out-of-range load -- the conservative "deny" that a broken filter deserves.
-static uint32_t hl_linux_bpf_run(const struct hl_linux_sock_filter *f, uint16_t flen,
-                                 const struct hl_linux_seccomp_data *sd) {
-    const uint8_t *pkt = (const uint8_t *)sd;
-    const uint32_t plen = (uint32_t)sizeof(*sd);
-    uint32_t A = 0, X = 0;
-    uint32_t mem[HL_LINUX_BPF_MEMWORDS];
-    memset(mem, 0, sizeof mem);
-    uint32_t pc = 0;
-    // cBPF jumps are forward-only unsigned offsets, so a well-formed program halts within flen steps; the
-    // extra guard bounds any pathological (yet in-range) case at the ISA maximum.
-    for (uint32_t steps = 0; pc < flen && steps <= HL_LINUX_BPF_MAXINSNS; steps++, pc++) {
-        const struct hl_linux_sock_filter *in = &f[pc];
-        uint16_t code = in->code;
-        uint32_t k = in->k;
-        switch (HL_LINUX_BPF_CLASS(code)) {
-        case HL_LINUX_BPF_LD:
-            switch (HL_LINUX_BPF_MODE(code)) {
-            case HL_LINUX_BPF_IMM: A = k; break;
-            case HL_LINUX_BPF_LEN: A = plen; break;
-            case HL_LINUX_BPF_ABS:
-            case HL_LINUX_BPF_IND: {
-                uint64_t off = (HL_LINUX_BPF_MODE(code) == HL_LINUX_BPF_IND) ? (uint64_t)X + k : (uint64_t)k;
-                uint32_t sz = (HL_LINUX_BPF_SIZE(code) == HL_LINUX_BPF_B)   ? 1
-                              : (HL_LINUX_BPF_SIZE(code) == HL_LINUX_BPF_H) ? 2
-                                                                            : 4;
-                if (off + sz > plen) return 0; // out of bounds -> deny (classic-BPF semantics)
-                if (sz == 1)
-                    A = pkt[off];
-                else if (sz == 2)
-                    A = (uint32_t)pkt[off] | ((uint32_t)pkt[off + 1] << 8);
-                else
-                    A = (uint32_t)pkt[off] | ((uint32_t)pkt[off + 1] << 8) | ((uint32_t)pkt[off + 2] << 16) |
-                        ((uint32_t)pkt[off + 3] << 24);
-                break;
-            }
-            case HL_LINUX_BPF_MEM:
-                if (k >= HL_LINUX_BPF_MEMWORDS) return 0;
-                A = mem[k];
-                break;
-            default: return 0;
-            }
-            break;
-        case HL_LINUX_BPF_LDX:
-            switch (HL_LINUX_BPF_MODE(code)) {
-            case HL_LINUX_BPF_IMM: X = k; break;
-            case HL_LINUX_BPF_LEN: X = plen; break;
-            case HL_LINUX_BPF_MEM:
-                if (k >= HL_LINUX_BPF_MEMWORDS) return 0;
-                X = mem[k];
-                break;
-            case HL_LINUX_BPF_MSH: // X = 4 * (pkt[k] & 0xf) -- IP-header-length idiom; harmless here
-                if (k >= plen) return 0;
-                X = 4 * (pkt[k] & 0xf);
-                break;
-            default: return 0;
-            }
-            break;
-        case HL_LINUX_BPF_ST:
-            if (k >= HL_LINUX_BPF_MEMWORDS) return 0;
-            mem[k] = A;
-            break;
-        case HL_LINUX_BPF_STX:
-            if (k >= HL_LINUX_BPF_MEMWORDS) return 0;
-            mem[k] = X;
-            break;
-        case HL_LINUX_BPF_ALU: {
-            uint32_t src = (HL_LINUX_BPF_SRC(code) == HL_LINUX_BPF_X) ? X : k;
-            switch (HL_LINUX_BPF_OP(code)) {
-            case HL_LINUX_BPF_ADD: A += src; break;
-            case HL_LINUX_BPF_SUB: A -= src; break;
-            case HL_LINUX_BPF_MUL: A *= src; break;
-            case HL_LINUX_BPF_DIV:
-                if (src == 0) return 0; // div by zero -> abort (deny)
-                A /= src;
-                break;
-            case HL_LINUX_BPF_MOD:
-                if (src == 0) return 0;
-                A %= src;
-                break;
-            case HL_LINUX_BPF_OR: A |= src; break;
-            case HL_LINUX_BPF_AND: A &= src; break;
-            case HL_LINUX_BPF_XOR: A ^= src; break;
-            case HL_LINUX_BPF_LSH: A = (src < 32) ? (A << src) : 0; break;
-            case HL_LINUX_BPF_RSH: A = (src < 32) ? (A >> src) : 0; break;
-            case HL_LINUX_BPF_NEG: A = (uint32_t)(-(int32_t)A); break;
-            default: return 0;
-            }
-            break;
-        }
-        case HL_LINUX_BPF_JMP: {
-            if (HL_LINUX_BPF_OP(code) == HL_LINUX_BPF_JA) {
-                pc += k; // += k, then the loop's pc++ advances to the target
-                break;
-            }
-            uint32_t cmp = (HL_LINUX_BPF_SRC(code) == HL_LINUX_BPF_X) ? X : k;
-            int t;
-            switch (HL_LINUX_BPF_OP(code)) {
-            case HL_LINUX_BPF_JEQ: t = (A == cmp); break;
-            case HL_LINUX_BPF_JGT: t = (A > cmp); break;
-            case HL_LINUX_BPF_JGE: t = (A >= cmp); break;
-            case HL_LINUX_BPF_JSET: t = (A & cmp) != 0; break;
-            default: return 0;
-            }
-            pc += t ? in->jt : in->jf; // += jt/jf, then loop pc++ advances past it
-            break;
-        }
-        case HL_LINUX_BPF_RET: {
-            uint32_t rval = (HL_LINUX_BPF_RVAL(code) == HL_LINUX_BPF_A) ? A : k;
-            return rval;
-        }
-        case HL_LINUX_BPF_MISC:
-            if (HL_LINUX_BPF_MISCOP(code) == HL_LINUX_BPF_TAX)
-                X = A;
-            else if (HL_LINUX_BPF_MISCOP(code) == HL_LINUX_BPF_TXA)
-                A = X;
-            else
-                return 0;
-            break;
-        default: return 0;
-        }
-    }
-    // Fell off the end without a RET (a malformed program). Classic BPF cannot; deny conservatively.
-    return 0;
-}
-
-// Precedence rank of a seccomp action -- SMALLER = higher precedence (more restrictive wins), matching the
-// kernel's documented order KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW.
-// An unrecognized action is treated as KILL_THREAD (the kernel's default for an unknown action word).
-static int hl_linux_seccomp_precedence(uint32_t action) {
-    switch (action & HL_LINUX_SECCOMP_RET_ACTION_FULL) {
-    case HL_LINUX_SECCOMP_RET_KILL_PROCESS: return 0;
-    case HL_LINUX_SECCOMP_RET_KILL_THREAD: return 1;
-    case HL_LINUX_SECCOMP_RET_TRAP: return 2;
-    case HL_LINUX_SECCOMP_RET_ERRNO: return 3;
-    case HL_LINUX_SECCOMP_RET_USER_NOTIF: return 4;
-    case HL_LINUX_SECCOMP_RET_TRACE: return 5;
-    case HL_LINUX_SECCOMP_RET_LOG: return 6;
-    case HL_LINUX_SECCOMP_RET_ALLOW: return 7;
-    default: return 1; // unknown -> KILL_THREAD
-    }
-}
+static __thread struct hl_linux_bpf_filter *t_seccomp_filters;
 
 // Run every installed filter and return the highest-precedence (most restrictive) action word.
 static uint32_t hl_linux_seccomp_evaluate(const struct hl_linux_seccomp_data *sd) {
     uint32_t best = HL_LINUX_SECCOMP_RET_ALLOW;
     int best_prec = 7;
     for (struct hl_linux_bpf_filter *f = t_seccomp_filters; f; f = f->prev) {
-        uint32_t r = hl_linux_bpf_run(f->insns, f->len, sd);
-        int p = hl_linux_seccomp_precedence(r);
+        uint32_t r = hl_seccomp_run(f->insns, f->len, sd);
+        int p = hl_seccomp_precedence(r);
         if (p < best_prec) {
             best_prec = p;
             best = r;
@@ -358,7 +120,7 @@ static int hl_linux_seccomp_apply(struct cpu *c) {
     }
     case HL_LINUX_SECCOMP_RET_TRACE:
         // SECCOMP_RET_TRACE with no ptrace supervisor attached: the kernel skips the syscall and returns
-        // -ENOSYS. dd has no seccomp-TRACE supervisor wiring, so this is the always-correct no-tracer path.
+        // -ENOSYS. The engine has no seccomp-TRACE supervisor wiring, so this is the correct no-tracer path.
         G_RET(c) = (uint64_t)(-(int64_t)ENOSYS);
         return 1;
     case HL_LINUX_SECCOMP_RET_USER_NOTIF:

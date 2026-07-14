@@ -250,7 +250,6 @@ static int cmsg_read_eventfd_marker(int fd, struct dd_cmsg_eventfd_meta *m) {
     return m->magic == DD_CMSG_EVENTFD_MAGIC;
 }
 
-
 static int cmsg_import_eventfd_trailer(int *fds, int nfds) {
     if (!fds || nfds <= 2) return nfds;
     int cap = nfds / 3 + 1;
@@ -334,7 +333,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
             if (errp) *errp = EINVAL;
             return -1;
         }
-        size_t dlen = (size_t)clen - LX_CMSGHDR;          // payload bytes (e.g. N*4 fds)
+        size_t dlen = (size_t)clen - LX_CMSGHDR; // payload bytes (e.g. N*4 fds)
         int *combo = NULL;
         int combo_cap = 0;
         int combo_n = 0;
@@ -465,9 +464,9 @@ static void cmsg_lx_set_cloexec_fds(uint8_t *g, size_t glen) {
 static size_t cmsg_add_cred(uint8_t *g, size_t off, size_t cap, int pid, int uid, int gid) {
     size_t need = LX_CMSGHDR + 12; // ucred = 3 x u32 = 12
     if (off + need > cap) return off;
-    *(uint64_t *)(g + off) = (uint64_t)need;   // Linux cmsg_len (payload + 16B hdr)
-    *(int *)(g + off + 8) = LX_SOL_SOCKET;     // cmsg_level = SOL_SOCKET(1)
-    *(int *)(g + off + 12) = 2;                // cmsg_type  = SCM_CREDENTIALS(2)
+    *(uint64_t *)(g + off) = (uint64_t)need; // Linux cmsg_len (payload + 16B hdr)
+    *(int *)(g + off + 8) = LX_SOL_SOCKET;   // cmsg_level = SOL_SOCKET(1)
+    *(int *)(g + off + 12) = 2;              // cmsg_type  = SCM_CREDENTIALS(2)
     *(uint32_t *)(g + off + 16) = (uint32_t)pid;
     *(uint32_t *)(g + off + 20) = (uint32_t)uid;
     *(uint32_t *)(g + off + 24) = (uint32_t)gid;
@@ -571,7 +570,7 @@ static int g_sock_pair_peer[DD_NFD];
 // SCM_CREDENTIALS/SO_PEERCRED self-fallback then collapsed to container_pid() == guest 1 for ALL of them.
 // IPC uses that peer pid as a node identity, so every child collided on node "1" and the
 // node-merge never finalized (transport up, but OnChannelConnected never fired -> the child's IO thread
-// blocked in recvmsg -> the 15s EnsureConnected watchdog killed it, before any Wayland/xdg_surface/frame).
+// blocked in recvmsg until its connection watchdog killed it).
 // Stamping each end with a unique id (>= 1<<30, above Linux PID_MAX ~4M so it never aliases a real guest
 // pid the protocol also tracks) gives every child a distinct, non-self node identity whenever LOCAL_PEERPID
 // degenerates to self. Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
@@ -598,7 +597,9 @@ static void seq_mark_wrote(int fd) {
 
 // A forked child inherits the parent's open channel ends but has WRITTEN to none of them yet: clear the
 // whole "wrote" table so a bystander child that closes inherited channel fds injects no spurious peer-EOF.
-static void seq_wrote_after_fork(void) { memset(g_sock_seq_wrote, 0, sizeof g_sock_seq_wrote); }
+static void seq_wrote_after_fork(void) {
+    memset(g_sock_seq_wrote, 0, sizeof g_sock_seq_wrote);
+}
 
 static int sock_alloc_synth_peer(void) {
     static int ctr = 0x40000000; // 1<<30
@@ -805,10 +806,10 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // is keyed by <netid> (mode 0700, the guest is path-jailed) so other networks never share sockets. The
 // 127/8 loopback path (g_netns / lo_*) is untouched and stays per-container; only non-127 in-subnet
 // AF_INET is bridged. Off when g_netbr[0]==0 || g_myip==0.
-static char g_netbr[200];        // shared per-network rendezvous dir ("" = bridge off)
-static uint32_t g_myip;          // this endpoint's IP, network byte order (0 = unset)
+static char g_netbr[200];          // shared per-network rendezvous dir ("" = bridge off)
+static uint32_t g_myip;            // this endpoint's IP, network byte order (0 = unset)
 static uint16_t g_br_port[DD_NFD]; // fd -> virtual port of a bridge socket (0 = not a bridge socket)
-static uint32_t g_br_ip[DD_NFD]; // fd -> virtual IP (network order) reported via getsockname/getpeername
+static uint32_t g_br_ip[DD_NFD];   // fd -> virtual IP (network order) reported via getsockname/getpeername
 static int g_br_init;
 
 // Carry the per-fd socket-emulation metadata (SOCK_STREAM-ness, loopback/bridge port + ip) from `src`
@@ -1496,7 +1497,10 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
 // (network byte order) so only family/len need fixing. AF_UNIX and other families pass through.
 #define LX_AF_INET 2
 #define LX_AF_INET6 10
-static int saxl_on(void) { return 1; }
+
+static int saxl_on(void) {
+    return 1;
+}
 
 // guest domain (Linux) -> host (macOS), for socket()/socketpair(). AF_INET(2)/AF_UNIX(1) match.
 static int af_l2m(int d) {
@@ -1571,6 +1575,7 @@ static int sa_m2l(const struct sockaddr *m, uint8_t *g, socklen_t gcap) {
 // site that calls us, and we re-guard loopback here as a safety net so a VPN never captures 127/8 or ::1.
 static const char *g_egress_socks = NULL; // "host:port"; stays NULL once probed-as-unset
 static int g_egress_probed = 0;
+
 static const char *egress_socks(void) {
     if (!g_egress_probed) {
         g_egress_probed = 1;
@@ -1579,6 +1584,7 @@ static const char *egress_socks(void) {
     }
     return g_egress_socks;
 }
+
 // Should this (already-translated macOS) destination be tunneled? 0 unless the redirect is armed AND the
 // address is a genuine external IPv4/IPv6 (never loopback/unspecified/link-local).
 static int egress_should_redirect(const struct sockaddr *m) {
@@ -1615,31 +1621,40 @@ static int v6_no_route(const struct sockaddr *m) {
     const struct in6_addr *a6 = &((const struct sockaddr_in6 *)m)->sin6_addr;
     return !(IN6_IS_ADDR_LOOPBACK(a6) || IN6_IS_ADDR_UNSPECIFIED(a6) || IN6_IS_ADDR_LINKLOCAL(a6));
 }
+
 // Blocking read/write of exactly `n` bytes (EINTR-retried); 0 = ok, -1 = errno set (peer close = ECONNRESET).
 static int egress_io_write(int fd, const void *buf, size_t n) {
     const uint8_t *p = buf;
     size_t off = 0;
     while (off < n) {
         ssize_t w = write(fd, p + off, n - off);
-        if (w > 0) { off += (size_t)w; continue; }
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
         if (w < 0 && errno == EINTR) continue;
         if (w == 0) errno = ECONNRESET;
         return -1;
     }
     return 0;
 }
+
 static int egress_io_read(int fd, void *buf, size_t n) {
     uint8_t *p = buf;
     size_t off = 0;
     while (off < n) {
         ssize_t r = read(fd, p + off, n - off);
-        if (r > 0) { off += (size_t)r; continue; }
+        if (r > 0) {
+            off += (size_t)r;
+            continue;
+        }
         if (r < 0 && errno == EINTR) continue;
         if (r == 0) errno = ECONNRESET; // proxy closed mid-handshake
         return -1;
     }
     return 0;
 }
+
 // Perform a SOCKS5 CONNECT to the macOS destination `m` over the guest socket `fd`, dialing the proxy in
 // HL_EGRESS_SOCKS. Returns 0 (fd now relayed to the real dest through the tunnel) or -1/errno mirroring
 // connect(). The guest fd is put in blocking mode for the short handshake and its O_NONBLOCK is restored
@@ -1647,23 +1662,38 @@ static int egress_io_read(int fd, void *buf, size_t n) {
 static int egress_connect(int fd, const struct sockaddr *m, socklen_t mlen) {
     (void)mlen;
     const char *hp = egress_socks();
-    if (!hp) { errno = EINVAL; return -1; }
+    if (!hp) {
+        errno = EINVAL;
+        return -1;
+    }
     // Parse the proxy "host:port" (host is an IPv4 loopback literal, e.g. 127.30.0.1).
     const char *colon = strrchr(hp, ':');
-    if (!colon || colon == hp) { errno = EINVAL; return -1; }
+    if (!colon || colon == hp) {
+        errno = EINVAL;
+        return -1;
+    }
     char host[64];
     size_t hl = (size_t)(colon - hp);
-    if (hl >= sizeof host) { errno = EINVAL; return -1; }
+    if (hl >= sizeof host) {
+        errno = EINVAL;
+        return -1;
+    }
     memcpy(host, hp, hl);
     host[hl] = 0;
     int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) { errno = EINVAL; return -1; }
+    if (port <= 0 || port > 65535) {
+        errno = EINVAL;
+        return -1;
+    }
     struct sockaddr_in px;
     memset(&px, 0, sizeof px);
     px.sin_len = sizeof px;
     px.sin_family = AF_INET;
     px.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &px.sin_addr) != 1) { errno = EINVAL; return -1; }
+    if (inet_pton(AF_INET, host, &px.sin_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
 
     int fl = fcntl(fd, F_GETFL);
     int was_nb = (fl >= 0 && (fl & O_NONBLOCK));
@@ -1675,13 +1705,25 @@ static int egress_connect(int fd, const struct sockaddr *m, socklen_t mlen) {
         do {
             cr = connect(fd, (struct sockaddr *)&px, sizeof px);
         } while (cr < 0 && errno == EINTR);
-        if (cr != 0) { e = errno; break; } // proxy down -> report as the connect error
+        if (cr != 0) {
+            e = errno;
+            break;
+        } // proxy down -> report as the connect error
         // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (no auth).
         uint8_t greet[3] = {0x05, 0x01, 0x00};
-        if (egress_io_write(fd, greet, 3) != 0) { e = errno; break; }
+        if (egress_io_write(fd, greet, 3) != 0) {
+            e = errno;
+            break;
+        }
         uint8_t sel[2];
-        if (egress_io_read(fd, sel, 2) != 0) { e = errno; break; }
-        if (sel[0] != 0x05 || sel[1] != 0x00) { e = ECONNREFUSED; break; } // no acceptable auth method
+        if (egress_io_read(fd, sel, 2) != 0) {
+            e = errno;
+            break;
+        }
+        if (sel[0] != 0x05 || sel[1] != 0x00) {
+            e = ECONNREFUSED;
+            break;
+        } // no acceptable auth method
         // CONNECT request: VER, CMD=1, RSV=0, ATYP, addr, port(BE) — copied verbatim from the macOS sockaddr.
         uint8_t req[22];
         int n = 0;
@@ -1703,31 +1745,49 @@ static int egress_connect(int fd, const struct sockaddr *m, socklen_t mlen) {
             memcpy(req + n, &s6->sin6_port, 2);
             n += 2;
         }
-        if (egress_io_write(fd, req, (size_t)n) != 0) { e = errno; break; }
+        if (egress_io_write(fd, req, (size_t)n) != 0) {
+            e = errno;
+            break;
+        }
         // Reply: VER, REP, RSV, ATYP, bound-addr, bound-port. Read the 4-byte header, then drain the bound
         // address (length per ATYP) and 2-byte port so the fd is left clean at the start of the relayed stream.
         uint8_t rep[4];
-        if (egress_io_read(fd, rep, 4) != 0) { e = errno; break; }
+        if (egress_io_read(fd, rep, 4) != 0) {
+            e = errno;
+            break;
+        }
         if (rep[1] != 0x00) { // SOCKS reply code -> map to a connect-style errno
             switch (rep[1]) {
-                case 0x03: e = ENETUNREACH; break;  // network unreachable
-                case 0x04: e = EHOSTUNREACH; break; // host unreachable
-                case 0x05: e = ECONNREFUSED; break; // connection refused
-                case 0x06: e = ETIMEDOUT; break;    // TTL expired
-                default: e = ECONNREFUSED; break;   // general/ruleset/unsupported failure
+            case 0x03: e = ENETUNREACH; break;  // network unreachable
+            case 0x04: e = EHOSTUNREACH; break; // host unreachable
+            case 0x05: e = ECONNREFUSED; break; // connection refused
+            case 0x06: e = ETIMEDOUT; break;    // TTL expired
+            default: e = ECONNREFUSED; break;   // general/ruleset/unsupported failure
             }
             break;
         }
         int skip = (rep[3] == 0x01) ? 4 : (rep[3] == 0x04) ? 16 : -1;
         if (rep[3] == 0x03) { // domain name: 1-byte length prefix
             uint8_t l;
-            if (egress_io_read(fd, &l, 1) != 0) { e = errno; break; }
+            if (egress_io_read(fd, &l, 1) != 0) {
+                e = errno;
+                break;
+            }
             skip = l;
         }
-        if (skip < 0) { e = ECONNREFUSED; break; } // unknown ATYP
+        if (skip < 0) {
+            e = ECONNREFUSED;
+            break;
+        } // unknown ATYP
         uint8_t junk[256];
-        if (skip > 0 && egress_io_read(fd, junk, (size_t)skip) != 0) { e = errno; break; }
-        if (egress_io_read(fd, junk, 2) != 0) { e = errno; break; } // bound port
+        if (skip > 0 && egress_io_read(fd, junk, (size_t)skip) != 0) {
+            e = errno;
+            break;
+        }
+        if (egress_io_read(fd, junk, 2) != 0) {
+            e = errno;
+            break;
+        } // bound port
         rc = 0;
     } while (0);
 
@@ -2105,13 +2165,13 @@ static int64_t nl_recv(int fd, struct iovec *iov, int iovn, int gflags, int *msg
 static void nl_error(int peer, const uint8_t *req_hdr, int err) {
     uint8_t out[36];
     memset(out, 0, sizeof out);
-    *(uint32_t *)(out + 0) = 36;                              // nlmsg_len = hdr(16) + err(4) + echoed hdr(16)
-    *(uint16_t *)(out + 4) = 2;                               // NLMSG_ERROR
-    *(uint16_t *)(out + 6) = 0;                               // nlmsg_flags
+    *(uint32_t *)(out + 0) = 36;                               // nlmsg_len = hdr(16) + err(4) + echoed hdr(16)
+    *(uint16_t *)(out + 4) = 2;                                // NLMSG_ERROR
+    *(uint16_t *)(out + 6) = 0;                                // nlmsg_flags
     *(uint32_t *)(out + 8) = *(const uint32_t *)(req_hdr + 8); // echo the request's seq
-    *(uint32_t *)(out + 12) = (uint32_t)getpid();            // nlmsg_pid == our port id (matches the dumps)
-    *(int32_t *)(out + 16) = (int32_t)err;                   // nlmsgerr.error (negative errno; 0 == ACK)
-    memcpy(out + 20, req_hdr, 16);                           // nlmsgerr.msg = echoed request header
+    *(uint32_t *)(out + 12) = (uint32_t)getpid();              // nlmsg_pid == our port id (matches the dumps)
+    *(int32_t *)(out + 16) = (int32_t)err;                     // nlmsgerr.error (negative errno; 0 == ACK)
+    memcpy(out + 20, req_hdr, 16);                             // nlmsgerr.msg = echoed request header
     ssize_t w = send(peer, out, sizeof out, 0);
     (void)w;
 }
@@ -2355,7 +2415,7 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 // NXDOMAIN (name has no address of any family), NODATA (name exists but not this type), SERVFAIL (transient
 // resolver error), multiple answers, TTL. Other qtypes (MX/TXT/SRV/SOA/NS/CAA/HTTPS/SVCB...) return NOERROR
 // with no answer (NODATA), so a client falls back to A/AAAA -- see the tracked-remaining note in the report.
-#define DD_DNS_NS 0x0b00007fu    // 127.0.0.11, network byte order (bytes 7f 00 00 0b == LE u32 0x0b00007f)
+#define DD_DNS_NS 0x0b00007fu      // 127.0.0.11, network byte order (bytes 7f 00 00 0b == LE u32 0x0b00007f)
 static uint8_t g_dns_sock[DD_NFD]; // fd -> 1 if this fd is an intercepted, socketpair-backed DNS socket
 static int g_dns_peer[DD_NFD];     // fd -> engine-held socketpair end we write synthesized responses into
 

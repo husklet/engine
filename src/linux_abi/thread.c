@@ -188,11 +188,13 @@ __attribute__((constructor)) static void futex_table_ctor(void) {
 // (dev,ino,off), so keys still match across processes); a zero-entry fast path keeps non-shared futexes
 // (every private/anon word, the overwhelming majority) byte-identical and lock-free.
 #define FSHKEY_MAX 4096
+
 static struct {
     uint64_t lo, hi;   // host VA range [lo, hi) of this mapping
     uint64_t dev, ino; // backing object identity (fstat)
     uint64_t foff;     // file offset mapped at `lo`
 } g_shkey[FSHKEY_MAX];
+
 static int g_shkey_n;
 static _Atomic int g_nshkey; // 0 => futex_key is identity (lock-free fast path, no registry scan)
 static pthread_mutex_t g_shkey_m = PTHREAD_MUTEX_INITIALIZER;
@@ -958,7 +960,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int val, const struct ti
         // glibc's pthread_cond_signal/broadcast issue this (bump the internal seq/counter at uaddr2 and wake
         // the condvar's futex at uaddr) -- the old "other ops -> return 0" reported success WITHOUT waking,
         // so every glibc condvar signal was silently dropped (the waiting thread remained blocked on the
-        // in-process Viz/GPU thread's condvar -> the live-window stall).
+        // an in-process helper thread's condvar -> an application stall).
         int do_wake2 = 0;
         int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
         if (rc < 0) return rc; // -EFAULT (bad uaddr2) / -ENOSYS (unknown op|cmp): report to the guest as-is
@@ -1199,7 +1201,7 @@ static int thread_tid_alive(int tid) {
 // Count of currently-live guest threads of THIS process (main + every spawned one still in run_guest). The
 // /proc/<self>/task st_nlink synth reports 2 + this (Linux: `.`, `..`, one subdir per thread) so guest
 // sandbox `IsSingleThreaded` (fstatat st_nlink == 3) and per-tid `IsThreadPresentInProcFS` (fstatat ENOENT
-// on a joined/exited thread) both track the real thread set -- otherwise the GPU process's thread_helpers
+// on a joined/exited thread) both track the real thread set -- otherwise a process's thread helpers
 // spins 30 iterations waiting for a stopped thread's /proc/self/task/<tid> to disappear, then FATALs.
 static int thread_live_count(void) {
     int n = 0;
@@ -1223,7 +1225,10 @@ static int thread_tid_list(int *out, int max, int main_tid) {
         if (tid == 0) tid = main_tid; // init thread -> its guest-visible tid (== pid)
         int dup = 0;
         for (int j = 0; j < n; j++)
-            if (out[j] == tid) { dup = 1; break; }
+            if (out[j] == tid) {
+                dup = 1;
+                break;
+            }
         if (!dup) out[n++] = tid;
     }
     pthread_mutex_unlock(&g_threg_m);

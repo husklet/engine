@@ -10,10 +10,13 @@ typedef struct hl_log_tag_entry {
 } hl_log_tag_entry;
 
 static const hl_log_tag_entry hl_log_tags[] = {
-    {"fs", HL_LOG_TAG_FS},           {"jit", HL_LOG_TAG_JIT},
-    {"syscall", HL_LOG_TAG_SYSCALL}, {"process", HL_LOG_TAG_PROCESS},
-    {"network", HL_LOG_TAG_NETWORK}, {"signal", HL_LOG_TAG_SIGNAL},
-    {"gpu", HL_LOG_TAG_GPU},         {"translate", HL_LOG_TAG_TRANSLATE},
+    {"fs", HL_LOG_TAG_FS},
+    {"jit", HL_LOG_TAG_JIT},
+    {"syscall", HL_LOG_TAG_SYSCALL},
+    {"process", HL_LOG_TAG_PROCESS},
+    {"network", HL_LOG_TAG_NETWORK},
+    {"signal", HL_LOG_TAG_SIGNAL},
+    {"translate", HL_LOG_TAG_TRANSLATE},
 };
 
 const char *hl_log_tag_name(uint32_t tag) {

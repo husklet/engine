@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,7 +30,18 @@
 static long fwait(int *addr, int expected, const struct timespec *to) {
     return syscall(SYS_futex, addr, FUTEX_WAIT, expected, to, NULL, 0);
 }
-static long fwake(int *addr, int n) { return syscall(SYS_futex, addr, FUTEX_WAKE, n, NULL, NULL, 0); }
+
+static long fwake(int *addr, int n) {
+    return syscall(SYS_futex, addr, FUTEX_WAKE, n, NULL, NULL, 0);
+}
+
+static pid_t raw_fork(void) {
+#ifdef SYS_fork
+    return (pid_t)syscall(SYS_fork);
+#else
+    return (pid_t)syscall(SYS_clone, SIGCHLD, 0, NULL, NULL, 0);
+#endif
+}
 
 // A fresh anonymous shared-memory object of one page.
 static int shared_page_fd(void) {
@@ -57,7 +69,7 @@ static void *waiter_thread(void *p) {
             return NULL;
         }
         long rc = fwait(a->word, 0, &to);
-        if (rc == 0) {          // delivered wake (real or spurious): the WAKE reached this address's bucket
+        if (rc == 0) { // delivered wake (real or spurious): the WAKE reached this address's bucket
             a->woke = 1;
             return NULL;
         }
@@ -81,9 +93,9 @@ static int test_two_mappings(void) {
     pthread_t th;
     if (pthread_create(&th, NULL, waiter_thread, &a) != 0) return -1;
     struct timespec nap = {0, 150 * 1000 * 1000};
-    nanosleep(&nap, NULL);                  // let the waiter park in FUTEX_WAIT on mapping A
-    atomic_store((_Atomic int *)&B[0], 1);  // flip the word through mapping B (same physical page)
-    fwake(&B[0], INT_MAX);                   // wake through mapping B's address -> must reach A's waiter
+    nanosleep(&nap, NULL);                 // let the waiter park in FUTEX_WAIT on mapping A
+    atomic_store((_Atomic int *)&B[0], 1); // flip the word through mapping B (same physical page)
+    fwake(&B[0], INT_MAX);                 // wake through mapping B's address -> must reach A's waiter
     pthread_join(th, NULL);
     munmap(A, 4096);
     munmap(B, 4096);
@@ -101,7 +113,8 @@ static int test_xproc(void) {
     P[0] = 0;
     int pipefd[2];
     if (pipe(pipefd) != 0) return -1;
-    pid_t pid = fork();
+    // Use the raw syscall so this fixture isolates the shared-futex key contract from libc's atfork state.
+    pid_t pid = raw_fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         close(pipefd[0]);
@@ -114,10 +127,19 @@ static int test_xproc(void) {
         struct timespec to = {2, 0};
         int woke = 0;
         for (;;) {
-            if (atomic_load((_Atomic int *)C) != 0) { woke = 1; break; } // store beat the park
+            if (atomic_load((_Atomic int *)C) != 0) {
+                woke = 1;
+                break;
+            } // store beat the park
             long rc = fwait(C, 0, &to);
-            if (rc == 0) { woke = 1; break; }                            // delivered cross-process wake
-            if (rc == -1 && errno == ETIMEDOUT) { woke = 0; break; }     // lost across the VA boundary
+            if (rc == 0) {
+                woke = 1;
+                break;
+            } // delivered cross-process wake
+            if (rc == -1 && errno == ETIMEDOUT) {
+                woke = 0;
+                break;
+            } // lost across the VA boundary
         }
         _exit(woke ? 0 : 1);
     }
@@ -125,9 +147,9 @@ static int test_xproc(void) {
     char rb = 0;
     (void)!read(pipefd[0], &rb, 1); // wait until the child has its mapping and is entering the wait
     struct timespec nap = {0, 200 * 1000 * 1000};
-    nanosleep(&nap, NULL);           // let the child actually park in FUTEX_WAIT
+    nanosleep(&nap, NULL); // let the child actually park in FUTEX_WAIT
     atomic_store((_Atomic int *)&P[0], 1);
-    fwake(&P[0], INT_MAX);           // wake through the parent's independent VA
+    fwake(&P[0], INT_MAX); // wake through the parent's independent VA
     int st = 0;
     waitpid(pid, &st, 0);
     munmap(P, 4096);

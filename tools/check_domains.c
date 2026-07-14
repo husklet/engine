@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *const forbidden[] = {"<mach/",         "<sys/event.h>", "<libkern/", "IOSurface",
+static const char *const forbidden[] = {"<mach/",         "<sys/event.h>", "<libkern/",
                                         "CoreFoundation", "windows.h",     "<linux/"};
 
 static int check_file(const char *path) {

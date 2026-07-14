@@ -80,9 +80,7 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
     // Docker --ulimit override wins (g_limits, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
     // requested value, not the dd default. `set` gates each resource so unspecified ones keep the defaults.
-    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) {
-        return;
-    }
+    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) { return; }
     switch (resource) {
     case 3: // RLIMIT_STACK
         o[0] = 8ull << 20;
@@ -213,27 +211,25 @@ static void fork_child_hooks(struct cpu *c) {
     // path (single-threaded parent, or the MAP_JIT fallback) the cache VA and content are unchanged,
     // so the inherited g_xibtc stays valid and is kept warm.
     if (g_dualmap && !g_fork_preserved) G_SHADOW_CLEAR(c);
-    rc_reset(); // S2: invalidate the inherited (COW) path/metadata caches so the child can never serve
-                // an entry the parent populated before the FS diverged (generation bump; see fscache.c)
-    g_ndirs = 0;                 // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
-                                 // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
+    rc_reset();  // S2: invalidate the inherited (COW) path/metadata caches so the child can never serve
+                 // an entry the parent populated before the FS diverged (generation bump; see fscache.c)
+    g_ndirs = 0; // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
+                 // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
     kqueue_rebuild_after_fork(); // macOS kqueue() fds (epoll/timerfd/inotify) don't survive fork ->
                                  // rebuild them so the child doesn't EBADF on its inherited event fds
                                  // (also reinits g_ep_mtx, inherited-locked if a peer forked mid-epoll)
-    thread_after_fork();    // reset process-private thread/futex locks a dead peer may have held at fork
-    seq_wrote_after_fork(); // a forked child has WRITTEN to none of its inherited SEQPACKET/pipe ends yet:
-                            // clear the "wrote" table so a bystander child closing an inherited IPC channel
-                            // end injects no spurious peer-EOF into another process's live channel (see netns.c)
-    sysv_after_fork();      // reset the SysV-shm lock (same fork-unsafe-mutex class)
-    eventfd_after_fork();   // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
-    ts_after_fork();        // drop the inherited task-state slot cache so the child re-claims its own
-    poslk_after_fork();     // re-cache pid; child inherits NONE of the parent's fcntl record locks
-    proc_reg_after_fork();  // publish the fork child in /proc and stop it inheriting the parent's registry path
-    acct_after_fork();      // claim this child's OWN cgroup accounting slot (new host pid, one task)
-    wipefork_apply_child(); // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
-    mlk_reset();            // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
-    hl_gpu_after_fork();    // GPU rung 2: this child can no longer create/map an IOSurface (fork-unsafe) —
-                            // it may only reuse the pre-fork, VM_INHERIT_SHARE'd IOSurface pool it inherited
+    thread_after_fork();         // reset process-private thread/futex locks a dead peer may have held at fork
+    seq_wrote_after_fork();      // a forked child has WRITTEN to none of its inherited SEQPACKET/pipe ends yet:
+                                 // clear the "wrote" table so a bystander child closing an inherited IPC channel
+                                 // end injects no spurious peer-EOF into another process's live channel (see netns.c)
+    sysv_after_fork();           // reset the SysV-shm lock (same fork-unsafe-mutex class)
+    eventfd_after_fork();        // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
+    ts_after_fork();             // drop the inherited task-state slot cache so the child re-claims its own
+    poslk_after_fork();          // re-cache pid; child inherits NONE of the parent's fcntl record locks
+    proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
+    acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
+    wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
+    mlk_reset();                 // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
 }
 
 // ---- runtime credential overlay (USER ns) -------------------------------------------------------
@@ -522,9 +518,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     // setns(fd, nstype): no real namespaces, but a negative/invalid fd must fail EBADF (Linux copies the ns fd
     // first). Fake success on setns(-1, ...) would let isolation setup proceed on a false premise.
-    case 268:
-        G_RET(c) = ((int)a0 < 0) ? (uint64_t)(int64_t)(-EBADF) : 0;
-        break;
+    case 268: G_RET(c) = ((int)a0 < 0) ? (uint64_t)(int64_t)(-EBADF) : 0; break;
     // futex
     case 98: // futex(uaddr, op, val, timeout|nr_wake2=a3, uaddr2=a4, val3=a5); a3 is a timespec* for WAIT
         // ops and a wake count for WAKE_OP -- pass it both ways, the op selects the interpretation.
@@ -1306,9 +1300,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
         case 59: G_RET(c) = 0; break;
         // EINVAL -- so feature probes (e.g. magic "AUXV") fail as on Linux
-        default:
-            G_RET(c) = (uint64_t)(-22);
-            break;
+        default: G_RET(c) = (uint64_t)(-22); break;
         }
         break;
     }
@@ -1389,7 +1381,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             proc_reg_mark_child((int)pid); // guest-pid namespace: register the child NOW (parent-side, race-
                                            // free) so a kill/pidfd membership check can never ESRCH it before
                                            // it runs its own proc_reg_after_fork publish
-            acct_child_born((int)pid); // register the child's OWN task slot (container-wide pids.current)
+            acct_child_born((int)pid);     // register the child's OWN task slot (container-wide pids.current)
         }
         // CLONE_PARENT_SETTID(0x00100000): store the child's tid (its pid) into the PARENT's *ptid (a2).
         // Mutually exclusive with CLONE_PIDFD (which also uses the ptid slot), so it never clobbers a pidfd.
@@ -1503,8 +1495,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
             // ENOENT
         }
-        char *argv[DD_MAXARGV]; // Linux allows far more than 255 args within ARG_MAX -- a fixed 256 silently
-        int ac = 0;             // dropped the tail (a different command ran, and /proc/self/cmdline diverged)
+        char *argv[DD_MAXARGV];        // Linux allows far more than 255 args within ARG_MAX -- a fixed 256 silently
+        int ac = 0;                    // dropped the tail (a different command ran, and /proc/self/cmdline diverged)
         uint64_t *gv = (uint64_t *)a1; // a1 (argv array base) already nonpie_p()'d at the top redirect
         while (gv && gv[ac] && ac < DD_MAXARGV - 1) {
             argv[ac] = (char *)nonpie_p(gv[ac]); // each argv[] element may itself be a low-image pointer
@@ -1912,7 +1904,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (pid > 0) { // parent side of a successful clone3 fork: count it (see case 220)
             atomic_fetch_add(&g_forks_since_boot, 1);
             proc_reg_mark_child((int)pid); // guest-pid namespace: parent-side registration (see case 220)
-            acct_child_born((int)pid); // register the child's OWN task slot (container-wide pids.current)
+            acct_child_born((int)pid);     // register the child's OWN task slot (container-wide pids.current)
         }
         // clone_args: parent_tid = ca[3]. CLONE_PARENT_SETTID stores the child's tid (pid) into the PARENT's
         // parent_tid (a distinct field from pidfd in clone3, so it never conflicts with CLONE_PIDFD).

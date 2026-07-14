@@ -776,7 +776,7 @@ static int elf_is_go_iscgo(const uint8_t *f, size_t sz) {
 static void load_elf(const char *path, struct loaded *out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        perror("open");
+        fprintf(stderr, "hl-engine: cannot open guest ELF %s: %s\n", path, strerror(errno));
         exit(1);
     }
     struct stat st;

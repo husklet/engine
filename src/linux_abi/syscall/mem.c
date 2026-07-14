@@ -216,7 +216,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // (PROT_NONE coverage was already dropped above via gna_clear over the guest-logical range.)
             gmap_split_unmap(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
-            futex_shared_unmap(u_lo, u_hi); // drop/trim shared-futex-key coverage for the released range
+            futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
             wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
             mlk_del(u_lo, u_hi - u_lo);      // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
@@ -377,21 +377,6 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // mmap
     case 222: {
-#ifdef __APPLE__
-        // GPU rung 2 (opt-in): mmap of a synth DRM render-node fd at a MAP_DUMB offset. Mesa's kms_swrast
-        // maps the dumb buffer for CPU software rendering; the buffer is an IOSurface that already lives at
-        // a host VA (== guest VA in this in-process JIT), so decode the handle from the fake offset MAP_DUMB
-        // handed back, look up the surface, and return its base VA directly — no real mmap. Gated on the
-        // render-node tag, so no other mmap is affected (inert unless HL_GPU_IOSURFACE).
-        if (gpu_iosurface_on() && !(a3 & 0x20) && (int)a4 >= 0 && (int)a4 < 1024 && g_devdri[(int)a4]) {
-            uint32_t handle = (uint32_t)((uint64_t)a5 >> 12);
-            int gi = hl_gpu_registry_by_handle(handle);
-            if (gi >= 0) {
-                G_RET(c) = (uint64_t)(uintptr_t)g_gpu_reg[gi].base;
-                break;
-            }
-        }
-#endif
         // A file-backed mmap (not MAP_ANON) whose fd is not a valid open descriptor is -EBADF, and Linux's
         // fget() rejects it BEFORE the length check -- so this must precede the len==0 EINVAL below (LTP
         // mmap08 maps a CLOSED/-1 fd with len 0 and expects EBADF, not EINVAL). macOS mmap otherwise reports
@@ -651,7 +636,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         // stale-translation: a MAP_FIXED mmap REPLACES whatever code lived at the destination VA, so drop any
         // translations cached for it (Linux MAP_FIXED implicitly unmaps the range first).
-        if (r != MAP_FAILED && (a3 & 0x10 /*MAP_FIXED*/)) G_SMC_UNMAP((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1);
+        if (r != MAP_FAILED && (a3 & 0x10 /*MAP_FIXED*/))
+            G_SMC_UNMAP((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1);
         G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -703,8 +689,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // g_rwx_guest latches -- once a JIT guest is present it stays armed across every re-toggle, so
             // SMC coverage is kept, not lost, on a subsequent mprotect(RW)->mprotect(RX). NORWXFIX=1
             // disables, mirroring case 222.
-            if ((int)a2 & PROT_EXEC)
-                g_rwx_guest = 1;
+            if ((int)a2 & PROT_EXEC) g_rwx_guest = 1;
         }
         G_RET(c) = 0;
         break;

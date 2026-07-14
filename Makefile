@@ -7,13 +7,17 @@ DEBUG ?= 0
 MAC ?= mac
 AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
+AARCH64_DYNAMIC_LOADER ?= /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+AARCH64_DYNAMIC_LIBC ?= /usr/lib/aarch64-linux-gnu/libc.so.6
+X86_64_DYNAMIC_LOADER ?= /usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2
+X86_64_DYNAMIC_LIBC ?= /usr/x86_64-linux-gnu/lib/libc.so.6
 
 CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 DEPFLAGS := -MMD -MP
-PRIVATE_HEADERS := src/core/cli.h src/host/sync.h src/linux_abi/encode.h src/translator/guest/x86_64/decoder.h \
+PRIVATE_HEADERS := src/core/cli.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \
 	src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
@@ -37,7 +41,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c src/linux_abi/device.c \
 	src/linux_abi/encode.c src/linux_abi/fdcache.c \
 	src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
-	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/stat.c src/linux_abi/xattr.c
+	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
 COMMON_HOST_SOURCES := src/host/sync.c
@@ -71,7 +75,7 @@ MAC_AUX_OBJECTS := $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/target/x86_64.o \
 	$(BUILD)/mac/lifecycle/aarch64-runner.o $(BUILD)/mac/lifecycle/x86_64-runner.o
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -79,11 +83,14 @@ FIXTURE_SOURCES := $(sort $(wildcard tests/compat/fixtures/*.c))
 FIXTURE_BINS := $(FIXTURE_SOURCES:tests/compat/fixtures/%.c=$(BUILD)/fixtures/%)
 NATIVE_SMOKE := atomics clockelapsed epoll epoll_edge eventfd eventfd_sema forkwait mmapanon mmapshared seccomp statx_agree sysv_ipc timerfd
 NATIVE_SMOKE_BINS := $(NATIVE_SMOKE:%=$(BUILD)/fixtures/%)
-E2E_CASES := atomics epoll_edge eventfd forkwait seccomp sysv_ipc
+E2E_CASES := atomics clockelapsed epoll epoll_dup_lifetime epoll_edge epoll_et epoll_fork_inherit epoll_highfd \
+	epoll_mod epoll_oneshot epoll_reblock_inf eventfd eventfd_nonblock eventfd_sema fd_reuse_guard forkwait \
+	futex futex_shared_key futex_xproc inotify inotify_moves mmapanon mmapshared procreap seccomp signalfd \
+	signalfd_multi signalfd_rt signals stat_layout statx_agree sysv_ipc timerfd timerfd_interval
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines e2e-compat \
+.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
 	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -156,6 +163,10 @@ $(BUILD)/tests/test_fdcache: tests/unit/test_fdcache.c $(BUILD)/lib/libhl-linux-
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
 		$(BUILD)/lib/libhl-host-fake.a -o $@
 
+$(BUILD)/tests/test_seccomp_vm: tests/unit/test_seccomp_vm.c $(BUILD)/lib/libhl-linux-abi.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -o $@
+
 $(BUILD)/tests/test_limits: tests/unit/test_limits.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -pthread -o $@
@@ -204,6 +215,16 @@ $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/dynamic-aarch64: tests/e2e/dynamic_guest.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -fPIE -pie -Wl,--dynamic-linker,/lib/ld-linux-aarch64.so.1 \
+		-Wl,-rpath,/lib $< -o $@
+
+$(BUILD)/e2e/dynamic-x86_64: tests/e2e/dynamic_guest.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -fPIE -pie -Wl,--dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/lib $< -o $@
+
 $(BUILD)/e2e/%-aarch64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static -pthread $< -o $@
@@ -223,13 +244,13 @@ $(BUILD)/mac/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 $(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $< $(MAC_LIBS) -framework IOSurface -framework CoreFoundation
+	$(MAC) clang -o $@ $< $(MAC_LIBS)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $< $(MAC_LIBS) -framework IOSurface -framework CoreFoundation
+	$(MAC) clang -o $@ $< $(MAC_LIBS)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
@@ -262,14 +283,14 @@ $(BUILD)/tools/lifecycle-aarch64: $(BUILD)/mac/lifecycle/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $(filter %.o %.a,$^) -framework IOSurface -framework CoreFoundation
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $(filter %.o %.a,$^) -framework IOSurface -framework CoreFoundation
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
@@ -295,11 +316,11 @@ e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
-	compat-engines
+	$(BUILD)/fixtures/$(1) compat-engines
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/$(1)-aarch64) 0
+		$(abspath $(BUILD)/e2e/$(1)-aarch64) 0 $(abspath $(BUILD)/fixtures/$(1))
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/$(1)-x86_64) 0
+		$(abspath $(BUILD)/e2e/$(1)-x86_64) 0 $(abspath $(BUILD)/fixtures/$(1))
 endef
 
 $(foreach test,$(E2E_CASES),$(eval $(call HL_E2E_CASE_RULE,$(test))))
@@ -319,6 +340,21 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 $(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/rootfs-e2e-runner: tools/rootfs_e2e_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+dynamic-e2e: compat-engines $(BUILD)/tools/rootfs-e2e-runner $(BUILD)/e2e/dynamic-aarch64 \
+	$(BUILD)/e2e/dynamic-x86_64
+	$(BUILD)/tools/rootfs-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/rootfs/aarch64) $(abspath $(BUILD)/e2e/dynamic-aarch64) \
+		$(AARCH64_DYNAMIC_LOADER) $(AARCH64_DYNAMIC_LIBC) /lib/ld-linux-aarch64.so.1 \
+		"dynamic-ok ctor=17 tls=23 file=rootfs-data path=1 arg=probe"
+	$(BUILD)/tools/rootfs-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/rootfs/x86_64) $(abspath $(BUILD)/e2e/dynamic-x86_64) \
+		$(X86_64_DYNAMIC_LOADER) $(X86_64_DYNAMIC_LIBC) /lib64/ld-linux-x86-64.so.2 \
+		"dynamic-ok ctor=17 tls=23 file=rootfs-data path=1 arg=probe"
 
 $(BUILD)/tools/perf-runner: tools/perf_runner.c
 	@mkdir -p $(@D)

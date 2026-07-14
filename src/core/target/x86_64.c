@@ -73,28 +73,28 @@
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
 #include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
-#include "../../translator/cache.c"          // SHARED translator: code cache + block map
-#include "../../translator/guest/x86_64/emit.c"      // x86 engine: arm64 emitters + SSE + x87
+#include "../../translator/cache.c"             // SHARED translator: code cache + block map
+#include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #define HL_X86_DECODER_EXTERNAL 1
 #include "../../translator/guest/x86_64/decode.c" // x86-64 effective-address emission; decoder is in its archive
 #undef HL_X86_DECODER_EXTERNAL
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
-#include "../../linux_abi/thread.c" // SHARED: clone->pthread, per-thread cpu, futex
-#include "../../linux_abi/signal.c" // SHARED: signal delivery driver + translation
-#include "../../translator/guest/x86_64/signal.c" // x86-64 rt_sigframe build/restore
-#include "../../translator/guest/x86_64/legacy.c" // x86 legacy-syscall -> *at normalization
-#include "../../linux_abi/container/vfs.c"   // SHARED: rootfs jail, overlay, /proc synth, stat
-#include "../../linux_abi/container/netns.c" // SHARED: sockets, loopback netns, termios
+#include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
+#include "../../linux_abi/signal.c"                  // SHARED: signal delivery driver + translation
+#include "../../translator/guest/x86_64/signal.c"    // x86-64 rt_sigframe build/restore
+#include "../../translator/guest/x86_64/legacy.c"    // x86 legacy-syscall -> *at normalization
+#include "../../linux_abi/container/vfs.c"           // SHARED: rootfs jail, overlay, /proc synth, stat
+#include "../../linux_abi/container/netns.c"         // SHARED: sockets, loopback netns, termios
 static void load_elf(const char *path, struct loaded *out);
 static int elf_interp(const char *path, char *out, size_t n);
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
-#include "../../linux_abi/syscall/dispatch.c" // SHARED: the canonical syscall layer
-#include "../../linux_abi/sentry.c" // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
+#include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
+#include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../../translator/guest/x86_64/ops.c" // x86 cpuid + x87 m80 block-exit helpers
 #include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
-#include "../dispatch.c"                     // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
-                                             // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
+#include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
+    // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../../translator/guest/x86_64/elf.c" // x86 ELF loader + stack + fault handlers
 
 // ---- entry + main ----
@@ -169,7 +169,8 @@ static void container_init(const char *rootfs) {
         if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(ns && ns[0])) hl_option_set("HL_NETNS", key, 1);
     }
     {
-        const char *vs = hl_option_get("HL_VOLUMES"); // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
+        const char *vs =
+            hl_option_get("HL_VOLUMES"); // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
         if (vs && vs[0]) {
             char tmp[2048];
             snprintf(tmp, sizeof tmp, "%s", vs);
@@ -253,11 +254,6 @@ static int engine_global_init(void) {
     // ptrace tracer/tracee coordination arena -- mmap the shared region ONCE here, BEFORE any guest
     // fork, so every descendant guest process inherits the same physical pages. Inert until a guest ptraces.
     ptrace_arena_init();
-    // Host-IOSurface GPU bridge: force its one-time ObjC/CoreFoundation/Foundation/IOSurface class
-    // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
-    // never be mid-flight when a guest forks (which would abort the child via libobjc's fork-safety guard).
-    // Gated on HL_GPU_IOSURFACE; a no-op for every other workload. Mirrors targets/linux_aarch64.c.
-    hl_gpu_prewarm_fork_safety();
     g_engine_inited = 1;
     return 0;
 }

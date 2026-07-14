@@ -248,7 +248,7 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
 static void load_elf(const char *path, struct loaded *out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        perror("open");
+        fprintf(stderr, "hl-engine: cannot open guest ELF %s: %s\n", path, strerror(errno));
         exit(1);
     }
     struct stat st;

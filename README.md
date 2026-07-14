@@ -18,7 +18,7 @@ build/test helpers. CMake metadata is also provided for installation and Rust `b
 
 Tagged logging is absent from release call sites. Build with `make DEBUG=1` to compile it in, then select tags with
 `HL_LOG=log:fs,log:jit` or the launch wire's `debug_log_offset`. Available tags are `fs`, `jit`, `syscall`, `process`,
-`network`, `signal`, `gpu`, and `translate`; `log:all` enables every tag. Filtering is common portable-core behavior,
+`network`, `signal`, and `translate`; `log:all` enables every tag. Filtering is common portable-core behavior,
 while each host backend only supplies the final byte sink.
 
 ## Domains

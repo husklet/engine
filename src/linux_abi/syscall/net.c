@@ -47,19 +47,19 @@ static int ip6_opt_l2m(int o) {
 // equivalent ones (IP_PKTINFO/IP_MTU_DISCOVER/IP_RECVERR/IP_FREEBIND: no macOS analogue or a divergent struct).
 static int ip_opt_l2m(int o) {
     switch (o) {
-    case 1: return 3;    // IP_TOS
-    case 2: return 4;    // IP_TTL
-    case 3: return 2;    // IP_HDRINCL
-    case 4: return 1;    // IP_OPTIONS
-    case 6: return 5;    // IP_RECVOPTS
-    case 7: return 8;    // IP_RETOPTS
-    case 12: return 24;  // IP_RECVTTL
-    case 32: return 9;   // IP_MULTICAST_IF   (in_addr; ip_mreqn extras are Linux-only -> best-effort)
-    case 33: return 10;  // IP_MULTICAST_TTL
-    case 34: return 11;  // IP_MULTICAST_LOOP
-    case 35: return 12;  // IP_ADD_MEMBERSHIP  (struct ip_mreq: same layout)
-    case 36: return 13;  // IP_DROP_MEMBERSHIP
-    default: return -1;  // unknown / no macOS equivalent -> ignore (never pass a Linux number to macOS IPPROTO_IP)
+    case 1: return 3;   // IP_TOS
+    case 2: return 4;   // IP_TTL
+    case 3: return 2;   // IP_HDRINCL
+    case 4: return 1;   // IP_OPTIONS
+    case 6: return 5;   // IP_RECVOPTS
+    case 7: return 8;   // IP_RETOPTS
+    case 12: return 24; // IP_RECVTTL
+    case 32: return 9;  // IP_MULTICAST_IF   (in_addr; ip_mreqn extras are Linux-only -> best-effort)
+    case 33: return 10; // IP_MULTICAST_TTL
+    case 34: return 11; // IP_MULTICAST_LOOP
+    case 35: return 12; // IP_ADD_MEMBERSHIP  (struct ip_mreq: same layout)
+    case 36: return 13; // IP_DROP_MEMBERSHIP
+    default: return -1; // unknown / no macOS equivalent -> ignore (never pass a Linux number to macOS IPPROTO_IP)
     }
 }
 
@@ -316,7 +316,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // net.local.dgram.maxdgram default (2048), so ANY send > 2048 bytes fails with EMSGSIZE --
                 // whereas a Linux SEQPACKET message is bounded only by SO_SNDBUF (~208KB default) and never
                 // hits a 2KB wall. Large SEQPACKET bootstrap messages require the Linux-sized buffer, and bring-up
-                // messages (the invitation carrying serialized handles, GPU/Viz init IPCs) routinely exceed
+                // messages carrying serialized handles and initialization IPC routinely exceed
                 // 2KB: on the DGRAM backing those sends fail and the message is lost, so the parent/child
                 // handshake wedges forever (the UI thread blocks on a readiness event the child can never
                 // signal -> no window is ever created). Raise SO_SNDBUF/SO_RCVBUF on BOTH ends (a per-socket
@@ -552,7 +552,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             }
             if (r >= 0 && r < DD_NFD) {
-                g_sock_conn[r] = 1;                                          // an accepted socket is already connected
+                g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < DD_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
             if (nr == 242) {
@@ -1092,7 +1092,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     ppid = 1; // peer is the container init -> guest pid 1
                 }
                 uint32_t *u = (uint32_t *)a3;
-                u[0] = (uint32_t)ppid;   // pid (resolved above)
+                u[0] = (uint32_t)ppid; // pid (resolved above)
                 // NOTE: peer uid/gid are reported as this container's identity, NOT the peer's real guest
                 // uid/gid. A truthful per-peer value is infeasible here: (a) macOS LOCAL_PEERCRED yields the
                 // peer's HOST uid, but every container process runs under the same host uid (guest uids are
@@ -1237,7 +1237,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-ENOMEM);
             break;
         }
-        if (nr == 211) {    // sendmsg: translate guest -> host before the call
+        if (nr == 211) { // sendmsg: translate guest -> host before the call
             // Ancillary data may carry SCM_RIGHTS fds to another process; flush all RAM-backed scratch so a
             // passed fd (and any other) is a coherent host file on the receiving side.
             if (gc && gcl) memf_materialize_all();
@@ -1330,7 +1330,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int host_mflags = (int)mh.msg_flags;
             if (!cmsg_trunc && gc && gcl) host_mflags &= ~0x20; // host-side sideband expansion compressed cleanly
             int mfl = msgflags_m2l(host_mflags);
-            if (cred_trunc || (cmsg_trunc && !passcred_active)) mfl |= 0x8; // MSG_CTRUNC
+            if (cred_trunc || (cmsg_trunc && !passcred_active)) mfl |= 0x8;          // MSG_CTRUNC
             if (((int)a2 & 0x40000000) && gc && ln) cmsg_lx_set_cloexec_fds(gc, ln); // MSG_CMSG_CLOEXEC
             *(uint64_t *)(g + 40) = ln;
             *(uint32_t *)(g + 48) = (uint32_t)mfl;

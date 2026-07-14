@@ -195,8 +195,8 @@ static void fd_reset_emul(int fd) {
             }
         }
         if (g_dn_mask[fd]) dnotify_apply(fd, 0, 0); // remove this fd's dnotify (F_NOTIFY) watch before it closes
-        g_lease[fd] = 0;      // release the F_SETLEASE lease this fd held (POSIX: lease dropped on close)
-        g_fsig[fd] = 0;       // drop the fd's F_SETSIG signal so a reused number reports the SIGIO default
+        g_lease[fd] = 0; // release the F_SETLEASE lease this fd held (POSIX: lease dropped on close)
+        g_fsig[fd] = 0;  // drop the fd's F_SETSIG signal so a reused number reports the SIGIO default
         if (g_fd_pushback[fd]) {
             free(g_fd_pushback[fd]);
             g_fd_pushback[fd] = NULL;
@@ -217,10 +217,6 @@ static void fd_reset_emul(int fd) {
         g_devseed[fd] = 0;
         g_devtty[fd] = 0;
         unix_bind_clear(fd);
-#ifdef __APPLE__
-        if (g_devdri[fd]) hl_gpu_free_fd(fd); // release the render node's IOSurfaces on close
-#endif
-        g_devdri[fd] = 0;
         g_lo_port[fd] = 0;
         g_sock_stream[fd] = 0;
         g_sock_conn[fd] = 0;
@@ -500,8 +496,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                   uint64_t a5) {
     const char *operation = fs_operation_name(nr);
     if (operation != NULL)
-        HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "%s nr=%llu a0=%#llx a1=%#llx a2=%#llx", operation,
-                (unsigned long long)nr, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "%s nr=%llu a0=%#llx a1=%#llx a2=%#llx", operation, (unsigned long long)nr,
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     switch (nr) {
     // ===================== Filesystem — open/stat/dir/link/perm/xattr/cwd, all path-confined to the rootfs jail
     // =====================
@@ -537,9 +533,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) =
-            (uint64_t)(int64_t)guest_xattr_get(host, (const char *)a1, (void *)a2, (size_t)a3,
-                                               nr == 9 ? XATTR_NOFOLLOW : 0);
+        G_RET(c) = (uint64_t)(int64_t)guest_xattr_get(host, (const char *)a1, (void *)a2, (size_t)a3,
+                                                      nr == 9 ? XATTR_NOFOLLOW : 0);
         break;
     }
     // listxattr(11)/llistxattr(12)/flistxattr(13): a0=path|fd, a1=list, a2=size
@@ -556,8 +551,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) =
-            (uint64_t)(int64_t)guest_xattr_list(host, (char *)a1, (size_t)a2, nr == 12 ? XATTR_NOFOLLOW : 0);
+        G_RET(c) = (uint64_t)(int64_t)guest_xattr_list(host, (char *)a1, (size_t)a2, nr == 12 ? XATTR_NOFOLLOW : 0);
         break;
     }
     // removexattr(14)/lremovexattr(15)/fremovexattr(16): a0=path|fd, a1=name
@@ -574,8 +568,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) =
-            (uint64_t)(int64_t)guest_xattr_remove(host, (const char *)a1, nr == 15 ? XATTR_NOFOLLOW : 0);
+        G_RET(c) = (uint64_t)(int64_t)guest_xattr_remove(host, (const char *)a1, nr == 15 ? XATTR_NOFOLLOW : 0);
         break;
     }
     case 17: {
@@ -619,23 +612,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // it worked there). This makes both forms match, fixing musl tmux/script/openpty and any high-bit ioctl.
         unsigned long rq = (uint32_t)a1;
         void *arg = (void *)a2;
-        // GPU rung 2 (opt-in): the render node services HL_IOCTL_GPU_ALLOC (host-IOSurface buffer).
-        // Gated on the per-fd render-node tag, so no other fd/ioctl is affected.
-        if (gpu_iosurface_on() && fd >= 0 && fd < DD_NFD && g_devdri[fd] && rq == HL_IOCTL_GPU_ALLOC) {
-            G_RET(c) = (uint64_t)hl_gpu_alloc(fd, arg);
-            break;
-        }
-        // DRM ioctls Mesa (kms_swrast) issues on the render node once it opens the discovered node:
-        // drmGetVersion (VERSION), GET_CAP, SET_CLIENT_CAP, and the dumb-buffer + PRIME set that Mesa's
-        // software GBM winsys uses to allocate/map/export the window buffer (CREATE/MAP/DESTROY_DUMB,
-        // GEM_CLOSE, PRIME_HANDLE_TO_FD). Gated on the render-node tag.
-        if (gpu_iosurface_on() && fd >= 0 && fd < DD_NFD && g_devdri[fd] &&
-            (rq == 0xc0406400 || rq == 0xc0106c0c || rq == 0x400c6d0d || rq == 0xc02064b2 ||
-             rq == 0xc01064b3 || rq == 0xc00464b4 || rq == 0x40086409 || rq == 0xc00c642d)) {
-            int64_t rr = drm_synth_ioctl(fd, rq, arg);
-            G_RET(c) = (uint64_t)rr;
-            break;
-        }
         // macOS pty MASTERS reject every termios/winsize ioctl with ENOTTY -- unlike Linux, where the master
         // accepts them and they act on the shared line discipline (apt/dpkg's StartPtyMagic does TIOCSWINSZ +
         // tcsetattr(TCSANOW) on the master; that ENOTTY is apt's "Setting TIOCSWINSZ for master fd N failed"
@@ -1623,10 +1599,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // Linux mode-combination validity (vfs_fallocate/do_fallocate): the range ops must be used
         // exclusively, otherwise the historical "dispatch on the first matching bit" logic silently ran one
         // op and dropped the rest (e.g. COLLAPSE|KEEP_SIZE shrank the file, ZERO|COLLAPSE overwrote bytes).
-        if (((mode & 0x02) && !(mode & 0x01)) ||           // PUNCH_HOLE requires KEEP_SIZE
-            ((mode & 0x08) && (mode & ~0x08)) ||           // COLLAPSE_RANGE must be used alone
-            ((mode & 0x20) && (mode & ~0x20)) ||           // INSERT_RANGE must be used alone
-            ((mode & 0x40) && (mode & ~(0x40 | 0x01)))) {  // UNSHARE_RANGE only with KEEP_SIZE
+        if (((mode & 0x02) && !(mode & 0x01)) ||          // PUNCH_HOLE requires KEEP_SIZE
+            ((mode & 0x08) && (mode & ~0x08)) ||          // COLLAPSE_RANGE must be used alone
+            ((mode & 0x20) && (mode & ~0x20)) ||          // INSERT_RANGE must be used alone
+            ((mode & 0x40) && (mode & ~(0x40 | 0x01)))) { // UNSHARE_RANGE only with KEEP_SIZE
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -2016,8 +1992,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (resolve & 0x04ULL /*RESOLVE_NO_SYMLINKS*/)
-            oflags |= (uint64_t)G_O_NOFOLLOW;
+        if (resolve & 0x04ULL /*RESOLVE_NO_SYMLINKS*/) oflags |= (uint64_t)G_O_NOFOLLOW;
         a2 = oflags; // open_how.flags -> openat flags
         a3 = omode;  // open_how.mode  -> openat mode
     } /* fall through to openat */
@@ -2128,7 +2103,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 int md = synth_misc_dir_open(rp);
                 if (md != -2) {
                     if (md >= 0 && (lf & 0x80000)) fcntl(md, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
-                    if (md >= 0 && md < DD_NFD) g_opath[md] = is_opath;             // O_PATH fd -> I/O EBADF
+                    if (md >= 0 && md < DD_NFD) g_opath[md] = is_opath;            // O_PATH fd -> I/O EBADF
                     G_RET(c) = md < 0 ? (uint64_t)(-errno) : (uint64_t)md;
                     break;
                 }
@@ -2235,7 +2210,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 int d = syscpu_dir_open(rp);
                 if (d != -2) {
                     if (d >= 0 && (lf & 0x80000)) fcntl(d, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
-                    if (d >= 0 && d < DD_NFD) g_opath[d] = is_opath;               // O_PATH fd -> I/O EBADF
+                    if (d >= 0 && d < DD_NFD) g_opath[d] = is_opath;             // O_PATH fd -> I/O EBADF
                     G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
                     break;
                 }
@@ -2252,38 +2227,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
             }
-            // GPU rung 2 (opt-in): the DRM render-node discovery + allocation path. Inert unless
-            // HL_GPU_IOSURFACE is set (other workloads never touch /dev/dri or the DRM sysfs).
-            if (rp && gpu_iosurface_on()) {
-                int drm_minor = -1;
-                // synthesize /dev/dri/{renderD128,card0} as a placeholder fd tagged as a render node; its
-                // HL_IOCTL_GPU_ALLOC / DRM ioctls (fs.c case 29) service the IOSurface + version/cap probes.
-                if (!strncmp(rp, "/dev/dri/", 9) && drm_dev_minor(rp + 9, &drm_minor)) {
-                    int d = open("/dev/null", O_RDWR); // backing is irrelevant; the ioctl carries the payload
-                    if (d >= 0 && d < DD_NFD) g_devdri[d] = (uint8_t)(drm_minor + 1); // minor+1 (fstat fixup)
-                    if (d >= 0 && (lf & 0x80000)) fcntl(d, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
-                    G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
-                    break;
-                }
-                // the minimal DRM sysfs tree libdrm's drmGetDevices2 walks: opendir the class/drm dirs,
-                // and serve uevent/dev attribute files as content fds.
-                if (!strncmp(rp, "/sys/dev/char/226:", 18) || !strncmp(rp, "/sys/class/drm", 14)) {
-                    int dd = drm_dir_open(rp);
-                    if (dd != -2) {
-                        if (dd >= 0 && (lf & 0x80000)) fcntl(dd, F_SETFD, FD_CLOEXEC);
-                        if (dd >= 0 && dd < 1024) g_opath[dd] = is_opath;
-                        G_RET(c) = dd < 0 ? (uint64_t)(-errno) : (uint64_t)dd;
-                        break;
-                    }
-                    char cb[256];
-                    int cn = drm_synth_content(rp, cb, sizeof cb);
-                    if (cn >= 0) {
-                        int d = synth_str_fd(cb);
-                        G_RET(c) = d < 0 ? (uint64_t)(-errno) : (uint64_t)d;
-                        break;
-                    }
-                }
-            }
             // device nodes -> host devices (rootfs has no real /dev)
             if (rp && !strncmp(rp, "/dev/", 5)) {
                 const char *hd = dev_node_hostpath(rp);
@@ -2293,8 +2236,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if (d >= 0 && d < DD_NFD) g_devfull[d] = !strcmp(rp, "/dev/full");
                     // /dev/tty (and /dev/console, backed by /dev/null): tty read semantics -- a nonblocking
                     // empty read is EAGAIN, never EOF (see g_devtty). Flag the fd so svc_io maps 0->EAGAIN.
-                    if (d >= 0 && d < DD_NFD)
-                        g_devtty[d] = (!strcmp(rp, "/dev/tty") || !strcmp(rp, "/dev/console"));
+                    if (d >= 0 && d < DD_NFD) g_devtty[d] = (!strcmp(rp, "/dev/tty") || !strcmp(rp, "/dev/console"));
                     // This dev open uses only the access mode (mf gains O_NONBLOCK below, after this block),
                     // so propagate the guest's O_NONBLOCK onto the tty fd now -- both so its host reads are
                     // genuinely nonblocking and so F_GETFL reflects it for the 0->EAGAIN remap in svc_io.
@@ -2694,8 +2636,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (p) {
             guest_abspath_at((int)a0, p, gpb, sizeof gpb);
             if (!strcmp(gpb, "/proc") || !strncmp(gpb, "/proc/", 6) || !strncmp(gpb, "/dev/fd/", 8) ||
-                !strncmp(gpb, "/dev/std", 8) || !strncmp(gpb, "/sys/dev/char/226:", 18) ||
-                !strncmp(gpb, "/sys/class/drm", 14))
+                !strncmp(gpb, "/dev/std", 8))
                 gp = gpb;
         }
         // /proc/self (and /proc/thread-self) are magic symlinks to the caller's own pid -- readlink returns
@@ -2855,15 +2796,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     G_RET(c) = (uint64_t)l;
                     break;
                 }
-            }
-        }
-        // DRM sysfs symlinks (subsystem/device classification) libdrm's drmGetDevices2 readlinks.
-        if (p && gpu_iosurface_on() &&
-            (!strncmp(gp, "/sys/dev/char/226:", 18) || !strncmp(gp, "/sys/class/drm", 14))) {
-            int dl = drm_synth_readlink(gp, buf, bs);
-            if (dl >= 0) {
-                G_RET(c) = (uint64_t)dl;
-                break;
             }
         }
         char ep[1024];
@@ -3046,7 +2978,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        if (empty_self) drm_fd_stat_fixup((int)a0, &s); // render-node fstatat("",AT_EMPTY_PATH) -> char dev
         // guest-chown xattr lives on the host backing file: read via fd for AT_EMPTY_PATH, else by path.
         // The stat succeeded above, so validate the guest buffer here (copyout-last) -> bad ptr = -EFAULT.
         if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
@@ -3065,7 +2996,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        drm_fd_stat_fixup((int)a0, &s); // render-node fd -> char dev 226:<minor> (else /dev/null's rdev leaks)
         // The guest stat buffer is filled DIRECTLY by the engine; validate it (after the fd/stat succeeds,
         // so a bad fd still reports EBADF first, matching Linux's copyout-last ordering) so a bad pointer
         // returns -EFAULT instead of faulting the engine (access_ok).
@@ -3250,7 +3180,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)rc;
             break;
         }
-        if (empty) drm_fd_stat_fixup((int)a0, &s); // render-node statx("",AT_EMPTY_PATH) -> char dev 226:<minor>
         // Route ownership through the SHARED virtualization (cuid/cgid default + guest-chown xattr via
         // the cache) so statx's uid/gid are byte-identical to fstat/newfstatat for the same file.
         uint32_t vuid, vgid;
@@ -3388,7 +3317,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // faccessat
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         {
-            const char *gp = (g_rootfs && p && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
+            const char *gp =
+                (g_rootfs && p && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
             if (gp48 && gp48 != (const char *)a1 && !strncmp(gp48, "/proc/", 6)) gp = gp48;
             struct stat ss;
             if (synth_stat_raw(gp, &ss)) {

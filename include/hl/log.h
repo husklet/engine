@@ -12,8 +12,7 @@ typedef enum hl_log_tag {
     HL_LOG_TAG_PROCESS = 1u << 3,
     HL_LOG_TAG_NETWORK = 1u << 4,
     HL_LOG_TAG_SIGNAL = 1u << 5,
-    HL_LOG_TAG_GPU = 1u << 6,
-    HL_LOG_TAG_TRANSLATE = 1u << 7,
+    HL_LOG_TAG_TRANSLATE = 1u << 6,
     HL_LOG_TAG_ALL = (1u << 8) - 1u
 } hl_log_tag;
 

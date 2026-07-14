@@ -36,6 +36,7 @@ add_library(hl-linux-abi STATIC
     src/linux_abi/number.c
     src/linux_abi/parse.c
     src/linux_abi/readonly.c
+    src/linux_abi/seccomp_vm.c
     src/linux_abi/stat.c
     src/linux_abi/xattr.c)
 target_include_directories(hl-linux-abi PUBLIC include)
@@ -86,15 +87,18 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name arena cli codegen config decoder emit fdcache gmap host_services identity ir launch linux_abi stat engine log namespace options profile)
+    foreach(test_name arena cli codegen config decoder emit fdcache gmap host_services identity ir launch linux_abi seccomp_vm stat engine log namespace options profile)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)
         if(test_name STREQUAL "linux_abi" OR test_name STREQUAL "stat" OR test_name STREQUAL "fdcache" OR
-           test_name STREQUAL "gmap")
+           test_name STREQUAL "gmap" OR test_name STREQUAL "seccomp_vm")
             target_link_libraries(test-${test_name} PRIVATE hl-linux-abi)
         endif()
         if(test_name STREQUAL "fdcache")
+            target_include_directories(test-${test_name} PRIVATE src/linux_abi)
+        endif()
+        if(test_name STREQUAL "seccomp_vm")
             target_include_directories(test-${test_name} PRIVATE src/linux_abi)
         endif()
         if(test_name STREQUAL "linux_abi")

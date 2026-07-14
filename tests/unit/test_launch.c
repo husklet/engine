@@ -3,7 +3,6 @@
 #include "test.h"
 
 #include "../../src/core/launch.h"
-#include "../../src/core/options.h"
 #include "hl/config.h"
 
 #include <errno.h>
@@ -21,7 +20,7 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     return 99;
 }
 
-static int write_launch(const char *path, const char *bridge) {
+static int write_launch(const char *path) {
     char pool[96] = {0};
     hl_launch_config config = {0};
     size_t cursor = 1;
@@ -32,15 +31,9 @@ static int write_launch(const char *path, const char *bridge) {
     config.abi = HL_CONFIG_ABI;
     config.uid = -1;
     config.gid = -1;
-    config.gpu_enabled = 1;
     config.arguments_offset = (uint32_t)cursor;
     memcpy(pool + cursor, "guest", 6);
     cursor += 7; // argument terminator plus list terminator
-    if (bridge) {
-        config.gpu_bridge_name_offset = (uint32_t)cursor;
-        memcpy(pool + cursor, bridge, strlen(bridge) + 1);
-        cursor += strlen(bridge) + 1;
-    }
     config.pool_size = (uint32_t)cursor;
     fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0) return -1;
@@ -66,16 +59,7 @@ int main(void) {
     errno = 0;
     HL_CHECK(access(path, F_OK) == -1 && errno == ENOENT);
 
-    hl_option_reset();
-    HL_CHECK(write_launch(path, NULL) == 0);
+    HL_CHECK(write_launch(path) == 0);
     HL_CHECK(hl_run_config_file(path) == 99);
-    HL_CHECK(hl_option_get("HL_GPU_IOSURFACE") != NULL);
-    HL_CHECK(hl_option_get("HL_GPU_BRIDGE_NAME") == NULL);
-
-    hl_option_reset();
-    HL_CHECK(write_launch(path, "org.example.presentation") == 0);
-    HL_CHECK(hl_run_config_file(path) == 99);
-    HL_CHECK(strcmp(hl_option_get("HL_GPU_BRIDGE_NAME"), "org.example.presentation") == 0);
-    hl_option_reset();
     return EXIT_SUCCESS;
 }
