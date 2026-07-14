@@ -1,0 +1,57 @@
+# case	group	source	legacy_source	isas	cflags	defines/env-argv	env	exit	stdout	dependencies	disposition	note
+atomics	final	atomics.c	atomics.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/atomics.out	linux-libc	active	exact source; deterministic checked base registration
+cpuid_features	final	cpuid_features.c	cpuid_features.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/cpuid_features.out	linux-libc	active	exact source; deterministic checked base registration
+dup2redir	final	dup2redir.c	dup2redir.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/dup2redir.out	linux-libc	active	exact source; deterministic checked base registration
+elf210	final	elf210.c	elf210.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/elf210.out	linux-libc	excluded-unsupported-registration	exact source; requires engine-process pcache collision hooks
+execfault	final	execfault.c	execfault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/execfault.out	linux-libc	active	exact source; deterministic checked base registration
+fcntlflags	final	fcntlflags.c	fcntlflags.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/fcntlflags.out	linux-libc	active	exact source; deterministic checked base registration
+forkserver-probe	final	forkserver/probe.c	forkserver/probe.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	42	expected/forkserver_probe.out	linux-libc	excluded-unsupported-registration	exact standalone forkserver probe; output embeds cwd/path and is harness-owned
+forkstorm	final	forkstorm.c	forkstorm.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/forkstorm.out	linux-libc	active	exact source; deterministic checked base registration
+forkwait	final	forkwait.c	forkwait.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/forkwait.out	linux-libc	active	exact source; deterministic checked base registration
+lse_atomics	final	lse_atomics.c	lse_atomics.c	aarch64	-static-pie -O2 -pthread -lm -march=armv8.2-a+lse -mno-outline-atomics	-	-	0	expected/lse_atomics.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_aterr	final	ltp_aterr.c	ltp_aterr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_aterr.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_checkpoint	final	ltp_checkpoint.c	ltp_checkpoint.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_checkpoint.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_dupfcntl	final	ltp_dupfcntl.c	ltp_dupfcntl.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_dupfcntl.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_linkstat	final	ltp_linkstat.c	ltp_linkstat.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_linkstat.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_neterr	final	ltp_neterr.c	ltp_neterr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_neterr.out	linux-libc	active	exact source; deterministic checked base registration
+ltp_procmisc	final	ltp_procmisc.c	ltp_procmisc.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ltp_procmisc.out	linux-libc	active	exact source; deterministic checked base registration
+mkfifo	final	mkfifo.c	mkfifo.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mkfifo.out	linux-libc	active	exact source; deterministic checked base registration
+msg	final	msg.c	msg.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/msg.out	linux-libc	active	exact source; deterministic checked base registration
+neonshm	final	neonshm.c	neonshm.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/neonshm.out	linux-libc	active	exact source; deterministic checked base registration
+net_nonblock	final	net_nonblock.c	net_nonblock.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_nonblock.out	linux-libc	active	exact source; deterministic checked base registration
+net_sendmsg	final	net_sendmsg.c	net_sendmsg.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_sendmsg.out	linux-libc	active	exact source; deterministic checked base registration
+net_sockopt	final	net_sockopt.c	net_sockopt.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_sockopt.out	linux-libc	active	exact source; deterministic checked base registration
+net_tcp	final	net_tcp.c	net_tcp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_tcp.out	linux-libc	active	exact source; deterministic checked base registration
+net_udp	final	net_udp.c	net_udp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_udp.out	linux-libc	active	exact source; deterministic checked base registration
+net_unix	final	net_unix.c	net_unix.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_unix.out	linux-libc	active	exact source; deterministic checked base registration
+nonpie_dladdr	final	nonpie_dladdr.c	nonpie_dladdr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/nonpie_dladdr.out	linux-libc	excluded-unsupported-registration	exact source; requires dynamic non-PIE rootfs/ld.so assembly
+pipeproc	final	pipeproc.c	pipeproc.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pipeproc.out	linux-libc	active	exact source; deterministic checked base registration
+procreap	final	procreap.c	procreap.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/procreap.out	linux-libc	active	exact source; deterministic checked base registration
+rflags_id	final	rflags_id.c	rflags_id.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/rflags_id.out	linux-libc	active	exact source; deterministic checked base registration
+scratch_exec	final	scratch_exec.c	scratch_exec.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/scratch_exec.out	linux-libc	excluded-unsupported-registration	exact source; requires synthesized scratch rootfs execution
+sem	final	sem.c	sem.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sem.out	linux-libc	active	exact source; deterministic checked base registration
+sentry_fork	final	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_fork.out	linux-libc	active	exact source; deterministic checked base registration
+sentry_fs	final	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_fs.out	linux-libc	active	exact source; deterministic checked base registration
+sentry_net	final	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_net.out	linux-libc	active	exact source; deterministic checked base registration
+shm	final	shm.c	shm.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/shm.out	linux-libc	active	exact source; deterministic checked base registration
+shmposix	final	shmposix.c	shmposix.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/shmposix.out	linux-libc	active	exact source; deterministic checked base registration
+signals	final	signals.c	signals.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/signals.out	linux-libc	active	exact source; deterministic checked base registration
+sigurg_preempt	final	sigurg_preempt.c	sigurg_preempt.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigurg_preempt.out	linux-libc	active	exact source; deterministic checked base registration
+sysinfo	final	sysinfo.c	sysinfo.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sysinfo.out	linux-libc	active	exact source; deterministic checked base registration
+sysvshm	final	sysvshm.c	sysvshm.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sysvshm.out	linux-libc	active	exact source; deterministic checked base registration
+threads	final	threads.c	threads.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads.out	linux-libc	active	exact source; deterministic checked base registration
+threads_many	final	threads_many.c	threads_many.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_many.out	linux-libc	active	exact source; deterministic checked base registration
+threads_mutex	final	threads_mutex.c	threads_mutex.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_mutex.out	linux-libc	active	exact source; deterministic checked base registration
+threads_nopie_tls	final	threads_nopie_tls.c	threads_nopie_tls.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/threads_nopie_tls.out	linux-libc	active	exact source; deterministic checked base registration
+thrfork	final	thrfork.c	thrfork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/thrfork.out	linux-libc	active	exact source; deterministic checked base registration
+tls	final	tls.c	tls.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tls.out	linux-libc	active	exact source; deterministic checked base registration
+tlsmodels	final	tlsmodels.c	tlsmodels.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels.out	linux-libc	active	exact source; deterministic checked base registration
+tlsmodels_main	final	tlsmodels_main.c	tlsmodels_main.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels_main.out	linux-libc	active	exact source; deterministic checked base registration
+waitcore	final	waitcore.c	waitcore.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/waitcore.out	linux-libc	active	exact source; deterministic checked base registration
+execfault-crashdbg	variant	execfault.c	execfault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	CRASHDBG=1	0	expected/execfault.out	linux-libc	excluded-unsupported-registration	requires argv mainhandled plus engine-process CRASHDBG
+threads-nopie	variant	threads_mutex.c	threads_mutex.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/threads_mutex.out	linux-libc	excluded-unsupported-registration	duplicate source requires distinct static non-PIE artifact
+sentry-fs-untrusted	variant	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_fs.out	linux-libc	active	exact untrusted registration
+sentry-fs-sandbox	variant	sentry_fs.c	sentry_fs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_SANDBOX=1	0	expected/sentry_fs.out	linux-libc	active	exact public sandbox registration
+sentry-net-untrusted	variant	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_net.out	linux-libc	active	exact untrusted registration
+sentry-fork-untrusted	variant	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_fork.out	linux-libc	active	exact untrusted registration
+sentry-fork-sandbox	variant	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_SANDBOX=1	0	expected/sentry_fork.out	linux-libc	active	exact public sandbox registration
