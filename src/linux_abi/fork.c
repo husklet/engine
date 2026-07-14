@@ -1,4 +1,19 @@
 // linux_abi/fork.c -- W3D: resident engine server fork-server, SHARED by both Linux engines.
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "../host/child.h"
 //
 // WHY: per-launch wall is dominated by the irreducible per-process posix_spawn + dyld +
 // codesign-validation floor of the engine ITSELF (opt8 measured ~2 ms of a ~3-5 ms launch), paid on
@@ -238,7 +253,7 @@ static int unpack_strvec(const char *in, size_t len, size_t *o, char **v, int ma
 
 // ---- runner: the guest process (ONE fork off the resident server); never returns ----
 // The SERVER keeps the control conn: it reports the runner pid right after fork and the raw wait
-// status when kqueue (EVFILT_PROC NOTE_EXIT|NOTE_EXITSTATUS) reports the exit -- one fork per launch,
+// status when the portable child-wake loop reaps it -- one fork per launch,
 // not a supervisor pair (fork of the engine's large address space is THE marginal cost; see).
 #define FSRV_MAXLIVE 256
 
@@ -247,7 +262,8 @@ static struct {
     int conn;
 } g_fsrv_live[FSRV_MAXLIVE]; // in-flight launches (server-side)
 
-static int g_fsrv_ls = -1, g_fsrv_kq = -1;
+static int g_fsrv_ls = -1;
+static hl_host_child_watch g_fsrv_wake = {.read_descriptor = -1, .write_descriptor = -1};
 
 static int hl_forkserver_guest_environment(char *const envv[]) {
     size_t size = 1;
@@ -281,11 +297,12 @@ static int hl_forkserver_guest_environment(char *const envv[]) {
 }
 
 static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **argv, char **envv, const char *cwd) {
-    // Shed every server-side fd so nothing leaks into the guest's fd table: the listener, the kqueue
-    // slot (kqueues are not inherited across fork, but the fd number is), every concurrently live
+    // Shed every server-side fd so nothing leaks into the guest's fd table: the listener, the child-wake
+    // pipe, every concurrently live
     // launch's control conn, and our OWN control conn (the server reports pid/status, not us).
     if (g_fsrv_ls >= 0) close(g_fsrv_ls);
-    if (g_fsrv_kq >= 0) close(g_fsrv_kq);
+    if (g_fsrv_wake.read_descriptor >= 0) close(g_fsrv_wake.read_descriptor);
+    if (g_fsrv_wake.write_descriptor >= 0) close(g_fsrv_wake.write_descriptor);
     for (int i = 0; i < FSRV_MAXLIVE; i++)
         if (g_fsrv_live[i].pid && g_fsrv_live[i].conn >= 0) close(g_fsrv_live[i].conn);
     close(conn);
@@ -362,6 +379,7 @@ static volatile sig_atomic_t g_srv_stop;
 static void srv_sigint(int s) {
     (void)s;
     g_srv_stop = 1;
+    hl_host_child_watch_notify(&g_fsrv_wake);
 }
 
 static int hl_server_main(int argc, char **argv) {
@@ -449,14 +467,15 @@ static int hl_server_main(int argc, char **argv) {
                 (long long)((g_cp - g_cache) / 1024));
     }
 
-    // SIGCHLD stays at the DEFAULT disposition: runners are reaped by the kqueue EVFILT_PROC handler
-    // below (waitpid after NOTE_EXIT), so no SIG_IGN auto-reap -- an ignored SIGCHLD could race a
-    // pid's disappearance before its EVFILT_PROC registration.
-    // SIGINT/SIGTERM stop the event loop. Install WITHOUT SA_RESTART (BSD signal() defaults to
-    // restarting): the handler must make the blocking kevent() return EINTR so the loop rechecks
-    // g_srv_stop -- with SA_RESTART the server is unkillable by anything but SIGKILL.
+    // A nonblocking self-pipe turns SIGCHLD into ordinary poll readiness without losing the race between
+    // reaping and blocking. This is the same portable mechanism on macOS and Linux.
+    if (hl_host_child_watch_init(&g_fsrv_wake) != 0) {
+        perror("child watch");
+        return 1;
+    }
     struct sigaction ssa;
     memset(&ssa, 0, sizeof ssa);
+    sigemptyset(&ssa.sa_mask);
     ssa.sa_handler = srv_sigint;
     sigaction(SIGINT, &ssa, NULL);
     sigaction(SIGTERM, &ssa, NULL);
@@ -488,66 +507,63 @@ static int hl_server_main(int argc, char **argv) {
         g_fsrv_live[i].pid = 0;
         g_fsrv_live[i].conn = -1;
     }
-    int kq = kqueue();
-    if (kq < 0) {
-        perror("kqueue");
-        return 1;
-    }
-    g_fsrv_kq = kq;
-    struct kevent reg;
-    EV_SET(&reg, ls, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    if (kevent(kq, &reg, 1, NULL, 0, NULL) < 0) {
-        perror("kevent(listener)");
-        return 1;
-    }
-
     while (!g_srv_stop) {
-        struct kevent ev;
-        int ne = kevent(kq, NULL, 0, &ev, 1, NULL);
+        struct pollfd watched[FSRV_MAXLIVE + 2];
+        int slots[FSRV_MAXLIVE + 2];
+        nfds_t watched_count = 2;
+        watched[0] = (struct pollfd){.fd = ls, .events = POLLIN};
+        watched[1] = (struct pollfd){.fd = hl_host_child_watch_descriptor(&g_fsrv_wake), .events = POLLIN};
+        slots[0] = slots[1] = -1;
+        for (int i = 0; i < FSRV_MAXLIVE; i++)
+            if (g_fsrv_live[i].pid && g_fsrv_live[i].conn >= 0) {
+                watched[watched_count] =
+                    (struct pollfd){.fd = g_fsrv_live[i].conn, .events = POLLIN | POLLHUP | POLLERR};
+                slots[watched_count++] = i;
+            }
+        int ne = poll(watched, watched_count, -1);
         if (ne < 0) {
             if (errno == EINTR) continue;
-            perror("kevent");
+            perror("poll");
             break;
         }
         if (ne == 0) continue;
-
-        if (ev.filter == EVFILT_PROC) {
-            // A runner terminated: reap it and report its RAW wait status on the saved control conn.
-            // NOTE_EXITSTATUS puts a wait4-style status in ev.data; the waitpid result (which also
-            // clears the zombie) is authoritative when available.
-            int slot = (int)(intptr_t)ev.udata;
-            int st = (int)ev.data, wst;
-            if (waitpid((pid_t)ev.ident, &wst, WNOHANG) > 0) st = wst;
-            if (slot >= 0 && slot < FSRV_MAXLIVE && g_fsrv_live[slot].pid == (pid_t)ev.ident) {
-                if (g_fsrv_live[slot].conn >= 0) {
-                    int32_t s32 = (int32_t)st;
-                    (void)send_full(g_fsrv_live[slot].conn, &s32, 4);
-                    close(g_fsrv_live[slot].conn); // also drops its EVFILT_READ registration
-                }
-                g_fsrv_live[slot].pid = 0;
-                g_fsrv_live[slot].conn = -1;
-            }
-            continue;
+        if (watched[1].revents != 0) {
+            hl_host_child_watch_drain(&g_fsrv_wake);
         }
-        if (ev.filter == EVFILT_READ && (int)ev.ident != ls) {
-            // A live launch's control conn. EOF = the CLIENT died mid-run (e.g. SIGKILL); a standalone
-            // engine would have died with it, so approximate parity by SIGHUPing the runner instead of
-            // orphaning a guest forever. Anything else (stray client data) is drained and ignored.
-            for (int i = 0; i < FSRV_MAXLIVE; i++)
-                if (g_fsrv_live[i].pid && g_fsrv_live[i].conn == (int)ev.ident) {
-                    if (ev.flags & EV_EOF) {
-                        kill(g_fsrv_live[i].pid, SIGHUP);
+        for (int i = 0; i < FSRV_MAXLIVE; i++)
+            if (g_fsrv_live[i].pid) {
+                int status;
+                pid_t reaped = waitpid(g_fsrv_live[i].pid, &status, WNOHANG);
+                if (reaped == g_fsrv_live[i].pid) {
+                    if (g_fsrv_live[i].conn >= 0) {
+                        int32_t status32 = (int32_t)status;
+                        (void)send_full(g_fsrv_live[i].conn, &status32, 4);
                         close(g_fsrv_live[i].conn);
-                        g_fsrv_live[i].conn = -1; // exit still reaps via EVFILT_PROC; nothing to report
-                    } else {
-                        char junk[256];
-                        (void)recv(g_fsrv_live[i].conn, junk, sizeof junk, 0);
                     }
-                    break;
+                    g_fsrv_live[i].pid = 0;
+                    g_fsrv_live[i].conn = -1;
                 }
-            continue;
+            }
+        for (nfds_t index = 2; index < watched_count; ++index) {
+            int slot = slots[index];
+            if (watched[index].revents == 0 || slot < 0 || !g_fsrv_live[slot].pid ||
+                g_fsrv_live[slot].conn != watched[index].fd)
+                continue;
+            if ((watched[index].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                kill(g_fsrv_live[slot].pid, SIGHUP);
+                close(g_fsrv_live[slot].conn);
+                g_fsrv_live[slot].conn = -1;
+            } else if ((watched[index].revents & POLLIN) != 0) {
+                char junk[256];
+                ssize_t received = recv(g_fsrv_live[slot].conn, junk, sizeof junk, 0);
+                if (received == 0) {
+                    kill(g_fsrv_live[slot].pid, SIGHUP);
+                    close(g_fsrv_live[slot].conn);
+                    g_fsrv_live[slot].conn = -1;
+                }
+            }
         }
-        if (ev.filter != EVFILT_READ) continue;
+        if ((watched[0].revents & POLLIN) == 0) continue;
 
         int conn = accept(ls, NULL, NULL);
         if (conn < 0) {
@@ -615,26 +631,9 @@ static int hl_server_main(int argc, char **argv) {
         }
         g_fsrv_live[slot].pid = pid;
         g_fsrv_live[slot].conn = conn;
-        // Watch the conn for client-death EOF, and the runner for exit (+status). If the PROC
-        // registration races an already-exited runner (ESRCH), fall back to a synchronous reap.
-        EV_SET(&reg, conn, EVFILT_READ, EV_ADD, 0, 0, (void *)(intptr_t)slot);
-        (void)kevent(kq, &reg, 1, NULL, 0, NULL);
-        EV_SET(&reg, pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT | NOTE_EXITSTATUS, 0, (void *)(intptr_t)slot);
-        if (kevent(kq, &reg, 1, NULL, 0, NULL) < 0) {
-            int st = 127 << 8;
-            pid_t r;
-            do {
-                r = waitpid(pid, &st, 0);
-            } while (r < 0 && errno == EINTR);
-            if (r < 0) st = 127 << 8;
-            int32_t s32 = (int32_t)st;
-            (void)send_full(conn, &s32, 4);
-            close(conn);
-            g_fsrv_live[slot].pid = 0;
-            g_fsrv_live[slot].conn = -1;
-        }
     }
     close(ls);
+    hl_host_child_watch_close(&g_fsrv_wake);
     unlink(sock);
     return 0;
 }
