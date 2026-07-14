@@ -1310,6 +1310,16 @@ static void thread_exit_others(struct cpu *self) {
 // node + futex_offset. list_op_pending covers a mutex mid-(un)lock and is handled once, at the end.
 #define DD_ROBUST_LIST_LIMIT 2048
 
+// Robust-list links are guest pointers read directly from guest memory, so they do not pass through the
+// syscall dispatcher's pointer translation. A static ET_EXEC can therefore put a low link address in a
+// high-mapped list head. Translate each link before validating or dereferencing it; for PIE, heap, stack,
+// and mmap pointers this is an identity operation.
+static inline uint64_t robust_guest_to_host(uint64_t address) {
+    return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi)
+               ? address + g_nonpie_bias
+               : address;
+}
+
 // If the dying thread still owns *futex_addr, set FUTEX_OWNER_DIED (preserving FUTEX_WAITERS) and wake one
 // waiter. cmpxchg-loops so a concurrent lock/unlock on the same word can't clobber the OWNER_DIED marking.
 static void robust_handle_death(uint64_t futex_addr, int mytid) {
@@ -1338,13 +1348,15 @@ static void futex_robust_exit(struct cpu *c) {
     if (!head || !host_range_mapped((uintptr_t)head, 24)) return;
     uint64_t raw_first = *(uint64_t *)(uintptr_t)head;                // head->list.next (LSB = PI flag)
     long futex_offset = *(long *)(uintptr_t)(head + 8);               // head->futex_offset
-    uint64_t pending = (*(uint64_t *)(uintptr_t)(head + 16)) & ~1ULL; // head->list_op_pending
+    uint64_t pending = robust_guest_to_host(
+        (*(uint64_t *)(uintptr_t)(head + 16)) & ~1ULL);               // head->list_op_pending
     int mytid = cpu_tid(c);
-    uint64_t entry = raw_first & ~1ULL;
+    uint64_t entry = robust_guest_to_host(raw_first & ~1ULL);
     for (int limit = 0; limit < DD_ROBUST_LIST_LIMIT; limit++) {
         if (entry == head) break; // wrapped back to &head->list -> done
         if (!host_range_mapped((uintptr_t)entry, 8)) break;
-        uint64_t next = (*(uint64_t *)(uintptr_t)entry) & ~1ULL; // entry->next
+        uint64_t next = robust_guest_to_host(
+            (*(uint64_t *)(uintptr_t)entry) & ~1ULL);            // entry->next
         if (entry != pending) robust_handle_death(entry + (uint64_t)futex_offset, mytid);
         entry = next;
     }
