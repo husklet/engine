@@ -49,7 +49,8 @@ typedef enum hl_status {
     HL_STATUS_IS_DIRECTORY = 16,
     HL_STATUS_NAME_TOO_LONG = 17,
     HL_STATUS_SYMLINK_LOOP = 18,
-    HL_STATUS_READ_ONLY = 19
+    HL_STATUS_READ_ONLY = 19,
+    HL_STATUS_DISCONNECTED = 20
 } hl_status;
 
 #endif

@@ -193,6 +193,7 @@ static hl_status hl_linux_status_from_errno(int error) {
     case ENAMETOOLONG: return HL_STATUS_NAME_TOO_LONG;
     case ELOOP: return HL_STATUS_SYMLINK_LOOP;
     case EROFS: return HL_STATUS_READ_ONLY;
+    case EPIPE: return HL_STATUS_DISCONNECTED;
     default: return HL_STATUS_IO;
     }
 }

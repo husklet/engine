@@ -662,7 +662,7 @@ int main(void) {
         HL_CHECK(services.file->close(services.context, pipe.value).status == HL_STATUS_OK);
         {
             hl_host_result broken = services.file->write(services.context, pipe.detail, "x", 1);
-            HL_CHECK(broken.status == HL_STATUS_PLATFORM_FAILURE && broken.detail == EPIPE);
+            HL_CHECK(broken.status == HL_STATUS_DISCONNECTED && broken.detail == EPIPE);
         }
         HL_CHECK(services.file->close(services.context, pipe.detail).status == HL_STATUS_OK);
     }

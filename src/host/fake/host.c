@@ -840,7 +840,14 @@ static hl_host_result hl_fake_stream_read(void *context, hl_host_handle stream, 
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     size = fake->stream_sizes[fake->stream_objects[index]];
     size = size == UINT16_MAX ? 0 : size;
-    if (size == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    if (size == 0) {
+        uint32_t peer;
+        for (peer = 0; peer < 16; ++peer)
+            if (fake->stream_handles[peer] != 0 &&
+                fake->stream_objects[peer] == fake->stream_objects[index] && fake->stream_write_ends[peer])
+                break;
+        return peer == 16 ? hl_fake_result(fake, 0) : (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    }
     count = output.size < size ? (uint32_t)output.size : size;
     memcpy(output.data, fake->stream_data[fake->stream_objects[index]], count);
     memmove(fake->stream_data[fake->stream_objects[index]], fake->stream_data[fake->stream_objects[index]] + count,
@@ -855,6 +862,14 @@ static hl_host_result hl_fake_stream_write(void *context, hl_host_handle stream,
     uint32_t size, count;
     if (index < 0 || !fake->stream_write_ends[index] || (input.size != 0 && input.data == NULL))
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    {
+        uint32_t peer;
+        for (peer = 0; peer < 16; ++peer)
+            if (fake->stream_handles[peer] != 0 &&
+                fake->stream_objects[peer] == fake->stream_objects[index] && !fake->stream_write_ends[peer])
+                break;
+        if (peer == 16) return (hl_host_result){HL_STATUS_DISCONNECTED, 0, 0, 0};
+    }
     size = fake->stream_sizes[fake->stream_objects[index]];
     size = size == UINT16_MAX ? 0 : size;
     count = input.size < 1024u - size ? (uint32_t)input.size : 1024u - size;

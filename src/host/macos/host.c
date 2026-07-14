@@ -262,6 +262,7 @@ static hl_status hl_macos_status(int error) {
     case ENAMETOOLONG: return HL_STATUS_NAME_TOO_LONG;
     case ELOOP: return HL_STATUS_SYMLINK_LOOP;
     case EROFS: return HL_STATUS_READ_ONLY;
+    case EPIPE: return HL_STATUS_DISCONNECTED;
     default: return HL_STATUS_PLATFORM_FAILURE;
     }
 }

@@ -12,8 +12,8 @@ typedef struct pipe_object {
 
 static int64_t pipe_error(hl_host_result result) {
     if (result.status == HL_STATUS_OK) return (int64_t)result.value;
-    if (result.detail == EPIPE) return -HL_LINUX_EPIPE;
     switch ((hl_status)result.status) {
+    case HL_STATUS_DISCONNECTED: return -HL_LINUX_EPIPE;
     case HL_STATUS_WOULD_BLOCK: return -HL_LINUX_EAGAIN;
     case HL_STATUS_INTERRUPTED: return -HL_LINUX_EINTR;
     case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
@@ -74,7 +74,7 @@ static uint32_t pipe_readiness(void *opaque, uint32_t interests) {
 
 static hl_host_result pipe_wait_handle(void *opaque) {
     pipe_object *object = opaque;
-    return (hl_host_result){HL_STATUS_OK, 1, object->stream, 0};
+    return (hl_host_result){.status = HL_STATUS_OK, .value = object->stream};
 }
 
 static hl_status pipe_clone(void *opaque, void **child) {
@@ -117,10 +117,12 @@ int64_t hl_linux_pipe_create(hl_linux_abi *linux_abi, uint32_t status_flags, uin
     hl_host_result pair;
     pipe_object *reader, *writer;
     hl_status status;
+    hl_linux_fd installed[2];
     uint32_t host_flags = (status_flags & HL_LINUX_O_NONBLOCK) != 0 ? HL_HOST_STREAM_NONBLOCK : 0;
-    if (linux_abi == NULL || output == NULL ||
-        (status_flags & ~(uint32_t)HL_LINUX_O_NONBLOCK) != 0 || !pipe_services(linux_abi->host))
+    if (linux_abi == NULL || output == NULL || (status_flags & ~(uint32_t)HL_LINUX_O_NONBLOCK) != 0 ||
+        (descriptor_flags & ~(uint32_t)HL_LINUX_FD_CLOEXEC) != 0)
         return -HL_LINUX_EINVAL;
+    if (!pipe_services(linux_abi->host)) return -HL_LINUX_ENOSYS;
     pair = linux_abi->host->stream->pipe_pair(linux_abi->host->context, host_flags);
     if (pair.status != HL_STATUS_OK) return pipe_error(pair);
     reader = malloc(sizeof(*reader));
@@ -135,18 +137,26 @@ int64_t hl_linux_pipe_create(hl_linux_abi *linux_abi, uint32_t status_flags, uin
     *reader = (pipe_object){linux_abi->host, pair.value, 0};
     *writer = (pipe_object){linux_abi->host, pair.detail, 1};
     status = hl_linux_object_install(linux_abi, &pipe_ops, reader, HL_LINUX_OBJECT_PIPE,
-                                     HL_LINUX_O_RDONLY | status_flags, descriptor_flags, &output[0]);
+                                     HL_LINUX_O_RDONLY | status_flags, descriptor_flags, &installed[0]);
     if (status != HL_STATUS_OK) {
         (void)pipe_close(reader);
         (void)pipe_close(writer);
-        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : -HL_LINUX_EIO;
+        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE
+               : status == HL_STATUS_OUT_OF_MEMORY ? -HL_LINUX_ENOMEM
+               : status == HL_STATUS_INVALID_ARGUMENT ? -HL_LINUX_EINVAL
+                                                      : -HL_LINUX_EIO;
     }
     status = hl_linux_object_install(linux_abi, &pipe_ops, writer, HL_LINUX_OBJECT_PIPE,
-                                     HL_LINUX_O_WRONLY | status_flags, descriptor_flags, &output[1]);
+                                     HL_LINUX_O_WRONLY | status_flags, descriptor_flags, &installed[1]);
     if (status != HL_STATUS_OK) {
-        (void)hl_linux_fd_close(linux_abi, output[0], NULL);
+        (void)hl_linux_fd_close(linux_abi, installed[0], NULL);
         (void)pipe_close(writer);
-        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : -HL_LINUX_EIO;
+        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE
+               : status == HL_STATUS_OUT_OF_MEMORY ? -HL_LINUX_ENOMEM
+               : status == HL_STATUS_INVALID_ARGUMENT ? -HL_LINUX_EINVAL
+                                                      : -HL_LINUX_EIO;
     }
+    output[0] = installed[0];
+    output[1] = installed[1];
     return 0;
 }

@@ -141,7 +141,7 @@ int main(void) {
         HL_CHECK(sigaction(SIGPIPE, &defaults, &original) == 0);
         HL_CHECK(services.stream->close(services.context, pipe.value).status == HL_STATUS_OK);
         broken = services.stream->write(services.context, pipe.detail, (hl_host_const_bytes){"x", 1});
-        HL_CHECK(broken.status == HL_STATUS_IO && broken.detail == EPIPE);
+        HL_CHECK(broken.status == HL_STATUS_DISCONNECTED && broken.detail == EPIPE);
         HL_CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
         HL_CHECK(services.stream->close(services.context, pipe.detail).status == HL_STATUS_OK);
     }
@@ -156,7 +156,7 @@ int main(void) {
         HL_CHECK(services.stream->write(services.context, source.detail, (hl_host_const_bytes){"m", 1}).value == 1);
         HL_CHECK(services.stream->close(services.context, destination.value).status == HL_STATUS_OK);
         hl_host_result moved = services.stream->move(services.context, source.value, 0, destination.detail, 0, 1, 0);
-        HL_CHECK(moved.status == HL_STATUS_IO && moved.detail == EPIPE);
+        HL_CHECK(moved.status == HL_STATUS_DISCONNECTED && moved.detail == EPIPE);
         HL_CHECK(services.stream->read(services.context, source.value, (hl_host_bytes){&retained, 1}).value == 1 &&
                  retained == 'm');
         HL_CHECK(sigaction(SIGPIPE, &original, NULL) == 0);
