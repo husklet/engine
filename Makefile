@@ -215,6 +215,14 @@ $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/clock-injected-aarch64: tests/e2e/clock_injected.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+
+$(BUILD)/e2e/clock-injected-x86_64: tests/e2e/clock_injected.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+
 $(BUILD)/e2e/dynamic-aarch64: tests/e2e/dynamic_guest.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -fPIE -pie -Wl,--dynamic-linker,/lib/ld-linux-aarch64.so.1 \
@@ -296,6 +304,7 @@ $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
+	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
@@ -309,6 +318,10 @@ e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --clock-spy \
+		$(abspath $(BUILD)/e2e/clock-injected-aarch64)
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --clock-spy \
+		$(abspath $(BUILD)/e2e/clock-injected-x86_64)
 	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --force-stop \

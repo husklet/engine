@@ -18,9 +18,7 @@ static void eventfd_peer_vacate(int fd) {
     if (owner < 0) return;
     int hi = fcntl(fd, F_DUPFD, 1 << 20);
     if (hi < 0) hi = fcntl(fd, F_DUPFD, 64);
-    if (hi >= 0 && hi != fd) {
-        g_eventfd_peer[owner] = hi + 1;
-    }
+    if (hi >= 0 && hi != fd) { g_eventfd_peer[owner] = hi + 1; }
 }
 
 // Carry dd's virtual-fd emulation state from oldfd to newfd on dup/dup2/dup3/F_DUPFD. Linux duplicated
@@ -112,8 +110,8 @@ static void engine_fd_reloc(int *slot, int newfd) {
 #define DN_MULTISHOT 0x80000000u
 #define DN_VALID (1u | 2u | 4u | 8u | 16u | 32u | DN_MULTISHOT) // ACCESS/MODIFY/CREATE/DELETE/RENAME/ATTRIB
 
-static int8_t g_lease[DD_NFD];   // 0 = no lease; else lease type + 1 (F_RDLCK 0->1, F_WRLCK 1->2, F_UNLCK 2->3)
-static uint8_t g_fsig[DD_NFD];   // per-fd F_SETSIG signal (0 = default); consulted by O_ASYNC + dnotify
+static int8_t g_lease[DD_NFD];     // 0 = no lease; else lease type + 1 (F_RDLCK 0->1, F_WRLCK 1->2, F_UNLCK 2->3)
+static uint8_t g_fsig[DD_NFD];     // per-fd F_SETSIG signal (0 = default); consulted by O_ASYNC + dnotify
 static uint32_t g_dn_mask[DD_NFD]; // per-fd active dnotify mask (0 = no watch)
 static uint8_t g_dn_sig[DD_NFD];   // signal captured for this fd's dnotify watch at arm time
 
@@ -540,7 +538,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 kevent(rfd, &rkv, 1, NULL, 0, NULL);
                 g_tfd_first_oneshot[rfd] = 0;
                 struct timespec tnow;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
                 g_tfd_deadline[rfd] = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec + g_tfd_interval[rfd];
             }
             G_RET(c) = 8;
@@ -1126,8 +1124,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 } else {
                     (void)fcntl((int)a0, F_GETPATH, p);
                 }
-                fprintf(stderr, "[HLFCNTL] pid=%d cpid=%d fd=%d mflags=0x%x lflags=0x%x path=%s\n",
-                        getpid(), container_pid(), (int)a0, r, lf, p);
+                fprintf(stderr, "[HLFCNTL] pid=%d cpid=%d fd=%d mflags=0x%x lflags=0x%x path=%s\n", getpid(),
+                        container_pid(), (int)a0, r, lf, p);
             }
             G_RET(c) = (uint64_t)(unsigned)lf;
             break;

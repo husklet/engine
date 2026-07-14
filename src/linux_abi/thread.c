@@ -490,7 +490,7 @@ static int host_range_mapped(uintptr_t a, size_t len) {
 }
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
-    hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_REALTIME, abs);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, abs);
     abs->tv_sec += ts->tv_sec;
     abs->tv_nsec += ts->tv_nsec;
     if (abs->tv_nsec >= 1000000000) {
@@ -508,8 +508,8 @@ static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
 // large value. Fills `rel` with the remaining time until the deadline, clamped at zero.
 static void futex_rel_from_abs(struct timespec *rel, const struct timespec *deadline) {
     struct timespec rt, mono;
-    hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_REALTIME, &rt);
-    hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &mono);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, &rt);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &mono);
     int64_t drt = (int64_t)(deadline->tv_sec - rt.tv_sec) * 1000000000 + (deadline->tv_nsec - rt.tv_nsec);
     int64_t dmono = (int64_t)(deadline->tv_sec - mono.tv_sec) * 1000000000 + (deadline->tv_nsec - mono.tv_nsec);
     int64_t ns;

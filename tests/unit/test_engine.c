@@ -13,7 +13,7 @@ static int32_t fake_entry(void *context) {
     return 0;
 }
 
-static hl_status fake_start(const hl_host_services *host, const char *rootfs, int argc, const char *const argv[],
+static hl_status fake_start(const hl_host_services *host, const char *rootfs, uint32_t argc, const char *const argv[],
                             hl_host_handle *process) {
     hl_host_result spawned;
     (void)rootfs;

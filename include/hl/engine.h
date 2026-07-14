@@ -48,6 +48,7 @@ typedef struct hl_engine_exit {
 
 HL_API uint32_t hl_engine_abi(void);
 HL_API const char *hl_engine_version(void);
+/* host, its callback-group tables, its context, and config-owned pointers remain valid until destroy. */
 HL_API hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine);
 HL_API hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], hl_engine_exit *out_exit);
 HL_API hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size);

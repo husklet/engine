@@ -15,11 +15,12 @@
 #include <unistd.h>
 
 #include "../../include/hl/config.h"
+#include "../../include/hl/host_services.h"
 #include "launch.h"
 #include "options.h"
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
-int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, const char *rootfs, uint32_t argc, char *const argv[]);
 
 // Read exactly `n` bytes from `fd` into `buf`, looping over short reads. Returns 0 on success, -1 on
 // EOF/error -- a truncated buffer is a hard failure (a partial config must never launch a container).
@@ -218,7 +219,7 @@ static int hl_read_config_file(int fd) {
 
     // rootfs: "" (bare launch) maps to NULL, matching the flag path's `rootfs = NULL` default.
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
-    int rc = hl_run_linux_guest(rootfs[0] ? rootfs : NULL, (int)argument_count, argv2);
+    int rc = hl_run_linux_guest(NULL, rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
     free(wire);

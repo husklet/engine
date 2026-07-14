@@ -28,6 +28,8 @@
 // growing slice toward simple busybox. Unknown opcodes print their bytes and exit —
 // that is the iterative workflow (run -> see unimpl -> add it -> repeat).
 
+#include <limits.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +63,10 @@
 #include "../options.h"
 #include "../cli.h"
 
+/* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
+static const hl_host_services *g_host_services;
+static uint64_t g_host_launch_monotonic_ns;
+
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
@@ -74,6 +80,11 @@
 #include "../../linux_abi/container/vfs/gmap.h"
 #include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
 #include "../../translator/cache.c"             // SHARED translator: code cache + block map
+
+static const hl_host_services *effective_host_services(void) {
+    return g_host_services != NULL ? g_host_services : &g_jit_services;
+}
+
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #define HL_X86_DECODER_EXTERNAL 1
 #include "../../translator/guest/x86_64/decode.c" // x86-64 effective-address emission; decoder is in its archive
@@ -94,7 +105,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 #include "../../translator/guest/x86_64/ops.c" // x86 cpuid + x87 m80 block-exit helpers
 #include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
-    // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
+// keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../../translator/guest/x86_64/elf.c" // x86 ELF loader + stack + fault handlers
 
 // ---- entry + main ----
@@ -337,7 +348,19 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     return c.exit_code;
 }
 
-int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
+int hl_run_linux_guest(const hl_host_services *host, const char *rootfs, uint32_t argument_count, char *const argv[]) {
+    int argc;
+    if (argument_count > (uint32_t)INT_MAX) return 2;
+    argc = (int)argument_count;
+    g_host_services = host;
+    g_host_launch_monotonic_ns = 0;
+    if (host != NULL) {
+        hl_host_result now;
+        if (hl_host_services_validate(host, HL_HOST_CAP_CLOCK) != HL_STATUS_OK) return 70;
+        now = host->clock->monotonic_ns(host->context);
+        if (now.status != HL_STATUS_OK) return 70;
+        g_host_launch_monotonic_ns = now.value;
+    }
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
@@ -465,5 +488,5 @@ int hl_engine_entry(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;
     }
-    return hl_run_linux_guest(rootfs, argc - ai, argv + ai);
+    return hl_run_linux_guest(NULL, rootfs, (uint32_t)(argc - ai), argv + ai);
 }

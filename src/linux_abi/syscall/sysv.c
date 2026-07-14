@@ -1215,7 +1215,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += to->tv_sec;
             deadline.tv_nsec += to->tv_nsec;
             if (deadline.tv_nsec >= 1000000000L) {
@@ -1310,7 +1310,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             did_wait = 1;
             if (have_deadline) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 if (now.tv_sec > deadline.tv_sec ||
                     (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
                     dd_lock(&C->lock);

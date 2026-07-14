@@ -34,7 +34,7 @@ static int mq_check_timeout(uint64_t p, struct timespec *dl, int *have_dl) {
 // single-thread case it blocks exactly as Linux does, since nothing else can change the queue).
 static int mq_block_wait(int have_dl, const struct timespec *dl) {
     struct timespec now;
-    hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_REALTIME, &now);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, &now);
     struct timespec slice = {0, 2 * 1000 * 1000}; // 2ms poll granularity
     if (have_dl) {
         long ds = dl->tv_sec - now.tv_sec;
@@ -107,7 +107,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // are also permitted. (mkstemp ignores `name`, so no name-length check is needed here.)
         {
             unsigned mfd_flags = (unsigned)a1;
-            unsigned mfd_known = 0x1fu; // CLOEXEC|ALLOW_SEALING|HUGETLB|NOEXEC_SEAL|EXEC
+            unsigned mfd_known = 0x1fu;                     // CLOEXEC|ALLOW_SEALING|HUGETLB|NOEXEC_SEAL|EXEC
             if (mfd_flags & 4u) mfd_known |= (0x3fu << 26); // MFD_HUGETLB -> size-log2 bits are valid
             if (mfd_flags & ~mfd_known) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
@@ -577,7 +577,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;
         }
-        if (f & 1u) mlk_wire_current();  // MCL_CURRENT: wire every existing mapping resident now
+        if (f & 1u) mlk_wire_current(); // MCL_CURRENT: wire every existing mapping resident now
         hl_gmap_lock_all((f & 2u) != 0);
         G_RET(c) = 0;
         break;
@@ -593,7 +593,9 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // x86-64 237/238/239/256/279 are mapped to these by sysmap.h.)
     case 235: G_RET(c) = 0; break; // mbind          -> success, no-op
     case 237: G_RET(c) = 0; break; // set_mempolicy  -> success, no-op
-    case 238: G_RET(c) = 0; break; // migrate_pages  -> success, no-op (single NUMA node, nothing to move)
+    case 238:
+        G_RET(c) = 0;
+        break; // migrate_pages  -> success, no-op (single NUMA node, nothing to move)
     // move_pages(pid, count, pages, nodes, status, flags). Single NUMA node here, so nothing ever migrates
     // -- but returning 0 while leaving status[] UNTOUCHED makes a NUMA-introspection guest (numactl --show,
     // libnuma) read an uninitialized buffer. QUERY mode (nodes==NULL) must fill status[] with each page's

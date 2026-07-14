@@ -86,7 +86,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         hl_engine_unlock(engine);
         return HL_STATUS_NOT_SUPPORTED;
     }
-    status = engine->backend->start_process(&engine->host, engine->config.rootfs, argc, argv, &process);
+    status = engine->backend->start_process(&engine->host, engine->config.rootfs, (uint32_t)argc, argv, &process);
     if (status != HL_STATUS_OK) {
         hl_engine_lock(engine);
         engine->state = HL_ENGINE_FINISHED;

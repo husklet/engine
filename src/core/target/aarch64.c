@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -39,6 +40,10 @@
 #include "../options.h"
 #include "../cli.h"
 
+/* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
+static const hl_host_services *g_host_services;
+static uint64_t g_host_launch_monotonic_ns;
+
 #include "../../translator/guest/aarch64/cpu.h"
 #include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
 #include "../../translator/guest/aarch64/stat.c" // the per-arch struct-stat layout os/linux/ fills
@@ -52,6 +57,11 @@
 #include "../../linux_abi/container/vfs/gmap.h"
 // code cache + block map + chaining
 #include "../../translator/cache.c"
+
+static const hl_host_services *effective_host_services(void) {
+    return g_host_services != NULL ? g_host_services : &g_jit_services;
+}
+
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
 #include "../../translator/host/aarch64/asm.c"
 // persistent cross-process translated-code cache (recorded emitters used by stubs.c/translate.c;
@@ -758,7 +768,19 @@ static int hl_restore_checkpoint(const char *rootfs, const char *dir) {
     return ckpt_restore_tree(rootfs, dir);
 }
 
-int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
+int hl_run_linux_guest(const hl_host_services *host, const char *rootfs, uint32_t argument_count, char *const argv[]) {
+    int argc;
+    if (argument_count > (uint32_t)INT_MAX) return 2;
+    argc = (int)argument_count;
+    g_host_services = host;
+    g_host_launch_monotonic_ns = 0;
+    if (host != NULL) {
+        hl_host_result now;
+        if (hl_host_services_validate(host, HL_HOST_CAP_CLOCK) != HL_STATUS_OK) return 70;
+        now = host->clock->monotonic_ns(host->context);
+        if (now.status != HL_STATUS_OK) return 70;
+        g_host_launch_monotonic_ns = now.value;
+    }
     // Resume a previously checkpointed workspace instead of launching a program (the embedding host sets this on
     // window reopen; the container config/env is otherwise identical to the original launch).
     const char *rdir = hl_option_get("HL_RESTORE_DIR");
@@ -925,7 +947,7 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
-    if (hl_option_get("HL_RESTORE_DIR")) return hl_run_linux_guest(rootfs, 0, NULL); // resume without an ELF arg
+    if (hl_option_get("HL_RESTORE_DIR")) return hl_run_linux_guest(NULL, rootfs, 0, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
                 "usage: %s [--rootfs DIR] [--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
@@ -935,5 +957,5 @@ int hl_engine_entry(int argc, char **argv) {
                 argv[0], argv[0]);
         return 2;
     }
-    return hl_run_linux_guest(rootfs, argc - ai, argv + ai);
+    return hl_run_linux_guest(NULL, rootfs, (uint32_t)(argc - ai), argv + ai);
 }

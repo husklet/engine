@@ -5,8 +5,8 @@
 
 typedef struct hl_engine_backend {
     uint32_t guest_isa;
-    hl_status (*start_process)(const hl_host_services *host, const char *rootfs, int argc, const char *const argv[],
-                               hl_host_handle *process);
+    hl_status (*start_process)(const hl_host_services *host, const char *rootfs, uint32_t argc,
+                               const char *const argv[], hl_host_handle *process);
 } hl_engine_backend;
 
 void hl_engine_backend_register(const hl_engine_backend *backend);

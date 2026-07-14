@@ -614,7 +614,9 @@ static void emit_prologue(void) {
 // clears it. Runtime rather than a static per-block flag because blocks CHAIN without spilling, so a
 // vector-dirty region can reach a statically-"clean" syscall block with host xmm != cpu->V. A syscall that
 // writes cpu->V (sigreturn) is republished by the prologue reload, so xmm state is never lost.
-static int slimsys_on(void) { return 1; }
+static int slimsys_on(void) {
+    return 1;
+}
 
 // Mark cpu->V as possibly-stale for a later syscall exit (x28 is the nonzero cpu pointer, so storing it
 // flags dirty). ONCE-PER-TRACE latch (g_vmark_done), not per-write: the v0.9.19-as-shipped per-instruction
@@ -755,8 +757,8 @@ anchor:;
     // Anchor CNTVCT against the host clocks in one tight instant (base_ticks <-> base_ns).
     struct timespec tm, tr;
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(g_cal_base_ticks));
-    clock_gettime(CLOCK_MONOTONIC, &tm);
-    clock_gettime(CLOCK_REALTIME, &tr);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tm);
+    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, &tr);
     g_cal_mono_ns = (uint64_t)tm.tv_sec * 1000000000ull + (uint64_t)tm.tv_nsec;
     g_cal_real_ns = (uint64_t)tr.tv_sec * 1000000000ull + (uint64_t)tr.tv_nsec;
 }

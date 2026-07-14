@@ -196,8 +196,8 @@ static int svc_adjtimex(uint8_t *tx) {
     if (!tx || !host_range_mapped((uintptr_t)tx, 96)) return -EFAULT;
     uint32_t modes = *(uint32_t *)(tx + 0);
     if (modes != 0) return -EPERM; // any clock-adjusting call -> EPERM (no CAP_SYS_TIME)
-    struct timeval now;
-    gettimeofday(&now, NULL);
+    struct timespec now;
+    if (hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, &now) != 0) return -EIO;
     *(int64_t *)(tx + 8) = 0;         // offset (us)
     *(int64_t *)(tx + 16) = 0;        // freq (scaled ppm)
     *(int64_t *)(tx + 24) = 16384;    // maxerror (us)
@@ -207,7 +207,7 @@ static int svc_adjtimex(uint8_t *tx) {
     *(int64_t *)(tx + 56) = 1;        // precision (us)
     *(int64_t *)(tx + 64) = 32768000; // tolerance (default)
     *(int64_t *)(tx + 72) = now.tv_sec;
-    *(int64_t *)(tx + 80) = now.tv_usec;
+    *(int64_t *)(tx + 80) = now.tv_nsec / 1000;
     *(int64_t *)(tx + 88) = 10000; // tick (us)
     return 0;                      // TIME_OK
 }

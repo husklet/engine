@@ -70,7 +70,7 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
 // A single mutex serializes the W3E per-instance state (changelist/prime/armed maps) whenever guest
 // threads exist; the single-threaded path is untouched (g_threaded == 0 -> no lock, no wake, no change).
 #define EP_WAKE_IDENT ((uintptr_t)0x7fffffe0u) // EVFILT_USER ident, disjoint from any real fd number
-static uint8_t g_ep_wake_armed[DD_NFD];          // per epoll fd: EVFILT_USER wake knote installed on its kqueue
+static uint8_t g_ep_wake_armed[DD_NFD];        // per epoll fd: EVFILT_USER wake knote installed on its kqueue
 static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
 // per-epoll-instance registered-fd membership (lazily allocated DD_NFD-bit bitmap indexed by the
 // watched fd -- the bitmap must span the SAME index range as the fd < DD_NFD guard on ep_mem_test/
@@ -238,7 +238,7 @@ static void kqueue_rebuild_after_fork(void) {
         // deadline back to a relative first delay), rather than leaving the child's timer disarmed.
         if (g_timerfd[fd] && g_tfd_deadline[fd] > 0) {
             struct timespec now;
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
             int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
             int64_t iv = g_tfd_interval[fd];
             int64_t delay = g_tfd_deadline[fd] - now_ns;
@@ -331,6 +331,7 @@ static int poll_sigmask_enter(struct cpu *c, uint64_t smptr, uint64_t *saved) {
     c->sigmask = nm;
     return 1;
 }
+
 // Restore the pre-wait mask. A signal that became deliverable under the temporary mask but is blocked under
 // the restored mask must still run its handler (Linux delivers it during the wait, then restores the mask on
 // return) -- force exactly those bits via g_force_deliver, mirroring rt_sigsuspend (signal.c case 133).
@@ -387,10 +388,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (fds[0] >= 0 && fds[0] < DD_NFD) {
             g_eventfd_peer[fds[0]] = peer + 1;
             g_eventfd_cslot[fds[0]] = fds[0] + 1;
-            g_eventfd_sema[fds[0]] = (a1 & 1) != 0; // EFD_SEMAPHORE
+            g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
             g_eventfd_gnb[fds[0]] = (a1 & 0x800) != 0; // EFD_NONBLOCK -> guest wants non-blocking reads
-            g_eventfd_count[fds[0]] = a0;           // initval
-            g_eventfd_refs[fds[0]] = 1;             // one alias (this fd); dup() bumps it (fd_carry_virt)
+            g_eventfd_count[fds[0]] = a0;              // initval
+            g_eventfd_refs[fds[0]] = 1;                // one alias (this fd); dup() bumps it (fd_carry_virt)
             if (a0 > 0) {
                 char b = 1;
                 if (write(peer, &b, 1) < 0) {}
@@ -607,7 +608,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // poll behaves as before.
         struct timespec deadline = {0, 0};
         if (tmo > 0) {
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += tmo / 1000;
             deadline.tv_nsec += (long)(tmo % 1000) * 1000000L;
             if (deadline.tv_nsec >= 1000000000L) {
@@ -625,7 +626,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 tp = &ts; // non-blocking poll
             } else if (tmo > 0) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (rem < 0) rem = 0;
                 ts.tv_sec = (time_t)(rem / 1000000000LL);
@@ -733,7 +734,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (oi == 0 && tmo != 0) {
                 if (tmo < 0) continue;
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (rem > 0) continue;
             }
@@ -866,7 +867,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         struct timespec deadline = {0, 0};
         if (have_to) {
             struct timespec ts = *(struct timespec *)a4;
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += ts.tv_sec;
             deadline.tv_nsec += ts.tv_nsec;
             if (deadline.tv_nsec >= 1000000000L) {
@@ -880,7 +881,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             struct timespec rem, *tsp = NULL;
             if (have_to) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (ns < 0) ns = 0;
                 rem.tv_sec = (time_t)(ns / 1000000000LL);
@@ -898,7 +899,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (sm_on) poll_sigmask_leave(c, sm_saved);
         if (r >= 0 && have_to) {
             struct timespec now;
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
             int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
             if (ns < 0) ns = 0;
             ((struct timespec *)a4)->tv_sec = (time_t)(ns / 1000000000LL);
@@ -960,7 +961,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // (the select02-class hang) and every finite wait overshoots. Capture the deadline once.
         struct timespec deadline = {0, 0};
         if (have_to && tmo_full > 0) {
-            hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += tmo_full / 1000;
             deadline.tv_nsec += (long)(tmo_full % 1000) * 1000000L;
             if (deadline.tv_nsec >= 1000000000L) {
@@ -974,7 +975,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             int tmo = tmo_full;
             if (have_to && tmo_full > 0) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t ms =
                     (int64_t)(deadline.tv_sec - now.tv_sec) * 1000LL + (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
                 tmo = ms < 0 ? 0 : (ms > 0x7fffffff ? 0x7fffffff : (int)ms);
@@ -993,7 +994,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             struct timespec left = {0, 0};
             if (tmo_full > 0) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (ns > 0) {
                     left.tv_sec = (time_t)(ns / 1000000000LL);
@@ -1173,7 +1174,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             int64_t oiv = (ofd >= 0 && ofd < DD_NFD) ? g_tfd_interval[ofd] : 0;
             if (odl > 0) {
                 struct timespec onow;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &onow);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &onow);
                 int64_t onow_ns = (int64_t)onow.tv_sec * 1000000000LL + onow.tv_nsec;
                 int64_t orem = odl - onow_ns;
                 if (orem < 0 && oiv > 0) orem += ((-orem) / oiv + 1) * oiv;
@@ -1200,7 +1201,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             // disarm
         }
         struct timespec now;
-        hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+        hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
         int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
         // TFD_TIMER_ABSTIME (flags bit 1): it_value is an ABSOLUTE deadline expressed in the TIMER'S OWN
         // clock. The kqueue EVFILT_TIMER delay is always RELATIVE, so convert by subtracting "now" IN THAT
@@ -1211,9 +1212,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if ((int)a1 & 1) {
             int clkid = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_tfd_clock[(int)a0] : 1;
             // Linux CLOCK_REALTIME(0)/REALTIME_ALARM(8) are wall-clock; everything else is monotonic-scale.
-            clockid_t tc = (clkid == 0 || clkid == 8) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
             struct timespec tnow;
-            clock_gettime(tc, &tnow);
+            int service_clock =
+                (clkid == 0 || clkid == 8) ? HL_PRODUCTION_CLOCK_REALTIME : HL_PRODUCTION_CLOCK_MONOTONIC;
+            hl_production_clock_gettime(effective_host_services(), service_clock, &tnow);
             int64_t tnow_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
             first_delay = value_ns - tnow_ns;
         } else {
@@ -1270,7 +1272,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             int64_t interval = (fd >= 0 && fd < DD_NFD) ? g_tfd_interval[fd] : 0;
             if (deadline > 0) {
                 struct timespec now;
-                hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
                 int64_t rem = deadline - now_ns;
                 if (rem < 0 && interval > 0) rem += ((-rem) / interval + 1) * interval; // next periodic tick

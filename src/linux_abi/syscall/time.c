@@ -58,14 +58,22 @@ static int g_gtimer_thr_up;
 static pthread_mutex_t g_gtimer_lk = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t gtimer_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    uint64_t value = 0;
+    (void)hl_production_clock_nanoseconds(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &value);
+    return value;
 }
 
 // guest clockid -> macOS clockid (only REALTIME vs MONOTONIC matters for the abstime "now" read)
 static clockid_t gtimer_hostclock(int clk) {
     return (clk == 0 || clk == 5) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+}
+
+static int engine_clock_gettime(clockid_t clock_id, struct timespec *output) {
+    if (clock_id == CLOCK_REALTIME)
+        return hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, output);
+    if (clock_id == CLOCK_MONOTONIC)
+        return hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, output);
+    return clock_gettime(clock_id, output);
 }
 
 // arm/re-arm slot `id`'s EVFILT_TIMER. Caller holds g_gtimer_lk. value_ns = delay to the next fire
@@ -219,7 +227,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // a full re-sleep). Compute the deadline once and re-sleep only the true remainder, so an internal
         // wakeup never extends the sleep and a deliverable guest signal returns EINTR with rem correctly set.
         struct timespec now, deadline;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        engine_clock_gettime(CLOCK_MONOTONIC, &deadline);
         deadline.tv_sec += req->tv_sec;
         deadline.tv_nsec += req->tv_nsec;
         if (deadline.tv_nsec >= 1000000000L) {
@@ -230,7 +238,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int r = 0;
         for (;;) {
             struct timespec d;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+            engine_clock_gettime(CLOCK_MONOTONIC, &now);
             d.tv_sec = deadline.tv_sec - now.tv_sec;
             d.tv_nsec = deadline.tv_nsec - now.tv_nsec;
             if (d.tv_nsec < 0) {
@@ -247,7 +255,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // A deliverable guest signal (or a real error): surface it, writing the remaining time to rem.
             if (a1 && host_range_mapped((uintptr_t)a1, sizeof(struct timespec))) {
                 struct timespec rem;
-                clock_gettime(CLOCK_MONOTONIC, &now);
+                engine_clock_gettime(CLOCK_MONOTONIC, &now);
                 rem.tv_sec = deadline.tv_sec - now.tv_sec;
                 rem.tv_nsec = deadline.tv_nsec - now.tv_nsec;
                 if (rem.tv_nsec < 0) {
@@ -283,7 +291,10 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         default: mc = CLOCK_MONOTONIC; break;
         }
         struct timespec ts;
-        clock_gettime(mc, &ts);
+        if (engine_clock_gettime(mc, &ts) != 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EIO);
+            break;
+        }
         // clock_gettime(clk, NULL) is -EFAULT on Linux -- UNLIKE gettimeofday(NULL)/clock_getres(clk,NULL),
         // which are legal no-ops that return 0. The kernel unconditionally copies the result out, so a NULL
         // or otherwise-bad buffer faults. Validate the full 16 bytes; host_range_mapped(NULL,16) probes addr
@@ -365,7 +376,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // recompute the remaining (deadline - now) against the ABSOLUTE deadline, not nanosleep's
             // own relative remainder, so accumulated scheduling slop never shortens the sleep.
             for (;;) {
-                clock_gettime(mc, &now);
+                engine_clock_gettime(mc, &now);
                 d.tv_sec = req->tv_sec - now.tv_sec;
                 d.tv_nsec = req->tv_nsec - now.tv_nsec;
                 if (d.tv_nsec < 0) {
@@ -374,7 +385,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 }
                 if (d.tv_sec < 0 || (d.tv_sec == 0 && d.tv_nsec <= 0)) break; // deadline passed
                 if (nanosleep(&d, NULL) == 0) break;
-                if (errno != EINTR) break; // genuine host error -> stop
+                if (errno != EINTR) break;                                // genuine host error -> stop
                 if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) break; // execve teardown: stop re-sleeping
                 // A deliverable guest signal must surface EINTR so the dispatcher runs the handler (Linux
                 // clock_nanosleep returns EINTR here); only a spurious/internal wakeup re-sleeps the true
@@ -409,7 +420,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // preemption); (2) macOS coalesces timer wakeups by ~1-2.5ms, blowing LTP nanosleep01's 450us
         // threshold, so a scoped real-time policy makes the wakeup precise. (LTP nanosleep01/nanosleep02.)
         struct timespec now, deadline;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        engine_clock_gettime(CLOCK_MONOTONIC, &deadline);
         deadline.tv_sec += req->tv_sec;
         deadline.tv_nsec += req->tv_nsec;
         if (deadline.tv_nsec >= 1000000000L) {
@@ -420,7 +431,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int rr = 0;
         for (;;) {
             struct timespec d;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+            engine_clock_gettime(CLOCK_MONOTONIC, &now);
             d.tv_sec = deadline.tv_sec - now.tv_sec;
             d.tv_nsec = deadline.tv_nsec - now.tv_nsec;
             if (d.tv_nsec < 0) {
@@ -436,7 +447,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (svc_poll_retry(c)) continue; // internal/spurious wakeup -> re-sleep the true remainder
             if (a3) {                        // deliverable guest signal: report the remaining time in rem
                 struct timespec rem;
-                clock_gettime(CLOCK_MONOTONIC, &now);
+                engine_clock_gettime(CLOCK_MONOTONIC, &now);
                 rem.tv_sec = deadline.tv_sec - now.tv_sec;
                 rem.tv_nsec = deadline.tv_nsec - now.tv_nsec;
                 if (rem.tv_nsec < 0) {
@@ -476,16 +487,19 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // which copy_to_user()s tv first and then tz. The old handler validated only `tv` and silently
         // ignored `tz`, so a valid-tv/bad-tz call wrongly succeeded. Validate both (tz is obsolete but the
         // kernel still writes the 8-byte struct timezone when the pointer is non-NULL).
-        struct timeval tv;
-        gettimeofday(&tv, 0);
+        struct timespec realtime;
+        if (engine_clock_gettime(CLOCK_REALTIME, &realtime) != 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EIO);
+            break;
+        }
         uint64_t *g = (uint64_t *)a0;
         if (g) {
             if (!host_range_mapped((uintptr_t)a0, 16)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            g[0] = tv.tv_sec;
-            g[1] = tv.tv_usec;
+            g[0] = (uint64_t)realtime.tv_sec;
+            g[1] = (uint64_t)realtime.tv_nsec / UINT64_C(1000);
         }
         if (a1) { // struct timezone (deprecated). Validate for EFAULT like the kernel's copy_to_user, but do
                   // NOT write it: modern Linux fills it with zeros and no caller reads it, while writing a
@@ -662,7 +676,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int64_t offset_ns;
         if (a1 & 1) { // TIMER_ABSTIME: it_value is an absolute deadline in the timer's clock
             struct timespec cn;
-            clock_gettime(gtimer_hostclock(t->clockid), &cn);
+            engine_clock_gettime(gtimer_hostclock(t->clockid), &cn);
             uint64_t cnow = (uint64_t)cn.tv_sec * 1000000000ull + (uint64_t)cn.tv_nsec;
             uint64_t deadline = vls * 1000000000ull + vln;
             offset_ns = (int64_t)deadline - (int64_t)cnow;      // may be negative (deadline already passed)

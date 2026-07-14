@@ -353,7 +353,7 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
         hl_option_unset("HL_PCACHE");
         hl_option_unset("HL_PCACHE_DIR");
     }
-    _exit(hl_run_linux_guest(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv));
+    _exit(hl_run_linux_guest(g_host_services, g_srv_rootfs[0] ? g_srv_rootfs : NULL, (uint32_t)argc, argv));
 }
 
 // ---- server ----
