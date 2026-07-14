@@ -414,6 +414,22 @@ static int hl_macos_pread_fill(int descriptor, void *buffer, size_t size, off_t 
     return 0;
 }
 
+/* Darwin has no portable mmap flag with Linux MAP_FIXED_NOREPLACE semantics.  Claim the
+ * destination atomically with Mach first: VM_FLAGS_FIXED, unlike VM_FLAGS_OVERWRITE,
+ * fails when any part is occupied.  Once claimed, MAP_FIXED can only replace our own
+ * reservation; non-fixed mappings cannot race into it. */
+static hl_host_result hl_macos_reserve_exact(uint64_t address, uint64_t size) {
+    mach_vm_address_t reserved = (mach_vm_address_t)address;
+    kern_return_t status = mach_vm_allocate(mach_task_self(), &reserved, (mach_vm_size_t)size, VM_FLAGS_FIXED);
+    if (status == KERN_SUCCESS) return hl_macos_result(HL_STATUS_OK, 0, 0);
+    if (status == KERN_NO_SPACE || status == KERN_MEMORY_PRESENT)
+        return hl_macos_result(HL_STATUS_ALREADY_EXISTS, 0, 0);
+    if (status == KERN_INVALID_ADDRESS || status == KERN_INVALID_ARGUMENT)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (status == KERN_RESOURCE_SHORTAGE) return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, (uint32_t)status, 0);
+}
+
 static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint64_t requested_address,
                                         uint64_t offset, uint64_t size, uint32_t protection, uint32_t flags,
                                         hl_host_file_mapping *output) {
@@ -436,7 +452,6 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
         (placement != 0 && requested_address == 0))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) return hl_macos_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
     descriptor = hl_macos_file_descriptor(host, file, 0);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (placement == 0 && sharing == HL_HOST_MEMORY_PRIVATE && (offset % (uint64_t)page) != 0) {
@@ -512,9 +527,18 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     native_flags = sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE;
     if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) {
+        hl_host_result reserved = hl_macos_reserve_exact(requested_address, size);
+        if (reserved.status != HL_STATUS_OK) return reserved;
+        native_flags |= MAP_FIXED;
+    }
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
                    descriptor, (off_t)offset);
-    if (address == MAP_FAILED) return hl_macos_errno();
+    if (address == MAP_FAILED) {
+        if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE)
+            (void)mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)requested_address, (mach_vm_size_t)size);
+        return hl_macos_errno();
+    }
     if (sharing == HL_HOST_MEMORY_PRIVATE) {
         struct stat metadata;
         if (fstat(descriptor, &metadata) == 0) {

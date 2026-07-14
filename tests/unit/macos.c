@@ -444,6 +444,32 @@ int main(void) {
                                 HL_HOST_MEMORY_READ, HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_FIXED, &mapped)
                      .status == HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(munmap(reservation, 32768) == 0);
+        {
+            long page_value = sysconf(_SC_PAGESIZE);
+            size_t host_page = page_value > 0 ? (size_t)page_value : 16384u;
+            unsigned char *occupied = mmap(NULL, host_page, PROT_READ | PROT_WRITE,
+                                           MAP_ANON | MAP_PRIVATE, -1, 0);
+            unsigned char *vacant = mmap(NULL, host_page, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            hl_host_file_mapping exact = {HL_HOST_FILE_MAPPING_ABI, sizeof(exact), 0, 0, 0, 0};
+            hl_host_file_mapping collision = {HL_HOST_FILE_MAPPING_ABI, sizeof(collision), 0, 0, 0, 0};
+            HL_CHECK(occupied != MAP_FAILED && vacant != MAP_FAILED);
+            memset(occupied, 0xa7, host_page);
+            HL_CHECK(munmap(vacant, host_page) == 0);
+            HL_CHECK(services.memory
+                         ->map_file(services.context, file.value, (uint64_t)(uintptr_t)occupied, 0, host_page,
+                                    HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE,
+                                    &collision)
+                         .status == HL_STATUS_ALREADY_EXISTS);
+            HL_CHECK(occupied[0] == 0xa7 && occupied[host_page - 1] == 0xa7);
+            HL_CHECK(services.memory
+                         ->map_file(services.context, file.value, (uint64_t)(uintptr_t)vacant, 0, host_page,
+                                    HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE,
+                                    &exact)
+                         .status == HL_STATUS_OK);
+            HL_CHECK(exact.address == (uint64_t)(uintptr_t)vacant && vacant[0] == 0x5a);
+            HL_CHECK(services.memory->release(services.context, exact.handle).status == HL_STATUS_OK);
+            HL_CHECK(munmap(occupied, host_page) == 0);
+        }
         HL_CHECK(services.file->truncate(services.context, file.value, 0).status == HL_STATUS_OK);
     }
     HL_CHECK(services.file
