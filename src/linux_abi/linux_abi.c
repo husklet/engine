@@ -259,6 +259,7 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     const hl_host_file_services *files;
     const hl_host_sync_services *sync;
     uint32_t index;
+    int topology_changed;
     if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || plan == NULL ||
         plan->abi != HL_LINUX_ABI_VERSION || plan->size < sizeof(*plan) ||
         (plan->capacity != 0 && plan->records == NULL))
@@ -268,9 +269,11 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     if (files == NULL || files->clone_for_fork == NULL || files->close == NULL || sync == NULL ||
         sync->fork_prepare == NULL)
         return HL_STATUS_NOT_SUPPORTED;
+retry_snapshot:
     plan->count = 0;
     plan->armed = 0;
     plan->host_completed = 0;
+    topology_changed = 0;
     hl_linux_lock(linux_abi);
     for (index = 0; index < linux_abi->fd_capacity; ++index) {
         if (linux_abi->fds[index].ofd == HL_LINUX_FD_RESERVED) {
@@ -365,8 +368,10 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
             entry->object_ops->fork_while_active_safe == 0) {
             goto arm_failed;
         }
-        if (matches != 1 || entry->closing != 0)
+        if (matches != 1 || entry->closing != 0) {
+            topology_changed = 1;
             goto arm_failed;
+        }
     }
     for (index = 0; index < plan->count; ++index) {
         hl_linux_fork_record *record = &plan->records[index];
@@ -374,8 +379,10 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
             linux_abi->ofds[record->ofd].generation != record->generation ||
             linux_abi->ofds[record->ofd].host_handle != record->parent_handle ||
             linux_abi->ofds[record->ofd].object_ops != record->object_ops ||
-            linux_abi->ofds[record->ofd].object_context != record->parent_context)
+            linux_abi->ofds[record->ofd].object_context != record->parent_context) {
+            topology_changed = 1;
             goto arm_failed;
+        }
     }
     {
         hl_host_result armed = sync->fork_prepare(linux_abi->host->context);
@@ -394,6 +401,7 @@ arm_failed:
     }
     hl_linux_fork_unpin(linux_abi, plan);
     plan->count = 0;
+    if (topology_changed) goto retry_snapshot;
     return HL_STATUS_BUSY;
 }
 

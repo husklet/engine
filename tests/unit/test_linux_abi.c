@@ -860,9 +860,10 @@ int main(void) {
         HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
         HL_CHECK(atomic_load_explicit(&file_host.closes, memory_order_relaxed) == closes);
         atomic_store_explicit(&file_host.clone_block, 0, memory_order_release);
-        /* Topology changed while cloning, so prepare retries cleanly after
-         * releasing both the cloned child and pinned retiring parent. */
-        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_BUSY);
+        /* Topology changed while cloning, so prepare resnapshots internally
+         * after releasing both the cloned child and pinned retiring parent. */
+        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_OK);
+        HL_CHECK(hl_linux_abi_fork_parent(&linux_abi, &plan) == HL_STATUS_OK);
         HL_CHECK(atomic_load_explicit(&file_host.closes, memory_order_relaxed) == closes + 2);
         HL_CHECK(atomic_load_explicit(&file_host.bad_handles, memory_order_relaxed) == 0);
     }
@@ -881,7 +882,8 @@ int main(void) {
         while (atomic_load_explicit(&object.clone_entered, memory_order_acquire) == 0) {}
         HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 0);
         atomic_store_explicit(&object.clone_block, 0, memory_order_release);
-        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_BUSY);
+        HL_CHECK(pthread_join(fork_thread, NULL) == 0 && args.status == HL_STATUS_OK);
+        HL_CHECK(hl_linux_abi_fork_parent(&linux_abi, &plan) == HL_STATUS_OK);
         HL_CHECK(object.clones == 1 && object.closes == 2);
         HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
     }

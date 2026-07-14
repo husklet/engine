@@ -24,6 +24,35 @@ typedef struct prepared_child {
     hl_linux_fork_plan *plan;
 } prepared_child;
 
+typedef struct topology_churn {
+    hl_linux_abi *abi;
+    const hl_host_services *services;
+    const char *path;
+    _Atomic uint32_t stop;
+    _Atomic uint32_t operations;
+    _Atomic uint32_t failures;
+} topology_churn;
+
+static void *churn_topology(void *opaque) {
+    topology_churn *churn = opaque;
+    while (atomic_load_explicit(&churn->stop, memory_order_acquire) == 0) {
+        hl_host_result opened = churn->services->file->open_relative(
+            churn->services->context, HL_HOST_HANDLE_CWD, churn->path, strlen(churn->path), HL_HOST_FILE_READ, 0, 0);
+        hl_linux_fd fd;
+        if (opened.status != HL_STATUS_OK ||
+            hl_linux_fd_install(churn->abi, opened.value, HL_LINUX_O_RDONLY, 0, &fd) != HL_STATUS_OK) {
+            if (opened.status == HL_STATUS_OK)
+                (void)churn->services->file->close(churn->services->context, opened.value);
+            atomic_fetch_add_explicit(&churn->failures, 1, memory_order_relaxed);
+            continue;
+        }
+        if (hl_linux_close(churn->abi, fd) != 0)
+            atomic_fetch_add_explicit(&churn->failures, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&churn->operations, 1, memory_order_release);
+    }
+    return NULL;
+}
+
 static int32_t run_prepared_child(void *opaque) {
     prepared_child *child = opaque;
     char byte;
@@ -83,6 +112,7 @@ int main(void) {
     char path[128], bytes[3] = {0};
     churn_thread churn = {0};
     pthread_t locker;
+    pthread_t topology_thread;
     int ready[2], status;
     pid_t child;
     clone_count = mmap(NULL, 2 * sizeof(*clone_count), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -107,6 +137,23 @@ int main(void) {
     HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OK && plan.armed == 1);
     HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK && plan.armed == 0);
     HL_CHECK(atomic_load(clone_count) == 1 && atomic_load(close_count) == 1);
+    {
+        topology_churn topology = {&abi, &services, path, 0, 0, 0};
+        HL_CHECK(pthread_create(&topology_thread, NULL, churn_topology, &topology) == 0);
+        while (atomic_load_explicit(&topology.operations, memory_order_acquire) < 10) {}
+        for (uint32_t iteration = 0; iteration < 100; ++iteration) {
+            HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OK);
+            HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK);
+        }
+        atomic_store_explicit(&topology.stop, 1, memory_order_release);
+        HL_CHECK(pthread_join(topology_thread, NULL) == 0);
+        HL_CHECK(atomic_load_explicit(&topology.operations, memory_order_relaxed) >= 10);
+        HL_CHECK(atomic_load_explicit(&topology.failures, memory_order_relaxed) == 0);
+        HL_CHECK(hl_linux_abi_validate_fds(&abi) == HL_STATUS_OK);
+        /* Keep the remaining assertions scoped to their original scenarios. */
+        atomic_store(clone_count, 1);
+        atomic_store(close_count, 1);
+    }
     churn.services = &services;
     HL_CHECK(pthread_create(&locker, NULL, churn_mutexes, &churn) == 0);
     while (atomic_load(&churn.operations) == 0) {}
