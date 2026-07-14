@@ -12,6 +12,10 @@
 enum {
     WATCH_COUNT = 257,
     EVENT_COUNT = 129,
+    DIRECTORY_COUNT = 129,
+    COUNTER_COUNT = 129,
+    TRANSFER_PAIR_COUNT = 33,
+    TIMER_COUNT = 33,
     MAPPING_COUNT = 4097,
     FILE_COUNT = 1025
 };
@@ -21,6 +25,9 @@ int main(void) {
     hl_host_services services = {0};
     hl_host_handle watches[WATCH_COUNT] = {0};
     hl_host_handle events[EVENT_COUNT] = {0};
+    hl_host_handle directories[DIRECTORY_COUNT] = {0};
+    hl_host_handle counters[COUNTER_COUNT] = {0};
+    hl_host_handle transfers[TRANSFER_PAIR_COUNT * 2] = {0};
     hl_host_handle *mappings = NULL;
     hl_host_handle *files = NULL;
     hl_host_result cross_mapping;
@@ -29,8 +36,9 @@ int main(void) {
     HL_CHECK(native >= 0);
     HL_CHECK(close(native) == 0);
     HL_CHECK(hl_native_host_create(&host, &services) == HL_STATUS_OK);
-    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_FILE | HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT) ==
-             HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_FILE | HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT |
+                                                       HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_COUNTER |
+                                                       HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
 
     hl_host_result file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                                        HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
@@ -50,6 +58,26 @@ int main(void) {
         HL_CHECK(created.status == HL_STATUS_OK);
         events[index] = created.value;
     }
+    for (size_t index = 0; index < DIRECTORY_COUNT; ++index) {
+        hl_host_result created = services.directory->create(services.context);
+        HL_CHECK(created.status == HL_STATUS_OK);
+        directories[index] = created.value;
+    }
+    for (size_t index = 0; index < COUNTER_COUNT; ++index) {
+        hl_host_result created = services.counter->create(services.context, index, 0);
+        HL_CHECK(created.status == HL_STATUS_OK);
+        counters[index] = created.value;
+    }
+    for (size_t index = 0; index < TRANSFER_PAIR_COUNT; ++index) {
+        hl_host_result pair = services.transfer->channel_pair(services.context);
+        HL_CHECK(pair.status == HL_STATUS_OK);
+        transfers[index * 2] = pair.value;
+        transfers[index * 2 + 1] = pair.detail;
+    }
+    uint64_t timer_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(60000000000);
+    for (size_t index = 0; index < TIMER_COUNT; ++index)
+        HL_CHECK(services.event->arm_timer(services.context, events[0], index + 1, timer_deadline, 0).status ==
+                 HL_STATUS_OK);
     HL_CHECK(services.watch->query(services.context, events[0], &(hl_host_watch_record){0}).status ==
              HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.event->wake(services.context, watches[0]).status == HL_STATUS_INVALID_ARGUMENT);
@@ -57,6 +85,10 @@ int main(void) {
              HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.file->metadata(services.context, events[0], &(hl_host_file_metadata){0}).status ==
              HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.counter->get_flags(services.context, directories[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.directory->close(services.context, counters[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    if (strcmp(HL_NATIVE_HOST_NAME, "macos") == 0)
+        HL_CHECK(services.transfer->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
     {
         mappings = calloc(MAPPING_COUNT, sizeof(*mappings));
         files = calloc(FILE_COUNT, sizeof(*files));
@@ -81,6 +113,8 @@ int main(void) {
             hl_host_watch_record inherited = {0};
             int valid = services.watch->query(services.context, watches[WATCH_COUNT - 1], &inherited).status ==
                             HL_STATUS_OK &&
+                        services.counter->get_flags(services.context, counters[COUNTER_COUNT - 1]).status ==
+                            HL_STATUS_OK &&
                         services.memory->protect(services.context, mappings[MAPPING_COUNT - 1], 0, 4096,
                                                  HL_HOST_MEMORY_READ)
                                 .status == HL_STATUS_OK;
@@ -94,6 +128,17 @@ int main(void) {
         HL_CHECK(services.file->close(services.context, files[index - 1]).status == HL_STATUS_OK);
     for (size_t index = MAPPING_COUNT; mappings != NULL && index != 0; --index)
         HL_CHECK(services.memory->release(services.context, mappings[index - 1]).status == HL_STATUS_OK);
+    for (size_t index = TIMER_COUNT; index != 0; --index)
+        HL_CHECK(services.event->disarm_timer(services.context, events[0], index).status == HL_STATUS_OK);
+    for (size_t index = TRANSFER_PAIR_COUNT * 2; index != 0; --index)
+        HL_CHECK(services.transfer->close(services.context, transfers[index - 1]).status == HL_STATUS_OK);
+    HL_CHECK(services.transfer->close(services.context, transfers[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    for (size_t index = COUNTER_COUNT; index != 0; --index)
+        HL_CHECK(services.counter->close(services.context, counters[index - 1]).status == HL_STATUS_OK);
+    HL_CHECK(services.counter->get_flags(services.context, counters[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    for (size_t index = DIRECTORY_COUNT; index != 0; --index)
+        HL_CHECK(services.directory->close(services.context, directories[index - 1]).status == HL_STATUS_OK);
+    HL_CHECK(services.directory->close(services.context, directories[0]).status == HL_STATUS_INVALID_ARGUMENT);
     for (size_t index = EVENT_COUNT; index != 0; --index)
         HL_CHECK(services.event->close(services.context, events[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.event->wake(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);

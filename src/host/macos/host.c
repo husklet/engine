@@ -90,7 +90,8 @@ typedef struct hl_macos_event {
     uint32_t generation;
     uint32_t active;
     int descriptor;
-    hl_macos_timer timers[HL_MACOS_TIMER_CAPACITY];
+    hl_macos_timer *timers;
+    uint32_t timer_capacity;
 } hl_macos_event;
 
 typedef struct hl_macos_watch {
@@ -175,10 +176,13 @@ struct hl_host_macos {
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
     hl_macos_event *events;
     uint32_t event_capacity;
-    hl_macos_counter counters[HL_MACOS_COUNTER_CAPACITY];
+    hl_macos_counter *counters;
+    uint32_t counter_capacity;
     hl_macos_counter_subscription counter_subscriptions[HL_MACOS_COUNTER_SUBSCRIPTIONS];
-    hl_macos_transfer transfers[HL_MACOS_TRANSFER_CAPACITY];
-    hl_macos_directory directories[HL_MACOS_DIRECTORY_CAPACITY];
+    hl_macos_transfer *transfers;
+    uint32_t transfer_capacity;
+    hl_macos_directory *directories;
+    uint32_t directory_capacity;
     hl_macos_watch *watches;
     uint32_t watch_capacity;
 };
@@ -2048,7 +2052,7 @@ static hl_macos_event *hl_macos_event_lookup(hl_host_macos *host, hl_host_handle
 
 static hl_macos_counter *hl_macos_counter_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_COUNTER, HL_MACOS_COUNTER_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_COUNTER, host->counter_capacity, &index) ||
         !host->counters[index].active ||
         host->counters[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -2057,7 +2061,7 @@ static hl_macos_counter *hl_macos_counter_lookup(hl_host_macos *host, hl_host_ha
 
 static hl_macos_directory *hl_macos_directory_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_DIRECTORY, HL_MACOS_DIRECTORY_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_DIRECTORY, host->directory_capacity, &index) ||
         !host->directories[index].active ||
         host->directories[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -2067,7 +2071,7 @@ static hl_macos_directory *hl_macos_directory_lookup(hl_host_macos *host, hl_hos
 static hl_host_result hl_macos_directory_register(hl_host_macos *host, hl_macos_directory_object *object) {
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;
     pthread_mutex_lock(&host->lock);
-    for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_CAPACITY; ++index) {
+    for (uint32_t index = 0; index < host->directory_capacity; ++index) {
         hl_macos_directory *directory = &host->directories[index];
         if (directory->active) continue;
         directory->generation++;
@@ -2077,6 +2081,22 @@ static hl_host_result hl_macos_directory_register(hl_host_macos *host, hl_macos_
         object->references++;
         handle = hl_macos_handle(HL_MACOS_HANDLE_DIRECTORY, index, directory->generation);
         break;
+    }
+    if (handle == HL_HOST_HANDLE_INVALID) {
+        uint32_t capacity = host->directory_capacity * 2u;
+        hl_macos_directory *grown = realloc(host->directories, (size_t)capacity * sizeof(*grown));
+        if (grown != NULL) {
+            memset(grown + host->directory_capacity, 0,
+                   (size_t)(capacity - host->directory_capacity) * sizeof(*grown));
+            uint32_t index = host->directory_capacity;
+            host->directories = grown;
+            host->directory_capacity = capacity;
+            grown[index].generation = 1;
+            grown[index].active = 1;
+            grown[index].object = object;
+            object->references++;
+            handle = hl_macos_handle(HL_MACOS_HANDLE_DIRECTORY, index, 1);
+        }
     }
     pthread_mutex_unlock(&host->lock);
     return handle == HL_HOST_HANDLE_INVALID ? hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0)
@@ -2251,7 +2271,7 @@ static hl_host_result hl_macos_directory_close(void *context, hl_host_handle ins
 
 static hl_macos_transfer *hl_macos_transfer_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_TRANSFER, HL_MACOS_TRANSFER_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_TRANSFER, host->transfer_capacity, &index) ||
         !host->transfers[index].active ||
         host->transfers[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -2261,7 +2281,7 @@ static hl_macos_transfer *hl_macos_transfer_lookup(hl_host_macos *host, hl_host_
 static hl_host_result hl_macos_transfer_register(hl_host_macos *host, int descriptor) {
     uint32_t index;
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_TRANSFER_CAPACITY; ++index) {
+    for (index = 0; index < host->transfer_capacity; ++index) {
         hl_macos_transfer *transfer = &host->transfers[index];
         if (transfer->active) continue;
         transfer->generation++;
@@ -2272,6 +2292,21 @@ static hl_host_result hl_macos_transfer_register(hl_host_macos *host, int descri
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_OK,
                                hl_macos_handle(HL_MACOS_HANDLE_TRANSFER, index, transfer->generation), 0);
+    }
+    uint32_t capacity = host->transfer_capacity * 2u;
+    hl_macos_transfer *grown = realloc(host->transfers, (size_t)capacity * sizeof(*grown));
+    if (grown != NULL) {
+        memset(grown + host->transfer_capacity, 0,
+               (size_t)(capacity - host->transfer_capacity) * sizeof(*grown));
+        index = host->transfer_capacity;
+        host->transfers = grown;
+        host->transfer_capacity = capacity;
+        grown[index].generation = 1;
+        grown[index].active = 1;
+        grown[index].descriptor = descriptor;
+        hl_host_process_fd_private_add(descriptor);
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_OK, hl_macos_handle(HL_MACOS_HANDLE_TRANSFER, index, 1), 0);
     }
     pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
@@ -2477,7 +2512,7 @@ static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_co
     uint32_t index;
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+    for (index = 0; index < host->counter_capacity; ++index) {
         hl_macos_counter *counter = &host->counters[index];
         if (counter->active) continue;
         counter->generation++;
@@ -2493,6 +2528,28 @@ static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_co
         object->shared->references++;
         handle = hl_macos_handle(HL_MACOS_HANDLE_COUNTER, index, counter->generation);
         break;
+    }
+    if (handle == HL_HOST_HANDLE_INVALID) {
+        uint32_t capacity = host->counter_capacity * 2u;
+        hl_macos_counter *grown = realloc(host->counters, (size_t)capacity * sizeof(*grown));
+        if (grown != NULL) {
+            memset(grown + host->counter_capacity, 0,
+                   (size_t)(capacity - host->counter_capacity) * sizeof(*grown));
+            index = host->counter_capacity;
+            host->counters = grown;
+            host->counter_capacity = capacity;
+            grown[index].generation = 1;
+            grown[index].active = 1;
+            grown[index].object = object;
+            grown[index].rights = rights;
+            if (object->shared->references == 0) {
+                hl_host_process_fd_private_add(object->readable);
+                hl_host_process_fd_private_add(object->signal);
+                hl_host_process_fd_private_add(object->backing);
+            }
+            object->shared->references++;
+            handle = hl_macos_handle(HL_MACOS_HANDLE_COUNTER, index, 1);
+        }
     }
     pthread_mutex_unlock(&host->lock);
     return handle == HL_HOST_HANDLE_INVALID ? hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0)
@@ -3053,7 +3110,9 @@ static hl_host_result hl_macos_event_create(void *context) {
         if (event->generation == 0) event->generation = 1;
         event->active = 1;
         event->descriptor = descriptor;
-        memset(event->timers, 0, sizeof(event->timers));
+        event->timers = calloc(HL_MACOS_TIMER_CAPACITY, sizeof(*event->timers));
+        if (event->timers == NULL) continue;
+        event->timer_capacity = HL_MACOS_TIMER_CAPACITY;
         handle = hl_macos_handle(HL_MACOS_HANDLE_EVENT, index, event->generation);
         break;
     }
@@ -3072,7 +3131,14 @@ static hl_host_result hl_macos_event_create(void *context) {
             event->generation = 1;
             event->active = 1;
             event->descriptor = descriptor;
-            handle = hl_macos_handle(HL_MACOS_HANDLE_EVENT, index, event->generation);
+            event->timers = calloc(HL_MACOS_TIMER_CAPACITY, sizeof(*event->timers));
+            if (event->timers == NULL) {
+                event->active = 0;
+                exhausted = HL_STATUS_OUT_OF_MEMORY;
+            } else {
+                event->timer_capacity = HL_MACOS_TIMER_CAPACITY;
+                handle = hl_macos_handle(HL_MACOS_HANDLE_EVENT, index, event->generation);
+            }
         } else if (capacity > host->event_capacity)
             exhausted = HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3087,7 +3153,7 @@ static hl_host_result hl_macos_event_create(void *context) {
 
 static hl_macos_timer *hl_macos_event_timer(hl_macos_event *event, uint64_t token) {
     uint32_t index;
-    for (index = 0; index < HL_MACOS_TIMER_CAPACITY; ++index)
+    for (index = 0; index < event->timer_capacity; ++index)
         if (event->timers[index].active && event->timers[index].token == token) return &event->timers[index];
     return NULL;
 }
@@ -3183,15 +3249,24 @@ static hl_host_result hl_macos_event_arm_timer(void *context, hl_host_handle pol
     }
     timer = hl_macos_event_timer(event, token);
     if (timer == NULL) {
-        for (index = 0; index < HL_MACOS_TIMER_CAPACITY; ++index)
+        for (index = 0; index < event->timer_capacity; ++index)
             if (!event->timers[index].active) {
                 timer = &event->timers[index];
                 break;
             }
     }
     if (timer == NULL) {
-        pthread_mutex_unlock(&host->lock);
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        uint32_t capacity = event->timer_capacity * 2u;
+        hl_macos_timer *grown = realloc(event->timers, (size_t)capacity * sizeof(*grown));
+        if (grown == NULL) {
+            pthread_mutex_unlock(&host->lock);
+            return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+        }
+        memset(grown + event->timer_capacity, 0,
+               (size_t)(capacity - event->timer_capacity) * sizeof(*grown));
+        timer = &grown[event->timer_capacity];
+        event->timers = grown;
+        event->timer_capacity = capacity;
     }
     now = hl_macos_monotonic_value();
     result = hl_macos_event_submit_timer(event->descriptor, token, deadline_ns > now ? deadline_ns - now : 1);
@@ -3309,7 +3384,9 @@ static hl_host_result hl_macos_event_close(void *context, hl_host_handle pollset
     descriptor = event->descriptor;
     event->active = 0;
     event->descriptor = -1;
-    memset(event->timers, 0, sizeof(event->timers));
+    free(event->timers);
+    event->timers = NULL;
+    event->timer_capacity = 0;
     pthread_mutex_unlock(&host->lock);
     hl_host_process_fd_private_remove(descriptor);
     return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
@@ -3532,7 +3609,7 @@ static hl_host_result hl_macos_fork_prepare(void *context) {
     result = hl_host_sync_fork_prepare(host->sync);
     if (result.status == HL_STATUS_OK) {
         uint32_t index;
-        for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+        for (index = 0; index < host->counter_capacity; ++index) {
             hl_macos_counter_object *object;
             uint32_t previous;
             if (!host->counters[index].active) continue;
@@ -3576,7 +3653,7 @@ static hl_host_result hl_macos_fork_child(void *context) {
         subscription->notify = NULL;
         subscription->observer = NULL;
     }
-    for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_CAPACITY && result.status == HL_STATUS_OK; ++index) {
+    for (uint32_t index = 0; index < host->directory_capacity && result.status == HL_STATUS_OK; ++index) {
         hl_macos_directory_object *object;
         uint32_t previous;
         if (!host->directories[index].active) continue;
@@ -3723,18 +3800,28 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     if (host == NULL) return HL_STATUS_OUT_OF_MEMORY;
     host->mappings = calloc(HL_MACOS_MAPPING_CAPACITY, sizeof(*host->mappings));
     host->files = calloc(HL_MACOS_FILE_CAPACITY, sizeof(*host->files));
+    host->counters = calloc(HL_MACOS_COUNTER_CAPACITY, sizeof(*host->counters));
+    host->transfers = calloc(HL_MACOS_TRANSFER_CAPACITY, sizeof(*host->transfers));
+    host->directories = calloc(HL_MACOS_DIRECTORY_CAPACITY, sizeof(*host->directories));
     host->events = calloc(HL_MACOS_EVENT_CAPACITY, sizeof(*host->events));
     host->watches = calloc(HL_MACOS_WATCH_CAPACITY, sizeof(*host->watches));
-    if (host->mappings == NULL || host->files == NULL || host->events == NULL || host->watches == NULL) {
+    if (host->mappings == NULL || host->files == NULL || host->counters == NULL || host->transfers == NULL ||
+        host->directories == NULL || host->events == NULL || host->watches == NULL) {
         free(host->watches);
         free(host->events);
         free(host->files);
         free(host->mappings);
+        free(host->directories);
+        free(host->transfers);
+        free(host->counters);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
     host->mapping_capacity = HL_MACOS_MAPPING_CAPACITY;
     host->file_capacity = HL_MACOS_FILE_CAPACITY;
+    host->counter_capacity = HL_MACOS_COUNTER_CAPACITY;
+    host->transfer_capacity = HL_MACOS_TRANSFER_CAPACITY;
+    host->directory_capacity = HL_MACOS_DIRECTORY_CAPACITY;
     host->event_capacity = HL_MACOS_EVENT_CAPACITY;
     host->watch_capacity = HL_MACOS_WATCH_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
@@ -3742,6 +3829,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->events);
         free(host->files);
         free(host->mappings);
+        free(host->directories);
+        free(host->transfers);
+        free(host->counters);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3751,6 +3841,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->events);
         free(host->files);
         free(host->mappings);
+        free(host->directories);
+        free(host->transfers);
+        free(host->counters);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3761,6 +3854,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->events);
         free(host->files);
         free(host->mappings);
+        free(host->directories);
+        free(host->transfers);
+        free(host->counters);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3772,6 +3868,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->events);
         free(host->files);
         free(host->mappings);
+        free(host->directories);
+        free(host->transfers);
+        free(host->counters);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3820,7 +3919,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         pthread_mutex_unlock(&host->lock);
         if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_unsubscribe(host, handle);
     }
-    for (index = 0; index < HL_MACOS_TRANSFER_CAPACITY; ++index) {
+    for (index = 0; index < host->transfer_capacity; ++index) {
         hl_host_handle handle = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
         if (host->transfers[index].active)
@@ -3828,7 +3927,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         pthread_mutex_unlock(&host->lock);
         if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_transfer_close(host, handle);
     }
-    for (index = 0; index < HL_MACOS_DIRECTORY_CAPACITY; ++index) {
+    for (index = 0; index < host->directory_capacity; ++index) {
         hl_host_handle handle = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
         if (host->directories[index].active)
@@ -3836,7 +3935,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         pthread_mutex_unlock(&host->lock);
         if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_directory_close(host, handle);
     }
-    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+    for (index = 0; index < host->counter_capacity; ++index) {
         hl_host_handle handle = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
         if (host->counters[index].active)
@@ -3885,5 +3984,8 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     free(host->events);
     free(host->files);
     free(host->mappings);
+    free(host->directories);
+    free(host->transfers);
+    free(host->counters);
     free(host);
 }
