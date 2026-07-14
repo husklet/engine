@@ -1,4 +1,4 @@
-// printf %a / %A hex-float conversion. Oracle vs native Linux (glibc-specific rendering).
+// printf %a / %A hex-float conversion. Oracle vs native Linux (glibc-specific formatting).
 #include <stdio.h>
 
 int main(void) {
