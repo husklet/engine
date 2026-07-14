@@ -54,7 +54,7 @@ int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, siz
 /* Snapshot one live native process. Returns zero when the pid is absent or inaccessible. */
 int hl_host_process_read(int64_t pid, hl_host_process_info *info);
 
-/* Enumerate a process descriptor table. count receives the total observed, including truncated entries. */
+/* Enumerate descriptor numbers. kind may remain OTHER until fd_read; count includes truncated entries. */
 int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count);
 
 /* Query one open descriptor and, for files, copy its native absolute path without a trailing NUL. */

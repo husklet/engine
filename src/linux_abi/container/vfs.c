@@ -2322,9 +2322,10 @@ static int proc_fd_dir_pid_open(int host) {
         int fd = fds[i].descriptor;
         char tgt[4200] = {0};
         size_t target_size = 0;
-        hl_host_process_fd entry;
+        hl_host_process_fd entry = {.descriptor = -1};
         int have = hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size) &&
                    entry.kind == HL_HOST_FD_FILE && target_size != 0;
+        if (entry.descriptor == fd) fds[i].kind = entry.kind;
         if (have) {
             tgt[target_size] = 0;
             proc_fd_rebase(tgt);

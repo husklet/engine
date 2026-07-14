@@ -163,13 +163,13 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     while ((item = readdir(directory)) != NULL) {
         char *end = NULL;
         long descriptor;
-        hl_host_process_fd entry;
-        size_t ignored;
         errno = 0;
         descriptor = strtol(item->d_name, &end, 10);
         if (errno != 0 || end == item->d_name || *end != '\0' || descriptor < 0 || descriptor > INT32_MAX) continue;
-        if (!hl_host_process_fd_read(pid, (int32_t)descriptor, &entry, NULL, 0, &ignored)) continue;
-        if (total < capacity) entries[total] = entry;
+        if (total < capacity) {
+            entries[total].descriptor = (int32_t)descriptor;
+            entries[total].kind = HL_HOST_FD_OTHER;
+        }
         total++;
     }
     closedir(directory);

@@ -58,6 +58,17 @@ int main(void) {
     hl_host_process_fd one_descriptor;
     size_t observed_count = 0;
     HL_CHECK(hl_host_process_fds(getpid(), &one_descriptor, 1, &observed_count) && observed_count >= 1);
+    hl_host_process_fd *descriptors = malloc(descriptor_count * sizeof *descriptors);
+    HL_CHECK(descriptors != NULL);
+    HL_CHECK(hl_host_process_fds(getpid(), descriptors, descriptor_count, &observed_count));
+    size_t visible = observed_count < descriptor_count ? observed_count : descriptor_count;
+    int saw_file = 0, saw_pipe = 0;
+    for (size_t index = 0; index < visible; ++index) {
+        if (descriptors[index].descriptor == file) saw_file = 1;
+        if (descriptors[index].descriptor == pipes[0]) saw_pipe = 1;
+    }
+    free(descriptors);
+    HL_CHECK(saw_file && saw_pipe);
     pid_t child = fork();
     HL_CHECK(child >= 0);
     if (child == 0) {
