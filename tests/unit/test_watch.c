@@ -52,6 +52,7 @@ int main(void) {
     pthread_t threads[4];
     producer jobs[4];
     size_t index;
+    size_t count;
 
     HL_CHECK(hl_linux_watch_init(&set) == HL_STATUS_OK);
     HL_CHECK(hl_linux_watch_retain(&set, 7, 9, 100, &first, &created) == HL_STATUS_OK && created);
@@ -59,19 +60,23 @@ int main(void) {
     HL_CHECK(alias == first);
     HL_CHECK(hl_linux_watch_enqueue(&set, first, 80, 1) == HL_STATUS_OK);
     HL_CHECK(hl_linux_watch_enqueue(&set, first, 60, 2) == HL_STATUS_OK);
-    HL_CHECK(hl_linux_watch_drain(&set, observe, &value) == 1);
+    HL_CHECK(hl_linux_watch_drain(&set, observe, &value, &count) == HL_STATUS_OK && count == 1);
     HL_CHECK(value.count == 1 && value.old_size == 100 && value.new_size == 60 && value.flags == 3);
 
+    HL_CHECK(hl_linux_watch_enqueue(&set, first, 44, 8) == HL_STATUS_OK);
     HL_CHECK(hl_linux_watch_release(&set, first, &removed) == HL_STATUS_OK && !removed);
     HL_CHECK(hl_linux_watch_release(&set, alias, &removed) == HL_STATUS_OK && removed);
     stale = first;
+    HL_CHECK(hl_linux_watch_enqueue(&set, stale, 44, 8) == HL_STATUS_NOT_FOUND);
     HL_CHECK(hl_linux_watch_retain(&set, 8, 10, 20, &reused, &created) == HL_STATUS_OK && created);
     HL_CHECK(reused != stale);
     HL_CHECK(hl_linux_watch_enqueue(&set, stale, 1, 1) == HL_STATUS_NOT_FOUND);
+    value = (observed){0};
+    HL_CHECK(hl_linux_watch_drain(&set, observe, &value, &count) == HL_STATUS_OK && count == 0);
 
     value = (observed){0};
     hl_linux_watch_fork_prepare(&set);
-    hl_linux_watch_fork_child(&set, rebuild, &value);
+    HL_CHECK(hl_linux_watch_fork_child(&set, rebuild, &value) == HL_STATUS_OK);
     HL_CHECK(value.count == 1 && value.token != reused && value.old_size == 8 && value.new_size == 10);
     reused = value.token;
     HL_CHECK(hl_linux_watch_enqueue(&set, reused, 21, 1) == HL_STATUS_OK);
@@ -82,7 +87,7 @@ int main(void) {
     }
     for (index = 0; index < 4; ++index) HL_CHECK(pthread_join(threads[index], NULL) == 0);
     value = (observed){0};
-    HL_CHECK(hl_linux_watch_drain(&set, observe, &value) == 1);
+    HL_CHECK(hl_linux_watch_drain(&set, observe, &value, &count) == HL_STATUS_OK && count == 1);
     HL_CHECK(value.count == 1 && value.old_size == 20 && value.flags == 15);
 
     hl_linux_watch_shutdown(&set);

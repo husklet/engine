@@ -28,12 +28,13 @@ hl_status hl_linux_watch_retain(hl_linux_watch_set *set, uint64_t device, uint64
                                 uint64_t *token, int *created);
 hl_status hl_linux_watch_release(hl_linux_watch_set *set, uint64_t token, int *removed);
 hl_status hl_linux_watch_enqueue(hl_linux_watch_set *set, uint64_t token, uint64_t size, uint32_t flags);
-size_t hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn callback, void *opaque);
+hl_status hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn callback, void *opaque,
+                               size_t *out_count);
 void hl_linux_watch_shutdown(hl_linux_watch_set *set);
 
 /* Called around fork in the thread which invokes fork. */
 void hl_linux_watch_fork_prepare(hl_linux_watch_set *set);
 void hl_linux_watch_fork_parent(hl_linux_watch_set *set);
-void hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_fn rebuild, void *opaque);
+hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_fn rebuild, void *opaque);
 
 #endif

@@ -81,6 +81,10 @@ hl_status hl_linux_watch_retain(hl_linux_watch_set *set, uint64_t device, uint64
     for (index = 0; index < state->count; ++index) {
         slot = &state->slots[index];
         if (slot->references != 0 && slot->device == device && slot->object == object) {
+            if (slot->references == UINT32_MAX) {
+                pthread_mutex_unlock(&state->lock);
+                return HL_STATUS_RESOURCE_LIMIT;
+            }
             slot->references++;
             *token = watch_token(index, slot->generation);
             *created = 0;
@@ -90,6 +94,10 @@ hl_status hl_linux_watch_retain(hl_linux_watch_set *set, uint64_t device, uint64
         if (slot->references == 0 && free_index == SIZE_MAX) free_index = index;
     }
     if (free_index == SIZE_MAX) {
+        if (state->count == UINT32_MAX) {
+            pthread_mutex_unlock(&state->lock);
+            return HL_STATUS_RESOURCE_LIMIT;
+        }
         if (state->count == state->capacity) {
             size_t capacity = state->capacity == 0 ? 8u : state->capacity * 2u;
             watch_slot *grown = realloc(state->slots, capacity * sizeof(*grown));
@@ -172,17 +180,20 @@ hl_status hl_linux_watch_enqueue(hl_linux_watch_set *set, uint64_t token, uint64
     return HL_STATUS_OK;
 }
 
-size_t hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn callback, void *opaque) {
+hl_status hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn callback, void *opaque,
+                               size_t *out_count) {
     watch_state *state;
     hl_linux_watch_change *changes;
     size_t index, count = 0;
-    if (set == NULL || set->state == NULL || callback == NULL) return 0;
+    if (set == NULL || set->state == NULL || callback == NULL || out_count == NULL)
+        return HL_STATUS_INVALID_ARGUMENT;
+    *out_count = 0;
     state = set->state;
     pthread_mutex_lock(&state->lock);
     changes = state->queued == 0 ? NULL : calloc(state->queued, sizeof(*changes));
     if (state->queued != 0 && changes == NULL) {
         pthread_mutex_unlock(&state->lock);
-        return 0;
+        return HL_STATUS_OUT_OF_MEMORY;
     }
     for (index = 0; index < state->queued; ++index) {
         size_t position = state->queue[index];
@@ -199,7 +210,8 @@ size_t hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn ca
     pthread_mutex_unlock(&state->lock);
     for (index = 0; index < count; ++index) callback(opaque, &changes[index]);
     free(changes);
-    return count;
+    *out_count = count;
+    return HL_STATUS_OK;
 }
 
 void hl_linux_watch_shutdown(hl_linux_watch_set *set) {
@@ -219,11 +231,18 @@ void hl_linux_watch_fork_parent(hl_linux_watch_set *set) {
     if (set != NULL && set->state != NULL) pthread_mutex_unlock(&((watch_state *)set->state)->lock);
 }
 
-void hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_fn rebuild, void *opaque) {
+hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_fn rebuild, void *opaque) {
     watch_state *state;
+    hl_linux_watch_change *active;
+    size_t count = 0;
     size_t index;
-    if (set == NULL || set->state == NULL) return;
+    if (set == NULL || set->state == NULL) return HL_STATUS_INVALID_ARGUMENT;
     state = set->state;
+    active = state->count == 0 ? NULL : calloc(state->count, sizeof(*active));
+    if (state->count != 0 && active == NULL) {
+        pthread_mutex_unlock(&state->lock);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
     state->queued = 0;
     state->shutdown = 0;
     for (index = 0; index < state->count; ++index) {
@@ -234,7 +253,13 @@ void hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_rebuild_f
         if (slot->references == 0) continue;
         slot->generation++;
         if (slot->generation == 0) slot->generation = 1;
-        if (rebuild != NULL) rebuild(opaque, watch_token(index, slot->generation), slot->device, slot->object);
+        active[count++] = (hl_linux_watch_change){.token = watch_token(index, slot->generation),
+                                                  .device = slot->device, .object = slot->object};
     }
     pthread_mutex_unlock(&state->lock);
+    if (rebuild != NULL)
+        for (index = 0; index < count; ++index)
+            rebuild(opaque, active[index].token, active[index].device, active[index].object);
+    free(active);
+    return HL_STATUS_OK;
 }
