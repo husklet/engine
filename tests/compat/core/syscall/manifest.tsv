@@ -1,0 +1,55 @@
+# case	group	source	legacy_source	isas	cflags	defines/env-argv	env	exit	stdout	dependencies	disposition	note
+pollselect	posix	pollselect.c	pollselect.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pollselect.out	linux-libc,syscall	active	exact source; deterministic checked golden
+pollselect-ext	posix	pollselect_ext.c	pollselect_ext.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pollselect_ext.out	linux-libc,syscall	active	exact source; deterministic checked golden
+mmapshared	posix	mmapshared.c	mmapshared.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mmapshared.out	linux-libc,syscall	active	exact source; deterministic checked golden
+filelock	posix	filelock.c	filelock.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/filelock.out	linux-libc,syscall	active	exact source; deterministic checked golden
+clock	posix	clockmono.c	clockmono.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockmono.out	linux-libc,syscall	active	exact source; deterministic checked golden
+realpath	posix	realpath.c	realpath.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/realpath.out	linux-libc,syscall	active	exact source; deterministic checked golden
+getdents	posix	getdents.c	getdents.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getdents.out	linux-libc,syscall	active	exact source; deterministic checked golden
+tmpfile	posix	tmpfile.c	tmpfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tmpfile.out	linux-libc,syscall	active	exact source; deterministic checked golden
+statvfs	posix	statvfs.c	statvfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statvfs.out	linux-libc,syscall	active	exact source; deterministic checked golden
+epoll	linuxsys	epoll.c	epoll.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll.out	linux-libc,syscall	active	exact source; deterministic checked golden
+epoll-highfd	linuxsys	epoll_highfd.c	epoll_highfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll_highfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+epoll-edge	linuxsys	epoll_edge.c	epoll_edge.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll_edge.out	linux-libc,syscall	active	exact source; deterministic checked golden
+epoll-dup-lifetime	linuxsys	epoll_dup_lifetime.c	epoll_dup_lifetime.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll_dup_lifetime.out	linux-libc,syscall	active	exact source; deterministic checked golden
+epoll-fork-inherit	linuxsys	epoll_fork_inherit.c	epoll_fork_inherit.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll_fork_inherit.out	linux-libc,syscall	active	exact source; deterministic checked golden
+pollselect-eintr	linuxsys	pollselect_eintr.c	pollselect_eintr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pollselect_eintr.out	linux-libc,syscall	active	exact source; deterministic checked golden
+eventfd	linuxsys	eventfd.c	eventfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/eventfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+eventfd-sema	linuxsys	eventfd_sema.c	eventfd_sema.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/eventfd_sema.out	linux-libc,syscall	active	exact source; deterministic checked golden
+pump-wakeup	linuxsys	pump_wakeup.c	pump_wakeup.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pump_wakeup.out	linux-libc,syscall	active	exact source; deterministic checked golden
+signalfd	linuxsys	signalfd.c	signalfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/signalfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+signalfd-multi	linuxsys	signalfd_multi.c	signalfd_multi.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/signalfd_multi.out	linux-libc,syscall	active	exact source; deterministic checked golden
+inotify	linuxsys	inotify.c	inotify.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/inotify.out	linux-libc,syscall	active	exact source; deterministic checked golden
+sendfile	linuxsys	sendfile.c	sendfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sendfile.out	linux-libc,syscall	active	exact source; deterministic checked golden
+timerfd	linuxsys	timerfd.c	timerfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/timerfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+memfd	linuxsys	memfd.c	memfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/memfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+splice	linuxsys	splice.c	splice.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/splice.out	linux-libc,syscall	active	exact source; deterministic checked golden
+prctl	linuxsys	prctl.c	prctl.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/prctl.out	linux-libc,syscall	active	exact source; deterministic checked golden
+sigqueue	linuxsys	sigqueue.c	sigqueue.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigqueue.out	linux-libc,syscall	active	exact source; deterministic checked golden
+getrandom	linuxsys	getrandom.c	getrandom.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getrandom.out	linux-libc,syscall	active	exact source; deterministic checked golden
+madvise	edge	edge_madvise.c	edge_madvise.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_madvise.out	linux-libc,syscall	active	exact source; deterministic checked golden
+renameat2	edge	edge_renameat2.c	edge_renameat2.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_renameat2.out	linux-libc,syscall	active	exact source; deterministic checked golden
+scmrights	edge	edge_scmrights.c	edge_scmrights.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_scmrights.out	linux-libc,syscall	active	exact source; deterministic checked golden
+fallocate	edge	edge_fallocate.c	edge_fallocate.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_fallocate.out	linux-libc,syscall	active	exact source; deterministic checked golden
+lseekhole	edge	edge_lseekhole.c	edge_lseekhole.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_lseekhole.out	linux-libc,syscall	active	exact source; deterministic checked golden
+otmpfile	edge	edge_otmpfile.c	edge_otmpfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_otmpfile.out	linux-libc,syscall	active	exact source; deterministic checked golden
+pipepacket	edge	edge_pipepacket.c	edge_pipepacket.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_pipepacket.out	linux-libc,syscall	active	exact source; deterministic checked golden
+msgflags	edge	edge_msgpeek.c	edge_msgpeek.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_msgpeek.out	linux-libc,syscall	active	exact source; deterministic checked golden
+abstract	edge	edge_abstract.c	edge_abstract.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_abstract.out	linux-libc,syscall	active	exact source; deterministic checked golden
+pipesz	edge	edge_pipesz.c	edge_pipesz.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_pipesz.out	linux-libc,syscall	active	exact source; deterministic checked golden
+mprotect	edge	edge_mprotect.c	edge_mprotect.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_mprotect.out	linux-libc,syscall	excluded-known-gap	exact source; legacy engine xfail remains open
+clockabstime	edge	edge_clockabstime.c	edge_clockabstime.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_clockabstime.out	linux-libc,syscall	active	exact source; deterministic checked golden
+sigpipe	edge	edge_sigpipe.c	edge_sigpipe.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_sigpipe.out	linux-libc,syscall	active	exact source; deterministic checked golden
+procfd	edge	edge_procfd.c	edge_procfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_procfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
+proctask	edge	edge_proctask.c	edge_proctask.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_proctask.out	linux-libc,syscall	active	exact source; deterministic checked golden
+times	edge	edge_times.c	edge_times.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_times.out	linux-libc,syscall	active	exact source; deterministic checked golden
+utimes-family	edge	utimes_family.c	utimes_family.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/utimes_family.out	linux-libc,syscall	active	exact source; deterministic checked golden
+statfs	edge	edge_statfs.c	edge_statfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_statfs.out	linux-libc,syscall	excluded-known-gap	exact source; legacy engine xfail remains open
+statx-agree	edge	statx_agree.c	statx_agree.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statx_agree.out	linux-libc,syscall	active	exact source; deterministic checked golden
+efault	edge	edge_efault.c	edge_efault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_efault.out	linux-libc,syscall	active	exact source; deterministic checked golden
+clockelapsed	edge	clockelapsed.c	clockelapsed.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockelapsed.out	linux-libc,syscall	active	exact source; deterministic checked golden
+clockelapsed-slow	edge	clockelapsed.c	clockelapsed.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_JIT_NOFASTSYS=1	0	expected/clockelapsed.out	linux-libc,syscall	excluded-harness-env	exact source and variant metadata; ABI4 runner cannot inject engine-process environment
+clockefault	edge	clockefault.c	clockefault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockefault.out	linux-libc,syscall	active	exact source; deterministic checked golden
+clockefault-slow	edge	clockefault.c	clockefault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_JIT_NOFASTSYS=1	0	expected/clockefault.out	linux-libc,syscall	excluded-harness-env	exact source and variant metadata; ABI4 runner cannot inject engine-process environment
+sysfault	edge	sysfault.c	sysfault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sysfault.out	linux-libc,syscall	active	exact source; deterministic checked golden
+sysfault-slow	edge	sysfault.c	sysfault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_JIT_NOFASTSYS=1	0	expected/sysfault.out	linux-libc,syscall	excluded-harness-env	exact source and variant metadata; ABI4 runner cannot inject engine-process environment

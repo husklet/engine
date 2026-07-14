@@ -264,6 +264,11 @@ static int config_option(config_wire *wire, const char *name, const char *value)
         return pool_string(wire, value, &wire->config.network_bridge_offset);
     } else if (strcmp(name, "HL_IP") == 0) {
         return pool_string(wire, value, &wire->config.ip_offset);
+    } else if (strcmp(name, "HL_PCACHE_DIR") == 0) {
+        // ABI4 enables the persistent translation cache by supplying its directory; production launch
+        // deliberately does not ingest ambient HL_* environment variables.
+        if (*value == 0) return 1;
+        return pool_string(wire, value, &wire->config.translation_cache_offset);
     } else {
         return 2;
     }

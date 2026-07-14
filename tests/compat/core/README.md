@@ -8,3 +8,8 @@ Every former native-oracle assertion is represented by a checked-in deterministi
 ISA restrictions, the SQLite argument, link dependencies, and the original static-PIE build model
 are explicit. Workload endurance files here are distinct top-level legacy sources; they do not
 duplicate the separately transferred `ext_soak` corpus.
+
+Slice two adds the non-graphics sources registered by `syscall.rs` and `regress.rs`. The display-only
+`wlshm_pool.c` remains excluded. Variants requiring an Alpine overlay or engine-process-only environment
+injection remain explicit manifest exclusions; their metadata is retained rather than silently running a
+weaker duplicate. Legacy syscall xfails likewise remain open.
