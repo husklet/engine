@@ -195,37 +195,40 @@ int main(void) {
 
         pollset = services.event->create(services.context);
         HL_CHECK(pollset.status == HL_STATUS_OK);
-        HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 0,
-                                         HL_HOST_READY_READ)
-                     .status == HL_STATUS_INVALID_ARGUMENT);
-        HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 73,
-                                         HL_HOST_READY_READ)
-                     .status == HL_STATUS_OK);
+        HL_CHECK(
+            services.event
+                ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 0, HL_HOST_READY_READ)
+                .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(
+            services.event
+                ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 73, HL_HOST_READY_READ)
+                .status == HL_STATUS_OK);
         uint64_t start = services.clock->monotonic_ns(services.context).value;
         uint64_t deadline = start + UINT64_C(10000000);
         HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1, deadline).value == 0);
         HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline);
 
-        HL_CHECK(services.network->send(services.context, sender.value,
-                                        (hl_host_const_bytes){datagram, sizeof(datagram)}, 0)
-                     .value == sizeof(datagram));
+        HL_CHECK(
+            services.network->send(services.context, sender.value, (hl_host_const_bytes){datagram, sizeof(datagram)}, 0)
+                .value == sizeof(datagram));
         deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
         {
             hl_host_result ready = services.event->wait(services.context, pollset.value, &event, 1, deadline);
             HL_CHECK(ready.status == HL_STATUS_OK && ready.value == 1 && event.token == 73 &&
                      (event.readiness & HL_HOST_READY_READ) != 0);
         }
-        HL_CHECK(services.network->receive(services.context, receiver.value,
-                                           (hl_host_bytes){received, sizeof(received)}, 0)
-                     .value == sizeof(received));
+        HL_CHECK(
+            services.network->receive(services.context, receiver.value, (hl_host_bytes){received, sizeof(received)}, 0)
+                .value == sizeof(received));
         HL_CHECK(memcmp(received, datagram, sizeof(datagram)) == 0);
         HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_DELETE, receiver.value, 73, 0)
                      .status == HL_STATUS_OK);
         HL_CHECK(services.event->control(services.context, pollset.value, 99, receiver.value, 73, 0).status ==
                  HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_OK);
-        HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1,
-                                      services.clock->monotonic_ns(services.context).value + UINT64_C(100000000))
+        HL_CHECK(services.event
+                     ->wait(services.context, pollset.value, &event, 1,
+                            services.clock->monotonic_ns(services.context).value + UINT64_C(100000000))
                      .value == 0);
         HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
         HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_INVALID_ARGUMENT);
