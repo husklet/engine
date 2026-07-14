@@ -1334,6 +1334,22 @@ static hl_host_result hl_macos_transfer_close(void *context, hl_host_handle hand
     return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_transfer_duplicate(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    hl_macos_transfer *transfer;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    transfer = hl_macos_transfer_lookup(host, handle);
+    descriptor = transfer == NULL ? -1 : dup(transfer->descriptor);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_macos_errno();
+    {
+        hl_host_result result = hl_macos_transfer_register(host, descriptor);
+        if (result.status != HL_STATUS_OK) close(descriptor);
+        return result;
+    }
+}
+
 static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_counter_object *object, uint32_t rights) {
     uint32_t index;
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;
@@ -1620,6 +1636,7 @@ static hl_host_result hl_macos_event_control(void *context, hl_host_handle polls
     hl_macos_event *event;
     hl_macos_counter *counter;
     hl_macos_directory *directory;
+    hl_macos_transfer *transfer;
     struct kevent changes[2];
     int count = 0;
     int descriptor;
@@ -1628,9 +1645,11 @@ static hl_host_result hl_macos_event_control(void *context, hl_host_handle polls
     event = hl_macos_event_lookup(host, pollset);
     counter = hl_macos_counter_lookup(host, object_handle);
     directory = hl_macos_directory_lookup(host, object_handle);
-    descriptor = event == NULL || (counter == NULL && directory == NULL) ? -1 : event->descriptor;
+    transfer = hl_macos_transfer_lookup(host, object_handle);
+    descriptor = event == NULL || (counter == NULL && directory == NULL && transfer == NULL) ? -1 : event->descriptor;
     if (descriptor >= 0 && counter != NULL) object_handle = (hl_host_handle)counter->object->readable;
     if (descriptor >= 0 && directory != NULL) object_handle = (hl_host_handle)directory->object->descriptor;
+    if (descriptor >= 0 && transfer != NULL) object_handle = (hl_host_handle)transfer->descriptor;
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (operation == HL_HOST_EVENT_DELETE)
@@ -2150,9 +2169,11 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                      hl_macos_counter_write,     hl_macos_counter_get_flags,
                                                      hl_macos_counter_set_flags, hl_macos_counter_duplicate,
                                                      hl_macos_counter_close};
-    static const hl_host_transfer_services transfer = {HL_HOST_TRANSFER_ABI,           sizeof(transfer),
-                                                       hl_macos_transfer_channel_pair, hl_macos_transfer_send,
-                                                       hl_macos_transfer_receive,      hl_macos_transfer_close};
+    static const hl_host_transfer_services transfer = {
+        HL_HOST_TRANSFER_ABI,    sizeof(transfer),          hl_macos_transfer_channel_pair,
+        hl_macos_transfer_send,  hl_macos_transfer_receive, hl_macos_transfer_duplicate,
+        hl_macos_transfer_close,
+    };
     static const hl_host_directory_services directory = {
         HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_macos_directory_create, hl_macos_directory_add,
         hl_macos_directory_modify, hl_macos_directory_remove, hl_macos_directory_read,   hl_macos_directory_duplicate,

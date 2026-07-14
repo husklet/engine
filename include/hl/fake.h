@@ -30,7 +30,9 @@ typedef struct hl_fake_host {
     uint32_t counter_rights[64];
     uint32_t live_counters;
     uint64_t transfer_channels[64];
+    uint8_t transfer_endpoints[64];
     uint8_t transfer_peers[64];
+    uint8_t transfer_references[64];
     uint8_t transfer_message_pending[64];
     uint16_t transfer_data_sizes[64];
     uint8_t transfer_attachment_counts[64];

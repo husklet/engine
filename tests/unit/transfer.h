@@ -51,6 +51,33 @@ static int check_transfer_fork(const hl_host_services *services) {
     HL_CHECK(services->counter->close(services->context, attachment.object).status == HL_STATUS_OK);
     HL_CHECK(services->transfer->close(services->context, channels.detail).status == HL_STATUS_OK);
 
+    /* Endpoint aliases share one queue and remain pollable after the original alias closes. */
+    channels = services->transfer->channel_pair(services->context);
+    HL_CHECK(channels.status == HL_STATUS_OK);
+    {
+        hl_host_result alias = services->transfer->duplicate(services->context, channels.detail);
+        hl_host_result pollset = services->event->create(services->context);
+        hl_host_event_record event;
+        char byte = 0;
+        HL_CHECK(alias.status == HL_STATUS_OK && pollset.status == HL_STATUS_OK);
+        HL_CHECK(services->transfer->close(services->context, channels.detail).status == HL_STATUS_OK);
+        HL_CHECK(services->event
+                     ->control(services->context, pollset.value, HL_HOST_EVENT_ADD, alias.value, 71, HL_HOST_READY_READ)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services->transfer->send(services->context, channels.value, (hl_host_const_bytes){"q", 1}, NULL, 0)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services->event->wait(services->context, pollset.value, &event, 1, HL_HOST_DEADLINE_INFINITE).value ==
+                     1 &&
+                 event.token == 71 && (event.readiness & HL_HOST_READY_READ) != 0);
+        HL_CHECK(
+            services->transfer->receive(services->context, alias.value, (hl_host_bytes){&byte, 1}, NULL, 0).status ==
+                HL_STATUS_OK &&
+            byte == 'q');
+        HL_CHECK(services->event->close(services->context, pollset.value).status == HL_STATUS_OK);
+        HL_CHECK(services->transfer->close(services->context, alias.value).status == HL_STATUS_OK);
+        HL_CHECK(services->transfer->close(services->context, channels.value).status == HL_STATUS_OK);
+    }
+
     /* Closing a receiver with an unread attached object must release the queued native descriptors. */
     channels = services->transfer->channel_pair(services->context);
     HL_CHECK(channels.status == HL_STATUS_OK);

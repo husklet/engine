@@ -1167,6 +1167,8 @@ static hl_host_result hl_linux_event_control(void *context, hl_host_handle polls
     if (object_fd < 0) object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
     if (object_fd < 0)
         object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_DIRECTORY, HL_LINUX_HANDLE_DIRECTORY);
+    if (object_fd < 0)
+        object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_TRANSFER, HL_LINUX_HANDLE_TRANSFER);
     pthread_mutex_unlock(&host->lock);
     if (pollset_fd < 0 || object_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (token == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -1625,6 +1627,20 @@ static hl_host_result hl_linux_transfer_receive(void *context, hl_host_handle ch
     return hl_linux_result(HL_STATUS_OK, wire.data_size, wire.attachment_count);
 }
 
+static hl_host_result hl_linux_transfer_duplicate(void *context, hl_host_handle channel) {
+    hl_host_linux *host = context;
+    int descriptor;
+    hl_host_result result;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, channel, HL_LINUX_HANDLE_TRANSFER, HL_LINUX_HANDLE_TRANSFER);
+    descriptor = descriptor < 0 ? -1 : dup(descriptor);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_errno_result();
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_TRANSFER, descriptor, NULL, NULL, 0, -1);
+    if (result.status != HL_STATUS_OK) close(descriptor);
+    return result;
+}
+
 static hl_host_result hl_linux_network_socket(void *context, uint32_t family, uint32_t type, uint32_t protocol) {
     hl_host_linux *host = context;
     int native_family;
@@ -2038,9 +2054,11 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                      hl_linux_counter_write,     hl_linux_counter_get_flags,
                                                      hl_linux_counter_set_flags, hl_linux_counter_duplicate,
                                                      hl_linux_close_descriptor};
-    static const hl_host_transfer_services transfer = {HL_HOST_TRANSFER_ABI,           sizeof(transfer),
-                                                       hl_linux_transfer_channel_pair, hl_linux_transfer_send,
-                                                       hl_linux_transfer_receive,      hl_linux_close_descriptor};
+    static const hl_host_transfer_services transfer = {
+        HL_HOST_TRANSFER_ABI,      sizeof(transfer),          hl_linux_transfer_channel_pair,
+        hl_linux_transfer_send,    hl_linux_transfer_receive, hl_linux_transfer_duplicate,
+        hl_linux_close_descriptor,
+    };
     static const hl_host_directory_services directory = {
         HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_linux_directory_create, hl_linux_directory_add,
         hl_linux_directory_modify, hl_linux_directory_remove, hl_linux_directory_read,   hl_linux_directory_duplicate,

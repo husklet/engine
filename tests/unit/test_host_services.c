@@ -223,6 +223,24 @@ int main(void) {
     HL_CHECK(services.transfer->close(services.context, channels.detail).status == HL_STATUS_OK &&
              fake.live_transfer_channels == 0);
 
+    channels = services.transfer->channel_pair(services.context);
+    {
+        hl_host_result alias = services.transfer->duplicate(services.context, channels.detail);
+        HL_CHECK(alias.status == HL_STATUS_OK && fake.live_transfer_channels == 3);
+        HL_CHECK(services.transfer->close(services.context, channels.detail).status == HL_STATUS_OK);
+        HL_CHECK(
+            services.transfer->send(services.context, channels.value, (hl_host_const_bytes){"d", 1}, NULL, 0).status ==
+            HL_STATUS_OK);
+        HL_CHECK(services.transfer
+                         ->receive(services.context, alias.value, (hl_host_bytes){received_data, sizeof(received_data)},
+                                   NULL, 0)
+                         .status == HL_STATUS_OK &&
+                 received_data[0] == 'd');
+        HL_CHECK(services.transfer->close(services.context, alias.value).status == HL_STATUS_OK);
+        HL_CHECK(services.transfer->close(services.context, channels.value).status == HL_STATUS_OK &&
+                 fake.live_transfer_channels == 0);
+    }
+
     counter = services.counter->create(services.context, 1, 0);
     channels = services.transfer->channel_pair(services.context);
     sent_attachment =

@@ -326,6 +326,8 @@ typedef struct hl_host_transfer_services {
     /* value is byte count and detail is attachment count. A successful receive consumes one message. */
     hl_host_result (*receive)(void *context, hl_host_handle channel, hl_host_bytes data,
                               hl_host_transfer_attachment *attachments, uint32_t attachment_capacity);
+    /* Duplicate aliases the same endpoint and queued-message stream. */
+    hl_host_result (*duplicate)(void *context, hl_host_handle channel);
     hl_host_result (*close)(void *context, hl_host_handle channel);
 } hl_host_transfer_services;
 
