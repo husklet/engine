@@ -13,7 +13,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_ABI_13 13u
 #define HL_HOST_FILE_ABI_14 14u
 #define HL_HOST_FILE_ABI_15 15u
-#define HL_HOST_FILE_ABI 16u
+#define HL_HOST_FILE_ABI_16 16u
+#define HL_HOST_FILE_ABI 17u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -255,6 +256,18 @@ typedef struct hl_host_file_resolution {
     char final[256];
 } hl_host_file_resolution;
 
+typedef enum hl_host_file_time_mode {
+    HL_HOST_FILE_TIME_EXPLICIT = 0,
+    HL_HOST_FILE_TIME_NOW = 1,
+    HL_HOST_FILE_TIME_OMIT = 2
+} hl_host_file_time_mode;
+
+typedef struct hl_host_file_time {
+    int64_t seconds;
+    uint32_t nanoseconds;
+    uint32_t mode;
+} hl_host_file_time;
+
 enum { HL_HOST_FILE_IOV_MAX = 1024 };
 enum {
     HL_HOST_FILE_SYNC_WAIT_BEFORE = 1u << 0,
@@ -323,6 +336,8 @@ typedef struct hl_host_file_services {
                                           hl_host_filesystem_metadata *output);
     /* Change only permission bits on an opaque file. Guest ownership virtualization is a Linux-front job. */
     hl_host_result (*set_permissions)(void *context, hl_host_handle file, uint32_t permissions);
+    /* Atomically update access and modification times on the open object. */
+    hl_host_result (*set_times)(void *context, hl_host_handle file, const hl_host_file_time times[2]);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

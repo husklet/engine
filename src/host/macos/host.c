@@ -974,6 +974,31 @@ static hl_host_result hl_macos_file_set_permissions(void *context, hl_host_handl
     return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_file_set_times(void *context, hl_host_handle file, const hl_host_file_time times[2]) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    struct timespec native[2];
+    int status;
+    if (descriptor < 0 || times == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    for (int index = 0; index < 2; ++index) {
+        if (times[index].mode == HL_HOST_FILE_TIME_NOW) {
+            native[index].tv_sec = 0;
+            native[index].tv_nsec = UTIME_NOW;
+        } else if (times[index].mode == HL_HOST_FILE_TIME_OMIT) {
+            native[index].tv_sec = 0;
+            native[index].tv_nsec = UTIME_OMIT;
+        } else if (times[index].mode == HL_HOST_FILE_TIME_EXPLICIT && times[index].nanoseconds < 1000000000u) {
+            native[index].tv_sec = (time_t)times[index].seconds;
+            native[index].tv_nsec = (long)times[index].nanoseconds;
+        } else {
+            return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        }
+    }
+    do
+        status = futimens(descriptor, native);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append) {
     hl_macos_file *file;
     int descriptor;
@@ -3543,7 +3568,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_open_beneath,
                                                hl_macos_file_allocate_range,
                                                hl_macos_file_filesystem_metadata,
-                                               hl_macos_file_set_permissions};
+                                               hl_macos_file_set_permissions,
+                                               hl_macos_file_set_times};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

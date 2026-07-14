@@ -1821,6 +1821,53 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = 0;
         break;
     }
+    case 88: {
+        hl_host_file_time times[2];
+        const struct timespec *guest = (const struct timespec *)(uintptr_t)a2;
+        if (a1 != 0) {
+            if (!host_range_mapped((uintptr_t)a1, 1)) {
+                result = -EFAULT;
+                break;
+            }
+            /* Absolute paths ignore dirfd. Relative paths require a directory, while typed handles
+             * currently represent ordinary files only. Let the common path route handle absolutes. */
+            if (*(const char *)(uintptr_t)a1 == '/') return 0;
+            result = -ENOTDIR;
+            break;
+        }
+        if (a3 != 0) {
+            result = -EINVAL;
+            break;
+        }
+        if (g_host_services->file->set_times == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        if (guest != NULL && !host_range_mapped((uintptr_t)guest, sizeof(struct timespec) * 2)) {
+            result = -EFAULT;
+            break;
+        }
+        for (int index = 0; index < 2; ++index) {
+            int64_t nanoseconds = guest == NULL ? INT64_C(0x3fffffff) : (int64_t)guest[index].tv_nsec;
+            times[index].seconds = guest == NULL ? 0 : (int64_t)guest[index].tv_sec;
+            times[index].nanoseconds = 0;
+            if (nanoseconds == INT64_C(0x3fffffff))
+                times[index].mode = HL_HOST_FILE_TIME_NOW;
+            else if (nanoseconds == INT64_C(0x3ffffffe))
+                times[index].mode = HL_HOST_FILE_TIME_OMIT;
+            else if (nanoseconds >= 0 && nanoseconds < INT64_C(1000000000)) {
+                times[index].nanoseconds = (uint32_t)nanoseconds;
+                times[index].mode = HL_HOST_FILE_TIME_EXPLICIT;
+            } else {
+                result = -EINVAL;
+                goto bound_set_times_done;
+            }
+        }
+        result = bound_host_error(
+            g_host_services->file->set_times(g_host_services->context, source.host_handle, times).status);
+    bound_set_times_done:
+        break;
+    }
     case 32: {
         hl_host_file_metadata metadata;
         hl_host_result status =

@@ -1086,6 +1086,36 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_set_times(void *context, hl_host_handle file, const hl_host_file_time times[2]) {
+    hl_host_linux *host = context;
+    struct timespec native[2];
+    int descriptor;
+    int status;
+    if (times == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    for (int index = 0; index < 2; ++index) {
+        if (times[index].mode == HL_HOST_FILE_TIME_NOW) {
+            native[index].tv_sec = 0;
+            native[index].tv_nsec = UTIME_NOW;
+        } else if (times[index].mode == HL_HOST_FILE_TIME_OMIT) {
+            native[index].tv_sec = 0;
+            native[index].tv_nsec = UTIME_OMIT;
+        } else if (times[index].mode == HL_HOST_FILE_TIME_EXPLICIT && times[index].nanoseconds < 1000000000u) {
+            native[index].tv_sec = (time_t)times[index].seconds;
+            native[index].tv_nsec = (long)times[index].nanoseconds;
+        } else {
+            return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        }
+    }
+    do
+        status = futimens(descriptor, native);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_read(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {
     hl_host_linux *host = context;
     int descriptor;
@@ -3073,7 +3103,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_open_beneath,
                                                hl_linux_file_allocate_range,
                                                hl_linux_file_filesystem_metadata,
-                                               hl_linux_file_set_permissions};
+                                               hl_linux_file_set_permissions,
+                                               hl_linux_file_set_times};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,
