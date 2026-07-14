@@ -726,6 +726,45 @@ static int bound_rights_reference(uint64_t message_address) {
     return 0;
 }
 
+static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, const hl_linux_fd_snapshot *input,
+                              uint64_t offset_address, uint64_t count) {
+    uint64_t explicit_offset = 0;
+    uint64_t input_offset = input->offset;
+    uint64_t done = 0;
+    int64_t error = 0;
+    char buffer[8192];
+    if (offset_address != 0) {
+        if (!host_range_mapped((uintptr_t)offset_address, sizeof(off_t))) return -EFAULT;
+        off_t supplied = *(off_t *)(uintptr_t)offset_address;
+        if (supplied < 0) return -EINVAL;
+        explicit_offset = (uint64_t)supplied;
+        input_offset = explicit_offset;
+    }
+    if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000); /* Linux MAX_RW_COUNT */
+    while (done < count) {
+        uint64_t remaining = count - done;
+        size_t chunk = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
+        int64_t read_count = hl_linux_pread64(g_linux_box, input->fd, buffer, chunk, input_offset);
+        if (read_count <= 0) {
+            error = read_count;
+            break;
+        }
+        int64_t written = hl_linux_write(g_linux_box, output->fd, buffer, (size_t)read_count);
+        if (written <= 0) {
+            error = written;
+            break;
+        }
+        input_offset += (uint64_t)written;
+        done += (uint64_t)written;
+        if (written != read_count) break;
+    }
+    if (offset_address != 0)
+        *(off_t *)(uintptr_t)offset_address = (off_t)input_offset;
+    else if (done != 0)
+        (void)hl_linux_lseek(g_linux_box, input->fd, (int64_t)done, SEEK_CUR);
+    return done != 0 ? (int64_t)done : error;
+}
+
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     hl_linux_fd_snapshot source;
     int64_t result;
@@ -781,7 +820,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     if (nr == 71 || nr == 77) {
         hl_linux_fd_snapshot second;
         if (bound_snapshot(a1, &second)) {
-            G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+            G_RET(c) = (uint64_t)(nr == 71 && source_bound ? bound_sendfile(&source, &second, a2, a3) : -ENOSYS);
             return 1;
         }
     }

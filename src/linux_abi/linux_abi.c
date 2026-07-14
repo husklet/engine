@@ -1162,6 +1162,8 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
                                                     : hl_linux_error((hl_status)host_result.status);
         if (host_result.status == HL_STATUS_OK && (host_result.value > size || host_result.value > INT64_MAX))
             result = -HL_LINUX_EIO;
+        else if (result > 0 && ofd->offset <= UINT64_MAX - (uint64_t)result)
+            ofd->offset += (uint64_t)result;
     }
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
@@ -1261,6 +1263,12 @@ int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buff
                                                     : hl_linux_error((hl_status)host_result.status);
         if (host_result.status == HL_STATUS_OK && (host_result.value > size || host_result.value > INT64_MAX))
             result = -HL_LINUX_EIO;
+        else if (result > 0 && !append && ofd->offset <= UINT64_MAX - (uint64_t)result)
+            ofd->offset += (uint64_t)result;
+        else if (result > 0 && append && files->seek != NULL) {
+            hl_host_result end = files->seek(linux_abi->host->context, ofd->host_handle, 0, HL_LINUX_SEEK_END);
+            if (end.status == HL_STATUS_OK) ofd->offset = end.value;
+        }
     }
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
@@ -1347,6 +1355,12 @@ static int64_t hl_linux_vector(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl
             result = -HL_LINUX_EIO;
         else
             result = (int64_t)host_result.value;
+        if (result > 0 && !positioned && !append && ofd->offset <= UINT64_MAX - (uint64_t)result)
+            ofd->offset += (uint64_t)result;
+        else if (result > 0 && append && files->seek != NULL) {
+            hl_host_result end = files->seek(linux_abi->host->context, ofd->host_handle, 0, HL_LINUX_SEEK_END);
+            if (end.status == HL_STATUS_OK) ofd->offset = end.value;
+        }
     }
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
@@ -1791,6 +1805,7 @@ int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, 
         result = host_result.status == HL_STATUS_OK ? (int64_t)host_result.value
                                                     : hl_linux_error((hl_status)host_result.status);
         if (host_result.status == HL_STATUS_OK && host_result.value > INT64_MAX) result = -HL_LINUX_EOVERFLOW;
+        if (host_result.status == HL_STATUS_OK && host_result.value <= INT64_MAX) ofd->offset = host_result.value;
     }
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
