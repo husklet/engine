@@ -14,6 +14,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
+#define HL_HOST_COUNTER_ABI 1u
 #define HL_HOST_SYNC_ABI 2u
 
 typedef uint64_t hl_host_handle;
@@ -31,7 +32,8 @@ enum {
     HL_HOST_CAP_SHARED_MEMORY = UINT64_C(1) << 8,
     HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 9,
     HL_HOST_CAP_SYNC = UINT64_C(1) << 10,
-    HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11
+    HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11,
+    HL_HOST_CAP_COUNTER = UINT64_C(1) << 12
 };
 
 enum {
@@ -40,6 +42,8 @@ enum {
     HL_HOST_FILE_APPEND = 1u << 2,
     HL_HOST_FILE_DIRECTORY = 1u << 3
 };
+
+enum { HL_HOST_COUNTER_SEMAPHORE = 1u << 0, HL_HOST_COUNTER_NONBLOCK = 1u << 1 };
 
 enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
 
@@ -277,6 +281,19 @@ typedef struct hl_host_shared_memory_services {
     hl_host_result (*close)(void *context, hl_host_handle object);
 } hl_host_shared_memory_services;
 
+/* Pollable unsigned 64-bit counter. UINT64_MAX is reserved and may never be stored. */
+typedef struct hl_host_counter_services {
+    HL_ABI_HEADER;
+    hl_host_result (*create)(void *context, uint64_t initial, uint32_t flags);
+    /* read returns the consumed value; semaphore mode consumes and returns one. */
+    hl_host_result (*read)(void *context, hl_host_handle counter);
+    hl_host_result (*write)(void *context, hl_host_handle counter, uint64_t value);
+    hl_host_result (*get_flags)(void *context, hl_host_handle counter);
+    hl_host_result (*set_flags)(void *context, hl_host_handle counter, uint32_t flags);
+    hl_host_result (*duplicate)(void *context, hl_host_handle counter);
+    hl_host_result (*close)(void *context, hl_host_handle counter);
+} hl_host_counter_services;
+
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -302,6 +319,7 @@ typedef struct hl_host_services {
     const hl_host_network_services *network;
     const hl_host_shared_memory_services *shared_memory;
     const hl_host_sync_services *sync;
+    const hl_host_counter_services *counter;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

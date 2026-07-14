@@ -1,6 +1,7 @@
 #include "test.h"
 
 #include "hl/linux.h"
+#include "counter.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -100,6 +101,7 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    HL_CHECK(check_counter(&services) == 0);
     HL_CHECK(hl_host_services_validate(
                  &services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE | HL_HOST_CAP_EVENT |
                                 HL_HOST_CAP_NETWORK | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |

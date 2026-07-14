@@ -83,5 +83,12 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->sync->fork_prepare == NULL || services->sync->fork_parent == NULL ||
          services->sync->fork_child == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_COUNTER) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, counter), sizeof(services->counter)) ||
+         !hl_valid_group(services->counter, HL_HOST_COUNTER_ABI, sizeof(*services->counter)) ||
+         services->counter->create == NULL || services->counter->read == NULL || services->counter->write == NULL ||
+         services->counter->get_flags == NULL || services->counter->set_flags == NULL ||
+         services->counter->duplicate == NULL || services->counter->close == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

@@ -12,6 +12,7 @@
 #include <mach/mach_vm.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +31,7 @@
 #define HL_MACOS_PROCESS_CAPACITY 1024u
 #define HL_MACOS_EVENT_CAPACITY 64u
 #define HL_MACOS_TIMER_CAPACITY 32u
+#define HL_MACOS_COUNTER_CAPACITY 128u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -71,6 +73,21 @@ typedef struct hl_macos_event {
     hl_macos_timer timers[HL_MACOS_TIMER_CAPACITY];
 } hl_macos_event;
 
+typedef struct hl_macos_counter_object {
+    pthread_mutex_t lock;
+    uint64_t value;
+    uint32_t flags;
+    uint32_t references;
+    int readable;
+    int signal;
+} hl_macos_counter_object;
+
+typedef struct hl_macos_counter {
+    uint32_t generation;
+    uint32_t active;
+    hl_macos_counter_object *object;
+} hl_macos_counter;
+
 struct hl_host_macos {
     pthread_mutex_t lock;
     pthread_mutex_t fork_gate;
@@ -81,6 +98,7 @@ struct hl_host_macos {
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
     hl_macos_event events[HL_MACOS_EVENT_CAPACITY];
+    hl_macos_counter counters[HL_MACOS_COUNTER_CAPACITY];
 };
 
 static hl_host_result hl_macos_fork_complete(void *context);
@@ -881,6 +899,191 @@ static hl_macos_event *hl_macos_event_lookup(hl_host_macos *host, hl_host_handle
     return &host->events[index];
 }
 
+static hl_macos_counter *hl_macos_counter_lookup(hl_host_macos *host, hl_host_handle handle) {
+    uint32_t low = (uint32_t)handle;
+    uint32_t index;
+    if (low == 0) return NULL;
+    index = low - 1u;
+    if (index >= HL_MACOS_COUNTER_CAPACITY || !host->counters[index].active ||
+        host->counters[index].generation != (uint32_t)(handle >> 32))
+        return NULL;
+    return &host->counters[index];
+}
+
+static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_counter_object *object) {
+    uint32_t index;
+    hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+        hl_macos_counter *counter = &host->counters[index];
+        if (counter->active) continue;
+        counter->generation++;
+        if (counter->generation == 0) counter->generation = 1;
+        counter->active = 1;
+        counter->object = object;
+        object->references++;
+        handle = hl_macos_handle(index, counter->generation);
+        break;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return handle == HL_HOST_HANDLE_INVALID ? hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0)
+                                            : hl_macos_result(HL_STATUS_OK, handle, 0);
+}
+
+static hl_host_result hl_macos_counter_create(void *context, uint64_t initial, uint32_t flags) {
+    hl_host_macos *host = context;
+    hl_macos_counter_object *object;
+    int descriptors[2];
+    hl_host_result result;
+    if (initial == UINT64_MAX || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (pipe(descriptors) != 0) return hl_macos_errno();
+    (void)fcntl(descriptors[0], F_SETFL, O_NONBLOCK);
+    (void)fcntl(descriptors[1], F_SETFL, O_NONBLOCK);
+    (void)fcntl(descriptors[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(descriptors[1], F_SETFD, FD_CLOEXEC);
+    object = mmap(NULL, sizeof(*object), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (object == MAP_FAILED) object = NULL;
+    if (object == NULL) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    }
+    {
+        pthread_mutexattr_t attributes;
+        int initialized = pthread_mutexattr_init(&attributes) == 0;
+        if (!initialized || pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) != 0 ||
+            pthread_mutex_init(&object->lock, &attributes) != 0) {
+            if (initialized) pthread_mutexattr_destroy(&attributes);
+            close(descriptors[0]);
+            close(descriptors[1]);
+            munmap(object, sizeof(*object));
+            return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+        }
+        pthread_mutexattr_destroy(&attributes);
+    }
+    object->value = initial;
+    object->flags = flags;
+    object->readable = descriptors[0];
+    object->signal = descriptors[1];
+    if (initial != 0) {
+        const uint8_t byte = 1;
+        (void)write(object->signal, &byte, 1);
+    }
+    result = hl_macos_counter_register(host, object);
+    if (result.status != HL_STATUS_OK) {
+        pthread_mutex_destroy(&object->lock);
+        close(object->readable);
+        close(object->signal);
+        munmap(object, sizeof(*object));
+    }
+    return result;
+}
+
+static hl_macos_counter_object *hl_macos_counter_object_get(hl_host_macos *host, hl_host_handle handle) {
+    hl_macos_counter *counter;
+    hl_macos_counter_object *object;
+    pthread_mutex_lock(&host->lock);
+    counter = hl_macos_counter_lookup(host, handle);
+    object = counter == NULL ? NULL : counter->object;
+    pthread_mutex_unlock(&host->lock);
+    return object;
+}
+
+static hl_host_result hl_macos_counter_read(void *context, hl_host_handle counter) {
+    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    uint64_t value;
+    uint8_t bytes[32];
+    if (object == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    for (;;) {
+        pthread_mutex_lock(&object->lock);
+        if (object->value != 0) break;
+        if ((object->flags & HL_HOST_COUNTER_NONBLOCK) != 0) {
+            pthread_mutex_unlock(&object->lock);
+            return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+        }
+        pthread_mutex_unlock(&object->lock);
+        poll(&(struct pollfd){object->readable, POLLIN, 0}, 1, -1);
+    }
+    value = (object->flags & HL_HOST_COUNTER_SEMAPHORE) != 0 ? 1 : object->value;
+    object->value -= value;
+    if (object->value == 0)
+        while (read(object->readable, bytes, sizeof(bytes)) > 0) {}
+    pthread_mutex_unlock(&object->lock);
+    return hl_macos_result(HL_STATUS_OK, value, 0);
+}
+
+static hl_host_result hl_macos_counter_write(void *context, hl_host_handle counter, uint64_t value) {
+    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    uint8_t byte = 1;
+    if (object == NULL || value == UINT64_MAX || value == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&object->lock);
+    if (value > UINT64_MAX - 1u - object->value) {
+        pthread_mutex_unlock(&object->lock);
+        return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+    }
+    if (object->value == 0) (void)write(object->signal, &byte, 1);
+    object->value += value;
+    pthread_mutex_unlock(&object->lock);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_counter_get_flags(void *context, hl_host_handle counter) {
+    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    uint32_t flags;
+    if (object == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&object->lock);
+    flags = object->flags;
+    pthread_mutex_unlock(&object->lock);
+    return hl_macos_result(HL_STATUS_OK, flags, 0);
+}
+
+static hl_host_result hl_macos_counter_set_flags(void *context, hl_host_handle counter, uint32_t flags) {
+    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    if (object == NULL || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&object->lock);
+    if ((object->flags & HL_HOST_COUNTER_SEMAPHORE) != (flags & HL_HOST_COUNTER_SEMAPHORE)) {
+        pthread_mutex_unlock(&object->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    object->flags = flags;
+    pthread_mutex_unlock(&object->lock);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_counter_duplicate(void *context, hl_host_handle counter) {
+    hl_host_macos *host = context;
+    hl_macos_counter_object *object = hl_macos_counter_object_get(host, counter);
+    if (object == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return hl_macos_counter_register(host, object);
+}
+
+static hl_host_result hl_macos_counter_close(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    hl_macos_counter *counter;
+    hl_macos_counter_object *object;
+    int final;
+    pthread_mutex_lock(&host->lock);
+    counter = hl_macos_counter_lookup(host, handle);
+    if (counter == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    object = counter->object;
+    counter->active = 0;
+    counter->object = NULL;
+    final = --object->references == 0;
+    pthread_mutex_unlock(&host->lock);
+    if (final) {
+        close(object->readable);
+        close(object->signal);
+        pthread_mutex_destroy(&object->lock);
+        munmap(object, sizeof(*object));
+    }
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_macos_event_create(void *context) {
     hl_host_macos *host = context;
     struct kevent wake;
@@ -919,6 +1122,36 @@ static hl_macos_timer *hl_macos_event_timer(hl_macos_event *event, uint64_t toke
     for (index = 0; index < HL_MACOS_TIMER_CAPACITY; ++index)
         if (event->timers[index].active && event->timers[index].token == token) return &event->timers[index];
     return NULL;
+}
+
+static hl_host_result hl_macos_event_control(void *context, hl_host_handle pollset, uint32_t operation,
+                                             hl_host_handle object_handle, uint64_t token, uint32_t interests) {
+    hl_host_macos *host = context;
+    hl_macos_event *event;
+    hl_macos_counter *counter;
+    struct kevent changes[2];
+    int count = 0;
+    int descriptor;
+    uint16_t flags;
+    pthread_mutex_lock(&host->lock);
+    event = hl_macos_event_lookup(host, pollset);
+    counter = hl_macos_counter_lookup(host, object_handle);
+    descriptor = event == NULL || counter == NULL ? -1 : event->descriptor;
+    if (descriptor >= 0) object_handle = (hl_host_handle)counter->object->readable;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (operation == HL_HOST_EVENT_DELETE)
+        flags = EV_DELETE;
+    else if (operation == HL_HOST_EVENT_ADD || operation == HL_HOST_EVENT_MODIFY)
+        flags = (uint16_t)(EV_ADD | EV_ENABLE | ((interests & HL_HOST_READY_EDGE) ? EV_CLEAR : 0) |
+                           ((interests & HL_HOST_READY_ONESHOT) ? EV_ONESHOT : 0));
+    else
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if ((interests & HL_HOST_READY_READ) != 0 || operation == HL_HOST_EVENT_DELETE)
+        EV_SET(&changes[count++], (uintptr_t)object_handle, EVFILT_READ, flags, 0, 0, (void *)(uintptr_t)token);
+    if (count == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return kevent(descriptor, changes, count, NULL, 0, NULL) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
+                                                                  : hl_macos_errno();
 }
 
 static int hl_macos_event_submit_timer(int descriptor, uint64_t token, uint64_t delay_ns) {
@@ -1288,6 +1521,18 @@ static hl_host_result hl_macos_fork_prepare(void *context) {
         return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     }
     result = hl_host_sync_fork_prepare(host->sync);
+    if (result.status == HL_STATUS_OK) {
+        uint32_t index;
+        for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+            hl_macos_counter_object *object;
+            uint32_t previous;
+            if (!host->counters[index].active) continue;
+            object = host->counters[index].object;
+            for (previous = 0; previous < index; ++previous)
+                if (host->counters[previous].active && host->counters[previous].object == object) break;
+            if (previous == index) object->references++;
+        }
+    }
     if (result.status != HL_STATUS_OK) {
         pthread_mutex_unlock(&host->lock);
         pthread_mutex_unlock(&host->fork_gate);
@@ -1356,7 +1601,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
     static const hl_host_event_services event = {
-        HL_HOST_EVENT_ABI,          sizeof(event),       hl_macos_event_create, NULL,
+        HL_HOST_EVENT_ABI,          sizeof(event),       hl_macos_event_create, hl_macos_event_control,
         hl_macos_event_wait,        hl_macos_event_wake, hl_macos_event_close,  hl_macos_event_arm_timer,
         hl_macos_event_disarm_timer};
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
@@ -1365,6 +1610,11 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
                                                hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
                                                hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_complete};
+    static const hl_host_counter_services counter = {HL_HOST_COUNTER_ABI,        sizeof(counter),
+                                                     hl_macos_counter_create,    hl_macos_counter_read,
+                                                     hl_macos_counter_write,     hl_macos_counter_get_flags,
+                                                     hl_macos_counter_set_flags, hl_macos_counter_duplicate,
+                                                     hl_macos_counter_close};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -1397,7 +1647,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_PROCESS | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
-                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC;
+                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC | HL_HOST_CAP_EVENT | HL_HOST_CAP_COUNTER;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -1407,6 +1657,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->event = &event;
     out_services->shared_memory = &shared_memory;
     out_services->sync = &sync;
+    out_services->counter = &counter;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -1422,6 +1673,20 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     }
     for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index)
         if (host->events[index].active) close(host->events[index].descriptor);
+    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+        hl_macos_counter *counter = &host->counters[index];
+        hl_macos_counter_object *object;
+        if (!counter->active) continue;
+        object = counter->object;
+        counter->active = 0;
+        counter->object = NULL;
+        if (--object->references == 0) {
+            close(object->readable);
+            close(object->signal);
+            pthread_mutex_destroy(&object->lock);
+            munmap(object, sizeof(*object));
+        }
+    }
     hl_host_sync_registry_destroy(host->sync);
     for (;;) {
         uint32_t waiters = 0;

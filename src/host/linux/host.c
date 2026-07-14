@@ -36,7 +36,8 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_SOCKET = 3,
     HL_LINUX_HANDLE_POLLSET = 4,
     HL_LINUX_HANDLE_SHARED_MEMORY = 5,
-    HL_LINUX_HANDLE_PROCESS = 6
+    HL_LINUX_HANDLE_PROCESS = 6,
+    HL_LINUX_HANDLE_COUNTER = 7
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -875,6 +876,7 @@ static hl_host_result hl_linux_event_control(void *context, hl_host_handle polls
     pthread_mutex_lock(&host->lock);
     pollset_fd = hl_linux_descriptor(host, pollset, HL_LINUX_HANDLE_POLLSET, HL_LINUX_HANDLE_POLLSET);
     object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SOCKET);
+    if (object_fd < 0) object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
     pthread_mutex_unlock(&host->lock);
     if (pollset_fd < 0 || object_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (token == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -1059,6 +1061,106 @@ static hl_host_result hl_linux_event_close(void *context, hl_host_handle pollset
     }
     pthread_mutex_unlock(&host->lock);
     return hl_linux_close_descriptor(context, pollset);
+}
+
+static hl_host_result hl_linux_counter_create(void *context, uint64_t initial, uint32_t flags) {
+    hl_host_linux *host = context;
+    int native_flags = EFD_CLOEXEC;
+    int descriptor;
+    hl_host_result result;
+    if (initial == UINT64_MAX || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if ((flags & HL_HOST_COUNTER_SEMAPHORE) != 0) native_flags |= EFD_SEMAPHORE;
+    if ((flags & HL_HOST_COUNTER_NONBLOCK) != 0) native_flags |= EFD_NONBLOCK;
+    descriptor = eventfd(0, native_flags);
+    if (descriptor < 0) return hl_linux_errno_result();
+    if (initial != 0 && write(descriptor, &initial, sizeof(initial)) != (ssize_t)sizeof(initial)) {
+        hl_host_result error = hl_linux_errno_result();
+        close(descriptor);
+        return error;
+    }
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_COUNTER, descriptor, NULL, NULL, flags, -1);
+    if (result.status != HL_STATUS_OK) close(descriptor);
+    return result;
+}
+
+static hl_host_result hl_linux_counter_read(void *context, hl_host_handle counter) {
+    hl_host_linux *host = context;
+    uint64_t value;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, counter, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return read(descriptor, &value, sizeof(value)) == (ssize_t)sizeof(value) ? hl_linux_result(HL_STATUS_OK, value, 0)
+                                                                             : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_counter_write(void *context, hl_host_handle counter, uint64_t value) {
+    hl_host_linux *host = context;
+    int descriptor;
+    if (value == UINT64_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, counter, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return write(descriptor, &value, sizeof(value)) == (ssize_t)sizeof(value) ? hl_linux_result(HL_STATUS_OK, 0, 0)
+                                                                              : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_counter_get_flags(void *context, hl_host_handle counter) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    uint64_t flags;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    flags = entry == NULL ? UINT64_MAX : entry->size;
+    pthread_mutex_unlock(&host->lock);
+    return flags == UINT64_MAX ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0)
+                               : hl_linux_result(HL_STATUS_OK, flags, 0);
+}
+
+static hl_host_result hl_linux_counter_set_flags(void *context, hl_host_handle counter, uint32_t flags) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    int descriptor;
+    int native;
+    if ((flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry == NULL || ((uint32_t)entry->size & HL_HOST_COUNTER_SEMAPHORE) != (flags & HL_HOST_COUNTER_SEMAPHORE)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = entry->descriptor;
+    native = fcntl(descriptor, F_GETFL);
+    if (native >= 0 &&
+        fcntl(descriptor, F_SETFL, (native & ~O_NONBLOCK) | ((flags & HL_HOST_COUNTER_NONBLOCK) ? O_NONBLOCK : 0)) == 0)
+        entry->size = flags;
+    else
+        descriptor = -1;
+    pthread_mutex_unlock(&host->lock);
+    return descriptor < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_counter_duplicate(void *context, hl_host_handle counter) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    int descriptor;
+    uint64_t flags;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    descriptor = entry == NULL ? -1 : dup(entry->descriptor);
+    flags = entry == NULL ? 0 : entry->size;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_errno_result();
+    {
+        hl_host_result result =
+            hl_linux_allocate_handle(host, HL_LINUX_HANDLE_COUNTER, descriptor, NULL, NULL, flags, -1);
+        if (result.status != HL_STATUS_OK) close(descriptor);
+        return result;
+    }
 }
 
 static hl_host_result hl_linux_network_socket(void *context, uint32_t family, uint32_t type, uint32_t protocol) {
@@ -1469,6 +1571,11 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_linux_shared_create,    hl_linux_shared_open,
                                                                  hl_linux_shared_resize,    hl_linux_close_descriptor};
+    static const hl_host_counter_services counter = {HL_HOST_COUNTER_ABI,        sizeof(counter),
+                                                     hl_linux_counter_create,    hl_linux_counter_read,
+                                                     hl_linux_counter_write,     hl_linux_counter_get_flags,
+                                                     hl_linux_counter_set_flags, hl_linux_counter_duplicate,
+                                                     hl_linux_close_descriptor};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
@@ -1515,7 +1622,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_NETWORK |
                                  HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING |
-                                 HL_HOST_CAP_SYNC;
+                                 HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -1526,6 +1633,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->shared_memory = &shared_memory;
     out_services->process = &process;
     out_services->sync = &sync;
+    out_services->counter = &counter;
     *out_host = host;
     return HL_STATUS_OK;
 }
