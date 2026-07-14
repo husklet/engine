@@ -1,0 +1,35 @@
+# case	group	source	legacy_source	isas	cflags	defines/env-argv	env	exit	stdout	dependencies	disposition	note
+hello	compat	hello.c	hello.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	42	expected/hello.out	linux-libc	active	exact source; explicit exit/stdout registration
+math	compat	math.c	math.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/math.out	linux-libc,libm	active	exact source; deterministic replacement for native oracle
+strings	compat	strings.c	strings.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/strings.out	linux-libc	active	exact source; deterministic replacement for native oracle
+bitops	compat	bitops.c	bitops.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/bitops.out	codegen	active	exact source; deterministic replacement for native oracle
+mov-moffs	compat	moffs.c	moffs.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/moffs.out	x86-moffs	active	exact x86-only registration
+varargs	compat	varargs.c	varargs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/varargs.out	linux-libc,varargs	active	exact source; deterministic replacement for native oracle
+longjmp	compat	longjmp.c	longjmp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/longjmp.out	linux-libc	active	exact registered golden
+recursion	compat	recursion.c	recursion.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/recursion.out	codegen,stack	active	exact source; deterministic replacement for native oracle
+fnptr	compat	fnptr.c	fnptr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/fnptr.out	ibtc	active	exact source; deterministic replacement for native oracle
+jumptable	compat	jumptable.c	jumptable.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/jumptable.out	indirect-branch	active	exact source; deterministic replacement for native oracle
+ibtc-dispatch	compat	ibtc_dispatch.c	ibtc_dispatch.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ibtc_dispatch.out	ibtc,computed-goto	active	exact registered golden
+floatmath	compat	floatmath.c	floatmath.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/floatmath.out	libm,fp	active	exact source; deterministic replacement for native oracle
+fpedge	compat	fpedge.c	fpedge.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/fpedge.out	x86-sse,fp	active	exact x86-only source; deterministic replacement for native oracle
+fpdnan	compat	fpdnan.c	fpdnan.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/fpdnan.out	x86-sse,fp	active	exact x86-only source; deterministic replacement for native oracle
+repmovsdf	compat	repmovsdf.c	repmovsdf.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/repmovsdf.out	x86-df,rep-movs	active	exact x86-only source; deterministic replacement for native oracle
+x87m80	compat	x87m80.c	x87m80.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/x87m80.out	x87,m80	active	exact x86-only source; deterministic replacement for native oracle
+shldflags	compat	shldflags.c	shldflags.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/shldflags.out	x86-shld-shrd,flags	active	exact x86-only source; deterministic replacement for native oracle
+stolen-regs	compat	stolen_regs.c	stolen_regs.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/stolen_regs.out	aarch64-register-mangling	active	exact AArch64-only source; deterministic replacement for native oracle
+heap	libc	heap.c	heap.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/heap.out	linux-libc,heap	active	exact source; deterministic replacement for native oracle
+qsort	libc	qsort.c	qsort.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/qsort.out	linux-libc,qsort	active	exact source; deterministic replacement for native oracle
+files	libc	files.c	files.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/files.out	linux-libc,filesystem	active	exact registered golden
+statfile	libc	statfile.c	statfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statfile.out	linux-libc,filesystem	active	exact source; deterministic replacement for native oracle
+pipe	libc	pipe.c	pipe.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pipe.out	linux-libc,pipe	active	exact registered golden
+mmapanon	libc	mmapanon.c	mmapanon.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mmapanon.out	linux-libc,mmap	active	exact source; deterministic replacement for native oracle
+munmap-partial	libc	munmap_partial.c	munmap_partial.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/munmap_partial.out	linux-libc,mmap	active	exact registered golden
+regex	clib	regex.c	regex.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/regex.out	linux-libc,regex	active	exact registered golden
+glob	clib	globmatch.c	globmatch.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/globmatch.out	linux-libc,glob	active	exact registered golden
+strtod	clib	strtod.c	strtod.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/strtod.out	linux-libc,fp	active	exact registered golden
+timefmt	clib	timefmt.c	timefmt.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/timefmt.out	linux-libc,time	active	exact registered golden
+environ	clib	environ.c	environ.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/environ.out	linux-libc,environment	active	exact registered golden
+atexit	clib	atexit.c	atexit.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/atexit.out	linux-libc,atexit	active	exact registered no-newline golden
+sigaction	clib	sigaction2.c	sigaction2.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigaction2.out	linux-libc,signals,fork/wait	active	exact registered golden
+sigjmp	clib	sigjmp.c	sigjmp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigjmp.out	linux-libc,signals	active	exact registered golden
+sortbig	perf	sortbig.c	sortbig.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sortbig.out	linux-libc,qsort,heavy	active	exact source; deterministic replacement for native oracle

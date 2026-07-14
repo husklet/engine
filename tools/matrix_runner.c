@@ -25,6 +25,7 @@ typedef struct suite_case {
     char source[256];
     char expected[256];
     char environment[256];
+    char argument[256];
     case_isa isa;
     int expected_exit;
     int needs_rootfs;
@@ -118,6 +119,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             cases[*case_count].isa = ISA_BOTH;
             cases[*case_count].needs_rootfs = 0;
             cases[*case_count].environment[0] = 0;
+            cases[*case_count].argument[0] = 0;
             if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
                     (int)sizeof(cases[*case_count].name) ||
                 snprintf(cases[*case_count].source, sizeof(cases[*case_count].source), "%s", fields[0]) >=
@@ -133,10 +135,16 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             continue;
         }
         if (strcmp(fields[11], "active") != 0 || *case_count == CASE_MAX || !relative_path(fields[2]) ||
-            !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 || strcmp(fields[6], "-") != 0 ||
+            !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
+            (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) ||
             !valid_environment(fields[7]) || parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
         cases[*case_count].needs_rootfs = strstr(fields[10], "alpine-rootfs") != NULL;
+        cases[*case_count].argument[0] = 0;
+        if (strncmp(fields[6], "argv:", 5) == 0 &&
+            snprintf(cases[*case_count].argument, sizeof(cases[*case_count].argument), "%s", fields[6] + 5) >=
+                (int)sizeof(cases[*case_count].argument))
+            goto invalid;
         if (strcmp(fields[4], "aarch64") == 0)
             cases[*case_count].isa = ISA_AARCH64;
         else if (strcmp(fields[4], "x86_64") == 0)
@@ -262,8 +270,8 @@ static int config_option(config_wire *wire, const char *name, const char *value)
     return 0;
 }
 
-static int make_config(const char *binary_root, const char *guest, const char *rootfs, const char *encoded,
-                       char path[1024]) {
+static int make_config(const char *binary_root, const char *guest, const char *argument, const char *rootfs,
+                       const char *encoded, char path[1024]) {
     config_wire wire;
     char copy[256], guest_environment[512] = {0}, *cursor;
     size_t environment_size = 0;
@@ -303,7 +311,14 @@ static int make_config(const char *binary_root, const char *guest, const char *r
     }
     if (environment_size != 0 && pool_string(&wire, guest_environment, &wire.config.environment_offset) != 0) return 1;
     /* argv is a NUL-separated vector terminated by an additional NUL. */
-    if (pool_string(&wire, guest, &wire.config.arguments_offset) != 0 || wire.used == sizeof wire.pool) return 1;
+    if (pool_string(&wire, guest, &wire.config.arguments_offset) != 0) return 1;
+    if (*argument != 0 && wire.used + strlen(argument) + 1 <= sizeof wire.pool) {
+        memcpy(wire.pool + wire.used, argument, strlen(argument) + 1);
+        wire.used += strlen(argument) + 1;
+    } else if (*argument != 0) {
+        return 1;
+    }
+    if (wire.used == sizeof wire.pool) return 1;
     wire.pool[wire.used++] = 0;
     wire.config.pool_size = (uint32_t)wire.used;
     if (snprintf(path, 1024, "%s/.matrix-config-XXXXXX", binary_root) >= 1024) return 1;
@@ -319,8 +334,8 @@ static int make_config(const char *binary_root, const char *guest, const char *r
     return 1;
 }
 
-static int run_guest(const char *bridge, const char *engine, const char *guest, const char *rootfs,
-                     const char *environment, const char *binary_root, capture *result) {
+static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
+                     const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
     char config_path[1024];
     uint64_t deadline;
@@ -329,7 +344,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     result->output = malloc(OUTPUT_MAX);
     result->error = malloc(ERROR_MAX);
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
-    if (make_config(binary_root, guest, rootfs, environment, config_path) != 0) return 1;
+    if (make_config(binary_root, guest, argument, rootfs, environment, config_path) != 0) return 1;
     child = fork();
     if (child < 0) {
         (void)unlink(config_path);
@@ -509,8 +524,8 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         return 1;
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
-    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest, item->needs_rootfs ? rootfs : NULL,
-                       item->environment, binary_root, result);
+    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest, item->argument,
+                       item->needs_rootfs ? rootfs : NULL, item->environment, binary_root, result);
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {
