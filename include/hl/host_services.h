@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 2u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 10u
+#define HL_HOST_FILE_ABI 11u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -55,6 +55,12 @@ enum { HL_HOST_STANDARD_INPUT = 0, HL_HOST_STANDARD_OUTPUT = 1, HL_HOST_STANDARD
 enum { HL_HOST_COUNTER_SEMAPHORE = 1u << 0, HL_HOST_COUNTER_NONBLOCK = 1u << 1 };
 
 enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
+
+enum {
+    HL_HOST_RESOLVE_NOFOLLOW_FINAL = 1u << 0,
+    HL_HOST_RESOLVE_NO_SYMLINKS = 1u << 1,
+    HL_HOST_RESOLVE_ALLOW_MISSING = 1u << 2
+};
 
 /* Host-independent object kinds returned by hl_host_file_metadata. */
 typedef enum hl_host_file_type {
@@ -181,6 +187,15 @@ typedef struct hl_host_iovec {
     uint64_t size;
 } hl_host_iovec;
 
+typedef struct hl_host_file_resolution {
+    hl_host_handle parent;
+    hl_host_handle target;
+    uint32_t target_type;
+    uint32_t reserved;
+    size_t final_size;
+    char final[256];
+} hl_host_file_resolution;
+
 enum { HL_HOST_FILE_IOV_MAX = 1024 };
 
 typedef struct hl_host_file_services {
@@ -225,6 +240,9 @@ typedef struct hl_host_file_services {
     hl_host_result (*readlink)(void *context, hl_host_handle file, hl_host_bytes output);
     /* Apply guest ownership after creation without exposing a native descriptor. */
     hl_host_result (*set_owner)(void *context, hl_host_handle file, uint32_t uid, uint32_t gid);
+    /* Resolve beneath a pinned directory; returned handles are independently closeable. */
+    hl_host_result (*resolve_beneath)(void *context, hl_host_handle root, const char *path, size_t path_size,
+                                      uint32_t policy, hl_host_file_resolution *output);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

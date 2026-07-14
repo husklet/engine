@@ -1,4 +1,8 @@
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#else
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "resolve.h"
 
@@ -20,7 +24,8 @@ typedef struct fd_stack {
 } fd_stack;
 
 static void stack_destroy(fd_stack *stack) {
-    while (stack->count != 0) close(stack->fds[--stack->count]);
+    while (stack->count != 0)
+        close(stack->fds[--stack->count]);
     free(stack->fds);
 }
 
@@ -106,7 +111,7 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
     int saved;
 
     if (root_fd < 0 || path == NULL || path[0] == '\0' || path[0] == '/' || result == NULL ||
-        (policy & ~(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0) {
+        (policy & ~(unsigned)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -126,7 +131,8 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
         char *start = pending;
         char *end;
         char *rest;
-        while (*start == '/') ++start;
+        while (*start == '/')
+            ++start;
         if (*start == '\0') {
             result->leaf = strdup(".");
             if (result->leaf == NULL) goto fail;
@@ -135,9 +141,11 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
             break;
         }
         end = start;
-        while (*end != '\0' && *end != '/') ++end;
+        while (*end != '\0' && *end != '/')
+            ++end;
         rest = end;
-        while (*rest == '/') ++rest;
+        while (*rest == '/')
+            ++rest;
         *end = '\0';
 
         if (strcmp(start, ".") == 0) {
@@ -198,9 +206,11 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
                 goto fail;
             }
             if (target[0] == '/') {
-                while (stack.count > 1) close(stack.fds[--stack.count]);
+                while (stack.count > 1)
+                    close(stack.fds[--stack.count]);
                 /* A symlink's absolute target is absolute within the pinned root. */
-                while (*next == '/') memmove(next, next + 1, strlen(next));
+                while (*next == '/')
+                    memmove(next, next + 1, strlen(next));
             }
             free(target);
             free(pending);
@@ -215,8 +225,7 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
             stack.count--;
             break;
         } else {
-            int child = openat(stack.fds[stack.count - 1], start,
-                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            int child = openat(stack.fds[stack.count - 1], start, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             char *next;
             if (child < 0) goto fail;
             if (stack_push(&stack, child) < 0) {
@@ -231,8 +240,7 @@ int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int 
     }
 
     if (target_open_flags >= 0) {
-        result->target_fd = openat(result->parent_fd, result->leaf,
-                                   target_open_flags | O_NOFOLLOW | O_CLOEXEC);
+        result->target_fd = openat(result->parent_fd, result->leaf, target_open_flags | O_NOFOLLOW | O_CLOEXEC);
         if (result->target_fd < 0) goto fail_result;
     }
     free(pending);

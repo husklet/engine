@@ -45,7 +45,7 @@ LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c \
 	src/host/macos/system.c
-COMMON_HOST_SOURCES := src/host/child.c src/host/range.c src/host/sync.c
+COMMON_HOST_SOURCES := src/host/child.c src/host/range.c src/host/resolve.c src/host/sync.c
 MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
 MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
 MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
@@ -84,7 +84,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan process range system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -304,6 +304,14 @@ $(BUILD)/tests/test_fdcache: tests/unit/test_fdcache.c $(BUILD)/lib/libhl-linux-
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
 		$(BUILD)/lib/libhl-host-fake.a -o $@
+
+$(BUILD)/tests/test_resolve: tests/unit/test_resolve.c src/host/resolve.c src/host/resolve.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) tests/unit/test_resolve.c src/host/resolve.c -o $@
+
+$(BUILD)/tests/test_resolve_services: tests/unit/test_resolve_services.c $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_linux_fork: tests/unit/test_linux_fork.c $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-linux.a

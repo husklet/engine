@@ -47,15 +47,13 @@ int main(void) {
     assert(read(resolved.target_fd, &byte, 1) == 1 && byte == 'F');
     hl_host_resolved_path_destroy(&resolved);
 
-    assert(hl_host_resolve_beneath(root, "relative", HL_HOST_RESOLVE_NOFOLLOW_FINAL, -1,
-                                   &resolved) == 0);
+    assert(hl_host_resolve_beneath(root, "relative", HL_HOST_RESOLVE_NOFOLLOW_FINAL, -1, &resolved) == 0);
     struct stat link_status;
     assert(fstatat(resolved.parent_fd, resolved.leaf, &link_status, AT_SYMLINK_NOFOLLOW) == 0);
     assert(S_ISLNK(link_status.st_mode));
     hl_host_resolved_path_destroy(&resolved);
     errno = 0;
-    assert(hl_host_resolve_beneath(root, "relative", HL_HOST_RESOLVE_NO_SYMLINKS, -1,
-                                   &resolved) == -1);
+    assert(hl_host_resolve_beneath(root, "relative", HL_HOST_RESOLVE_NO_SYMLINKS, -1, &resolved) == -1);
     assert(errno == ELOOP);
 
     assert(hl_host_resolve_beneath(root, "absolute", 0, O_RDONLY, &resolved) == 0);

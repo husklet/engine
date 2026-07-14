@@ -707,6 +707,8 @@ static uint8_t *g_fd_pushback[HL_NFD];
 static size_t g_fd_pb_len[HL_NFD];
 // pinned O_DIRECTORY fd to the rootfs (set at startup)
 static int g_root_fd = -1;
+/* Opaque twin used by the host-service resolver; legacy VFS paths retain g_root_fd until converted. */
+static hl_host_handle g_root_handle = HL_HOST_HANDLE_INVALID;
 
 // Engine-private host fds (the rootfs dir-fd + each bind-mount volume dir-fd) share the guest's descriptor
 // table in hl's in-process model. Opened at startup, right after stdio, they otherwise squat the LOW numbers

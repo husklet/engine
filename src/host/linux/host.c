@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "hl/linux.h"
+#include "../resolve.h"
 #include "../sync.h"
 
 #include <errno.h>
@@ -112,6 +113,7 @@ struct hl_host_linux {
 static hl_host_result hl_linux_fork_complete(void *context);
 static hl_host_result hl_linux_fork_child(void *context);
 static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle subscription);
+static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle handle);
 static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter);
 
 static uint64_t hl_linux_monotonic_value(void) {
@@ -887,6 +889,66 @@ static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle f
         output->type = HL_HOST_FILE_TYPE_FIFO;
     else if (S_ISSOCK(status.st_mode))
         output->type = HL_HOST_FILE_TYPE_SOCKET;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_file_resolve_beneath(void *context, hl_host_handle root, const char *path,
+                                                    size_t path_size, uint32_t policy,
+                                                    hl_host_file_resolution *output) {
+    hl_host_linux *host = context;
+    hl_host_resolved_path resolved;
+    hl_host_result parent;
+    hl_host_result target = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
+    char local[PATH_MAX];
+    int root_fd;
+    int target_flags = O_RDONLY;
+    if (output == NULL || path == NULL || path_size == 0 || path_size >= sizeof(local) ||
+        (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS |
+                              HL_HOST_RESOLVE_ALLOW_MISSING)) != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    pthread_mutex_lock(&host->lock);
+    root_fd = hl_linux_descriptor(host, root, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (root_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+#ifdef O_PATH
+    if ((policy & HL_HOST_RESOLVE_NOFOLLOW_FINAL) != 0) target_flags = O_PATH;
+#endif
+    if ((policy & HL_HOST_RESOLVE_ALLOW_MISSING) != 0) target_flags = -1;
+    if (hl_host_resolve_beneath(root_fd, local, policy & (HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS),
+                                target_flags, &resolved) != 0)
+        return hl_linux_errno_result();
+    if (strlen(resolved.leaf) >= sizeof(output->final)) {
+        hl_host_resolved_path_destroy(&resolved);
+        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    parent = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, resolved.parent_fd, NULL, NULL, 0, -1);
+    if (parent.status != HL_STATUS_OK) {
+        hl_host_resolved_path_destroy(&resolved);
+        return parent;
+    }
+    resolved.parent_fd = -1;
+    if (resolved.target_fd >= 0) {
+        target = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, resolved.target_fd, NULL, NULL, 0, -1);
+        if (target.status != HL_STATUS_OK) {
+            (void)hl_linux_close_descriptor(host, parent.value);
+            hl_host_resolved_path_destroy(&resolved);
+            return target;
+        }
+        resolved.target_fd = -1;
+    }
+    memset(output, 0, sizeof(*output));
+    output->parent = parent.value;
+    output->target = target.value;
+    output->final_size = strlen(resolved.leaf);
+    memcpy(output->final, resolved.leaf, output->final_size + 1);
+    if (output->target != HL_HOST_HANDLE_INVALID) {
+        hl_host_file_metadata metadata;
+        if (hl_linux_file_metadata_get(host, output->target, &metadata).status == HL_STATUS_OK)
+            output->target_type = metadata.type;
+    }
+    hl_host_resolved_path_destroy(&resolved);
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -2287,7 +2349,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_path,
                                                hl_linux_file_standard_stream,
                                                hl_linux_file_readlink,
-                                               hl_linux_file_set_owner};
+                                               hl_linux_file_set_owner,
+                                               hl_linux_file_resolve_beneath};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

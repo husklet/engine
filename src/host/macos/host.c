@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "hl/macos.h"
+#include "../resolve.h"
 #include "../sync.h"
 
 #include <errno.h>
@@ -155,6 +156,7 @@ struct hl_host_macos {
 static hl_host_result hl_macos_fork_complete(void *context);
 static hl_host_result hl_macos_fork_child(void *context);
 static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle subscription);
+static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle);
 static void hl_macos_counter_unsubscribe_all(hl_host_macos *host, hl_host_handle counter);
 
 static uint64_t hl_macos_monotonic_value(void) {
@@ -905,6 +907,62 @@ static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle f
         output->type = HL_HOST_FILE_TYPE_FIFO;
     else if (S_ISSOCK(status.st_mode))
         output->type = HL_HOST_FILE_TYPE_SOCKET;
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handle root, const char *path,
+                                                    size_t path_size, uint32_t policy,
+                                                    hl_host_file_resolution *output) {
+    hl_host_macos *host = context;
+    hl_host_resolved_path resolved;
+    hl_host_result parent;
+    hl_host_result target = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
+    char local[PATH_MAX];
+    int root_fd = hl_macos_file_descriptor(host, root, 0);
+    int target_flags = O_RDONLY;
+    if (root_fd < 0 || output == NULL || path == NULL || path_size == 0 || path_size >= sizeof(local) ||
+        (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS |
+                              HL_HOST_RESOLVE_ALLOW_MISSING)) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+#ifdef O_SYMLINK
+    if ((policy & HL_HOST_RESOLVE_NOFOLLOW_FINAL) != 0) target_flags = O_SYMLINK;
+#endif
+    if ((policy & HL_HOST_RESOLVE_ALLOW_MISSING) != 0) target_flags = -1;
+    if (hl_host_resolve_beneath(root_fd, local, policy & (HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS),
+                                target_flags, &resolved) != 0)
+        return hl_macos_errno();
+    if (strlen(resolved.leaf) >= sizeof(output->final)) {
+        hl_host_resolved_path_destroy(&resolved);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    parent = hl_macos_file_register(host, resolved.parent_fd, -1, 0);
+    if (parent.status != HL_STATUS_OK) {
+        hl_host_resolved_path_destroy(&resolved);
+        return parent;
+    }
+    resolved.parent_fd = -1;
+    if (resolved.target_fd >= 0) {
+        target = hl_macos_file_register(host, resolved.target_fd, -1, 0);
+        if (target.status != HL_STATUS_OK) {
+            (void)hl_macos_file_close(host, parent.value);
+            hl_host_resolved_path_destroy(&resolved);
+            return target;
+        }
+        resolved.target_fd = -1;
+    }
+    memset(output, 0, sizeof(*output));
+    output->parent = parent.value;
+    output->target = target.value;
+    output->final_size = strlen(resolved.leaf);
+    memcpy(output->final, resolved.leaf, output->final_size + 1);
+    if (output->target != HL_HOST_HANDLE_INVALID) {
+        hl_host_file_metadata metadata;
+        if (hl_macos_file_metadata_get(host, output->target, &metadata).status == HL_STATUS_OK)
+            output->target_type = metadata.type;
+    }
+    hl_host_resolved_path_destroy(&resolved);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -2383,7 +2441,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_path,
                                                hl_macos_file_standard_stream,
                                                hl_macos_file_readlink,
-                                               hl_macos_file_set_owner};
+                                               hl_macos_file_set_owner,
+                                               hl_macos_file_resolve_beneath};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
