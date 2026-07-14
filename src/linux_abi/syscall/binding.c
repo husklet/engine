@@ -441,6 +441,36 @@ static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_fi
     }
 }
 
+static uint32_t bound_mode_type(uint32_t type) {
+    switch (type) {
+    case HL_HOST_FILE_TYPE_REGULAR: return 0100000;
+    case HL_HOST_FILE_TYPE_DIRECTORY: return 0040000;
+    case HL_HOST_FILE_TYPE_SYMLINK: return 0120000;
+    case HL_HOST_FILE_TYPE_CHARACTER: return 0020000;
+    case HL_HOST_FILE_TYPE_BLOCK: return 0060000;
+    case HL_HOST_FILE_TYPE_FIFO: return 0010000;
+    case HL_HOST_FILE_TYPE_SOCKET: return 0140000;
+    default: return 0;
+    }
+}
+
+static void bound_status_from_metadata(hl_linux_file_status *status, const hl_host_file_metadata *metadata) {
+    memset(status, 0, sizeof(*status));
+    status->device = metadata->stable_device;
+    status->object = metadata->stable_object;
+    status->size = metadata->size;
+    status->blocks_512 = metadata->allocated_size / 512u;
+    status->modified_ns = metadata->modified_ns;
+    status->accessed_ns = metadata->accessed_ns;
+    status->changed_ns = metadata->changed_ns;
+    status->created_ns = metadata->created_ns;
+    status->special_device = metadata->device;
+    status->link_count = metadata->link_count;
+    status->mode = bound_mode_type(metadata->type) | (metadata->permissions & 07777u);
+    status->user = metadata->user;
+    status->group = metadata->group;
+}
+
 static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
     bound_mapping **head = bound_mapping_head();
     bound_mapping *entry;
@@ -1615,6 +1645,132 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
+    case 35: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        if ((a2 & ~UINT64_C(0x200)) != 0) {
+            result = -EINVAL;
+            break;
+        }
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        if ((a2 & UINT64_C(0x200)) != 0 || g_host_services->file->unlink_relative == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        result = bound_host_error(g_host_services->file
+                                      ->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
+                                      .status);
+        break;
+    }
+    case 53:
+    case 452: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        uint64_t flags = nr == 452 ? a3 : 0;
+        if ((flags & ~UINT64_C(0x1100)) != 0) {
+            result = -EINVAL;
+            break;
+        }
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        if (g_host_services->file->open_relative == NULL || g_host_services->file->set_permissions == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        uint32_t access = HL_HOST_FILE_PATH_ONLY;
+        if ((flags & UINT64_C(0x100)) != 0) access |= HL_HOST_FILE_NOFOLLOW;
+        hl_host_result opened = g_host_services->file->open_relative(
+            g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+        if (opened.status != HL_STATUS_OK) {
+            result = bound_host_error(opened.status);
+            break;
+        }
+        result = bound_host_error(g_host_services->file
+                                      ->set_permissions(g_host_services->context, opened.value, (uint32_t)a2 & 07777u)
+                                      .status);
+        (void)g_host_services->file->close(g_host_services->context, opened.value);
+        break;
+    }
+    case 48:
+    case 439: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        uint64_t flags = nr == 439 ? a3 : 0;
+        if (a2 > 7 || (flags & ~UINT64_C(0x1200)) != 0) {
+            result = -EINVAL;
+            break;
+        }
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        uint32_t access = a2 == 0 ? HL_HOST_FILE_PATH_ONLY : 0;
+        if ((a2 & 4u) != 0) access |= HL_HOST_FILE_READ;
+        if ((a2 & 2u) != 0) access |= HL_HOST_FILE_WRITE;
+        if ((a2 & 1u) != 0) access |= HL_HOST_FILE_PATH_ONLY;
+        hl_host_result opened = g_host_services->file->open_relative(
+            g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+        result = bound_host_error(opened.status);
+        if (opened.status == HL_STATUS_OK) {
+            if ((a2 & 1u) != 0) {
+                hl_host_file_metadata metadata;
+                hl_host_result measured =
+                    g_host_services->file->metadata(g_host_services->context, opened.value, &metadata);
+                if (measured.status != HL_STATUS_OK)
+                    result = bound_host_error(measured.status);
+                else if (metadata.type != HL_HOST_FILE_TYPE_DIRECTORY && (metadata.permissions & 0111u) == 0)
+                    result = -EACCES;
+            }
+            (void)g_host_services->file->close(g_host_services->context, opened.value);
+        }
+        break;
+    }
+    case 79: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        if ((a3 & ~UINT64_C(0x1900)) != 0) {
+            result = -EINVAL;
+            break;
+        }
+        if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+            result = -EFAULT;
+            break;
+        }
+        result = bound_path_copy(a1, path, &path_size);
+        int empty = result == -HL_LINUX_ENOENT && (a3 & UINT64_C(0x1000)) != 0;
+        if (result != 0 && !empty) break;
+        if (!empty && path[0] == '/') return 0;
+        hl_host_handle target = source.host_handle;
+        int close_target = 0;
+        if (!empty) {
+            uint32_t access = HL_HOST_FILE_PATH_ONLY;
+            if ((a3 & UINT64_C(0x100)) != 0) access |= HL_HOST_FILE_NOFOLLOW;
+            hl_host_result opened = g_host_services->file->open_relative(
+                g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+            if (opened.status != HL_STATUS_OK) {
+                result = bound_host_error(opened.status);
+                break;
+            }
+            target = opened.value;
+            close_target = 1;
+        }
+        hl_host_file_metadata metadata;
+        hl_host_result measured = g_host_services->file->metadata(g_host_services->context, target, &metadata);
+        if (measured.status != HL_STATUS_OK) {
+            result = bound_host_error(measured.status);
+        } else {
+            hl_linux_file_status status;
+            hl_linux_fd_snapshot target_snapshot = {.host_handle = target};
+            bound_status_from_metadata(&status, &metadata);
+            bound_virtualize_owner(&target_snapshot, &status);
+            fill_linux_bound_stat((uint8_t *)(uintptr_t)a2, &status);
+            result = 0;
+        }
+        if (close_target) (void)g_host_services->file->close(g_host_services->context, target);
+        break;
+    }
     case 56: {
         const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
                                    HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
@@ -2244,7 +2400,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 75:           /* vmsplice */
     case 76:           /* splice */
     case 77:           /* tee */
-    case 79:           /* newfstatat directory */
     case 200:          /* bind */
     case 201:          /* listen */
     case 202:          /* accept */
