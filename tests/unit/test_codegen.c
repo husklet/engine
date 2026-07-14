@@ -68,6 +68,150 @@ static hl_status execute_native_memory(const uint8_t *code, size_t code_size, ui
     return status;
 }
 
+static int check_cfg_codegen(void) {
+    hl_ir_function function;
+    hl_ir_block blocks[4], *entry, *loop, *body, *done;
+    hl_ir_instruction instructions[4][8], current;
+    hl_ir_value address, one, limit, loaded, condition, incremented;
+    uint8_t code[8192], memory[8] = {0};
+    hl_code_buffer buffer;
+    hl_ir_exit native_exit;
+    uint32_t host_isa;
+    HL_CHECK(hl_ir_function_init(&function, 1, blocks, HL_ARRAY_COUNT(blocks)) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_function_add_block(&function, 1, 0, instructions[0], 8, &entry) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_function_add_block(&function, 2, 0, instructions[1], 8, &loop) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_function_add_block(&function, 3, 0, instructions[2], 8, &body) == HL_STATUS_OK);
+    HL_CHECK(hl_ir_function_add_block(&function, 4, 0, instructions[3], 8, &done) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_GUEST_ADDRESS);
+    HL_CHECK(hl_ir_function_append(&function, entry, &current, &address) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_I32);
+    current.immediate = 1;
+    HL_CHECK(hl_ir_function_append(&function, entry, &current, &one) == HL_STATUS_OK);
+    current.immediate = 7;
+    HL_CHECK(hl_ir_function_append(&function, entry, &current, &limit) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_BRANCH, HL_IR_TYPE_NONE);
+    current.true_label = 2;
+    HL_CHECK(hl_ir_function_append(&function, entry, &current, NULL) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_LOAD, HL_IR_TYPE_I32);
+    current.operand_count = 1;
+    current.operands[0] = address;
+    HL_CHECK(hl_ir_function_append(&function, loop, &current, &loaded) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_COMPARE, HL_IR_TYPE_CONDITION);
+    current.flags = HL_IR_CONDITION_UNSIGNED_LT;
+    current.operand_count = 2;
+    current.operands[0] = loaded;
+    current.operands[1] = limit;
+    HL_CHECK(hl_ir_function_append(&function, loop, &current, &condition) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_BRANCH_CONDITIONAL, HL_IR_TYPE_NONE);
+    current.operand_count = 1;
+    current.operands[0] = condition;
+    current.true_label = 3;
+    current.false_label = 4;
+    HL_CHECK(hl_ir_function_append(&function, loop, &current, NULL) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_ADD, HL_IR_TYPE_I32);
+    current.operand_count = 2;
+    current.operands[0] = loaded;
+    current.operands[1] = one;
+    HL_CHECK(hl_ir_function_append(&function, body, &current, &incremented) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_STORE, HL_IR_TYPE_NONE);
+    current.operand_count = 2;
+    current.operands[0] = address;
+    current.operands[1] = incremented;
+    HL_CHECK(hl_ir_function_append(&function, body, &current, NULL) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_BRANCH, HL_IR_TYPE_NONE);
+    current.true_label = 2;
+    HL_CHECK(hl_ir_function_append(&function, body, &current, NULL) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_GUEST_RETURN, HL_IR_TYPE_NONE);
+    current.operand_count = 1;
+    current.operands[0] = loaded;
+    HL_CHECK(hl_ir_function_append(&function, done, &current, NULL) == HL_STATUS_OK);
+    for (host_isa = HL_HOST_ISA_AARCH64; host_isa <= HL_HOST_ISA_X86_64; ++host_isa) {
+        HL_CHECK(hl_code_buffer_init(&buffer, code, sizeof(code)) == HL_STATUS_OK);
+        HL_CHECK(hl_codegen_function(host_isa, &function, &buffer) == HL_STATUS_OK);
+#if defined(__aarch64__)
+        if (host_isa == HL_HOST_ISA_AARCH64) {
+#elif defined(__x86_64__)
+        if (host_isa == HL_HOST_ISA_X86_64) {
+#else
+        if (0) {
+#endif
+            memset(memory, 0, sizeof(memory));
+            HL_CHECK(execute_native_memory(code, buffer.code_size, memory, sizeof(memory), &native_exit) ==
+                     HL_STATUS_OK);
+            HL_CHECK(native_exit.kind == HL_IR_EXIT_RETURN && native_exit.value == 7 && memory[0] == 7);
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
+static int check_cfg_conditions(void) {
+    uint16_t conditions[] = {HL_IR_CONDITION_EQ,          HL_IR_CONDITION_NE,          HL_IR_CONDITION_SIGNED_LT,
+                             HL_IR_CONDITION_SIGNED_LE,   HL_IR_CONDITION_SIGNED_GT,   HL_IR_CONDITION_SIGNED_GE,
+                             HL_IR_CONDITION_UNSIGNED_LT, HL_IR_CONDITION_UNSIGNED_LE, HL_IR_CONDITION_UNSIGNED_GT,
+                             HL_IR_CONDITION_UNSIGNED_GE};
+    uint64_t expected[] = {22, 11, 11, 11, 22, 22, 22, 22, 11, 11};
+    size_t case_index;
+    for (case_index = 0; case_index < HL_ARRAY_COUNT(conditions); ++case_index) {
+        hl_ir_function function;
+        hl_ir_block blocks[3], *entry, *yes, *no;
+        hl_ir_instruction code_blocks[3][5], current;
+        hl_ir_value minus_one, one, condition;
+        hl_ir_execution execution;
+        uint8_t code[1024];
+        hl_code_buffer buffer;
+        uint32_t host_isa;
+        HL_CHECK(hl_ir_function_init(&function, 1, blocks, 3) == HL_STATUS_OK);
+        /* Entry is intentionally last in storage: entry_label, never array order, selects it. */
+        HL_CHECK(hl_ir_function_add_block(&function, 2, 0, code_blocks[0], 5, &yes) == HL_STATUS_OK);
+        HL_CHECK(hl_ir_function_add_block(&function, 3, 0, code_blocks[1], 5, &no) == HL_STATUS_OK);
+        HL_CHECK(hl_ir_function_add_block(&function, 1, 0, code_blocks[2], 5, &entry) == HL_STATUS_OK);
+        current = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_I64);
+        current.immediate = UINT64_MAX;
+        HL_CHECK(hl_ir_function_append(&function, entry, &current, &minus_one) == HL_STATUS_OK);
+        current.immediate = 1;
+        HL_CHECK(hl_ir_function_append(&function, entry, &current, &one) == HL_STATUS_OK);
+        current = instruction(HL_IR_OP_COMPARE, HL_IR_TYPE_CONDITION);
+        current.flags = conditions[case_index];
+        current.operand_count = 2;
+        current.operands[0] = minus_one;
+        current.operands[1] = one;
+        HL_CHECK(hl_ir_function_append(&function, entry, &current, &condition) == HL_STATUS_OK);
+        current = instruction(HL_IR_OP_BRANCH_CONDITIONAL, HL_IR_TYPE_NONE);
+        current.operand_count = 1;
+        current.operands[0] = condition;
+        current.true_label = 2;
+        current.false_label = 3;
+        HL_CHECK(hl_ir_function_append(&function, entry, &current, NULL) == HL_STATUS_OK);
+        current = instruction(HL_IR_OP_GUEST_RETURN, HL_IR_TYPE_NONE);
+        current.immediate = 11;
+        HL_CHECK(hl_ir_function_append(&function, yes, &current, NULL) == HL_STATUS_OK);
+        current.immediate = 22;
+        HL_CHECK(hl_ir_function_append(&function, no, &current, NULL) == HL_STATUS_OK);
+        memset(&execution, 0, sizeof(execution));
+        execution.abi = HL_IR_EXECUTION_ABI;
+        execution.size = sizeof(execution);
+        HL_CHECK(hl_ir_function_interpret(&function, &execution) == HL_STATUS_OK &&
+                 execution.exit.value == expected[case_index]);
+        for (host_isa = HL_HOST_ISA_AARCH64; host_isa <= HL_HOST_ISA_X86_64; ++host_isa) {
+            hl_ir_exit native_exit;
+            HL_CHECK(hl_code_buffer_init(&buffer, code, sizeof(code)) == HL_STATUS_OK);
+            HL_CHECK(hl_codegen_function(host_isa, &function, &buffer) == HL_STATUS_OK);
+#if defined(__aarch64__)
+            if (host_isa == HL_HOST_ISA_AARCH64)
+#elif defined(__x86_64__)
+            if (host_isa == HL_HOST_ISA_X86_64)
+#else
+            if (0)
+#endif
+            {
+                HL_CHECK(execute_native(code, buffer.code_size, &native_exit) == HL_STATUS_OK);
+                HL_CHECK(native_exit.kind == HL_IR_EXIT_RETURN && native_exit.value == expected[case_index]);
+            }
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
 static int check_memory(void) {
     hl_ir_instruction ins[28], current;
     hl_ir_block block;
@@ -316,5 +460,7 @@ int main(void) {
     HL_CHECK(check_native_exit(HL_IR_OP_FAULT_EXIT, HL_IR_EXIT_FAULT) == EXIT_SUCCESS);
     HL_CHECK(check_register_spills() == EXIT_SUCCESS);
     HL_CHECK(check_memory() == EXIT_SUCCESS);
+    HL_CHECK(check_cfg_codegen() == EXIT_SUCCESS);
+    HL_CHECK(check_cfg_conditions() == EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

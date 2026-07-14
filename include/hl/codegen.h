@@ -5,7 +5,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_CODEGEN_ABI 2u
+#define HL_CODEGEN_ABI 3u
 
 typedef enum hl_host_isa { HL_HOST_ISA_AARCH64 = 1, HL_HOST_ISA_X86_64 = 2 } hl_host_isa;
 
@@ -25,6 +25,7 @@ typedef hl_status (*hl_code_entry)(hl_ir_execution *execution);
 
 HL_API hl_status hl_code_buffer_init(hl_code_buffer *buffer, void *storage, size_t capacity);
 HL_API hl_status hl_codegen_block(uint32_t host_isa, const hl_ir_block *block, hl_code_buffer *output);
+HL_API hl_status hl_codegen_function(uint32_t host_isa, const hl_ir_function *function, hl_code_buffer *output);
 
 HL_EXTERN_C_END
 
