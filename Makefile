@@ -840,7 +840,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \

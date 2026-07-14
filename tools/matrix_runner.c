@@ -351,7 +351,9 @@ static int make_config(const char *binary_root, const char *guest, const char *a
         const char *declared = wire.config.volumes_offset ? wire.pool + wire.config.volumes_offset : NULL;
         int length = declared ? snprintf(volume, sizeof volume, "%s,/tmp:%s", declared, scratch)
                               : snprintf(volume, sizeof volume, "/tmp:%s", scratch);
-        if (length < 0 || length >= (int)sizeof volume || pool_string(&wire, volume, &wire.config.volumes_offset) != 0)
+        if (length < 0 || length >= (int)sizeof volume ||
+            pool_string(&wire, volume, &wire.config.volumes_offset) != 0 ||
+            pool_string(&wire, "/tmp", &wire.config.working_directory_offset) != 0)
             return 1;
     }
     if (environment_size != 0 && pool_string(&wire, guest_environment, &wire.config.environment_offset) != 0) return 1;
