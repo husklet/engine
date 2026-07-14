@@ -13,13 +13,16 @@ static int32_t fake_entry(void *context) {
     return 0;
 }
 
+static uint32_t fake_box_seen;
+
 static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
                             const char *const argv[], hl_host_handle *process) {
     hl_host_result spawned;
     (void)rootfs;
-    (void)box;
     (void)argc;
     (void)argv;
+    if (box == NULL || hl_linux_abi_validate_fds(box) != HL_STATUS_OK) return HL_STATUS_CORRUPT;
+    fake_box_seen++;
     spawned = host->process->spawn_cloned(host->context, fake_entry, NULL);
     if (spawned.status != HL_STATUS_OK) return (hl_status)spawned.status;
     *process = spawned.value;
@@ -88,6 +91,7 @@ int main(void) {
 
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
+    HL_CHECK(fake_box_seen == 2);
 
     config.abi++;
     engine = (hl_engine *)(uintptr_t)1;
