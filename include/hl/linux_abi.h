@@ -191,6 +191,13 @@ HL_API hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_for
 HL_API hl_status hl_linux_abi_fork_host_completed(hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
+/*
+ * Spawn an entry in a host-cloned process while preserving this Linux fd table.
+ * The operation owns the fork plan and completes the host fork bracket in both
+ * branches. On success, out_process is an opaque host process handle.
+ */
+HL_API hl_status hl_linux_abi_spawn(hl_linux_abi *linux_abi, hl_host_process_entry entry, void *entry_context,
+                                    hl_host_handle *out_process);
 HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,
                                      uint32_t descriptor_flags, hl_linux_fd *out_fd);
 /* Installs only at the requested vacant guest descriptor; never exposes or duplicates a native descriptor. */

@@ -34,6 +34,14 @@ static int32_t run_prepared_child(void *opaque) {
     return 0;
 }
 
+static int32_t run_abstract_child(void *opaque) {
+    hl_linux_abi *abi = opaque;
+    char bytes[2];
+    if (hl_linux_read(abi, 9, bytes, sizeof(bytes)) != 2 || memcmp(bytes, "ef", 2) != 0) return 30;
+    if (hl_linux_close(abi, 9) != 0) return 31;
+    return 47;
+}
+
 static void *churn_mutexes(void *opaque) {
     churn_thread *thread = opaque;
     while (atomic_load(&thread->stop) == 0) {
@@ -132,8 +140,17 @@ int main(void) {
     waited = services.process->wait(services.context, spawned.value, HL_HOST_DEADLINE_INFINITE);
     HL_CHECK(waited.status == HL_STATUS_OK && waited.detail == HL_HOST_PROCESS_EXIT_CODE && waited.value == 0);
     HL_CHECK(services.process->close(services.context, spawned.value).status == HL_STATUS_OK);
+    /* The production operation owns allocation, host spawning and both fork completions. */
+    HL_CHECK(hl_linux_lseek(&abi, 9, 4, HL_LINUX_SEEK_SET) == 4);
+    HL_CHECK(hl_linux_abi_spawn(&abi, run_abstract_child, &abi, &spawned.value) == HL_STATUS_OK);
+    waited = services.process->wait(services.context, spawned.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(waited.status == HL_STATUS_OK && waited.detail == HL_HOST_PROCESS_EXIT_CODE && waited.value == 47);
+    HL_CHECK(services.process->close(services.context, spawned.value).status == HL_STATUS_OK);
+    /* Forked descriptors share their open-file-description offset with the parent. */
+    HL_CHECK(hl_linux_read(&abi, 9, bytes, 1) == 0);
+    HL_CHECK(hl_linux_abi_spawn(NULL, run_abstract_child, &abi, &spawned.value) == HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(hl_linux_close(&abi, 9) == 0);
-    HL_CHECK(atomic_load(clone_count) == 3 && atomic_load(close_count) == 8);
+    HL_CHECK(atomic_load(clone_count) == 4 && atomic_load(close_count) == 11);
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);
     unlink(path);
     hl_host_linux_destroy(host);

@@ -1,5 +1,6 @@
 #include "hl/linux_abi.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define HL_LINUX_FD_RESERVED UINT32_MAX
@@ -327,6 +328,57 @@ corrupt:
     while (index != 0)
         (void)sync->mutex_close(linux_abi->host->context, plan->records[--index].child_mutex);
     return HL_STATUS_CORRUPT;
+}
+
+typedef struct hl_linux_spawn_context {
+    hl_linux_abi *linux_abi;
+    hl_linux_fork_plan *plan;
+    hl_host_process_entry entry;
+    void *entry_context;
+} hl_linux_spawn_context;
+
+static int32_t hl_linux_spawn_entry(void *opaque) {
+    hl_linux_spawn_context *context = opaque;
+    if (hl_linux_abi_fork_host_completed(context->plan) != HL_STATUS_OK ||
+        hl_linux_abi_fork_child(context->linux_abi, context->plan) != HL_STATUS_OK)
+        return 255;
+    return context->entry(context->entry_context);
+}
+
+hl_status hl_linux_abi_spawn(hl_linux_abi *linux_abi, hl_host_process_entry entry, void *entry_context,
+                             hl_host_handle *out_process) {
+    const hl_host_process_services *processes;
+    hl_linux_fork_plan plan = {0};
+    hl_linux_spawn_context context;
+    hl_host_result spawned;
+    hl_status completed;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || entry == NULL || out_process == NULL)
+        return HL_STATUS_INVALID_ARGUMENT;
+    if (linux_abi->host == NULL || (linux_abi->host->capabilities & HL_HOST_CAP_PROCESS) == 0 ||
+        (processes = linux_abi->host->process) == NULL || processes->abi != HL_HOST_PROCESS_ABI ||
+        processes->size < sizeof(*processes) || processes->spawn_prepared == NULL)
+        return HL_STATUS_NOT_SUPPORTED;
+    *out_process = HL_HOST_HANDLE_INVALID;
+    plan.abi = HL_LINUX_ABI_VERSION;
+    plan.size = sizeof(plan);
+    plan.capacity = linux_abi->ofd_capacity;
+    plan.records = calloc(plan.capacity, sizeof(*plan.records));
+    if (plan.records == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    completed = hl_linux_abi_fork_prepare(linux_abi, &plan);
+    if (completed != HL_STATUS_OK) {
+        free(plan.records);
+        return completed;
+    }
+    context = (hl_linux_spawn_context){linux_abi, &plan, entry, entry_context};
+    spawned = processes->spawn_prepared(linux_abi->host->context, hl_linux_spawn_entry, &context);
+    completed = hl_linux_abi_fork_host_completed(&plan);
+    if (completed == HL_STATUS_OK) completed = hl_linux_abi_fork_parent(linux_abi, &plan);
+    free(plan.records);
+    if (completed != HL_STATUS_OK) return completed;
+    if (spawned.status != HL_STATUS_OK) return (hl_status)spawned.status;
+    if (spawned.value == HL_HOST_HANDLE_INVALID) return HL_STATUS_PLATFORM_FAILURE;
+    *out_process = spawned.value;
+    return HL_STATUS_OK;
 }
 
 hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,
