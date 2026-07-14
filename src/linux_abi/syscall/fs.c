@@ -620,7 +620,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)hl_gpu_alloc(fd, arg);
             break;
         }
-        // DRM ioctls chromium/Mesa(kms_swrast) issue on the render node once it opens the discovered node:
+        // DRM ioctls Mesa (kms_swrast) issues on the render node once it opens the discovered node:
         // drmGetVersion (VERSION), GET_CAP, SET_CLIENT_CAP, and the dumb-buffer + PRIME set that Mesa's
         // software GBM winsys uses to allocate/map/export the window buffer (CREATE/MAP/DESTROY_DUMB,
         // GEM_CLOSE, PRIME_HANDLE_TO_FD). Gated on the render-node tag.

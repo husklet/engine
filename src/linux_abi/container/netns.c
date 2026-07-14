@@ -561,12 +561,12 @@ static uint8_t g_sock_seqpacket[DD_NFD];
 // EOF) from a parent dropping the child's fork-inherited peer end while it still holds its OWN end (must NOT
 // inject: Linux delivers no EOF while the child still references that end, and our zero-length datagram would
 // otherwise land in our own retained end's queue and be misread as a premature EOF -- exactly what broke
-// Chromium's Mojo SEQPACKET handshake). Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
+// a multi-process SEQPACKET handshake). Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
 static int g_sock_pair_peer[DD_NFD];
 
 // fd -> a DISTINCT synthetic peer pid stamped on both ends at socketpair() creation (0 = none). macOS
 // captures LOCAL_PEERPID at socketpair-creation time and reports the CREATOR's pid on BOTH ends, never
-// updating it on fork -- so the process that CREATED the pair (Chromium's browser == container init, guest
+// updating it on fork -- so the process that CREATED the pair (typically container init, guest
 // pid 1) reads its OWN pid as the peer credential for every forked child (renderer/GPU), which the
 // SCM_CREDENTIALS/SO_PEERCRED self-fallback then collapsed to container_pid() == guest 1 for ALL of them.
 // Mojo uses that peer pid as the ports node identity, so every child collided on node "1" and the ports
@@ -579,7 +579,7 @@ static int g_sock_peer_pid[DD_NFD];
 
 // fd -> 1 if THIS process has actually SENT on this SEQPACKET/O_DIRECT-pipe endpoint (0 = never used it).
 // The synthetic peer-EOF injected on close (seq_send_eof) may fire ONLY for an endpoint this process wrote
-// to -- never for one it merely inherited across fork and never used. Rationale (the Chromium Mojo wall):
+// to -- never for one it merely inherited across fork and never used. Rationale:
 // when the browser forks a renderer/GPU child, that child inherits ALL the browser's open fds, including the
 // browser's SEND end of a Mojo channel meant for a DIFFERENT child. The bystander never sends on it, but on
 // startup it CLOSES the inherited copy -- and the old close-time EOF injection then delivered a spurious
@@ -616,7 +616,7 @@ static int seq_is(int fd) {
 
 // fd -> 1 if the guest enabled SO_PASSCRED on this AF_UNIX socket. macOS has no SO_PASSCRED/SCM_CREDENTIALS,
 // so we record the request and synthesize the peer-credentials ancillary record on each recvmsg (below).
-// Chromium's Mojo NodeChannel sets SO_PASSCRED and REQUIRES an SCM_CREDENTIALS cmsg on the bootstrap message
+// Credential-aware IPC sets SO_PASSCRED and requires an SCM_CREDENTIALS cmsg on the bootstrap message
 // -- without it the receiver logs "missing credentials" and aborts. Carried on dup, reset on close.
 static uint8_t g_sock_passcred[DD_NFD];
 
@@ -656,7 +656,7 @@ static void seq_send_eof(int fd) {
     // Only a genuine WRITER on this endpoint may synthesize the peer's EOF on close. An endpoint this process
     // merely inherited across fork and never wrote to belongs to another process's channel topology -- a
     // bystander renderer/GPU child closing the browser's inherited Mojo channel-send end must NOT dump a
-    // zero-length "EOF" into the real target child's live recv queue (the Chromium Mojo handshake wall). On
+    // zero-length "EOF" into the real target child's live recv queue. On
     // Linux a bystander's close signals nothing to the peer either, so staying silent is Linux-exact; a real
     // writer's last close still injects the EOF a blocked reader needs (jobserver / O_DIRECT pipe). See
     // g_sock_seq_wrote for the full rationale.
@@ -664,7 +664,7 @@ static void seq_send_eof(int fd) {
     // Suppress the synthetic EOF when this pair's OTHER end is still open in THIS process: we're a parent
     // dropping a fork-inherited peer copy (Linux delivers no EOF while the fork child still holds that end),
     // and injecting our zero-length "EOF" datagram here would deliver it to our OWN retained end -- a later
-    // recv there would misread it as a premature end-of-stream (this is the Chromium Mojo handshake wall).
+    // recv there would misread it as a premature end-of-stream.
     // A real last-local close -- where we no longer hold the partner -- still injects, so a blocked peer recv
     // (e.g. a jobserver/O_DIRECT-pipe reader that never gets ECONNRESET on macOS) still wakes and returns 0.
     int p = g_sock_pair_peer[fd];

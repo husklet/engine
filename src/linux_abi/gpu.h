@@ -5,7 +5,7 @@
 // returns the IOSurface's global id, which the guest carries to the compositor in the linux-dmabuf modifier
 // so the compositor resolves the same IOSurface and wraps it as an MTLTexture (zero readback).
 //
-// This whole path is inert unless HL_GPU_IOSURFACE is enabled in the process-local launch options (the GUI launcher
+// This whole path is inert unless HL_GPU_IOSURFACE is enabled in the process-local launch options (the host
 // sets it), so every existing workload — and the test gate — is byte-for-byte unaffected.
 #ifndef HL_GPU_H
 #define HL_GPU_H

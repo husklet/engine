@@ -315,7 +315,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // _seqpacket-dgram-maxmsg_: a macOS AF_UNIX DGRAM socket caps SO_SNDBUF at the tiny
                 // net.local.dgram.maxdgram default (2048), so ANY send > 2048 bytes fails with EMSGSIZE --
                 // whereas a Linux SEQPACKET message is bounded only by SO_SNDBUF (~208KB default) and never
-                // hits a 2KB wall. Chromium's Mojo node channel IS a SEQPACKET socketpair, and its bring-up
+                // hits a 2KB wall. Large SEQPACKET bootstrap messages require the Linux-sized buffer, and bring-up
                 // messages (the invitation carrying serialized handles, GPU/Viz init IPCs) routinely exceed
                 // 2KB: on the DGRAM backing those sends fail and the message is lost, so the browser<->child
                 // handshake wedges forever (the UI thread blocks on a readiness event the child can never
@@ -990,7 +990,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 208: {
         int lvl = (int)a1, opt = (int)a2;
         // SO_PASSCRED (Linux SOL_SOCKET/16): macOS has no equivalent. Record it per-fd so recvmsg(212)
-        // synthesizes the SCM_CREDENTIALS ancillary record the Linux kernel would auto-attach (Chromium's
+        // synthesizes the SCM_CREDENTIALS ancillary record the Linux kernel would auto-attach (credential-aware
         // Mojo bootstrap requires it). Never fail the guest.
         if (lvl == 1 && opt == 16) {
             // Validate the fd like the real kernel before recording state: a closed fd is EBADF, a non-socket
@@ -1312,7 +1312,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // SO_PASSCRED: the Linux kernel auto-attaches an SCM_CREDENTIALS record with the peer's ucred to
             // every received message; macOS does not, so synthesize it (uid/gid = container identity, pid =
             // the peer's -- LOCAL_PEERPID, mapping the container init's host pid back to guest pid 1, self as
-            // the container pid). Chromium's Mojo bootstrap aborts ("missing credentials") without it.
+            // the container pid). IPC bootstrap may abort with "missing credentials" without it.
             int passcred_active = gc && gcl && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_passcred[(int)a0];
             int cred_trunc = 0;
             size_t ln = 0;

@@ -109,7 +109,7 @@ static void fd_reset_emul(int fd);
 // ==================== Wall 7 renderer-stall instrumentation (flag-gated) =========================
 // Guarded by env DD_WALL7_TRACE=1. When unset this is a single cached-int compare per call site, so
 // the whole facility is inert for the normal test matrix. When set it emits one-line, pid-tagged
-// traces to stderr for the exact primitives the multi-process-Chrome renderer's Mojo bring-up rides
+// traces to stderr for the exact primitives used by multi-process IPC bring-up
 // on: AF_UNIX socketpair/eventfd creation, epoll_ctl registration, epoll_wait block/wake on those
 // fds, and sendmsg/recvmsg with SCM control (fd-passing + synthesized SO_PASSCRED credentials) on
 // the primary node channel. Children inherit the launcher's stderr, so a forked renderer's trace

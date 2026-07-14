@@ -59,6 +59,7 @@
 #include "hl/engine.h"
 #include "../launch.h"
 #include "../options.h"
+#include "../cli.h"
 
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
@@ -230,7 +231,7 @@ static int engine_global_init(void) {
     // ptrace tracer/tracee coordination arena -- mmap the shared region ONCE here, BEFORE any guest
     // fork, so every descendant guest process inherits the same physical pages. Inert until a guest ptraces.
     ptrace_arena_init();
-    // Host-IOSurface GPU bridge (--gui): force its one-time ObjC/CoreFoundation/Foundation/IOSurface class
+    // Host-IOSurface GPU bridge: force its one-time ObjC/CoreFoundation/Foundation/IOSurface class
     // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
     // never be mid-flight when a guest forks (which would abort the child via libobjc's fork-safety guard).
     // Gated on HL_GPU_IOSURFACE; a no-op for every other workload. Mirrors targets/linux_aarch64.c.
@@ -392,6 +393,7 @@ int main(int argc, char **argv) {
 }
 #endif
 int hl_engine_entry(int argc, char **argv) {
+    hl_cli_route route = hl_cli_route_parse(argc, argv);
     int ai = 1;
     const char *rootfs = NULL;
     static char self[4200];
@@ -401,14 +403,12 @@ int hl_engine_entry(int argc, char **argv) {
     else
         g_self_path = argv[0];
     // Final-product launch: the host provides one serialized, validated HL config file.
-    if (argc > 2 && strcmp(argv[1], "--configfile") == 0) return hl_run_config_file(argv[2]);
+    if (route.mode == HL_CLI_CONFIG) return hl_run_config_file(route.config_path);
     // W3D fork-server dispatch (gated; standalone path untouched when neither flag is present):
     //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run resident ddjitd, listen on SOCK
     //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to a ddjitd
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--server") == 0) return ddjitd_server_main(argc, argv);
-        if (strcmp(argv[i], "--client") == 0) return ddjitd_client_main(argc, argv);
-    }
+    if (route.mode == HL_CLI_SERVER) return ddjitd_server_main(argc, argv);
+    if (route.mode == HL_CLI_CLIENT) return ddjitd_client_main(argc, argv);
     while (ai + 1 < argc) { // --rootfs DIR / --vol guest:host (repeatable)
         if (strcmp(argv[ai], "--rootfs") == 0) {
             rootfs = argv[ai + 1];

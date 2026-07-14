@@ -110,12 +110,31 @@ static int g_threaded;
 // patch_links_to() back-patched a `b (NULL - slot)` wild branch (mongod, ~65K blocks of C++ static init,
 // crashed with SIGILL/SIGSEGV here). NOT the leaked container-state MAP_N (that one is unrelated, 64K).
 #define JIT_MAP_N (1u << 19)
+#define TXPG_N (1u << 18)
+#define TXLN_N (1u << 21)
 
-static struct {
+typedef struct {
     uint64_t gpc;
     void *host;
     void *body;
-} g_map[JIT_MAP_N];
+} hl_translation_map_entry;
+
+// All indexes describing the currently live translation generation share one owner. Keep these arrays
+// embedded (rather than separately allocated) so the hot lookup layout and zero-initialized lifetime stay
+// byte-for-byte equivalent. The compatibility aliases below intentionally leave the existing inline paths
+// unchanged while reset sites can treat this as one coherent translation index.
+typedef struct {
+    hl_translation_map_entry map[JIT_MAP_N];
+    uint64_t pages[TXPG_N];
+    uint64_t lines[TXLN_N];
+    uint64_t hashes[TXLN_N];
+} hl_translation_index;
+
+static hl_translation_index g_translation_index;
+#define g_map g_translation_index.map
+#define g_txpg g_translation_index.pages
+#define g_txln g_translation_index.lines
+#define g_txlh g_translation_index.hashes
 
 // Crash-only reverse lookup: map a host RX pc back to the nearest translated block start.
 int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn) {
@@ -155,8 +174,8 @@ int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn
 // `ic ivau` to a page NOT in the set is a no-op (skip the wholesale drop). A page that WAS translated
 // still triggers the full conservative invalidation -> correctness for genuine in-place self-modification
 // is unchanged. Reset whenever g_map is wholesale-cleared (the set then re-fills as blocks re-translate).
-#define TXPG_N (1u << 18)       // 256K slots * 8B = 2MB; guest code spans at most a few thousand pages
-static uint64_t g_txpg[TXPG_N]; // value = guest page (addr>>12); 0 = empty (page 0 never holds guest code)
+// TXPG_N: 256K slots * 8B = 2MB; guest code spans at most a few thousand pages.
+// g_txpg values are guest pages (addr>>12); 0 is empty (page 0 never holds guest code).
 
 static void txpg_put(uint64_t p) { // insert one guest page (addr>>12) into the set
     uint32_t h = (uint32_t)(p * 2654435761u) & (TXPG_N - 1);
@@ -178,12 +197,11 @@ static void txpg_put(uint64_t p) { // insert one guest page (addr>>12) into the 
 // invalidated line genuinely overlaps translated code (real in-place self-modification), not mere same-page
 // appends. Sized 2^21 slots (16MB) so even a large JIT working set (~1M lines = 64MB of guest code) keeps
 // the open-addressed load factor low; saturation degrades conservatively (assume present -> wholesale drop).
-#define TXLN_N (1u << 21)
 // Cap the open-addressed linear probe. Once this set saturates (a >128MB guest code working set --
-// e.g. a 206MB chromium/musl binary translates >2M distinct 64B lines during startup), an UNBOUNDED
+// e.g. a large musl binary translates >2M distinct 64B lines during startup), an UNBOUNDED
 // probe walks the whole 2M-slot table on every lookup/insert. txln_put() is on translate_block's HOT
 // path (via txpg_mark), so a full table turned each block's translation into an O(TXLN_N) scan per 64B
-// line -> `chromium --version` pinned translate_block at 100% CPU with RSS flat (no progress) forever.
+// line -> the guest pinned translate_block at 100% CPU with RSS flat (no progress) forever.
 // (This is DISTINCT from the SMC re-translation livelock the content gate below fixes; it is a hash-set
 // saturation blowup on the translate path.) Bounding the probe restores O(1) amortized and degrades to
 // the conservative fallback the callers already document ("saturated -> assume present -> wholesale
@@ -192,19 +210,19 @@ static void txpg_put(uint64_t p) { // insert one guest page (addr>>12) into the 
 // inserted is always re-found within the same cap; any probe that exhausts the cap means the line was
 // never recorded -> returning "present"/"drop" over-approximates safely (never misses stale code).
 #define TXLN_PROBE_CAP 512u
-static uint64_t g_txln[TXLN_N]; // value = guest line (addr>>6); 0 = empty
-// ---- SMC content gate: benign icache-flush detection (the chromium/V8 startup livelock fix) ----
+// g_txln values are guest lines (addr>>6); 0 is empty.
+// ---- SMC content gate: benign icache-flush detection ----
 // A code-generating guest re-flushes ALREADY-TRANSLATED, UNCHANGED code lines constantly at startup (a
 // builtin/trampoline flushed as part of a range every call; a block flushing its OWN executing source
 // line). smc_icflush() answered EVERY such line-hit with a WHOLESALE drop of the whole translation map,
-// re-translating the entire working set -> `chromium --version` spun in translate_block at 100% CPU
+// re-translating the entire working set -> the guest spun in translate_block at 100% CPU
 // forever (RSS flat, no real progress). This parallel array (SAME slot index as g_txln) holds a 64-bit
 // content hash of each translated line; the FIRST flush of a line records it (and drops conservatively,
 // since we did not capture the pre-flush bytes), and every LATER flush compares -- unchanged bytes
 // (benign icache maintenance) SKIP the drop; genuinely-rewritten bytes (soak_smc/smc2, a V8 IC patch)
 // still drop + re-record. Cost is on the SMC slow path only (zero translate-path overhead). Cleared in
 // lockstep with g_txln (txln_clear) so a slot's hash always matches the line living in that slot.
-static uint64_t g_txlh[TXLN_N]; // 64-bit content hash of the line at the SAME slot as g_txln (0 = unrecorded)
+// g_txlh stores the 64-bit content hash at the SAME slot as g_txln (0 = unrecorded).
 
 static void txln_put(uint64_t l) {
     uint32_t h = (uint32_t)(l * 2654435761u) & (TXLN_N - 1);
@@ -244,7 +262,7 @@ static uint64_t line_hash64(uint64_t line_base) {
 //   0 = the line is NOT the source of any live translation (nothing stale to drop)
 //   1 = translated, and this is its FIRST flush OR its bytes CHANGED -> GENUINE, take the wholesale drop
 //   2 = translated but bytes UNCHANGED since the last flush -> BENIGN icache maintenance, SKIP the drop
-// Case 2 is what breaks the V8/chromium re-translation livelock: a hot loop re-flushing its own unchanged
+// Case 2 breaks the re-translation livelock: a hot loop re-flushing its own unchanged
 // code no longer nukes the working set. Correct-by-construction: a genuine in-place rewrite changes the
 // 64B line -> case 1 -> the block still re-translates (g_smc_seen already latched by the caller).
 static int txln_flush_class(uint64_t addr) {

@@ -1172,7 +1172,7 @@ static void smc_icflush(uint64_t va) {
     // while a genuine in-place overwrite (V8 patching a jump) still overlaps a translated line -> real drop.
     // pcache warm-load restores blocks with page info but no line info (see pcache.c), so for a restored
     // arena fall back to the coarse page gate -- conservative (may over-drop) but never misses stale code.
-    // CONTENT GATE (the chromium/V8 SMC-livelock fix): classify the flush by whether the invalidated
+    // CONTENT GATE: classify the flush by whether the invalidated
     // translated line's bytes actually CHANGED. A benign re-flush of unchanged already-translated code
     // (a builtin/trampoline flushed as part of a range each call, or a block flushing its OWN executing
     // source line -- exactly what V8 does thousands of times at startup) must NOT trigger the wholesale

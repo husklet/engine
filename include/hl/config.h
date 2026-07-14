@@ -6,7 +6,7 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 2u
+#define HL_CONFIG_ABI 3u
 
 typedef struct hl_launch_config {
     uint32_t magic;
@@ -42,7 +42,6 @@ typedef struct hl_launch_config {
     uint32_t debug_log_offset;
     uint32_t checkpoint_directory_offset;
     uint32_t restore_directory_offset;
-    uint32_t chrome_window_size_offset;
     uint32_t gpu_bridge_name_offset;
     uint32_t gpu_pool_offset;
     uint32_t gpu_pool_capacity;

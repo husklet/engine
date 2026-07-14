@@ -1,4 +1,4 @@
-// Cross-mapping futex on a MAP_SHARED page reached at TWO DIFFERENT virtual addresses (the Chrome
+// Cross-mapping futex on a MAP_SHARED page reached at TWO DIFFERENT virtual addresses (the
 // renderer<->GPU-service command-buffer pattern: one shared-memory object, mmap'd independently in each
 // peer, so the SAME futex word lives at a DIFFERENT address in each). On Linux a FUTEX_WAIT and a
 // FUTEX_WAKE on a MAP_SHARED page rendezvous by the shared key (inode+offset), NOT by virtual address,

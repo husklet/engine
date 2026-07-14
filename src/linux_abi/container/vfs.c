@@ -131,7 +131,7 @@ static void unix_bind_clear(int fd) {
 // its ioctl routes to the dd GPU allocator. Set only when DD_GPU_IOSURFACE gates the path on.
 static uint8_t g_devdri[DD_NFD];
 // DD_GPU_IOSURFACE opt-in: the whole host-IOSurface GPU path (render-node synth + alloc ioctl) is inert
-// unless this is set in the engine env (the --gui launcher sets it). Cached; -1 = unqueried.
+// unless the typed launch configuration enables it. Cached; -1 = unqueried.
 static int g_gpu_iosurface = -1;
 static int gpu_iosurface_on(void) {
     if (g_gpu_iosurface < 0) g_gpu_iosurface = hl_option_get("HL_GPU_IOSURFACE") != NULL ? 1 : 0;
@@ -157,7 +157,7 @@ static int g_eventfd_cslot[DD_NFD];
 static void eventfd_count_init(void) {
     if (g_eventfd_count) return;
     // One slot per POSSIBLE fd number: eventfd_counter_slot() indexes this by the fd number (or a
-    // SCM_RIGHTS-imported eventfd's sender-fd slot), and Chrome opens FAR more than 1024 fds — a 1024-slot
+    // SCM_RIGHTS-imported eventfd's sender-fd slot), and large workloads open far more than 1024 fds — a 1024-slot
     // array is a cross-process out-of-bounds write for any eventfd whose fd number exceeds it (silent
     // counter corruption / heap clobber past the mapped page). Size it to the whole fd space.
     size_t sz = sizeof(uint64_t) * DD_NFD;
@@ -173,7 +173,7 @@ static void eventfd_count_init(void) {
 // across processes (fork / SCM_RIGHTS) as one open file description, so a transient host O_NONBLOCK flip in
 // one process's drain is observed by a concurrent reader in ANOTHER process (g_eventfd_lock is process-
 // private and cannot serialize it), which then wrongly takes the nonblocking path and returns a spurious
-// EAGAIN on a BLOCKING eventfd (Chrome's renderer↔gpu-process command-buffer / ScheduleWork wake fd). The
+// EAGAIN on a BLOCKING eventfd used for a cross-process command-buffer wakeup. The
 // guest's REAL blocking/non-blocking intent lives here instead; the read path consults it and blocks via
 // poll() when the guest asked to block. Propagated on dup + SCM_RIGHTS import alongside the peer/slot.
 static uint8_t g_eventfd_gnb[DD_NFD];
@@ -186,7 +186,7 @@ __attribute__((constructor)) static void eventfd_count_ctor(void) {
 // _eventfd-atomicity_: an eventfd is emulated as {accumulating counter, readiness pipe}. write() does
 // `count += add; drain-pipe; write-one-byte` and read() does `v = count; count = 0; drain-pipe; if
 // count>0 re-signal` -- a PAIR of mutations (counter + pipe) that MUST move together. With no lock, two
-// threads (Chrome's ScheduleWork writers vs its message-pump reader) interleave and strand the invariant
+// threads (work-scheduling writers versus an event-loop reader) interleave and strand the invariant
 // "pipe-readable IFF count>0": a byte left in the pipe with count==0 makes a level-triggered epoll_wait
 // report the fd endlessly ready while read() returns EAGAIN (the pump busy-spins), and an edge-triggered
 // watcher that saw no fresh edge never wakes at all (the "lost wakeup" park). Either way the browser main
@@ -1896,7 +1896,7 @@ static void set_guest_cmdline(int argc, char *const argv[]) {
 }
 
 // /proc/[pid]/cmdline -- the guest argv as NUL-separated, NUL-terminated arguments. Prefer the same
-// published argv record used for peer /proc/<pid>/cmdline so self-introspection sees Chrome's --type and
+// published argv record used for peer /proc/<pid>/cmdline so self-introspection sees process arguments and
 // service switches. Fall back to the captured argv blob (bare mode), then argv[0].
 static int proc_cmdline_text(char *b, size_t n) {
     char comm[32], cmd[4096];
@@ -4643,7 +4643,7 @@ static void dd_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf
 #endif
 
 // ---- fork-safe IOSurface pool (THE 6th-blocker fix) ---------------------------------------------
-// dd emulates the guest fork() as a real host fork(), so Chrome's GPU/render process is a host
+// The engine emulates guest fork() as a real host fork(), so a forked GPU process is a host
 // fork()-WITHOUT-exec child. On such a child EVERY IOSurface entry point is unusable — not just
 // IOSurfaceCreate (returns NULL, errno=22) but ALSO IOSurfaceLookupFromMachPort (returns NULL) and even
 // touching an inherited surface's mapped pages (the region is VM_INHERIT_NONE → the child faults). Proven
@@ -4680,7 +4680,7 @@ static void dd_gpu_share_inherit(void *base, size_t size) {
 #ifdef __APPLE__
 // Per-render-node IOSurface registry: reuse a same-size surface across frames (a guest redraws into the
 // same buffer each frame) and release every surface a render-node fd owns when it closes — so a
-// long-running GUI app doesn't accumulate IOSurfaces. Bounded, gated (only the GPU path touches it).
+// long-running presentation workload doesn't accumulate IOSurfaces. Bounded, gated (only the GPU path touches it).
 #define DD_GPU_REG_MAX 256
 static struct dd_gpu_reg_ent {
     int owner_fd;  // the render-node fd that checked this surface out, or -1 = a FREE pool surface
@@ -4775,7 +4775,7 @@ static void dd_gpu_free_handle(uint32_t handle) {
 #endif
 
 // Core IOSurface allocator shared by HL_IOCTL_GPU_ALLOC (glmark2/EGL shim path) and the DRM
-// CREATE_DUMB ioctl (chromium/Mesa kms_swrast path). Reuse-or-create a host IOSurface for
+// CREATE_DUMB ioctl (Mesa kms_swrast path). Reuse-or-create a host IOSurface for
 // (owner_fd,w,h), announce it to dd-display over mach, register it under owner_fd, and hand back its
 // id/stride/base. `reuse` selects redraw-in-place (glmark2) vs a fresh distinct surface per call
 // (gbm bo pool). Returns 0 or -errno. Gated: only ever reached on a render-node fd with the GPU path on.
@@ -4857,7 +4857,7 @@ static int dd_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint3
         }
     }
     // Take a distinct FREE surface from the pre-fork, share-inherited pool. THIS is the fork-safe path: it
-    // works identically in the root and in a forked child (Chrome's GPU process), because it only reads
+    // works identically in the root and in a forked child, because it only reads
     // inherited plain data (base/id/stride) — no IOSurface API call, which would fault/NULL in the child.
     int pi = dd_gpu_reg_take_pool(owner_fd, w, h);
     if (pi < 0 && !g_gpu_fork_child) {
@@ -4940,8 +4940,8 @@ static int64_t hl_gpu_alloc(int owner_fd, void *arg) {
 
 // Fork-safety prewarm for the host-IOSurface GPU bridge. Called ONCE from engine_global_init(), on the
 // single engine startup thread, BEFORE the guest's first instruction runs (hence before any guest thread
-// exists and before Chrome's mandatory zygote/broker fork()). Gated on DD_GPU_IOSURFACE, so inert for
-// every non-GUI workload / the test gate.
+// exists and before any guest fork without exec). Gated on HL_GPU_IOSURFACE, so inert for
+// every workload that does not request this presentation service.
 //
 // Why this is needed: the bridge's CoreFoundation/IOSurface/mach calls (CFDictionary/CFNumber build,
 // IOSurfaceCreate, IOSurfaceCreateMachPort, bootstrap_look_up) lazily run one-time ObjC class
@@ -4950,7 +4950,7 @@ static int64_t hl_gpu_alloc(int owner_fd, void *arg) {
 // thread is mid guest-fork() (libc fork() in os/linux/syscall/proc.c, which runs libobjc's pthread_atfork
 // handlers). If an ObjC +initialize is in progress at fork() — e.g. +[NSPlaceholderString initialize],
 // pulled in transitively via IOSurface->Foundation — libobjc's initialize-fork-safety guard aborts the
-// child (objc_initializeAfterForkError) -> chromium EXIT=137, 0 frames. The race is load-sensitive: on a
+// child (objc_initializeAfterForkError). The race is load-sensitive: on a
 // quiet host the init finishes before the fork; under load it's mid-flight at the fork. Forcing every
 // lazy init to COMPLETION here, before any guest thread/fork exists, closes the race STRUCTURALLY and
 // deterministically, independent of host load (and independent of whether OBJC_DISABLE_INITIALIZE_FORK_-
@@ -5000,10 +5000,9 @@ static void dd_gpu_prewarm_fork_safety(void) {
     // IOSurfaces. Record it so a later forked child never attempts a (fatal) create.
     g_gpu_root_pid = (int)getpid();
 
-    // Pre-fill the share-inherited pool for the sizes the GUI will render, BEFORE any guest fork. Chrome's
-    // GPU/render process forks WITHOUT exec and cannot create/map an IOSurface at all, so every surface it
-    // will use must exist, mapped SHARED, at fork time. DD_GPU_POOL="WxH[,WxH...]" names the sizes (the
-    // --gui launcher passes the window size); DD_GPU_POOL_N sets how many per size (default 6 — covers a
+    // Pre-fill the share-inherited pool for configured surface sizes BEFORE any guest fork. A forked
+    // GPU process cannot create/map an IOSurface, so every surface it will use must exist, mapped SHARED,
+    // at fork time. HL_GPU_POOL="WxH[,WxH...]" names the sizes; HL_GPU_POOL_N sets how many per size (default 6 — covers a
     // gbm 2-4 bo pool plus slack). Unset → no prefill (root-side on-demand batch-create still amplifies).
     int per = 6;
     const char *pn = hl_option_get("HL_GPU_POOL_N");
@@ -5022,14 +5021,6 @@ static void dd_gpu_prewarm_fork_safety(void) {
                 for (int k = 0; k < per; k++)
                     if (dd_gpu_pool_make_one(pw, ph) != 0) break;
         }
-    } else {
-        // Fallback: the --gui launcher already exports the window geometry as CHROME_WINDOW_SIZE="W,H";
-        // seed the pool from it so the fix works without a dedicated DD_GPU_POOL env.
-        const char *ws = hl_option_get("HL_CHROME_WINDOW_SIZE");
-        unsigned pw = 0, ph = 0;
-        if (ws && sscanf(ws, "%u,%u", &pw, &ph) == 2 && pw && ph)
-            for (int k = 0; k < per; k++)
-                if (dd_gpu_pool_make_one(pw, ph) != 0) break;
     }
 #endif
 }
@@ -5212,12 +5203,12 @@ static void container_populate_machine_id(void) {
 }
 
 // -> macOS struct stat for a synth file
-// ================= DRM render-node synthesis (chromium ozone GPU discovery) =================
+// ================= DRM render-node synthesis =================
 // Gated on DD_GPU_IOSURFACE. libdrm's drmGetDevices2() enumerates /dev/dri, stats each node's st_rdev ->
 // major:minor, then walks /sys/dev/char/<maj>:<min>/... to classify the DRM device's bus. We advertise
 // ONE platform DRM device with a primary node (card0 = 226:0) and a render node (renderD128 = 226:128),
 // both parented to a single platform device ("dd-gpu") so libdrm MERGES them into one drmDevice exposing a
-// render node -- which chromium opens instead of hold-and-wait deadlocking in its viz buffer-manager
+// render node -- which a Linux DRM client opens instead of deadlocking in its buffer manager
 // fallback. Every sysfs path is matched EXACTLY (no real /sys tree); /dev/dri itself is a real placeholder
 // dir in the writable upper (container_populate_dev) so opendir/readdir just work through the overlay.
 #define DD_DRM_MAJOR 226
@@ -5706,7 +5697,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         if (lf && pid > 0) {
             int host;
             if (pid == (int)getpid() || pid == container_pid() || pid == 1 || proc_pid_member(pid, &host)) {
-                int istaskdir = !strcmp(lf, "task") || !strcmp(lf, "task/"); // chromium stats "self/task/"
+                int istaskdir = !strcmp(lf, "task") || !strcmp(lf, "task/"); // guests stat "self/task/"
                 int istid = 0;
                 if (!istaskdir && !strncmp(lf, "task/", 5) && lf[5]) {
                     istid = 1;
@@ -5716,7 +5707,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
                 if (istaskdir || istid) {
                     // For OUR OWN process, reflect the REAL live-thread set: /proc/self/task st_nlink must be
                     // 2 + live-thread-count, and /proc/self/task/<tid> must ENOENT once that thread has
-                    // joined/exited. Chromium's sandbox (thread_helpers.cc) fstatat-watches /proc/self/task/<tid>
+                    // joined/exited. Sandboxes may fstatat-watch /proc/self/task/<tid>
                     // for ENOENT after stopping a helper thread and reads /proc/self/task st_nlink==3 for
                     // single-threadedness; a fixed nlink=3 + a per-tid dir synthesized for ANY number made the
                     // stopped thread never "disappear" -> the GPU process spun 30 iterations and FATAL'd. A PEER

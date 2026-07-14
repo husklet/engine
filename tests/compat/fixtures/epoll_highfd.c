@@ -1,5 +1,5 @@
 // epoll readiness + EEXIST/ENOENT semantics for a WATCHED FD WHOSE NUMBER EXCEEDS 1024.
-// A Chromium renderer registers hundreds of fds, so its watched fd numbers routinely climb past
+// A large event loop registers hundreds of fds, so watched fd numbers routinely climb past
 // 1024. The engine tracks per-epoll-instance membership in a bitmap indexed by the watched fd; the
 // bitmap must span the full guarded fd range, not just the first 1024. If it is sized to only 1024
 // bits, indexing it with fd>=1024 is a heap out-of-bounds access whose garbage membership bit either

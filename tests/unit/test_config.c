@@ -23,6 +23,9 @@ int main(void) {
     HL_CHECK(offsetof(hl_launch_config, pool_size) == 4);
     HL_CHECK(offsetof(hl_launch_config, header_size) == 8);
     HL_CHECK(offsetof(hl_launch_config, abi) == 12);
+    HL_CHECK(offsetof(hl_launch_config, gpu_bridge_name_offset) == 136);
+    HL_CHECK(offsetof(hl_launch_config, gpu_pool_offset) == 140);
+    HL_CHECK(offsetof(hl_launch_config, gpu_pool_capacity) == 144);
 
     memset(&wire, 0, sizeof(wire));
     wire.config.magic = HL_CONFIG_MAGIC;

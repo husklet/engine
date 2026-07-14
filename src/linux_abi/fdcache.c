@@ -7,6 +7,119 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 
 // Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
 #define ATFD(a) (((int)(a) == -100) ? AT_FDCWD : (int)(a))
+
+#define MCACHE_N 8192
+#define RCACHE_N 8192
+#define UDCACHE_N 4096
+#define UDVCACHE_N 4096
+#define DCACHE_N 8192
+#define OCACHE_N 8192
+
+struct mcent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    char path[192];
+    int rc;
+    struct stat st;
+};
+
+struct rlent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    char path[176];
+    int rc;
+    char link[200];
+    int linklen;
+};
+
+struct hl_fdcache_access_entry {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    char path[176];
+    int rc;
+};
+
+struct rcent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    uint16_t hlen;
+    char guest[200];
+    char host[256];
+};
+
+struct udent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    char dir[200];
+};
+
+struct udvent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    uint8_t verdict;
+    char dir[200];
+};
+
+struct dcent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    uint16_t nmiss;
+    uint16_t clen;
+    char key[DC_KEYMAX];
+    char canon[DC_KEYMAX];
+};
+
+struct ocent {
+    uint64_t hash;
+    uint32_t epoch;
+    uint32_t fgen;
+    uint16_t hlen;
+    char guest[200];
+    char host[256];
+};
+
+struct hl_fdcache {
+    _Atomic uint32_t resolver_epoch_local;
+    _Atomic uint32_t *resolver_epoch_ptr;
+    uint32_t fork_generation;
+    struct mcent metadata[MCACHE_N];
+    struct rlent readlink[2048];
+    struct hl_fdcache_access_entry access[2048];
+    struct rcent resolution[RCACHE_N];
+    struct udent upper_negative[UDCACHE_N];
+    struct udvent upper_verdict[UDVCACHE_N];
+    struct dcent dentry[DCACHE_N];
+    struct ocent open_resolution[OCACHE_N];
+    _Atomic uint32_t filesystem_generation_local;
+    _Atomic uint32_t *filesystem_generation_ptr;
+    _Atomic uint32_t filesystem_generation_seen;
+};
+
+static struct hl_fdcache g_fdcache = {.resolver_epoch_local = 1,
+                                      .resolver_epoch_ptr = &g_fdcache.resolver_epoch_local,
+                                      .filesystem_generation_ptr = &g_fdcache.filesystem_generation_local};
+
+/* Compatibility aliases keep the established hot callsites and lock discipline unchanged. */
+#define g_res_epoch_ptr g_fdcache.resolver_epoch_ptr
+#define g_res_epoch (*g_res_epoch_ptr)
+#define g_fs_fgen g_fdcache.fork_generation
+#define g_mc g_fdcache.metadata
+#define g_rl g_fdcache.readlink
+#define g_ac g_fdcache.access
+#define g_rc g_fdcache.resolution
+#define g_ud g_fdcache.upper_negative
+#define g_udv g_fdcache.upper_verdict
+#define g_dc g_fdcache.dentry
+#define g_oc g_fdcache.open_resolution
+#define g_fsgen_ptr g_fdcache.filesystem_generation_ptr
+#define g_fsgen_seen g_fdcache.filesystem_generation_seen
 // ---- S2 path-resolution cache (forward decls; impl after mc_hash, which it reuses) ----
 // Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
 // runs on the result, so existence/contents are never cached). A global epoch -- bumped by
@@ -23,7 +136,6 @@ static void rc_reset(void);
 static int oc_lookup(const char *g, char *out, size_t n);
 static void oc_store(const char *g, const char *host);
 static void oc_reset(void);
-
 
 // ---- FS-metadata cache ----
 // Container processes (ld.so, shells, build tools) hammer redundant stat() on
@@ -53,10 +165,6 @@ static void oc_reset(void);
 // counter; a fresh `docker exec` is a NEW dd process = its own tree = its own counter (correct per-container
 // isolation). Falls back to a private local counter if the mmap fails (degrades to the old per-process
 // behaviour, never crashes). Positive entries are still served epoch-independently, unchanged.
-static _Atomic uint32_t g_res_epoch_local = 1;                 // fallback when the shared mapping can't be made
-static _Atomic uint32_t *g_res_epoch_ptr = &g_res_epoch_local; // -> a MAP_SHARED page once the ctor runs
-#define g_res_epoch (*g_res_epoch_ptr) // 0 is reserved as "never matches" (shared by the rc_/oc_ path caches)
-
 __attribute__((constructor)) static void res_epoch_ctor(void) {
     void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (m != MAP_FAILED) {
@@ -71,19 +179,6 @@ __attribute__((constructor)) static void res_epoch_ctor(void) {
 // memset'ing ~13MB of arrays inside the fork child's critical path. The counter is ordinary process
 // memory (COW-private), so a child's bump never disturbs the parent's warm caches. Reads/writes happen
 // under the same CLK lock as the entries themselves.
-static uint32_t g_fs_fgen;
-
-#define MCACHE_N 8192
-
-static struct mcent {
-    uint64_t hash;
-    uint32_t epoch; // stamp at store; a negative (rc<0) entry only hits while it still equals g_res_epoch
-    uint32_t fgen;  // fork/chroot generation stamp (see g_fs_fgen)
-    char path[192];
-    int rc;
-    struct stat st;
-} g_mc[MCACHE_N];
-
 static uint64_t mc_hash(const char *s) {
     uint64_t h = 1469598103934665603ull;
     for (; *s; s++) {
@@ -151,16 +246,6 @@ static void mc_evict_ino(dev_t dev, ino_t ino) {
 }
 
 // readlink cache (ld.so resolves symlinks on every library search path)
-static struct rlent {
-    uint64_t hash;
-    uint32_t epoch; // negative (rc<0) entries are epoch-gated; see the mcent rationale above
-    uint32_t fgen;  // fork/chroot generation stamp
-    char path[176];
-    int rc;
-    char link[200];
-    int linklen;
-} g_rl[2048];
-
 static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
@@ -205,21 +290,6 @@ static void rl_evict(const char *p) {
 }
 
 // access(F_OK) existence cache (ld.so probes every library candidate)
-struct hl_fdcache_access_entry {
-    uint64_t hash;
-    uint32_t epoch; // negative (rc<0) entries are epoch-gated; see the mcent rationale above
-    uint32_t fgen;  // fork/chroot generation stamp
-    char path[176];
-    int rc;
-};
-
-struct hl_fdcache {
-    struct hl_fdcache_access_entry access[2048];
-};
-
-static struct hl_fdcache g_fdcache;
-#define g_ac g_fdcache.access
-
 static int ac_lookup(const char *p, int *rc) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
@@ -272,17 +342,6 @@ static void ac_evict(const char *p) {
 //     delete-after-positive, rename, mkdir/rmdir -- when in doubt we MISS and re-resolve.
 //   * Hard reset on fork (rc_reset, called in the clone/clone3 child) so a child never serves a
 //     mapping the parent populated before the FS diverged.
-#define RCACHE_N 8192
-
-static struct rcent {
-    uint64_t hash;
-    uint32_t epoch;
-    uint32_t fgen; // fork/chroot generation stamp
-    uint16_t hlen; // strlen(host), cached so a hit copies via memcpy instead of re-scanning/snprintf
-    char guest[200];
-    char host[256];
-} g_rc[RCACHE_N];
-
 // g_res_epoch is defined up with the FS-metadata cache (the metadata caches' negative-entry gating
 // references it too); it is shared by these path-string caches and the metadata caches alike.
 // kill switch (read once): DD_NOPATHCACHE=1 -> exact baseline resolution, no memoization. This gates
@@ -313,15 +372,6 @@ static void res_bump(void) {
 //   * fork/chroot hard reset via rc_reset() below.
 //   * volume paths are never stored (host-mutable backing; enforced at the overlay_lookup call site).
 //   * kill switch: DD_NOPATHCACHE=1 disables it together with the other path caches (res_enabled).
-#define UDCACHE_N 4096
-
-static struct udent {
-    uint64_t hash;
-    uint32_t epoch;
-    uint32_t fgen; // fork/chroot generation stamp
-    char dir[200];
-} g_ud[UDCACHE_N];
-
 static int updirneg_lookup(const char *d) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
     CLK;
@@ -361,16 +411,6 @@ static void updirneg_store(const char *d) {
 // container-shared g_res_epoch (every unlink/rmdir/rename/mkdir/whiteout/opaque bumps it, so a removal
 // instantly invalidates the memo), fork/chroot hard reset via rc_reset(), and DD_NOPATHCACHE=1 disables
 // it (overlay_dir_verdict then recomputes every call -- correct, just uncached).
-#define UDVCACHE_N 4096
-
-static struct udvent {
-    uint64_t hash;
-    uint32_t epoch;
-    uint32_t fgen;   // fork/chroot generation stamp
-    uint8_t verdict; // 0 = present (lowers contribute), 1 = hidden, 2 = opaque-cut (upper-only)
-    char dir[200];
-} g_udv[UDVCACHE_N];
-
 static int updirverdict_lookup(const char *d, int *verdict) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
     CLK;
@@ -430,18 +470,6 @@ static void updirverdict_store(const char *d, int verdict) {
 // returning its input verbatim admits no symlink hop), which is precisely the condition under which
 // the lexical fast path and the per-component walk agree -- see the guard comments at that site.
 // No dir-fds are cached (path strings only), so there is no fd-exhaustion/LRU concern.
-#define DCACHE_N 8192
-
-static struct dcent {
-    uint64_t hash;
-    uint32_t epoch;
-    uint32_t fgen;  // fork/chroot generation stamp (rc_reset bumps g_fs_fgen, O(1), instead of memset)
-    uint16_t nmiss; // trailing components of key that did NOT exist when resolved (0 = fully exists)
-    uint16_t clen;  // strlen(canon)
-    char key[DC_KEYMAX];
-    char canon[DC_KEYMAX];
-} g_dc[DCACHE_N];
-
 static int dc_jail_cacheable(const char *jcanon) {
     if (!res_enabled()) return 0;
     if (jcanon == g_vfs_namespace.root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)
@@ -571,17 +599,6 @@ static void rc_store(const char *g, const char *host) {
 // (defensive strncmp). The caller EXCLUDES O_CREAT/O_EXCL/O_TRUNC (mutating/creating) and O_DIRECTORY
 // (deep-host-path reopen regressed -21%; see optimization-research/w4d-openat.md). Hard reset on fork via
 // oc_reset() (from rc_reset). Kill switch (read once): W4_NOOPENCACHE=1 -> the original uncached walk.
-#define OCACHE_N 8192
-
-static struct ocent {
-    uint64_t hash;
-    uint32_t epoch;
-    uint32_t fgen; // fork/chroot generation stamp
-    uint16_t hlen; // strlen(host), cached so a hit copies via memcpy instead of re-scanning/snprintf
-    char guest[200];
-    char host[256];
-} g_oc[OCACHE_N];
-
 static int oc_enabled(void) {
     return 1;
 }
@@ -661,10 +678,6 @@ static void oc_reset(void) {
 // the poll is a `static inline` two-word compare with a RELAXED load (plain LDR, not the pricier acquire
 // LDAR) and a predicted-not-taken branch; the acquire barrier + rc_reset() live in an out-of-line `cold`
 // helper reached only when the generation actually moved (i.e. only right after a real daemon write).
-static _Atomic uint32_t g_fsgen_local = 0;             // fallback: "no external writer exists"
-static _Atomic uint32_t *g_fsgen_ptr = &g_fsgen_local; // -> the daemon's file page once the ctor runs
-static _Atomic uint32_t g_fsgen_seen = 0;              // last generation this process acted on
-
 __attribute__((constructor)) static void fsgen_ctor(void) {
     const char *p = hl_option_get("HL_FSGEN_FILE");
     if (!p || !p[0]) return;

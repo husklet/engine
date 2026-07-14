@@ -171,7 +171,7 @@ __attribute__((constructor)) static void futex_table_ctor(void) {
 // dd hashes a futex bucket by the WORD's host virtual address. That is exactly Linux's PRIVATE futex key
 // (mm + address) and is correct for anon/private words -- including a fork-inherited MAP_SHARED page, which
 // lands at the SAME VA in parent and child. But a file-backed MAP_SHARED object (memfd, shm) is mapped
-// INDEPENDENTLY by each peer: Chrome's renderer and GPU-service map the command-buffer shmem at DIFFERENT
+// INDEPENDENTLY by each peer: cooperating processes may map command-buffer shared memory at DIFFERENT
 // addresses, so the SAME physical futex word has a different VA in each. Linux keys such a word by the
 // SHARED object identity (inode + page offset), so a FUTEX_WAKE through one mapping reaches a FUTEX_WAIT
 // parked through another. dd's VA-only key put the two in different buckets and LOST the wake -- the
@@ -957,7 +957,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int val, const struct ti
     if (op == 5) { // FUTEX_WAKE_OP: atomically mutate *uaddr2, wake uaddr waiters, conditionally uaddr2's.
         // glibc's pthread_cond_signal/broadcast issue this (bump the internal seq/counter at uaddr2 and wake
         // the condvar's futex at uaddr) -- the old "other ops -> return 0" reported success WITHOUT waking,
-        // so every glibc condvar signal was silently dropped (Chromium's main thread waited forever on the
+        // so every glibc condvar signal was silently dropped (the waiting thread remained blocked on the
         // in-process Viz/GPU thread's condvar -> the live-window stall).
         int do_wake2 = 0;
         int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
@@ -1197,7 +1197,7 @@ static int thread_tid_alive(int tid) {
 }
 
 // Count of currently-live guest threads of THIS process (main + every spawned one still in run_guest). The
-// /proc/<self>/task st_nlink synth reports 2 + this (Linux: `.`, `..`, one subdir per thread) so chromium's
+// /proc/<self>/task st_nlink synth reports 2 + this (Linux: `.`, `..`, one subdir per thread) so guest
 // sandbox `IsSingleThreaded` (fstatat st_nlink == 3) and per-tid `IsThreadPresentInProcFS` (fstatat ENOENT
 // on a joined/exited thread) both track the real thread set -- otherwise the GPU process's thread_helpers
 // spins 30 iterations waiting for a stopped thread's /proc/self/task/<tid> to disappear, then FATALs.

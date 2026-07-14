@@ -99,7 +99,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
 
     case 279: { // memfd_create(name, flags) -> an anonymous file: a tmpfile, unlinked immediately
-        // Validate `flags` exactly as Linux (mm/memfd.c): any unknown bit -> EINVAL. Chromium's Mojo
+        // Validate `flags` exactly as Linux (mm/memfd.c): any unknown bit -> EINVAL. Shared-memory IPC
         // ChannelLinux::KernelSupportsUpgradeRequirements() probes memfd_create("", ~0) and PCHECKs the
         // call FAILS with EINVAL/ENOSYS/EPERM; without this the probe SUCCEEDED (fd>=0) and the browser
         // process aborted at channel_linux.cc (Check failed). MFD_CLOEXEC=1 MFD_ALLOW_SEALING=2

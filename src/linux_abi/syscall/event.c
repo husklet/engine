@@ -79,7 +79,7 @@ static uint8_t g_ep_has_mojo[DD_NFD];
 
 // per-epoll-instance registered-fd membership (lazily allocated DD_NFD-bit bitmap indexed by the
 // watched fd -- the bitmap must span the SAME index range as the fd < DD_NFD guard on ep_mem_test/
-// ep_mem_set and the sibling [DD_NFD] interest tables; a Chromium renderer registers hundreds of fds,
+// ep_mem_set and the sibling [DD_NFD] interest tables; large event loops register hundreds of fds,
 // so the watched-fd number routinely exceeds 1024 and any narrower bitmap would be indexed out of
 // bounds -- a heap overflow whose corrupted/garbage membership bit spuriously returns EEXIST and drops
 // the real registration, stranding that fd's readiness (the load-dependent renderer node-connect stall).
@@ -359,7 +359,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // eventfd2(initval, flags) -> pipe
     case 19: {
         // Validate `flags` exactly as Linux (fs/eventfd.c): only EFD_SEMAPHORE(1) | EFD_NONBLOCK(O_NONBLOCK
-        // 0x800) | EFD_CLOEXEC(O_CLOEXEC 0x80000) are defined; any other bit -> EINVAL. Chromium's Mojo
+        // 0x800) | EFD_CLOEXEC(O_CLOEXEC 0x80000) are defined; any other bit -> EINVAL. IPC runtimes
         // EventFDNotifier::KernelSupported() probes eventfd2(0, ~0) and PCHECKs it FAILS with EINVAL/ENOSYS/
         // EPERM (channel_linux.cc); without this the probe SUCCEEDED and the browser aborted.
         if ((unsigned)a1 & ~(unsigned)(1u | 0x800u | 0x80000u)) {

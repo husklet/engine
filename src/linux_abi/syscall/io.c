@@ -709,7 +709,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             // Counter bump + pipe re-signal held together under g_eventfd_lock so a concurrent read()'s
             // drain (or a peer write) can never strand the pipe readable-with-count-0 / empty-with-count>0
-            // (the Chrome pump spin / lost-wakeup root cause -- see the _eventfd-atomicity_ note in vfs.c).
+            // (the event-loop spin / lost-wakeup root cause -- see the _eventfd-atomicity_ note in vfs.c).
             pthread_mutex_lock(&g_eventfd_lock);
             // Linux caps the counter at ULLONG_MAX-1 (0xfffffffffffffffe). A write that would overflow that
             // maximum does NOT wrap: a nonblocking eventfd returns EAGAIN and leaves the counter unchanged
@@ -729,7 +729,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (add > 0) {
                 // The read end is permanently O_NONBLOCK, so drain to exactly one fresh byte with no flag
                 // toggle. The old toggle mutated the cross-process-shared fd flags and a concurrent reader in
-                // another process observed the transient O_NONBLOCK -> spurious EAGAIN (the Chrome wake bug).
+                // another process observed the transient O_NONBLOCK -> spurious EAGAIN.
                 char buf[64];
                 while (read(wfd, buf, sizeof buf) > 0) {}
                 char b = 1;

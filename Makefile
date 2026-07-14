@@ -12,7 +12,7 @@ CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
-PRIVATE_HEADERS := src/host/sync.h src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
+PRIVATE_HEADERS := src/core/cli.h src/host/sync.h src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
 # translator, and Linux-personality implementation. Make cannot discover those nested includes from the
@@ -26,7 +26,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
 	$(call rwildcard,include/hl/,*.h))
 
-CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c \
+CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
 	src/translator/window.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
@@ -58,7 +58,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-linux
 endif
 
-UNIT_NAMES := affinity arena clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena cli clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 

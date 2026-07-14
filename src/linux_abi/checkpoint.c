@@ -45,7 +45,7 @@
 // Trigger: HL_CHECKPOINT_DIR=<dir> arms a SIGUSR1 control handler inherited by every forked
 // guest process); SIGUSR1 to the container init checkpoints the whole tree then _exit()s each process.
 // Restore: HL_RESTORE_DIR=<dir> (or `--restore <dir>`) calls the restore path.
-// dd_jit::Runtime layers checkpoint(dir)/restore(dir) on this; the GUI calls it on window close/reopen.
+// The embedding runtime layers checkpoint(dir)/restore(dir) on this explicit lifecycle operation.
 
 #include <libproc.h>   // proc_pidpath: filter session members to engine processes
 #include <sys/sysctl.h> // KERN_PROC_SESSION: enumerate the container's whole process tree

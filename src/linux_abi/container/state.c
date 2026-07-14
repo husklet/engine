@@ -7,7 +7,7 @@
 
 // DD_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
-// Chromium's Mojo shared-memory channel creates a memfd whose fd is >=1024, and F_ADD_SEALS then returned
+// A high-fd shared-memory channel can create a memfd whose fd is >=1024, and F_ADD_SEALS then returned
 // EINVAL (fd out of the tracked range) and the browser aborted (channel_linux.cc). 65536 covers a realistic
 // RLIMIT_NOFILE; the tables are zero-init BSS so the cost is a few MB of never-resident address space.
 #define DD_NFD 65536
@@ -239,7 +239,7 @@ static volatile uint32_t *g_ckpt_trigger;
 static uint32_t g_ckpt_seen_gen;
 
 // A whole-tree checkpoint has been requested. Consulted by syscall_should_restart / svc_poll_retry so a
-// process parked in a blocking host syscall (bash in read()/poll on its pty -- every GUI shell at a prompt)
+// process parked in a blocking host syscall (for example a shell in read()/poll on its pty)
 // returns EINTR and reaches the dispatcher safepoint (where G_CKPT_POLL runs) instead of transparently
 // re-blocking. Inert (0) unless a checkpoint is actually in flight, so SA_RESTART semantics are untouched in
 // normal operation.

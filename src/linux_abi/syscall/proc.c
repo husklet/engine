@@ -1286,7 +1286,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        // PR_SET_PTRACER (0x59616d61, "Yama"): Chromium/crashpad allows a specific helper pid to ptrace it
+        // PR_SET_PTRACER (0x59616d61, "Yama"): a process may allow a specific helper pid to ptrace it
         // when Linux's Yama LSM is present. dd has no Yama policy to enforce, so accept the request as a no-op.
         if ((int)a0 == 1499557217) {
             G_RET(c) = 0;
