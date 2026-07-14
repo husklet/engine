@@ -163,7 +163,8 @@ typedef struct hl_macos_directory_watch {
 typedef struct hl_macos_directory_object {
     uint32_t references;
     int descriptor;
-    hl_macos_directory_watch watches[HL_MACOS_DIRECTORY_WATCH_CAPACITY];
+    hl_macos_directory_watch *watches;
+    uint32_t watch_capacity;
 } hl_macos_directory_object;
 
 typedef struct hl_macos_directory {
@@ -2312,7 +2313,7 @@ static hl_host_result hl_macos_directory_add(void *context, hl_host_handle insta
     int descriptor = file_entry == NULL ? -1 : file_entry->descriptor;
     pthread_mutex_unlock(&host->lock);
     if (object == NULL || descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++index) {
+    for (uint32_t index = 0; index < object->watch_capacity; ++index) {
         hl_macos_directory_watch *watch = &object->watches[index];
         if (watch->active && watch->token != token) continue;
         if (!watch->active || watch->token == token) {
@@ -2326,14 +2327,28 @@ static hl_host_result hl_macos_directory_add(void *context, hl_host_handle insta
             return hl_macos_result(HL_STATUS_OK, 0, 0);
         }
     }
-    return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    uint32_t capacity = object->watch_capacity == 0 ? HL_MACOS_DIRECTORY_WATCH_CAPACITY : object->watch_capacity * 2u;
+    hl_macos_directory_watch *grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
+    if (grown == NULL) return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    memset(grown + object->watch_capacity, 0, (size_t)(capacity - object->watch_capacity) * sizeof(*grown));
+    uint32_t index = object->watch_capacity;
+    object->watches = grown;
+    object->watch_capacity = capacity;
+    struct kevent change;
+    uint16_t flags = (uint16_t)(EV_ADD | EV_CLEAR |
+                                ((interests & HL_HOST_DIRECTORY_ONESHOT) != 0 ? EV_ONESHOT : 0));
+    EV_SET(&change, descriptor, EVFILT_VNODE, flags, hl_macos_directory_native(interests), 0,
+           (void *)(uintptr_t)token);
+    if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0) return hl_macos_errno();
+    object->watches[index] = (hl_macos_directory_watch){token, interests, descriptor, 1};
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
 static hl_host_result hl_macos_directory_modify(void *context, hl_host_handle instance, uint64_t token,
                                                 uint32_t interests) {
     hl_macos_directory_object *object = hl_macos_directory_object_get(context, instance);
     if (object == NULL || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++index) {
+    for (uint32_t index = 0; index < object->watch_capacity; ++index) {
         hl_macos_directory_watch *watch = &object->watches[index];
         if (!watch->active || watch->token != token) continue;
         struct kevent change;
@@ -2351,7 +2366,7 @@ static hl_host_result hl_macos_directory_modify(void *context, hl_host_handle in
 static hl_host_result hl_macos_directory_remove(void *context, hl_host_handle instance, uint64_t token) {
     hl_macos_directory_object *object = hl_macos_directory_object_get(context, instance);
     if (object == NULL || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    for (uint32_t index = 0; index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++index) {
+    for (uint32_t index = 0; index < object->watch_capacity; ++index) {
         hl_macos_directory_watch *watch = &object->watches[index];
         if (!watch->active || watch->token != token) continue;
         struct kevent change;
@@ -2386,7 +2401,7 @@ static hl_host_result hl_macos_directory_read(void *context, hl_host_handle inst
     for (int index = 0; index < count; ++index) {
         uint64_t token = (uint64_t)(uintptr_t)native[index].udata;
         uint32_t interests = 0;
-        for (uint32_t watch_index = 0; watch_index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++watch_index) {
+        for (uint32_t watch_index = 0; watch_index < object->watch_capacity; ++watch_index) {
             hl_macos_directory_watch *watch = &object->watches[watch_index];
             if (watch->active && watch->token == token) interests = watch->interests;
             if (watch->active && watch->token == token && (watch->interests & HL_HOST_DIRECTORY_ONESHOT) != 0) {
@@ -2426,6 +2441,7 @@ static hl_host_result hl_macos_directory_close(void *context, hl_host_handle ins
     if (final) {
         hl_host_process_fd_private_remove(object->descriptor);
         close(object->descriptor);
+        free(object->watches);
         free(object);
     }
     return hl_macos_result(HL_STATUS_OK, 0, 0);
@@ -3852,7 +3868,7 @@ static hl_host_result hl_macos_fork_child(void *context) {
         }
         (void)fcntl(replacement, F_SETFD, FD_CLOEXEC);
         hl_host_process_fd_private_add(replacement);
-        for (uint32_t watch_index = 0; watch_index < HL_MACOS_DIRECTORY_WATCH_CAPACITY; ++watch_index) {
+        for (uint32_t watch_index = 0; watch_index < object->watch_capacity; ++watch_index) {
             hl_macos_directory_watch *watch = &object->watches[watch_index];
             if (!watch->active) continue;
             struct kevent change;

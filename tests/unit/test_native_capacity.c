@@ -21,6 +21,7 @@ enum {
     TRANSFER_PAIR_COUNT = 33,
     TIMER_COUNT = 257,
     PROCESS_COUNT = 1025,
+    DIRECTORY_WATCH_COUNT = 257,
     MAPPING_COUNT = 4097,
     FILE_COUNT = 1025
 };
@@ -69,6 +70,10 @@ int main(void) {
         HL_CHECK(created.status == HL_STATUS_OK);
         directories[index] = created.value;
     }
+    for (size_t index = 0; index < DIRECTORY_WATCH_COUNT; ++index)
+        HL_CHECK(services.directory
+                     ->add(services.context, directories[0], file.value, index + 1, HL_HOST_DIRECTORY_MODIFY)
+                     .status == HL_STATUS_OK);
     for (size_t index = 0; index < COUNTER_COUNT; ++index) {
         hl_host_result created = services.counter->create(services.context, index, 0);
         HL_CHECK(created.status == HL_STATUS_OK);

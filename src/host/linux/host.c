@@ -111,7 +111,8 @@ typedef struct hl_linux_directory_object {
     uint32_t references;
     uint32_t pending_count;
     uint32_t pending_capacity;
-    hl_linux_directory_watch watches[HL_LINUX_DIRECTORY_WATCHES];
+    hl_linux_directory_watch *watches;
+    uint32_t watch_capacity;
     hl_host_directory_record *pending;
 } hl_linux_directory_object;
 
@@ -1704,14 +1705,14 @@ static uint32_t hl_linux_directory_mask(uint32_t interests) {
 
 static hl_linux_directory_watch *hl_linux_directory_watch_for_token(hl_linux_directory_object *object, uint64_t token) {
     uint32_t index;
-    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+    for (index = 0; index < object->watch_capacity; ++index)
         if (object->watches[index].active != 0 && object->watches[index].token == token) return &object->watches[index];
     return NULL;
 }
 
 static hl_linux_directory_watch *hl_linux_directory_watch_for_id(hl_linux_directory_object *object, int watch) {
     uint32_t index;
-    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+    for (index = 0; index < object->watch_capacity; ++index)
         if (object->watches[index].watch == watch) return &object->watches[index];
     return NULL;
 }
@@ -1729,13 +1730,21 @@ static hl_host_result hl_linux_directory_create(void *context) {
         return hl_linux_errno_result();
     }
     object->references = 1;
-    for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index) {
+    object->watch_capacity = HL_LINUX_DIRECTORY_WATCHES;
+    object->watches = calloc(object->watch_capacity, sizeof(*object->watches));
+    if (object->watches == NULL) {
+        close(descriptor);
+        free(object);
+        return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    }
+    for (index = 0; index < object->watch_capacity; ++index) {
         object->watches[index].watch = -1;
         object->watches[index].descriptor = -1;
     }
     result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_DIRECTORY, descriptor, object, NULL, 0, -1);
     if (result.status != HL_STATUS_OK) {
         close(descriptor);
+        free(object->watches);
         free(object);
     }
     return result;
@@ -1760,11 +1769,25 @@ static hl_host_result hl_linux_directory_add(void *context, hl_host_handle insta
     object = instance_entry == NULL ? NULL : instance_entry->address;
     file_descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
     if (object != NULL && hl_linux_directory_watch_for_token(object, token) == NULL) {
-        for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+        for (index = 0; index < object->watch_capacity; ++index)
             if (object->watches[index].watch < 0) {
                 slot = &object->watches[index];
                 break;
             }
+        if (slot == NULL) {
+            uint32_t capacity = object->watch_capacity * 2u;
+            hl_linux_directory_watch *grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
+            if (grown != NULL) {
+                for (index = object->watch_capacity; index < capacity; ++index) {
+                    grown[index] = (hl_linux_directory_watch){0};
+                    grown[index].watch = -1;
+                    grown[index].descriptor = -1;
+                }
+                slot = &grown[object->watch_capacity];
+                object->watches = grown;
+                object->watch_capacity = capacity;
+            }
+        }
     }
     retained = file_descriptor < 0 ? -1 : fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
     if (instance_entry == NULL || slot == NULL || retained < 0) {
@@ -1948,7 +1971,7 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
     entry->descriptor = -1;
     entry->address = NULL;
     if (--object->references == 0) {
-        for (index = 0; index < HL_LINUX_DIRECTORY_WATCHES; ++index)
+        for (index = 0; index < object->watch_capacity; ++index)
             if (object->watches[index].descriptor >= 0) close(object->watches[index].descriptor);
         free(object->pending);
         free(object);
@@ -3356,9 +3379,10 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             close(entry->descriptor);
             if (--object->references == 0) {
                 uint32_t watch;
-                for (watch = 0; watch < HL_LINUX_DIRECTORY_WATCHES; ++watch)
+                for (watch = 0; watch < object->watch_capacity; ++watch)
                     if (object->watches[watch].descriptor >= 0) close(object->watches[watch].descriptor);
                 free(object->pending);
+                free(object->watches);
                 free(object);
             }
         } else if (entry->kind == HL_LINUX_HANDLE_WATCH) {
