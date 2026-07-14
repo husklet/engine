@@ -19,6 +19,7 @@
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 30000 };
 
 typedef enum case_isa { ISA_AARCH64, ISA_X86_64, ISA_BOTH } case_isa;
+
 typedef struct suite_case {
     char name[128];
     char source[256];
@@ -28,6 +29,7 @@ typedef struct suite_case {
     int expected_exit;
     int needs_rootfs;
 } suite_case;
+
 typedef struct capture {
     unsigned char *output;
     size_t output_size;
@@ -96,7 +98,8 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         char *cursor;
         size_t field_count = 0;
         if (size == 0 || line[0] == '#') continue;
-        while (size > 0 && (line[size - 1] == '\n' || line[size - 1] == '\r')) line[--size] = 0;
+        while (size > 0 && (line[size - 1] == '\n' || line[size - 1] == '\r'))
+            line[--size] = 0;
         cursor = line;
         while (field_count < 13) {
             fields[field_count++] = cursor;
@@ -145,7 +148,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
                 (int)sizeof(cases[*case_count].name) ||
             snprintf(cases[*case_count].source, sizeof(cases[*case_count].source), "%s", fields[2]) >=
-                    (int)sizeof(cases[*case_count].source) ||
+                (int)sizeof(cases[*case_count].source) ||
             snprintf(cases[*case_count].environment, sizeof(cases[*case_count].environment), "%s",
                      strcmp(fields[7], "-") == 0 ? "" : fields[7]) >= (int)sizeof(cases[*case_count].environment) ||
             snprintf(cases[*case_count].expected, sizeof(cases[*case_count].expected), "%s", fields[9]) >=
@@ -168,8 +171,14 @@ static int drain(int fd, unsigned char *buffer, size_t *size, size_t limit, int 
         ssize_t count;
         if (*size == limit) return 1;
         count = read(fd, buffer + *size, limit - *size);
-        if (count > 0) { *size += (size_t)count; continue; }
-        if (count == 0) { *eof = 1; return 0; }
+        if (count > 0) {
+            *size += (size_t)count;
+            continue;
+        }
+        if (count == 0) {
+            *eof = 1;
+            return 0;
+        }
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         if (errno != EINTR) return 1;
     }
@@ -191,7 +200,10 @@ static int write_full(int fd, const void *buffer, size_t size) {
     const unsigned char *cursor = buffer;
     while (size != 0) {
         ssize_t written = write(fd, cursor, size);
-        if (written < 0) { if (errno == EINTR) continue; return 1; }
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return 1;
+        }
         cursor += (size_t)written;
         size -= (size_t)written;
     }
@@ -294,37 +306,63 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
     if (make_config(binary_root, guest, rootfs, environment, config_path) != 0) return 1;
     child = fork();
-    if (child < 0) { (void)unlink(config_path); return 1; }
+    if (child < 0) {
+        (void)unlink(config_path);
+        return 1;
+    }
     if (child == 0) {
         (void)setpgid(0, 0);
-        close(output_pipe[0]); close(error_pipe[0]);
+        close(output_pipe[0]);
+        close(error_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
-        close(output_pipe[1]); close(error_pipe[1]);
+        close(output_pipe[1]);
+        close(error_pipe[1]);
         execlp(bridge, bridge, engine, "--configfile", config_path, (char *)NULL);
         _exit(127);
     }
     (void)setpgid(child, child);
-    close(output_pipe[1]); close(error_pipe[1]);
+    close(output_pipe[1]);
+    close(error_pipe[1]);
     if (fcntl(output_pipe[0], F_SETFL, O_NONBLOCK) < 0 || fcntl(error_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
-        terminate(child); (void)unlink(config_path); return 1;
+        terminate(child);
+        (void)unlink(config_path);
+        return 1;
     }
     deadline = monotonic_ms() + TIMEOUT_MS;
     while (!exited || !output_eof || !error_eof) {
         struct pollfd descriptors[2] = {{output_pipe[0], POLLIN | POLLHUP, 0}, {error_pipe[0], POLLIN | POLLHUP, 0}};
         pid_t waited;
-        if (monotonic_ms() >= deadline) { terminate(child); close(output_pipe[0]); close(error_pipe[0]); unlink(config_path); return 2; }
-        if (poll(descriptors, 2, 10) < 0 && errno != EINTR) { terminate(child); (void)unlink(config_path); return 1; }
+        if (monotonic_ms() >= deadline) {
+            terminate(child);
+            close(output_pipe[0]);
+            close(error_pipe[0]);
+            unlink(config_path);
+            return 2;
+        }
+        if (poll(descriptors, 2, 10) < 0 && errno != EINTR) {
+            terminate(child);
+            (void)unlink(config_path);
+            return 1;
+        }
         if (drain(output_pipe[0], result->output, &result->output_size, OUTPUT_MAX, &output_eof) != 0 ||
             drain(error_pipe[0], result->error, &result->error_size, ERROR_MAX, &error_eof) != 0) {
-            terminate(child); (void)unlink(config_path); return 1;
+            terminate(child);
+            (void)unlink(config_path);
+            return 1;
         }
         if (!exited) {
             waited = waitpid(child, &result->wait_status, WNOHANG);
-            if (waited == child) exited = 1;
-            else if (waited < 0 && errno != EINTR) { terminate(child); (void)unlink(config_path); return 1; }
+            if (waited == child)
+                exited = 1;
+            else if (waited < 0 && errno != EINTR) {
+                terminate(child);
+                (void)unlink(config_path);
+                return 1;
+            }
         }
     }
-    close(output_pipe[0]); close(error_pipe[0]);
+    close(output_pipe[0]);
+    close(error_pipe[0]);
     (void)unlink(config_path); /* Engine normally unlinks immediately; covers pre-exec failure. */
     return 0;
 }
@@ -345,15 +383,28 @@ static int copy_file(const char *source, const char *destination) {
     int input = open(source, O_RDONLY), output = -1;
     if (input < 0) return 1;
     output = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0755);
-    if (output < 0) { close(input); return 1; }
+    if (output < 0) {
+        close(input);
+        return 1;
+    }
     for (;;) {
         ssize_t count = read(input, buffer, sizeof buffer);
         size_t offset = 0;
         if (count == 0) break;
-        if (count < 0) { if (errno == EINTR) continue; close(input); close(output); return 1; }
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            close(input);
+            close(output);
+            return 1;
+        }
         while (offset < (size_t)count) {
             ssize_t written = write(output, buffer + offset, (size_t)count - offset);
-            if (written < 0) { if (errno == EINTR) continue; close(input); close(output); return 1; }
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                close(input);
+                close(output);
+                return 1;
+            }
             offset += (size_t)written;
         }
     }
@@ -367,9 +418,8 @@ static int stage_rootfs(const char *binary_root, const char *guest, char rootfs[
         snprintf(dev, sizeof dev, "%s/dev", rootfs) >= (int)sizeof dev ||
         snprintf(pts, sizeof pts, "%s/dev/pts", rootfs) >= (int)sizeof pts ||
         snprintf(tmp, sizeof tmp, "%s/tmp", rootfs) >= (int)sizeof tmp ||
-        snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged ||
-        mkdir(bin, 0755) != 0 || mkdir(dev, 0755) != 0 || mkdir(pts, 0755) != 0 || mkdir(tmp, 01777) != 0 ||
-        copy_file(guest, staged) != 0)
+        snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged || mkdir(bin, 0755) != 0 ||
+        mkdir(dev, 0755) != 0 || mkdir(pts, 0755) != 0 || mkdir(tmp, 01777) != 0 || copy_file(guest, staged) != 0)
         return 1;
     return 0;
 }
@@ -384,21 +434,28 @@ static void remove_rootfs(const char *rootfs) {
     (void)rmdir(rootfs);
 }
 
-static void capture_free(capture *result) { free(result->output); free(result->error); }
+static void capture_free(capture *result) {
+    free(result->output);
+    free(result->error);
+}
+
 static int exit_matches(const capture *result, int expected) {
     return WIFEXITED(result->wait_status) && WEXITSTATUS(result->wait_status) == expected;
 }
+
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
     fprintf(stderr, "matrix-runner: %s [%s] %s", item->name, isa, reason);
     if (result != NULL) {
         size_t index, shown = result->output_size > 64 ? 64 : result->output_size;
         fprintf(stderr, ": wait=0x%x stdout=%zuB hex=", result->wait_status, result->output_size);
-        for (index = 0; index < shown; ++index) fprintf(stderr, "%02x", result->output[index]);
+        for (index = 0; index < shown; ++index)
+            fprintf(stderr, "%02x", result->output[index]);
         if (shown < result->output_size) fputs("...", stderr);
     }
     if (result != NULL && result->error_size != 0) {
         size_t shown = result->error_size > 240 ? 240 : result->error_size;
-        fprintf(stderr, " stderr="); (void)fwrite(result->error, 1, shown, stderr);
+        fprintf(stderr, " stderr=");
+        (void)fwrite(result->error, 1, shown, stderr);
     }
     fputc('\n', stderr);
 }
@@ -410,50 +467,66 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
     size_t expected_size, length = strlen(item->source);
     int status;
     if (length < 3 || strcmp(item->source + length - 2, ".c") != 0 || length - 2 >= sizeof(binary)) return 1;
-    memcpy(binary, item->source, length - 2); binary[length - 2] = 0;
+    memcpy(binary, item->source, length - 2);
+    binary[length - 2] = 0;
     if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
-        snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >= (int)sizeof(expected_path) ||
+        snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >=
+            (int)sizeof(expected_path) ||
         read_file(expected_path, &expected, &expected_size) != 0) {
-        fprintf(stderr, "matrix-runner: %s input path/read failure\n", item->name); return 1;
+        fprintf(stderr, "matrix-runner: %s input path/read failure\n", item->name);
+        return 1;
     }
     if (item->needs_rootfs && stage_rootfs(binary_root, guest, rootfs) != 0) {
         fprintf(stderr, "matrix-runner: %s rootfs staging failure\n", item->name);
-        free(expected); return 1;
+        free(expected);
+        return 1;
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
-    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest,
-                       item->needs_rootfs ? rootfs : NULL, item->environment, binary_root, result);
+    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest, item->needs_rootfs ? rootfs : NULL,
+                       item->environment, binary_root, result);
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {
         diagnostic(item, isa, status == 2 ? "timeout" : "exit/stdout mismatch", result);
-        free(expected); return 1;
+        free(expected);
+        return 1;
     }
-    free(expected); return 0;
+    free(expected);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
     size_t count, excluded, index;
     if (argc != 7) {
-        fprintf(stderr, "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT\n");
+        fprintf(
+            stderr,
+            "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT\n");
         return 2;
     }
     if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
     for (index = 0; index < count; ++index) {
         capture a = {0}, x = {0};
         if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
-            run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) { capture_free(&a); return 1; }
+            run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {
+            capture_free(&a);
+            return 1;
+        }
         if ((cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
             run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0) {
-            capture_free(&a); capture_free(&x); return 1;
+            capture_free(&a);
+            capture_free(&x);
+            return 1;
         }
         if (cases[index].isa == ISA_BOTH &&
             (a.output_size != x.output_size || memcmp(a.output, x.output, a.output_size) != 0)) {
             diagnostic(&cases[index], "cross-ISA", "stdout mismatch", &x);
-            capture_free(&a); capture_free(&x); return 1;
+            capture_free(&a);
+            capture_free(&x);
+            return 1;
         }
-        capture_free(&a); capture_free(&x);
+        capture_free(&a);
+        capture_free(&x);
     }
     printf("matrix-runner: %zu active cases passed; %zu replaced variants excluded\n", count, excluded);
     return 0;
