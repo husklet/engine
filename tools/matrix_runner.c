@@ -139,7 +139,8 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
             parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
-        cases[*case_count].needs_rootfs = strstr(fields[10], "alpine-rootfs") != NULL;
+        /* Rootfs shape is explicit manifest metadata; ABI4 always carries the staged root as typed launch data. */
+        cases[*case_count].needs_rootfs = strstr(fields[10], "-rootfs") != NULL;
         cases[*case_count].argument[0] = 0;
         if (strncmp(fields[6], "argv:", 5) == 0 &&
             snprintf(cases[*case_count].argument, sizeof(cases[*case_count].argument), "%s", fields[6] + 5) >=
