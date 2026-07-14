@@ -33,13 +33,14 @@ static int check_transfer_fork(const hl_host_services *services) {
         _exit(0);
     }
     HL_CHECK(services->transfer->close(services->context, channels.value).status == HL_STATUS_OK);
-    received = services->transfer->receive(services->context, channels.detail, (hl_host_bytes){data, 1}, &attachment, 1);
+    received =
+        services->transfer->receive(services->context, channels.detail, (hl_host_bytes){data, 1}, &attachment, 1);
     HL_CHECK(received.status == HL_STATUS_RESOURCE_LIMIT && received.value == sizeof(payload) && received.detail == 1);
-    received = services->transfer->receive(services->context, channels.detail,
-                                           (hl_host_bytes){data, sizeof(data)}, NULL, 0);
+    received =
+        services->transfer->receive(services->context, channels.detail, (hl_host_bytes){data, sizeof(data)}, NULL, 0);
     HL_CHECK(received.status == HL_STATUS_RESOURCE_LIMIT && received.value == sizeof(payload) && received.detail == 1);
-    received = services->transfer->receive(services->context, channels.detail,
-                                           (hl_host_bytes){data, sizeof(data)}, &attachment, 1);
+    received = services->transfer->receive(services->context, channels.detail, (hl_host_bytes){data, sizeof(data)},
+                                           &attachment, 1);
     HL_CHECK(received.status == HL_STATUS_OK && received.value == sizeof(payload) && received.detail == 1);
     HL_CHECK(memcmp(data, payload, sizeof(payload)) == 0 && attachment.kind == HL_HOST_TRANSFER_KIND_COUNTER &&
              attachment.rights == HL_HOST_TRANSFER_READ);
@@ -57,12 +58,10 @@ static int check_transfer_fork(const hl_host_services *services) {
     HL_CHECK(child >= 0);
     if (child == 0) {
         hl_host_result counter = services->counter->create(services->context, 1, HL_HOST_COUNTER_NONBLOCK);
-        hl_host_transfer_attachment sent =
-            {counter.value, HL_HOST_TRANSFER_KIND_COUNTER, HL_HOST_TRANSFER_READ};
+        hl_host_transfer_attachment sent = {counter.value, HL_HOST_TRANSFER_KIND_COUNTER, HL_HOST_TRANSFER_READ};
         (void)services->transfer->close(services->context, channels.detail);
         if (counter.status != HL_STATUS_OK) _exit(41);
-        if (services->transfer
-                ->send(services->context, channels.value, (hl_host_const_bytes){NULL, 0}, &sent, 1)
+        if (services->transfer->send(services->context, channels.value, (hl_host_const_bytes){NULL, 0}, &sent, 1)
                 .status != HL_STATUS_OK)
             _exit(42);
         if (services->counter->close(services->context, counter.value).status != HL_STATUS_OK) _exit(43);

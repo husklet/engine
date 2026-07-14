@@ -1442,8 +1442,8 @@ static hl_macos_counter_object *hl_macos_counter_object_get(hl_host_macos *host,
     return object;
 }
 
-static hl_macos_counter_object *hl_macos_counter_object_with_right(void *context, hl_host_handle handle,
-                                                                   uint32_t right, hl_status *status) {
+static hl_macos_counter_object *hl_macos_counter_object_with_right(void *context, hl_host_handle handle, uint32_t right,
+                                                                   hl_status *status) {
     hl_host_macos *host = context;
     hl_macos_counter *counter;
     hl_macos_counter_object *object = NULL;
