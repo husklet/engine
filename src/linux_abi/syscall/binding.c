@@ -1,5 +1,7 @@
 /* Bridge opaque host-file bindings into the legacy native-fd guest runtime. */
 
+#include "../object.h"
+
 static int g_bound_sentinel = -1;
 
 static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
@@ -212,6 +214,272 @@ static int bound_fdsets_reference(uint64_t count, uint64_t read_set, uint64_t wr
     return 0;
 }
 
+static uint32_t bound_poll_interests(short events) {
+    uint32_t interests = 0;
+    if ((events & POLLIN) != 0) interests |= HL_LINUX_READY_READ;
+    if ((events & POLLOUT) != 0) interests |= HL_LINUX_READY_WRITE;
+    if ((events & POLLPRI) != 0) interests |= HL_LINUX_READY_PRIORITY;
+    return interests;
+}
+
+static short bound_poll_readiness(uint32_t readiness) {
+    short events = 0;
+    if ((readiness & HL_LINUX_READY_READ) != 0) events |= POLLIN;
+    if ((readiness & HL_LINUX_READY_WRITE) != 0) events |= POLLOUT;
+    if ((readiness & HL_LINUX_READY_PRIORITY) != 0) events |= POLLPRI;
+    if ((readiness & HL_LINUX_READY_ERROR) != 0) events |= POLLERR;
+    if ((readiness & HL_LINUX_READY_HANGUP) != 0) events |= POLLHUP;
+    return events;
+}
+
+static uint64_t bound_now_ns(void) {
+    struct timespec now = {0, 0};
+    if (hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t bound_deadline(const struct timespec *timeout) {
+    uint64_t now;
+    uint64_t delta;
+    if (timeout == NULL) return UINT64_MAX;
+    if (timeout->tv_sec < 0) return 0;
+    now = bound_now_ns();
+    if ((uint64_t)timeout->tv_sec > UINT64_MAX / UINT64_C(1000000000)) return UINT64_MAX;
+    delta = (uint64_t)timeout->tv_sec * UINT64_C(1000000000) + (uint64_t)timeout->tv_nsec;
+    return delta > UINT64_MAX - now ? UINT64_MAX : now + delta;
+}
+
+/* Poll native descriptors from a private copy: typed guest slots are never host descriptors. */
+static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint64_t timeout_address,
+                           uint64_t mask_address) {
+    struct pollfd *guest = (struct pollfd *)(uintptr_t)address;
+    struct timespec *timeout = (struct timespec *)(uintptr_t)timeout_address;
+    struct pollfd *native;
+    hl_linux_poll_entry *objects;
+    uint32_t *object_indices;
+    uint64_t deadline;
+    uint64_t index;
+    uint32_t object_count = 0;
+    uint64_t saved = 0;
+    int mask_on;
+    int64_t result = 0;
+    if (count > (uint64_t)guest_nofile_cur()) return -EINVAL;
+    if (count > SIZE_MAX / sizeof(*guest) || (count != 0 && guest_bad_ptr(address, (size_t)count * sizeof(*guest))) ||
+        (timeout != NULL && guest_bad_ptr(timeout_address, sizeof(*timeout))))
+        return -EFAULT;
+    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) return -EINVAL;
+    if (mask_address != 0 && (size_t)G_A4(c) != 8) return -EINVAL;
+    if (mask_address != 0 && guest_bad_ptr(mask_address, 8)) return -EFAULT;
+    native = calloc(count != 0 ? (size_t)count : 1, sizeof(*native));
+    objects = calloc(count != 0 ? (size_t)count : 1, sizeof(*objects));
+    object_indices = calloc(count != 0 ? (size_t)count : 1, sizeof(*object_indices));
+    if (native == NULL || objects == NULL || object_indices == NULL) {
+        free(native);
+        free(objects);
+        free(object_indices);
+        return -ENOMEM;
+    }
+    memcpy(native, guest, (size_t)count * sizeof(*native));
+    for (index = 0; index < count; ++index) {
+        hl_linux_fd_snapshot snapshot;
+        guest[index].revents = 0;
+        if (guest[index].fd >= 0 && bound_snapshot((uint64_t)(unsigned)guest[index].fd, &snapshot)) {
+            object_indices[object_count] = (uint32_t)index;
+            objects[object_count++] = (hl_linux_poll_entry){snapshot.fd, bound_poll_interests(guest[index].events), 0};
+            native[index].fd = -1;
+        }
+    }
+    deadline = bound_deadline(timeout);
+    mask_on = poll_sigmask_enter(c, mask_address, &saved);
+    for (;;) {
+        int native_ready;
+        int64_t object_ready = hl_linux_object_poll(g_linux_box, objects, object_count, 0);
+        int wait_ms = 0;
+        uint64_t now = bound_now_ns();
+        if (object_ready < 0) {
+            result = object_ready;
+            break;
+        }
+        if (object_ready == 0 && deadline != 0 && now < deadline) wait_ms = 1;
+        native_ready = poll(native, (nfds_t)count, wait_ms);
+        if (native_ready < 0) {
+            if (svc_poll_retry(c)) continue;
+            result = -errno;
+            break;
+        }
+        if (object_ready != 0 || native_ready != 0 || deadline == 0 || (deadline != UINT64_MAX && bound_now_ns() >= deadline)) {
+            result = native_ready + object_ready;
+            for (index = 0; index < count; ++index) guest[index].revents = native[index].revents;
+            for (index = 0; index < object_count; ++index)
+                guest[object_indices[index]].revents = bound_poll_readiness(objects[index].readiness);
+            break;
+        }
+    }
+    if (mask_on) poll_sigmask_leave(c, saved);
+    if (result >= 0 && timeout != NULL) {
+        uint64_t now = bound_now_ns();
+        uint64_t left = deadline != UINT64_MAX && deadline > now ? deadline - now : 0;
+        timeout->tv_sec = (time_t)(left / UINT64_C(1000000000));
+        timeout->tv_nsec = (long)(left % UINT64_C(1000000000));
+    }
+    free(objects);
+    free(object_indices);
+    free(native);
+    return result;
+}
+
+static int bound_set_test(const uint8_t *set, uint32_t fd) {
+    return set != NULL && (set[fd >> 3] & (uint8_t)(1u << (fd & 7u))) != 0;
+}
+
+static void bound_set_mark(uint8_t *set, uint32_t fd) {
+    if (set != NULL) set[fd >> 3] |= (uint8_t)(1u << (fd & 7u));
+}
+
+static int64_t bound_pselect(struct cpu *c, uint64_t count_value, uint64_t read_address, uint64_t write_address,
+                             uint64_t except_address) {
+    uint32_t count = count_value > HL_LINUX_FD_LIMIT ? HL_LINUX_FD_LIMIT : (uint32_t)count_value;
+    size_t bytes = ((size_t)count + 7u) / 8u;
+    uint8_t *guest_read = (uint8_t *)(uintptr_t)read_address;
+    uint8_t *guest_write = (uint8_t *)(uintptr_t)write_address;
+    uint8_t *guest_except = (uint8_t *)(uintptr_t)except_address;
+    struct timespec *timeout = (struct timespec *)(uintptr_t)G_A4(c);
+    uint64_t mask_pair_address = G_A5(c);
+    uint8_t *requested;
+    struct pollfd *native;
+    hl_linux_poll_entry *objects;
+    uint32_t *object_indices;
+    uint32_t object_count = 0;
+    uint32_t fd;
+    uint64_t deadline;
+    uint64_t mask_address = 0;
+    uint64_t saved = 0;
+    int mask_on;
+    int64_t result = 0;
+    if (count_value > INT_MAX) return -EINVAL;
+    if ((read_address != 0 && guest_bad_ptr(read_address, bytes)) ||
+        (write_address != 0 && guest_bad_ptr(write_address, bytes)) ||
+        (except_address != 0 && guest_bad_ptr(except_address, bytes)) ||
+        (timeout != NULL && guest_bad_ptr(G_A4(c), sizeof(*timeout))))
+        return -EFAULT;
+    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) return -EINVAL;
+    if (mask_pair_address != 0) {
+        const uint64_t *pair;
+        if (guest_bad_ptr(mask_pair_address, 16)) return -EFAULT;
+        pair = (const uint64_t *)(uintptr_t)mask_pair_address;
+        if (pair[0] != 0) {
+            if (pair[1] != 8) return -EINVAL;
+            if (guest_bad_ptr(pair[0], 8)) return -EFAULT;
+            mask_address = pair[0];
+        }
+    }
+    requested = calloc(bytes != 0 ? bytes * 3 : 1, 1);
+    native = calloc(count != 0 ? count : 1, sizeof(*native));
+    objects = calloc(count != 0 ? count : 1, sizeof(*objects));
+    object_indices = calloc(count != 0 ? count : 1, sizeof(*object_indices));
+    if (requested == NULL || native == NULL || objects == NULL || object_indices == NULL) {
+        result = -ENOMEM;
+        goto done;
+    }
+    if (guest_read != NULL) memcpy(requested, guest_read, bytes);
+    if (guest_write != NULL) memcpy(requested + bytes, guest_write, bytes);
+    if (guest_except != NULL) memcpy(requested + bytes * 2, guest_except, bytes);
+    for (fd = 0; fd < count; ++fd) {
+        uint32_t interests = 0;
+        hl_linux_fd_snapshot snapshot;
+        if (bound_set_test(requested, fd)) interests |= HL_LINUX_READY_READ;
+        if (bound_set_test(requested + bytes, fd)) interests |= HL_LINUX_READY_WRITE;
+        if (bound_set_test(requested + bytes * 2, fd)) interests |= HL_LINUX_READY_PRIORITY;
+        native[fd] = (struct pollfd){.fd = interests != 0 ? (int)fd : -1, .events = bound_poll_readiness(interests)};
+        if (interests != 0 && bound_snapshot(fd, &snapshot)) {
+            object_indices[object_count] = fd;
+            objects[object_count++] = (hl_linux_poll_entry){snapshot.fd, interests, 0};
+            native[fd].fd = -1;
+        }
+    }
+    deadline = bound_deadline(timeout);
+    mask_on = poll_sigmask_enter(c, mask_address, &saved);
+    for (;;) {
+        int native_ready;
+        int64_t object_ready = hl_linux_object_poll(g_linux_box, objects, object_count, 0);
+        uint64_t now = bound_now_ns();
+        if (object_ready < 0) {
+            result = object_ready;
+            break;
+        }
+        native_ready = poll(native, count, object_ready == 0 && deadline != 0 && now < deadline ? 1 : 0);
+        if (native_ready < 0) {
+            if (svc_poll_retry(c)) continue;
+            result = -errno;
+            break;
+        }
+        for (fd = 0; fd < count; ++fd)
+            if ((native[fd].revents & POLLNVAL) != 0) {
+                result = -EBADF;
+                goto waited;
+            }
+        if (native_ready != 0 || object_ready != 0 || deadline == 0 ||
+            (deadline != UINT64_MAX && bound_now_ns() >= deadline)) {
+            if (guest_read != NULL) memset(guest_read, 0, bytes);
+            if (guest_write != NULL) memset(guest_write, 0, bytes);
+            if (guest_except != NULL) memset(guest_except, 0, bytes);
+            result = 0;
+            for (fd = 0; fd < count; ++fd) {
+                int ready = 0;
+                if ((native[fd].revents & (POLLIN | POLLHUP | POLLERR)) != 0 && bound_set_test(requested, fd)) {
+                    bound_set_mark(guest_read, fd);
+                    ready = 1;
+                }
+                if ((native[fd].revents & (POLLOUT | POLLERR)) != 0 && bound_set_test(requested + bytes, fd)) {
+                    bound_set_mark(guest_write, fd);
+                    ready = 1;
+                }
+                if ((native[fd].revents & POLLPRI) != 0 && bound_set_test(requested + bytes * 2, fd)) {
+                    bound_set_mark(guest_except, fd);
+                    ready = 1;
+                }
+                result += ready;
+            }
+            for (fd = 0; fd < object_count; ++fd) {
+                uint32_t descriptor = object_indices[fd];
+                int ready = 0;
+                if ((objects[fd].readiness & (HL_LINUX_READY_READ | HL_LINUX_READY_HANGUP | HL_LINUX_READY_ERROR)) !=
+                        0 &&
+                    bound_set_test(requested, descriptor)) {
+                    bound_set_mark(guest_read, descriptor);
+                    ready = 1;
+                }
+                if ((objects[fd].readiness & (HL_LINUX_READY_WRITE | HL_LINUX_READY_ERROR)) != 0 &&
+                    bound_set_test(requested + bytes, descriptor)) {
+                    bound_set_mark(guest_write, descriptor);
+                    ready = 1;
+                }
+                if ((objects[fd].readiness & HL_LINUX_READY_PRIORITY) != 0 &&
+                    bound_set_test(requested + bytes * 2, descriptor)) {
+                    bound_set_mark(guest_except, descriptor);
+                    ready = 1;
+                }
+                result += ready;
+            }
+            break;
+        }
+    }
+waited:
+    if (mask_on) poll_sigmask_leave(c, saved);
+    if (result >= 0 && timeout != NULL) {
+        uint64_t now = bound_now_ns();
+        uint64_t left = deadline != UINT64_MAX && deadline > now ? deadline - now : 0;
+        timeout->tv_sec = (time_t)(left / UINT64_C(1000000000));
+        timeout->tv_nsec = (long)(left % UINT64_C(1000000000));
+    }
+done:
+    free(object_indices);
+    free(objects);
+    free(native);
+    free(requested);
+    return result;
+}
+
 static int bound_rights_reference(uint64_t message_address) {
     const uint8_t *message = (const uint8_t *)(uintptr_t)message_address;
     const uint8_t *control;
@@ -255,8 +523,15 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = bound_snapshot(a0, &source);
-    if ((nr == 73 && bound_poll_references(a0, a1)) || (nr == 72 && bound_fdsets_reference(a0, a1, a2, a3)) ||
-        (nr == 211 && bound_rights_reference(a1))) {
+    if (nr == 73 && bound_poll_references(a0, a1)) {
+        G_RET(c) = (uint64_t)bound_ppoll(c, a0, a1, a2, a3);
+        return 1;
+    }
+    if (nr == 72 && bound_fdsets_reference(a0, a1, a2, a3)) {
+        G_RET(c) = (uint64_t)bound_pselect(c, a0, a1, a2, a3);
+        return 1;
+    }
+    if (nr == 211 && bound_rights_reference(a1)) {
         G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
         return 1;
     }
