@@ -12,11 +12,11 @@ int main(void) {
     uint64_t add;
     for (int i = 1; i <= 10; i++) {
         add = i;
-        write(efd, &add, sizeof add); // counter += i
+        if (write(efd, &add, sizeof add) != (ssize_t)sizeof add) { perror("write"); return 1; }
     }
     uint64_t v = 0;
-    read(efd, &v, sizeof v); // reads + resets the counter
+    if (read(efd, &v, sizeof v) != (ssize_t)sizeof v) { perror("read"); return 1; }
     close(efd);
     printf("eventfd counter=%llu\n", (unsigned long long)v); // 55
-    return 0;
+    return v == 55 ? 0 : 1;
 }

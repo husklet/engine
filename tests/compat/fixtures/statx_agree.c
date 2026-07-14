@@ -75,7 +75,8 @@ int main(void) {
     fd = open(cwn, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd >= 0) { (void)!write(fd, "z", 1); close(fd); }
     struct sx xb; do_statx(AT_FDCWD, cwn, 0, &xb); // before chown
-    chown(cwn, 12345, 6789);
+    /* A non-root native oracle may reject this; agreement after either outcome is the contract. */
+    (void)!chown(cwn, 12345, 6789);
     do_statx(AT_FDCWD, cwn, 0, &x); fstatat(AT_FDCWD, cwn, &s, 0);
     int r_chowned = agree(&x, &s);
     // order: the after-chown statx must differ-or-equal EXACTLY as fstat does relative to before; the
@@ -95,7 +96,7 @@ int main(void) {
     }
 
     // symlink, AT_SYMLINK_NOFOLLOW (lstat the link itself)
-    symlink(reg, sym);
+    if (symlink(reg, sym) != 0) { perror("symlink"); return 1; }
     do_statx(AT_FDCWD, sym, AT_NOFOLLOW, &x); fstatat(AT_FDCWD, sym, &s, AT_NOFOLLOW);
     int r_sym = agree(&x, &s);
 

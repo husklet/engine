@@ -10,7 +10,7 @@ int main(void) {
     int fd = eventfd(0, EFD_SEMAPHORE);
     if (fd < 0) { perror("eventfd"); return 1; }
     uint64_t five = 5;
-    write(fd, &five, sizeof five);
+    if (write(fd, &five, sizeof five) != (ssize_t)sizeof five) { perror("write"); return 1; }
     long got = 0;
     for (int i = 0; i < 5; i++) {
         uint64_t v = 0;
@@ -18,5 +18,5 @@ int main(void) {
     }
     close(fd);
     printf("eventfd_sema got=%ld\n", got); // 5
-    return 0;
+    return got == 5 ? 0 : 1;
 }

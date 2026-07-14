@@ -1,6 +1,15 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <string.h>
-int main(void){ size_t sz=1u<<20; char*p=mmap(0,sz,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-  if(p==MAP_FAILED)return 1; memset(p,3,sz); long s=0; for(size_t i=0;i<sz;i+=4096)s+=p[i]; munmap(p,sz);
-  printf("mmap sum=%ld\n",s); return 0; }
+
+int main(void) {
+    size_t size = 1u << 20;
+    char *memory = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long sum = 0;
+    if (memory == MAP_FAILED) return 1;
+    memset(memory, 3, size);
+    for (size_t offset = 0; offset < size; offset += 4096) sum += memory[offset];
+    if (munmap(memory, size) != 0) return 1;
+    printf("mmap sum=%ld\n", sum);
+    return sum == 768 ? 0 : 1;
+}
