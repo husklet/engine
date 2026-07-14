@@ -102,7 +102,7 @@ static void engine_fd_reloc(int *slot, int newfd) {
 //     type per fd so F_GETLEASE round-trips what F_SETLEASE set. RESIDUAL: the lease-BREAK signal on a
 //     conflicting cross-process open is NOT delivered -- macOS gives no rootless hook to intercept another
 //     opener of the same file. Documented in syscall-compat.md.
-//   * F_NOTIFY: backed by a real kqueue EVFILT_VNODE watch on the directory fd, drained on a lazily-spawned
+//   * F_NOTIFY: backed by the host directory-watch primitive, drained on a lazily-spawned
 //     thread that raises the requested signal (F_SETSIG signal, else the SIGIO default) in the guest -- the
 //     same async delivery path POSIX timers/timerfd use (g_pending + the signalfd wake). One-shot by
 //     default; re-armed each event only when DN_MULTISHOT is set.
@@ -115,31 +115,29 @@ static uint8_t g_fsig[HL_NFD];     // per-fd F_SETSIG signal (0 = default); cons
 static uint32_t g_dn_mask[HL_NFD]; // per-fd active dnotify mask (0 = no watch)
 static uint8_t g_dn_sig[HL_NFD];   // signal captured for this fd's dnotify watch at arm time
 
-static int g_dn_kq = -1;
+static hl_host_directory g_dn_directory;
 static pthread_t g_dn_thr;
 static int g_dn_thr_up;
 static pthread_mutex_t g_dn_lk = PTHREAD_MUTEX_INITIALIZER;
 
-// dnotify drain thread: block on the watch kqueue and, per vnode event, raise the armed signal in the guest.
+// dnotify drain thread: block on the host directory watcher and raise the armed signal in the guest.
 static void *dn_loop(void *arg) {
     (void)arg;
     for (;;) {
-        struct kevent ev;
-        int n = kevent(g_dn_kq, NULL, 0, &ev, 1, NULL);
+        uint64_t token;
+        int n = hl_host_directory_wait(&g_dn_directory, &token);
         if (n < 0) {
             if (errno == EINTR) continue;
-            break; // kq closed -> thread exits
+            break; // watcher closed -> thread exits
         }
         if (n == 0) continue;
-        int fd = (int)ev.ident;
+        int fd = (int)token;
         if (fd < 0 || fd >= HL_NFD) continue;
         pthread_mutex_lock(&g_dn_lk);
         uint32_t mask = g_dn_mask[fd];
         int sig = g_dn_sig[fd] ? g_dn_sig[fd] : DN_SIG_DEFAULT;
         if (mask && !(mask & DN_MULTISHOT)) { // one-shot: consume the watch (Linux re-arm is explicit)
-            struct kevent del;
-            EV_SET(&del, fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-            kevent(g_dn_kq, &del, 1, NULL, 0, NULL);
+            (void)hl_host_directory_remove(&g_dn_directory, token);
             g_dn_mask[fd] = 0;
         }
         pthread_mutex_unlock(&g_dn_lk);
@@ -153,27 +151,23 @@ static void *dn_loop(void *arg) {
     return NULL;
 }
 
-// per-process timers/dnotify are NOT inherited across fork(): a forked child's inherited kqueue + drain
+// per-process timers/dnotify are NOT inherited across fork(): a forked child's inherited watcher + drain
 // thread are dead, so reset the dnotify table so the child re-arms cleanly on its own first F_NOTIFY.
 static void dn_atfork_child(void) {
-    g_dn_kq = -1;
+    hl_host_directory_abandon(&g_dn_directory);
     g_dn_thr_up = 0;
     memset(g_dn_mask, 0, sizeof g_dn_mask);
     pthread_mutex_init(&g_dn_lk, NULL);
 }
 
-// Lazily bring up the shared watch kqueue + drain thread. Caller holds g_dn_lk. Returns 0 / -errno.
+// Lazily bring up the shared directory watcher + drain thread. Caller holds g_dn_lk. Returns 0 / -errno.
 static int dn_init(void) {
     static int reg = 0;
     if (!reg) {
         pthread_atfork(NULL, NULL, dn_atfork_child);
         reg = 1;
     }
-    if (g_dn_kq < 0) {
-        g_dn_kq = kqueue();
-        if (g_dn_kq < 0) return -errno;
-        fcntl(g_dn_kq, F_SETFD, FD_CLOEXEC);
-    }
+    if (g_dn_directory.state == NULL && hl_host_directory_init(&g_dn_directory) != 0) return -errno;
     if (!g_dn_thr_up) {
         if (pthread_create(&g_dn_thr, NULL, dn_loop, NULL) != 0) return -EAGAIN;
         g_dn_thr_up = 1;
@@ -189,9 +183,7 @@ static int dnotify_apply(int fd, uint32_t mask, int sig) {
     int rc = 0;
     if (mask == 0) { // remove the watch
         if (g_dn_mask[fd]) {
-            struct kevent del;
-            EV_SET(&del, fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
-            kevent(g_dn_kq, &del, 1, NULL, 0, NULL);
+            (void)hl_host_directory_remove(&g_dn_directory, (uint64_t)fd);
             g_dn_mask[fd] = 0;
         }
         pthread_mutex_unlock(&g_dn_lk);
@@ -202,16 +194,8 @@ static int dnotify_apply(int fd, uint32_t mask, int sig) {
         pthread_mutex_unlock(&g_dn_lk);
         return rc;
     }
-    // Translate the requested DN_* bits into the kqueue vnode fflags (the closest macOS equivalents).
-    unsigned fflags = 0;
-    if (mask & (2u | 32u)) fflags |= NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB; // DN_MODIFY/DN_ATTRIB
-    if (mask & (4u | 8u)) fflags |= NOTE_WRITE | NOTE_LINK;                  // DN_CREATE/DN_DELETE (dir entry)
-    if (mask & 16u) fflags |= NOTE_RENAME | NOTE_WRITE;                      // DN_RENAME
-    if (mask & 1u) fflags |= NOTE_ATTRIB;                                    // DN_ACCESS (atime) -- best effort
-    if (!fflags) fflags = NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_ATTRIB | NOTE_EXTEND | NOTE_LINK;
-    struct kevent kv;
-    EV_SET(&kv, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, fflags, 0, (void *)(intptr_t)fd);
-    if (kevent(g_dn_kq, &kv, 1, NULL, 0, NULL) < 0) {
+    uint32_t interests = mask & ~DN_MULTISHOT;
+    if (hl_host_directory_set(&g_dn_directory, fd, (uint64_t)fd, interests) != 0) {
         rc = -errno;
         pthread_mutex_unlock(&g_dn_lk);
         return rc;
@@ -230,7 +214,7 @@ static void engine_fd_vacate(int newfd) {
     // guest fds and are NOT relocated -- a dup2 onto a signalfd read end legitimately replaces that signalfd).
     for (int i = 0; i < HL_SFD_MAX; i++)
         if (g_sfd[i].refs > 0) engine_fd_reloc(&g_sfd[i].wr, newfd);
-    engine_fd_reloc(&g_dn_kq, newfd);
+    (void)hl_host_directory_relocate(&g_dn_directory, newfd);
     for (int i = 0; i < g_nvols; i++)
         engine_fd_reloc(&g_vols[i].fd, newfd);
 }
@@ -238,7 +222,7 @@ static void engine_fd_vacate(int newfd) {
 // Vacate every engine-private fd whose NUMBER falls in [first,last] -- for a guest close_range() that would
 // otherwise close the runtime's descriptors (g_root_fd etc.). Visible to fs.c/rare.c (io.c is #included first).
 static void engine_fd_vacate_range(unsigned first, unsigned last) {
-    int fds[2] = {g_root_fd, g_dn_kq};
+    int fds[2] = {g_root_fd, hl_host_directory_descriptor(&g_dn_directory)};
     for (int i = 0; i < 2; i++)
         if (fds[i] >= 0 && (unsigned)fds[i] >= first && (unsigned)fds[i] <= last) engine_fd_vacate(fds[i]);
     for (int i = 0; i < HL_SFD_MAX; i++) // signalfd write ends (engine-private)
@@ -1340,7 +1324,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (fd < HL_NFD) g_lease[fd] = (arg == 2) ? 0 : (int8_t)(arg + 1); // F_UNLCK clears
             G_RET(c) = 0;
             break;
-        } else if (lcmd == 1026) { // F_NOTIFY(fd, DN_* mask): arm a real kqueue directory-change watch.
+        } else if (lcmd == 1026) { // F_NOTIFY(fd, DN_* mask): arm a real host directory-change watch.
             int fd = (int)a0;
             if (fd < 0 || fcntl(fd, F_GETFD) < 0) {
                 G_RET(c) = (uint64_t)(int64_t)(-EBADF);
