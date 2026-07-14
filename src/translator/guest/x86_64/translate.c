@@ -1579,6 +1579,7 @@ static void *translate_block(uint64_t gpc) {
                 int w = (op & 1) ? I.opsize : 1, mem;
                 if (I.is_mem) {
                     emit_ea(&I, next);
+                    emit_bus_guard(17, (uint64_t)w, gpc);
                     int sv = (w == 1) ? byte_val(&I, I.reg, 19) : I.reg; // reg->mem: handle ah/bh/ch/dh
                     // xchg with memory is IMPLICITLY atomic on x86 (no LOCK needed) -> SWP, not load+store.
                     // glibc's mutex fast-path acquires the lock with xchg, so this must be a real atomic.
@@ -3259,6 +3260,7 @@ static void *translate_block(uint64_t gpc) {
             }
             if (op == 0xC3) { // movnti: non-temporal store r32/r64 -> m
                 emit_ea(&I, next);
+                emit_bus_guard(17, (uint64_t)I.opsize, gpc);
                 e_store(I.opsize, I.reg, 17);
                 gpc = next;
                 continue;
@@ -3271,6 +3273,7 @@ static void *translate_block(uint64_t gpc) {
                 // cmpxchg16b affects ONLY ZF, so materialize any lazy flags first (the C helper edits ZF alone).
                 if (g_fl_pending) flags_materialize();
                 emit_ea(&I, next); // x17 = EA
+                emit_bus_guard(17, 16, gpc);
                 e_str(17, 28, OFF_X87EA);
                 emit_exit_const(next, R_CMPXCHG16);
                 break;
@@ -3627,6 +3630,7 @@ static void *translate_block(uint64_t gpc) {
                         e_sxt(20, I.reg, w);           // sxtw/sxth: index as a 64-bit signed value
                     e_asr_i(20, 20, logbits, 1);       // x20 = signed word offset = index >> log2(bits)
                     e_rrr(A_ADD, 17, 17, 20, 1, logw); // EA += wordoff * w
+                    emit_bus_guard(17, (uint64_t)w, gpc);
                     e_load(w, 16, 17);
                     val = 16;
                     mem = 1;
@@ -3678,6 +3682,7 @@ static void *translate_block(uint64_t gpc) {
                 int w = op == 0xB0 ? 1 : I.opsize, sf2 = (w == 8);
                 if (I.is_mem) {
                     emit_ea(&I, next);
+                    emit_bus_guard(17, (uint64_t)w, gpc);
                     e_mov_rr(19, RAX, sf2);    // expected
                     e_cas(w, 19, I.reg, 17);   // x19 = old; if old==expected [m]=reg
                     do_alu(7, -1, 19, RAX, w); // ZF = (old == rax)
@@ -3702,6 +3707,7 @@ static void *translate_block(uint64_t gpc) {
                 int w = op == 0xC0 ? 1 : I.opsize, sf2 = (w == 8);
                 if (I.is_mem) {
                     emit_ea(&I, next);
+                    emit_bus_guard(17, (uint64_t)w, gpc);
                     e_lse(LSE_LDADD, w, I.reg, 19, 17); // x19 = old; [m] += reg
                     do_alu(0, -1, 19, I.reg, w);        // flags from old+reg
                     if (w >= 4)
