@@ -28,14 +28,26 @@ static void eventfd_peer_vacate(int fd) {
 // descriptors refer to the SAME open file description, so a dup'd eventfd/timerfd must share the underlying
 // object. The host dup already shares the backing pipe/kqueue; these tables are what route the guest's
 // read/write to the virtual handler, so without carrying them the duplicate degraded to a raw pipe/fd.
-static void fd_carry_virt(int newfd, int oldfd) {
+static int fd_virt_reserve(int oldfd, struct fdvis_reservation *reservation) {
+    memset(reservation, 0, sizeof *reservation);
+    if (oldfd < 0 || oldfd >= HL_NFD || g_pipe_identity[oldfd] == 0) return 0;
+    return proc_fdvis_reserve(reservation);
+}
+
+static int fd_virt_reserve_at(int oldfd, int newfd, struct fdvis_reservation *reservation) {
+    memset(reservation, 0, sizeof *reservation);
+    if (oldfd < 0 || oldfd >= HL_NFD || g_pipe_identity[oldfd] == 0) return 0;
+    return proc_fdvis_reserve_at(newfd, reservation);
+}
+
+static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reservation) {
     if (newfd < 0 || newfd >= HL_NFD || oldfd < 0 || oldfd >= HL_NFD || newfd == oldfd) return;
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
     if (g_pipe_identity[oldfd] != 0) {
         g_pipe_identity[newfd] = g_pipe_identity[oldfd];
-        (void)proc_fdvis_publish(newfd, HL_HOST_FD_PIPE, 1, g_pipe_identity[newfd]);
+        proc_fdvis_reservation_publish(reservation, newfd, HL_HOST_FD_PIPE, 1, g_pipe_identity[newfd]);
     }
     // eventfd: share the peer write end + counter slot; bump the slot refcount so closing either alias does
     // not tear the shared object down until the last one closes (see fd_reset_emul / g_eventfd_refs).
@@ -1034,9 +1046,15 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         break;
     }
     case 23: {
+        struct fdvis_reservation fdvis;
         // dup -- a 2nd fd would share the description; flush the RAM cache so both see the real file
         memf_materialize((int)a0);
+        if (fd_virt_reserve((int)a0, &fdvis) != 0) {
+            G_RET(c) = (uint64_t)(-ENOSPC);
+            break;
+        }
         int r = nofile_gate(dup((int)a0)); // EMFILE if the new fd would be >= the guest's soft RLIMIT_NOFILE
+        if (r < 0) proc_fdvis_reservation_cancel(&fdvis);
         // carry path + socket-emulation metadata to the new fd
         if (r >= 0 && r < HL_NFD && (int)a0 >= 0 && (int)a0 < HL_NFD) {
             strcpy(g_fdpath[r], g_fdpath[(int)a0]);
@@ -1049,12 +1067,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 memfd_reg_set_fd(r, g_memfd_seal[r]);
             }
             fd_carry_sock(r, (int)a0);
-            fd_carry_virt(r, (int)a0); // eventfd/timerfd share the same object across a dup
+            fd_carry_virt(r, (int)a0, &fdvis); // eventfd/timerfd share the same object across a dup
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 24: {
+        struct fdvis_reservation fdvis;
         // dup3(old,new,flags). x86's legacy dup2 arrives here rewritten to the dup3 form + a private
         // DUP2_COMPAT marker (bit 30) in the flags (see translate/x86_64/legacy.c) because the two calls
         // DIVERGE on oldfd==newfd: dup3 -> EINVAL, but dup2 -> returns newfd unchanged (EBADF if oldfd is
@@ -1088,6 +1107,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EBADF);
             break;
         }
+        if (fd_virt_reserve_at(oldfd, newfd, &fdvis) != 0) {
+            G_RET(c) = (uint64_t)(-ENOSPC);
+            break;
+        }
         memf_materialize((int)a0); // source: a 2nd fd shares the description -> flush RAM cache
         memf_close((int)a1);       // target fd is about to be reused; drop any cache it held
         engine_fd_vacate((int)a1); // move any engine-private fd off the target before dup2 overwrites it
@@ -1095,6 +1118,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                                    // eventfd/inotify/epoll/sock/...) so the reused number isn't left misrouted; the
                                    // real close is dup2's, and fd_carry_sock below repopulates from oldfd
         int r = dup2((int)a0, (int)a1);
+        if (r < 0) proc_fdvis_reservation_cancel(&fdvis);
         if (r >= 0) {
             if (d3flags & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC); // O_CLOEXEC
             if ((int)a1 >= 0 && (int)a1 < HL_NFD && (int)a0 >= 0 && (int)a0 < HL_NFD) {
@@ -1108,13 +1132,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     memfd_reg_set_fd((int)a1, g_memfd_seal[(int)a1]);
                 }
                 fd_carry_sock((int)a1, (int)a0);
-                fd_carry_virt((int)a1, (int)a0); // eventfd/timerfd share the same object across a dup
+                fd_carry_virt((int)a1, (int)a0, &fdvis); // eventfd/timerfd share the same object across a dup
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 25: {
+        struct fdvis_reservation fdvis;
         // fcntl -- Linux cmd# -> macOS (they diverge!)
         int lcmd = (int)a1;
         // F_DUPFD(_CLOEXEC): the floor arg must be a valid descriptor index -- Linux rejects a negative or
@@ -1145,10 +1170,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 have_fgetpath = 1;
                 if (proc_text_host_path(fgetpath_buf)) lf &= ~0x3;
             }
-            if (r & 0x8) lf |= 0x400;
-            if (r & 0x4) lf |= 0x800;
+            if (r & O_APPEND) lf |= 0x400;
+            if (r & O_NONBLOCK) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
-            if (r & 0x40) lf |= 0x2000;
+            if (r & O_ASYNC) lf |= 0x2000;
             // eventfd: the host read end is kept permanently O_NONBLOCK internally, so report the guest's
             // OWN blocking/non-blocking intent (g_eventfd_gnb), not the host flag. See vfs.c g_eventfd_gnb.
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_eventfd_peer[(int)a0]) {
@@ -1172,16 +1197,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // F_SETFL: Linux O_* -> macOS O_*
         if (lcmd == 4) {
             int la = (int)a2, mf = 0;
-            if (la & 0x400) mf |= 0x8;
-            if (la & 0x800) mf |= 0x4;
+            if (la & 0x400) mf |= O_APPEND;
+            if (la & 0x800) mf |= O_NONBLOCK;
             // APPEND/NONBLOCK/ASYNC
-            if (la & 0x2000) mf |= 0x40;
+            if (la & 0x2000) mf |= O_ASYNC;
             // eventfd: record the guest's blocking/non-blocking intent in the shadow and NEVER clear the
             // host read end's O_NONBLOCK (the internal drains rely on it; clearing it would let a drain
             // block). Other flag changes still apply to the host fd. See vfs.c g_eventfd_gnb.
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_eventfd_peer[(int)a0]) {
                 g_eventfd_gnb[(int)a0] = (la & 0x800) != 0;
-                mf |= 0x4; // keep host O_NONBLOCK on regardless of the guest's request
+                mf |= O_NONBLOCK; // keep host O_NONBLOCK on regardless of the guest's request
             }
             int r = fcntl((int)a0, F_SETFL, mf);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -1432,8 +1457,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 1030: break; // recognized Linux command -> proceed to the host fcntl
         default: G_RET(c) = (uint64_t)(-EINVAL); goto fcntl_done;
         }
+        if ((lcmd == 0 || lcmd == 1030) && fd_virt_reserve((int)a0, &fdvis) != 0) {
+            G_RET(c) = (uint64_t)(-ENOSPC);
+            goto fcntl_done;
+        }
         int r = fcntl((int)a0, mcmd, a2);
         if (lcmd == 0 || lcmd == 1030) r = nofile_gate(r); // F_DUPFD(_CLOEXEC): EMFILE past the guest fd cap
+        if (r < 0 && (lcmd == 0 || lcmd == 1030)) proc_fdvis_reservation_cancel(&fdvis);
         if (r >= 0 && (lcmd == 0 || lcmd == 1030) && r < HL_NFD && (int)a0 >= 0 && (int)a0 < HL_NFD) {
             // F_DUPFD(_CLOEXEC)
             strcpy(g_fdpath[r], g_fdpath[(int)a0]);
@@ -1441,7 +1471,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             g_proc_text_ro[r] = g_proc_text_ro[(int)a0];
             g_pagemap_fd[r] = g_pagemap_fd[(int)a0];
             fd_carry_sock(r, (int)a0);
-            fd_carry_virt(r, (int)a0); // eventfd/timerfd share the same object across a dup
+            fd_carry_virt(r, (int)a0, &fdvis); // eventfd/timerfd share the same object across a dup
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
     fcntl_done:

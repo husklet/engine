@@ -899,6 +899,49 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0 \
 		$(BUILD)/compat/procfs/x86_64/peerfd tests/compat/procfs/expected/shared/peerfd.out 0
 
+.PHONY: test-linux-production-core-abi
+test-linux-production-core-abi: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/tools/linux-matrix $(filter %/x86_64/%,$(CORE_ABI_BINS))
+	$(BUILD)/tools/linux-matrix --suite $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+		$(BUILD)/compat/core/abi/x86_64 tests/compat/core/abi
+
+LINUX_PRODUCTION_COMPAT_BINS := $(filter %/x86_64/%,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) $(LIBC_CASE_BINS) \
+	$(COMPLETENESS_BINS) $(POSIX_CASE_BINS) $(SYSCALL_CASE_BINS) $(NETWORK_CASE_BINS) $(PROCFS_CASE_BINS) \
+	$(MEMORY_CASE_BINS) $(FILESYSTEM_CASE_BINS) $(SIGNALS_CASE_BINS) $(PROCESS_CASE_BINS) $(TIME_CASE_BINS) \
+	$(ISA_X86_64_BINS) $(CORE_ABI_BINS) $(CORE_WORKLOAD_BINS) $(CORE_SYSCALL_BINS) $(CORE_REGRESS_BINS) \
+	$(IPC_CASE_BINS) $(THREAD_CASE_BINS) $(ISOLATION_CASE_BINS) $(SYSCALL_EDGE_CASE_BINS) $(SOAK_CASE_BINS))
+
+define HL_LINUX_PRODUCTION_SUITE
+	$(BUILD)/tools/linux-matrix --suite $(BUILD)/linux-production/hl-engine-linux-x86_64 $(1) $(2)
+endef
+
+.PHONY: test-linux-production-full
+test-linux-production-full: $(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/tools/linux-matrix \
+	$(LINUX_PRODUCTION_COMPAT_BINS)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/abi/x86_64,tests/compat/abi)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/abi-corpus/x86_64,tests/compat/abi/corpus)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/libc/x86_64,tests/compat/libc)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/completeness/x86_64,tests/compat/completeness)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/posix/x86_64,tests/compat/posix)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/syscall/x86_64,tests/compat/syscall)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/network/x86_64,tests/compat/network)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/procfs/x86_64,tests/compat/procfs)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/memory/x86_64,tests/compat/memory)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/filesystem/x86_64,tests/compat/filesystem)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/signals/x86_64,tests/compat/signals)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/process/x86_64,tests/compat/process)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/time/x86_64,tests/compat/time)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/isa/x86_64,tests/compat/isa/x86_64)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/core/abi/x86_64,tests/compat/core/abi)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/core/workload/x86_64,tests/compat/core/workload)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/core/syscall/x86_64,tests/compat/core/syscall)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/core/regress/x86_64,tests/compat/core/regress)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/ipc/x86_64,tests/compat/ipc)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/threads/x86_64,tests/compat/threads)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/isolation/x86_64,tests/compat/isolation)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/syscall_edges/x86_64,tests/compat/syscall_edges)
+	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/soak/x86_64,tests/soak)
+
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
 	$(BUILD)/production/hl-remote-supervisor
 

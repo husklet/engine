@@ -99,10 +99,133 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
     return 1;
 }
 
+static int has_token(const char *list, const char *token) {
+    size_t token_size = strlen(token);
+    const char *cursor = list;
+    while ((cursor = strstr(cursor, token)) != NULL) {
+        if ((cursor == list || cursor[-1] == ',') && (cursor[token_size] == 0 || cursor[token_size] == ',')) return 1;
+        cursor += token_size;
+    }
+    return 0;
+}
+
+static int parse_exit(const char *text, int *value) {
+    char *end = NULL;
+    long parsed;
+    errno = 0;
+    parsed = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != 0 || parsed < 0 || parsed > 255) return 1;
+    *value = (int)parsed;
+    return 0;
+}
+
+static int run_suite(const char *engine, const char *binary_root, const char *suite_root) {
+    char manifest[1024], *line = NULL;
+    size_t capacity = 0, passed = 0, unsupported = 0, excluded = 0;
+    ssize_t length;
+    FILE *file;
+    if (snprintf(manifest, sizeof(manifest), "%s/manifest.tsv", suite_root) >= (int)sizeof(manifest) ||
+        (file = fopen(manifest, "r")) == NULL) {
+        perror("linux matrix manifest");
+        return 1;
+    }
+    while ((length = getline(&line, &capacity, file)) >= 0) {
+        char *fields[13], *cursor;
+        size_t count = 0, source_size;
+        int expected_exit;
+        char guest[1024], golden[1024], binary[512];
+        if (length == 0 || line[0] == '#') continue;
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) line[--length] = 0;
+        cursor = line;
+        while (count < 13) {
+            fields[count++] = cursor;
+            cursor = strchr(cursor, '\t');
+            if (cursor == NULL) break;
+            *cursor++ = 0;
+        }
+        if (cursor != NULL || (count != 7 && count != 13)) {
+            fprintf(stderr, "linux-matrix: invalid manifest %s\n", manifest);
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        if (count == 7) {
+            source_size = strlen(fields[0]);
+            if (!has_token(fields[2], "x86_64")) {
+                excluded++;
+                continue;
+            }
+            if (parse_exit(fields[3], &expected_exit) != 0 || source_size < 3 ||
+                strcmp(fields[0] + source_size - 2, ".c") != 0 || source_size - 2 >= sizeof(binary)) {
+                fprintf(stderr, "linux-matrix: invalid legacy row %s\n", fields[0]);
+                free(line);
+                fclose(file);
+                return 1;
+            }
+            memcpy(binary, fields[0], source_size - 2);
+            binary[source_size - 2] = 0;
+            if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
+                snprintf(golden, sizeof(golden), "%s/%s", suite_root, fields[4]) >= (int)sizeof(golden) ||
+                run_case(engine, guest, golden, expected_exit) != 0) {
+                free(line);
+                fclose(file);
+                return 1;
+            }
+            passed++;
+            continue;
+        }
+        if (strncmp(fields[11], "excluded-", 9) == 0 || !has_token(fields[4], "x86_64")) {
+            excluded++;
+            continue;
+        }
+        if (strcmp(fields[11], "active") != 0 || parse_exit(fields[8], &expected_exit) != 0) {
+            fprintf(stderr, "linux-matrix: invalid active row %s\n", fields[0]);
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        /* Typed launch data is covered only after the Linux config path is production-safe. */
+        if (strcmp(fields[6], "-") != 0 || strcmp(fields[7], "-") != 0 || strstr(fields[10], "-rootfs") != NULL) {
+            unsupported++;
+            continue;
+        }
+        source_size = strlen(fields[2]);
+        if (source_size < 3 || strcmp(fields[2] + source_size - 2, ".c") != 0 || source_size - 2 >= sizeof(binary)) {
+            fprintf(stderr, "linux-matrix: invalid source %s\n", fields[2]);
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        memcpy(binary, fields[2], source_size - 2);
+        binary[source_size - 2] = 0;
+        if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
+            snprintf(golden, sizeof(golden), "%s/%s", suite_root, fields[9]) >= (int)sizeof(golden)) {
+            fprintf(stderr, "linux-matrix: path too long for %s\n", fields[0]);
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        if (run_case(engine, guest, golden, expected_exit) != 0) {
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        passed++;
+    }
+    free(line);
+    if (fclose(file) != 0) return 1;
+    printf("linux-matrix: %zu active x86-64 cases passed; %zu require typed launch; %zu excluded or other ISA\n",
+           passed, unsupported, excluded);
+    return passed == 0;
+}
+
 int main(int argc, char **argv) {
     int failed = 0;
+    if (argc == 5 && strcmp(argv[1], "--suite") == 0)
+        return run_suite(argv[2], argv[3], argv[4]) ? EXIT_FAILURE : EXIT_SUCCESS;
     if (argc < 5 || (argc - 2) % 3 != 0) {
-        fprintf(stderr, "usage: %s ENGINE GUEST GOLDEN EXIT [GUEST GOLDEN EXIT ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s ENGINE GUEST GOLDEN EXIT [GUEST GOLDEN EXIT ...]\n"
+                        "       %s --suite ENGINE BIN_ROOT SUITE_ROOT\n", argv[0], argv[0]);
         return 2;
     }
     for (int index = 2; index < argc; index += 3) {

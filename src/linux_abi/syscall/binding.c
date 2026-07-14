@@ -893,6 +893,7 @@ activation_failed: {
 }
 
 static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t descriptor_flags) {
+    struct fdvis_reservation fdvis;
     int shadow = bound_shadow_reserve(minimum);
     int64_t result;
     if (shadow < 0) return -(int64_t)errno;
@@ -900,8 +901,32 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
         close(shadow);
         return -EMFILE;
     }
+    if (proc_fdvis_reserve(&fdvis) != 0) {
+        close(shadow);
+        return -ENOSPC;
+    }
     result = hl_linux_dup3(g_linux_box, source, (hl_linux_fd)shadow, descriptor_flags != 0 ? HL_LINUX_O_CLOEXEC : 0);
-    if (result < 0) close(shadow);
+    if (result < 0) {
+        proc_fdvis_reservation_cancel(&fdvis);
+        close(shadow);
+    } else {
+        hl_linux_fd_snapshot snapshot;
+        hl_host_file_metadata metadata = {0};
+        uint32_t kind = HL_HOST_FD_OTHER;
+        if (bound_snapshot((uint64_t)result, &snapshot) && g_host_services != NULL &&
+            g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+            g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata).status ==
+                HL_STATUS_OK) {
+            if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+                metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+                kind = HL_HOST_FD_FILE;
+            else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+                kind = HL_HOST_FD_PIPE;
+            else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+                kind = HL_HOST_FD_SOCKET;
+        }
+        proc_fdvis_reservation_publish(&fdvis, (int)result, kind, metadata.stable_device, metadata.stable_object);
+    }
     return result;
 }
 
@@ -910,8 +935,10 @@ static int bound_handle_reserve(void *opaque) {
     hl_status status;
     int shadow = bound_shadow_reserve(0);
     if (slot == NULL || slot->active) return -EINVAL;
+    if (proc_fdvis_reserve(&slot->fdvis) != 0) return -ENOSPC;
     if (shadow < 0 || shadow >= guest_nofile_cur()) {
         if (shadow >= 0) close(shadow);
+        proc_fdvis_reservation_cancel(&slot->fdvis);
         return -EMFILE;
     }
     for (;;) {
@@ -923,6 +950,7 @@ static int bound_handle_reserve(void *opaque) {
     }
     if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
         if (shadow >= 0) close(shadow);
+        proc_fdvis_reservation_cancel(&slot->fdvis);
         return -EMFILE;
     }
     slot->shadow = shadow;
@@ -934,20 +962,32 @@ static void bound_handle_cancel(bound_handle_slot *slot) {
     if (slot == NULL || !slot->active) return;
     (void)hl_linux_fd_cancel(g_linux_box, &slot->reservation);
     close(slot->shadow);
+    proc_fdvis_reservation_cancel(&slot->fdvis);
     slot->active = 0;
 }
 
-static void bound_fdvis_publish(int guest_fd);
-
 static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags) {
+    hl_host_file_metadata metadata = {0};
+    uint32_t kind = HL_HOST_FD_OTHER;
     if (slot == NULL || !slot->active) return -EMFILE;
+    if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+        g_host_services->file->metadata(g_host_services->context, file, &metadata).status == HL_STATUS_OK) {
+        if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+            metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+            kind = HL_HOST_FD_FILE;
+        else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+            kind = HL_HOST_FD_PIPE;
+        else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+            kind = HL_HOST_FD_SOCKET;
+    }
     int64_t result = hl_linux_file_adopt_reserved(g_linux_box, &slot->reservation, file, flags);
     if (result < 0) {
         bound_handle_cancel(slot);
     } else {
         slot->active = 0;
+        proc_fdvis_reservation_publish(&slot->fdvis, (int)result, kind, metadata.stable_device,
+                                       metadata.stable_object);
     }
-    if (result >= 0) bound_fdvis_publish((int)result);
     return result;
 }
 
@@ -966,25 +1006,49 @@ static int bound_handle_dirfd_error(int fd) {
  * handles are closed, republish the new typed OFD at the true lowest logical
  * guest slot and retire the temporary shadow. */
 static int64_t bound_relocate_lowest(int64_t opened) {
+    struct fdvis_reservation fdvis;
     int shadow;
     int64_t duplicated;
     hl_linux_fd_snapshot snapshot;
     if (opened < 0) return opened;
     shadow = bound_shadow_reserve(0);
     if (shadow < 0) return opened;
+    if (proc_fdvis_reserve(&fdvis) != 0) {
+        close(shadow);
+        return opened;
+    }
     uint32_t flags = hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)opened, &snapshot) == HL_STATUS_OK &&
                              snapshot.descriptor_flags != 0
                          ? HL_LINUX_O_CLOEXEC
                          : 0;
     duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)opened, (hl_linux_fd)shadow, flags);
     if (duplicated < 0) {
+        proc_fdvis_reservation_cancel(&fdvis);
         close(shadow);
         return opened;
     }
     (void)hl_linux_close(g_linux_box, (hl_linux_fd)opened);
     proc_fdvis_close((int)opened);
     (void)close((int)opened);
-    bound_fdvis_publish((int)duplicated);
+    {
+        hl_linux_fd_snapshot duplicate;
+        hl_host_file_metadata metadata = {0};
+        uint32_t kind = HL_HOST_FD_OTHER;
+        if (bound_snapshot((uint64_t)duplicated, &duplicate) && g_host_services != NULL &&
+            g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+            g_host_services->file->metadata(g_host_services->context, duplicate.host_handle, &metadata).status ==
+                HL_STATUS_OK) {
+            if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+                metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+                kind = HL_HOST_FD_FILE;
+            else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+                kind = HL_HOST_FD_PIPE;
+            else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+                kind = HL_HOST_FD_SOCKET;
+        }
+        proc_fdvis_reservation_publish(&fdvis, (int)duplicated, kind, metadata.stable_device,
+                                       metadata.stable_object);
+    }
     return duplicated;
 }
 
@@ -1400,25 +1464,6 @@ static void bound_attachment_release(int native_fd) {
         (void)attachments->release(g_host_services->context, (uint64_t)(unsigned)native_fd);
     else
         close(native_fd);
-}
-
-static void bound_fdvis_publish(int guest_fd) {
-    hl_linux_fd_snapshot snapshot;
-    hl_host_file_metadata metadata = {0};
-    uint32_t kind = HL_HOST_FD_OTHER;
-    if (guest_fd < 0 || !bound_snapshot((uint64_t)(uint32_t)guest_fd, &snapshot)) return;
-    if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL ||
-        g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata).status !=
-            HL_STATUS_OK)
-        return;
-    if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
-        metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
-        kind = HL_HOST_FD_FILE;
-    else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
-        kind = HL_HOST_FD_PIPE;
-    else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
-        kind = HL_HOST_FD_SOCKET;
-    (void)proc_fdvis_publish(guest_fd, kind, metadata.stable_device, metadata.stable_object);
 }
 
 static int64_t bound_stream_read(const hl_linux_fd_snapshot *file, int native_fd, void *buffer, size_t size,
@@ -1929,6 +1974,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     }
     case 56: {
+        struct fdvis_reservation fdvis;
         const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
                                    HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
         size_t path_size;
@@ -1953,6 +1999,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -HL_LINUX_EMFILE;
             break;
         }
+        if (proc_fdvis_reserve(&fdvis) != 0) {
+            close(shadow);
+            result = -HL_LINUX_ENOSPC;
+            break;
+        }
         for (;;) {
             status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
             if (status != HL_STATUS_ALREADY_EXISTS) break;
@@ -1962,6 +2013,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
         if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
             if (shadow >= 0) close(shadow);
+            proc_fdvis_reservation_cancel(&fdvis);
             result = -HL_LINUX_EMFILE;
             break;
         }
@@ -1970,8 +2022,26 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (result < 0) {
             (void)hl_linux_fd_cancel(g_linux_box, &reservation);
             close(shadow);
-        } else
-            bound_fdvis_publish((int)result);
+            proc_fdvis_reservation_cancel(&fdvis);
+        } else {
+            hl_linux_fd_snapshot opened;
+            hl_host_file_metadata metadata = {0};
+            uint32_t kind = HL_HOST_FD_OTHER;
+            if (bound_snapshot((uint64_t)result, &opened) && g_host_services != NULL &&
+                g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+                g_host_services->file->metadata(g_host_services->context, opened.host_handle, &metadata).status ==
+                    HL_STATUS_OK) {
+                if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+                    metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+                    kind = HL_HOST_FD_FILE;
+                else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+                    kind = HL_HOST_FD_PIPE;
+                else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+                    kind = HL_HOST_FD_SOCKET;
+            }
+            proc_fdvis_reservation_publish(&fdvis, (int)result, kind, metadata.stable_device,
+                                           metadata.stable_object);
+        }
         break;
     }
     case 57: /* close */
@@ -2411,6 +2481,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     case 23: result = bound_dup_at_least(source.fd, 0, 0); break;
     case 24: {
+        struct fdvis_reservation fdvis;
         uint32_t flags = (uint32_t)a2;
         int is_dup2 = (flags & 0x40000000u) != 0;
         int target = (int)a1;
@@ -2423,6 +2494,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             hl_linux_fd_snapshot target_snapshot;
             int target_bound = bound_snapshot((uint64_t)(uint32_t)target, &target_snapshot);
             int shadow;
+            if (proc_fdvis_reserve_at(target, &fdvis) != 0) {
+                result = -ENOSPC;
+                break;
+            }
             if (target_bound) {
                 shadow = target;
             } else {
@@ -2430,6 +2505,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 fd_reset_emul(target);
                 shadow = dup2(g_bound_sentinel, target);
                 if (shadow < 0) {
+                    proc_fdvis_reservation_cancel(&fdvis);
                     result = -(int64_t)errno;
                     break;
                 }
@@ -2437,8 +2513,28 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             }
             result = hl_linux_dup3(g_linux_box, source.fd, (hl_linux_fd)target,
                                    flags & HL_LINUX_O_CLOEXEC ? HL_LINUX_O_CLOEXEC : 0);
-            if (result < 0 && !target_bound) close(shadow);
-            if (result >= 0) bound_fdvis_publish(target);
+            if (result < 0) {
+                proc_fdvis_reservation_cancel(&fdvis);
+                if (!target_bound) close(shadow);
+            } else {
+                hl_linux_fd_snapshot duplicate;
+                hl_host_file_metadata metadata = {0};
+                uint32_t kind = HL_HOST_FD_OTHER;
+                if (bound_snapshot((uint64_t)target, &duplicate) && g_host_services != NULL &&
+                    g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+                    g_host_services->file->metadata(g_host_services->context, duplicate.host_handle, &metadata)
+                            .status == HL_STATUS_OK) {
+                    if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+                        metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+                        kind = HL_HOST_FD_FILE;
+                    else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+                        kind = HL_HOST_FD_PIPE;
+                    else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+                        kind = HL_HOST_FD_SOCKET;
+                }
+                proc_fdvis_reservation_publish(&fdvis, target, kind, metadata.stable_device,
+                                               metadata.stable_object);
+            }
         }
         break;
     }
@@ -2449,7 +2545,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             else
                 result = bound_dup_at_least(source.fd, (int)a2,
                                             (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
-            if (result >= 0) bound_fdvis_publish((int)result);
         } else if (a1 == 5 || a1 == 6 || a1 == 7) {
             uint8_t *lock = (uint8_t *)(uintptr_t)a2;
             hl_host_file_metadata metadata;

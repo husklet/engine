@@ -762,7 +762,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        int r = kqueue();
+        int r;
+#if defined(__linux__)
+        r = inotify_init1((int)a0);
+#else
+        r = kqueue();
         if (r >= 0) {
             if (r < HL_NFD) {
                 g_inotify[r] = 1;
@@ -774,6 +778,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             // flag survives exec instead of being swept by hl's close-on-exec pass.
             fcntl(r, F_SETFD, (a0 & 0x80000) ? FD_CLOEXEC : 0);
         }
+#endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -782,6 +787,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         char pb[4200];
         // confined (realpath gate)
         const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
+#if defined(__linux__)
+        int wd = inotify_add_watch((int)a0, p, (uint32_t)a2);
+        G_RET(c) = wd < 0 ? (uint64_t)(-errno) : (uint64_t)wd;
+#else
         int wfd = hl_native_open_watch(p);
         if (wfd < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -805,10 +814,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             g_inotify_owner[wfd] = (int)a0; // the inotify instance this watch belongs to (for the move queue)
         }
         G_RET(c) = (uint64_t)wfd;
+#endif
         break;
         // watch descriptor = the watched fd
     }
     case 28: {
+#if defined(__linux__)
+        int result = inotify_rm_watch((int)a0, (int)a1);
+        G_RET(c) = result < 0 ? (uint64_t)(-errno) : 0;
+#else
         struct kevent kv;
         // inotify_rm_watch(fd, wd). The wd is the watched fd; deleting the EVFILT_VNODE knote from THIS
         // inotify kqueue is the source of truth for "is this a real watch of this instance". If the knote
@@ -821,6 +835,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         close((int)a1);
         G_RET(c) = 0;
+#endif
         break;
     }
     case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout(timespec), sigmask) -> pselect.

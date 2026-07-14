@@ -510,6 +510,9 @@ static size_t cmsg_add_cred(uint8_t *g, size_t off, size_t cap, int pid, int uid
 
 // SOL_SOCKET option name: Linux -> macOS (they differ). -1 = ignore (unsupported here).
 static int so_opt_l2m(int o) {
+#if defined(__linux__)
+    return o;
+#else
     switch (o) {
     // SO_DEBUG
     case 1: return 0x0001;
@@ -541,6 +544,7 @@ static int so_opt_l2m(int o) {
     // arming); every other unknown SOL_SOCKET optname -> ignore here.
     default: return -1;
     }
+#endif
 }
 
 // IPPROTO_TCP optname Linux -> macOS. CRITICAL: these numbers diverge, and a raw pass-through maps
@@ -548,6 +552,9 @@ static int so_opt_l2m(int o) {
 // socket so a server's reply is never delivered until close (breaks redis & every keepalive-setting
 // server). Map the known ones; ignore (-1) unknown rather than pass through and accidentally cork.
 static int tcp_opt_l2m(int o) {
+#if defined(__linux__)
+    return o;
+#else
     switch (o) {
     case 1: return 0x01;  // TCP_NODELAY  (same)
     case 2: return 0x02;  // TCP_MAXSEG   (same)
@@ -557,6 +564,7 @@ static int tcp_opt_l2m(int o) {
     case 6: return 0x102; // Linux TCP_KEEPCNT  -> macOS TCP_KEEPCNT
     default: return -1;   // unknown -> ignore (never pass a Linux number straight to macOS IPPROTO_TCP)
     }
+#endif
 }
 
 // ---- NET namespace: per-container private loopback. A container's explicit 127.0.0.0/8 TCP sockets

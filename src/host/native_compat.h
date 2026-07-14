@@ -33,6 +33,7 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>

@@ -15,6 +15,7 @@ static int jail_routed_at(int dirfd, const char *path) {
 
 typedef struct bound_handle_slot {
     hl_linux_fd_reservation reservation;
+    struct fdvis_reservation fdvis;
     int shadow;
     int active;
 } bound_handle_slot;

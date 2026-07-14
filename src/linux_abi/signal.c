@@ -198,15 +198,23 @@ static int sigexit_lookup(int pid, int *signo, int *core, int consume) {
 // Signal numbers diverge: Linux SIGUSR1=10/CHLD=17/BUS=7/SYS=31/USR2=12/URG=23/IO=29/STOP=19/
 // CONT=18/TSTP=20 vs macOS 30/20/10/12/31/16/23/17/19/18. Translate at the host boundary.
 static int sig_l2m(int s) {
+#if defined(__linux__)
+    return s;
+#else
     static const unsigned char T[32] = {0,  1,  2,  3,  4,  5,  6,  10, 8,  9,  30, 11, 31, 13, 14, 15,
                                         16, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 30, 12};
     return (s >= 1 && s <= 31) ? T[s] : s;
+#endif
 }
 
 static int sig_m2l(int s) {
+#if defined(__linux__)
+    return s;
+#else
     static const unsigned char T[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  7,  11, 31, 13, 14, 15,
                                         23, 19, 20, 18, 17, 21, 22, 29, 24, 25, 26, 27, 28, 29, 10, 12};
     return (s >= 1 && s <= 31) ? T[s] : s;
+#endif
 }
 
 // sigsuspend/pause force-delivery mask (per-thread, bit = 1<<signo, same convention as g_pending). When

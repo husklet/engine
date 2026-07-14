@@ -30,6 +30,9 @@ static int dgram_addr_peek(int fd, int wantaddr, size_t totlen) {
 // fails EADDRINUSE (breaks dual-stack servers like MariaDB that bind :: v6-only + 0.0.0.0 separately).
 // Map the known ones; ignore (-1) unknown rather than pass a Linux number straight to macOS IPPROTO_IPV6.
 static int ip6_opt_l2m(int o) {
+#if defined(__linux__)
+    return o;
+#else
     switch (o) {
     case 16: return 4;  // IPV6_UNICAST_HOPS
     case 17: return 9;  // IPV6_MULTICAST_IF
@@ -42,6 +45,7 @@ static int ip6_opt_l2m(int o) {
     case 67: return 36; // IPV6_TCLASS
     default: return -1; // unknown -> ignore (never pass a Linux number straight to macOS IPPROTO_IPV6)
     }
+#endif
 }
 
 // IPPROTO_IP (level 0) optname: Linux -> macOS. Like TCP/IPV6 the numbers diverge (Linux IP_TOS=1/IP_TTL=2/
@@ -50,6 +54,9 @@ static int ip6_opt_l2m(int o) {
 // (int TOS/TTL/HDRINCL/loop/mcast-ttl, in_addr mcast-if, ip_mreq membership); ignore (-1) unknown / no-mac-
 // equivalent ones (IP_PKTINFO/IP_MTU_DISCOVER/IP_RECVERR/IP_FREEBIND: no macOS analogue or a divergent struct).
 static int ip_opt_l2m(int o) {
+#if defined(__linux__)
+    return o;
+#else
     switch (o) {
     case 1: return 3;   // IP_TOS
     case 2: return 4;   // IP_TTL
@@ -65,6 +72,7 @@ static int ip_opt_l2m(int o) {
     case 36: return 13; // IP_DROP_MEMBERSHIP
     default: return -1; // unknown / no macOS equivalent -> ignore (never pass a Linux number to macOS IPPROTO_IP)
     }
+#endif
 }
 
 // an AF_UNIX DATAGRAM send to a PATHNAME/abstract dest (sendto/sendmsg with an explicit dest addr --

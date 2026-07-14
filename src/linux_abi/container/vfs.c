@@ -249,7 +249,9 @@ static struct ts_slot *g_ts_tab;
  * guest-visible numbers, so peer /proc/<pid>/fd resolves the logical fd's stable OFD identity to a persistent
  * peer descriptor before asking the host process service for vnode/socket information. Entries live in
  * pre-fork shared memory and are generation stamped so readers never combine old identity with fd reuse. */
+#ifndef FDVIS_N
 #define FDVIS_N 131072
+#endif
 
 struct fdvis_slot {
     uint64_t key; /* host pid in high 32 bits; guest fd + 1 in low 32 bits; 0 = free */
@@ -274,6 +276,19 @@ static uint8_t g_fdvis_private[HL_NFD];
 static _Atomic uint64_t g_pipe_identity_next = 1;
 static void proc_fdvis_cleanup(void);
 static void proc_fdvis_close(int guest_fd);
+
+struct fdvis_fork_entry {
+    unsigned slot;
+    int guest_fd;
+    uint32_t kind;
+    uint64_t device;
+    uint64_t object;
+};
+
+struct fdvis_fork_plan {
+    struct fdvis_fork_entry *entries;
+    size_t count;
+};
 
 static uint64_t fdvis_key(int pid, int fd) {
     return pid > 0 && fd >= 0 ? ((uint64_t)(uint32_t)pid << 32) | ((uint32_t)fd + 1u) : 0;
@@ -358,6 +373,94 @@ static void fdvis_sweep_stale_locked(void) {
         uint64_t live_start = fdvis_process_token(owner);
         if (live_start == 0 || live_start != slot->owner_start_ns) memset(slot, 0, sizeof *slot);
     }
+}
+
+struct fdvis_reservation {
+    unsigned slot;
+    int active;
+    int new_slot;
+};
+
+static int proc_fdvis_reserve(struct fdvis_reservation *reservation) {
+    if (!reservation) return -EINVAL;
+    memset(reservation, 0, sizeof *reservation);
+    if (!g_fdvis || !g_fdvis_control) return -ENOSPC;
+    fdvis_lock();
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned index = 0; index < FDVIS_N; ++index) {
+            if (g_fdvis[index].key != 0) continue;
+            g_fdvis[index].key = UINT64_MAX;
+            reservation->slot = index;
+            reservation->active = 1;
+            reservation->new_slot = 1;
+            fdvis_unlock();
+            return 0;
+        }
+        fdvis_sweep_stale_locked();
+    }
+    fdvis_unlock();
+    return -ENOSPC;
+}
+
+static int proc_fdvis_reserve_at(int guest_fd, struct fdvis_reservation *reservation) {
+    int pid = (int)getpid();
+    uint64_t owner_start = fdvis_process_token(pid);
+    if (!reservation) return -EINVAL;
+    memset(reservation, 0, sizeof *reservation);
+    if (!g_fdvis || !g_fdvis_control) return -ENOSPC;
+    fdvis_lock();
+    struct fdvis_slot *present = fdvis_find(fdvis_key(pid, guest_fd), owner_start, 0);
+    if (present) {
+        reservation->slot = (unsigned)(present - g_fdvis);
+        reservation->active = 1;
+        fdvis_unlock();
+        return 0;
+    }
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned index = 0; index < FDVIS_N; ++index) {
+            if (g_fdvis[index].key != 0) continue;
+            g_fdvis[index].key = UINT64_MAX;
+            reservation->slot = index;
+            reservation->active = 1;
+            reservation->new_slot = 1;
+            fdvis_unlock();
+            return 0;
+        }
+        fdvis_sweep_stale_locked();
+    }
+    fdvis_unlock();
+    return -ENOSPC;
+}
+
+static void proc_fdvis_reservation_cancel(struct fdvis_reservation *reservation) {
+    if (!reservation || !reservation->active) return;
+    fdvis_lock();
+    struct fdvis_slot *slot = &g_fdvis[reservation->slot];
+    if (reservation->new_slot && slot->key == UINT64_MAX) memset(slot, 0, sizeof *slot);
+    fdvis_unlock();
+    reservation->active = 0;
+}
+
+static void proc_fdvis_reservation_publish(struct fdvis_reservation *reservation, int guest_fd, uint32_t kind,
+                                           uint64_t device, uint64_t object) {
+    int pid = (int)getpid();
+    uint64_t owner_start = fdvis_process_token(pid);
+    fdvis_lock();
+    struct fdvis_slot *slot = fdvis_find(fdvis_key(pid, guest_fd), owner_start, 0);
+    struct fdvis_slot *reserved = &g_fdvis[reservation->slot];
+    if (slot) {
+        if (reserved != slot && reserved->key == UINT64_MAX) memset(reserved, 0, sizeof *reserved);
+    } else {
+        slot = reserved;
+    }
+    slot->device = device;
+    slot->object = object;
+    slot->kind = kind;
+    slot->owner_start_ns = owner_start;
+    slot->generation = ++g_fdvis_control->generation;
+    slot->key = fdvis_key(pid, guest_fd);
+    fdvis_unlock();
+    reservation->active = 0;
 }
 
 static int proc_fdvis_publish(int guest_fd, uint32_t kind, uint64_t device, uint64_t object) {
@@ -448,32 +551,85 @@ static size_t proc_fdvis_list(int pid, struct fdvis_view *views, size_t capacity
     return count;
 }
 
-static void proc_fdvis_fork_prepare(void) {
+static int proc_fdvis_fork_prepare(struct fdvis_fork_plan *plan) {
+    size_t count = 0;
+    size_t reserved = 0;
+    struct fdvis_fork_entry *entries = NULL;
     g_fdvis_fork_parent = (int)getpid();
     g_fdvis_fork_parent_start = fdvis_process_token(g_fdvis_fork_parent);
+    memset(plan, 0, sizeof *plan);
+    if (!g_fdvis || !g_fdvis_control) return -ENOSPC;
+
+    fdvis_lock();
+    fdvis_sweep_stale_locked();
+    for (unsigned index = 0; index < FDVIS_N; ++index)
+        if ((int)(uint32_t)(g_fdvis[index].key >> 32) == g_fdvis_fork_parent &&
+            g_fdvis[index].owner_start_ns == g_fdvis_fork_parent_start)
+            ++count;
+    if (count != 0) entries = calloc(count, sizeof *entries);
+    if (count != 0 && entries == NULL) {
+        fdvis_unlock();
+        return -ENOMEM;
+    }
+    for (unsigned index = 0; index < FDVIS_N && reserved < count; ++index) {
+        if (g_fdvis[index].key != 0) continue;
+        g_fdvis[index].key = UINT64_MAX;
+        entries[reserved++].slot = index;
+    }
+    if (reserved != count) {
+        for (size_t index = 0; index < reserved; ++index) memset(&g_fdvis[entries[index].slot], 0, sizeof *g_fdvis);
+        fdvis_unlock();
+        free(entries);
+        return -ENOSPC;
+    }
+    reserved = 0;
+    for (unsigned index = 0; index < FDVIS_N; ++index) {
+        struct fdvis_slot *slot = &g_fdvis[index];
+        if ((int)(uint32_t)(slot->key >> 32) != g_fdvis_fork_parent ||
+            slot->owner_start_ns != g_fdvis_fork_parent_start)
+            continue;
+        entries[reserved].guest_fd = (int)(uint32_t)slot->key - 1;
+        entries[reserved].kind = slot->kind;
+        entries[reserved].device = slot->device;
+        entries[reserved].object = slot->object;
+        ++reserved;
+    }
+    fdvis_unlock();
+    plan->entries = entries;
+    plan->count = count;
+    return 0;
 }
 
-static void proc_fdvis_after_fork(void) {
-    int parent = g_fdvis_fork_parent;
-    int child = (int)getpid();
-    uint64_t parent_start = g_fdvis_fork_parent_start;
-    uint64_t child_start = fdvis_process_token(child);
-    if (!g_fdvis || !g_fdvis_control || parent <= 0 || parent == child) return;
+static void proc_fdvis_fork_cancel(struct fdvis_fork_plan *plan) {
+    if (!plan->entries) return;
     fdvis_lock();
-    for (unsigned index = 0; index < FDVIS_N; ++index) {
-        uint64_t key = g_fdvis[index].key;
-        if ((int)(uint32_t)(key >> 32) != parent || g_fdvis[index].owner_start_ns != parent_start) continue;
-        int guest_fd = (int)(uint32_t)key - 1;
-        struct fdvis_slot *copy = fdvis_find(fdvis_key(child, guest_fd), child_start, 1);
-        if (copy) {
-            *copy = g_fdvis[index];
-            copy->key = fdvis_key(child, guest_fd);
-            copy->owner_start_ns = child_start;
-            copy->generation = ++g_fdvis_control->generation;
-        }
+    for (size_t index = 0; index < plan->count; ++index) {
+        struct fdvis_slot *slot = &g_fdvis[plan->entries[index].slot];
+        if (slot->key == UINT64_MAX) memset(slot, 0, sizeof *slot);
     }
-    g_fdvis_fork_parent = child;
-    g_fdvis_fork_parent_start = child_start;
+    fdvis_unlock();
+}
+
+static void proc_fdvis_after_fork(struct fdvis_fork_plan *plan, int child, int in_child) {
+    uint64_t child_start = fdvis_process_token(child);
+    if (!g_fdvis || !g_fdvis_control || child <= 0) return;
+    fdvis_lock();
+    for (size_t index = 0; index < plan->count; ++index) {
+        struct fdvis_fork_entry *entry = &plan->entries[index];
+        struct fdvis_slot *copy = &g_fdvis[entry->slot];
+        uint64_t key = fdvis_key(child, entry->guest_fd);
+        if (copy->key != UINT64_MAX && copy->key != key) continue;
+        copy->device = entry->device;
+        copy->object = entry->object;
+        copy->kind = entry->kind;
+        copy->owner_start_ns = child_start;
+        copy->generation = ++g_fdvis_control->generation;
+        copy->key = key;
+    }
+    if (in_child) {
+        g_fdvis_fork_parent = child;
+        g_fdvis_fork_parent_start = child_start;
+    }
     fdvis_unlock();
 }
 
