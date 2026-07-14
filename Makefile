@@ -100,6 +100,10 @@ ABI_CASE_AARCH64_NAMES := $(filter-out cpuid_features rflags_id,$(ABI_CASE_NAMES
 ABI_CASE_X86_64_NAMES := $(filter-out lse_atomics,$(ABI_CASE_NAMES))
 ABI_CASE_BINS := $(ABI_CASE_AARCH64_NAMES:%=$(BUILD)/compat/abi/aarch64/%) \
 	$(ABI_CASE_X86_64_NAMES:%=$(BUILD)/compat/abi/x86_64/%)
+ABI_CORPUS_SOURCES := $(sort $(wildcard tests/compat/abi/corpus/*.c))
+ABI_CORPUS_NAMES := $(basename $(notdir $(ABI_CORPUS_SOURCES)))
+ABI_CORPUS_BINS := $(ABI_CORPUS_NAMES:%=$(BUILD)/compat/abi-corpus/aarch64/%) \
+	$(ABI_CORPUS_NAMES:%=$(BUILD)/compat/abi-corpus/x86_64/%)
 LIBC_CASE_SOURCES := $(sort $(wildcard tests/compat/libc/*.c))
 LIBC_CASE_NAMES := $(basename $(notdir $(LIBC_CASE_SOURCES)))
 LIBC_CASE_BINS := $(LIBC_CASE_NAMES:%=$(BUILD)/compat/libc/aarch64/%) \
@@ -206,7 +210,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -369,6 +373,14 @@ $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 $(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static $< -lm -o $@
+
+$(BUILD)/compat/abi-corpus/aarch64/%: tests/compat/abi/corpus/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+
+$(BUILD)/compat/abi-corpus/x86_64/%: tests/compat/abi/corpus/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
 $(BUILD)/compat/libc/aarch64/%: tests/compat/libc/%.c
 	@mkdir -p $(@D)
@@ -828,7 +840,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-core compat-filesystem compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -901,6 +913,11 @@ compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/abi/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/abi/x86_64) $(abspath tests/compat/abi)
+
+compat-abi-corpus: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CORPUS_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/abi-corpus/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/abi-corpus/x86_64) $(abspath tests/compat/abi/corpus)
 
 compat-libc: compat-engines $(BUILD)/tools/matrix-runner $(LIBC_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
