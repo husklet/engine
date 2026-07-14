@@ -817,7 +817,8 @@ static void stw_force_dispatch_flush(void) {
         if (pthread_equal(g_stw_threads[i].th, me)) {
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
         } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire)) {
-            if (g_stw_threads[i].cpu) g_stw_threads[i].cpu->irq = 1;
+            /* Only the target thread's signal handler writes its non-atomic cpu->irq.
+               A cross-thread store here would be a C data race with emitted loads. */
             pthread_kill(g_stw_threads[i].th, STW_SIG);
         }
     }
