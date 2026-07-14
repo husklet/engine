@@ -3,8 +3,16 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define HL_LINUX_FD_RESERVED UINT32_MAX
+
+static _Atomic uint32_t g_linux_ofd_token_counter;
+static uint64_t hl_linux_new_ofd_token(void) {
+    uint64_t token = ((uint64_t)(uint32_t)getpid() << 32) |
+                     (uint64_t)(atomic_fetch_add_explicit(&g_linux_ofd_token_counter, 1, memory_order_relaxed) + 1u);
+    return token != 0 ? token : 1;
+}
 
 static hl_status hl_linux_fd_get_unlocked(const hl_linux_abi *linux_abi, hl_linux_fd fd,
                                           const hl_linux_fd_entry **fd_entry,
@@ -636,6 +644,7 @@ hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handl
     linux_abi->ofds[ofd].io_mutex = mutex;
     linux_abi->ofds[ofd].references = 1;
     linux_abi->ofds[ofd].generation++;
+    linux_abi->ofds[ofd].flock_token = hl_linux_new_ofd_token();
     linux_abi->fds[fd].ofd = ofd;
     linux_abi->fds[fd].descriptor_flags = descriptor_flags;
     linux_abi->fds[fd].generation++;
@@ -674,6 +683,7 @@ hl_status hl_linux_fd_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_hos
     linux_abi->ofds[ofd].io_mutex = mutex;
     linux_abi->ofds[ofd].references = 1;
     linux_abi->ofds[ofd].generation++;
+    linux_abi->ofds[ofd].flock_token = hl_linux_new_ofd_token();
     linux_abi->fds[fd].ofd = ofd;
     linux_abi->fds[fd].descriptor_flags = descriptor_flags;
     linux_abi->fds[fd].generation++;
@@ -709,6 +719,7 @@ static hl_status hl_linux_object_install_common(hl_linux_abi *linux_abi, hl_linu
     candidate.io_mutex = created.value;
     candidate.object_ops = ops;
     candidate.object_context = context;
+    candidate.flock_token = hl_linux_new_ofd_token();
     hl_linux_lock(linux_abi);
     if (requested == UINT32_MAX)
         status = hl_linux_find_fd(linux_abi, &fd);
@@ -990,6 +1001,7 @@ static hl_status hl_linux_fd_commit(hl_linux_abi *linux_abi, const hl_linux_fd_r
     linux_abi->ofds[ofd].io_mutex = created.value;
     linux_abi->ofds[ofd].references = 1;
     linux_abi->ofds[ofd].generation++;
+    linux_abi->ofds[ofd].flock_token = hl_linux_new_ofd_token();
     linux_abi->fds[reservation->fd].ofd = ofd;
     linux_abi->fds[reservation->fd].descriptor_flags = descriptor_flags;
 done:
@@ -1016,6 +1028,7 @@ hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linux_fd fd
         snapshot->ofd_generation = ofd_entry->generation;
         snapshot->descriptor_references = ofd_entry->references;
         snapshot->kind = ofd_entry->kind;
+        snapshot->flock_token = ofd_entry->flock_token;
     }
     hl_linux_unlock((hl_linux_abi *)linux_abi);
     return status;

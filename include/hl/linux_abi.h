@@ -110,6 +110,8 @@ typedef struct hl_linux_ofd_entry {
     uint32_t closing;
     uint32_t generation;
     uint32_t kind;
+    /* Stable Linux open-file-description identity: preserved by dup/fork, renewed on allocation. */
+    uint64_t flock_token;
     /* Serializes the shared offset and final close for this OFD only. */
     hl_host_handle io_mutex;
     /* Private typed-object adapter. NULL denotes the ordinary host-file adapter. */
@@ -142,6 +144,7 @@ typedef struct hl_linux_fd_snapshot {
     uint32_t ofd_generation;
     uint32_t descriptor_references;
     uint32_t kind;
+    uint64_t flock_token;
 } hl_linux_fd_snapshot;
 
 /* Host-neutral values which the syscall marshaller can encode for either Linux guest ISA. */
