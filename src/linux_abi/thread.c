@@ -2,7 +2,6 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>       // mach_vm_region: probe whether a guest address is still mapped (see cleartid)
 #include <mach/mach_time.h>     // mach_timebase_info: ns<->mach-abs for the precise-sleep RT window
 #include <mach/thread_policy.h> // THREAD_TIME_CONSTRAINT_POLICY: precise (uncoalesced) timer wakeups
 #endif

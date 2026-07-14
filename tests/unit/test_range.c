@@ -17,11 +17,20 @@ int main(void) {
     HL_CHECK(hl_host_address_mapped((uintptr_t)mapping));
     HL_CHECK(hl_host_address_mapped((uintptr_t)mapping + page - 1));
     HL_CHECK(hl_host_range_mapped((uintptr_t)mapping + page - 1, page + 2));
+    hl_host_region region = {0};
+    HL_CHECK(hl_host_region_query((uintptr_t)mapping, &region));
+    HL_CHECK((uintptr_t)mapping >= region.address && (uintptr_t)mapping - region.address < region.size);
+    HL_CHECK((region.protection & (HL_HOST_REGION_READ | HL_HOST_REGION_WRITE)) ==
+             (HL_HOST_REGION_READ | HL_HOST_REGION_WRITE));
+    HL_CHECK(!hl_host_region_query((uintptr_t)mapping, NULL));
+    HL_CHECK(!hl_host_region_query(UINTPTR_MAX, &region));
     HL_CHECK(hl_host_range_mapped(UINTPTR_MAX, 0));
     HL_CHECK(!hl_host_range_mapped(UINTPTR_MAX - 3, 8));
 
     HL_CHECK(munmap(mapping + page, page) == 0);
     HL_CHECK(!hl_host_address_mapped((uintptr_t)mapping + page));
+    HL_CHECK(hl_host_region_query((uintptr_t)mapping + page, &region));
+    HL_CHECK(region.address >= (uintptr_t)mapping + page);
     HL_CHECK(hl_host_page_neighbor_mapped((uintptr_t)mapping + page));
     HL_CHECK(!hl_host_page_neighbor_mapped((uintptr_t)mapping + page + 1));
     HL_CHECK(!hl_host_page_neighbor_mapped(UINTPTR_MAX));
@@ -31,6 +40,8 @@ int main(void) {
 
     HL_CHECK(mprotect(mapping, page, PROT_NONE) == 0);
     HL_CHECK(hl_host_address_mapped((uintptr_t)mapping));
+    HL_CHECK(hl_host_region_query((uintptr_t)mapping, &region));
+    HL_CHECK((region.protection & (HL_HOST_REGION_READ | HL_HOST_REGION_WRITE | HL_HOST_REGION_EXECUTE)) == 0);
     HL_CHECK(munmap(mapping, page) == 0);
     HL_CHECK(munmap(mapping + page * 2, page) == 0);
     return 0;

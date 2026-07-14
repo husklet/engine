@@ -25,7 +25,6 @@
 #include <poll.h>
 #include <signal.h>
 #include <dirent.h>
-#include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
 #include <dlfcn.h>
@@ -41,6 +40,7 @@
 #include "../options.h"
 #include "../cli.h"
 #include "native.h"
+#include "../../host/range.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
 static const hl_host_services *g_host_services;
@@ -393,36 +393,31 @@ static void *exc_thread(void *arg) {
             b[130 + sl] = sn[sl];
             sl++;
         }
-        mach_vm_address_t raddr = st.__pc;
-        mach_vm_size_t rsz = 0;
-        vm_region_basic_info_data_64_t rinfo;
-        mach_msg_type_number_t ricnt = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t robj = MACH_PORT_NULL;
-        kern_return_t rkr = mach_vm_region(mach_task_self(), &raddr, &rsz, VM_REGION_BASIC_INFO_64,
-                                           (vm_region_info_t)&rinfo, &ricnt, &robj);
+        hl_host_region region = {0};
+        int region_found = hl_host_region_query(st.__pc, &region);
         // Append the GUEST pc (x28 is the reserved CPUREG -> struct cpu*), so a guest `brk`/fault maps to a
         // guest instruction, not just the host JIT pc. Guarded: x28 may not be a cpu ptr outside the cache.
         int bp = 130 + sl;
         memcpy(b + bp, " rkr=0x", 7);
         bp += 7;
-        diag_hx8(b + bp, rkr);
+        diag_hx8(b + bp, region_found ? 0 : 1);
         bp += 8;
-        if (rkr == KERN_SUCCESS) {
+        if (region_found) {
             memcpy(b + bp, " rbase=0x", 9);
             bp += 9;
-            diag_hx(b + bp, raddr);
+            diag_hx(b + bp, region.address);
             bp += 16;
             memcpy(b + bp, " rsz=0x", 7);
             bp += 7;
-            diag_hx(b + bp, rsz);
+            diag_hx(b + bp, region.size);
             bp += 16;
             memcpy(b + bp, " prot=0x", 8);
             bp += 8;
-            diag_hx8(b + bp, (uint32_t)rinfo.protection);
+            diag_hx8(b + bp, region.protection);
             bp += 8;
             memcpy(b + bp, " rmap=0x", 8);
             bp += 8;
-            diag_hx8(b + bp, (st.__pc >= raddr && st.__pc < raddr + rsz) ? 1 : 0);
+            diag_hx8(b + bp, (st.__pc >= region.address && st.__pc - region.address < region.size) ? 1 : 0);
             bp += 8;
         }
         memcpy(b + bp, " gpc=0x", 7);

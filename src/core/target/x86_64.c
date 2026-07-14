@@ -56,7 +56,6 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <stdatomic.h>
-#include <libkern/OSCacheControl.h>
 
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
