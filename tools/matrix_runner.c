@@ -136,8 +136,8 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         }
         if (strcmp(fields[11], "active") != 0 || *case_count == CASE_MAX || !relative_path(fields[2]) ||
             !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
-            (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) ||
-            !valid_environment(fields[7]) || parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
+            (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
+            parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
         cases[*case_count].needs_rootfs = strstr(fields[10], "alpine-rootfs") != NULL;
         cases[*case_count].argument[0] = 0;
