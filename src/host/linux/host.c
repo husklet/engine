@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 
-#include "hl/host_linux.h"
+#include "hl/linux.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -44,12 +44,55 @@ typedef struct hl_linux_handle_entry {
     uint64_t size;
     int wake_descriptor;
     uint32_t process_reaped;
+    uint32_t process_waiting;
+    uint32_t process_waiters;
+    uint32_t process_exit_kind;
+    uint32_t process_exit_value;
 } hl_linux_handle_entry;
 
 struct hl_host_linux {
     pthread_mutex_t lock;
+    pthread_cond_t process_changed;
+    uint32_t destroying;
     hl_linux_handle_entry handles[HL_LINUX_HANDLE_CAPACITY];
 };
+
+static uint64_t hl_linux_monotonic_value(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static void hl_linux_sleep_until(uint64_t deadline_ns) {
+    uint64_t now = hl_linux_monotonic_value();
+    struct timespec delay;
+    uint64_t remaining;
+    if (now >= deadline_ns) return;
+    remaining = deadline_ns - now;
+    if (remaining > UINT64_C(1000000)) remaining = UINT64_C(1000000);
+    delay.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
+    delay.tv_nsec = (long)(remaining % UINT64_C(1000000000));
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
+
+static void hl_linux_process_changed_wait(hl_host_linux *host, uint64_t deadline_ns) {
+    struct timespec realtime;
+    uint64_t now;
+    uint64_t remaining;
+    uint64_t absolute;
+    if (deadline_ns == HL_HOST_DEADLINE_INFINITE) {
+        pthread_cond_wait(&host->process_changed, &host->lock);
+        return;
+    }
+    now = hl_linux_monotonic_value();
+    if (now >= deadline_ns) return;
+    remaining = deadline_ns - now;
+    clock_gettime(CLOCK_REALTIME, &realtime);
+    absolute = (uint64_t)realtime.tv_sec * UINT64_C(1000000000) + (uint64_t)realtime.tv_nsec + remaining;
+    realtime.tv_sec = (time_t)(absolute / UINT64_C(1000000000));
+    realtime.tv_nsec = (long)(absolute % UINT64_C(1000000000));
+    pthread_cond_timedwait(&host->process_changed, &host->lock, &realtime);
+}
 
 static hl_host_result hl_linux_result(hl_status status, uint64_t value, uint64_t detail) {
     return (hl_host_result){status, 1, value, detail};
@@ -779,21 +822,57 @@ static hl_host_result hl_linux_process_wait(void *context, hl_host_handle handle
     int options;
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
-    pid = entry != NULL && !entry->process_reaped ? entry->descriptor : -1;
+    if (entry == NULL || host->destroying) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    entry->process_waiters++;
+    while (entry != NULL && entry->process_waiting && !entry->process_reaped) {
+        if (deadline_ns == 0 ||
+            (deadline_ns != HL_HOST_DEADLINE_INFINITE && hl_linux_monotonic_value() >= deadline_ns)) {
+            entry->process_waiters--;
+            pthread_cond_broadcast(&host->process_changed);
+            pthread_mutex_unlock(&host->lock);
+            return hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+        }
+        hl_linux_process_changed_wait(host, deadline_ns);
+        entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
+    }
+    if (entry != NULL && entry->process_reaped) {
+        hl_host_result result = hl_linux_result(HL_STATUS_OK, entry->process_exit_value, entry->process_exit_kind);
+        entry->process_waiters--;
+        pthread_cond_broadcast(&host->process_changed);
+        pthread_mutex_unlock(&host->lock);
+        return result;
+    }
+    pid = entry != NULL ? entry->descriptor : -1;
+    if (entry != NULL) entry->process_waiting = 1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (deadline_ns != 0 && deadline_ns != HL_HOST_DEADLINE_INFINITE)
-        return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
-    options = deadline_ns == 0 ? WNOHANG : 0;
-    do {
-        waited = waitpid(pid, &status, options);
-    } while (waited < 0 && errno == EINTR);
-    if (waited == 0) return hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0);
-    if (waited < 0) return hl_linux_errno_result();
+    options = deadline_ns == HL_HOST_DEADLINE_INFINITE ? 0 : WNOHANG;
+    for (;;) {
+        do {
+            waited = waitpid(pid, &status, options);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != 0) break;
+        if (deadline_ns == 0 || hl_linux_monotonic_value() >= deadline_ns) break;
+        hl_linux_sleep_until(deadline_ns);
+    }
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
-    if (entry != NULL) entry->process_reaped = 1;
+    if (entry != NULL) {
+        entry->process_waiting = 0;
+        entry->process_waiters--;
+    }
+    if (waited > 0 && entry != NULL) {
+        entry->process_reaped = 1;
+        entry->process_exit_kind = WIFEXITED(status) ? HL_HOST_PROCESS_EXIT_CODE : HL_HOST_PROCESS_EXIT_SIGNAL;
+        entry->process_exit_value = WIFEXITED(status) ? (uint32_t)WEXITSTATUS(status) : (uint32_t)WTERMSIG(status);
+    }
+    pthread_cond_broadcast(&host->process_changed);
     pthread_mutex_unlock(&host->lock);
+    if (waited == 0) return hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+    if (waited < 0) return hl_linux_errno_result();
     if (WIFEXITED(status))
         return hl_linux_result(HL_STATUS_OK, (uint64_t)WEXITSTATUS(status), HL_HOST_PROCESS_EXIT_CODE);
     if (WIFSIGNALED(status))
@@ -809,7 +888,7 @@ static hl_host_result hl_linux_process_terminate(void *context, hl_host_handle h
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
-    pid = entry != NULL && !entry->process_reaped ? entry->descriptor : -1;
+    pid = entry != NULL && !entry->process_reaped && !host->destroying ? entry->descriptor : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (kill(pid, reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT : SIGKILL) != 0)
@@ -826,13 +905,15 @@ static hl_host_result hl_linux_process_close(void *context, hl_host_handle handl
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    if (!entry->process_reaped) {
+    if (host->destroying || !entry->process_reaped || entry->process_waiting || entry->process_waiters != 0) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_BUSY, 0, 0);
     }
     entry->kind = HL_LINUX_HANDLE_NONE;
     entry->descriptor = -1;
     entry->process_reaped = 0;
+    entry->process_exit_kind = 0;
+    entry->process_exit_value = 0;
     pthread_mutex_unlock(&host->lock);
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
@@ -870,6 +951,11 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (pthread_cond_init(&host->process_changed, NULL) != 0) {
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
         host->handles[i].descriptor = -1;
         host->handles[i].wake_descriptor = -1;
@@ -895,6 +981,20 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
 void hl_host_linux_destroy(hl_host_linux *host) {
     uint32_t i;
     if (host == NULL) return;
+    pthread_mutex_lock(&host->lock);
+    host->destroying = 1;
+    for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
+        hl_linux_handle_entry *entry = &host->handles[i];
+        if (entry->kind == HL_LINUX_HANDLE_PROCESS && !entry->process_reaped) kill(entry->descriptor, SIGKILL);
+    }
+    for (;;) {
+        uint32_t waiters = 0;
+        for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i)
+            waiters += host->handles[i].process_waiters;
+        if (waiters == 0) break;
+        pthread_cond_wait(&host->process_changed, &host->lock);
+    }
+    pthread_mutex_unlock(&host->lock);
     for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
@@ -912,6 +1012,7 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);
         }
     }
+    pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->lock);
     free(host);
 }

@@ -18,7 +18,7 @@ int main(void) {
     size_t value_size;
     size_t argument_count;
 
-    HL_CHECK(sizeof(hl_launch_config) == 128);
+    HL_CHECK(sizeof(hl_launch_config) == 152);
     HL_CHECK(offsetof(hl_launch_config, magic) == 0);
     HL_CHECK(offsetof(hl_launch_config, pool_size) == 4);
     HL_CHECK(offsetof(hl_launch_config, header_size) == 8);

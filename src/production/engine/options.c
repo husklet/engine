@@ -3,11 +3,17 @@
 typedef struct hl_option_definition {
     const char *name;
     const char *purpose;
+    char *value;
+    size_t value_size;
 } hl_option_definition;
 
-#define HL_RUNTIME_OPTION(name, purpose) {name, purpose}
+#define HL_RUNTIME_OPTION(name, purpose) {name, purpose, NULL, 0}
 
-static const hl_option_definition hl_option_definitions[] = {
+enum { HL_OPTION_STORE_LIMIT = 64 * 1024 * 1024 };
+
+static size_t hl_option_store_size;
+
+static hl_option_definition hl_option_definitions[] = {
     /* Typed launch state and operational choices consumed by production code. */
     HL_RUNTIME_OPTION("HL_CHECKPOINT_DIR", "directory receiving an explicitly requested checkpoint"),
     HL_RUNTIME_OPTION("HL_CPUS", "guest-visible CPU quota"),
@@ -45,7 +51,7 @@ static const hl_option_definition hl_option_definitions[] = {
     HL_RUNTIME_OPTION("HL_VOLUMES", "guest volume mount specification"),
 };
 
-static const hl_option_definition *hl_option_find(const char *name) {
+static hl_option_definition *hl_option_find(const char *name) {
     size_t index;
     if (name == NULL) return NULL;
     for (index = 0; index < sizeof hl_option_definitions / sizeof hl_option_definitions[0]; index++)
@@ -54,19 +60,60 @@ static const hl_option_definition *hl_option_find(const char *name) {
 }
 
 static const char *hl_option_get(const char *name) {
-    const hl_option_definition *definition = hl_option_find(name);
+    hl_option_definition *definition = hl_option_find(name);
     if (definition == NULL) return NULL;
-    return getenv(definition->name);
+    return definition->value;
+}
+
+static size_t hl_option_value_size(const char *value) {
+    size_t length;
+    for (length = 0; length < HL_OPTION_STORE_LIMIT; length++)
+        if (value[length] == 0) return length + 1;
+    return 0;
 }
 
 static int hl_option_set(const char *name, const char *value, int overwrite) {
-    const hl_option_definition *definition = hl_option_find(name);
-    if (definition == NULL) return -1;
-    return setenv(definition->name, value, overwrite);
+    hl_option_definition *definition = hl_option_find(name);
+    size_t value_size;
+    char *copy;
+    if (definition == NULL || value == NULL) return -1;
+    if (!overwrite && definition->value != NULL) return 0;
+    value_size = hl_option_value_size(value);
+    if (value_size == 0 || hl_option_store_size - definition->value_size > HL_OPTION_STORE_LIMIT - value_size)
+        return -1;
+    copy = (char *)malloc(value_size);
+    if (copy == NULL) return -1;
+    memcpy(copy, value, value_size);
+    free(definition->value);
+    definition->value = copy;
+    hl_option_store_size = hl_option_store_size - definition->value_size + value_size;
+    definition->value_size = value_size;
+    return 0;
 }
 
 static int hl_option_unset(const char *name) {
-    const hl_option_definition *definition = hl_option_find(name);
+    hl_option_definition *definition = hl_option_find(name);
     if (definition == NULL) return -1;
-    return unsetenv(definition->name);
+    free(definition->value);
+    definition->value = NULL;
+    hl_option_store_size -= definition->value_size;
+    definition->value_size = 0;
+    return 0;
+}
+
+static void hl_option_reset(void) {
+    size_t index;
+    for (index = 0; index < sizeof hl_option_definitions / sizeof hl_option_definitions[0]; index++) {
+        free(hl_option_definitions[index].value);
+        hl_option_definitions[index].value = NULL;
+        hl_option_definitions[index].value_size = 0;
+    }
+    hl_option_store_size = 0;
+#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
+    /* Debug builds alone may opt into diagnostics from the process environment. */
+    {
+        const char *selector = getenv("HL_LOG");
+        if (selector != NULL) (void)hl_option_set("HL_LOG", selector, 1);
+    }
+#endif
 }

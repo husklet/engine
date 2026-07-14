@@ -860,6 +860,7 @@ int main(int argc, char **argv) {
 int hl_engine_entry(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;
+    hl_option_reset();
     // Final-product launch: the host provides one serialized, validated HL config file.
     if (argc > 2 && strcmp(argv[1], "--configfile") == 0) return hl_run_config_file(argv[2]);
     // fork-server dispatch (gated; standalone path untouched when neither flag is present):

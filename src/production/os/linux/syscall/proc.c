@@ -10,20 +10,20 @@
 #define G_FORK_PRESERVE(c) ((void)0)
 #endif
 
-// execve env forwarding: serialize the guest's envp array into DD_GUEST_ENV (the "K=V\nK=V..." string
+// execve env forwarding: serialize the guest's envp array into HL_GUEST_ENV (the "K=V\nK=V..." string
 // build_stack reads when laying out the new process stack), so the guest's actual environment crosses the
 // re-exec. A guest-initiated exec makes the guest's envp AUTHORITATIVE (like Linux): whatever the guest
 // passes -- including an EMPTY set for envp==NULL -- is EXACTLY what the new program sees. We mark it with
-// DD_GUEST_ENV_EXACT so build_stack injects NONE of the engine's fallback defaults (PATH/HOME/LANG/
+// HL_GUEST_ENV_EXACT so build_stack injects NONE of the engine's fallback defaults (PATH/HOME/LANG/
 // GLIBC_TUNABLES). Those defaults are only appropriate on the INITIAL container launch (the daemon never
-// sets DD_GUEST_ENV_EXACT); a guest execve that curates its env -- or clears it -- must match Linux, where
+// sets HL_GUEST_ENV_EXACT); a guest execve that curates its env -- or clears it -- must match Linux, where
 // `execve(path, argv, NULL)` yields an empty environment and `execve(path,argv,["FOO=bar"])` yields exactly
 // one entry. Each pointer may be a low non-PIE address, so rebase the array base and every element with
 // nonpie_p(), exactly as the argv loop does. hl_option_set() copies the buffer, so it survives the teardown.
 static void exec_forward_env(uint64_t envp_guest) {
     if (!envp_guest) {
         // Linux: NULL envp -> the new program runs with an EMPTY environment. Publish an empty, authoritative
-        // env (do NOT leak the container's stale/default DD_GUEST_ENV) and flag it EXACT so build_stack adds
+        // env (do not leak stale initial HL_GUEST_ENV data) and flag it exact so build_stack adds
         // no defaults -> the guest sees envc==0, byte-exact with the native oracle.
         hl_option_set("HL_GUEST_ENV", "", 1);
         hl_option_set("HL_GUEST_ENV_ESC", "1", 1);
@@ -38,7 +38,7 @@ static void exec_forward_env(uint64_t envp_guest) {
     for (int i = 0; ev[i]; i++) {
         const char *e = (const char *)nonpie_p(ev[i]);
         size_t el = strlen(e);
-        // '\n' is DD_GUEST_ENV's record separator, but Linux permits newline (and any non-NUL byte) INSIDE an
+        // '\n' is HL_GUEST_ENV's record separator, but Linux permits newline (and any non-NUL byte) inside an
         // env value. Escape '\\'->"\\\\" and '\n'->"\\n" so a raw '\n' only ever marks a record boundary;
         // build_stack unescapes when DD_GUEST_ENV_ESC=1. Worst case each byte becomes 2 -> reserve 2*el+2.
         if (len + 2 * el + 2 > cap) {
@@ -62,7 +62,7 @@ static void exec_forward_env(uint64_t envp_guest) {
                 buf[len++] = ch;
             }
         }
-        buf[len++] = '\n'; // DD_GUEST_ENV record separator (build_stack splits on '\n')
+        buf[len++] = '\n'; // HL_GUEST_ENV record separator (build_stack splits on '\n')
         buf[len] = 0;
     }
     hl_option_set("HL_GUEST_ENV", buf, 1);

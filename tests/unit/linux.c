@@ -1,8 +1,9 @@
 #include "test.h"
 
-#include "hl/host_linux.h"
+#include "hl/linux.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,6 +37,19 @@ static int32_t process_pause(void *context) {
 typedef struct cleanup_probe {
     int descriptor;
 } cleanup_probe;
+
+typedef struct process_wait_context {
+    const hl_host_services *services;
+    hl_host_handle process;
+    hl_host_result result;
+} process_wait_context;
+
+static void *wait_for_process(void *opaque) {
+    process_wait_context *waiter = opaque;
+    waiter->result =
+        waiter->services->process->wait(waiter->services->context, waiter->process, HL_HOST_DEADLINE_INFINITE);
+    return NULL;
+}
 
 static int32_t process_cleanup_probe(void *opaque) {
     cleanup_probe *probe = opaque;
@@ -139,11 +153,37 @@ int main(void) {
     process = services.process->spawn_cloned(services.context, process_sleep, (void *)(intptr_t)200000000);
     HL_CHECK(process.status == HL_STATUS_OK);
     HL_CHECK(services.process->wait(services.context, process.value, 0).status == HL_STATUS_WOULD_BLOCK);
+    {
+        uint64_t deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(20000000);
+        HL_CHECK(services.process->wait(services.context, process.value, deadline).status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline);
+    }
     HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_BUSY);
     process_result = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
     HL_CHECK(process_result.status == HL_STATUS_OK && process_result.detail == HL_HOST_PROCESS_EXIT_CODE &&
              process_result.value == 9);
     HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+
+    {
+        process_wait_context first = {&services, 0, {0}};
+        process_wait_context second = {&services, 0, {0}};
+        pthread_t first_thread;
+        pthread_t second_thread;
+        process = services.process->spawn_cloned(services.context, process_pause, NULL);
+        HL_CHECK(process.status == HL_STATUS_OK);
+        first.process = process.value;
+        second.process = process.value;
+        HL_CHECK(pthread_create(&first_thread, NULL, wait_for_process, &first) == 0);
+        HL_CHECK(pthread_create(&second_thread, NULL, wait_for_process, &second) == 0);
+        HL_CHECK(services.process->terminate(services.context, process.value, HL_HOST_PROCESS_TERMINATE_FORCE).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(pthread_join(first_thread, NULL) == 0 && pthread_join(second_thread, NULL) == 0);
+        HL_CHECK(first.result.status == HL_STATUS_OK && second.result.status == HL_STATUS_OK &&
+                 first.result.detail == HL_HOST_PROCESS_EXIT_SIGNAL && second.result.detail == first.result.detail &&
+                 first.result.value == SIGKILL && second.result.value == first.result.value);
+        HL_CHECK(services.process->wait(services.context, process.value, 0).value == SIGKILL);
+        HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+    }
 
     process = services.process->spawn_cloned(services.context, process_pause, NULL);
     HL_CHECK(process.status == HL_STATUS_OK);
@@ -160,16 +200,25 @@ int main(void) {
     {
         int descriptors[2];
         cleanup_probe probe;
+        process_wait_context cleanup_waiter = {&services, 0, {0}};
+        pthread_t cleanup_thread;
+        struct timespec settle = {0, 10000000};
         pid_t child;
         int status;
         HL_CHECK(pipe(descriptors) == 0);
         probe.descriptor = descriptors[1];
         process = services.process->spawn_cloned(services.context, process_cleanup_probe, &probe);
         HL_CHECK(process.status == HL_STATUS_OK);
+        cleanup_waiter.process = process.value;
+        HL_CHECK(pthread_create(&cleanup_thread, NULL, wait_for_process, &cleanup_waiter) == 0);
         close(descriptors[1]);
         HL_CHECK(read(descriptors[0], &child, sizeof(child)) == (ssize_t)sizeof(child));
         close(descriptors[0]);
+        nanosleep(&settle, NULL);
         hl_host_linux_destroy(linux_host);
+        HL_CHECK(pthread_join(cleanup_thread, NULL) == 0);
+        HL_CHECK(cleanup_waiter.result.status == HL_STATUS_OK &&
+                 cleanup_waiter.result.detail == HL_HOST_PROCESS_EXIT_SIGNAL && cleanup_waiter.result.value == SIGKILL);
         errno = 0;
         HL_CHECK(waitpid(child, &status, WNOHANG) == -1 && errno == ECHILD);
     }

@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "hl/fake_host.h"
+#include "hl/fake.h"
 #include "hl/linux_abi.h"
 
 #include <string.h>

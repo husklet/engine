@@ -1,5 +1,5 @@
-#ifndef HL_HOST_LINUX_H
-#define HL_HOST_LINUX_H
+#ifndef HL_LINUX_H
+#define HL_LINUX_H
 
 #include "hl/host_services.h"
 

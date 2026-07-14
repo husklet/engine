@@ -1,5 +1,5 @@
-#ifndef HL_HOST_MACOS_H
-#define HL_HOST_MACOS_H
+#ifndef HL_MACOS_H
+#define HL_MACOS_H
 
 #include "hl/host_services.h"
 

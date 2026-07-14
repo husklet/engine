@@ -1,5 +1,5 @@
 #include "hl/engine.h"
-#include "hl/host_macos.h"
+#include "hl/macos.h"
 
 #include <stdio.h>
 #include <pthread.h>

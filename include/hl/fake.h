@@ -1,5 +1,5 @@
-#ifndef HL_FAKE_HOST_H
-#define HL_FAKE_HOST_H
+#ifndef HL_FAKE_H
+#define HL_FAKE_H
 
 #include "hl/host_services.h"
 

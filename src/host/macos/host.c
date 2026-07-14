@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 
-#include "hl/host_macos.h"
+#include "hl/macos.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,14 +43,57 @@ typedef struct hl_macos_process {
     uint32_t active;
     pid_t pid;
     uint32_t reaped;
+    uint32_t waiting;
+    uint32_t waiters;
+    uint32_t exit_kind;
+    uint32_t exit_value;
 } hl_macos_process;
 
 struct hl_host_macos {
     pthread_mutex_t lock;
+    pthread_cond_t process_changed;
+    uint32_t destroying;
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
 };
+
+static uint64_t hl_macos_monotonic_value(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static void hl_macos_sleep_until(uint64_t deadline_ns) {
+    uint64_t now = hl_macos_monotonic_value();
+    uint64_t remaining;
+    struct timespec delay;
+    if (now >= deadline_ns) return;
+    remaining = deadline_ns - now;
+    if (remaining > UINT64_C(1000000)) remaining = UINT64_C(1000000);
+    delay.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
+    delay.tv_nsec = (long)(remaining % UINT64_C(1000000000));
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
+
+static void hl_macos_process_changed_wait(hl_host_macos *host, uint64_t deadline_ns) {
+    struct timespec realtime;
+    uint64_t now;
+    uint64_t remaining;
+    uint64_t absolute;
+    if (deadline_ns == HL_HOST_DEADLINE_INFINITE) {
+        pthread_cond_wait(&host->process_changed, &host->lock);
+        return;
+    }
+    now = hl_macos_monotonic_value();
+    if (now >= deadline_ns) return;
+    remaining = deadline_ns - now;
+    clock_gettime(CLOCK_REALTIME, &realtime);
+    absolute = (uint64_t)realtime.tv_sec * UINT64_C(1000000000) + (uint64_t)realtime.tv_nsec + remaining;
+    realtime.tv_sec = (time_t)(absolute / UINT64_C(1000000000));
+    realtime.tv_nsec = (long)(absolute % UINT64_C(1000000000));
+    pthread_cond_timedwait(&host->process_changed, &host->lock, &realtime);
+}
 
 static hl_host_result hl_macos_result(hl_status status, uint64_t value, uint64_t detail) {
     return (hl_host_result){(int32_t)status, 2, value, detail};
@@ -502,6 +545,10 @@ static hl_host_result hl_macos_process_spawn(void *context, hl_host_process_entr
         process->active = 1;
         process->pid = pid;
         process->reaped = 0;
+        process->waiting = 0;
+        process->waiters = 0;
+        process->exit_kind = 0;
+        process->exit_value = 0;
         handle = hl_macos_handle(index, process->generation);
         break;
     }
@@ -524,21 +571,57 @@ static hl_host_result hl_macos_process_wait(void *context, hl_host_handle handle
     int options;
     pthread_mutex_lock(&host->lock);
     process = hl_macos_process_lookup(host, handle);
+    if (process == NULL || host->destroying) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    process->waiters++;
+    while (process != NULL && process->waiting && !process->reaped) {
+        if (deadline_ns == 0 ||
+            (deadline_ns != HL_HOST_DEADLINE_INFINITE && hl_macos_monotonic_value() >= deadline_ns)) {
+            process->waiters--;
+            pthread_cond_broadcast(&host->process_changed);
+            pthread_mutex_unlock(&host->lock);
+            return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+        }
+        hl_macos_process_changed_wait(host, deadline_ns);
+        process = hl_macos_process_lookup(host, handle);
+    }
+    if (process != NULL && process->reaped) {
+        hl_host_result result = hl_macos_result(HL_STATUS_OK, process->exit_value, process->exit_kind);
+        process->waiters--;
+        pthread_cond_broadcast(&host->process_changed);
+        pthread_mutex_unlock(&host->lock);
+        return result;
+    }
     pid = process != NULL ? process->pid : -1;
+    if (process != NULL) process->waiting = 1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (deadline_ns != 0 && deadline_ns != HL_HOST_DEADLINE_INFINITE)
-        return hl_macos_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
-    options = deadline_ns == 0 ? WNOHANG : 0;
-    do {
-        waited = waitpid(pid, &status, options);
-    } while (waited < 0 && errno == EINTR);
-    if (waited == 0) return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
-    if (waited < 0) return hl_macos_errno();
+    options = deadline_ns == HL_HOST_DEADLINE_INFINITE ? 0 : WNOHANG;
+    for (;;) {
+        do {
+            waited = waitpid(pid, &status, options);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != 0) break;
+        if (deadline_ns == 0 || hl_macos_monotonic_value() >= deadline_ns) break;
+        hl_macos_sleep_until(deadline_ns);
+    }
     pthread_mutex_lock(&host->lock);
     process = hl_macos_process_lookup(host, handle);
-    if (process != NULL) process->reaped = 1;
+    if (process != NULL) {
+        process->waiting = 0;
+        process->waiters--;
+    }
+    if (waited > 0 && process != NULL) {
+        process->reaped = 1;
+        process->exit_kind = WIFEXITED(status) ? HL_HOST_PROCESS_EXIT_CODE : HL_HOST_PROCESS_EXIT_SIGNAL;
+        process->exit_value = WIFEXITED(status) ? (uint32_t)WEXITSTATUS(status) : (uint32_t)WTERMSIG(status);
+    }
+    pthread_cond_broadcast(&host->process_changed);
     pthread_mutex_unlock(&host->lock);
+    if (waited == 0) return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+    if (waited < 0) return hl_macos_errno();
     if (WIFEXITED(status))
         return hl_macos_result(HL_STATUS_OK, (uint64_t)WEXITSTATUS(status), HL_HOST_PROCESS_EXIT_CODE);
     if (WIFSIGNALED(status))
@@ -554,7 +637,7 @@ static hl_host_result hl_macos_process_terminate(void *context, hl_host_handle h
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     process = hl_macos_process_lookup(host, handle);
-    pid = process != NULL ? process->pid : -1;
+    pid = process != NULL && !process->reaped && !host->destroying ? process->pid : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (kill(pid, reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT : SIGKILL) != 0) return hl_macos_errno();
@@ -570,13 +653,15 @@ static hl_host_result hl_macos_process_close(void *context, hl_host_handle handl
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    if (!process->reaped) {
+    if (host->destroying || !process->reaped || process->waiting || process->waiters != 0) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_BUSY, 0, 0);
     }
     process->active = 0;
     process->pid = -1;
     process->reaped = 0;
+    process->exit_kind = 0;
+    process->exit_value = 0;
     pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
@@ -619,6 +704,11 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (pthread_cond_init(&host->process_changed, NULL) != 0) {
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
@@ -636,6 +726,20 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
 void hl_host_macos_destroy(hl_host_macos *host) {
     uint32_t index;
     if (host == NULL) return;
+    pthread_mutex_lock(&host->lock);
+    host->destroying = 1;
+    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+        hl_macos_process *process = &host->processes[index];
+        if (process->active && !process->reaped) kill(process->pid, SIGKILL);
+    }
+    for (;;) {
+        uint32_t waiters = 0;
+        for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index)
+            waiters += host->processes[index].waiters;
+        if (waiters == 0) break;
+        pthread_cond_wait(&host->process_changed, &host->lock);
+    }
+    pthread_mutex_unlock(&host->lock);
     for (index = 0; index < HL_MACOS_MAPPING_CAPACITY; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) continue;
@@ -656,6 +760,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         kill(process->pid, SIGKILL);
         while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
     }
+    pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->lock);
     free(host);
 }

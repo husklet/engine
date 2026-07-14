@@ -1,4 +1,4 @@
-#include "hl/fake_host.h"
+#include "hl/fake.h"
 
 #include <string.h>
 #include <sched.h>

@@ -249,6 +249,38 @@ static struct {
 
 static int g_fsrv_ls = -1, g_fsrv_kq = -1;
 
+static int hl_forkserver_guest_environment(char *const envv[]) {
+    size_t size = 1;
+    size_t offset = 0;
+    char *serialized;
+    int index;
+    for (index = 0; envv != NULL && envv[index] != NULL; index++) {
+        size_t length = strlen(envv[index]);
+        if (length > (SIZE_MAX - size - 1) / 2) return -1;
+        size += length * 2 + 1;
+    }
+    serialized = (char *)malloc(size);
+    if (serialized == NULL) return -1;
+    for (index = 0; envv != NULL && envv[index] != NULL; index++) {
+        const char *input = envv[index];
+        while (*input != 0) {
+            if (*input == '\\' || *input == '\n') serialized[offset++] = '\\';
+            serialized[offset++] = *input == '\n' ? 'n' : *input;
+            input++;
+        }
+        serialized[offset++] = '\n';
+    }
+    serialized[offset] = 0;
+    if (hl_option_set("HL_GUEST_ENV", serialized, 1) != 0) {
+        free(serialized);
+        return -1;
+    }
+    free(serialized);
+    if (hl_option_set("HL_GUEST_ENV_ESC", "1", 1) != 0 || hl_option_set("HL_GUEST_ENV_EXACT", "1", 1) != 0)
+        return -1;
+    return 0;
+}
+
 static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **argv, char **envv, const char *cwd) {
     // Shed every server-side fd so nothing leaks into the guest's fd table: the listener, the kqueue
     // slot (kqueues are not inherited across fork, but the fd number is), every concurrently live
@@ -271,14 +303,8 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     if (nfd >= 3 && fds[2] != 2) dup2(fds[2], 2);
     for (int i = 0; i < nfd; i++)
         if (fds[i] > 2) close(fds[i]);
-    // Adopt the client's environment WHOLESALE (guest envp is built from environ) + its cwd, so
-    // `FOO=bar cd dir && ddjit --client ...` behaves exactly like the standalone engine invocation.
-    static char *envvec[FSRV_MAXENV + 1];
-    int ne = 0;
-    for (; envv && envv[ne] && ne < FSRV_MAXENV; ne++)
-        envvec[ne] = envv[ne];
-    envvec[ne] = NULL;
-    environ = envvec;
+    // The client environment is explicit guest data. It never becomes the engine process environment.
+    if (hl_forkserver_guest_environment(envv) != 0) _exit(125);
     if (cwd && cwd[0] && chdir(cwd) != 0) { /* client dir unreachable server-side: keep server cwd */
     }
     // W^X / APRR per-thread execute state is NOT reliably inherited across fork() on Apple Silicon

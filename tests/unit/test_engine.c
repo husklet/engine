@@ -1,7 +1,7 @@
 #include "test.h"
 
 #include "hl/engine.h"
-#include "hl/fake_host.h"
+#include "hl/fake.h"
 #include "../../src/core/engine_backend.h"
 
 #include <pthread.h>

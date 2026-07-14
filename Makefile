@@ -27,8 +27,8 @@ CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src
 IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
-FAKE_HOST_SOURCES := src/host/fake/fake_host.c
-MACOS_HOST_SOURCES := src/host/macos/host_macos.c
+FAKE_HOST_SOURCES := src/host/fake/host.c
+MACOS_HOST_SOURCES := src/host/macos/host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/%.o)
 TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
@@ -36,13 +36,13 @@ LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
 ifeq ($(HOST),linux)
-LINUX_HOST_SOURCES := src/host/linux/host_linux.c
+LINUX_HOST_SOURCES := src/host/linux/host.c
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := codegen config host_services ir linux_abi engine log xattr_cache
+UNIT_NAMES := codegen config host_services ir linux_abi engine log options xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -129,47 +129,47 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c \
+	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
-		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c \
+	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
-		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
 $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c \
 	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
-	src/host/macos/host_macos.c packaging/macos/jit.entitlements
+	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
 		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/lifecycle_adapter.c \
-		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c \
 	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
-	src/host/macos/host_macos.c packaging/macos/jit.entitlements
+	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
 		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/lifecycle_adapter.c \
-		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
@@ -242,16 +242,16 @@ $(foreach test,$(UNIT_NAMES),$(eval $(call HL_UNIT_RULE,$(test))))
 run-unit-host_linux: $(BUILD)/tests/test_host_linux
 	$<
 
-$(BUILD)/tests/test_host_linux: tests/unit/test_host_linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+$(BUILD)/tests/test_host_linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
-$(BUILD)/tests/test-host-macos: tests/unit/test_host_macos.c src/host/macos/host_macos.c src/core/host_services.c \
-	src/core/log.c include/hl/host_macos.h include/hl/host_services.h
+$(BUILD)/tests/test-host-macos: tests/unit/macos.c src/host/macos/host.c src/core/host_services.c \
+	src/core/log.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/test_host_macos.c \
-		src/host/macos/host_macos.c src/core/host_services.c src/core/log.c -o $@
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
+		src/host/macos/host.c src/core/host_services.c src/core/log.c -o $@
 
 test-macos-host: $(BUILD)/tests/test-host-macos
 	$(MAC) $(abspath $<)

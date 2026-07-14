@@ -432,17 +432,17 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, argv[i], l);
         argp[i] = (uint64_t)top;
     }
-    // The container's env arrives as DD_GUEST_ENV="K=V\nK=V\n…" (set by the daemon / forwarded across
+    // The container's env arrives as HL_GUEST_ENV="K=V\nK=V\n…" (set by launch config / forwarded across
     // execve by exec_forward_env). Forward EXACTLY those FIRST so they override the built-in defaults; the
     // defaults then fill ONLY the keys the container didn't set (match on the "KEY=" prefix). Mirrors the
     // shared aarch64 build_stack (os/linux/elf.c) -- without this, x86 guests ignored the container env.
     const char *estr[256];
     const char *ge = hl_option_get("HL_GUEST_ENV");
     char *gecopy = NULL;
-    // execve() escape-encodes records (DD_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
+    // execve() escape-encodes records (HL_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
     // record separator -- unescape "\\n"->'\n' and "\\\\"->'\\' after splitting. Mirrors os/linux/elf.c.
     int env_escaped = (hl_option_get("HL_GUEST_ENV_ESC") != NULL);
-    // Guest-initiated execve makes its envp authoritative (exec_forward_env sets DD_GUEST_ENV_EXACT): forward
+    // Guest-initiated execve makes its envp authoritative (exec_forward_env sets HL_GUEST_ENV_EXACT): forward
     // it verbatim and inject NO fallback defaults, so NULL/curated envp matches Linux. Mirrors os/linux/elf.c.
     int env_exact = (hl_option_get("HL_GUEST_ENV_EXACT") != NULL);
     if (ge) {

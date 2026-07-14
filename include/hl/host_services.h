@@ -176,7 +176,12 @@ typedef struct hl_host_process_services {
     HL_ABI_HEADER;
     /* Run an already-loaded entry in an isolated clone of the current process. */
     hl_host_result (*spawn_cloned)(void *context, hl_host_process_entry entry, void *entry_context);
-    /* On success, value is the exit value and detail is hl_host_process_exit_kind. */
+    /*
+     * deadline_ns is an absolute host monotonic-clock timestamp. Zero polls and
+     * HL_HOST_DEADLINE_INFINITE blocks without a deadline. Completion is retained
+     * until close, so concurrent and repeated waiters receive the same result.
+     * On success, value is the exit value and detail is hl_host_process_exit_kind.
+     */
     hl_host_result (*wait)(void *context, hl_host_handle process, uint64_t deadline_ns);
     hl_host_result (*terminate)(void *context, hl_host_handle process, uint32_t reason);
     hl_host_result (*close)(void *context, hl_host_handle process);

@@ -4,7 +4,7 @@
 // A host launcher serializes the container into the position-independent hl_launch_config wire buffer
 // and spawns the architecture-matching Linux engine as `<engine> --configfile <path>`. This is the engine
 // side: open, unlink, read, and validate the buffer, then translate
-// every populated field into the centralized `HL_*` option registry, rebuilds the guest argv, and enters
+// every populated field into the process-local option store, rebuilds the guest argv, and enters
 // the Linux guest engine.
 #include <errno.h>
 #include <fcntl.h>
@@ -61,6 +61,11 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->filesystem_generation_offset,
         config->egress_proxy_offset,
         config->debug_log_offset,
+        config->checkpoint_directory_offset,
+        config->restore_directory_offset,
+        config->chrome_window_size_offset,
+        config->gpu_bridge_name_offset,
+        config->gpu_pool_offset,
     };
     size_t i;
     for (i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
@@ -118,7 +123,7 @@ static int hl_read_config_file(int fd) {
     char num[32];
     const char *s;
 
-    // scalars -> the same env vars container_init()/container_read_resource_env() read.
+    // Scalars populate the same process-local values container initialization reads.
     if (cfg.memory_limit) {
         snprintf(num, sizeof num, "%llu", (unsigned long long)cfg.memory_limit);
         hl_option_set("HL_MEM_MAX", num, 1);
@@ -138,6 +143,10 @@ static int hl_read_config_file(int fd) {
     // gpu_iosurface_on()); carrying it in the typed config — not the ambient host env — is what makes it
     // reach the engine reliably (the FFI/bridge does not forward the launcher's ambient environment).
     if (cfg.gpu_enabled) hl_option_set("HL_GPU_IOSURFACE", "1", 1);
+    if (cfg.gpu_pool_capacity) {
+        snprintf(num, sizeof num, "%u", cfg.gpu_pool_capacity);
+        hl_option_set("HL_GPU_POOL_N", num, 1);
+    }
     if (cfg.uid >= 0) {
         snprintf(num, sizeof num, "%d", cfg.uid);
         hl_option_set("HL_UID", num, 1);
@@ -147,7 +156,7 @@ static int hl_read_config_file(int fd) {
         hl_option_set("HL_GID", num, 1);
     }
 
-    // pooled strings -> the same env vars (decode via offsets; "" means unset -> leave the env untouched).
+    // Pooled strings are copied by hl_option_set; an empty field leaves the option unset.
     s = launch_string(&cfg, pool, cfg.hostname_offset);
     if (s[0]) hl_option_set("HL_HOSTNAME", s, 1);
     s = launch_string(&cfg, pool, cfg.limits_offset);
@@ -175,6 +184,16 @@ static int hl_read_config_file(int fd) {
     // ambient host env, which the FFI spawn never forwards) — "" leaves it unset so direct egress is unchanged.
     s = launch_string(&cfg, pool, cfg.egress_proxy_offset);
     if (s[0]) hl_option_set("HL_EGRESS_SOCKS", s, 1);
+    s = launch_string(&cfg, pool, cfg.checkpoint_directory_offset);
+    if (s[0]) hl_option_set("HL_CHECKPOINT_DIR", s, 1);
+    s = launch_string(&cfg, pool, cfg.restore_directory_offset);
+    if (s[0]) hl_option_set("HL_RESTORE_DIR", s, 1);
+    s = launch_string(&cfg, pool, cfg.chrome_window_size_offset);
+    if (s[0]) hl_option_set("HL_CHROME_WINDOW_SIZE", s, 1);
+    s = launch_string(&cfg, pool, cfg.gpu_bridge_name_offset);
+    if (s[0]) hl_option_set("HL_GPU_BRIDGE_NAME", s, 1);
+    s = launch_string(&cfg, pool, cfg.gpu_pool_offset);
+    if (s[0]) hl_option_set("HL_GPU_POOL", s, 1);
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     s = launch_string(&cfg, pool, cfg.debug_log_offset);
     if (s[0]) hl_option_set("HL_LOG", s, 1);

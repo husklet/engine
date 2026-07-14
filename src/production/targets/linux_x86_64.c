@@ -395,6 +395,7 @@ int hl_engine_entry(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;
     static char self[4200];
+    hl_option_reset();
     if (realpath(argv[0], self))
         g_self_path = self;
     else

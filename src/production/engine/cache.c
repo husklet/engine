@@ -2,7 +2,7 @@
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
-#include "../../../include/hl/host_macos.h"
+#include "../../../include/hl/macos.h"
 #include "../../../include/hl/log.h"
 
 #define CACHE_SZ (64u << 20)
