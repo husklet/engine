@@ -928,7 +928,6 @@ static int jail_pick(const char *abs, const char **canon, size_t *clen, const ch
 // hard-reset on fork/chroot (rc_reset), volumes never cached, DD_NOPATHCACHE=1 kills it. See the full
 // correctness model at the impl. DC_KEYMAX bounds the fixed-size slots (longer paths bypass, safely).
 #define DC_KEYMAX 320
-static int dc_jail_cacheable(const char *jcanon);
 
 // Core: confine `rel` within an explicit jail root (jcanon). Generalized from secure_resolve so the
 // overlay can resolve the SAME guest path inside each layer's root, reusing the realpath boundary.

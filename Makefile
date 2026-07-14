@@ -32,7 +32,7 @@ CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/host
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
 	src/translator/window.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/device.c src/linux_abi/encode.c \
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/device.c src/linux_abi/encode.c src/linux_abi/fdcache.c \
 	src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/stat.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
@@ -68,7 +68,7 @@ MAC_AUX_OBJECTS := $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/target/x86_64.o \
 	$(BUILD)/mac/lifecycle/aarch64-runner.o $(BUILD)/mac/lifecycle/x86_64-runner.o
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena cli clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena cli clock codegen config device digest emit fdcache file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -147,6 +147,11 @@ $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-en
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
+
+$(BUILD)/tests/test_fdcache: tests/unit/test_fdcache.c $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
+		$(BUILD)/lib/libhl-host-fake.a -o $@
 
 $(BUILD)/tests/test_limits: tests/unit/test_limits.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)

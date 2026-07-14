@@ -48,6 +48,7 @@
 
 // container/ns config state + parsers (early globals)
 #include "../../linux_abi/container/state.c"
+#include "../../linux_abi/fdcache.h"
 // code cache + block map + chaining
 #include "../../translator/cache.c"
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
@@ -69,7 +70,9 @@
 // termios + NET-ns loopback
 #include "../../linux_abi/container/netns.c"
 // ELF fwd-decls + FS-metadata cache
-#include "../../linux_abi/fdcache.c"
+static void load_elf(const char *path, struct loaded *out);
+static int elf_interp(const char *path, char *out, size_t n);
+static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
 // the syscall layer (service())
 #include "../../linux_abi/syscall/dispatch.c"
 // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
@@ -625,6 +628,21 @@ static int engine_global_init(void) {
     if (jit_cache_init() != 0) {
         fprintf(stderr, "hl-engine: unable to allocate JIT code mapping\n");
         return 1;
+    }
+    {
+        hl_fdcache_binding binding = {&g_jit_services,
+                                      &g_vfs_namespace,
+                                      &g_nvols,
+                                      g_rootfs_canon,
+                                      &g_rootfs_canon_len,
+                                      g_fdpath,
+                                      1024,
+                                      &g_threaded,
+                                      hl_option_get("HL_FSGEN_FILE")};
+        if (hl_fdcache_bind(&binding) != 0) {
+            fprintf(stderr, "hl-engine: unable to initialize filesystem caches\n");
+            return 1;
+        }
     }
 
     g_trace = 0;

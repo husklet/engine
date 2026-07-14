@@ -1,12 +1,13 @@
-// hl/linux_abi -- ELF loader fwd-decls + the FS-metadata cache (stat/access/readlink memoized).
+// hl/linux_abi -- filesystem metadata and path-resolution caches.
 #include "fdcache.h"
 
-static void load_elf(const char *path, struct loaded *out);
-static int elf_interp(const char *path, char *out, size_t n);
-static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
-
-// Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
-#define ATFD(a) (((int)(a) == -100) ? AT_FDCWD : (int)(a))
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define MCACHE_N 8192
 #define RCACHE_N 8192
@@ -14,6 +15,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 #define UDVCACHE_N 4096
 #define DCACHE_N 8192
 #define OCACHE_N 8192
+#define DC_KEYMAX 320
 
 struct mcent {
     uint64_t hash;
@@ -100,6 +102,8 @@ struct hl_fdcache {
     _Atomic uint32_t filesystem_generation_local;
     _Atomic uint32_t *filesystem_generation_ptr;
     _Atomic uint32_t filesystem_generation_seen;
+    hl_fdcache_binding binding;
+    hl_host_handle mutex;
 };
 
 static struct hl_fdcache g_fdcache = {.resolver_epoch_local = 1,
@@ -120,21 +124,41 @@ static struct hl_fdcache g_fdcache = {.resolver_epoch_local = 1,
 #define g_oc g_fdcache.open_resolution
 #define g_fsgen_ptr g_fdcache.filesystem_generation_ptr
 #define g_fsgen_seen g_fdcache.filesystem_generation_seen
+
+static int fdcache_threaded(void) {
+    return g_fdcache.binding.threaded && *g_fdcache.binding.threaded;
+}
+
+static void fdcache_lock(void) {
+    (void)g_fdcache.binding.host->sync->mutex_lock(g_fdcache.binding.host->context, g_fdcache.mutex);
+}
+
+static void fdcache_unlock(void) {
+    (void)g_fdcache.binding.host->sync->mutex_unlock(g_fdcache.binding.host->context, g_fdcache.mutex);
+}
+
+#define CLK                                                                                                            \
+    int fdcache_locked = fdcache_threaded();                                                                           \
+    if (fdcache_locked) fdcache_lock()
+#define CUL                                                                                                            \
+    do {                                                                                                               \
+        if (fdcache_locked) fdcache_unlock();                                                                          \
+    } while (0)
 // ---- S2 path-resolution cache (forward decls; impl after mc_hash, which it reuses) ----
 // Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
 // runs on the result, so existence/contents are never cached). A global epoch -- bumped by
 // service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
 // it in the fork child so a child never serves the parent's stale mappings. Kill: DD_NOPATHCACHE=1.
-static int rc_lookup(const char *g, char *out, size_t n);
-static void rc_store(const char *g, const char *host);
-static void res_bump(void);
-static void rc_reset(void);
+int rc_lookup(const char *g, char *out, size_t n);
+void rc_store(const char *g, const char *host);
+void res_bump(void);
+void rc_reset(void);
 // ---- W4D openat resolution cache (forward decls; impl after the S2 rc_* cache it extends) ----
 // Extends item-9's rc_* (which memoizes only the read-only atpath() resolver) to the open-heavy half:
 // guest-abs-path -> canonical symlink-free host path, so a repeated open collapses the TOCTOU-safe
 // per-component jail walk to a single open(host, O_NOFOLLOW). Shares g_res_epoch. Kill: W4_NOOPENCACHE=1.
-static int oc_lookup(const char *g, char *out, size_t n);
-static void oc_store(const char *g, const char *host);
+int oc_lookup(const char *g, char *out, size_t n);
+void oc_store(const char *g, const char *host);
 static void oc_reset(void);
 
 // ---- FS-metadata cache ----
@@ -188,7 +212,7 @@ static uint64_t mc_hash(const char *s) {
     return h ? h : 1;
 }
 
-static int mc_lookup(const char *p, int *rc, struct stat *out) {
+int mc_lookup(const char *p, int *rc, struct stat *out) {
     if (!p || strlen(p) >= 192) return 0;
     CLK;
     int hit = 0;
@@ -205,10 +229,13 @@ static int mc_lookup(const char *p, int *rc, struct stat *out) {
     return hit;
 }
 
-static void mc_store(const char *p, int rc, const struct stat *s) {
+void mc_store(const char *p, int rc, const struct stat *s) {
     if (!p || strlen(p) >= 192) return;
     // don't cache mutable volume paths
-    if (g_nvols && strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) return;
+    if (g_fdcache.binding.volume_count && *g_fdcache.binding.volume_count && g_fdcache.binding.root_canonical &&
+        g_fdcache.binding.root_canonical_length &&
+        strncmp(p, g_fdcache.binding.root_canonical, *g_fdcache.binding.root_canonical_length))
+        return;
     CLK;
     uint64_t h = mc_hash(p);
     struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
@@ -221,7 +248,7 @@ static void mc_store(const char *p, int rc, const struct stat *s) {
     CUL;
 }
 
-static void mc_evict(const char *p) {
+void mc_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -235,7 +262,7 @@ static void mc_evict(const char *p) {
 // nlink. link()/unlink() of a multiply-linked inode call this to drop every POSITIVE cached stat for that
 // (dev,ino), so the next stat of any alias re-reads the true link count. Rare op (only when nlink>=2), so
 // the full-table scan is acceptable; negative entries carry no inode and are left alone.
-static void mc_evict_ino(dev_t dev, ino_t ino) {
+void mc_evict_ino(dev_t dev, ino_t ino) {
     if (!ino) return;
     CLK;
     for (int i = 0; i < MCACHE_N; i++) {
@@ -246,7 +273,7 @@ static void mc_evict_ino(dev_t dev, ino_t ino) {
 }
 
 // readlink cache (ld.so resolves symlinks on every library search path)
-static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
+int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;
@@ -257,7 +284,7 @@ static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     if (e->hash == h && e->fgen == g_fs_fgen && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
         *rc = e->rc;
         int n = e->linklen < bs ? e->linklen : bs;
-        if (e->rc >= 0) memcpy(out, e->link, n);
+        if (e->rc >= 0) memcpy(out, e->link, (size_t)n);
         *len = n;
         hit = 1;
     }
@@ -265,7 +292,7 @@ static int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     return hit;
 }
 
-static void rl_store(const char *p, int rc, const char *link, int len) {
+void rl_store(const char *p, int rc, const char *link, int len) {
     if (!p || strlen(p) >= 176 || len > 200) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -276,11 +303,11 @@ static void rl_store(const char *p, int rc, const char *link, int len) {
     strcpy(e->path, p);
     e->rc = rc;
     e->linklen = len;
-    if (rc >= 0) memcpy(e->link, link, len);
+    if (rc >= 0) memcpy(e->link, link, (size_t)len);
     CUL;
 }
 
-static void rl_evict(const char *p) {
+void rl_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -290,7 +317,7 @@ static void rl_evict(const char *p) {
 }
 
 // access(F_OK) existence cache (ld.so probes every library candidate)
-static int ac_lookup(const char *p, int *rc) {
+int ac_lookup(const char *p, int *rc) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;
@@ -306,7 +333,7 @@ static int ac_lookup(const char *p, int *rc) {
     return hit;
 }
 
-static void ac_store(const char *p, int rc) {
+void ac_store(const char *p, int rc) {
     if (!p || strlen(p) >= 176) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -319,7 +346,7 @@ static void ac_store(const char *p, int rc) {
     CUL;
 }
 
-static void ac_evict(const char *p) {
+void ac_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -352,7 +379,7 @@ static int res_enabled(void) {
 
 // Bump the epoch -> the whole cache misses. Skip 0 (the reserved "never matches" stamp).
 // Locked under threads (same model as mc_*) so a bump can't race a concurrent lookup's epoch read.
-static void res_bump(void) {
+void res_bump(void) {
     CLK;
     g_res_epoch++;
     if (!g_res_epoch) g_res_epoch = 1;
@@ -372,7 +399,7 @@ static void res_bump(void) {
 //   * fork/chroot hard reset via rc_reset() below.
 //   * volume paths are never stored (host-mutable backing; enforced at the overlay_lookup call site).
 //   * kill switch: DD_NOPATHCACHE=1 disables it together with the other path caches (res_enabled).
-static int updirneg_lookup(const char *d) {
+int updirneg_lookup(const char *d) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
@@ -383,7 +410,7 @@ static int updirneg_lookup(const char *d) {
     return hit;
 }
 
-static void updirneg_store(const char *d) {
+void updirneg_store(const char *d) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);
@@ -411,7 +438,7 @@ static void updirneg_store(const char *d) {
 // container-shared g_res_epoch (every unlink/rmdir/rename/mkdir/whiteout/opaque bumps it, so a removal
 // instantly invalidates the memo), fork/chroot hard reset via rc_reset(), and DD_NOPATHCACHE=1 disables
 // it (overlay_dir_verdict then recomputes every call -- correct, just uncached).
-static int updirverdict_lookup(const char *d, int *verdict) {
+int updirverdict_lookup(const char *d, int *verdict) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
@@ -425,7 +452,7 @@ static int updirverdict_lookup(const char *d, int *verdict) {
     return hit;
 }
 
-static void updirverdict_store(const char *d, int verdict) {
+void updirverdict_store(const char *d, int verdict) {
     if (!res_enabled() || !d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);
@@ -470,15 +497,17 @@ static void updirverdict_store(const char *d, int verdict) {
 // returning its input verbatim admits no symlink hop), which is precisely the condition under which
 // the lexical fast path and the per-component walk agree -- see the guard comments at that site.
 // No dir-fds are cached (path strings only), so there is no fd-exhaustion/LRU concern.
-static int dc_jail_cacheable(const char *jcanon) {
+int dc_jail_cacheable(const char *jcanon) {
     if (!res_enabled()) return 0;
-    if (jcanon == g_vfs_namespace.root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)
-    for (int i = 0; i < hl_linux_vfs_lower_count(&g_vfs_namespace); i++)
-        if (jcanon == g_vfs_namespace.lowers[i].canon) return 1; // read-only image lowers
+    const struct hl_linux_vfs_namespace *vfs = g_fdcache.binding.vfs;
+    if (!vfs) return 0;
+    if (jcanon == vfs->root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)
+    for (int i = 0; i < hl_linux_vfs_lower_count(vfs); i++)
+        if (jcanon == vfs->lowers[i].canon) return 1; // read-only image lowers
     return 0; // anything else (bind-mount volumes, unknown roots): host-mutable -> never cache
 }
 
-static int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
+int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
     if (!res_enabled() || !key || !key[0] || strlen(key) >= DC_KEYMAX) return 0;
     CLK;
     int hit = 0;
@@ -495,7 +524,7 @@ static int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
     return hit;
 }
 
-static void dc_store(const char *key, const char *canon, int nmiss) {
+void dc_store(const char *key, const char *canon, int nmiss) {
     if (!res_enabled() || !key || !key[0] || !canon || nmiss < 0 || nmiss > 0xffff) return;
     size_t cl = strlen(canon);
     if (strlen(key) >= DC_KEYMAX || cl >= DC_KEYMAX) return; // over-length: bypass, re-resolved safely
@@ -521,7 +550,7 @@ static void dc_store(const char *key, const char *canon, int nmiss) {
 // ENOENT -> "no such file" / "No rule to make target"). The epoch only invalidates this process's own
 // mutations, so it can't cover a cross-process create; dropping the inherited entries at the fork point
 // makes the child re-resolve against the real FS.
-static void rc_reset(void) {
+void rc_reset(void) {
     CLK;
     // O(1) GENERATION BUMP instead of memset'ing all arrays (~13MB: rc+oc ~3.8MB each, mc
     // ~2.9MB, rl/ac/ud/dc) in the fork child's critical path -- those memsets were a fixed ~ms-scale
@@ -547,7 +576,7 @@ static void rc_reset(void) {
     CUL;
 }
 
-static int rc_lookup(const char *g, char *out, size_t n) {
+int rc_lookup(const char *g, char *out, size_t n) {
     if (!res_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct rcent *)0)->guest)) return 0;
     CLK;
     int hit = 0;
@@ -566,7 +595,7 @@ static int rc_lookup(const char *g, char *out, size_t n) {
     return hit;
 }
 
-static void rc_store(const char *g, const char *host) {
+void rc_store(const char *g, const char *host) {
     if (!res_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
     size_t hl = strlen(host);
@@ -603,7 +632,7 @@ static int oc_enabled(void) {
     return 1;
 }
 
-static int oc_lookup(const char *g, char *out, size_t n) {
+int oc_lookup(const char *g, char *out, size_t n) {
     if (!oc_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct ocent *)0)->guest)) return 0;
     CLK;
     int hit = 0;
@@ -622,14 +651,15 @@ static int oc_lookup(const char *g, char *out, size_t n) {
     return hit;
 }
 
-static void oc_store(const char *g, const char *host) {
+void oc_store(const char *g, const char *host) {
     if (!oc_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-walked every time, safely.
     size_t hl = strlen(host);
     if (strlen(g) >= sizeof(((struct ocent *)0)->guest) || hl >= sizeof(((struct ocent *)0)->host)) return;
     // defensive: never cache a host path that resolved OUTSIDE the rootfs jail (item-9-style confinement).
-    size_t root_length = hl_linux_vfs_root_length(&g_vfs_namespace);
-    if (root_length && strncmp(host, g_vfs_namespace.root_canonical, root_length)) return;
+    const struct hl_linux_vfs_namespace *vfs = g_fdcache.binding.vfs;
+    size_t root_length = vfs ? hl_linux_vfs_root_length(vfs) : 0;
+    if (root_length && strncmp(host, vfs->root_canonical, root_length)) return;
     CLK;
     uint64_t h = mc_hash(g);
     struct ocent *e = &g_oc[h & (OCACHE_N - 1)];
@@ -678,11 +708,11 @@ static void oc_reset(void) {
 // the poll is a `static inline` two-word compare with a RELAXED load (plain LDR, not the pricier acquire
 // LDAR) and a predicted-not-taken branch; the acquire barrier + rc_reset() live in an out-of-line `cold`
 // helper reached only when the generation actually moved (i.e. only right after a real daemon write).
-__attribute__((constructor)) static void fsgen_ctor(void) {
-    const char *p = hl_option_get("HL_FSGEN_FILE");
+static void fsgen_bind(const char *p) {
     if (!p || !p[0]) return;
-    int fd = open(p, O_RDONLY | O_CLOEXEC); // engine only READS the counter; the daemon writes it
+    int fd = open(p, O_RDONLY); // engine only READS the counter; the daemon writes it
     if (fd < 0) return;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     void *m = mmap(NULL, sizeof(uint32_t), PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return; // degrade to the local never-moving counter; never crash
@@ -704,23 +734,25 @@ __attribute__((noinline, cold)) static void fsgen_flush(void) {
 // The per-syscall poll (called from dispatch.c service_local BEFORE dispatch). Relaxed compare only; a
 // stale relaxed read at worst defers the flush to the very next syscall, still within "visible by the
 // guest's next syscall". Both operands are one word: the shared page (clean/shared -> L1) and a local.
-static inline void fsgen_poll(void) {
+void fsgen_poll(void) {
     if (__builtin_expect(atomic_load_explicit(g_fsgen_ptr, memory_order_relaxed) !=
                              atomic_load_explicit(&g_fsgen_seen, memory_order_relaxed),
                          0))
         fsgen_flush();
 }
 
-static void fd_setpath(int fd, const char *p) {
-    if (fd >= 0 && fd < 1024 && p && strlen(p) < 192) strcpy(g_fdpath[fd], p);
+void fd_setpath(int fd, const char *p) {
+    if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && p && strlen(p) < HL_FDCACHE_PATH_CAPACITY)
+        strcpy(g_fdcache.binding.fd_paths[fd], p);
 }
 
-static void fd_evict(int fd) {
-    if (fd >= 0 && fd < 1024 && g_fdpath[fd][0]) mc_evict(g_fdpath[fd]);
+void fd_evict(int fd) {
+    if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && g_fdcache.binding.fd_paths[fd][0])
+        mc_evict(g_fdcache.binding.fd_paths[fd]);
 }
 
-static void fd_clear(int fd) {
-    if (fd >= 0 && fd < 1024) g_fdpath[fd][0] = 0;
+void fd_clear(int fd) {
+    if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity) g_fdcache.binding.fd_paths[fd][0] = 0;
 }
 
 // A create/rename/link/symlink makes a host path appear -- or changes the identity of an existing
@@ -730,8 +762,24 @@ static void fd_clear(int fd) {
 // caches are precise-evict, NOT epoch-gated like the rc_/oc_ path-string caches, so every mutation
 // must name the exact path whose existence it changed. Two shapes: a full host path, and the jail
 // idiom of a dir-fd + final component (resolved to its host path via F_GETPATH).
-static void fc_evict_path(const char *hp) {
+void fc_evict_path(const char *hp) {
     mc_evict(hp);
     ac_evict(hp);
     rl_evict(hp);
+}
+
+int hl_fdcache_bind(const hl_fdcache_binding *binding) {
+    hl_host_result created;
+    if (!binding || !binding->host || !binding->host->sync || !binding->host->sync->mutex_create ||
+        !binding->host->sync->mutex_lock || !binding->host->sync->mutex_unlock || !binding->fd_paths ||
+        !binding->threaded)
+        return -1;
+    if (g_fdcache.mutex == HL_HOST_HANDLE_INVALID) {
+        created = binding->host->sync->mutex_create(binding->host->context);
+        if (created.status != HL_STATUS_OK || created.value == HL_HOST_HANDLE_INVALID) return -1;
+        g_fdcache.mutex = created.value;
+    }
+    g_fdcache.binding = *binding;
+    fsgen_bind(binding->generation_file);
+    return 0;
 }

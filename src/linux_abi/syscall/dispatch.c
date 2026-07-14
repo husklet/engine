@@ -28,6 +28,9 @@ int g_rwx_guest;
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
 #include "../seccomp.c"
+
+// Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
+#define ATFD(value) (((int)(value) == -100) ? AT_FDCWD : (int)(value))
 // macOS renamex_np/renameatx_np flags (Linux renameat2 flags map onto these)
 #ifndef RENAME_SWAP
 #define RENAME_SWAP 0x00000002 // atomic swap  <- Linux RENAME_EXCHANGE(2)

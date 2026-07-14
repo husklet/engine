@@ -70,6 +70,7 @@
 #define GUEST_LINUX_STAT_BYTES 144
 
 #include "../../linux_abi/container/state.c" // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
+#include "../../linux_abi/fdcache.h"
 #include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
 #include "../../translator/cache.c"          // SHARED translator: code cache + block map
 #include "../../translator/guest/x86_64/emit.c"      // x86 engine: arm64 emitters + SSE + x87
@@ -82,7 +83,9 @@
 #include "../../translator/guest/x86_64/legacy.c" // x86 legacy-syscall -> *at normalization
 #include "../../linux_abi/container/vfs.c"   // SHARED: rootfs jail, overlay, /proc synth, stat
 #include "../../linux_abi/container/netns.c" // SHARED: sockets, loopback netns, termios
-#include "../../linux_abi/fdcache.c" // SHARED: fd/path cache
+static void load_elf(const char *path, struct loaded *out);
+static int elf_interp(const char *path, char *out, size_t n);
+static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
 #include "../../linux_abi/syscall/dispatch.c" // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c" // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../../translator/guest/x86_64/ops.c" // x86 cpuid + x87 m80 block-exit helpers
@@ -212,6 +215,21 @@ static int engine_global_init(void) {
     if (jit_cache_init() != 0) {
         fprintf(stderr, "hl-engine: unable to allocate JIT code mapping\n");
         return 1;
+    }
+    {
+        hl_fdcache_binding binding = {&g_jit_services,
+                                      &g_vfs_namespace,
+                                      &g_nvols,
+                                      g_rootfs_canon,
+                                      &g_rootfs_canon_len,
+                                      g_fdpath,
+                                      1024,
+                                      &g_threaded,
+                                      hl_option_get("HL_FSGEN_FILE")};
+        if (hl_fdcache_bind(&binding) != 0) {
+            fprintf(stderr, "hl-engine: unable to initialize filesystem caches\n");
+            return 1;
+        }
     }
     g_trace = 0;
     g_systrace = 0;
