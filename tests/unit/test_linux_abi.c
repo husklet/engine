@@ -708,10 +708,10 @@ int main(void) {
         file_host.next_value = 3;
         HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &original) == HL_STATUS_OK);
         HL_CHECK(hl_linux_readv(&linux_abi, original, vectors, 2) == 3);
-        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 0);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 3);
         file_host.next_status = HL_STATUS_WOULD_BLOCK;
         HL_CHECK(hl_linux_preadv(&linux_abi, original, vectors, 2, 1) == -HL_LINUX_EAGAIN);
-        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 0);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 3);
         HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
         file_host.closes = 0;
 
