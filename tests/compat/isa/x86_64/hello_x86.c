@@ -2,7 +2,7 @@
 // _start issues exactly two raw syscalls: write(1, "hi\n", 3) then exit_group(42). No glibc startup,
 // no auxv walking, no TLS init beyond the kernel ABI — so it pins the engine's bare entry path
 // (ELF load → _start → syscall) for a static non-PIE (ET_EXEC) image with an absolute .rodata ref.
-// Build (see build.sh): x86_64-linux-gnu-gcc -O2 -static -no-pie -nostdlib
+// Build: x86_64-linux-gnu-gcc -O2 -static -no-pie -nostdlib
 static long sys3(long n, long a, long b, long c) {
     long r;
     __asm__ volatile("syscall"

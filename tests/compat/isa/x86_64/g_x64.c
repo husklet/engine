@@ -3,7 +3,7 @@
 // comparator through a function pointer, strtod, and a clock_gettime sanity read — then prints
 // "glibc ok". Everything checked is deterministic; the golden only matches on full success, so a
 // broken glibc startup (auxv/TLS/ifunc resolution) or any of the above mislowering fails the case.
-// Build (see build.sh): x86_64-linux-gnu-gcc -O2 -static-pie
+// Build: x86_64-linux-gnu-gcc -O2 -static-pie
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

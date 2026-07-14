@@ -2,7 +2,7 @@
 // 64 goroutines × 500k iterations churning through channels, enough work to draw real async
 // preemption (the #250 crash site: a low-rewritten LEAQ asyncPreempt(SB) broke findfunc during
 // runtime.init). The total is scheduling-independent, so the golden "goro tot= 16119975488" is
-// byte-exact vs a native aarch64 build of this same source (see build.sh).
+// byte-exact vs a native aarch64 build of this same source.
 package main
 
 import "fmt"

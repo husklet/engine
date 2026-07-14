@@ -1,6 +1,6 @@
 // x86/hx fixture: freestanding nolibc guest that COMPUTES 42 (never a literal) and prints it with a
 // hand-rolled itoa — so the golden "42" proves arithmetic + div/mod lowering + the write path, not a
-// constant-folded string. 42 = sum of 1..21 minus 189 = 231-189. Static non-PIE, no libc (build.sh).
+// constant-folded string. 42 = sum of 1..21 minus 189 = 231-189. Static non-PIE, no libc.
 static long sys3(long n, long a, long b, long c) {
     long r;
     __asm__ volatile("syscall"

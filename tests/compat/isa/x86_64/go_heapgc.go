@@ -3,7 +3,7 @@
 // so the collector walks gcdata/gcbss masks and the lfstack under the engine's non-PIE high rebase
 // (qemu-x86_64 cannot oracle this: its lfstack pointer-packing breaks at high heap addresses).
 // The total is allocation-order-independent; the golden is byte-exact vs a native aarch64 build of
-// this same source (see build.sh).
+// this same source.
 package main
 
 import (
