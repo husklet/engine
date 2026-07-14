@@ -208,6 +208,14 @@ HL_API hl_status hl_linux_fd_cancel(hl_linux_abi *linux_abi, const hl_linux_fd_r
 HL_API hl_status hl_linux_fd_dup(hl_linux_abi *linux_abi, hl_linux_fd source, uint32_t descriptor_flags,
                                  hl_linux_fd *out_fd);
 HL_API hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle);
+/*
+ * Apply Linux close-on-exec policy to one descriptor. The descriptor table is
+ * authoritative: out_closed is one only when this call removed fd. A final OFD
+ * reference also closes its host file handle through the host-service seam.
+ */
+HL_API hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *out_closed);
+/* Quiescent-state diagnostic for descriptor/OFD ownership invariants. */
+HL_API hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi);
 /* Returns a stable value snapshot; internal entries and mutex-bearing OFDs never escape. */
 HL_API hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linux_fd fd,
                                           hl_linux_fd_snapshot *snapshot);

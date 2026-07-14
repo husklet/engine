@@ -656,6 +656,69 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     return final_reference ? hl_linux_ofd_finalize(linux_abi, ofd_entry, last_host_handle) : HL_STATUS_OK;
 }
 
+hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *out_closed) {
+    const hl_host_file_services *files;
+    hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+    hl_status status;
+    hl_host_result result;
+    if (linux_abi == NULL || out_closed == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    *out_closed = 0;
+    hl_linux_lock(linux_abi);
+    if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0 || linux_abi->fds[fd].ofd == HL_LINUX_FD_RESERVED) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_NOT_FOUND;
+    }
+    if ((linux_abi->fds[fd].descriptor_flags & HL_LINUX_FD_CLOEXEC) == 0) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_OK;
+    }
+    hl_linux_unlock(linux_abi);
+    status = hl_linux_fd_close(linux_abi, fd, &handle);
+    if (status != HL_STATUS_OK) return status;
+    *out_closed = 1;
+    if (handle == HL_HOST_HANDLE_INVALID) return HL_STATUS_OK;
+    files = hl_linux_files(linux_abi);
+    if (files == NULL || files->close == NULL) return HL_STATUS_NOT_SUPPORTED;
+    result = files->close(linux_abi->host->context, handle);
+    return (hl_status)result.status;
+}
+
+hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi) {
+    uint32_t *references;
+    uint32_t fd;
+    uint32_t ofd;
+    hl_status status = HL_STATUS_OK;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION) return HL_STATUS_INVALID_ARGUMENT;
+    references = calloc(linux_abi->ofd_capacity, sizeof(*references));
+    if (references == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    hl_linux_lock((hl_linux_abi *)linux_abi);
+    for (fd = 0; fd < linux_abi->fd_capacity; ++fd) {
+        ofd = linux_abi->fds[fd].ofd;
+        if (ofd == 0 || ofd == HL_LINUX_FD_RESERVED) continue;
+        if (ofd >= linux_abi->ofd_capacity || references[ofd] == UINT32_MAX) {
+            status = HL_STATUS_CORRUPT;
+            goto done;
+        }
+        references[ofd]++;
+    }
+    for (ofd = 1; ofd < linux_abi->ofd_capacity; ++ofd) {
+        const hl_linux_ofd_entry *entry = &linux_abi->ofds[ofd];
+        if (entry->references != references[ofd] ||
+            (entry->references != 0 && (entry->host_handle == HL_HOST_HANDLE_INVALID ||
+                                        entry->io_mutex == HL_HOST_HANDLE_INVALID || entry->closing != 0)) ||
+            (entry->references == 0 && entry->active_operations == 0 &&
+             (entry->host_handle != HL_HOST_HANDLE_INVALID || entry->io_mutex != HL_HOST_HANDLE_INVALID ||
+              entry->closing != 0))) {
+            status = HL_STATUS_CORRUPT;
+            goto done;
+        }
+    }
+done:
+    hl_linux_unlock((hl_linux_abi *)linux_abi);
+    free(references);
+    return status;
+}
+
 static int64_t hl_linux_pread64_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd, void *buffer, size_t size,
                                       uint64_t offset) {
     const hl_host_file_services *files;

@@ -128,14 +128,13 @@ static int exec_fd_is_engine(int fd) {
 }
 
 static int exec_close_bound_cloexec(int fd) {
-    hl_linux_fd_snapshot snapshot;
+    uint32_t closed;
+    hl_status status;
     if (g_linux_box == NULL || fd < 0 ||
-        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &snapshot) != HL_STATUS_OK)
+        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &(hl_linux_fd_snapshot){0}) != HL_STATUS_OK)
         return 0;
-    if ((snapshot.descriptor_flags & HL_LINUX_FD_CLOEXEC) != 0) {
-        (void)hl_linux_close(g_linux_box, (hl_linux_fd)fd);
-        close(fd);
-    }
+    status = hl_linux_fd_exec(g_linux_box, (hl_linux_fd)fd, &closed);
+    if (status == HL_STATUS_OK && closed != 0) close(fd);
     return 1;
 }
 

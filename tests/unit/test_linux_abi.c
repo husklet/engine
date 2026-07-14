@@ -423,6 +423,11 @@ int main(void) {
     HL_CHECK(snapshot.fd == duplicate && snapshot.ofd == fds[original].ofd);
     HL_CHECK(snapshot.descriptor_references == 2 && snapshot.status_flags == 0123);
     HL_CHECK(snapshot.host_handle == 55 && snapshot.descriptor_flags == 0);
+    HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
+    ofds[snapshot.ofd].references++;
+    HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_CORRUPT);
+    ofds[snapshot.ofd].references--;
+    HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
 
     /* read advances the OFD shared by both descriptors. */
     HL_CHECK(hl_linux_read(&linux_abi, original, buffer, 2) == 2);
@@ -453,6 +458,24 @@ int main(void) {
     HL_CHECK(hl_linux_fd_close(&linux_abi, duplicate, &closed) == HL_STATUS_OK);
     HL_CHECK(closed == 55);
     HL_CHECK(hl_linux_fd_close(&linux_abi, duplicate, &closed) == HL_STATUS_NOT_FOUND);
+    HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
+
+    /* Exec removes only CLOEXEC descriptors and preserves a shared OFD until its final reference. */
+    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_fd_dup(&linux_abi, original, HL_LINUX_FD_CLOEXEC, &duplicate) == HL_STATUS_OK);
+    {
+        uint32_t removed = 99;
+        uint32_t closes_before = file_host.closes;
+        HL_CHECK(hl_linux_fd_exec(&linux_abi, original, &removed) == HL_STATUS_OK && removed == 0);
+        HL_CHECK(hl_linux_fd_exec(&linux_abi, duplicate, &removed) == HL_STATUS_OK && removed == 1);
+        HL_CHECK(file_host.closes == closes_before);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK);
+        HL_CHECK(snapshot.descriptor_references == 1 && snapshot.status_flags == HL_LINUX_O_RDWR);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0 && file_host.closes == closes_before + 1);
+        file_host.closes = 0;
+    }
 
     /* Syscall close closes the host handle exactly once, at the final OFD reference. */
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &original) == HL_STATUS_OK);
