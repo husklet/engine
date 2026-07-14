@@ -94,9 +94,13 @@ E2E_CASES := atomics clockelapsed epoll epoll_dup_lifetime epoll_edge epoll_et e
 	signalfd_multi signalfd_rt signals stat_layout statx_agree sysv_ipc timerfd timerfd_interval
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
+ABI_CASE_SOURCES := $(sort $(wildcard tests/compat/abi/*.c))
+ABI_CASE_NAMES := $(basename $(notdir $(ABI_CASE_SOURCES)))
+ABI_CASE_BINS := $(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/aarch64/%) \
+	$(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	$(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -252,6 +256,14 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
+$(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static $< -lm -o $@
+
+$(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static $< -lm -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -402,7 +414,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -462,6 +474,15 @@ $(BUILD)/tools/compat-runner: tools/compat_runner.c
 $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/matrix-runner: tools/matrix_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/abi/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/abi/x86_64) $(abspath tests/compat/abi)
 
 $(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
 	@mkdir -p $(@D)
