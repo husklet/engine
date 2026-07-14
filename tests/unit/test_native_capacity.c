@@ -9,6 +9,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static int32_t capacity_child(void *context) {
+    return (int32_t)(uintptr_t)context;
+}
+
 enum {
     WATCH_COUNT = 257,
     EVENT_COUNT = 129,
@@ -16,6 +20,7 @@ enum {
     COUNTER_COUNT = 129,
     TRANSFER_PAIR_COUNT = 33,
     TIMER_COUNT = 33,
+    PROCESS_COUNT = 1025,
     MAPPING_COUNT = 4097,
     FILE_COUNT = 1025
 };
@@ -30,6 +35,7 @@ int main(void) {
     hl_host_handle transfers[TRANSFER_PAIR_COUNT * 2] = {0};
     hl_host_handle *mappings = NULL;
     hl_host_handle *files = NULL;
+    hl_host_handle *processes = NULL;
     hl_host_result cross_mapping;
     char path[] = "/tmp/hl-native-capacity-XXXXXX";
     int native = mkstemp(path);
@@ -139,6 +145,22 @@ int main(void) {
     for (size_t index = DIRECTORY_COUNT; index != 0; --index)
         HL_CHECK(services.directory->close(services.context, directories[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.directory->close(services.context, directories[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    if (strcmp(HL_NATIVE_HOST_NAME, "macos") == 0) {
+        processes = calloc(PROCESS_COUNT, sizeof(*processes));
+        HL_CHECK(processes != NULL);
+        for (size_t index = 0; index < PROCESS_COUNT; ++index) {
+            hl_host_result spawned =
+                services.process->spawn_cloned(services.context, capacity_child, (void *)(index & 7u));
+            HL_CHECK(spawned.status == HL_STATUS_OK);
+            processes[index] = spawned.value;
+            hl_host_result waited = services.process->wait(services.context, spawned.value, HL_HOST_DEADLINE_INFINITE);
+            HL_CHECK(waited.status == HL_STATUS_OK && waited.value == (index & 7u));
+        }
+        HL_CHECK(services.process->close(services.context, file.value).status == HL_STATUS_INVALID_ARGUMENT);
+        for (size_t index = PROCESS_COUNT; index != 0; --index)
+            HL_CHECK(services.process->close(services.context, processes[index - 1]).status == HL_STATUS_OK);
+        HL_CHECK(services.process->close(services.context, processes[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    }
     for (size_t index = EVENT_COUNT; index != 0; --index)
         HL_CHECK(services.event->close(services.context, events[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.event->wake(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
@@ -153,6 +175,7 @@ int main(void) {
     HL_CHECK(services.memory->release(services.context, cross_mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
     free(files);
     free(mappings);
+    free(processes);
     hl_native_host_destroy(host);
     HL_CHECK(unlink(path) == 0);
     return 0;

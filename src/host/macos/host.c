@@ -173,7 +173,8 @@ struct hl_host_macos {
     uint32_t mapping_capacity;
     hl_macos_file *files;
     uint32_t file_capacity;
-    hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
+    hl_macos_process *processes;
+    uint32_t process_capacity;
     hl_macos_event *events;
     uint32_t event_capacity;
     hl_macos_counter *counters;
@@ -3394,7 +3395,7 @@ static hl_host_result hl_macos_event_close(void *context, hl_host_handle pollset
 
 static hl_macos_process *hl_macos_process_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_PROCESS, HL_MACOS_PROCESS_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_PROCESS, host->process_capacity, &index) ||
         !host->processes[index].active ||
         host->processes[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -3441,7 +3442,7 @@ static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process
     }
     if (pid == 0) _exit(entry(entry_context) & 255);
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+    for (index = 0; index < host->process_capacity; ++index) {
         hl_macos_process *process = &host->processes[index];
         if (process->active) continue;
         process->generation++;
@@ -3455,6 +3456,21 @@ static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process
         process->exit_value = 0;
         handle = hl_macos_handle(HL_MACOS_HANDLE_PROCESS, index, process->generation);
         break;
+    }
+    if (handle == 0) {
+        uint32_t capacity = host->process_capacity * 2u;
+        hl_macos_process *grown = realloc(host->processes, (size_t)capacity * sizeof(*grown));
+        if (grown != NULL) {
+            memset(grown + host->process_capacity, 0,
+                   (size_t)(capacity - host->process_capacity) * sizeof(*grown));
+            index = host->process_capacity;
+            host->processes = grown;
+            host->process_capacity = capacity;
+            grown[index].generation = 1;
+            grown[index].active = 1;
+            grown[index].pid = pid;
+            handle = hl_macos_handle(HL_MACOS_HANDLE_PROCESS, index, 1);
+        }
     }
     pthread_mutex_unlock(&host->lock);
     if (handle == 0) {
@@ -3803,10 +3819,11 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     host->counters = calloc(HL_MACOS_COUNTER_CAPACITY, sizeof(*host->counters));
     host->transfers = calloc(HL_MACOS_TRANSFER_CAPACITY, sizeof(*host->transfers));
     host->directories = calloc(HL_MACOS_DIRECTORY_CAPACITY, sizeof(*host->directories));
+    host->processes = calloc(HL_MACOS_PROCESS_CAPACITY, sizeof(*host->processes));
     host->events = calloc(HL_MACOS_EVENT_CAPACITY, sizeof(*host->events));
     host->watches = calloc(HL_MACOS_WATCH_CAPACITY, sizeof(*host->watches));
     if (host->mappings == NULL || host->files == NULL || host->counters == NULL || host->transfers == NULL ||
-        host->directories == NULL || host->events == NULL || host->watches == NULL) {
+        host->directories == NULL || host->processes == NULL || host->events == NULL || host->watches == NULL) {
         free(host->watches);
         free(host->events);
         free(host->files);
@@ -3814,6 +3831,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->directories);
         free(host->transfers);
         free(host->counters);
+        free(host->processes);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3822,6 +3840,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     host->counter_capacity = HL_MACOS_COUNTER_CAPACITY;
     host->transfer_capacity = HL_MACOS_TRANSFER_CAPACITY;
     host->directory_capacity = HL_MACOS_DIRECTORY_CAPACITY;
+    host->process_capacity = HL_MACOS_PROCESS_CAPACITY;
     host->event_capacity = HL_MACOS_EVENT_CAPACITY;
     host->watch_capacity = HL_MACOS_WATCH_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
@@ -3832,6 +3851,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->directories);
         free(host->transfers);
         free(host->counters);
+        free(host->processes);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3844,6 +3864,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->directories);
         free(host->transfers);
         free(host->counters);
+        free(host->processes);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3857,6 +3878,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->directories);
         free(host->transfers);
         free(host->counters);
+        free(host->processes);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3871,6 +3893,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host->directories);
         free(host->transfers);
         free(host->counters);
+        free(host->processes);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3903,7 +3926,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     if (host == NULL) return;
     pthread_mutex_lock(&host->lock);
     host->destroying = 1;
-    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+    for (index = 0; index < host->process_capacity; ++index) {
         hl_macos_process *process = &host->processes[index];
         if (process->active && !process->reaped) kill(process->pid, SIGKILL);
     }
@@ -3951,7 +3974,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     hl_host_sync_registry_destroy(host->sync);
     for (;;) {
         uint32_t waiters = 0;
-        for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index)
+        for (index = 0; index < host->process_capacity; ++index)
             waiters += host->processes[index].waiters;
         if (waiters == 0) break;
         pthread_cond_wait(&host->process_changed, &host->lock);
@@ -3970,7 +3993,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         close(file->descriptor);
         if (file->append_descriptor >= 0) close(file->append_descriptor);
     }
-    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+    for (index = 0; index < host->process_capacity; ++index) {
         hl_macos_process *process = &host->processes[index];
         int status;
         if (!process->active || process->reaped) continue;
@@ -3987,5 +4010,6 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     free(host->directories);
     free(host->transfers);
     free(host->counters);
+    free(host->processes);
     free(host);
 }
