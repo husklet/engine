@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -22,6 +23,7 @@ typedef struct suite_case {
     char expected[256];
     case_isa isa;
     int expected_exit;
+    int needs_rootfs;
 } suite_case;
 typedef struct capture {
     unsigned char *output;
@@ -90,6 +92,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
                 parse_exit(fields[3], &cases[*case_count].expected_exit) != 0)
                 goto invalid;
             cases[*case_count].isa = ISA_BOTH;
+            cases[*case_count].needs_rootfs = 0;
             if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
                     (int)sizeof(cases[*case_count].name) ||
                 snprintf(cases[*case_count].source, sizeof(cases[*case_count].source), "%s", fields[0]) >=
@@ -108,6 +111,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 || strcmp(fields[6], "-") != 0 ||
             strcmp(fields[7], "-") != 0 || parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
+        cases[*case_count].needs_rootfs = strstr(fields[10], "alpine-rootfs") != NULL;
         if (strcmp(fields[4], "aarch64") == 0)
             cases[*case_count].isa = ISA_AARCH64;
         else if (strcmp(fields[4], "x86_64") == 0)
@@ -153,7 +157,7 @@ static void terminate(pid_t child) {
     while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
 }
 
-static int run_guest(const char *bridge, const char *engine, const char *guest, capture *result) {
+static int run_guest(const char *bridge, const char *engine, const char *guest, const char *rootfs, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
     uint64_t deadline;
     pid_t child;
@@ -168,7 +172,10 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         close(output_pipe[0]); close(error_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]); close(error_pipe[1]);
-        execlp(bridge, bridge, engine, guest, (char *)NULL);
+        if (rootfs != NULL)
+            execlp(bridge, bridge, engine, "--rootfs", rootfs, guest, (char *)NULL);
+        else
+            execlp(bridge, bridge, engine, guest, (char *)NULL);
         _exit(127);
     }
     (void)setpgid(child, child);
@@ -207,6 +214,50 @@ static int read_file(const char *path, unsigned char **data, size_t *size) {
     return 0;
 }
 
+static int copy_file(const char *source, const char *destination) {
+    unsigned char buffer[64 * 1024];
+    int input = open(source, O_RDONLY), output = -1;
+    if (input < 0) return 1;
+    output = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    if (output < 0) { close(input); return 1; }
+    for (;;) {
+        ssize_t count = read(input, buffer, sizeof buffer);
+        size_t offset = 0;
+        if (count == 0) break;
+        if (count < 0) { if (errno == EINTR) continue; close(input); close(output); return 1; }
+        while (offset < (size_t)count) {
+            ssize_t written = write(output, buffer + offset, (size_t)count - offset);
+            if (written < 0) { if (errno == EINTR) continue; close(input); close(output); return 1; }
+            offset += (size_t)written;
+        }
+    }
+    return close(input) != 0 || close(output) != 0;
+}
+
+static int stage_rootfs(const char *binary_root, const char *guest, char rootfs[1024]) {
+    char bin[1024], dev[1024], pts[1024], tmp[1024], staged[1024];
+    if (snprintf(rootfs, 1024, "%s/.rootfs-XXXXXX", binary_root) >= 1024 || mkdtemp(rootfs) == NULL ||
+        snprintf(bin, sizeof bin, "%s/bin", rootfs) >= (int)sizeof bin ||
+        snprintf(dev, sizeof dev, "%s/dev", rootfs) >= (int)sizeof dev ||
+        snprintf(pts, sizeof pts, "%s/dev/pts", rootfs) >= (int)sizeof pts ||
+        snprintf(tmp, sizeof tmp, "%s/tmp", rootfs) >= (int)sizeof tmp ||
+        snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged ||
+        mkdir(bin, 0755) != 0 || mkdir(dev, 0755) != 0 || mkdir(pts, 0755) != 0 || mkdir(tmp, 01777) != 0 ||
+        copy_file(guest, staged) != 0)
+        return 1;
+    return 0;
+}
+
+static void remove_rootfs(const char *rootfs) {
+    char path[1024];
+    if (snprintf(path, sizeof path, "%s/bin/guest", rootfs) < (int)sizeof path) (void)unlink(path);
+    if (snprintf(path, sizeof path, "%s/dev/pts", rootfs) < (int)sizeof path) (void)rmdir(path);
+    if (snprintf(path, sizeof path, "%s/bin", rootfs) < (int)sizeof path) (void)rmdir(path);
+    if (snprintf(path, sizeof path, "%s/dev", rootfs) < (int)sizeof path) (void)rmdir(path);
+    if (snprintf(path, sizeof path, "%s/tmp", rootfs) < (int)sizeof path) (void)rmdir(path);
+    (void)rmdir(rootfs);
+}
+
 static void capture_free(capture *result) { free(result->output); free(result->error); }
 static int exit_matches(const capture *result, int expected) {
     return WIFEXITED(result->wait_status) && WEXITSTATUS(result->wait_status) == expected;
@@ -222,7 +273,7 @@ static void diagnostic(const suite_case *item, const char *isa, const char *reas
 
 static int run_one(const suite_case *item, const char *bridge, const char *engine, const char *binary_root,
                    const char *suite_root, const char *isa, capture *result) {
-    char guest[1024], expected_path[1024], binary[256];
+    char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
     unsigned char *expected;
     size_t expected_size, length = strlen(item->source);
     int status;
@@ -233,7 +284,14 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         read_file(expected_path, &expected, &expected_size) != 0) {
         fprintf(stderr, "matrix-runner: %s input path/read failure\n", item->name); return 1;
     }
-    status = run_guest(bridge, engine, guest, result);
+    if (item->needs_rootfs && stage_rootfs(binary_root, guest, rootfs) != 0) {
+        fprintf(stderr, "matrix-runner: %s rootfs staging failure\n", item->name);
+        free(expected); return 1;
+    }
+    /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
+    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest,
+                       item->needs_rootfs ? rootfs : NULL, result);
+    if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {
         diagnostic(item, isa, status == 2 ? "timeout" : "exit/stdout mismatch", result);
