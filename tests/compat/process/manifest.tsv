@@ -26,7 +26,6 @@ sentry_fork	process	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -
 sysinfo	process	sysinfo.c	sysinfo.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sysinfo.out	linux-libc	active	exact source; deterministic checked registration
 thrfork	process	thrfork.c	thrfork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/thrfork.out	linux-libc	active	exact source; deterministic checked registration
 waitcore	process	waitcore.c	waitcore.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/waitcore.out	linux-libc	active	exact source; deterministic checked registration
-forkserver-probe	forkserver	forkserver_probe.c	forkserver_probe.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	42	expected/forkserver_probe.out	linux-libc	excluded-unsupported-registration	standalone probe output embeds harness-owned cwd/path
 nonpie-dladdr	loader	nonpie_dladdr.c	nonpie_dladdr.c	aarch64,x86_64	-no-pie -O2 -rdynamic -pthread -ldl	-	-	0	expected/nonpie_dladdr.out	linux-libc,dynamic-rootfs	active	exact dynamic non-PIE source; C runner stages the configured loader and libc through typed ABI4 rootfs launch data
 sentry-fork-untrusted	sandbox	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_fork.out	linux-libc	active	exact typed untrusted registration
 sentry-fork-sandbox	sandbox	sentry_fork.c	sentry_fork.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_SANDBOX=1	0	expected/sentry_fork.out	linux-libc	active	exact typed sandbox registration

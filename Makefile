@@ -144,7 +144,7 @@ SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
 	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt,$(SIGNALS_CASE_NAMES)))
-PROCESS_CASE_SOURCES := $(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c))
+PROCESS_CASE_SOURCES := $(filter-out tests/compat/process/integration/%.c,$(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c)))
 PROCESS_CASE_NAMES := $(patsubst tests/compat/process/%.c,%,$(PROCESS_CASE_SOURCES))
 PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
 	$(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/x86_64/%)
@@ -901,6 +901,10 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
+$(BUILD)/tools/forkserver-runner: tests/compat/process/integration/forkserver_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
 $(BUILD)/tools/matrix-runner: tools/matrix_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) \
@@ -959,10 +963,16 @@ compat-signals: compat-engines $(BUILD)/tools/matrix-runner $(SIGNALS_CASE_BINS)
 		$(abspath $(BUILD)/compat/signals/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/signals/x86_64) $(abspath tests/compat/signals)
 
-compat-process: compat-engines $(BUILD)/tools/matrix-runner $(PROCESS_CASE_BINS)
+compat-process: compat-engines $(BUILD)/tools/matrix-runner $(BUILD)/tools/forkserver-runner $(PROCESS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/process/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/process/x86_64) $(abspath tests/compat/process)
+	$(BUILD)/tools/forkserver-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/process/aarch64/forkserver_probe) \
+		$(abspath tests/compat/process/expected/forkserver_integration.out)
+	$(BUILD)/tools/forkserver-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/process/x86_64/forkserver_probe) \
+		$(abspath tests/compat/process/expected/forkserver_integration.out)
 
 compat-time: compat-engines $(BUILD)/tools/matrix-runner $(TIME_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
