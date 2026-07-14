@@ -130,9 +130,13 @@ MEMORY_CASE_SOURCES := $(sort $(wildcard tests/compat/memory/*.c))
 MEMORY_CASE_NAMES := $(basename $(notdir $(MEMORY_CASE_SOURCES)))
 MEMORY_CASE_BINS := $(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/aarch64/%) \
 	$(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/x86_64/%)
+FILESYSTEM_CASE_SOURCES := $(sort $(wildcard tests/compat/filesystem/*.c))
+FILESYSTEM_CASE_NAMES := $(basename $(notdir $(FILESYSTEM_CASE_SOURCES)))
+FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aarch64/%) \
+	$(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-syscall $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-syscall $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -352,6 +356,14 @@ $(BUILD)/compat/memory/x86_64/%: tests/compat/memory/%.c tests/compat/memory/mem
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
 
+$(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -502,7 +514,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-syscall $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-syscall $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -601,6 +613,11 @@ compat-memory: compat-engines $(BUILD)/tools/matrix-runner $(MEMORY_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/memory/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/memory/x86_64) $(abspath tests/compat/memory)
+
+compat-filesystem: compat-engines $(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/filesystem/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/filesystem/x86_64) $(abspath tests/compat/filesystem)
 
 compat-procfs: compat-engines $(BUILD)/tools/matrix-runner $(PROCFS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \

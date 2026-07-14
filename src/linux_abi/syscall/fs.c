@@ -300,16 +300,15 @@ static int xattr_hostpath(const char *path, int nofollow, int forwrite, char *ho
     return 0;
 }
 
-// setxattr with Linux XATTR_CREATE/XATTR_REPLACE semantics. macOS honours each flag alone, but rejects
-// the *combination* with EINVAL — where Linux's simple_xattr_set never does: it tests XATTR_CREATE first
-// (an if/else-if), so CREATE+REPLACE on an existing attr yields EEXIST, on a missing one yields ENODATA.
-// So we resolve the create/replace precondition ourselves against a host existence probe and hand macOS
-// a plain set (flags=0), which reproduces the kernel byte-for-byte and never leaks macOS's EINVAL.
+// setxattr with Linux XATTR_CREATE/XATTR_REPLACE semantics. Linux rejects unknown flag bits and the
+// mutually-exclusive CREATE|REPLACE combination with EINVAL. Resolve each valid precondition ourselves
+// against a host existence probe and hand macOS a plain set (flags=0).
 static long guest_xattr_set(const char *host, const char *name, const void *val, size_t sz, uint64_t lflags,
                             int nofollow) {
     char hn[512];
     snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
     int opt = nofollow ? XATTR_NOFOLLOW : 0;
+    if ((lflags & ~UINT64_C(3)) != 0 || (lflags & 3) == 3) return -EINVAL;
     if (lflags & 3) { // XATTR_CREATE(1) | XATTR_REPLACE(2)
         int exists = getxattr(host, hn, NULL, 0, 0, opt) >= 0;
         if ((lflags & 1) && exists) return -EEXIST;   // XATTR_CREATE on an existing attr
