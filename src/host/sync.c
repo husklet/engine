@@ -192,3 +192,14 @@ hl_host_result hl_host_sync_mutex_close(hl_host_sync_registry *registry, hl_host
     pthread_mutex_unlock(&registry->lock);
     return hl_sync_result(HL_STATUS_OK, 0, 0);
 }
+
+hl_host_result hl_host_sync_fork_prepare(hl_host_sync_registry *registry) {
+    if (registry == NULL) return hl_sync_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (pthread_mutex_lock(&registry->lock) != 0) return hl_sync_result(HL_STATUS_PLATFORM_FAILURE, 0, errno);
+    return hl_sync_result(HL_STATUS_OK, 0, 0);
+}
+
+hl_host_result hl_host_sync_fork_complete(hl_host_sync_registry *registry) {
+    if (registry == NULL) return hl_sync_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return hl_sync_result(hl_sync_status(pthread_mutex_unlock(&registry->lock)), 0, 0);
+}

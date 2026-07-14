@@ -11,5 +11,7 @@ hl_host_result hl_host_sync_mutex_create(hl_host_sync_registry *registry);
 hl_host_result hl_host_sync_mutex_lock(hl_host_sync_registry *registry, hl_host_handle handle);
 hl_host_result hl_host_sync_mutex_unlock(hl_host_sync_registry *registry, hl_host_handle handle);
 hl_host_result hl_host_sync_mutex_close(hl_host_sync_registry *registry, hl_host_handle handle);
+hl_host_result hl_host_sync_fork_prepare(hl_host_sync_registry *registry);
+hl_host_result hl_host_sync_fork_complete(hl_host_sync_registry *registry);
 
 #endif

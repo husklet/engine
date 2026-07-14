@@ -475,6 +475,49 @@ static hl_host_result hl_linux_file_write_sequential(void *context, hl_host_hand
     return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_clone_for_fork(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    uint32_t low = (uint32_t)file;
+    hl_linux_handle_entry *entry = NULL;
+    int descriptor = -1;
+    int append_descriptor = -1;
+    int needs_append = 0;
+    pthread_mutex_lock(&host->lock);
+    if (low != 0 && low - 1u < HL_LINUX_HANDLE_CAPACITY) entry = &host->handles[low - 1u];
+    if (entry != NULL && entry->generation == (uint32_t)(file >> 32) && entry->kind == HL_LINUX_HANDLE_FILE) {
+        needs_append = entry->wake_descriptor >= 0;
+        descriptor = dup(entry->descriptor);
+        if (descriptor >= 0 && needs_append) append_descriptor = dup(entry->wake_descriptor);
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0 || (needs_append && append_descriptor < 0)) {
+        hl_host_result error = hl_linux_errno_result();
+        if (descriptor >= 0) close(descriptor);
+        return error;
+    }
+    {
+        hl_host_result result =
+            hl_linux_allocate_handle(host, HL_LINUX_HANDLE_FILE, descriptor, NULL, NULL, 0, append_descriptor);
+        if (result.status != HL_STATUS_OK) {
+            close(descriptor);
+            if (append_descriptor >= 0) close(append_descriptor);
+        }
+        return result;
+    }
+}
+
+static hl_host_result hl_linux_file_seek(void *context, hl_host_handle file, int64_t offset, uint32_t whence) {
+    hl_host_linux *host = context;
+    int descriptor;
+    off_t result;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0 || whence > UINT32_C(2)) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = lseek(descriptor, (off_t)offset, (int)whence);
+    return result < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, (uint64_t)result, 0);
+}
+
 static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
     hl_host_linux *host = context;
     uint32_t low = (uint32_t)file;
@@ -970,6 +1013,23 @@ static hl_host_result hl_linux_mutex_close(void *context, hl_host_handle handle)
     return hl_host_sync_mutex_close(host->sync, handle);
 }
 
+static hl_host_result hl_linux_fork_prepare(void *context) {
+    hl_host_linux *host = context;
+    hl_host_result result;
+    if (pthread_mutex_lock(&host->lock) != 0) return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    result = hl_host_sync_fork_prepare(host->sync);
+    if (result.status != HL_STATUS_OK) pthread_mutex_unlock(&host->lock);
+    return result;
+}
+
+static hl_host_result hl_linux_fork_complete(void *context) {
+    hl_host_linux *host = context;
+    hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    if (pthread_mutex_unlock(&host->lock) != 0 && result.status == HL_STATUS_OK)
+        return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    return result;
+}
+
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
@@ -986,7 +1046,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_metadata_get,
                                                hl_linux_close_descriptor,
                                                hl_linux_file_read_sequential,
-                                               hl_linux_file_write_sequential};
+                                               hl_linux_file_write_sequential,
+                                               hl_linux_file_clone_for_fork,
+                                               hl_linux_file_seek};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};
@@ -999,8 +1061,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
                                                      hl_linux_process_spawn,     hl_linux_process_wait,
                                                      hl_linux_process_terminate, hl_linux_process_close};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,    sizeof(sync),          hl_linux_mutex_create,
-                                               hl_linux_mutex_lock, hl_linux_mutex_unlock, hl_linux_mutex_close};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create,
+                                               hl_linux_mutex_lock,   hl_linux_mutex_unlock,  hl_linux_mutex_close,
+                                               hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_complete};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;

@@ -41,7 +41,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         (!hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)) ||
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
          services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL ||
-         services->file->read == NULL || services->file->write == NULL))
+         services->file->read == NULL || services->file->write == NULL || services->file->clone_for_fork == NULL ||
+         services->file->seek == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||
@@ -67,7 +68,9 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         (!hl_has_field(services->size, offsetof(hl_host_services, sync), sizeof(services->sync)) ||
          !hl_valid_group(services->sync, HL_HOST_SYNC_ABI, sizeof(*services->sync)) ||
          services->sync->mutex_create == NULL || services->sync->mutex_lock == NULL ||
-         services->sync->mutex_unlock == NULL || services->sync->mutex_close == NULL))
+         services->sync->mutex_unlock == NULL || services->sync->mutex_close == NULL ||
+         services->sync->fork_prepare == NULL || services->sync->fork_parent == NULL ||
+         services->sync->fork_child == NULL))
         return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

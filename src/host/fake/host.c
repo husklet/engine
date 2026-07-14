@@ -166,6 +166,11 @@ static hl_host_result hl_fake_mutex_close(void *context, hl_host_handle mutex) {
     return result;
 }
 
+static hl_host_result hl_fake_fork_lifecycle(void *context) {
+    (void)context;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
                                                    sizeof(memory),
@@ -179,8 +184,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,       sizeof(process),
                                                      hl_fake_spawn_cloned,      hl_fake_process_wait,
                                                      hl_fake_process_terminate, hl_fake_process_close};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,   sizeof(sync),         hl_fake_mutex_create,
-                                               hl_fake_mutex_lock, hl_fake_mutex_unlock, hl_fake_mutex_close};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,
+                                               hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
+                                               hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;

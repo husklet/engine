@@ -9,12 +9,12 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 4u
+#define HL_HOST_FILE_ABI 5u
 #define HL_HOST_PROCESS_ABI 2u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
-#define HL_HOST_SYNC_ABI 1u
+#define HL_HOST_SYNC_ABI 2u
 
 typedef uint64_t hl_host_handle;
 
@@ -162,6 +162,8 @@ typedef struct hl_host_file_services {
     /* Sequential operations for streams and other non-seekable descriptors. */
     hl_host_result (*read)(void *context, hl_host_handle file, void *output, uint64_t output_size);
     hl_host_result (*write)(void *context, hl_host_handle file, const void *input, uint64_t input_size);
+    hl_host_result (*clone_for_fork)(void *context, hl_host_handle file);
+    hl_host_result (*seek)(void *context, hl_host_handle file, int64_t offset, uint32_t whence);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX
@@ -232,6 +234,9 @@ typedef struct hl_host_sync_services {
     hl_host_result (*mutex_lock)(void *context, hl_host_handle mutex);
     hl_host_result (*mutex_unlock)(void *context, hl_host_handle mutex);
     hl_host_result (*mutex_close)(void *context, hl_host_handle mutex);
+    hl_host_result (*fork_prepare)(void *context);
+    hl_host_result (*fork_parent)(void *context);
+    hl_host_result (*fork_child)(void *context);
 } hl_host_sync_services;
 
 typedef struct hl_host_services {

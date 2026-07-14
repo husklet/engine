@@ -121,6 +121,22 @@ typedef struct hl_linux_file_status {
     uint32_t mode;
 } hl_linux_file_status;
 
+typedef struct hl_linux_fork_record {
+    uint32_t ofd;
+    uint32_t generation;
+    hl_host_handle parent_handle;
+    hl_host_handle child_handle;
+    hl_host_handle child_mutex;
+} hl_linux_fork_record;
+
+typedef struct hl_linux_fork_plan {
+    HL_ABI_HEADER;
+    hl_linux_fork_record *records;
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t armed;
+} hl_linux_fork_plan;
+
 enum { HL_LINUX_STAT_AARCH64_SIZE = 128, HL_LINUX_STAT_X86_64_SIZE = 144 };
 
 typedef struct hl_linux_abi {
@@ -152,6 +168,10 @@ HL_API hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_servic
  * destroy's entry onward; after success the instance may only be initialized.
  */
 HL_API hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi);
+/* Caller must quiesce every concurrent operation on linux_abi until parent/child completion. */
+HL_API hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
+HL_API hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
+HL_API hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,
                                      uint32_t descriptor_flags, hl_linux_fd *out_fd);
 /* Installs only at the requested vacant guest descriptor; never exposes or duplicates a native descriptor. */

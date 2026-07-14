@@ -11,6 +11,7 @@ typedef struct test_file_host {
     hl_fake_host fake;
     char bytes[32];
     size_t size;
+    uint64_t offset;
     _Atomic uint32_t reads;
     _Atomic uint32_t closes;
     _Atomic uint32_t bad_handles;
@@ -114,6 +115,7 @@ static hl_host_result test_append(void *context, hl_host_handle file, hl_host_co
     if (result.status == HL_STATUS_OK) {
         host->appends++;
         result.detail = host->size;
+        host->offset = host->size;
     }
     return result;
 }
@@ -130,6 +132,43 @@ static hl_host_result test_metadata(void *context, hl_host_handle file, hl_host_
     metadata->type = host->metadata_type == 0 ? HL_HOST_FILE_TYPE_REGULAR : host->metadata_type;
     metadata->permissions = 0640;
     return file_result(HL_STATUS_OK, 0);
+}
+
+static hl_host_result test_read(void *context, hl_host_handle file, void *output, uint64_t output_size) {
+    test_file_host *host = context;
+    hl_host_result result = test_read_at(context, file, host->offset, (hl_host_bytes){output, (size_t)output_size});
+    if (result.status == HL_STATUS_OK && result.value <= output_size) host->offset += result.value;
+    return result;
+}
+
+static hl_host_result test_write(void *context, hl_host_handle file, const void *input, uint64_t input_size) {
+    test_file_host *host = context;
+    hl_host_result result =
+        test_write_at(context, file, host->offset, (hl_host_const_bytes){input, (size_t)input_size});
+    if (result.status == HL_STATUS_OK && result.value <= input_size) host->offset += result.value;
+    return result;
+}
+
+static hl_host_result test_clone(void *context, hl_host_handle file) {
+    (void)context;
+    return file == 55 ? file_result(HL_STATUS_OK, 56) : file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+}
+
+static hl_host_result test_seek(void *context, hl_host_handle file, int64_t offset, uint32_t whence) {
+    test_file_host *host = context;
+    int64_t base;
+    if (file != 55 && file != 56) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    if (whence == HL_LINUX_SEEK_SET)
+        base = 0;
+    else if (whence == HL_LINUX_SEEK_CUR)
+        base = (int64_t)host->offset;
+    else if (whence == HL_LINUX_SEEK_END)
+        base = (int64_t)host->size;
+    else
+        return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    if (offset < -base) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    host->offset = (uint64_t)(base + offset);
+    return file_result(HL_STATUS_OK, host->offset);
 }
 
 typedef struct read_thread_args {
@@ -170,7 +209,11 @@ int main(void) {
                                    .write_at = test_write_at,
                                    .append = test_append,
                                    .metadata = test_metadata,
-                                   .close = test_close};
+                                   .close = test_close,
+                                   .read = test_read,
+                                   .write = test_write,
+                                   .clone_for_fork = test_clone,
+                                   .seek = test_seek};
     char buffer[8] = {0};
 
     file_host.size = 6;
@@ -235,22 +278,22 @@ int main(void) {
     memset(buffer, 0, sizeof(buffer));
     HL_CHECK(hl_linux_read(&linux_abi, duplicate, buffer, 2) == 2);
     HL_CHECK(memcmp(buffer, "cd", 2) == 0);
-    HL_CHECK(ofds[fds[original].ofd].offset == 4);
+    HL_CHECK(file_host.offset == 4);
 
     /* pread reads at an explicit offset and never changes the shared OFD offset. */
     memset(buffer, 0, sizeof(buffer));
     HL_CHECK(hl_linux_pread64(&linux_abi, duplicate, buffer, 2, 1) == 2);
     HL_CHECK(memcmp(buffer, "bc", 2) == 0);
-    HL_CHECK(ofds[fds[original].ofd].offset == 4);
+    HL_CHECK(file_host.offset == 4);
 
     /* A failed host read becomes Linux errno and does not advance the offset. */
     file_host.next_status = HL_STATUS_WOULD_BLOCK;
     HL_CHECK(hl_linux_read(&linux_abi, duplicate, buffer, 1) == -HL_LINUX_EAGAIN);
-    HL_CHECK(ofds[fds[original].ofd].offset == 4);
+    HL_CHECK(file_host.offset == 4);
     HL_CHECK(hl_linux_read(&linux_abi, duplicate, NULL, 1) == -HL_LINUX_EINVAL);
     file_host.next_value = 9;
     HL_CHECK(hl_linux_read(&linux_abi, duplicate, buffer, 1) == -HL_LINUX_EIO);
-    HL_CHECK(ofds[fds[original].ofd].offset == 4);
+    HL_CHECK(file_host.offset == 4);
 
     closed = HL_HOST_HANDLE_INVALID;
     HL_CHECK(hl_linux_fd_close(&linux_abi, original, &closed) == HL_STATUS_OK);
@@ -269,29 +312,31 @@ int main(void) {
 
     /* write shares its OFD offset across dup; pwrite is positional and leaves it unchanged. */
     file_host.size = 0;
+    file_host.offset = 0;
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
     HL_CHECK(hl_linux_write(&linux_abi, original, "xy", 2) == 2);
     HL_CHECK(hl_linux_write(&linux_abi, duplicate, "z", 1) == 1);
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 3);
+    HL_CHECK(file_host.offset == 3);
     HL_CHECK(hl_linux_pwrite64(&linux_abi, duplicate, "Q", 1, 0) == 1);
     HL_CHECK(memcmp(file_host.bytes, "Qyz", 3) == 0);
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_OK && snapshot.offset == 3);
+    HL_CHECK(file_host.offset == 3);
     file_host.next_status = HL_STATUS_WOULD_BLOCK;
     HL_CHECK(hl_linux_write(&linux_abi, original, "!", 1) == -HL_LINUX_EAGAIN);
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 3);
+    HL_CHECK(file_host.offset == 3);
     HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
     HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0);
 
     /* lseek changes the shared OFD offset; SEEK_END uses portable host metadata. */
     file_host.size = 6;
+    file_host.offset = 0;
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_dup(&linux_abi, original) == 1);
     duplicate = 1;
     HL_CHECK(hl_linux_lseek(&linux_abi, original, 2, HL_LINUX_SEEK_SET) == 2);
     HL_CHECK(hl_linux_lseek(&linux_abi, duplicate, 1, HL_LINUX_SEEK_CUR) == 3);
     HL_CHECK(hl_linux_lseek(&linux_abi, original, -1, HL_LINUX_SEEK_END) == 5);
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_OK && snapshot.offset == 5);
+    HL_CHECK(file_host.offset == 5);
     HL_CHECK(hl_linux_lseek(&linux_abi, original, -7, HL_LINUX_SEEK_SET) == -HL_LINUX_EINVAL);
     HL_CHECK(hl_linux_lseek(&linux_abi, original, 0, 99) == -HL_LINUX_EINVAL);
     file_host.metadata_type = HL_HOST_FILE_TYPE_SOCKET;
@@ -355,15 +400,16 @@ int main(void) {
 
     /* O_APPEND delegates one atomic append to the host and adopts its resulting offset. */
     file_host.size = 3;
+    file_host.offset = 0;
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY | HL_LINUX_O_APPEND, 0, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
     HL_CHECK(hl_linux_write(&linux_abi, original, "A", 1) == 1);
     HL_CHECK(hl_linux_write(&linux_abi, duplicate, "B", 1) == 1);
     HL_CHECK(file_host.appends == 2 && memcmp(file_host.bytes, "QyzAB", 5) == 0);
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 5);
+    HL_CHECK(file_host.offset == 5);
     HL_CHECK(hl_linux_pwrite64(&linux_abi, duplicate, "P", 1, 1) == 1);
     HL_CHECK(file_host.bytes[1] == 'P');
-    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK && snapshot.offset == 5);
+    HL_CHECK(file_host.offset == 5);
     HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
     HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0);
 
@@ -397,6 +443,7 @@ int main(void) {
         /* Concurrent reads through duplicated fds consume one shared OFD offset atomically. */
         memcpy(file_host.bytes, "abcdef", 6);
         file_host.size = 6;
+        file_host.offset = 0;
         HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &first.fd) == HL_STATUS_OK);
         HL_CHECK(hl_linux_fd_dup(&linux_abi, first.fd, 0, &second.fd) == HL_STATUS_OK);
         HL_CHECK(pthread_create(&first_thread, NULL, read_three_bytes, &first) == 0);
@@ -416,6 +463,7 @@ int main(void) {
         HL_CHECK(hl_linux_close(&linux_abi, second.fd) == 0);
 
         /* Host calls on unrelated OFDs overlap; table ownership is not held across I/O. */
+        file_host.offset = 0;
         HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &first.fd) == HL_STATUS_OK);
         HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_HOST_FILE_READ, 0, &second.fd) == HL_STATUS_OK);
         atomic_store_explicit(&file_host.concurrent_calls, 0, memory_order_relaxed);

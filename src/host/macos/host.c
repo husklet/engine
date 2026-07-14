@@ -474,6 +474,43 @@ static hl_host_result hl_macos_file_write_sequential(void *context, hl_host_hand
     return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
 }
 
+static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle file) {
+    hl_host_macos *host = context;
+    hl_macos_file *entry;
+    int descriptor = -1;
+    int append_descriptor = -1;
+    int needs_append = 0;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_macos_file_lookup(host, file);
+    if (entry != NULL) {
+        needs_append = entry->append_descriptor >= 0;
+        descriptor = dup(entry->descriptor);
+        if (descriptor >= 0 && needs_append) append_descriptor = dup(entry->append_descriptor);
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0 || (needs_append && append_descriptor < 0)) {
+        hl_host_result error = hl_macos_errno();
+        if (descriptor >= 0) close(descriptor);
+        return error;
+    }
+    {
+        hl_host_result result = hl_macos_file_register(host, descriptor, append_descriptor);
+        if (result.status != HL_STATUS_OK) {
+            close(descriptor);
+            if (append_descriptor >= 0) close(append_descriptor);
+        }
+        return result;
+    }
+}
+
+static hl_host_result hl_macos_file_seek(void *context, hl_host_handle file, int64_t offset, uint32_t whence) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    off_t result;
+    if (descriptor < 0 || whence > UINT32_C(2)) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    result = lseek(descriptor, (off_t)offset, (int)whence);
+    return result < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)result, 0);
+}
+
 static hl_host_result hl_macos_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
     int descriptor = hl_macos_file_descriptor(context, file, 1);
     ssize_t count;
@@ -708,6 +745,23 @@ static hl_host_result hl_macos_mutex_close(void *context, hl_host_handle handle)
     return hl_host_sync_mutex_close(host->sync, handle);
 }
 
+static hl_host_result hl_macos_fork_prepare(void *context) {
+    hl_host_macos *host = context;
+    hl_host_result result;
+    if (pthread_mutex_lock(&host->lock) != 0) return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    result = hl_host_sync_fork_prepare(host->sync);
+    if (result.status != HL_STATUS_OK) pthread_mutex_unlock(&host->lock);
+    return result;
+}
+
+static hl_host_result hl_macos_fork_complete(void *context) {
+    hl_host_macos *host = context;
+    hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    if (pthread_mutex_unlock(&host->lock) != 0 && result.status == HL_STATUS_OK)
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    return result;
+}
+
 static void hl_macos_log(void *context, uint32_t event, const char *message, size_t message_size) {
     size_t written = 0;
     (void)context;
@@ -739,12 +793,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_metadata_get,
                                                hl_macos_file_close,
                                                hl_macos_file_read_sequential,
-                                               hl_macos_file_write_sequential};
+                                               hl_macos_file_write_sequential,
+                                               hl_macos_file_clone_for_fork,
+                                               hl_macos_file_seek};
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
                                                      hl_macos_process_spawn,     hl_macos_process_wait,
                                                      hl_macos_process_terminate, hl_macos_process_close};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,    sizeof(sync),          hl_macos_mutex_create,
-                                               hl_macos_mutex_lock, hl_macos_mutex_unlock, hl_macos_mutex_close};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
+                                               hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
+                                               hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_complete};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;

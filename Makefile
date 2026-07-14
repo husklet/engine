@@ -75,7 +75,7 @@ MAC_AUX_OBJECTS := $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/target/x86_64.o \
 	$(BUILD)/mac/lifecycle/aarch64-runner.o $(BUILD)/mac/lifecycle/x86_64-runner.o
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi linux_fork seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -162,6 +162,12 @@ $(BUILD)/tests/test_fdcache: tests/unit/test_fdcache.c $(BUILD)/lib/libhl-linux-
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
 		$(BUILD)/lib/libhl-host-fake.a -o $@
+
+$(BUILD)/tests/test_linux_fork: tests/unit/test_linux_fork.c $(BUILD)/lib/libhl-linux-abi.a \
+	$(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
+		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_seccomp_vm: tests/unit/test_seccomp_vm.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)
