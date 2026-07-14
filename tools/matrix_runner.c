@@ -489,11 +489,13 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
                    const char *suite_root, const char *isa, capture *result) {
     char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
     unsigned char *expected;
-    size_t expected_size, length = strlen(item->source);
+    size_t expected_size, length = strlen(item->source), binary_length = length;
     int status;
-    if (length < 3 || strcmp(item->source + length - 2, ".c") != 0 || length - 2 >= sizeof(binary)) return 1;
-    memcpy(binary, item->source, length - 2);
-    binary[length - 2] = 0;
+    /* Source-built suites use foo.c; fixture suites may name the committed executable itself. */
+    if (length >= 2 && strcmp(item->source + length - 2, ".c") == 0) binary_length -= 2;
+    if (binary_length == 0 || binary_length >= sizeof(binary)) return 1;
+    memcpy(binary, item->source, binary_length);
+    binary[binary_length] = 0;
     if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
         snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >=
             (int)sizeof(expected_path) ||
