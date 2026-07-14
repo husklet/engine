@@ -77,7 +77,7 @@ static void exec_forward_env(uint64_t envp_guest) {
 // RLIMIT_NOFILE(7) reports a finite fd cap (soft 20480 / hard 1048576, the docker container default) -- a
 // guest like memcached does calloc(rlim_cur, sizeof(conn)), which overflows if the soft limit is RLIM_INFINITY.
 static void svc_fill_rlimit(int resource, uint64_t *o) {
-    // docker --ulimit override wins (g_ulimit, seeded from DD_ULIMITS in state.c): a guest that reads its
+    // Docker --ulimit override wins (g_ulimit, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
     // requested value, not the dd default. `set` gates each resource so unspecified ones keep the defaults.
     if (resource >= 0 && resource < DD_RLIM_MAX && g_ulimit[resource].set) {
@@ -248,14 +248,6 @@ static void fork_child_hooks(struct cpu *c) {
     dd_gpu_after_fork();    // GPU rung 2: this child can no longer create/map an IOSurface (fork-unsafe) —
                             // it may only reuse the pre-fork, VM_INHERIT_SHARE'd IOSurface pool it inherited
     if (fp) t[4] = now_ns();
-#ifdef DD_HAS_MACH_EXC
-    // The CRASHDBG Mach exception port + its receiver thread do NOT survive fork, so a crash in the
-    // child silently dies. Clear the inherited task exception port so a fault falls through to the
-    // POSIX diag_crash handler (which IS inherited) and reports fault=/pc=.
-    if (0)
-        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION, MACH_PORT_NULL,
-                                 EXCEPTION_DEFAULT, 0);
-#endif
     if (fp) {
         t[5] = now_ns();
         fprintf(stderr, "[forkprof] child jit=%llu rc=%llu kq=%llu locks=%llu total=%llu ns preserved=%d rw=%p rx=%p\n",

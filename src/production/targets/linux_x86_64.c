@@ -112,7 +112,7 @@ static void container_init(const char *rootfs) {
     // cross-engine-process cgroup accounting: a FRESH shared slot table for THIS container init, inherited
     // by every guest fork (see state.c). Per-container so sibling forkserver workers never share a total.
     if (rootfs) acct_container_reset();
-    container_read_resource_env(); // docker --cpus / --read-only / --ulimit (DD_CPUS/DD_ROOTFS_RO/DD_ULIMITS)
+    container_read_resource_env(); // Docker CPU, read-only-root, and ulimit values from centralized HL options.
     // The final typed launch hands the container model to the engine as HL options, not as the
     // --hostname/--mem-max/--pids-max CLI flags. aarch64's container_init() already reads these options;
     // (linux_aarch64.c); x86-64 did not, so a `docker run --hostname h` on x86 dropped the hostname
@@ -139,9 +139,7 @@ static void container_init(const char *rootfs) {
         g_root_fd = engine_fd_hoist(g_root_fd); // keep it off the guest's low fds (else it squats fd 3)
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
-        // Container identity = root (0) by default, matching linux_aarch64.c; DD_UID/DD_GID (or --uid/--gid)
-        // override. Without this g_uid stayed -1 and cuid() fell back to the HOST uid -> the guest saw
-        // getuid()/geteuid() == the host's 501 ("I have no name!", non-root shell) on x86-64 only.
+        // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
         const char *eu = hl_option_get("HL_UID");
         if (eu && g_uid < 0) g_uid = dd_parse_id("HL_UID", eu);
         const char *eg = hl_option_get("HL_GID");
@@ -150,11 +148,9 @@ static void container_init(const char *rootfs) {
         if (g_gid < 0) g_gid = 0;
     }
     {
-        // DD_NETNS is a short KEY (not a path) -- the SAME key netns.c derives the abstract-socket / IPC
-        // namespace dirs from (/tmp/.ddabs-<key>, ...) and that the daemon + aarch64 engine use. The
-        // private-loopback dir is derived FROM it. Inherit the key across exec / from the daemon, else
-        // mint one from our pid. (Setting DD_NETNS to the full loopback path put slashes in those derived
-        // dir names -> mkdir failed -> abstract-socket bind broke.)
+        // HL_NETNS is a short key (not a path) used to derive abstract-socket and IPC identities.
+        // The daemon and both guest ISAs share it across exec; the private-loopback directory is derived from it.
+        // Inherit the key when supplied, otherwise mint one from the process id.
         const char *ns = hl_option_get("HL_NETNS");
         char key[40];
         if (ns && ns[0])
@@ -192,7 +188,7 @@ static void container_init(const char *rootfs) {
         }
     }
     if (g_rootfs) chdir(g_rootfs); // container model: guest cwd "/" maps to the rootfs root
-    // docker -w / initial working directory: start the guest in DD_CWD (must be reachable inside the
+    // Docker -w / initial working directory: start the guest in HL_CWD (must be reachable inside the
     // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
     const char *icwd = hl_option_get("HL_CWD");
     if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
@@ -237,7 +233,7 @@ static int engine_global_init(void) {
     // Host-IOSurface GPU bridge (--gui): force its one-time ObjC/CoreFoundation/Foundation/IOSurface class
     // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
     // never be mid-flight when a guest forks (which would abort the child via libobjc's fork-safety guard).
-    // Gated on DD_GPU_IOSURFACE; a no-op for every other workload. Mirrors targets/linux_aarch64.c.
+    // Gated on HL_GPU_IOSURFACE; a no-op for every other workload. Mirrors targets/linux_aarch64.c.
     dd_gpu_prewarm_fork_safety();
     g_engine_inited = 1;
     return 0;
@@ -324,10 +320,9 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 
 int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     if (argc < 1 || !argv || !argv[0]) return 2;
-    // Persistent translated-code cache: opt in via HL_PCACHE; HL_NOPCACHE always wins.
-    // kill-switch and always wins (same contract as the aarch64 pcache). Read once.
+    // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
-    g_pcache = hl_option_get("HL_PCACHE") != NULL && hl_option_get("HL_NOPCACHE") == NULL;
+    g_pcache = hl_option_get("HL_PCACHE") != NULL;
     container_init(rootfs);
     int rc = engine_global_init();
     if (rc) return rc;

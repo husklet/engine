@@ -52,7 +52,7 @@
 //
 // Config model: engine-level HL options and the container rootfs are server
 // launch config, read once at --server startup. Guest-visible env + the per-request container env the
-// cold path re-parses (DDVOL/DD_NETNS/DD_CWD/DD_PUBLISH...) come from the CLIENT per request.
+// Cold-path launch options such as volumes, namespace, cwd, and published ports come from each client request.
 
 #include <sys/wait.h> // waitpid + W* status macros (also pulled in by sentry.c; idempotent)
 
@@ -249,7 +249,7 @@ static struct {
 
 static int g_fsrv_ls = -1, g_fsrv_kq = -1;
 
-static void ddjitd_runner(int conn, int *fds, int nfd, int argc, char **argv, char **envv, const char *cwd) {
+static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **argv, char **envv, const char *cwd) {
     // Shed every server-side fd so nothing leaks into the guest's fd table: the listener, the kqueue
     // slot (kqueues are not inherited across fork, but the fd number is), every concurrently live
     // launch's control conn, and our OWN control conn (the server reports pid/status, not us).
@@ -317,13 +317,16 @@ static void ddjitd_runner(int conn, int *fds, int nfd, int argc, char **argv, ch
     }
     // Cold: no matching prewarm. Pay a full per-launch load + translate in the runner (still no
     // spawn/dyld/engine-init -- those were paid by the resident parent). container_init re-runs
-    // against the CLIENT's env (DDVOL/DD_NETNS/DD_CWD...); engine_global_init is a no-op
+    // against the client's centralized HL options; engine_global_init is a no-op
     // (g_engine_inited). Translations are COW-private to this runner and discarded on exit.
     // A PREWARMED arena bars the persistent cache in a cold runner: pcache_load() restores over the
     // arena from offset 0 WITHOUT clearing the prewarm block map (stale entries would point into the
     // clobbered bytes), and the pcache fixed-VA image base (PC_IMG_BASE) is already occupied by the
-    // prewarm image. HL_NOPCACHE always wins inside the guest entry.
-    if (g_warm_ready) hl_option_set("HL_NOPCACHE", "1", 1);
+    // prewarm image. Persistent cache activation is removed in this short-lived cold runner.
+    if (g_warm_ready) {
+        hl_option_unset("HL_PCACHE");
+        hl_option_unset("HL_PCACHE_DIR");
+    }
     _exit(hl_run_linux_guest(g_srv_rootfs[0] ? g_srv_rootfs : NULL, argc, argv));
 }
 
@@ -352,7 +355,7 @@ static int ddjitd_server_main(int argc, char **argv) {
     if (rootfs) snprintf(g_srv_rootfs, sizeof g_srv_rootfs, "%s", rootfs);
 
     // keep the default dual-mapped RW/RX arena. It doesn't survive fork on its own, but every
-    // runner re-couples it via jit_after_fork() (see ddjitd_runner) -- the same preserved-arena hook a
+    // runner re-couples it via jit_after_fork() (see hl_forkserver_runner) -- the same preserved-arena hook a
     // guest fork uses -- so we get the fast no-W^X-toggle dual map AND correct COW inheritance, without
     // the old NODUALMAP single-mapping hack the x86 research forkserver needed.
 
@@ -574,7 +577,7 @@ static int ddjitd_server_main(int argc, char **argv) {
             continue;
         }
         pid_t pid = fork();
-        if (pid == 0) ddjitd_runner(conn, fds, nfd, wac, wargv, wenv, wcwd); // never returns
+        if (pid == 0) hl_forkserver_runner(conn, fds, nfd, wac, wargv, wenv, wcwd); // never returns
         for (int i = 0; i < nfd; i++)
             close(fds[i]); // ours were only for the runner
         int32_t p32 = (int32_t)(pid > 0 ? pid : -1);

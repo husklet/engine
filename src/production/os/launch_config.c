@@ -186,9 +186,11 @@ static int hl_read_config_file(int fd) {
         hl_option_set("HL_PCACHE", "1", 1);
         hl_option_set("HL_PCACHE_DIR", s, 1);
     }
-    // per-container persistent-cache kill switch: carried through typed launch so a single container can opt
-    // out even when the runtime enables persistent-cache defaults globally.
-    if (cfg.translation_cache_disabled) hl_option_set("HL_NOPCACHE", "1", 1);
+    /* A typed per-container disable removes cache activation instead of creating a second kill-switch contract. */
+    if (cfg.translation_cache_disabled) {
+        hl_option_unset("HL_PCACHE");
+        hl_option_unset("HL_PCACHE_DIR");
+    }
     // untrusted-guest sentry: both gates as the engine reads them.
     if (cfg.sandbox) {
         hl_option_set("HL_UNTRUSTED", "1", 1);

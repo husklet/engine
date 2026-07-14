@@ -67,9 +67,9 @@
 //
 // Keyed by (engine build id, cpu-struct size, map/ibtc sizes, both fixed bases,
 // entry PC, argv[0] basename, and the identity -- dev/ino/size/mtime(ns) -- of the guest binary AND its
-// interpreter). Opt in via HL_PCACHE=1; HL_NOPCACHE=1 always wins.
+// interpreter). Opt in via HL_PCACHE=1.
 
-#define PC_MAGIC 0x3436414350544a44ull // "DDJTPCA4" (LE tag)
+#define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
 #define PC_VERSION 4 // v4 retires mode-dependent A/B cache identities; production codegen is fixed.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
@@ -88,8 +88,8 @@ struct pc_reloc {
 };
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
-static int g_pcache;            // persistent cache active (HL_PCACHE=1; HL_NOPCACHE=1 disables)
-static int g_coldprof;          // COLDPROF=1: print pcache hit/miss + save timing
+static int g_pcache;            // persistent cache active (HL_PCACHE=1)
+static int g_coldprof;          // Internal cache timing diagnostics; production entry keeps this disabled.
 static uint64_t g_force_base;   // if nonzero, load_elf() maps the NEXT image MAP_FIXED here (one-shot; elf.c)
 static int g_force_base_failed; // a fixed-VA map fell back to a kernel base -> this image can't hit OR save
 static uint64_t g_pc_binid;     // identity of the guest binary+interp+argv0+engine+mode (cache file key)

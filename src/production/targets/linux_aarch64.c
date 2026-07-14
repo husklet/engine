@@ -27,7 +27,6 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
-#define DD_HAS_MACH_EXC 1 // service.c gates its CRASHDBG fork-child Mach re-arm on this
 #include <dlfcn.h>
 #include <sys/event.h>
 #include <termios.h>
@@ -502,50 +501,6 @@ static void install_mach_exc(void) {
     pthread_create(&t, NULL, exc_thread, NULL);
 }
 
-// DD_FAULTCOUNT=1: measurement-only wrapper around nonpie_guard that tallies served low-address faults
-// (the guest-base bias fold should drive this to zero). Per-process; printed at guest exit.
-static volatile uint64_t g_nonpie_faults;
-static volatile uint64_t g_fhist[16];
-static const char *g_fhname[16] = {"uoff", "unscaled", "wb",    "regoff", "ldp",   "ldp_wb", "excl",  "lse",
-                                   "cas",  "advmult",  "advsi", "dczva",  "ldlit", "ldar",   "other", "x"};
-
-static int fault_class(uint32_t in) {
-    if ((in & 0xFFFFFFE0u) == 0xD50B7420u) return 11;                                     // dc zva
-    if ((in & 0x3B000000u) == 0x18000000u) return 12;                                     // ldr literal
-    if ((in & 0x3A000000u) == 0x28000000u) return ((in >> 23) & 1) ? 5 : 4;               // ldp (wb if op2 odd)
-    if ((in & 0x3F200C00u) == 0x38200000u) return 7;                                      // lse atomic
-    if ((in & 0x3FA07C00u) == 0x08A07C00u) return 8;                                      // cas
-    if ((in & 0x3F200000u) == 0x08000000u) return (in & 0x00800000u) ? 13 : 6;            // ordered(ldar)/exclusive
-    if ((in & 0xBFBF0000u) == 0x0C000000u || (in & 0xBFA00000u) == 0x0C800000u) return 9; // advsimd mult
-    if ((in & 0xBF000000u) == 0x0D000000u) return 10;                                     // advsimd single
-    if ((in & 0x3B000000u) == 0x39000000u) return 0;                                      // uoff
-    if ((in & 0x3B200C00u) == 0x38200800u) return 3;                                      // regoff
-    if (((in >> 27) & 7) == 7) {
-        int m = (in >> 10) & 3;
-        return (!((in >> 24) & 1) && (m == 1 || m == 3)) ? 2 : 1; // wb (pre/post) else unscaled/unpriv
-    }
-    return 14;
-}
-
-static void nonpie_guard_count(int sig, siginfo_t *si, void *uc) {
-    uint64_t va = (uint64_t)si->si_addr;
-    if (g_nonpie_lo && va >= g_nonpie_lo && va < g_nonpie_hi) {
-        ucontext_t *u = (ucontext_t *)uc;
-        g_fhist[fault_class(*(uint32_t *)(u->uc_mcontext->__ss.__pc))]++;
-        uint64_t n = __atomic_add_fetch(&g_nonpie_faults, 1, __ATOMIC_RELAXED);
-        if (n % 50000 == 0) {
-            char b[256];
-            int o = snprintf(b, sizeof b, "[fhist pid=%d n=%llu]", getpid(), (unsigned long long)n);
-            for (int i = 0; i < 15; i++)
-                if (g_fhist[i])
-                    o += snprintf(b + o, sizeof b - o, " %s=%llu", g_fhname[i], (unsigned long long)g_fhist[i]);
-            b[o++] = '\n';
-            if (write(2, b, o) < 0) {}
-        }
-    }
-    nonpie_guard(sig, si, uc);
-}
-
 // Fork-server seam: the original guest entry inlined (1)
 // container init, (2) engine init (signal handlers + pthread key + code-cache arena + env flags), and
 // (3) per-launch load+run. The resident ddjitd parent must pay (1)+(2) ONCE and share them COW with
@@ -569,7 +524,7 @@ static void container_init(const char *rootfs) {
         if (m && !g_mem_max) g_mem_max = parse_size(m);
         const char *p = hl_option_get("HL_PIDS_MAX");
         if (p && !g_pids_max) g_pids_max = dd_parse_id("HL_PIDS_MAX", p);
-        container_read_resource_env(); // docker --cpus / --read-only / --ulimit (DD_CPUS/DD_ROOTFS_RO/DD_ULIMITS)
+        container_read_resource_env(); // Docker CPU, read-only-root, and ulimit values from centralized HL options.
         const char *pub = hl_option_get("HL_PUBLISH");
         if (pub && !g_nportmap) parse_publish(pub);
         const char *low = hl_option_get("HL_LOWER");
@@ -581,13 +536,13 @@ static void container_init(const char *rootfs) {
             for (char *t = strtok_r(tb, ":", &sv); t; t = strtok_r(NULL, ":", &sv))
                 add_lower(t);
         }
-        // Private-loopback netns: derive g_netns from the DD_NETNS KEY (set per-container by the
+        // Private-loopback netns: derive g_netns from the HL_NETNS key (set per-container by the
         // daemon; a `docker exec` reuses the target container's key so the exec shares its 127.0.0.1).
-        // When DD_NETNS is UNSET (a bare engine launch / the basics matrix), MINT a per-process key and
+        // When HL_NETNS is unset (a bare engine launch), mint a per-process key and
         // export it — so loopback isolation is ALWAYS on. Otherwise g_netns stayed empty, lo_on() was
         // false, and 127.0.0.1 fell through to the REAL host TCP stack shared by every concurrent guest,
         // so two containers' 127.0.0.1:PORT collided (nc-loopback intermittently reached another
-        // container's published listener). Mirrors linux_x86_64.c. Opt out via DD_NONETNS.
+        // container's published listener). Mirrors linux_x86_64.c.
         if (!g_netns[0]) {
             const char *nn = hl_option_get("HL_NETNS");
             char key[40];
@@ -617,9 +572,9 @@ static void container_init(const char *rootfs) {
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         if (g_uid < 0) g_uid = 0;
-        // container default: run as root (0); unless DD_UID/--uid set
+        // Container default: run as root (0), unless HL_UID or the typed uid field is set.
         if (g_gid < 0) g_gid = 0;
-        // docker -w / initial working directory: start the guest in DD_CWD (must be reachable inside the
+        // Docker -w / initial working directory: start the guest in HL_CWD (must be reachable inside the
         // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
         const char *icwd = hl_option_get("HL_CWD");
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
@@ -699,7 +654,7 @@ static int engine_global_init(void) {
     // Host-IOSurface GPU bridge (--gui): force its one-time ObjC/CoreFoundation/Foundation/IOSurface class
     // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
     // never be mid-flight when Chrome forks its zygote/broker (which would abort the child via libobjc's
-    // fork-safety guard -> chromium EXIT=137). Gated on DD_GPU_IOSURFACE; a no-op for every other workload.
+    // fork-safety guard -> chromium EXIT=137). Gated on HL_GPU_IOSURFACE; a no-op for every other workload.
     dd_gpu_prewarm_fork_safety();
     g_engine_inited = 1;
     return 0;
@@ -779,11 +734,10 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     return c.exit_code;
 }
 
-// Restore driver (the dd_jit::Runtime::restore surface; also reachable via the `--restore <dir>` flag).
-// Rebuilds the checkpointed process tree from `dir` and resumes it. Guest memory for the init is rebuilt
+// Rebuild the checkpointed process tree selected by the engine restore option. Guest memory for the init is rebuilt
 // FIRST -- before container_init/engine_global_init allocate anything -- inside ckpt_restore_tree.
-int dd_restore(const char *rootfs, const char *dir) {
-    g_pcache = hl_option_get("HL_PCACHE") != NULL && hl_option_get("HL_NOPCACHE") == NULL;
+static int hl_restore_checkpoint(const char *rootfs, const char *dir) {
+    g_pcache = hl_option_get("HL_PCACHE") != NULL;
     return ckpt_restore_tree(rootfs, dir);
 }
 
@@ -791,13 +745,11 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     // Resume a previously checkpointed workspace instead of launching a program (the GUI sets this on
     // window reopen; the container config/env is otherwise identical to the original launch).
     const char *rdir = hl_option_get("HL_RESTORE_DIR");
-    if (rdir && rdir[0]) return dd_restore(rootfs, rdir);
+    if (rdir && rdir[0]) return hl_restore_checkpoint(rootfs, rdir);
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent cross-process translated-code cache. Opt in with HL_PCACHE=1.
-    // the x86 opt8 pcache) so the default correctness matrix stays byte-identical to the baseline; the
-    // one-line flip to default-on (`hl_option_get("HL_NOPCACHE") == NULL`) is gated on a green full pcache-on
-    // HL_NOPCACHE=1 always wins. Read per invocation so a fork-server cold runner honors client options.
-    g_pcache = hl_option_get("HL_PCACHE") != NULL && hl_option_get("HL_NOPCACHE") == NULL;
+    // Read per invocation so a fork-server cold runner honors its typed launch configuration.
+    g_pcache = hl_option_get("HL_PCACHE") != NULL;
     g_coldprof = 0;
     container_init(rootfs);
     int irc = engine_global_init();
