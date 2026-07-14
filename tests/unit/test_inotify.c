@@ -15,6 +15,7 @@ typedef struct provider_root {
     uint32_t clones;
     uint32_t closes;
     uint32_t last_mask;
+    hl_status clone_status;
 } provider_root;
 
 typedef struct provider {
@@ -95,12 +96,14 @@ static void provider_unsubscribe(void *opaque, void *observer, uint64_t token) {
 
 static hl_status provider_clone(void *opaque, void **out_context) {
     provider *source = opaque;
-    provider *copy = calloc(1, sizeof(*copy));
+    provider *copy;
+    source->root->clones++;
+    if (source->root->clone_status != HL_STATUS_OK) return source->root->clone_status;
+    copy = calloc(1, sizeof(*copy));
     if (copy == NULL) return HL_STATUS_OUT_OF_MEMORY;
     *copy = *source;
     copy->notify = NULL;
     copy->observer = NULL;
-    copy->root->clones++;
     *out_context = copy;
     return HL_STATUS_OK;
 }
@@ -218,6 +221,9 @@ int main(void) {
         HL_CHECK(root.clones == 1);
     }
     HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK && root.closes == 1);
+    root.clone_status = HL_STATUS_OUT_OF_MEMORY;
+    HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OUT_OF_MEMORY && root.clones == 2);
+    root.clone_status = HL_STATUS_OK;
     HL_CHECK(hl_linux_close(&abi, (hl_linux_fd)alias) == 0 && root.closes == 2);
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);
     return EXIT_SUCCESS;
