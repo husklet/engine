@@ -57,6 +57,7 @@
 #include <libkern/OSCacheControl.h>
 
 #include "hl/engine.h"
+#include "../launch.h"
 #include "../options.h"
 
 #include "../../translator/guest/x86_64/cpu.h"
@@ -88,7 +89,6 @@
 #include "../dispatch.c"                     // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
                                              // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../../translator/guest/x86_64/elf.c" // x86 ELF loader + stack + fault handlers
-#include "../launch.c"                        // serialized HL config-file launch bridge
 
 // ---- entry + main ----
 // ---------------- entry ----------------

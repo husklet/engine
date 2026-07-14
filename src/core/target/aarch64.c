@@ -35,6 +35,7 @@
 #include <stdatomic.h>
 
 #include "hl/engine.h"
+#include "../launch.h"
 #include "../options.h"
 
 #include "../../translator/guest/aarch64/cpu.h"
@@ -87,7 +88,6 @@ static int engine_global_init(void);
 // native checkpoint/restore (multi-process tree): dump/restore guest RAM + cpu + path-backed fds + pty
 #include "../../linux_abi/checkpoint.c"
 // Final-product bridge: read the serialized HL config file and enter this target's Linux guest.
-#include "../launch.c"
 
 // ---- library entry (Rust binding) + main() ----
 // ---------------- library entry (Rust bindings call this) ----------------

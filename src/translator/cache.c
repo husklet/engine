@@ -6,12 +6,16 @@
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
 #include "../host/file.h"
+#include "emit.h"
 
 #define CACHE_SZ (64u << 20)
-// base, bump pointer
-static uint8_t *g_cache, *g_cp;
-// start of current translation (for icache flush)
-static uint8_t *g_emit_start;
+// Emission-arena state stays TU-local. The aliases preserve existing unity callsites while making the
+// ownership boundary explicit for the future inline assembler context.
+static hl_emit_state g_emit;
+#define g_cache g_emit.base
+#define g_cp g_emit.cursor
+#define g_emit_start g_emit.start
+#define g_rw2rx g_emit.rx_delta
 
 // ---- dual-mapped (W^X-toggle-free) code cache ----
 // g_cache/g_cp are the RW (writer) alias; the engine EXECUTES through an RX alias of the
@@ -21,15 +25,14 @@ static uint8_t *g_emit_start;
 // only the few ABSOLUTE handoffs (run_block target, IBTC/IC body literals, icache flush)
 // convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
 // region's W^X per translation/IC-fill (NODUALMAP=1).
-static ptrdiff_t g_rw2rx;     // RX_addr - RW_addr (0 in fallback)
 static int g_dualmap;         // 1 when the RW/RX dual mapping is active
 static uint64_t g_wx_toggles; // # of pthread_jit_write_protect_np() calls actually made (PROF)
 static hl_host_macos *g_jit_host;
 static hl_host_services g_jit_services;
 static hl_host_code_mapping g_code_mapping;
 static hl_log_context g_jit_log;
-#define J_RX(p) ((void *)((uint8_t *)(p) + g_rw2rx)) // RW alias addr -> RX alias addr
-#define J_RW(p) ((void *)((uint8_t *)(p) - g_rw2rx)) // RX alias addr -> RW alias addr
+#define J_RX(p) hl_emit_rx(&g_emit, (const void *)(uintptr_t)(p)) // RW alias addr -> RX alias addr
+#define J_RW(p) hl_emit_rw(&g_emit, (const void *)(uintptr_t)(p)) // RX alias addr -> RW alias addr
 
 // DIAGNOSTIC predicate (elf.c fatal-fault guard): is a host PC inside the CURRENT RX code cache arena?
 int jit_pc_in_cache(uint64_t pc, uint64_t *base) {

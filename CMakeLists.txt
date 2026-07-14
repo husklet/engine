@@ -25,7 +25,8 @@ target_include_directories(hl-translator PUBLIC include)
 add_library(hl-linux-abi STATIC src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c)
 target_include_directories(hl-linux-abi PUBLIC include)
 
-add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c src/core/options.c)
+add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c
+                             src/core/options.c)
 target_include_directories(hl-engine PUBLIC include)
 target_compile_definitions(hl-engine PUBLIC HL_ENABLE_LOGGING=$<BOOL:${HL_ENABLE_LOGGING}>)
 target_link_libraries(hl-engine PUBLIC hl-translator hl-linux-abi)
@@ -102,7 +103,7 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name codegen config host_services identity ir linux_abi stat engine log options)
+    foreach(test_name codegen config emit host_services identity ir launch linux_abi stat engine log options)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)

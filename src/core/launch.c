@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../../include/hl/config.h"
+#include "launch.h"
 #include "options.h"
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
@@ -31,9 +32,7 @@ static int cfd_read_full(int fd, void *buf, size_t n) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) {
-            return -1;
-        } // premature EOF
+        if (r == 0) { return -1; } // premature EOF
         got += (size_t)r;
     }
     return 0;
@@ -98,9 +97,8 @@ static int hl_read_config_file(int fd) {
     memcpy(&pool_size, prefix + 4, 4);
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
-    if (magic != HL_CONFIG_MAGIC || abi != HL_CONFIG_ABI ||
-        header_size < sizeof(hl_launch_config) || header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 ||
-        pool_size > HL_LAUNCH_POOL_LIMIT) {
+    if (magic != HL_CONFIG_MAGIC || abi != HL_CONFIG_ABI || header_size < sizeof(hl_launch_config) ||
+        header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
     }
