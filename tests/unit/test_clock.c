@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/host/clock.h"
+#include "../../src/host/clock.h"
 #include "hl/fake.h"
 
 #include <errno.h>

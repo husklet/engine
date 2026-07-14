@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_XATTR_CACHE_H
-#define HL_PRODUCTION_XATTR_CACHE_H
+#ifndef HL_LINUX_XATTR_H
+#define HL_LINUX_XATTR_H
 
 #include <stdint.h>
 

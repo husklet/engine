@@ -76,10 +76,10 @@
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
 #define PC_RELOC_CAP (1u << 20)              // recorded baked-host-pointer slots (poison if exceeded)
 
-#include "../reloc.h"
-#include "../digest.h"
+#include "../../../translator/reloc.h"
+#include "../../../translator/digest.h"
 #include "../../../translator/identity.h"
-#include "../window.h"
+#include "../../../translator/window.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
 #define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`

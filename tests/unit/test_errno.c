@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/os/linux/syscall/errno.h"
+#include "../../src/linux_abi/errno.h"
 
 int main(void) {
     HL_CHECK(hl_linux_errno_from_macos(0) == 0);

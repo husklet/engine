@@ -1,8 +1,8 @@
 // dd/runtime/os/linux/container -- container config state (UTS/cgroup/USER-ns/port-map) + parsers.
 #include "../../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
-#include "xattr_cache.h"
-#include "readonly/table.h"
-#include "limits/table.h"
+#include "../../../../linux_abi/xattr.h"
+#include "../../../../linux_abi/readonly.h"
+#include "../../../../linux_abi/limits.h"
 #include <sys/sysctl.h>            // sysctlbyname("hw.activecpu") -- true host core count (see container_online_cpus)
 
 // DD_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket

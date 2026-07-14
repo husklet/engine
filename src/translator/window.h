@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_WINDOW_H
-#define HL_PRODUCTION_WINDOW_H
+#ifndef HL_TRANSLATOR_WINDOW_H
+#define HL_TRANSLATOR_WINDOW_H
 
 #include <stdint.h>
 

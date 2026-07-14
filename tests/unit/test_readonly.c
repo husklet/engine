@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/os/linux/container/readonly/table.h"
+#include "../../src/linux_abi/readonly.h"
 
 #include <string.h>
 

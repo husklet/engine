@@ -4,7 +4,7 @@
 //
 // x86-64 cpu: r[16] = rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15. Linux x86-64 syscall ABI:
 //   number = rax ; args = rdi,rsi,rdx,r10,r8,r9 ; return = rax.
-#include "../../os/linux/syscall/number.h"
+#include "../../../linux_abi/number.h"
 
 #define G_NR(c) hl_linux_syscall_number(HL_LINUX_GUEST_X86_64, (c)->r[0])
 #define CANON_X86ONLY HL_LINUX_SYSCALL_X86_ONLY

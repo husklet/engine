@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_RELOC_H
-#define HL_PRODUCTION_RELOC_H
+#ifndef HL_TRANSLATOR_RELOC_H
+#define HL_TRANSLATOR_RELOC_H
 
 #include <stddef.h>
 #include <stdint.h>

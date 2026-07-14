@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/os/linux/syscall/number.h"
+#include "../../src/linux_abi/number.h"
 
 int main(void) {
     HL_CHECK(hl_linux_syscall_number(HL_LINUX_GUEST_AARCH64, 63) == 63);

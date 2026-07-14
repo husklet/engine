@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/translate/reloc.h"
+#include "../../src/translator/reloc.h"
 
 #include <string.h>
 

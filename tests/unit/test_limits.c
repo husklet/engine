@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/os/linux/container/limits/table.h"
+#include "../../src/linux_abi/limits.h"
 
 #include <pthread.h>
 #include <stdatomic.h>

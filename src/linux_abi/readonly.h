@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_READONLY_TABLE_H
-#define HL_PRODUCTION_READONLY_TABLE_H
+#ifndef HL_LINUX_READONLY_H
+#define HL_LINUX_READONLY_H
 
 #include <stdatomic.h>
 

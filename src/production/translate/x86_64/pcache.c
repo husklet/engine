@@ -51,9 +51,9 @@
 // advisory only: it never gates correctness, only the restore/skip decision, and it is written with the
 // same atomic temp+rename protocol (the .pcache file itself is NEVER modified after publication).
 
-#include "../digest.h"
+#include "../../../translator/digest.h"
 #include "../../../translator/identity.h"
-#include "../window.h"
+#include "../../../translator/window.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
 #define PC_VERSION 7 // v7 retires mode-dependent A/B cache identities; production codegen is fixed.

@@ -23,7 +23,7 @@ int g_rwx_guest;
 #include <stdlib.h>
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
-#include "errno.h"
+#include "../../../../linux_abi/errno.h"
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.

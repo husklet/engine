@@ -89,7 +89,7 @@ enum {
 // construction regardless of table size, so a reload can NEVER jump/read a stale absolute host address.
 #define PC_RELOC_CAP (1u << 20)
 
-#include "../reloc.h"
+#include "../../../translator/reloc.h"
 
 static hl_reloc g_reloc_storage[PC_RELOC_CAP];
 static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};

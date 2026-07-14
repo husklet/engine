@@ -1,7 +1,7 @@
 #include "test.h"
 
 #include "hl/macos.h"
-#include "../../src/production/host/clock.h"
+#include "../../src/host/clock.h"
 #include "../../src/host/file.h"
 
 #include <errno.h>

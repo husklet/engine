@@ -2,7 +2,7 @@
 // confined to the rootfs jail (overlay copy-up, /proc/self/exe synth). Returns 1 if nr was handled, 0
 // otherwise. Included by service.c AFTER its local helpers (overlay_*/proc_self_exe/synth_str_fd/
 // cpu_range_str it calls) and before service() -- same TU scope.
-#include "device.h"
+#include "../../../../linux_abi/device.h"
 
 // A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
 // group raises SIGTTOU on the whole group; with the default disposition that STOPS it. During job-control

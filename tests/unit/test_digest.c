@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/translate/digest.h"
+#include "../../src/translator/digest.h"
 
 #include <string.h>
 

@@ -1,4 +1,4 @@
-#include "../../src/production/os/linux/container/xattr_cache.h"
+#include "../../src/linux_abi/xattr.h"
 
 #include <assert.h>
 

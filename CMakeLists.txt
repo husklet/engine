@@ -12,7 +12,10 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 add_library(hl-translator STATIC
     src/translator/codegen.c
+    src/translator/digest.c
     src/translator/identity.c
+    src/translator/reloc.c
+    src/translator/window.c
     src/translator/host/aarch64/codegen.c
     src/translator/host/x86_64/codegen.c
     src/translator/ir/interpreter.c
@@ -27,57 +30,44 @@ target_include_directories(hl-engine PUBLIC include)
 target_compile_definitions(hl-engine PUBLIC HL_ENABLE_LOGGING=$<BOOL:${HL_ENABLE_LOGGING}>)
 target_link_libraries(hl-engine PUBLIC hl-translator hl-linux-abi)
 
-add_library(hl-production-xattr-cache OBJECT src/production/os/linux/container/xattr_cache.c)
-target_include_directories(hl-production-xattr-cache PRIVATE src/production/os/linux/container)
-target_compile_options(hl-production-xattr-cache PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                         -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-xattr OBJECT src/linux_abi/xattr.c)
+target_include_directories(hl-linux-xattr PRIVATE src/linux_abi)
+target_compile_options(hl-linux-xattr PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                              -Wmissing-prototypes)
 
-add_library(hl-production-readonly OBJECT src/production/os/linux/container/readonly/table.c)
-target_include_directories(hl-production-readonly PRIVATE src/production/os/linux/container/readonly)
-target_compile_options(hl-production-readonly PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                     -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-readonly OBJECT src/linux_abi/readonly.c)
+target_include_directories(hl-linux-readonly PRIVATE src/linux_abi)
+target_compile_options(hl-linux-readonly PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                                -Wmissing-prototypes)
 
-add_library(hl-production-limits OBJECT src/production/os/linux/container/limits/table.c)
-target_include_directories(hl-production-limits PRIVATE src/production/os/linux/container/limits)
-target_compile_options(hl-production-limits PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                   -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-limits OBJECT src/linux_abi/limits.c)
+target_include_directories(hl-linux-limits PRIVATE src/linux_abi)
+target_compile_options(hl-linux-limits PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                              -Wmissing-prototypes)
 
-add_library(hl-production-reloc OBJECT src/production/translate/reloc.c)
-target_include_directories(hl-production-reloc PRIVATE src/production/translate)
-target_compile_options(hl-production-reloc PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                  -Wstrict-prototypes -Wmissing-prototypes)
-
-add_library(hl-production-digest OBJECT src/production/translate/digest.c)
-target_include_directories(hl-production-digest PRIVATE src/production/translate)
-target_compile_options(hl-production-digest PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                   -Wstrict-prototypes -Wmissing-prototypes)
-add_library(hl-production-window OBJECT src/production/translate/window.c)
-target_include_directories(hl-production-window PRIVATE src/production/translate)
-target_compile_options(hl-production-window PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                   -Wstrict-prototypes -Wmissing-prototypes)
-add_library(hl-production-device OBJECT src/production/os/linux/syscall/device.c)
-target_include_directories(hl-production-device PRIVATE src/production/os/linux/syscall)
-target_compile_options(hl-production-device PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                   -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-device OBJECT src/linux_abi/device.c)
+target_include_directories(hl-linux-device PRIVATE src/linux_abi)
+target_compile_options(hl-linux-device PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                               -Wmissing-prototypes)
 add_library(hl-linux-affinity OBJECT src/linux_abi/affinity.c)
 target_include_directories(hl-linux-affinity PRIVATE src/linux_abi)
 target_compile_options(hl-linux-affinity PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
                                                  -Wmissing-prototypes)
 
-add_library(hl-production-clock OBJECT src/production/host/clock.c)
+add_library(hl-host-clock OBJECT src/host/clock.c)
 add_library(hl-host-file OBJECT src/host/file.c)
 
-add_library(hl-production-errno OBJECT src/production/os/linux/syscall/errno.c)
-target_include_directories(hl-production-errno PRIVATE src/production/os/linux/syscall)
-target_compile_options(hl-production-errno PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                  -Wstrict-prototypes -Wmissing-prototypes)
-add_library(hl-production-number OBJECT src/production/os/linux/syscall/number.c)
-target_include_directories(hl-production-number PRIVATE src/production/os/linux/syscall)
-target_compile_options(hl-production-number PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                   -Wstrict-prototypes -Wmissing-prototypes)
-target_include_directories(hl-production-clock PRIVATE include src/production/host)
-target_compile_options(hl-production-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                  -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-errno OBJECT src/linux_abi/errno.c)
+target_include_directories(hl-linux-errno PRIVATE src/linux_abi)
+target_compile_options(hl-linux-errno PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                              -Wmissing-prototypes)
+add_library(hl-linux-number OBJECT src/linux_abi/number.c)
+target_include_directories(hl-linux-number PRIVATE src/linux_abi)
+target_compile_options(hl-linux-number PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                               -Wmissing-prototypes)
+target_include_directories(hl-host-clock PRIVATE include src/host)
+target_compile_options(hl-host-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                             -Wmissing-prototypes)
 target_include_directories(hl-host-file PRIVATE include src/host)
 target_compile_options(hl-host-file PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
                                             -Wmissing-prototypes)
@@ -121,35 +111,38 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME ${test_name} COMMAND test-${test_name})
     endforeach()
-    add_executable(test-readonly tests/unit/test_readonly.c $<TARGET_OBJECTS:hl-production-readonly>)
+    add_executable(test-readonly tests/unit/test_readonly.c $<TARGET_OBJECTS:hl-linux-readonly>)
     target_include_directories(test-readonly PRIVATE include tests/unit)
     add_test(NAME readonly COMMAND test-readonly)
-    add_executable(test-limits tests/unit/test_limits.c $<TARGET_OBJECTS:hl-production-limits>)
+    add_executable(test-limits tests/unit/test_limits.c $<TARGET_OBJECTS:hl-linux-limits>)
     target_include_directories(test-limits PRIVATE include tests/unit)
     target_link_libraries(test-limits PRIVATE Threads::Threads)
     add_test(NAME limits COMMAND test-limits)
-    add_executable(test-reloc tests/unit/test_reloc.c $<TARGET_OBJECTS:hl-production-reloc>)
-    target_include_directories(test-reloc PRIVATE include tests/unit src/production/translate)
+    add_executable(test-reloc tests/unit/test_reloc.c)
+    target_include_directories(test-reloc PRIVATE include tests/unit src/translator)
+    target_link_libraries(test-reloc PRIVATE hl-translator)
     add_test(NAME reloc COMMAND test-reloc)
-    add_executable(test-digest tests/unit/test_digest.c $<TARGET_OBJECTS:hl-production-digest>)
-    target_include_directories(test-digest PRIVATE include tests/unit src/production/translate)
+    add_executable(test-digest tests/unit/test_digest.c)
+    target_include_directories(test-digest PRIVATE include tests/unit src/translator)
+    target_link_libraries(test-digest PRIVATE hl-translator)
     add_test(NAME digest COMMAND test-digest)
-    add_executable(test-window tests/unit/test_window.c $<TARGET_OBJECTS:hl-production-window>)
-    target_include_directories(test-window PRIVATE include tests/unit src/production/translate)
+    add_executable(test-window tests/unit/test_window.c)
+    target_include_directories(test-window PRIVATE include tests/unit src/translator)
+    target_link_libraries(test-window PRIVATE hl-translator)
     add_test(NAME window COMMAND test-window)
-    add_executable(test-device tests/unit/test_device.c $<TARGET_OBJECTS:hl-production-device>)
+    add_executable(test-device tests/unit/test_device.c $<TARGET_OBJECTS:hl-linux-device>)
     target_include_directories(test-device PRIVATE include tests/unit)
     add_test(NAME device COMMAND test-device)
     add_executable(test-affinity tests/unit/test_affinity.c $<TARGET_OBJECTS:hl-linux-affinity>)
     target_include_directories(test-affinity PRIVATE include tests/unit)
     add_test(NAME affinity COMMAND test-affinity)
-    add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-production-errno>)
+    add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-linux-errno>)
     target_include_directories(test-errno PRIVATE include tests/unit)
     add_test(NAME errno COMMAND test-errno)
-    add_executable(test-number tests/unit/test_number.c $<TARGET_OBJECTS:hl-production-number>)
+    add_executable(test-number tests/unit/test_number.c $<TARGET_OBJECTS:hl-linux-number>)
     target_include_directories(test-number PRIVATE include tests/unit)
     add_test(NAME number COMMAND test-number)
-    add_executable(test-clock tests/unit/test_clock.c $<TARGET_OBJECTS:hl-production-clock>)
+    add_executable(test-clock tests/unit/test_clock.c $<TARGET_OBJECTS:hl-host-clock>)
     target_include_directories(test-clock PRIVATE include tests/unit)
     target_link_libraries(test-clock PRIVATE hl-host-fake)
     add_test(NAME clock COMMAND test-clock)

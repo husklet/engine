@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/translate/window.h"
+#include "../../src/translator/window.h"
 
 int main(void) {
     static const struct {

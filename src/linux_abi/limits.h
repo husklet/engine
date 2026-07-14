@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_LIMIT_TABLE_H
-#define HL_PRODUCTION_LIMIT_TABLE_H
+#ifndef HL_LINUX_LIMITS_H
+#define HL_LINUX_LIMITS_H
 
 #include <stdint.h>
 #include <stdatomic.h>

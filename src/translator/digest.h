@@ -1,5 +1,5 @@
-#ifndef HL_PRODUCTION_DIGEST_H
-#define HL_PRODUCTION_DIGEST_H
+#ifndef HL_TRANSLATOR_DIGEST_H
+#define HL_TRANSLATOR_DIGEST_H
 
 #include <stddef.h>
 #include <stdint.h>

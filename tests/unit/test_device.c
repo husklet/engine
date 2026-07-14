@@ -1,6 +1,6 @@
 #include "test.h"
 
-#include "../../src/production/os/linux/syscall/device.h"
+#include "../../src/linux_abi/device.h"
 
 int main(void) {
     HL_CHECK(hl_linux_device_major(0) == 0);

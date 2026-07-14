@@ -1,4 +1,4 @@
-#include "xattr_cache.h"
+#include "xattr.h"
 
 #include <stdint.h>
 #include <string.h>
