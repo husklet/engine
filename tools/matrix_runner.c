@@ -128,7 +128,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (*case_count)++;
             continue;
         }
-        if (strcmp(fields[11], "excluded-replaced") == 0) {
+        if (strncmp(fields[11], "excluded-", 9) == 0) {
             (*excluded)++;
             continue;
         }
@@ -547,6 +547,6 @@ int main(int argc, char **argv) {
         capture_free(&a);
         capture_free(&x);
     }
-    printf("matrix-runner: %zu active cases passed; %zu replaced variants excluded\n", count, excluded);
+    printf("matrix-runner: %zu active cases passed; %zu manifest cases excluded\n", count, excluded);
     return 0;
 }
