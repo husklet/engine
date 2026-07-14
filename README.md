@@ -5,6 +5,9 @@ defines the portable boundary, and Linux has a native backend whose implemented 
 independently. The production target roots do not yet use that boundary exclusively, so Linux-host execution is not
 end-to-end production-ready.
 
+[`DOCS.md`](DOCS.md) is the normative system design, operating guide, testing contract, performance methodology, and
+completion roadmap. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is the compact dependency-boundary reference.
+
 ## Build and test
 
 ```text
