@@ -2,6 +2,7 @@
 
 #include "hl/fake.h"
 #include "hl/linux_abi.h"
+#include "../../src/linux_abi/object.h"
 
 #include <pthread.h>
 #include <string.h>
@@ -30,6 +31,55 @@ typedef struct test_file_host {
     uint32_t last_permissions;
     uint32_t metadata_type;
 } test_file_host;
+
+typedef struct test_object {
+    char byte;
+    uint32_t reads;
+    uint32_t writes;
+    uint32_t closes;
+    uint32_t clones;
+    hl_status close_status;
+} test_object;
+
+static int64_t object_read(void *opaque, void *buffer, size_t size) {
+    test_object *object = opaque;
+    if (size == 0) return 0;
+    *(char *)buffer = object->byte;
+    object->reads++;
+    return 1;
+}
+
+static int64_t object_write(void *opaque, const void *buffer, size_t size) {
+    test_object *object = opaque;
+    if (size == 0) return 0;
+    object->byte = *(const char *)buffer;
+    object->writes++;
+    return 1;
+}
+
+static uint32_t object_ready(void *opaque, uint32_t interests) {
+    test_object *object = opaque;
+    return object->byte != 0 ? interests & HL_LINUX_READY_READ : 0;
+}
+
+static hl_status object_clone(void *opaque, void **child) {
+    test_object *object = opaque;
+    object->clones++;
+    *child = object;
+    return HL_STATUS_OK;
+}
+
+static hl_status object_close(void *opaque) {
+    test_object *object = opaque;
+    object->closes++;
+    return object->close_status;
+}
+
+static const hl_linux_object_ops object_ops = {.read = object_read,
+                                               .write = object_write,
+                                               .readiness = object_ready,
+                                               .clone = object_clone,
+                                               .close = object_close};
 
 static hl_host_result file_result(hl_status status, uint64_t value) {
     hl_host_result result = {(int32_t)status, 0, value, 0};
@@ -734,6 +784,36 @@ int main(void) {
         HL_CHECK(atomic_load_explicit(&file_host.concurrent_calls, memory_order_acquire) == 2);
         HL_CHECK(hl_linux_close(&linux_abi, first.fd) == 0);
         HL_CHECK(hl_linux_close(&linux_abi, second.fd) == 0);
+    }
+    {
+        test_object object = {.byte = 'q'};
+        hl_linux_object_pin pin;
+        hl_linux_fd typed;
+        hl_linux_fd alias;
+        uint32_t old_generation;
+        char byte = 0;
+        HL_CHECK(hl_linux_object_install(&linux_abi, &object_ops, &object, 77, HL_LINUX_O_RDWR, 0, &typed) ==
+                 HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_OK && snapshot.kind == 77 &&
+                 snapshot.host_handle == HL_HOST_HANDLE_INVALID);
+        old_generation = snapshot.descriptor_generation;
+        HL_CHECK(hl_linux_fd_dup(&linux_abi, typed, 0, &alias) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_read(&linux_abi, alias, &byte, 1) == 1 && byte == 'q' && object.reads == 1);
+        byte = 'z';
+        HL_CHECK(hl_linux_write(&linux_abi, typed, &byte, 1) == 1 && object.byte == 'z' && object.writes == 1);
+        HL_CHECK(hl_linux_object_pin_fd(&linux_abi, alias, &pin) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_object_ready(&pin, HL_LINUX_READY_READ) == HL_LINUX_READY_READ);
+        hl_linux_object_unpin(&pin);
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 0);
+        object.close_status = HL_STATUS_IO;
+        HL_CHECK(hl_linux_close(&linux_abi, alias) == -HL_LINUX_EIO && object.closes == 1);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_NOT_FOUND);
+        object.close_status = HL_STATUS_OK;
+        HL_CHECK(hl_linux_object_install_at(&linux_abi, typed, &object_ops, &object, 77, HL_LINUX_O_RDWR, 0) ==
+                 HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_OK &&
+                 snapshot.descriptor_generation != old_generation);
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 2);
     }
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
     HL_CHECK(file_host.fake.live_mutexes == 0);

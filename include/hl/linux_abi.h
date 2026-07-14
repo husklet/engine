@@ -98,6 +98,9 @@ typedef struct hl_linux_ofd_entry {
     uint32_t kind;
     /* Serializes the shared offset and final close for this OFD only. */
     hl_host_handle io_mutex;
+    /* Private typed-object adapter. NULL denotes the ordinary host-file adapter. */
+    const struct hl_linux_object_ops *object_ops;
+    void *object_context;
 } hl_linux_ofd_entry;
 
 typedef struct hl_linux_fd_entry {
@@ -143,6 +146,9 @@ typedef struct hl_linux_fork_record {
     hl_host_handle parent_handle;
     hl_host_handle child_handle;
     hl_host_handle child_mutex;
+    const struct hl_linux_object_ops *object_ops;
+    void *parent_context;
+    void *child_context;
 } hl_linux_fork_record;
 
 typedef struct hl_linux_fork_plan {

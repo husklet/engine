@@ -1,4 +1,5 @@
 #include "hl/linux_abi.h"
+#include "object.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -195,21 +196,47 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
             plan->count = 0;
             return HL_STATUS_RESOURCE_LIMIT;
         }
-        plan->records[plan->count++] = (hl_linux_fork_record){index, entry->generation, entry->host_handle,
-                                                              HL_HOST_HANDLE_INVALID, HL_HOST_HANDLE_INVALID};
+        plan->records[plan->count++] = (hl_linux_fork_record){
+            .ofd = index,
+            .generation = entry->generation,
+            .parent_handle = entry->host_handle,
+            .child_handle = HL_HOST_HANDLE_INVALID,
+            .child_mutex = HL_HOST_HANDLE_INVALID,
+            .object_ops = entry->object_ops,
+            .parent_context = entry->object_context,
+        };
     }
     hl_linux_unlock(linux_abi);
     /* External quiescence keeps snapshots stable; host callbacks run without the ABI table lock. */
     for (index = 0; index < plan->count; ++index) {
-        hl_host_result cloned = files->clone_for_fork(linux_abi->host->context, plan->records[index].parent_handle);
-        if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) {
-            hl_status failure = cloned.status == HL_STATUS_OK ? HL_STATUS_PLATFORM_FAILURE : (hl_status)cloned.status;
-            while (index != 0)
-                (void)files->close(linux_abi->host->context, plan->records[--index].child_handle);
-            plan->count = 0;
-            return failure;
+        hl_linux_fork_record *record = &plan->records[index];
+        hl_host_result cloned = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
+        hl_status clone_status = HL_STATUS_OK;
+        if (record->object_ops != NULL) {
+            if (record->object_ops->clone == NULL)
+                clone_status = HL_STATUS_NOT_SUPPORTED;
+            else
+                clone_status = record->object_ops->clone(record->parent_context, &record->child_context);
+            if (clone_status == HL_STATUS_OK && record->child_context == NULL)
+                clone_status = HL_STATUS_PLATFORM_FAILURE;
+        } else {
+            cloned = files->clone_for_fork(linux_abi->host->context, record->parent_handle);
+            clone_status = cloned.status == HL_STATUS_OK && cloned.value == HL_HOST_HANDLE_INVALID
+                               ? HL_STATUS_PLATFORM_FAILURE
+                               : (hl_status)cloned.status;
+            record->child_handle = cloned.value;
         }
-        plan->records[index].child_handle = cloned.value;
+        if (clone_status != HL_STATUS_OK) {
+            while (index != 0) {
+                hl_linux_fork_record *rollback = &plan->records[--index];
+                if (rollback->object_ops != NULL)
+                    (void)rollback->object_ops->close(rollback->child_context);
+                else
+                    (void)files->close(linux_abi->host->context, rollback->child_handle);
+            }
+            plan->count = 0;
+            return clone_status;
+        }
     }
     hl_linux_lock(linux_abi);
     /* Require a bijection: no live OFD may have appeared during the unlocked clone phase. */
@@ -221,7 +248,8 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
         for (record_index = 0; record_index < plan->count; ++record_index) {
             hl_linux_fork_record *record = &plan->records[record_index];
             if (record->ofd == index && record->generation == entry->generation &&
-                record->parent_handle == entry->host_handle)
+                record->parent_handle == entry->host_handle && record->object_ops == entry->object_ops &&
+                record->parent_context == entry->object_context)
                 matches++;
         }
         if (matches != 1 || entry->active_operations != 0 || entry->closing != 0) goto arm_failed;
@@ -230,7 +258,9 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
         hl_linux_fork_record *record = &plan->records[index];
         if (record->ofd >= linux_abi->ofd_capacity || linux_abi->ofds[record->ofd].references == 0 ||
             linux_abi->ofds[record->ofd].generation != record->generation ||
-            linux_abi->ofds[record->ofd].host_handle != record->parent_handle)
+            linux_abi->ofds[record->ofd].host_handle != record->parent_handle ||
+            linux_abi->ofds[record->ofd].object_ops != record->object_ops ||
+            linux_abi->ofds[record->ofd].object_context != record->parent_context)
             goto arm_failed;
     }
     {
@@ -241,8 +271,13 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
     return HL_STATUS_OK;
 arm_failed:
     hl_linux_unlock(linux_abi);
-    while (plan->count != 0)
-        (void)files->close(linux_abi->host->context, plan->records[--plan->count].child_handle);
+    while (plan->count != 0) {
+        hl_linux_fork_record *rollback = &plan->records[--plan->count];
+        if (rollback->object_ops != NULL)
+            (void)rollback->object_ops->close(rollback->child_context);
+        else
+            (void)files->close(linux_abi->host->context, rollback->child_handle);
+    }
     return HL_STATUS_BUSY;
 }
 
@@ -273,8 +308,13 @@ hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *
         if (completed.status != HL_STATUS_OK) status = (hl_status)completed.status;
     }
     while (plan->count != 0) {
-        hl_host_result closed = files->close(linux_abi->host->context, plan->records[--plan->count].child_handle);
-        if (closed.status != HL_STATUS_OK && status == HL_STATUS_OK) status = (hl_status)closed.status;
+        hl_linux_fork_record *record = &plan->records[--plan->count];
+        hl_status closed;
+        if (record->object_ops != NULL)
+            closed = record->object_ops->close(record->child_context);
+        else
+            closed = (hl_status)files->close(linux_abi->host->context, record->child_handle).status;
+        if (closed != HL_STATUS_OK && status == HL_STATUS_OK) status = closed;
     }
     return status;
 }
@@ -302,7 +342,9 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
         hl_linux_fork_record *record = &plan->records[index];
         hl_host_result created;
         if (record->ofd >= linux_abi->ofd_capacity || linux_abi->ofds[record->ofd].generation != record->generation ||
-            linux_abi->ofds[record->ofd].host_handle != record->parent_handle)
+            linux_abi->ofds[record->ofd].host_handle != record->parent_handle ||
+            linux_abi->ofds[record->ofd].object_ops != record->object_ops ||
+            linux_abi->ofds[record->ofd].object_context != record->parent_context)
             goto corrupt;
         created = sync->mutex_create(linux_abi->host->context);
         if (created.status != HL_STATUS_OK || created.value == HL_HOST_HANDLE_INVALID) {
@@ -319,8 +361,13 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
         hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
         (void)sync->mutex_close(linux_abi->host->context, entry->io_mutex);
         entry->io_mutex = record->child_mutex;
-        entry->host_handle = record->child_handle;
-        (void)files->close(linux_abi->host->context, record->parent_handle);
+        if (record->object_ops != NULL) {
+            entry->object_context = record->child_context;
+            (void)record->object_ops->close(record->parent_context);
+        } else {
+            entry->host_handle = record->child_handle;
+            (void)files->close(linux_abi->host->context, record->parent_handle);
+        }
     }
     plan->count = 0;
     return HL_STATUS_OK;
@@ -453,6 +500,106 @@ done:
     hl_linux_unlock(linux_abi);
     if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, mutex);
     return status;
+}
+
+static hl_status hl_linux_object_install_common(hl_linux_abi *linux_abi, hl_linux_fd requested,
+                                                const hl_linux_object_ops *ops, void *context, uint32_t kind,
+                                                uint32_t status_flags, uint32_t descriptor_flags, hl_linux_fd *out_fd) {
+    const hl_host_sync_services *sync;
+    hl_host_result created;
+    hl_linux_ofd_entry candidate = {0};
+    hl_linux_ofd ofd;
+    hl_linux_fd fd;
+    hl_status status;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || ops == NULL || ops->close == NULL ||
+        context == NULL || out_fd == NULL || (requested != UINT32_MAX && requested >= linux_abi->fd_capacity))
+        return HL_STATUS_INVALID_ARGUMENT;
+    sync = hl_linux_sync(linux_abi);
+    if (sync == NULL || sync->mutex_create == NULL || sync->mutex_close == NULL) return HL_STATUS_NOT_SUPPORTED;
+    created = sync->mutex_create(linux_abi->host->context);
+    if (created.status != HL_STATUS_OK || created.value == HL_HOST_HANDLE_INVALID)
+        return created.status == HL_STATUS_OK ? HL_STATUS_RESOURCE_LIMIT : (hl_status)created.status;
+
+    /* Build the complete immutable adapter away from the table. Publication is one fd-store under ownership. */
+    candidate.host_handle = HL_HOST_HANDLE_INVALID;
+    candidate.status_flags = status_flags;
+    candidate.references = 1;
+    candidate.kind = kind;
+    candidate.io_mutex = created.value;
+    candidate.object_ops = ops;
+    candidate.object_context = context;
+    hl_linux_lock(linux_abi);
+    if (requested == UINT32_MAX)
+        status = hl_linux_find_fd(linux_abi, &fd);
+    else if (linux_abi->fds[requested].ofd != 0)
+        status = HL_STATUS_ALREADY_EXISTS;
+    else {
+        fd = requested;
+        status = HL_STATUS_OK;
+    }
+    if (status == HL_STATUS_OK) status = hl_linux_find_ofd(linux_abi, &ofd);
+    if (status == HL_STATUS_OK) {
+        candidate.generation = linux_abi->ofds[ofd].generation + 1;
+        linux_abi->ofds[ofd] = candidate;
+        linux_abi->fds[fd].descriptor_flags = descriptor_flags;
+        linux_abi->fds[fd].generation++;
+        linux_abi->fds[fd].ofd = ofd;
+        *out_fd = fd;
+    }
+    hl_linux_unlock(linux_abi);
+    if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, created.value);
+    return status;
+}
+
+hl_status hl_linux_object_install(hl_linux_abi *linux_abi, const hl_linux_object_ops *ops, void *context, uint32_t kind,
+                                  uint32_t status_flags, uint32_t descriptor_flags, hl_linux_fd *out_fd) {
+    return hl_linux_object_install_common(linux_abi, UINT32_MAX, ops, context, kind, status_flags, descriptor_flags,
+                                          out_fd);
+}
+
+hl_status hl_linux_object_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, const hl_linux_object_ops *ops,
+                                     void *context, uint32_t kind, uint32_t status_flags, uint32_t descriptor_flags) {
+    hl_linux_fd installed = UINT32_MAX;
+    return hl_linux_object_install_common(linux_abi, fd, ops, context, kind, status_flags, descriptor_flags,
+                                          &installed);
+}
+
+hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_object_pin *pin) {
+    const hl_linux_fd_entry *descriptor;
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    hl_status status;
+    if (linux_abi == NULL || pin == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    memset(pin, 0, sizeof(*pin));
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, &descriptor, &found);
+    if (status == HL_STATUS_OK && found->object_ops == NULL) status = HL_STATUS_NOT_SUPPORTED;
+    if (status == HL_STATUS_OK) {
+        ofd = &linux_abi->ofds[descriptor->ofd];
+        ofd->active_operations++;
+        pin->linux_abi = linux_abi;
+        pin->ofd = descriptor->ofd;
+        pin->generation = ofd->generation;
+        pin->ops = ofd->object_ops;
+        pin->context = ofd->object_context;
+    }
+    hl_linux_unlock(linux_abi);
+    return status;
+}
+
+void hl_linux_object_unpin(hl_linux_object_pin *pin) {
+    hl_linux_ofd_entry *ofd;
+    if (pin == NULL || pin->linux_abi == NULL) return;
+    hl_linux_lock(pin->linux_abi);
+    ofd = &pin->linux_abi->ofds[pin->ofd];
+    if (ofd->generation == pin->generation && ofd->active_operations != 0) ofd->active_operations--;
+    hl_linux_unlock(pin->linux_abi);
+    memset(pin, 0, sizeof(*pin));
+}
+
+uint32_t hl_linux_object_ready(hl_linux_object_pin *pin, uint32_t interests) {
+    if (pin == NULL || pin->ops == NULL || pin->ops->readiness == NULL) return 0;
+    return pin->ops->readiness(pin->context, interests) & (interests | HL_LINUX_READY_ERROR | HL_LINUX_READY_HANGUP);
 }
 
 hl_status hl_linux_fd_reserve_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_fd_reservation *reservation) {
@@ -592,6 +739,9 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
                                        hl_host_handle *last_host_handle) {
     const hl_host_sync_services *sync = hl_linux_sync(linux_abi);
     hl_host_handle host_handle;
+    const hl_linux_object_ops *object_ops;
+    void *object_context;
+    hl_status close_status = HL_STATUS_OK;
     hl_host_handle mutex = ofd_entry->io_mutex;
     hl_host_result result;
     /* Wait only for this OFD. Operations drop their pin before releasing io_lock. */
@@ -604,15 +754,20 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
         return HL_STATUS_CORRUPT;
     }
     host_handle = ofd_entry->host_handle;
+    object_ops = ofd_entry->object_ops;
+    object_context = ofd_entry->object_context;
     ofd_entry->host_handle = HL_HOST_HANDLE_INVALID;
     ofd_entry->offset = 0;
     ofd_entry->status_flags = 0;
     ofd_entry->kind = 0;
+    ofd_entry->object_ops = NULL;
+    ofd_entry->object_context = NULL;
     hl_linux_unlock(linux_abi);
+    if (object_ops != NULL) close_status = object_ops->close(object_context);
     result = sync->mutex_unlock(linux_abi->host->context, mutex);
-    if (result.status != HL_STATUS_OK) return (hl_status)result.status;
+    if (result.status != HL_STATUS_OK && close_status == HL_STATUS_OK) close_status = (hl_status)result.status;
     result = sync->mutex_close(linux_abi->host->context, mutex);
-    if (result.status != HL_STATUS_OK) return (hl_status)result.status;
+    if (result.status != HL_STATUS_OK && close_status == HL_STATUS_OK) close_status = (hl_status)result.status;
     hl_linux_lock(linux_abi);
     if (ofd_entry->references != 0 || ofd_entry->active_operations != 0 || ofd_entry->closing == 0 ||
         ofd_entry->io_mutex != mutex) {
@@ -624,7 +779,7 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     ofd_entry->generation++;
     hl_linux_unlock(linux_abi);
     if (last_host_handle != NULL) *last_host_handle = host_handle;
-    return HL_STATUS_OK;
+    return close_status;
 }
 
 hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle) {
@@ -634,7 +789,7 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     if (last_host_handle != NULL) *last_host_handle = HL_HOST_HANDLE_INVALID;
     if (linux_abi == NULL) return HL_STATUS_NOT_FOUND;
     hl_linux_lock(linux_abi);
-    if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0) {
+    if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0 || linux_abi->fds[fd].ofd == HL_LINUX_FD_RESERVED) {
         hl_linux_unlock(linux_abi);
         return HL_STATUS_NOT_FOUND;
     }
@@ -648,7 +803,9 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
         hl_linux_unlock(linux_abi);
         return HL_STATUS_CORRUPT;
     }
-    memset(&linux_abi->fds[fd], 0, sizeof(linux_abi->fds[fd]));
+    linux_abi->fds[fd].ofd = 0;
+    linux_abi->fds[fd].descriptor_flags = 0;
+    linux_abi->fds[fd].generation++;
     ofd_entry->references--;
     final_reference = ofd_entry->references == 0;
     if (final_reference) ofd_entry->closing = 1;
@@ -704,11 +861,13 @@ hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi) {
     for (ofd = 1; ofd < linux_abi->ofd_capacity; ++ofd) {
         const hl_linux_ofd_entry *entry = &linux_abi->ofds[ofd];
         if (entry->references != references[ofd] ||
-            (entry->references != 0 && (entry->host_handle == HL_HOST_HANDLE_INVALID ||
-                                        entry->io_mutex == HL_HOST_HANDLE_INVALID || entry->closing != 0)) ||
+            (entry->references != 0 &&
+             (((entry->object_ops == NULL) == (entry->host_handle == HL_HOST_HANDLE_INVALID)) ||
+              (entry->object_ops != NULL && entry->object_context == NULL) ||
+              entry->io_mutex == HL_HOST_HANDLE_INVALID || entry->closing != 0)) ||
             (entry->references == 0 && entry->active_operations == 0 &&
              (entry->host_handle != HL_HOST_HANDLE_INVALID || entry->io_mutex != HL_HOST_HANDLE_INVALID ||
-              entry->closing != 0))) {
+              entry->closing != 0 || entry->object_ops != NULL || entry->object_context != NULL))) {
             status = HL_STATUS_CORRUPT;
             goto done;
         }
@@ -780,6 +939,9 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
     files = hl_linux_files(linux_abi);
     if (size != 0 && buffer == NULL)
         result = -HL_LINUX_EINVAL;
+    else if (ofd->object_ops != NULL)
+        result =
+            ofd->object_ops->read == NULL ? -HL_LINUX_ENOSYS : ofd->object_ops->read(ofd->object_context, buffer, size);
     else if (files == NULL || files->read == NULL)
         result = -HL_LINUX_ENOSYS;
     else {
@@ -870,6 +1032,9 @@ int64_t hl_linux_write(hl_linux_abi *linux_abi, hl_linux_fd fd, const void *buff
     files = hl_linux_files(linux_abi);
     if (size != 0 && buffer == NULL)
         result = -HL_LINUX_EINVAL;
+    else if (ofd->object_ops != NULL)
+        result = ofd->object_ops->write == NULL ? -HL_LINUX_ENOSYS
+                                                : ofd->object_ops->write(ofd->object_context, buffer, size);
     else if (files == NULL)
         result = -HL_LINUX_ENOSYS;
     else {
