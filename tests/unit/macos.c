@@ -139,6 +139,17 @@ int main(void) {
         HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
     }
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
+    {
+        hl_host_result mapping =
+            services.memory->reserve(services.context, 16384, 16384, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+        HL_CHECK(mapping.status == HL_STATUS_OK && mapping.value != HL_HOST_HANDLE_INVALID);
+        HL_CHECK(services.memory->protect(services.context, mapping.value, 0, 16384, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->protect(services.context, mapping.value, 16384, 1, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
+    }
     snprintf(path, sizeof(path), "/tmp/hl_host_macos_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                         HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,
@@ -155,6 +166,32 @@ int main(void) {
         services.file->read_at(services.context, file.value, 0, (hl_host_bytes){contents, sizeof(contents)}).value ==
         sizeof(contents));
     HL_CHECK(memcmp(contents, "xbc", sizeof(contents)) == 0);
+    {
+        hl_host_file_metadata metadata;
+        hl_host_result clone;
+        char first = 0;
+        char second = 0;
+        char vector_contents[3] = {0};
+        hl_host_iovec vectors[] = {{(uint64_t)(uintptr_t)&vector_contents[0], 1},
+                                   {(uint64_t)(uintptr_t)&vector_contents[1], 2}};
+        HL_CHECK(services.file->metadata(services.context, file.value, &metadata).status == HL_STATUS_OK);
+        HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR && metadata.size == 3 &&
+                 (metadata.permissions & 0600u) == 0600u);
+        HL_CHECK(services.file->seek(services.context, file.value, 0, SEEK_SET).value == 0);
+        clone = services.file->clone_for_fork(services.context, file.value);
+        HL_CHECK(clone.status == HL_STATUS_OK && clone.value != file.value);
+        HL_CHECK(services.file->read(services.context, clone.value, &first, 1).value == 1 && first == 'x');
+        HL_CHECK(services.file->read(services.context, file.value, &second, 1).value == 1 && second == 'b');
+        HL_CHECK(services.file->seek(services.context, clone.value, 0, SEEK_SET).value == 0);
+        HL_CHECK(services.file->readv(services.context, clone.value, vectors, 2).value == 3);
+        HL_CHECK(memcmp(vector_contents, "xbc", 3) == 0);
+        HL_CHECK(services.file->sync(services.context, clone.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->data_sync(services.context, clone.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->truncate(services.context, clone.value, 2).status == HL_STATUS_OK);
+        HL_CHECK(services.file->truncate(services.context, clone.value, 3).status == HL_STATUS_OK);
+        HL_CHECK(services.file->write_at(services.context, clone.value, 2, (hl_host_const_bytes){"c", 1}).value == 1);
+        HL_CHECK(services.file->close(services.context, clone.value).status == HL_STATUS_OK);
+    }
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     {
         struct stat status;
