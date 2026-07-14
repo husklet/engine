@@ -531,13 +531,25 @@ path that weakens Linux behavior, isolation, invalidation, or error fidelity is 
 This checklist tracks work required to reach the design above. It is intentionally separate from the normative rules;
 items describe remaining proof or implementation, not accepted permanent exceptions.
 
+Work is completed in this order:
+
+1. **macOS production completion.** Transfer and separate the complete working macOS-hosted Linux engine, then pass
+   every active dual-ISA compatibility, stress, lifecycle, and performance gate on the real mac host.
+2. **Linux production completion.** Reuse the already-separated translator, Linux ABI, and host-service contract;
+   finish the Linux backend and pass the same exact-golden corpus without changing guest semantics.
+3. **Windows production implementation.** Implement Windows only after macOS and Linux prove that the portable
+   contract is complete. Windows is a required eventual host, but it is deliberately the final host milestone.
+
+macOS work must not create macOS exceptions in portable code. Each transferred behavior is placed in its final owning
+layer immediately so completing macOS reduces, rather than increases, the later Linux work.
+
 ### Portability and boundaries
 
 - [ ] Remove the remaining unity-only dependencies from production target roots.
 - [ ] Route every production host operation through a typed host-service group.
 - [ ] Remove ambient file/mapping access from guest ELF and persistent-cache storage paths.
 - [ ] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes.
-- [ ] Add a Windows backend only after the common contract passes without POSIX leakage.
+- [ ] Add a Windows backend after macOS and Linux are complete and the common contract passes without POSIX leakage.
 
 ### Linux behavior
 
