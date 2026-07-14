@@ -2422,10 +2422,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        // OVERLAY: resolve across layers (upper shadows lowers)
-        if (g_rootfs && g_nlower) {
-            char gp[4200];
-            abs_guest((int)a0, (const char *)a1, gp, sizeof gp);
+        // OVERLAY: resolve across layers (upper shadows lowers). A bind volume is its own jail and must
+        // reach the opaque jail planner below; treating it as an overlay path bypasses typed directory I/O.
+        char overlay_guest[4200];
+        abs_guest((int)a0, (const char *)a1, overlay_guest, sizeof overlay_guest);
+        if (g_rootfs && g_nlower && !jail_is_vol(overlay_guest)) {
+            const char *gp = overlay_guest;
             char host[4300];
             // O_WRONLY/O_RDWR/O_CREAT -> write
             int isw = (lf & 3) || (lf & 0x40);
@@ -2541,10 +2543,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // fin is resolved -> O_NOFOLLOW safe
             // probe pre-existence (relative to the resolved parent) so we stamp ONLY a fresh create.
             int nf_new = nf_want && faccessat(pfd, fin, F_OK, AT_SYMLINK_NOFOLLOW) != 0;
+            char typed_guest_path[4200];
+            abs_guest((int)a0, (const char *)a1, typed_guest_path, sizeof typed_guest_path);
+            int typed_directory = plan.target_type == HL_HOST_FILE_TYPE_DIRECTORY && (lf & G_O_DIRECTORY) &&
+                                  (!g_nlower || jail_is_vol(typed_guest_path));
             /* The sentry wire still transports native descriptors; typed publication is safe only locally. */
             if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID &&
-                plan.target != HL_HOST_HANDLE_INVALID && plan.target_type == HL_HOST_FILE_TYPE_REGULAR &&
-                !(lf & G_O_DIRECTORY)) {
+                plan.target != HL_HOST_HANDLE_INVALID &&
+                ((plan.target_type == HL_HOST_FILE_TYPE_REGULAR && !(lf & G_O_DIRECTORY)) ||
+                 typed_directory)) {
                 int64_t opened;
                 close(pfd);
                 opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));

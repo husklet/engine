@@ -8,7 +8,7 @@ typed-sendfile	posix	sendfile_edge.c	focused-production-regression	aarch64,x86_6
 typed-vector-io	posix	vector_io.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/vector_io.out	linux-libc,syscall,filesystem,scratch-rootfs	active	preadv2/pwritev2 typed-file vectors, offset semantics, unsupported flags, and readahead validation
 clock	posix	clockmono.c	clockmono.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockmono.out	linux-libc,syscall	active	exact source; deterministic checked golden
 realpath	posix	realpath.c	realpath.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/realpath.out	linux-libc,syscall	active	exact source; deterministic checked golden
-getdents	posix	getdents.c	getdents.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getdents.out	linux-libc,syscall	active	exact source; deterministic checked golden
+getdents	posix	getdents.c	getdents.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getdents.out	linux-libc,syscall,typed-rootfs	active	typed directory cursor/layout behavioral coverage
 tmpfile	posix	tmpfile.c	tmpfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tmpfile.out	linux-libc,syscall	active	exact source; deterministic checked golden
 statvfs	posix	statvfs.c	statvfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statvfs.out	linux-libc,syscall	active	exact source; deterministic checked golden
 epoll	linuxsys	epoll.c	epoll.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/epoll.out	linux-libc,syscall	active	exact source; deterministic checked golden
