@@ -307,9 +307,11 @@ static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint
             result = -errno;
             break;
         }
-        if (object_ready != 0 || native_ready != 0 || deadline == 0 || (deadline != UINT64_MAX && bound_now_ns() >= deadline)) {
+        if (object_ready != 0 || native_ready != 0 || deadline == 0 ||
+            (deadline != UINT64_MAX && bound_now_ns() >= deadline)) {
             result = native_ready + object_ready;
-            for (index = 0; index < count; ++index) guest[index].revents = native[index].revents;
+            for (index = 0; index < count; ++index)
+                guest[index].revents = native[index].revents;
             for (index = 0; index < object_count; ++index)
                 guest[object_indices[index]].revents = bound_poll_readiness(objects[index].readiness);
             break;
