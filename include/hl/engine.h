@@ -73,6 +73,7 @@ HL_API const char *hl_engine_version(void);
 HL_API hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine);
 HL_API hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], hl_engine_exit *out_exit);
 HL_API hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size);
+/* May be called from another thread after run has started. It force-stops and joins the active run before freeing. */
 HL_API void hl_engine_destroy(hl_engine *engine);
 
 HL_EXTERN_C_END

@@ -68,6 +68,28 @@ static int check_concurrent_stop(hl_fake_host *fake, hl_host_services *services,
     return EXIT_SUCCESS;
 }
 
+static int check_concurrent_destroy(hl_fake_host *fake, hl_host_services *services, hl_engine_config *config) {
+    enum { REPEATS = 100 };
+    uint32_t iteration;
+    for (iteration = 0; iteration < REPEATS; ++iteration) {
+        run_context context;
+        pthread_t thread;
+        memset(&context, 0, sizeof(context));
+        context.result.abi = HL_ENGINE_ABI;
+        context.result.size = sizeof(context.result);
+        hl_fake_host_block_process_wait(fake, 1);
+        HL_CHECK(hl_engine_create(config, services, &context.engine) == HL_STATUS_OK);
+        HL_CHECK(pthread_create(&thread, NULL, run_engine, &context) == 0);
+        while (__atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0)
+            sched_yield();
+        hl_engine_destroy(context.engine);
+        HL_CHECK(pthread_join(thread, NULL) == 0);
+        HL_CHECK(context.status == HL_STATUS_OK && context.result.kind == HL_ENGINE_EXIT_SIGNAL &&
+                 context.result.guest_status == 9 && __atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0);
+    }
+    return EXIT_SUCCESS;
+}
+
 int main(void) {
     hl_fake_host fake;
     hl_host_services services;
@@ -120,6 +142,7 @@ int main(void) {
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
     HL_CHECK(fake_box_seen == 3);
+    HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;
     engine = (hl_engine *)(uintptr_t)1;

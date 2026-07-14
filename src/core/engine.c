@@ -5,6 +5,11 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sched.h>
+#endif
 
 static const hl_engine_backend *production_backend;
 
@@ -26,7 +31,13 @@ struct hl_engine {
     uint32_t box_initialized;
 };
 
-enum { HL_ENGINE_CREATED = 0, HL_ENGINE_STARTING = 1, HL_ENGINE_RUNNING = 2, HL_ENGINE_FINISHED = 3 };
+enum {
+    HL_ENGINE_CREATED = 0,
+    HL_ENGINE_STARTING = 1,
+    HL_ENGINE_RUNNING = 2,
+    HL_ENGINE_FINISHED = 3,
+    HL_ENGINE_DESTROYING = 4
+};
 
 static void hl_engine_lock(hl_engine *engine) {
     while (atomic_flag_test_and_set_explicit(&engine->lock, memory_order_acquire)) {}
@@ -34,6 +45,14 @@ static void hl_engine_lock(hl_engine *engine) {
 
 static void hl_engine_unlock(hl_engine *engine) {
     atomic_flag_clear_explicit(&engine->lock, memory_order_release);
+}
+
+static void hl_engine_yield(void) {
+#if defined(_WIN32)
+    (void)SwitchToThread();
+#else
+    sched_yield();
+#endif
 }
 
 uint32_t hl_engine_abi(void) {
@@ -188,30 +207,38 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
     }
     hl_engine_lock(engine);
     engine->process = process;
-    engine->state = HL_ENGINE_RUNNING;
+    if (engine->state != HL_ENGINE_DESTROYING) engine->state = HL_ENGINE_RUNNING;
     pending = engine->pending_termination;
     hl_engine_unlock(engine);
     if (pending != 0) engine->host.process->terminate(engine->host.context, process, pending);
     waited = engine->host.process->wait(engine->host.context, process, HL_HOST_DEADLINE_INFINITE);
     hl_engine_lock(engine);
     engine->process = HL_HOST_HANDLE_INVALID;
-    engine->state = HL_ENGINE_FINISHED;
     hl_engine_unlock(engine);
     closed = engine->host.process->close(engine->host.context, process);
-    if (waited.status != HL_STATUS_OK) return (hl_status)waited.status;
-    if (closed.status != HL_STATUS_OK) return (hl_status)closed.status;
-    out_exit->detail = 0;
-    if (waited.detail == HL_HOST_PROCESS_EXIT_CODE) {
-        out_exit->kind = HL_ENGINE_EXIT_CODE;
-        out_exit->guest_status = (int32_t)waited.value;
-    } else if (waited.detail == HL_HOST_PROCESS_EXIT_SIGNAL) {
-        out_exit->kind = HL_ENGINE_EXIT_SIGNAL;
-        out_exit->guest_status = (int32_t)waited.value;
+    if (waited.status != HL_STATUS_OK) {
+        status = (hl_status)waited.status;
+    } else if (closed.status != HL_STATUS_OK) {
+        status = (hl_status)closed.status;
     } else {
-        out_exit->guest_status = HL_STATUS_CORRUPT;
-        return HL_STATUS_CORRUPT;
+        out_exit->detail = 0;
+        if (waited.detail == HL_HOST_PROCESS_EXIT_CODE) {
+            out_exit->kind = HL_ENGINE_EXIT_CODE;
+            out_exit->guest_status = (int32_t)waited.value;
+            status = HL_STATUS_OK;
+        } else if (waited.detail == HL_HOST_PROCESS_EXIT_SIGNAL) {
+            out_exit->kind = HL_ENGINE_EXIT_SIGNAL;
+            out_exit->guest_status = (int32_t)waited.value;
+            status = HL_STATUS_OK;
+        } else {
+            out_exit->guest_status = HL_STATUS_CORRUPT;
+            status = HL_STATUS_CORRUPT;
+        }
     }
-    return HL_STATUS_OK;
+    hl_engine_lock(engine);
+    engine->state = HL_ENGINE_FINISHED;
+    hl_engine_unlock(engine);
+    return status;
 }
 
 hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size) {
@@ -227,7 +254,8 @@ hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *dat
     else
         return HL_STATUS_NOT_SUPPORTED;
     hl_engine_lock(engine);
-    if (engine->state == HL_ENGINE_CREATED || engine->state == HL_ENGINE_FINISHED) {
+    if (engine->state == HL_ENGINE_CREATED || engine->state == HL_ENGINE_FINISHED ||
+        engine->state == HL_ENGINE_DESTROYING) {
         hl_engine_unlock(engine);
         return HL_STATUS_BUSY;
     }
@@ -245,8 +273,29 @@ hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *dat
 }
 
 void hl_engine_destroy(hl_engine *engine) {
+    hl_host_handle process;
     uint32_t fd;
     if (engine == NULL) return;
+    hl_engine_lock(engine);
+    if (engine->state == HL_ENGINE_STARTING || engine->state == HL_ENGINE_RUNNING) {
+        engine->state = HL_ENGINE_DESTROYING;
+        engine->pending_termination = HL_HOST_PROCESS_TERMINATE_FORCE;
+        process = engine->process;
+        hl_engine_unlock(engine);
+        if (process != HL_HOST_HANDLE_INVALID)
+            (void)engine->host.process->terminate(engine->host.context, process, HL_HOST_PROCESS_TERMINATE_FORCE);
+        for (;;) {
+            uint32_t state;
+            hl_engine_lock(engine);
+            state = engine->state;
+            hl_engine_unlock(engine);
+            if (state == HL_ENGINE_FINISHED) break;
+            hl_engine_yield();
+        }
+    } else {
+        engine->state = HL_ENGINE_DESTROYING;
+        hl_engine_unlock(engine);
+    }
     if (engine->box_initialized) {
         for (fd = 0; fd < engine->box.fd_capacity; ++fd)
             (void)hl_linux_close(&engine->box, fd);
