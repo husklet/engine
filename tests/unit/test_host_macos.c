@@ -8,16 +8,30 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static int32_t child_exit_37(void *context) {
+    HL_CHECK(context == (void *)(uintptr_t)37);
+    return 37;
+}
+
 int main(void) {
     hl_host_macos *host;
     hl_host_services services;
     hl_host_code_mapping code;
+    hl_host_result process;
+    hl_host_result process_exit;
     hl_host_result file;
     char path[128];
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
-    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) ==
-             HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
+                                                      HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
+
+    process = services.process->spawn_cloned(services.context, child_exit_37, (void *)(uintptr_t)37);
+    HL_CHECK(process.status == HL_STATUS_OK && process.value != HL_HOST_HANDLE_INVALID);
+    process_exit = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_exit.status == HL_STATUS_OK && process_exit.detail == HL_HOST_PROCESS_EXIT_CODE &&
+             process_exit.value == 37);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
     snprintf(path, sizeof(path), "/tmp/hl_host_macos_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),

@@ -44,7 +44,9 @@ typedef enum hl_ir_opcode {
 /*
  * Interpreter semantics currently cover CONSTANT, COPY, integer
  * ADD/SUB/AND/OR/XOR, SAFEPOINT, GUEST_RETURN, SYSCALL_EXIT, and FAULT_EXIT;
- * native blocks currently lower the same value operations through GUEST_RETURN.
+ * native blocks lower the same operations.  A terminator's immediate is its
+ * primary exit value unless operand zero supplies that value.  SYSCALL_EXIT
+ * and FAULT_EXIT may additionally supply operand one as exit detail.
  * LOAD/STORE have no memory-context contract yet; COMPARE/BRANCH operations
  * have no label/CFG contract; GUEST_CALL has no call-frame contract. Those
  * reserved opcodes are rejected by append and validation until their complete

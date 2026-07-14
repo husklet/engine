@@ -44,8 +44,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||
-         services->process->spawn == NULL || services->process->wait == NULL || services->process->terminate == NULL ||
-         services->process->close == NULL))
+         services->process->spawn_cloned == NULL || services->process->wait == NULL ||
+         services->process->terminate == NULL || services->process->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_EVENT) != 0 &&
         (!hl_valid_group(services->event, HL_HOST_EVENT_ABI, sizeof(*services->event)) ||

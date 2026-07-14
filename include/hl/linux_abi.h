@@ -29,7 +29,10 @@ typedef enum hl_linux_errno {
     HL_LINUX_EEXIST = 17,
     HL_LINUX_EINVAL = 22,
     HL_LINUX_ENFILE = 23,
-    HL_LINUX_ENOSYS = 38
+    HL_LINUX_EMFILE = 24,
+    HL_LINUX_ESPIPE = 29,
+    HL_LINUX_ENOSYS = 38,
+    HL_LINUX_EOVERFLOW = 75
 } hl_linux_errno;
 
 enum {
@@ -44,6 +47,27 @@ enum {
     HL_LINUX_O_DIRECTORY = 00200000u,
     HL_LINUX_O_CLOEXEC = 02000000u,
     HL_LINUX_FD_CLOEXEC = 1u
+};
+
+enum {
+    HL_LINUX_SEEK_SET = 0,
+    HL_LINUX_SEEK_CUR = 1,
+    HL_LINUX_SEEK_END = 2,
+    HL_LINUX_F_DUPFD = 0,
+    HL_LINUX_F_GETFD = 1,
+    HL_LINUX_F_SETFD = 2,
+    HL_LINUX_F_GETFL = 3,
+    HL_LINUX_F_DUPFD_CLOEXEC = 1030
+};
+
+enum {
+    HL_LINUX_S_IFIFO = 0010000u,
+    HL_LINUX_S_IFCHR = 0020000u,
+    HL_LINUX_S_IFDIR = 0040000u,
+    HL_LINUX_S_IFBLK = 0060000u,
+    HL_LINUX_S_IFREG = 0100000u,
+    HL_LINUX_S_IFLNK = 0120000u,
+    HL_LINUX_S_IFSOCK = 0140000u
 };
 
 #define HL_LINUX_AT_FDCWD (-100)
@@ -87,6 +111,16 @@ typedef struct hl_linux_fd_snapshot {
     uint32_t descriptor_references;
     uint32_t kind;
 } hl_linux_fd_snapshot;
+
+/* Host-neutral values which the syscall marshaller can encode for either Linux guest ISA. */
+typedef struct hl_linux_file_status {
+    uint64_t device;
+    uint64_t object;
+    uint64_t size;
+    uint64_t blocks_512;
+    uint64_t modified_ns;
+    uint32_t mode;
+} hl_linux_file_status;
 
 typedef struct hl_linux_abi {
     HL_ABI_HEADER;
@@ -144,6 +178,12 @@ HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, co
                                uint32_t flags, uint32_t mode);
 /* close() invalidates this descriptor even if the host reports a late close error. */
 HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
+/* dup and supported fcntl commands operate only on the guest fd/OFD tables. */
+HL_API int64_t hl_linux_dup(hl_linux_abi *linux_abi, hl_linux_fd fd);
+HL_API int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command, uint64_t argument);
+/* lseek changes the shared OFD offset. SEEK_END and fstat use normalized host metadata. */
+HL_API int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, int32_t whence);
+HL_API int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_status *output);
 
 HL_EXTERN_C_END
 

@@ -63,6 +63,7 @@ int main(void) {
     HL_CHECK(memcmp(suffix, readback + sizeof(contents), sizeof(suffix)) == 0);
     HL_CHECK(services.file->metadata(services.context, file.value, &metadata).status == HL_STATUS_OK);
     HL_CHECK(metadata.size == sizeof(readback));
+    HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR);
     HL_CHECK((metadata.permissions & 0777u) == 0600u);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     unlink(path);

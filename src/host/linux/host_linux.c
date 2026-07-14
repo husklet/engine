@@ -440,7 +440,20 @@ static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle f
     output->allocated_size = (uint64_t)status.st_blocks * 512u;
     output->modified_ns = (uint64_t)status.st_mtim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtim.tv_nsec;
     output->permissions = (uint32_t)status.st_mode & 07777u;
-    output->type = (uint32_t)status.st_mode & S_IFMT;
+    if (S_ISREG(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_REGULAR;
+    else if (S_ISDIR(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_DIRECTORY;
+    else if (S_ISLNK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_SYMLINK;
+    else if (S_ISCHR(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_CHARACTER;
+    else if (S_ISBLK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_BLOCK;
+    else if (S_ISFIFO(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_FIFO;
+    else if (S_ISSOCK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_SOCKET;
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 

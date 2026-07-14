@@ -9,8 +9,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 2u
-#define HL_HOST_PROCESS_ABI 1u
+#define HL_HOST_FILE_ABI 3u
+#define HL_HOST_PROCESS_ABI 2u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
@@ -41,6 +41,18 @@ enum {
 };
 
 enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
+
+/* Host-independent object kinds returned by hl_host_file_metadata. */
+typedef enum hl_host_file_type {
+    HL_HOST_FILE_TYPE_UNKNOWN = 0,
+    HL_HOST_FILE_TYPE_REGULAR = 1,
+    HL_HOST_FILE_TYPE_DIRECTORY = 2,
+    HL_HOST_FILE_TYPE_SYMLINK = 3,
+    HL_HOST_FILE_TYPE_CHARACTER = 4,
+    HL_HOST_FILE_TYPE_BLOCK = 5,
+    HL_HOST_FILE_TYPE_FIFO = 6,
+    HL_HOST_FILE_TYPE_SOCKET = 7
+} hl_host_file_type;
 
 typedef enum hl_host_network_family {
     HL_HOST_NETWORK_IPV4 = 1,
@@ -149,10 +161,22 @@ typedef struct hl_host_file_services {
     hl_host_result (*close)(void *context, hl_host_handle file);
 } hl_host_file_services;
 
+#define HL_HOST_DEADLINE_INFINITE UINT64_MAX
+
+typedef int32_t (*hl_host_process_entry)(void *entry_context);
+
+typedef enum hl_host_process_exit_kind {
+    HL_HOST_PROCESS_EXIT_CODE = 1,
+    HL_HOST_PROCESS_EXIT_SIGNAL = 2
+} hl_host_process_exit_kind;
+
+enum { HL_HOST_PROCESS_TERMINATE_FORCE = 1 };
+
 typedef struct hl_host_process_services {
     HL_ABI_HEADER;
-    hl_host_result (*spawn)(void *context, hl_host_const_bytes state, const hl_host_handle *handles,
-                            size_t handle_count);
+    /* Run an already-loaded entry in an isolated clone of the current process. */
+    hl_host_result (*spawn_cloned)(void *context, hl_host_process_entry entry, void *entry_context);
+    /* On success, value is the exit value and detail is hl_host_process_exit_kind. */
     hl_host_result (*wait)(void *context, hl_host_handle process, uint64_t deadline_ns);
     hl_host_result (*terminate)(void *context, hl_host_handle process, uint32_t reason);
     hl_host_result (*close)(void *context, hl_host_handle process);

@@ -9,16 +9,19 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define HL_MACOS_MAPPING_CAPACITY 4096u
 #define HL_MACOS_FILE_CAPACITY 1024u
+#define HL_MACOS_PROCESS_CAPACITY 1024u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -35,10 +38,18 @@ typedef struct hl_macos_file {
     int append_descriptor;
 } hl_macos_file;
 
+typedef struct hl_macos_process {
+    uint32_t generation;
+    uint32_t active;
+    pid_t pid;
+    uint32_t reaped;
+} hl_macos_process;
+
 struct hl_host_macos {
     pthread_mutex_t lock;
     hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
+    hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
 };
 
 static hl_host_result hl_macos_result(hl_status status, uint64_t value, uint64_t detail) {
@@ -423,7 +434,20 @@ static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle f
     output->modified_ns =
         (uint64_t)status.st_mtimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtimespec.tv_nsec;
     output->permissions = (uint32_t)status.st_mode & 07777u;
-    output->type = (uint32_t)status.st_mode & S_IFMT;
+    if (S_ISREG(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_REGULAR;
+    else if (S_ISDIR(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_DIRECTORY;
+    else if (S_ISLNK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_SYMLINK;
+    else if (S_ISCHR(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_CHARACTER;
+    else if (S_ISBLK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_BLOCK;
+    else if (S_ISFIFO(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_FIFO;
+    else if (S_ISSOCK(status.st_mode))
+        output->type = HL_HOST_FILE_TYPE_SOCKET;
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -446,6 +470,113 @@ static hl_host_result hl_macos_file_close(void *context, hl_host_handle handle) 
     pthread_mutex_unlock(&host->lock);
     if (close(descriptor) != 0) return hl_macos_errno();
     if (append_descriptor >= 0 && close(append_descriptor) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_macos_process *hl_macos_process_lookup(hl_host_macos *host, hl_host_handle handle) {
+    uint32_t low = (uint32_t)handle;
+    uint32_t index;
+    if (low == 0) return NULL;
+    index = low - 1u;
+    if (index >= HL_MACOS_PROCESS_CAPACITY || !host->processes[index].active ||
+        host->processes[index].generation != (uint32_t)(handle >> 32))
+        return NULL;
+    return &host->processes[index];
+}
+
+static hl_host_result hl_macos_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+    hl_host_macos *host = context;
+    hl_host_handle handle = 0;
+    uint32_t index;
+    pid_t pid;
+    if (entry == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pid = fork();
+    if (pid < 0) return hl_macos_errno();
+    if (pid == 0) _exit(entry(entry_context) & 255);
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+        hl_macos_process *process = &host->processes[index];
+        if (process->active) continue;
+        process->generation++;
+        if (process->generation == 0) process->generation = 1;
+        process->active = 1;
+        process->pid = pid;
+        process->reaped = 0;
+        handle = hl_macos_handle(index, process->generation);
+        break;
+    }
+    pthread_mutex_unlock(&host->lock);
+    if (handle == 0) {
+        int status;
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
+    return hl_macos_result(HL_STATUS_OK, handle, 0);
+}
+
+static hl_host_result hl_macos_process_wait(void *context, hl_host_handle handle, uint64_t deadline_ns) {
+    hl_host_macos *host = context;
+    hl_macos_process *process;
+    pid_t pid;
+    pid_t waited;
+    int status;
+    int options;
+    pthread_mutex_lock(&host->lock);
+    process = hl_macos_process_lookup(host, handle);
+    pid = process != NULL ? process->pid : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (deadline_ns != 0 && deadline_ns != HL_HOST_DEADLINE_INFINITE)
+        return hl_macos_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    options = deadline_ns == 0 ? WNOHANG : 0;
+    do {
+        waited = waitpid(pid, &status, options);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == 0) return hl_macos_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+    if (waited < 0) return hl_macos_errno();
+    pthread_mutex_lock(&host->lock);
+    process = hl_macos_process_lookup(host, handle);
+    if (process != NULL) process->reaped = 1;
+    pthread_mutex_unlock(&host->lock);
+    if (WIFEXITED(status))
+        return hl_macos_result(HL_STATUS_OK, (uint64_t)WEXITSTATUS(status), HL_HOST_PROCESS_EXIT_CODE);
+    if (WIFSIGNALED(status))
+        return hl_macos_result(HL_STATUS_OK, (uint64_t)WTERMSIG(status), HL_HOST_PROCESS_EXIT_SIGNAL);
+    return hl_macos_result(HL_STATUS_CORRUPT, 0, (uint64_t)(uint32_t)status);
+}
+
+static hl_host_result hl_macos_process_terminate(void *context, hl_host_handle handle, uint32_t reason) {
+    hl_host_macos *host = context;
+    hl_macos_process *process;
+    pid_t pid;
+    if (reason != HL_HOST_PROCESS_TERMINATE_FORCE) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    process = hl_macos_process_lookup(host, handle);
+    pid = process != NULL ? process->pid : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (kill(pid, SIGKILL) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_process_close(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    hl_macos_process *process;
+    pthread_mutex_lock(&host->lock);
+    process = hl_macos_process_lookup(host, handle);
+    if (process == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if (!process->reaped) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_BUSY, 0, 0);
+    }
+    process->active = 0;
+    process->pid = -1;
+    process->reaped = 0;
+    pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -474,6 +605,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,           sizeof(file),        hl_macos_file_open,
                                                hl_macos_file_read,         hl_macos_file_write, hl_macos_file_append,
                                                hl_macos_file_metadata_get, hl_macos_file_close};
+    static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
+                                                     hl_macos_process_spawn,     hl_macos_process_wait,
+                                                     hl_macos_process_terminate, hl_macos_process_close};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -486,13 +620,14 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     }
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
-    out_services->capabilities =
-        HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE | HL_HOST_CAP_CODE_MAPPING;
+    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
+                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
     out_services->log = &log;
     out_services->file = &file;
+    out_services->process = &process;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -512,6 +647,13 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         if (!file->active) continue;
         close(file->descriptor);
         if (file->append_descriptor >= 0) close(file->append_descriptor);
+    }
+    for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
+        hl_macos_process *process = &host->processes[index];
+        int status;
+        if (!process->active || process->reaped) continue;
+        kill(process->pid, SIGKILL);
+        while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
     }
     pthread_mutex_destroy(&host->lock);
     free(host);

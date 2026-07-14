@@ -57,7 +57,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         engine->backend->run_process == NULL)
         return HL_STATUS_NOT_SUPPORTED;
     engine->has_run = 1;
-    return engine->backend->run_process(engine->config.rootfs, argc, argv, out_exit);
+    return engine->backend->run_process(&engine->host, engine->config.rootfs, argc, argv, out_exit);
 }
 
 hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size) {

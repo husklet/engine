@@ -59,6 +59,18 @@ static hl_status hl_linux_find_fd(const hl_linux_abi *linux_abi, hl_linux_fd *ou
     return HL_STATUS_RESOURCE_LIMIT;
 }
 
+static hl_status hl_linux_find_fd_at_least(const hl_linux_abi *linux_abi, hl_linux_fd minimum, hl_linux_fd *out_fd) {
+    uint32_t fd;
+    if (minimum >= linux_abi->fd_capacity) return HL_STATUS_RESOURCE_LIMIT;
+    for (fd = minimum; fd < linux_abi->fd_capacity; ++fd) {
+        if (linux_abi->fds[fd].ofd == 0) {
+            *out_fd = fd;
+            return HL_STATUS_OK;
+        }
+    }
+    return HL_STATUS_RESOURCE_LIMIT;
+}
+
 static hl_status hl_linux_find_ofd(const hl_linux_abi *linux_abi, hl_linux_ofd *out_ofd) {
     uint32_t ofd;
     for (ofd = 1; ofd < linux_abi->ofd_capacity; ++ofd) {
@@ -191,6 +203,29 @@ hl_status hl_linux_fd_dup(hl_linux_abi *linux_abi, hl_linux_fd source, uint32_t 
 done:
     hl_linux_unlock(linux_abi);
     return status;
+}
+
+static int64_t hl_linux_fd_dup_at_least(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd minimum,
+                                        uint32_t descriptor_flags) {
+    const hl_linux_fd_entry *source_entry;
+    hl_linux_fd fd;
+    hl_status status;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, source, &source_entry, NULL);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    status = hl_linux_find_fd_at_least(linux_abi, minimum, &fd);
+    if (status == HL_STATUS_OK) {
+        linux_abi->fds[fd].ofd = source_entry->ofd;
+        linux_abi->fds[fd].descriptor_flags = descriptor_flags;
+        linux_abi->fds[fd].generation++;
+        linux_abi->ofds[source_entry->ofd].references++;
+    }
+    hl_linux_unlock(linux_abi);
+    return status == HL_STATUS_OK ? (int64_t)fd : -HL_LINUX_EMFILE;
 }
 
 hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle) {
@@ -487,4 +522,154 @@ int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {
     if (files == NULL || files->close == NULL) return -HL_LINUX_ENOSYS;
     result = files->close(linux_abi->host->context, handle);
     return result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)result.status);
+}
+
+int64_t hl_linux_dup(hl_linux_abi *linux_abi, hl_linux_fd fd) {
+    return hl_linux_fd_dup_at_least(linux_abi, fd, 0, 0);
+}
+
+int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command, uint64_t argument) {
+    const hl_linux_fd_entry *fd_entry;
+    const hl_linux_ofd_entry *ofd_entry;
+    hl_status status;
+    if (command == HL_LINUX_F_DUPFD || command == HL_LINUX_F_DUPFD_CLOEXEC) {
+        if (linux_abi == NULL) return -HL_LINUX_EBADF;
+        if (argument >= linux_abi->fd_capacity) return -HL_LINUX_EINVAL;
+        return hl_linux_fd_dup_at_least(linux_abi, fd, (hl_linux_fd)argument,
+                                        command == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
+    }
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, &fd_entry, &ofd_entry);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    switch (command) {
+    case HL_LINUX_F_GETFD: argument = fd_entry->descriptor_flags; break;
+    case HL_LINUX_F_SETFD:
+        linux_abi->fds[fd].descriptor_flags = (uint32_t)argument & HL_LINUX_FD_CLOEXEC;
+        argument = 0;
+        break;
+    case HL_LINUX_F_GETFL: argument = ofd_entry->status_flags; break;
+    default: hl_linux_unlock(linux_abi); return -HL_LINUX_EINVAL;
+    }
+    hl_linux_unlock(linux_abi);
+    return (int64_t)argument;
+}
+
+static uint32_t hl_linux_mode_type(uint32_t host_type) {
+    switch (host_type) {
+    case HL_HOST_FILE_TYPE_REGULAR: return HL_LINUX_S_IFREG;
+    case HL_HOST_FILE_TYPE_DIRECTORY: return HL_LINUX_S_IFDIR;
+    case HL_HOST_FILE_TYPE_SYMLINK: return HL_LINUX_S_IFLNK;
+    case HL_HOST_FILE_TYPE_CHARACTER: return HL_LINUX_S_IFCHR;
+    case HL_HOST_FILE_TYPE_BLOCK: return HL_LINUX_S_IFBLK;
+    case HL_HOST_FILE_TYPE_FIFO: return HL_LINUX_S_IFIFO;
+    case HL_HOST_FILE_TYPE_SOCKET: return HL_LINUX_S_IFSOCK;
+    default: return 0;
+    }
+}
+
+static int64_t hl_linux_metadata_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd,
+                                       hl_host_file_metadata *metadata) {
+    const hl_host_file_services *files = hl_linux_files(linux_abi);
+    hl_host_result result;
+    if (files == NULL || files->metadata == NULL) return -HL_LINUX_ENOSYS;
+    result = files->metadata(linux_abi->host->context, ofd->host_handle, metadata);
+    return result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)result.status);
+}
+
+int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_status *output) {
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    hl_host_file_metadata metadata;
+    hl_status status;
+    int64_t result;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    if (output == NULL) return -HL_LINUX_EINVAL;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, NULL, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(ofd);
+    result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(ofd);
+    if (result != 0) return result;
+    output->device = metadata.stable_device;
+    output->object = metadata.stable_object;
+    output->size = metadata.size;
+    output->blocks_512 = metadata.allocated_size / 512u;
+    output->modified_ns = metadata.modified_ns;
+    output->mode = hl_linux_mode_type(metadata.type) | (metadata.permissions & 07777u);
+    return 0;
+}
+
+int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, int32_t whence) {
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    hl_host_file_metadata metadata;
+    hl_status status;
+    int64_t base;
+    int64_t result = 0;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, NULL, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(ofd);
+    result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
+    if (result != 0) goto done;
+    if (metadata.type != HL_HOST_FILE_TYPE_REGULAR && metadata.type != HL_HOST_FILE_TYPE_BLOCK) {
+        result = -HL_LINUX_ESPIPE;
+        goto done;
+    }
+    if (whence == HL_LINUX_SEEK_SET) {
+        base = 0;
+    } else if (whence == HL_LINUX_SEEK_CUR) {
+        if (ofd->offset > INT64_MAX) {
+            result = -HL_LINUX_EOVERFLOW;
+            goto done;
+        }
+        base = (int64_t)ofd->offset;
+    } else if (whence == HL_LINUX_SEEK_END) {
+        if (metadata.size > INT64_MAX) {
+            result = -HL_LINUX_EOVERFLOW;
+            goto done;
+        }
+        base = (int64_t)metadata.size;
+    } else {
+        result = -HL_LINUX_EINVAL;
+        goto done;
+    }
+    if ((offset > 0 && base > INT64_MAX - offset) || (offset < 0 && base < INT64_MIN - offset)) {
+        result = -HL_LINUX_EOVERFLOW;
+        goto done;
+    }
+    base += offset;
+    if (base < 0) {
+        result = -HL_LINUX_EINVAL;
+        goto done;
+    }
+    ofd->offset = (uint64_t)base;
+    result = base;
+done:
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(ofd);
+    return result;
 }

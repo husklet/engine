@@ -10,6 +10,10 @@ typedef struct hl_fake_host {
     uint64_t realtime_ns;
     uint64_t next_handle;
     uint32_t live_mappings;
+    uint32_t live_processes;
+    uint32_t process_waited;
+    uint32_t process_exit_kind;
+    int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;
 

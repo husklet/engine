@@ -33,7 +33,38 @@ static hl_status hl_aarch64_constant(hl_code_buffer *output, uint32_t destinatio
 }
 
 static uint32_t hl_aarch64_register(hl_ir_value value) {
-    return value.id - 1u;
+    /* x0 carries hl_ir_exit * for the complete generated-block call. */
+    return value.id;
+}
+
+static hl_status hl_aarch64_exit(hl_code_buffer *output, const hl_ir_instruction *instruction, uint32_t kind) {
+    const uint32_t scratch = 17;
+    hl_status status;
+    status = hl_aarch64_constant(output, scratch, kind, 0);
+    if (status != HL_STATUS_OK) return status;
+    status = hl_aarch64_emit(output, UINT32_C(0xb9000000) | scratch | 0u << 5);
+    if (status != HL_STATUS_OK) return status;
+    status = hl_aarch64_emit(output, UINT32_C(0xb9000000) | 1u << 10 | 31u | 0u << 5);
+    if (status != HL_STATUS_OK) return status;
+    if (instruction->operand_count == 0) {
+        status = hl_aarch64_constant(output, scratch, instruction->immediate, 1);
+        if (status != HL_STATUS_OK) return status;
+        status = hl_aarch64_emit(output, UINT32_C(0xf9000000) | 1u << 10 | scratch | 0u << 5);
+    } else {
+        status = hl_aarch64_emit(output, UINT32_C(0xf9000000) | 1u << 10 |
+                                             hl_aarch64_register(instruction->operands[0]) | 0u << 5);
+    }
+    if (status != HL_STATUS_OK) return status;
+    if (instruction->operand_count < 2) {
+        status = hl_aarch64_emit(output, UINT32_C(0xf9000000) | 2u << 10 | 31u | 0u << 5);
+    } else {
+        status = hl_aarch64_emit(output, UINT32_C(0xf9000000) | 2u << 10 |
+                                             hl_aarch64_register(instruction->operands[1]) | 0u << 5);
+    }
+    if (status != HL_STATUS_OK) return status;
+    status = hl_aarch64_emit(output, UINT32_C(0x52800000));
+    if (status != HL_STATUS_OK) return status;
+    return hl_aarch64_emit(output, UINT32_C(0xd65f03c0));
 }
 
 static int hl_aarch64_type_supported(uint16_t type) {
@@ -94,19 +125,9 @@ hl_status hl_codegen_aarch64(const hl_ir_block *block, hl_code_buffer *output) {
             status = hl_aarch64_emit(output, encoding);
             break;
         case HL_IR_OP_SAFEPOINT: status = HL_STATUS_OK; break;
-        case HL_IR_OP_GUEST_RETURN:
-            if (instruction->operand_count == 1 && hl_aarch64_register(instruction->operands[0]) != 0) {
-                encoding =
-                    (instruction->operands[0].type == HL_IR_TYPE_I32 ? UINT32_C(0x2a0003e0) : UINT32_C(0xaa0003e0)) |
-                    hl_aarch64_register(instruction->operands[0]) << 16;
-                status = hl_aarch64_emit(output, encoding);
-                if (status != HL_STATUS_OK) return status;
-            } else if (instruction->operand_count == 0) {
-                status = hl_aarch64_constant(output, 0, instruction->immediate, 1);
-                if (status != HL_STATUS_OK) return status;
-            }
-            status = hl_aarch64_emit(output, UINT32_C(0xd65f03c0));
-            break;
+        case HL_IR_OP_GUEST_RETURN: status = hl_aarch64_exit(output, instruction, HL_IR_EXIT_RETURN); break;
+        case HL_IR_OP_SYSCALL_EXIT: status = hl_aarch64_exit(output, instruction, HL_IR_EXIT_SYSCALL); break;
+        case HL_IR_OP_FAULT_EXIT: status = hl_aarch64_exit(output, instruction, HL_IR_EXIT_FAULT); break;
         default: return HL_STATUS_NOT_SUPPORTED;
         }
         if (status != HL_STATUS_OK) return status;

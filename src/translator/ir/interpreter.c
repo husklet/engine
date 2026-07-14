@@ -48,12 +48,16 @@ hl_status hl_ir_interpret(const hl_ir_block *block, hl_ir_exit *out_exit) {
             return HL_STATUS_OK;
         case HL_IR_OP_SYSCALL_EXIT:
             out_exit->kind = HL_IR_EXIT_SYSCALL;
-            out_exit->value = instruction->immediate;
+            out_exit->value =
+                instruction->operand_count == 0 ? instruction->immediate : values[instruction->operands[0].id].bits;
+            out_exit->detail = instruction->operand_count < 2 ? 0 : values[instruction->operands[1].id].bits;
             free(values);
             return HL_STATUS_OK;
         case HL_IR_OP_FAULT_EXIT:
             out_exit->kind = HL_IR_EXIT_FAULT;
-            out_exit->value = instruction->immediate;
+            out_exit->value =
+                instruction->operand_count == 0 ? instruction->immediate : values[instruction->operands[0].id].bits;
+            out_exit->detail = instruction->operand_count < 2 ? 0 : values[instruction->operands[1].id].bits;
             free(values);
             return HL_STATUS_OK;
         default: free(values); return HL_STATUS_NOT_SUPPORTED;

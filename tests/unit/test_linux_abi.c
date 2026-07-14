@@ -24,6 +24,7 @@ typedef struct test_file_host {
     uint32_t last_access;
     uint32_t last_creation;
     uint32_t last_permissions;
+    uint32_t metadata_type;
 } test_file_host;
 
 static hl_host_result file_result(hl_status status, uint64_t value) {
@@ -112,11 +113,18 @@ static hl_host_result test_append(void *context, hl_host_handle file, hl_host_co
     return result;
 }
 
-static hl_host_result unsupported_metadata(void *c, hl_host_handle f, hl_host_file_metadata *m) {
-    (void)c;
-    (void)f;
-    (void)m;
-    return file_result(HL_STATUS_NOT_SUPPORTED, 0);
+static hl_host_result test_metadata(void *context, hl_host_handle file, hl_host_file_metadata *metadata) {
+    test_file_host *host = context;
+    if ((file != 55 && file != 56) || metadata == NULL) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    memset(metadata, 0, sizeof(*metadata));
+    metadata->stable_device = 7;
+    metadata->stable_object = 11;
+    metadata->size = host->size;
+    metadata->allocated_size = 512;
+    metadata->modified_ns = 123456789;
+    metadata->type = host->metadata_type == 0 ? HL_HOST_FILE_TYPE_REGULAR : host->metadata_type;
+    metadata->permissions = 0640;
+    return file_result(HL_STATUS_OK, 0);
 }
 
 #if !defined(__STDC_NO_THREADS__)
@@ -151,14 +159,14 @@ int main(void) {
     hl_linux_fd duplicate;
     hl_linux_fd_snapshot snapshot;
     hl_host_handle closed;
-    test_file_host file_host = {{0}, 6, 0, 0, 0, HL_STATUS_OK, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    test_file_host file_host = {{0}, 6, 0, 0, 0, HL_STATUS_OK, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hl_host_file_services files = {.abi = HL_HOST_FILE_ABI,
                                    .size = sizeof(files),
                                    .open_relative = test_open,
                                    .read_at = test_read_at,
                                    .write_at = test_write_at,
                                    .append = test_append,
-                                   .metadata = unsupported_metadata,
+                                   .metadata = test_metadata,
                                    .close = test_close};
     char buffer[8] = {0};
 
@@ -231,7 +239,46 @@ int main(void) {
     HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
     HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0);
 
+    /* lseek changes the shared OFD offset; SEEK_END uses portable host metadata. */
+    file_host.size = 6;
+    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_dup(&linux_abi, original) == 1);
+    duplicate = 1;
+    HL_CHECK(hl_linux_lseek(&linux_abi, original, 2, HL_LINUX_SEEK_SET) == 2);
+    HL_CHECK(hl_linux_lseek(&linux_abi, duplicate, 1, HL_LINUX_SEEK_CUR) == 3);
+    HL_CHECK(hl_linux_lseek(&linux_abi, original, -1, HL_LINUX_SEEK_END) == 5);
+    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_OK && snapshot.offset == 5);
+    HL_CHECK(hl_linux_lseek(&linux_abi, original, -7, HL_LINUX_SEEK_SET) == -HL_LINUX_EINVAL);
+    HL_CHECK(hl_linux_lseek(&linux_abi, original, 0, 99) == -HL_LINUX_EINVAL);
+    file_host.metadata_type = HL_HOST_FILE_TYPE_SOCKET;
+    HL_CHECK(hl_linux_lseek(&linux_abi, original, 0, HL_LINUX_SEEK_SET) == -HL_LINUX_ESPIPE);
+    file_host.metadata_type = HL_HOST_FILE_TYPE_REGULAR;
+
+    /* fcntl keeps descriptor flags separate from status flags and honors the minimum fd. */
+    HL_CHECK(hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_GETFD, 0) == 0);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_SETFD, UINT64_MAX) == 0);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_GETFD, 0) == HL_LINUX_FD_CLOEXEC);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, duplicate, HL_LINUX_F_GETFL, 0) == HL_LINUX_O_RDWR);
+    {
+        int64_t high = hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_DUPFD_CLOEXEC, 5);
+        HL_CHECK(high == 5);
+        HL_CHECK(hl_linux_fcntl(&linux_abi, (hl_linux_fd)high, HL_LINUX_F_GETFD, 0) == HL_LINUX_FD_CLOEXEC);
+        HL_CHECK(hl_linux_close(&linux_abi, (hl_linux_fd)high) == 0);
+    }
+    HL_CHECK(hl_linux_fcntl(&linux_abi, original, 999, 0) == -HL_LINUX_EINVAL);
+    HL_CHECK(hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_DUPFD, HL_ARRAY_COUNT(fds)) == -HL_LINUX_EINVAL);
+    {
+        hl_linux_file_status file_status;
+        HL_CHECK(hl_linux_fstat(&linux_abi, original, &file_status) == 0);
+        HL_CHECK(file_status.device == 7 && file_status.object == 11 && file_status.size == 6);
+        HL_CHECK(file_status.blocks_512 == 1 && file_status.modified_ns == 123456789);
+        HL_CHECK(file_status.mode == (HL_LINUX_S_IFREG | 0640u));
+    }
+    HL_CHECK(hl_linux_close(&linux_abi, original) == 0);
+    HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0);
+
     /* O_APPEND delegates one atomic append to the host and adopts its resulting offset. */
+    file_host.size = 3;
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_WRONLY | HL_LINUX_O_APPEND, 0, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
     HL_CHECK(hl_linux_write(&linux_abi, original, "A", 1) == 1);
