@@ -4,7 +4,8 @@ pollselect-ext	posix	pollselect_ext.c	pollselect_ext.c	aarch64,x86_64	-static-pi
 mmapshared	posix	mmapshared.c	mmapshared.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mmapshared.out	linux-libc,syscall	active	exact source; deterministic checked golden
 filelock	posix	filelock.c	filelock.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/filelock.out	linux-libc,syscall	active	exact source; deterministic checked golden
 typed-filelock	posix	typed_lock.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/typed_lock.out	linux-libc,syscall,filesystem,fork/wait	active	stable identity across reopen; SEEK_CUR/END; close releases process locks; invalid whence
-typed-sendfile	posix	sendfile_edge.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sendfile_edge.out	linux-libc,syscall,filesystem	active	current and explicit offsets; partial EOF transfer; EFAULT; exact bytes
+typed-sendfile	posix	sendfile_edge.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sendfile_edge.out	linux-libc,syscall,filesystem,scratch-rootfs	active	current and explicit offsets through opaque typed files; partial EOF transfer; EFAULT; exact bytes
+typed-vector-io	posix	vector_io.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/vector_io.out	linux-libc,syscall,filesystem,scratch-rootfs	active	preadv2/pwritev2 typed-file vectors, offset semantics, unsupported flags, and readahead validation
 clock	posix	clockmono.c	clockmono.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockmono.out	linux-libc,syscall	active	exact source; deterministic checked golden
 realpath	posix	realpath.c	realpath.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/realpath.out	linux-libc,syscall	active	exact source; deterministic checked golden
 getdents	posix	getdents.c	getdents.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getdents.out	linux-libc,syscall	active	exact source; deterministic checked golden
@@ -25,7 +26,7 @@ inotify	linuxsys	inotify.c	inotify.c	aarch64,x86_64	-static-pie -O2 -pthread -lm
 sendfile	linuxsys	sendfile.c	sendfile.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sendfile.out	linux-libc,syscall	active	exact source; deterministic checked golden
 timerfd	linuxsys	timerfd.c	timerfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/timerfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
 memfd	linuxsys	memfd.c	memfd.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/memfd.out	linux-libc,syscall	active	exact source; deterministic checked golden
-splice	linuxsys	splice.c	splice.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/splice.out	linux-libc,syscall	active	exact source; deterministic checked golden
+splice	linuxsys	splice.c	splice.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/splice.out	linux-libc,syscall,scratch-rootfs	active	typed ordinary files composed with native pipe endpoints; deterministic checked golden
 prctl	linuxsys	prctl.c	prctl.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/prctl.out	linux-libc,syscall	active	exact source; deterministic checked golden
 sigqueue	linuxsys	sigqueue.c	sigqueue.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sigqueue.out	linux-libc,syscall	active	exact source; deterministic checked golden
 getrandom	linuxsys	getrandom.c	getrandom.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getrandom.out	linux-libc,syscall	active	exact source; deterministic checked golden

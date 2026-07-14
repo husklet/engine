@@ -1266,43 +1266,132 @@ static int bound_rights_reference(uint64_t message_address) {
     return 0;
 }
 
-static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, const hl_linux_fd_snapshot *input,
-                              uint64_t offset_address, uint64_t count) {
-    uint64_t explicit_offset = 0;
-    uint64_t input_offset = input->offset;
+static int64_t bound_stream_read(const hl_linux_fd_snapshot *file, int native_fd, void *buffer, size_t size,
+                                 off_t *offset) {
+    if (file != NULL)
+        return offset != NULL ? hl_linux_pread64(g_linux_box, file->fd, buffer, size, (uint64_t)*offset)
+                              : hl_linux_read(g_linux_box, file->fd, buffer, size);
+    ssize_t count = offset != NULL ? pread(native_fd, buffer, size, *offset) : read(native_fd, buffer, size);
+    return count < 0 ? -errno : count;
+}
+
+static int64_t bound_stream_write(const hl_linux_fd_snapshot *file, int native_fd, const void *buffer, size_t size,
+                                  off_t *offset) {
+    if (file != NULL)
+        return offset != NULL ? hl_linux_pwrite64(g_linux_box, file->fd, buffer, size, (uint64_t)*offset)
+                              : hl_linux_write(g_linux_box, file->fd, buffer, size);
+    ssize_t count = offset != NULL ? pwrite(native_fd, buffer, size, *offset) : write(native_fd, buffer, size);
+    return count < 0 ? -errno : count;
+}
+
+static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
+                              const hl_linux_fd_snapshot *input, int input_fd, uint64_t offset_address,
+                              uint64_t count) {
+    off_t supplied_offset = 0;
+    off_t *input_offset = NULL;
     uint64_t done = 0;
     int64_t error = 0;
     char buffer[8192];
+    if (input == NULL) {
+        struct stat metadata;
+        if (fstat(input_fd, &metadata) != 0) return -errno;
+        if (!S_ISREG(metadata.st_mode)) return -EINVAL;
+    } else if (g_host_services != NULL && g_host_services->file != NULL &&
+               g_host_services->file->metadata != NULL) {
+        hl_host_file_metadata metadata;
+        hl_host_result status =
+            g_host_services->file->metadata(g_host_services->context, input->host_handle, &metadata);
+        if (status.status != HL_STATUS_OK) return bound_host_error(status.status);
+        if (metadata.type != HL_HOST_FILE_TYPE_REGULAR) return -EINVAL;
+    }
     if (offset_address != 0) {
         if (!host_range_mapped((uintptr_t)offset_address, sizeof(off_t))) return -EFAULT;
-        off_t supplied = *(off_t *)(uintptr_t)offset_address;
-        if (supplied < 0) return -EINVAL;
-        explicit_offset = (uint64_t)supplied;
-        input_offset = explicit_offset;
+        supplied_offset = *(off_t *)(uintptr_t)offset_address;
+        if (supplied_offset < 0) return -EINVAL;
+        input_offset = &supplied_offset;
     }
     if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000); /* Linux MAX_RW_COUNT */
     while (done < count) {
         uint64_t remaining = count - done;
         size_t chunk = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
-        int64_t read_count = hl_linux_pread64(g_linux_box, input->fd, buffer, chunk, input_offset);
+        int64_t read_count = bound_stream_read(input, input_fd, buffer, chunk, input_offset);
         if (read_count <= 0) {
             error = read_count;
             break;
         }
-        int64_t written = hl_linux_write(g_linux_box, output->fd, buffer, (size_t)read_count);
+        int64_t written = bound_stream_write(output, output_fd, buffer, (size_t)read_count, NULL);
         if (written <= 0) {
             error = written;
+            if (input_offset == NULL)
+                (void)(input != NULL ? hl_linux_lseek(g_linux_box, input->fd, -read_count, SEEK_CUR)
+                                     : lseek(input_fd, (off_t)-read_count, SEEK_CUR));
             break;
         }
-        input_offset += (uint64_t)written;
+        if (input_offset != NULL) *input_offset += (off_t)written;
+        if (output != NULL)
+            bound_mapping_file_written(output, output->offset + done, (uint64_t)written);
         done += (uint64_t)written;
-        if (written != read_count) break;
+        if (written != read_count) {
+            if (input_offset == NULL)
+                (void)(input != NULL ? hl_linux_lseek(g_linux_box, input->fd, written - read_count, SEEK_CUR)
+                                     : lseek(input_fd, (off_t)(written - read_count), SEEK_CUR));
+            break;
+        }
     }
     if (offset_address != 0)
-        *(off_t *)(uintptr_t)offset_address = (off_t)input_offset;
-    else if (done != 0)
-        (void)hl_linux_lseek(g_linux_box, input->fd, (int64_t)done, SEEK_CUR);
+        *(off_t *)(uintptr_t)offset_address = supplied_offset;
     return done != 0 ? (int64_t)done : error;
+}
+
+static int bound_native_pipe(int fd) {
+    struct stat metadata;
+    return fstat(fd, &metadata) == 0 && S_ISFIFO(metadata.st_mode);
+}
+
+static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uint64_t input_offset_address,
+                            const hl_linux_fd_snapshot *output, int output_fd, uint64_t output_offset_address,
+                            uint64_t size, uint64_t flags) {
+    off_t *input_offset = (off_t *)(uintptr_t)input_offset_address;
+    off_t *output_offset = (off_t *)(uintptr_t)output_offset_address;
+    int input_pipe = input == NULL && bound_native_pipe(input_fd);
+    int output_pipe = output == NULL && bound_native_pipe(output_fd);
+    static _Thread_local char buffer[65536];
+    int64_t read_count, write_count, write_error = 0;
+    size_t pushed = 0;
+    if (flags & ~UINT64_C(0xf)) return -EINVAL;
+    if (!input_pipe && !output_pipe) return -EINVAL;
+    if ((input_pipe && input_offset != NULL) || (output_pipe && output_offset != NULL)) return -ESPIPE;
+    if ((input_offset != NULL && !host_range_mapped((uintptr_t)input_offset, sizeof(*input_offset))) ||
+        (output_offset != NULL && !host_range_mapped((uintptr_t)output_offset, sizeof(*output_offset))))
+        return -EFAULT;
+    if (size > UINT64_C(0x7ffff000)) size = UINT64_C(0x7ffff000);
+    if (size > sizeof(buffer)) size = sizeof(buffer);
+    if (size == 0) return 0;
+    if (input_pipe) pushed = pipe_pushback_take(input_fd, buffer, (size_t)size);
+    read_count = pushed != 0 ? (int64_t)pushed
+                             : bound_stream_read(input, input_fd, buffer, (size_t)size, input_offset);
+    if (read_count <= 0) return read_count;
+    write_count = bound_stream_write(output, output_fd, buffer, (size_t)read_count, output_offset);
+    if (write_count < 0) {
+        write_error = write_count;
+        write_count = 0;
+    }
+    if (write_count < read_count) {
+        size_t remainder = (size_t)(read_count - write_count);
+        if (input_pipe)
+            pipe_pushback_set(input_fd, buffer + write_count, remainder);
+        else if (input_offset == NULL)
+            (void)(input != NULL ? hl_linux_lseek(g_linux_box, input->fd, write_count - read_count, SEEK_CUR)
+                                 : lseek(input_fd, (off_t)(write_count - read_count), SEEK_CUR));
+    }
+    if (write_count == 0) return write_error;
+    if (input_offset != NULL) *input_offset += (off_t)write_count;
+    if (output != NULL)
+        bound_mapping_file_written(output,
+                                   output_offset != NULL ? (uint64_t)*output_offset : output->offset,
+                                   (uint64_t)write_count);
+    if (output_offset != NULL) *output_offset += (off_t)write_count;
+    return write_count;
 }
 
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
@@ -1369,17 +1458,33 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         pthread_mutex_unlock(&g_bound_mapping_lock);
         pthread_mutex_unlock(&g_bound_mapping_gate);
     }
-    if (nr == 71 || nr == 77) {
+    if (nr == 71) {
         hl_linux_fd_snapshot second;
-        if (bound_snapshot(a1, &second)) {
-            G_RET(c) = (uint64_t)(nr == 71 && source_bound ? bound_sendfile(&source, &second, a2, a3) : -ENOSYS);
+        int second_bound = bound_snapshot(a1, &second);
+        if (source_bound || second_bound) {
+            G_RET(c) = (uint64_t)bound_sendfile(source_bound ? &source : NULL, (int)a0,
+                                                second_bound ? &second : NULL, (int)a1, a2, a3);
             return 1;
         }
     }
     if (nr == 76) {
         hl_linux_fd_snapshot second;
-        if (bound_snapshot(a2, &second)) {
-            G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+        int second_bound = bound_snapshot(a2, &second);
+        if (source_bound || second_bound) {
+            G_RET(c) = (uint64_t)bound_splice(source_bound ? &source : NULL, (int)a0, a1,
+                                              second_bound ? &second : NULL, (int)a2, a3, G_A4(c), G_A5(c));
+            return 1;
+        }
+    }
+    if ((nr == 75 || nr == 77) && source_bound) {
+        /* vmsplice and tee require pipe endpoints. Typed descriptors currently name ordinary files. */
+        G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+        return 1;
+    }
+    if (nr == 77) {
+        hl_linux_fd_snapshot second;
+        if (bound_snapshot(a1, &second)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             return 1;
         }
     }
@@ -1509,6 +1614,50 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = hl_linux_preadv(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
         else
             result = hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
+        break;
+    }
+    case 213: {
+        hl_host_file_metadata metadata;
+        if ((int64_t)a1 < 0)
+            result = -EINVAL;
+        else if (g_host_services == NULL || g_host_services->file == NULL ||
+                 g_host_services->file->metadata == NULL)
+            result = -95; /* Linux EOPNOTSUPP; this route bypasses the native-to-Linux errno mapper. */
+        else {
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            result = status.status != HL_STATUS_OK ? bound_host_error(status.status)
+                     : metadata.type != HL_HOST_FILE_TYPE_REGULAR ? -EINVAL
+                     : hl_linux_pread64(g_linux_box, source.fd, NULL, 0, a1) < 0 ? -EBADF
+                                                                                 : 0;
+        }
+        break;
+    }
+    case 286:
+    case 287: {
+        static _Thread_local hl_host_iovec vectors[HL_LINUX_IOV_MAX];
+#ifdef CANON_X86ONLY
+        uint64_t vector_offset = a3; /* x86-64 passes the complete 64-bit offset in argument 4. */
+#else
+        uint64_t vector_offset =
+            (uint64_t)(uint32_t)a3 | ((uint64_t)(uint32_t)G_A4(c) << 32); /* AArch64 split offset. */
+#endif
+        result = bound_vectors_copy(a1, a2, vectors);
+        if (result != 0) break;
+        /* Flags are semantic requirements, not hints. Do not silently erase RWF_NOWAIT/APPEND/SYNC. */
+        if (G_A5(c) != 0) {
+            result = -95; /* Linux EOPNOTSUPP; macOS's native value is 102. */
+            break;
+        }
+        if (vector_offset == UINT64_MAX)
+            result = nr == 286 ? hl_linux_readv(g_linux_box, source.fd, vectors, (uint32_t)a2)
+                               : hl_linux_writev(g_linux_box, source.fd, vectors, (uint32_t)a2);
+        else
+            result = nr == 286 ? hl_linux_preadv(g_linux_box, source.fd, vectors, (uint32_t)a2, vector_offset)
+                               : hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, vector_offset);
+        if (nr == 287 && result > 0)
+            bound_mapping_file_written(&source, vector_offset == UINT64_MAX ? source.offset : vector_offset,
+                                       (uint64_t)result);
         break;
     }
     case 46: {
@@ -1841,9 +1990,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 210:          /* shutdown */
     case 211:          /* sendmsg */
     case 212:          /* recvmsg */
-    case 213:          /* readahead */
-    case 286:          /* preadv2 */
-    case 287:          /* pwritev2 */
         /* A bound slot is never a native descriptor. Unsupported fd operations cannot touch its shadow. */
         result = -ENOSYS;
         break;

@@ -677,7 +677,15 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (a1) *(unsigned *)a1 = 0;
         G_RET(c) = 0;
         break;
-    case 213: G_RET(c) = 0; break; // readahead: advisory, no-op
+    case 213: { // readahead: advisory, but Linux still validates the descriptor and offset
+        if ((int)a0 < 0 || fcntl((int)a0, F_GETFD) < 0)
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+        else if ((int64_t)a1 < 0)
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+        else
+            G_RET(c) = 0;
+        break;
+    }
     case 274:
         G_RET(c) = 0;
         break; // sched_setattr -> ok (ignored)
