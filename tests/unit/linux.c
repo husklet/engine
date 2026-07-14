@@ -174,6 +174,12 @@ int main(void) {
 
     pollset = services.event->create(services.context);
     HL_CHECK(pollset.status == HL_STATUS_OK);
+    {
+        uint64_t start = services.clock->monotonic_ns(services.context).value;
+        uint64_t deadline = start + UINT64_C(10000000);
+        HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1, deadline).value == 0);
+        HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline);
+    }
     HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_OK);
     HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1, 100000000).value == 0);
     HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);

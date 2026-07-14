@@ -790,12 +790,14 @@ static hl_host_result hl_linux_event_wait(void *context, hl_host_handle pollset,
     wake_descriptor = pollset_entry == NULL ? -1 : pollset_entry->wake_descriptor;
     pthread_mutex_unlock(&host->lock);
     if (pollset_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (deadline_ns == UINT64_MAX)
+    if (deadline_ns == HL_HOST_DEADLINE_INFINITE)
         timeout = -1;
-    else if (deadline_ns / UINT64_C(1000000) > INT_MAX)
-        timeout = INT_MAX;
-    else
-        timeout = (int)(deadline_ns / UINT64_C(1000000));
+    else {
+        uint64_t now = hl_linux_monotonic_value();
+        uint64_t remaining = deadline_ns > now ? deadline_ns - now : 0;
+        uint64_t milliseconds = (remaining + UINT64_C(999999)) / UINT64_C(1000000);
+        timeout = milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
+    }
     count = epoll_wait(pollset_fd, native_events, (int)event_capacity, timeout);
     if (count < 0) return hl_linux_errno_result();
     size_t output_count = 0;
