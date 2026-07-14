@@ -22,6 +22,10 @@ static int compare_u64(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
+static unsigned long percentile_index(unsigned long count, unsigned long percentile) {
+    return (count * percentile + 99UL) / 100UL - 1UL;
+}
+
 static int run_once(const char *bridge, const char *engine, const char *guest, int expected_exit, uint64_t *elapsed) {
     uint64_t start = monotonic_ns();
     pid_t child = fork();
@@ -71,10 +75,14 @@ int main(int argc, char **argv) {
         sum += samples[i];
     }
     qsort(samples, iterations, sizeof(*samples), compare_u64);
-    printf("engine=%s guest=%s iterations=%lu cold_us=%llu min_us=%llu median_us=%llu p95_us=%llu mean_us=%llu\n",
+    printf("engine=%s guest=%s iterations=%lu cold_us=%llu min_us=%llu median_us=%llu p90_us=%llu p95_us=%llu "
+           "p99_us=%llu max_us=%llu mean_us=%llu\n",
            argv[2], argv[3], iterations, (unsigned long long)(cold_ns / 1000), (unsigned long long)(samples[0] / 1000),
            (unsigned long long)(samples[iterations / 2] / 1000),
-           (unsigned long long)(samples[(iterations * 95) / 100] / 1000),
+           (unsigned long long)(samples[percentile_index(iterations, 90)] / 1000),
+           (unsigned long long)(samples[percentile_index(iterations, 95)] / 1000),
+           (unsigned long long)(samples[percentile_index(iterations, 99)] / 1000),
+           (unsigned long long)(samples[iterations - 1] / 1000),
            (unsigned long long)((sum / iterations) / 1000));
     free(samples);
     return 0;
