@@ -5,11 +5,6 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <sched.h>
-#endif
 
 static const hl_engine_backend *production_backend;
 
@@ -47,12 +42,12 @@ static void hl_engine_unlock(hl_engine *engine) {
     atomic_flag_clear_explicit(&engine->lock, memory_order_release);
 }
 
-static void hl_engine_yield(void) {
-#if defined(_WIN32)
-    (void)SwitchToThread();
-#else
-    sched_yield();
-#endif
+static void hl_engine_yield(hl_engine *engine) {
+    hl_host_result now = engine->host.clock->monotonic_ns(engine->host.context);
+    uint64_t deadline;
+    if (now.status != HL_STATUS_OK) return;
+    deadline = now.value == UINT64_MAX ? UINT64_MAX : now.value + 1u;
+    (void)engine->host.clock->sleep_until(engine->host.context, HL_HOST_CLOCK_MONOTONIC, deadline);
 }
 
 uint32_t hl_engine_abi(void) {
@@ -290,7 +285,7 @@ void hl_engine_destroy(hl_engine *engine) {
             state = engine->state;
             hl_engine_unlock(engine);
             if (state == HL_ENGINE_FINISHED) break;
-            hl_engine_yield();
+            hl_engine_yield(engine);
         }
     } else {
         engine->state = HL_ENGINE_DESTROYING;
