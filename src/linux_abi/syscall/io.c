@@ -365,9 +365,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     switch (nr) {
     // ===================== I/O — read/write/seek (+ eventfd/timerfd/signalfd fd redirection) =====================
     case 62: {
-        // lseek -- SEEK_SET/CUR/END(0/1/2) match, but SEEK_DATA/SEEK_HOLE are SWAPPED between the ABIs:
-        // Linux SEEK_DATA=3,SEEK_HOLE=4 ; macOS SEEK_HOLE=3,SEEK_DATA=4. Translate so sparse-file
-        // probing finds holes/data correctly.
+        // lseek -- SEEK_SET/CUR/END(0/1/2) match. SEEK_DATA/SEEK_HOLE use host-native constants because
+        // Darwin swaps their numeric values while Linux consumes the guest values directly.
         int whence = (int)a2;
         // Directory streams are read via getdents, backed by a private DIR* (fdopendir(dup(fd))) in the
         // plain path or a merged snapshot in the overlay path -- neither moves when the guest lseeks its
@@ -403,9 +402,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         int guest_whence = whence;
         if (whence == 3)
-            whence = 4; // Linux SEEK_DATA -> macOS SEEK_DATA
+            whence = HL_NATIVE_SEEK_DATA;
         else if (whence == 4)
-            whence = 3; // Linux SEEK_HOLE -> macOS SEEK_HOLE
+            whence = HL_NATIVE_SEEK_HOLE;
         off_t r = lseek((int)a0, (off_t)a1, whence);
         int seek_error = errno;
         if (r < 0 && (guest_whence == 3 || guest_whence == 4) && errno != EBADF && errno != ESPIPE) {

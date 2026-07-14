@@ -1340,8 +1340,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         break;
     }
     case 38:
-    // renameat(38) / renameat2(276): translate the renameat2 flags onto macOS renameatx_np --
-    // RENAME_NOREPLACE(1)->RENAME_EXCL (fail if dst exists), RENAME_EXCHANGE(2)->RENAME_SWAP (atomic swap).
+    // renameat(38) / renameat2(276): translate Linux flags to the native host operation.
     case 276: {
         // renameat2 flag validation (LTP renameat201). Valid flags are RENAME_NOREPLACE(1) |
         // RENAME_EXCHANGE(2) | RENAME_WHITEOUT(4); any unknown bit -> EINVAL, and RENAME_EXCHANGE is exclusive
@@ -1373,8 +1372,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         unsigned int rxflags = 0;
         if (nr == 276) {
             int lf = (int)a4;
-            if (lf & 1) rxflags |= RENAME_EXCL;
-            if (lf & 2) rxflags |= RENAME_SWAP;
+            if (lf & 1) rxflags |= HL_NATIVE_RENAME_NOREPLACE;
+            if (lf & 2) rxflags |= HL_NATIVE_RENAME_EXCHANGE;
         }
         // shm/sem create that renames (rather than links) a temp /dev/shm file to the final name: both ends
         // are shm-backed host files under /tmp, so rename them directly (the jail branch would ENOENT them).
@@ -1392,7 +1391,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // else the rename moves an EMPTY dir and loses the contents. For an EXCHANGE, the DEST must also
             // be copied up (both ends land in the upper before the atomic swap).
             overlay_copyup_at_tree((int)a0, (const char *)a1);
-            if (rxflags & RENAME_SWAP) overlay_copyup_at_tree((int)a2, (const char *)a3);
+            if (rxflags & HL_NATIVE_RENAME_EXCHANGE) overlay_copyup_at_tree((int)a2, (const char *)a3);
             char ofin[512], nfin[512];
             int opfd = jail_at((int)a0, (const char *)a1, ofin, sizeof ofin, 1);
             if (opfd < 0) {
@@ -1418,7 +1417,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // Overlay: a plain move (not RENAME_EXCHANGE) of a file the image lower still provides leaves the
             // copied-up upper source moved away but the lower copy exposed -> the source would re-appear. Drop
             // a whiteout at the source so it stays gone (real overlayfs rename semantics). No-op outside overlay.
-            if (r == 0 && !(rxflags & RENAME_SWAP)) {
+            if (r == 0 && !(rxflags & HL_NATIVE_RENAME_EXCHANGE)) {
                 char sgp[4200];
                 abs_guest((int)a0, (const char *)a1, sgp, sizeof sgp);
                 if (overlay_lower_has(sgp)) overlay_whiteout(sgp);
@@ -1698,6 +1697,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         off_t cur = s.st_size;
+#if defined(__linux__)
+        // Linux already provides the exact fallocate ABI, including filesystem-specific alignment,
+        // sparse-file, seal, and range-mode behavior.  The emulation below exists for hosts without
+        // that syscall; using it here would incorrectly reject PUNCH_HOLE as unsupported.
+        int native_result = fallocate(fd, mode, off, len), native_error = errno;
+        fd_evict(fd);
+        G_RET(c) = native_result < 0 ? (uint64_t)(-(int64_t)native_error) : 0;
+        break;
+#endif
         char zb[65536];
         // ---- PUNCH_HOLE (keep size, range reads as zeros) ----
         if (mode & 0x02) {

@@ -33,12 +33,6 @@ int g_rwx_guest;
 
 // Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
 #define ATFD(value) (((int)(value) == -100) ? AT_FDCWD : (int)(value))
-#ifndef RENAME_SWAP
-#define RENAME_SWAP 0x00000002
-#endif
-#ifndef RENAME_EXCL
-#define RENAME_EXCL 0x00000004
-#endif
 // ================= ptrace(2) — in-hl tracer/tracee coordination ========================
 // hl runs each guest PROCESS as its own host process (fork(2) is a real host fork; see proc.c case 220),
 // so a guest tracer ptracing a guest tracee is TWO host processes. We CANNOT proxy to the host macOS

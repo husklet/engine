@@ -1020,6 +1020,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
             int on = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+#if defined(__linux__)
+            if (setsockopt((int)a0, SOL_SOCKET, SO_PASSCRED, &on, sizeof on) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+#endif
             if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_passcred[(int)a0] = on ? 1 : 0;
             G_RET(c) = 0;
             break;
@@ -1345,9 +1351,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // the peer's -- LOCAL_PEERPID, mapping the container init's host pid back to guest pid 1, self as
             // the container pid). IPC bootstrap may abort with "missing credentials" without it.
             int passcred_active = gc && gcl && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_passcred[(int)a0];
+            int synth_passcred = passcred_active;
+#if defined(__linux__)
+            // The Linux kernel attaches the sender's real SCM_CREDENTIALS.  Synthesizing the Darwin
+            // fallback here would replace a post-fork sender pid with the socketpair creator's pid.
+            synth_passcred = 0;
+#endif
             int cred_trunc = 0;
             size_t ln = 0;
-            if (passcred_active) {
+            if (synth_passcred) {
                 int ppid = 0;
 #if defined(__APPLE__)
                 socklen_t pl = sizeof ppid;
@@ -1375,7 +1387,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int cmsg_trunc = 0;
             if (gc && gcl) ln = (size_t)cmsg_m2l(&mh, gc, gcl, ln, &cmsg_trunc);
             int host_mflags = (int)mh.msg_flags;
-            if (!cmsg_trunc && gc && gcl) host_mflags &= ~0x20; // host-side sideband expansion compressed cleanly
+            if (!cmsg_trunc && gc && gcl)
+                host_mflags &= ~MSG_CTRUNC; // host-side sideband expansion compressed cleanly
             int mfl = msgflags_m2l(host_mflags);
             if (cred_trunc || (cmsg_trunc && !passcred_active)) mfl |= 0x8;          // MSG_CTRUNC
             if (((int)a2 & 0x40000000) && gc && ln) cmsg_lx_set_cloexec_fds(gc, ln); // MSG_CMSG_CLOEXEC
@@ -1544,7 +1557,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (((int)a3 & 0x40000000) && gc && ln) cmsg_lx_set_cloexec_fds(gc, ln); // MSG_CMSG_CLOEXEC
                 *(uint64_t *)(g + 40) = ln;
                 int host_mflags = (int)mh.msg_flags;
-                if (!cmsg_trunc && gc && gcl) host_mflags &= ~0x20; // host-side sideband expansion compressed cleanly
+                if (!cmsg_trunc && gc && gcl)
+                    host_mflags &= ~MSG_CTRUNC; // host-side sideband expansion compressed cleanly
                 int mfl = msgflags_m2l(host_mflags);
                 if (cmsg_trunc) mfl |= 0x8; // MSG_CTRUNC
                 *(uint32_t *)(g + 48) = (uint32_t)mfl;

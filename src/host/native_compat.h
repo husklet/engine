@@ -12,6 +12,11 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 
+#define HL_NATIVE_RENAME_NOREPLACE RENAME_EXCL
+#define HL_NATIVE_RENAME_EXCHANGE RENAME_SWAP
+#define HL_NATIVE_SEEK_DATA SEEK_DATA
+#define HL_NATIVE_SEEK_HOLE SEEK_HOLE
+
 static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity) {
     (void)capacity;
     return fcntl(descriptor, F_GETPATH, path);
@@ -42,6 +47,14 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
+
+/* renameat2 consumes the Linux guest flag values directly.  Darwin's
+   renameatx_np uses different values, so callers must use these host-native
+   constants instead of carrying the Darwin spelling into common code. */
+#define HL_NATIVE_RENAME_NOREPLACE 1u
+#define HL_NATIVE_RENAME_EXCHANGE 2u
+#define HL_NATIVE_SEEK_DATA SEEK_DATA
+#define HL_NATIVE_SEEK_HOLE SEEK_HOLE
 
 /* Temporary shape-compatible event seam for the production unity runtime.
    Linux-native epoll/inotify/timerfd implementations will replace these calls;
