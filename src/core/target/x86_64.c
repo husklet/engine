@@ -381,7 +381,6 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     container_init(rootfs);
     int rc = engine_global_init();
     if (rc) return rc;
-    if (box != NULL && g_untrusted) return 70;
     // Initial-exec shebang handling -- mirror of linux_aarch64.c (and execve case 221) via the shared
     // resolve_shebang_chain(). The container entry may itself be a "#!" script (redis/postgres'
     // docker-entrypoint.sh), and that script's interpreter may ITSELF be a "#!" script (nested, Linux

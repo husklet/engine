@@ -1362,6 +1362,8 @@ static void sentry_loop(void) {
 
 // ------------------------------------------------------------------ worker-side init / teardown
 static void sentry_init(void) {
+    bound_fork_state bound_fork;
+    int bound_status;
     g_shm = mmap(NULL, sizeof(struct sentry_shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (g_shm == MAP_FAILED) {
         perror("[sentry] ring mmap");
@@ -1385,12 +1387,36 @@ static void sentry_init(void) {
     g_worker_pid = getpid();
     g_sentry_owner_pid = getpid(); // only this process may signal-quit + reap the sentry
     g_guest_children = 0;
+    // The authoritative ABI box and the host implementation both own process-local locks and handles.
+    // Bracket the sentry helper fork exactly like a guest fork so the parent releases the speculative
+    // child handles and the helper repairs its inherited host state.  The helper deliberately drops its
+    // box pointer afterwards: sentry virtual descriptors belong to g_proc and must never be mistaken for
+    // worker-side typed descriptors merely because their small integer values overlap.
+    bound_status = bound_fork_prepare(&bound_fork);
+    if (bound_status != 0) {
+        fprintf(stderr, "[sentry] host fork prepare failed: %d\n", bound_status);
+        _exit(71);
+    }
     pid_t pid = fork(); // sentry forks AFTER load -> inherits the fd table / jail config / auxv / cwd
+    int fork_error = errno;
+    bound_status = bound_fork_complete(&bound_fork, pid == 0);
+    if (bound_status != 0) {
+        if (pid == 0) _exit(71);
+        if (pid > 0) {
+            int failed_status;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &failed_status, 0) < 0 && errno == EINTR) {}
+        }
+        fprintf(stderr, "[sentry] host fork completion failed: %d\n", bound_status);
+        _exit(71);
+    }
+    errno = fork_error;
     if (pid < 0) {
         perror("[sentry] fork");
         _exit(71);
     }
     if (pid == 0) {
+        g_linux_box = NULL;
         sentry_loop(); // child: spawns the per-ring servicer threads; never returns
         _exit(0);
     }

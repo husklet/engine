@@ -802,7 +802,6 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     container_init(rootfs);
     int irc = engine_global_init();
     if (irc) return irc;
-    if (box != NULL && g_untrusted) return 70;
     const char *prog = argv[0];
     static char gb[1024];
     prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH
