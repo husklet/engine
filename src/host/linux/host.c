@@ -1383,10 +1383,16 @@ static hl_host_result hl_linux_counter_create(void *context, uint64_t initial, u
 
 static hl_host_result hl_linux_counter_read(void *context, hl_host_handle counter) {
     hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
     uint64_t value;
     int descriptor;
     pthread_mutex_lock(&host->lock);
-    descriptor = hl_linux_descriptor(host, counter, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_READ) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = entry == NULL ? -1 : entry->descriptor;
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     return read(descriptor, &value, sizeof(value)) == (ssize_t)sizeof(value) ? hl_linux_result(HL_STATUS_OK, value, 0)
@@ -1395,10 +1401,16 @@ static hl_host_result hl_linux_counter_read(void *context, hl_host_handle counte
 
 static hl_host_result hl_linux_counter_write(void *context, hl_host_handle counter, uint64_t value) {
     hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
     int descriptor;
     if (value == UINT64_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
-    descriptor = hl_linux_descriptor(host, counter, HL_LINUX_HANDLE_COUNTER, HL_LINUX_HANDLE_COUNTER);
+    entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_WRITE) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
+    descriptor = entry == NULL ? -1 : entry->descriptor;
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     return write(descriptor, &value, sizeof(value)) == (ssize_t)sizeof(value) ? hl_linux_result(HL_STATUS_OK, 0, 0)
@@ -1411,6 +1423,10 @@ static hl_host_result hl_linux_counter_get_flags(void *context, hl_host_handle c
     uint64_t flags;
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_CONTROL) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
     flags = entry == NULL ? UINT64_MAX : entry->size;
     pthread_mutex_unlock(&host->lock);
     return flags == UINT64_MAX ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0)
@@ -1426,6 +1442,10 @@ static hl_host_result hl_linux_counter_set_flags(void *context, hl_host_handle c
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, counter, HL_LINUX_HANDLE_COUNTER);
+    if (entry != NULL && (entry->reserved & HL_HOST_TRANSFER_CONTROL) == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    }
     if (entry == NULL || ((uint32_t)entry->size & HL_HOST_COUNTER_SEMAPHORE) != (flags & HL_HOST_COUNTER_SEMAPHORE)) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);

@@ -2,6 +2,7 @@
 
 #include "hl/macos.h"
 #include "counter.h"
+#include "transfer.h"
 #include "../../src/host/clock.h"
 #include "../../src/host/file.h"
 
@@ -75,6 +76,7 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(check_counter(&services) == 0);
+    HL_CHECK(check_transfer_fork(&services) == 0);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
                                                       HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
                                                       HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);

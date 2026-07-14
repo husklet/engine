@@ -1182,7 +1182,8 @@ static hl_host_result hl_macos_transfer_channel_pair(void *context) {
     int pair[2];
     hl_host_result first;
     hl_host_result second;
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return hl_macos_errno();
+    /* Darwin does not provide AF_UNIX SOCK_SEQPACKET; datagrams retain message boundaries. */
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) return hl_macos_errno();
     (void)fcntl(pair[0], F_SETFD, FD_CLOEXEC);
     (void)fcntl(pair[1], F_SETFD, FD_CLOEXEC);
     first = hl_macos_transfer_register(host, pair[0]);
@@ -1441,11 +1442,32 @@ static hl_macos_counter_object *hl_macos_counter_object_get(hl_host_macos *host,
     return object;
 }
 
+static hl_macos_counter_object *hl_macos_counter_object_with_right(void *context, hl_host_handle handle,
+                                                                   uint32_t right, hl_status *status) {
+    hl_host_macos *host = context;
+    hl_macos_counter *counter;
+    hl_macos_counter_object *object = NULL;
+    pthread_mutex_lock(&host->lock);
+    counter = hl_macos_counter_lookup(host, handle);
+    if (counter == NULL)
+        *status = HL_STATUS_INVALID_ARGUMENT;
+    else if ((counter->rights & right) == 0)
+        *status = HL_STATUS_PERMISSION_DENIED;
+    else {
+        object = counter->object;
+        *status = HL_STATUS_OK;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return object;
+}
+
 static hl_host_result hl_macos_counter_read(void *context, hl_host_handle counter) {
-    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    hl_status status;
+    hl_macos_counter_object *object =
+        hl_macos_counter_object_with_right(context, counter, HL_HOST_TRANSFER_READ, &status);
     uint64_t value;
     uint8_t bytes[32];
-    if (object == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (object == NULL) return hl_macos_result(status, 0, 0);
     for (;;) {
         pthread_mutex_lock(&object->shared->lock);
         if (object->shared->value != 0) break;
@@ -1465,9 +1487,12 @@ static hl_host_result hl_macos_counter_read(void *context, hl_host_handle counte
 }
 
 static hl_host_result hl_macos_counter_write(void *context, hl_host_handle counter, uint64_t value) {
-    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    hl_status status;
+    hl_macos_counter_object *object =
+        hl_macos_counter_object_with_right(context, counter, HL_HOST_TRANSFER_WRITE, &status);
     uint8_t byte = 1;
-    if (object == NULL || value == UINT64_MAX || value == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (object == NULL) return hl_macos_result(status, 0, 0);
+    if (value == UINT64_MAX || value == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&object->shared->lock);
     if (value > UINT64_MAX - 1u - object->shared->value) {
         pthread_mutex_unlock(&object->shared->lock);
@@ -1480,9 +1505,11 @@ static hl_host_result hl_macos_counter_write(void *context, hl_host_handle count
 }
 
 static hl_host_result hl_macos_counter_get_flags(void *context, hl_host_handle counter) {
-    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
+    hl_status status;
+    hl_macos_counter_object *object =
+        hl_macos_counter_object_with_right(context, counter, HL_HOST_TRANSFER_CONTROL, &status);
     uint32_t flags;
-    if (object == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (object == NULL) return hl_macos_result(status, 0, 0);
     pthread_mutex_lock(&object->shared->lock);
     flags = object->shared->flags;
     pthread_mutex_unlock(&object->shared->lock);
@@ -1490,8 +1517,11 @@ static hl_host_result hl_macos_counter_get_flags(void *context, hl_host_handle c
 }
 
 static hl_host_result hl_macos_counter_set_flags(void *context, hl_host_handle counter, uint32_t flags) {
-    hl_macos_counter_object *object = hl_macos_counter_object_get(context, counter);
-    if (object == NULL || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
+    hl_status status;
+    hl_macos_counter_object *object =
+        hl_macos_counter_object_with_right(context, counter, HL_HOST_TRANSFER_CONTROL, &status);
+    if (object == NULL) return hl_macos_result(status, 0, 0);
+    if ((flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&object->shared->lock);
     if ((object->shared->flags & HL_HOST_COUNTER_SEMAPHORE) != (flags & HL_HOST_COUNTER_SEMAPHORE)) {
@@ -1536,7 +1566,7 @@ static hl_host_result hl_macos_counter_close(void *context, hl_host_handle handl
     if (final) {
         close(object->readable);
         close(object->signal);
-        pthread_mutex_destroy(&object->shared->lock);
+        /* A descriptor already queued through SCM_RIGHTS may still map this object. */
         munmap(object->shared, sizeof(*object->shared));
         close(object->backing);
         free(object);
