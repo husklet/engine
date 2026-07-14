@@ -13,8 +13,13 @@ typedef struct hl_host_resolved_path {
     char *leaf;
 } hl_host_resolved_path;
 
+enum {
+    HL_HOST_RESOLVE_NOFOLLOW_FINAL = 1u << 0,
+    HL_HOST_RESOLVE_NO_SYMLINKS = 1u << 1
+};
+
 /* path must be relative.  Symlink expansion is limited to 40 links. */
-int hl_host_resolve_beneath(int root_fd, const char *path, int target_open_flags,
+int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int target_open_flags,
                             hl_host_resolved_path *result);
 void hl_host_resolved_path_destroy(hl_host_resolved_path *result);
 

@@ -98,14 +98,15 @@ void hl_host_resolved_path_destroy(hl_host_resolved_path *result) {
     result->leaf = NULL;
 }
 
-int hl_host_resolve_beneath(int root_fd, const char *path, int target_open_flags,
+int hl_host_resolve_beneath(int root_fd, const char *path, unsigned policy, int target_open_flags,
                             hl_host_resolved_path *result) {
     fd_stack stack = {0};
     char *pending = NULL;
     unsigned links = 0;
     int saved;
 
-    if (root_fd < 0 || path == NULL || path[0] == '\0' || path[0] == '/' || result == NULL) {
+    if (root_fd < 0 || path == NULL || path[0] == '\0' || path[0] == '/' || result == NULL ||
+        (policy & ~(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -169,6 +170,17 @@ int hl_host_resolve_beneath(int root_fd, const char *path, int target_open_flags
         if (S_ISLNK(status.st_mode)) {
             char *target;
             char *next;
+            if ((policy & HL_HOST_RESOLVE_NO_SYMLINKS) != 0) {
+                errno = ELOOP;
+                goto fail;
+            }
+            if (*rest == '\0' && (policy & HL_HOST_RESOLVE_NOFOLLOW_FINAL) != 0) {
+                result->leaf = strdup(start);
+                if (result->leaf == NULL) goto fail;
+                result->parent_fd = stack.fds[stack.count - 1];
+                stack.count--;
+                break;
+            }
             if (++links > 40) {
                 errno = ELOOP;
                 goto fail;
