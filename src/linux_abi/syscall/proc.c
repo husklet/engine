@@ -204,6 +204,7 @@ static void exec_close_cloexec(void) {
 // never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop).
 
 static void fork_child_hooks(struct cpu *c) {
+    atomic_flag_clear_explicit(&g_bus_lock, memory_order_release);
     // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
     // so the child's first run_block can instruction-abort fetching from the (non-executable) code
     // cache -> the intermittent fork+exec SIGBUS. The host end-write gate re-asserts RX execution.

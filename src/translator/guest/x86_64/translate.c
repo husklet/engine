@@ -246,6 +246,7 @@ static void report_unimpl(uint64_t pc, struct insn *I);
 static int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
     if (I->is_mem) {
         emit_ea(I, next);
+        emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
         e_load(w, 16, 17);
         *mem = 1;
         return 16;
@@ -257,6 +258,11 @@ static int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
 
 static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17 if mem)
     if (I->is_mem) {
+        if (val == 16) {
+            e_mov_rr(19, 16, 1); /* host-call guard clobbers x16 */
+            val = 19;
+        }
+        emit_bus_guard(17, (uint64_t)w, g_emit_gpc);
         e_store(w, val, 17);
         return;
     }
@@ -1606,8 +1612,8 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- push imm (68 iz, 6A ib) ----
             if (op == 0x68 || op == 0x6A) {
-                e_movconst(16, (uint64_t)I.imm);
                 e_subi(RSP, RSP, 8, 1);
+                e_movconst(16, (uint64_t)I.imm);
                 e_store(8, 16, RSP);
                 gpc = next;
                 continue;
@@ -3849,6 +3855,7 @@ static void *translate_block(uint64_t gpc) {
                 int dst = (dw == 2) ? 16 : I.reg; // 16-bit dest extends into scratch, then bfi-merges
                 if (I.is_mem) {
                     emit_ea(&I, next);
+                    emit_bus_guard(17, (uint64_t)w, gpc);
                     if (signd)
                         e_ldrs_w(w, dst, 17, dw == 8); // sign-extend; W form (dw<=4) clears bits 63:32
                     else

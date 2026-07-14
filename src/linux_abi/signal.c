@@ -570,6 +570,25 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
     return deliver_guest_fault_hint(NULL, hostsig, si, ucv);
 }
 
+/* Dispatcher-only delivery for a translated access rejected by the file-mapping BUS ledger. */
+static int raise_guest_bus(struct cpu *c) {
+    if (g_sigact[7].handler <= 1) {
+        if (container_pid() != 1) {
+            int core = sig_coredumps(7) && svc_core_rlimit_cur() > 0;
+            sigexit_record(7, core);
+        }
+        c->exited = 1;
+        c->exit_code = 135;
+        return 0;
+    }
+    g_sigaddr[7] = c->fault_addr;
+    g_sigcode[7] = 2; /* BUS_ADRERR */
+    c->sigmask &= ~(1ull << 6);
+    c->reason = R_BRANCH;
+    __atomic_or_fetch(&g_pending, 1ull << 7, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
 static void sig_diag_hex16(char *p, uint64_t v) {
     static const char h[] = "0123456789abcdef";
     for (int i = 15; i >= 0; i--) {

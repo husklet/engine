@@ -86,6 +86,7 @@
 #define RK_IBTC 2     // 4-insn movz/movk of &g_ibtc into reg `rd`
 #define RK_T2CNT 3    // 4-insn movz/movk of &g_t2cnt[slot] into reg `rd`
 #define RK_ICSITE 4   // 16-byte per-site IC {target,body} literal pair -> zero on load (neutralize)
+#define RK_BUSFAULT 5 // 4-insn pointer to the generic translated-memory BUS query
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
 static int g_pcache;            // persistent cache active (HL_PCACHE=1)
@@ -146,6 +147,15 @@ static void emit_t2cntptr(int rd, int slot) {
         emit_hostptr48(rd, (uint64_t)&g_t2cnt[slot]);
     } else {
         e_adrp_add(rd, (uint64_t)&g_t2cnt[slot]);
+    }
+}
+
+static void emit_busfaultptr(int rd) {
+    if (g_pcache) {
+        pc_reloc_add((uint32_t)(g_cp - g_cache), RK_BUSFAULT, (uint8_t)rd, 0);
+        emit_hostptr48(rd, (uint64_t)jit_guest_bus_fault);
+    } else {
+        e_movconst(rd, (uint64_t)jit_guest_bus_fault);
     }
 }
 
@@ -233,6 +243,7 @@ static void pcache_relocate(void) {
         case RK_BLOCKRET: v = (uint64_t)block_return; break;
         case RK_IBTC: v = (uint64_t)g_ibtc; break;
         case RK_T2CNT: v = (uint64_t)&g_t2cnt[slot]; break;
+        case RK_BUSFAULT: v = (uint64_t)jit_guest_bus_fault; break;
         case RK_ICSITE:
             // zero both cached literals (target at +0, body at +8): the body is a stale arena pointer, and
             // a zeroed target makes the site's equality guard miss so the dispatcher re-resolves + refills.
@@ -256,7 +267,7 @@ static int pc_reloc_ok(hl_reloc r, uint64_t arena_used) {
     if (kind == RK_ICSITE) return 1;
     if (((r.info >> 8) & 0xff) > 30) return 0; // rd must be a real GPR (we never bake into sp/xzr)
     if (kind == RK_T2CNT) return slot < T2_MAX;
-    return kind == RK_BLOCKRET || kind == RK_IBTC;
+    return kind == RK_BLOCKRET || kind == RK_IBTC || kind == RK_BUSFAULT;
 }
 
 // Returns 1 on HIT (arena + maps restored -> translation of the startup path is skipped). ANY mismatch /

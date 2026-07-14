@@ -78,6 +78,8 @@ struct cpu {
     // (which republishes cpu->V). A plain R_SYSCALL exit reads this: 0 -> slim GPR-only spill, else FULL.
     // Appended after the baked-offset fields so the emitted-code offsets above are unaffected.
     uint64_t vdirty;
+    /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
+    uint64_t fault_addr;
 };
 
 #define OFF_VDIRTY ((int)offsetof(struct cpu, vdirty))
@@ -146,3 +148,5 @@ static int is_stolen(int r) {
 
 #define R_BRANCH 0
 #define R_SYSCALL 1
+#define R_BUS 5
+#define OFF_FAULT_ADDR ((int)offsetof(struct cpu, fault_addr))

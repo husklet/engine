@@ -400,6 +400,7 @@ static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
 // signed imm. On success sets *rn = host base reg, *off = displacement to pass to the encoder.
 // NOEAOPT=1 forces 0 (no fold) -> the caller uses the baseline emit_ea + e_load/e_store.
 static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
+    if (jit_guest_bus_active()) return 0;
     if (noeaopt()) return 0;
     // guest_base bias-fold: the direct [base+disp] fold uses the guest base register unbiased -> route
     // through emit_ea (which biases x17) instead, so a low image access is redirected to the high mapping.
@@ -424,6 +425,7 @@ static void emit_load_mem(struct insn *I, uint64_t next, int w, int rt) {
         e_ldur(w, rt, rn, off);
     else {
         emit_ea(I, next);
+        emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
         e_load(w, rt, 17);
     }
 }

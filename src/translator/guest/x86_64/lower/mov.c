@@ -31,6 +31,7 @@ static int translate_mov(struct insn *I, uint64_t next) {
         int w = op == 0xC6 ? 1 : I->opsize;
         if (I->is_mem) {
             emit_ea(I, next);
+            emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
             e_movconst(16, (uint64_t)I->imm);
             e_store(w, 16, 17);
         } else {
@@ -55,6 +56,7 @@ static int translate_mov(struct insn *I, uint64_t next) {
         I->m_hasbase = I->m_hasindex = I->rip_rel = 0;
         I->disp = I->imm; // absolute address (already addr-size sized by the decoder)
         emit_ea(I, next); // x17 = host address (seg base + non-PIE bias applied)
+        emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
         if (load) {
             if (w == 1) {
                 e_load(1, 16, 17);
@@ -91,6 +93,7 @@ static int translate_mov(struct insn *I, uint64_t next) {
                         e_stur(w, sv, rn, off);
                 } else {
                     emit_ea(I, next);                                     // may clobber x16
+                    emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
                     int sv = (w == 1) ? byte_val(I, I->reg, 16) : I->reg; // byte src: ah/bh/ch/dh -> bits 8-15
                     e_store(w, sv, 17);
                 }

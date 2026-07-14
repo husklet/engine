@@ -16,9 +16,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef MAP_ANON
+#define MAP_ANON 0x1000
+#endif
 
 static int32_t child_exit_37(void *context) {
     HL_CHECK(context == (void *)(uintptr_t)37);
@@ -355,6 +360,35 @@ int main(void) {
                                         HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,
                                         HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
     HL_CHECK(file.status == HL_STATUS_OK);
+    {
+        hl_host_file_mapping mapped = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapped), 0, 0, 0, 0};
+        unsigned char payload[8192];
+        unsigned char *reservation;
+        memset(payload, 0x5a, sizeof payload);
+        HL_CHECK(services.file->write_at(services.context, file.value, 0,
+                                         (hl_host_const_bytes){payload, sizeof payload}).value == sizeof payload);
+        reservation = mmap(NULL, 32768, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        HL_CHECK(reservation != MAP_FAILED);
+        memset(reservation, 0xa5, 4096);
+        HL_CHECK(services.memory
+                     ->map_file(services.context, file.value, (uint64_t)(uintptr_t)(reservation + 4096), 4096, 4096,
+                                HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &mapped)
+                     .status == HL_STATUS_OK);
+        for (size_t index = 0; index < 4096; ++index)
+            HL_CHECK(reservation[index] == 0xa5 && reservation[4096 + index] == 0x5a);
+        HL_CHECK(mapped.address == (uint64_t)(uintptr_t)(reservation + 4096) && mapped.reserved == 4096);
+        HL_CHECK(services.memory->release(services.context, mapped.handle).status == HL_STATUS_OK);
+        HL_CHECK(munmap(reservation + 16384, 16384) == 0);
+        reservation = mmap(NULL, 32768, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        HL_CHECK(reservation != MAP_FAILED);
+        mapped = (hl_host_file_mapping){HL_HOST_FILE_MAPPING_ABI, sizeof(mapped), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_file(services.context, file.value, (uint64_t)(uintptr_t)(reservation + 4096), 4096, 4096,
+                                HL_HOST_MEMORY_READ, HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_FIXED, &mapped)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(munmap(reservation, 32768) == 0);
+        HL_CHECK(services.file->truncate(services.context, file.value, 0).status == HL_STATUS_OK);
+    }
     HL_CHECK(services.file
                  ->sync_range(services.context, file.value, 0, 0,
                               HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE | HL_HOST_FILE_SYNC_WAIT_AFTER)

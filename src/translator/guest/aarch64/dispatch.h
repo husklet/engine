@@ -97,7 +97,10 @@ static uint64_t g_smc_flushes;
 // on the non-redirect path (x86 will instead rely on rip pre-set in the emitter). `break` exits the
 // dispatcher loop into which this expands. Byte-for-byte the prior inline block.
 #define G_DISPATCH_REASON(c)                                                                                           \
-    if ((c)->reason == R_ICFLUSH) {                                                                                    \
+    if ((c)->reason == R_BUS) {                                                                                        \
+        if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
+        break;                                                                                                         \
+    } else if ((c)->reason == R_ICFLUSH) {                                                                             \
         smc_icflush((c)->smc_va); /* guest `ic ivau`: precise drop keyed on the invalidated VA (cpu->smc_va) */        \
     } else if ((c)->reason == R_SYSCALL) {                                                                             \
         if (g_prof) g_prof_sys++;                                                                                      \

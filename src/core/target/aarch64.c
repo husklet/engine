@@ -40,6 +40,8 @@
 #include "../options.h"
 #include "../cli.h"
 #include "native.h"
+#include "../bus.h"
+#include "../../linux_abi/bus.h"
 #include "../../host/range.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
@@ -782,6 +784,8 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     argc = (int)argument_count;
     g_host_services = host;
     g_linux_box = box;
+    jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());
+    hl_linux_bus_set_change_callback(jit_guest_bus_changed, NULL);
     g_host_launch_monotonic_ns = 0;
     if (host != NULL) {
         hl_host_result now;

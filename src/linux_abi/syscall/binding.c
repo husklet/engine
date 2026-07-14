@@ -114,6 +114,8 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     bound_mapping *entry;
     bound_mapping **head = bound_mapping_head();
     int64_t result;
+    uint64_t bus_accessible = size;
+    int bus_prepared = 0;
     if (head == NULL || g_host_services == NULL || g_host_services->memory == NULL ||
         g_host_services->memory->map_file == NULL)
         return -ENOSYS;
@@ -126,22 +128,47 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         free(entry);
         return -ENOMEM;
     }
+    if (g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
+        hl_host_file_metadata metadata;
+        hl_host_result status =
+            g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
+        if (status.status == HL_STATUS_OK) {
+            uint64_t available = metadata.size > offset ? metadata.size - offset : 0;
+            bus_accessible = available > UINT64_MAX - UINT64_C(4095)
+                                 ? UINT64_MAX
+                                 : (available + UINT64_C(4095)) & ~UINT64_C(4095);
+            if (bus_accessible < size) {
+                gbus_prepare();
+                bus_prepared = 1;
+            }
+        }
+    }
     result = hl_linux_map_file(g_linux_box, file->fd, address, offset, size, protection & 7u, flags, &mapped);
     if (result < 0) {
+        if (bus_prepared) gbus_prepare_release();
         free(object);
         free(entry);
         return result;
     }
     if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
     *object = (bound_mapping_object){mapped.handle, mapped.address, mapped.mapped_size, 1};
-    *entry = (bound_mapping){mapped.address, mapped.mapped_size, 0, object, *head};
+    *entry = (bound_mapping){mapped.address, mapped.mapped_size, mapped.reserved, object, *head};
     *head = entry;
-    if (mapped.address == 0 || mapped.mapped_size < size) {
+    if (mapped.address == 0 || mapped.mapped_size < size || mapped.address > UINT64_MAX - size) {
+        if (bus_prepared) gbus_prepare_release();
         bound_mapping_drop(entry, NULL);
         return -EIO;
     }
     gmap_add(mapped.address, mapped.mapped_size);
     gmap_set_glen(mapped.address, size);
+    gbus_clear(mapped.address, mapped.address + size);
+    if (bus_prepared && gbus_add(mapped.address + bus_accessible, mapped.address + size) != 0) {
+        gbus_prepare_release();
+        bound_mapping_drop(entry, NULL);
+        gmap_split_unmap(mapped.address, mapped.address + mapped.mapped_size);
+        return -ENOMEM;
+    }
+    if (bus_prepared) gbus_prepare_release();
     return (int64_t)mapped.address;
 }
 
@@ -714,7 +741,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
         return 1;
     }
-    if (nr == 222) {
+    if (nr == 222 && (a3 & 0x20u) == 0) {
         hl_linux_fd_snapshot mapped;
         if (bound_snapshot(G_A4(c), &mapped)) {
             G_RET(c) = (uint64_t)bound_mmap_file(&mapped, a0, a1, (uint32_t)a2, (uint32_t)a3, G_A5(c));
@@ -726,6 +753,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (mapping != NULL) {
             uint64_t offset = a0 - mapping->address;
             hl_host_result operation;
+            /* Guest mprotect is modeled by the 4 KiB Linux VMA/SMC registries in svc_mem. Routing a
+             * typed file mapping to host protect applies macOS's 16 KiB granularity and can protect
+             * adjacent ELF segments, breaking ld.so RELRO. Keep the typed mapping ledger, but let the
+             * common guest-logical path validate the range and update permissions. */
+            if (nr == 226) return 0;
             if (nr == 227 && (((a2 & ~(uint64_t)7u) != 0) || (a2 & 5u) == 0 || (a2 & 5u) == 5u)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 return 1;
@@ -733,16 +765,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             if (nr == 215)
                 operation = g_host_services->memory->unmap_range(g_host_services->context, mapping->object->handle,
                                                                  mapping->object_offset + offset, a1);
-            else if (nr == 226)
-                operation = g_host_services->memory->protect(g_host_services->context, mapping->object->handle,
-                                                             mapping->object_offset + offset, a1,
-                                                             (uint32_t)a2 & 7u);
             else
                 operation = g_host_services->memory->sync(g_host_services->context, mapping->object->handle,
                                                           mapping->object_offset + offset, a1);
             if (operation.status == HL_STATUS_OK && nr == 215) {
                 bound_mapping_retire(a0, a1);
                 gmap_split_unmap(a0, a0 + a1);
+                gbus_clear(a0, a0 + a1);
             }
             G_RET(c) = (uint64_t)bound_host_error(operation.status);
             return 1;

@@ -602,6 +602,9 @@ static struct {
     _Atomic int used;
     pthread_t th;
     _Atomic uint64_t exec_gen;
+    struct cpu *cpu;
+    _Atomic uint64_t dispatch_ack;
+    _Atomic int in_translated;
 } g_stw_threads[STW_MAXTHREAD];
 
 static pthread_mutex_t g_stw_reg_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -621,6 +624,9 @@ static uint64_t g_stw_flushes;   // PROF: stop-the-world flushes performed
 // that corrupted parked peers.
 static uint64_t g_cache_gen;                     // generation of the CURRENT cache (g_cache)
 static __thread _Atomic uint64_t *g_my_exec_gen; // this thread's exec_gen slot (NULL until registered)
+static __thread int g_my_stw_slot = -1;
+static _Atomic uint64_t g_dispatch_request;
+static _Atomic int g_dispatch_gate;
 #define STW_RETIRED_MAX (STW_MAXTHREAD + 8)
 
 static struct {
@@ -646,6 +652,7 @@ static struct {
 static uint64_t g_nfreed_total;
 
 static void cache_oom_abort(void);
+static void jit_flush_to_fresh(void);
 
 int jit_pc_in_retained_cache(uint64_t pc) {
     if (!g_cache) return 0;
@@ -690,8 +697,19 @@ void jit_cache_diag(uint64_t *gen, uint64_t *flushes, uint32_t *retired, uint32_
 // Park safepoint handler -- async-signal-safe (atomics + nanosleep only). A peer caught here is, by
 // definition, no longer executing a translated block (it is on its host stack in this handler), so the
 // flusher may safely retire the cache while we spin.
-static void stw_park_handler(int sig) {
+static void stw_park_handler(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
+    (void)si;
+    (void)ucv;
+    /* A BUS activation uses this signal only to break a peer out of a host wait.  The
+       peer's emitted IRQ poll performs the architectural spill at a real guest
+       instruction boundary; redirecting an arbitrary host PC would lose that
+       precision.  Ordinary cache rotation still parks here. */
+    if (atomic_load_explicit(&g_dispatch_gate, memory_order_acquire)) {
+        int slot = g_my_stw_slot;
+        if (slot >= 0 && g_stw_threads[slot].cpu) g_stw_threads[slot].cpu->irq = 1;
+        return;
+    }
     atomic_fetch_add_explicit(&g_stw_parked, 1, memory_order_seq_cst);
     while (atomic_load_explicit(&g_stw_active, memory_order_seq_cst)) {
         struct timespec ts = {0, 200000}; // 0.2ms
@@ -705,13 +723,13 @@ static pthread_once_t g_stw_once = PTHREAD_ONCE_INIT;
 static void stw_install(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_handler = stw_park_handler;
-    sa.sa_flags = SA_RESTART; // auto-restart interrupted host syscalls so a flush never perturbs a peer
+    sa.sa_sigaction = stw_park_handler;
+    sa.sa_flags = SA_RESTART | SA_SIGINFO; // auto-restart interrupted host syscalls
     sigemptyset(&sa.sa_mask);
     sigaction(STW_SIG, &sa, NULL);
 }
 
-static void stw_register(void) {
+static void stw_register(struct cpu *cpu) {
     pthread_once(&g_stw_once, stw_install);
     // Guarantee the park signal is deliverable on this thread (a blocked STW_SIG would stall a flush).
     sigset_t unb;
@@ -724,8 +742,14 @@ static void stw_register(void) {
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed)) {
             g_stw_threads[i].th = pthread_self();
+            g_stw_threads[i].cpu = cpu;
             atomic_store_explicit(&g_stw_threads[i].exec_gen, g_cache_gen, memory_order_relaxed);
+            atomic_store_explicit(&g_stw_threads[i].dispatch_ack,
+                                  atomic_load_explicit(&g_dispatch_request, memory_order_relaxed),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&g_stw_threads[i].in_translated, 0, memory_order_relaxed);
             g_my_exec_gen = &g_stw_threads[i].exec_gen;
+            g_my_stw_slot = i;
             atomic_store_explicit(&g_stw_threads[i].used, 1, memory_order_release);
             break;
         }
@@ -739,9 +763,81 @@ static void stw_unregister(void) {
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
             pthread_equal(g_stw_threads[i].th, me)) {
             atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_release);
+            g_stw_threads[i].cpu = NULL;
+            g_my_stw_slot = -1;
             break;
         }
     pthread_mutex_unlock(&g_stw_reg_lock);
+}
+
+/* Publish a precise dispatcher safepoint.  A BUS prepare waits for this
+   generation acknowledgement before publishing a shortened file mapping, so
+   no peer can enter an old, unguarded translation after the prepare returns. */
+static void stw_dispatch_safepoint(void) {
+    if (g_my_stw_slot < 0) return;
+    uint64_t request = atomic_load_explicit(&g_dispatch_request, memory_order_acquire);
+    atomic_store_explicit(&g_stw_threads[g_my_stw_slot].dispatch_ack, request, memory_order_release);
+    while (atomic_load_explicit(&g_dispatch_gate, memory_order_acquire)) {
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+static int stw_before_translated(uint64_t selected_epoch) {
+    if (g_my_stw_slot < 0) return 1;
+    for (;;) {
+        stw_dispatch_safepoint();
+        if (atomic_load_explicit(&g_dispatch_request, memory_order_acquire) != selected_epoch) return 0;
+        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 1, memory_order_release);
+        /* Close activation's phase-transition race: once the gate is visible we
+           withdraw from translated execution and acknowledge at the dispatcher. */
+        if (!atomic_load_explicit(&g_dispatch_gate, memory_order_acquire) &&
+            atomic_load_explicit(&g_dispatch_request, memory_order_acquire) == selected_epoch)
+            return 1;
+        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 0, memory_order_release);
+        if (atomic_load_explicit(&g_dispatch_request, memory_order_acquire) != selected_epoch) return 0;
+    }
+}
+
+static void stw_after_translated(void) {
+    if (g_my_stw_slot >= 0)
+        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 0, memory_order_release);
+    stw_dispatch_safepoint();
+}
+
+static void stw_force_dispatch_flush(void) {
+    uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
+    pthread_t me = pthread_self();
+    /* Preserve the global lock order used by ordinary STW: jit -> registry. */
+    pthread_mutex_lock(&g_jit_lock);
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        if (pthread_equal(g_stw_threads[i].th, me)) {
+            atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
+        } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire)) {
+            if (g_stw_threads[i].cpu) g_stw_threads[i].cpu->irq = 1;
+            pthread_kill(g_stw_threads[i].th, STW_SIG);
+        }
+    }
+    for (;;) {
+        int pending = 0;
+        for (int i = 0; i < STW_MAXTHREAD; i++)
+            if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
+                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
+                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) != request) {
+                pending = 1;
+                break;
+            }
+        if (!pending) break;
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+    jit_flush_to_fresh();
+    atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
+    pthread_mutex_unlock(&g_stw_reg_lock);
+    pthread_mutex_unlock(&g_jit_lock);
 }
 
 // # of OTHER live guest threads (excludes the caller). 0 -> the cheap in-place flush is safe.
@@ -894,15 +990,19 @@ static void smc_inplace_drop(void) {
 // fork(): drop the inherited (parent-only) thread registry -- host fork() duplicates only the calling
 // thread -- so a later flush in the child never signals a dead handle. Re-register the child's own thread.
 static void stw_after_fork(void) {
+    struct cpu *survivor = g_my_stw_slot >= 0 ? g_stw_threads[g_my_stw_slot].cpu : NULL;
     atomic_store_explicit(&g_stw_active, 0, memory_order_relaxed);
     atomic_store_explicit(&g_stw_parked, 0, memory_order_relaxed);
     pthread_mutex_init(&g_stw_reg_lock, NULL);
     for (int i = 0; i < STW_MAXTHREAD; i++)
         atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_relaxed);
     g_stw_threads[0].th = pthread_self();
+    g_stw_threads[0].cpu = survivor;
     atomic_store_explicit(&g_stw_threads[0].exec_gen, g_cache_gen, memory_order_relaxed);
+    atomic_store_explicit(&g_stw_threads[0].in_translated, 0, memory_order_relaxed);
     atomic_store_explicit(&g_stw_threads[0].used, 1, memory_order_relaxed);
     g_my_exec_gen = &g_stw_threads[0].exec_gen;
+    g_my_stw_slot = 0;
 }
 
 // fork() and the dual-mapped cache. Left alone, fork() would COW the RW and RX aliases independently and

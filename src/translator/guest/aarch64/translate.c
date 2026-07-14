@@ -243,6 +243,94 @@ static int is_foldable_mem(uint32_t in) {
     return 0;
 }
 
+static uint64_t a64_mem_bytes(uint32_t in) {
+    int pair = (in & 0x3A000000u) == 0x28000000u;
+    int vector = (in >> 26) & 1;
+    unsigned size = (in >> 30) & 3;
+    uint64_t bytes;
+    if (pair)
+        bytes = vector ? (UINT64_C(4) << size) : (size == 2 ? UINT64_C(8) : UINT64_C(4));
+    else if (!vector)
+        bytes = UINT64_C(1) << size;
+    else {
+        unsigned scale = ((((in >> 22) & 3u) >> 1) << 2) | size;
+        bytes = UINT64_C(1) << scale; /* B/H/S/D/Q scalar or vector */
+    }
+    return pair ? bytes * 2 : bytes;
+}
+
+/* Byte displacement of the access performed by a foldable memory opcode.
+   The copied opcode is de-indexed after this displacement is folded into Sb,
+   so the BUS query and the native access use exactly the same address. */
+static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
+    if (wb == 2) return 0; /* post-index accesses before writeback */
+    if (wb == 1) return sext((in >> 12) & 0x1ff, 9);
+    if ((in & 0x3b000000u) == 0x39000000u) {
+        uint64_t bytes = a64_mem_bytes(in);
+        return (int64_t)((in >> 10) & 0xfff) << __builtin_ctzll(bytes);
+    }
+    if ((in & 0x3b200000u) == 0x38000000u)
+        return sext((in >> 12) & 0x1ff, 9);
+    if ((in & 0x3a000000u) == 0x28000000u) {
+        int64_t element = (int64_t)(a64_mem_bytes(in) / 2);
+        return sext((in >> 15) & 0x7f, 7) * element;
+    }
+    return 0; /* register-offset already materialized; atomics use [Xn] */
+}
+
+/* BUS-active generations instrument a native copied memory instruction before
+   it is emitted.  The exact guest EA is already materialized in `ea`; spill the
+   complete architectural file, query the generic core seam, and either return
+   to the dispatcher as R_BUS or reload byte-for-byte state and continue. */
+static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
+    emit_spill();
+    e_ldr(0, CPUREG, OFF_FAULT_ADDR);
+    e_movconst(1, bytes);
+    emit_busfaultptr(16);
+    emit32(0xD63F0000u | (16u << 5)); /* blr x16 */
+    uint32_t *clear = (uint32_t *)g_cp;
+    emit32(0); /* cbz x0, clear */
+    e_str(0, CPUREG, OFF_FAULT_ADDR); /* exact first invalid byte */
+    e_movconst(9, pc);
+    e_str(9, CPUREG, OFF_PC);
+    e_movconst(9, R_BUS);
+    e_str(9, CPUREG, OFF_RSN);
+    e_movr(0, CPUREG);
+    emit_blockret(9);
+    e_br(9);
+    uint8_t *resume = g_cp;
+    *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7FFFFu) << 5);
+    e_ldr(9, CPUREG, OFF_SP);
+    e_mov_sp_from(9);
+    e_ldr(9, CPUREG, OFF_NZCV);
+    emit32(0xD51B4200u | 9);
+    for (int t = 0; t < 32; t += 2) e_ldp_q(t, t + 1, CPUREG, OFF_V + t * 16);
+    for (int r = 1; r <= 30; r++)
+        if (!is_stolen(r)) e_ldr(r, CPUREG, r * 8);
+    e_ldr(0, CPUREG, 0);
+}
+
+static void emit_a64_bus_guard(int ea, uint64_t bytes, uint64_t pc) {
+    if (!jit_guest_bus_active()) return;
+    e_str(ea, CPUREG, OFF_FAULT_ADDR);
+    emit_a64_bus_guard_saved(bytes, pc);
+}
+
+static void emit_a64_bus_guard_base(int base, int64_t offset, uint64_t bytes, uint64_t pc) {
+    if (!jit_guest_bus_active()) return;
+    if (base == 31)
+        e_mov_from_sp(16);
+    else if (is_stolen(base))
+        e_ldr(16, CPUREG, base * 8);
+    else
+        e_movr(16, base);
+    if (offset < 0)
+        e_subi(16, 16, (unsigned)(-offset));
+    else if (offset > 0)
+        e_addi(16, 16, (unsigned)offset);
+    emit_a64_bus_guard(16, bytes, pc);
+}
+
 // Emit a folded memory op: compute the guest effective address into a scratch Sb, add g_nonpie_bias iff
 // that address is a LOW image address (< 4GiB; everything else -- stack/heap/mmap/libs -- is >= the
 // engine's 4GiB __PAGEZERO), then the access re-pointed at Sb. Flag-free (loads/stores must not disturb the
@@ -296,6 +384,12 @@ static void emit_fold_mem(uint32_t in) {
         // Sb = Xn + extend(Xm)  (extended-register add; option/amount mirror the load's index extend)
         emit32(0x8B200000u | (mreg << 16) | (opt << 13) | ((unsigned)(amt & 7) << 10) | (Sb << 5) | Sb);
     }
+    int64_t access_off = regoff ? 0 : a64_fold_mem_offset(in, wb);
+    if (access_off) {
+        e_movconst(T, (uint64_t)(access_off < 0 ? -access_off : access_off));
+        emit32((access_off < 0 ? 0xCB000000u : 0x8B000000u) | ((unsigned)T << 16) |
+               ((unsigned)Sb << 5) | (unsigned)Sb); /* sub/add Sb,Sb,T */
+    }
     // Bias iff the EA falls in THIS image's span [g_nonpie_lo, g_nonpie_hi). Fast path: a >= 4GiB address is
     // never the low non-PIE image (stack/heap/mmap/ld.so/libc all live above the 4GiB __PAGEZERO) -> skip
     // with no flag traffic (the common case). For a < 4GiB EA, do the exact two-sided range test; biasing
@@ -328,13 +422,32 @@ static void emit_fold_mem(uint32_t in) {
         m = (in & ~0x003FFC00u & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
         emask &= ~4; // Rm now folded into Sb -> drop it from the mangle set
     } else if (wb) {
-        // de-index pre/post -> unscaled [Sb,#imm9]: mode bits[11:10] -> 00; post accesses at the base, so
-        // also zero imm9 (pre keeps imm9 == the offset). The writeback is applied to the LOW base below.
-        m = in & ~(0x3u << 10);
-        if (wb == 2) m &= ~(0x1FFu << 12);
+        // The architectural access address is already in Sb.  Convert the
+        // pre/post-index opcode to an unscaled zero-offset access; writeback is
+        // applied separately to the original guest base below.
+        m = in & ~(0x3u << 10) & ~(0x1FFu << 12);
         m = (m & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
     } else {
-        m = (in & ~(0x1Fu << 5)) | ((unsigned)Sb << 5); // re-base the access onto Sb
+        m = (in & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
+        if ((in & 0x3b000000u) == 0x39000000u)
+            m &= ~(0xfffu << 10); /* unsigned immediate */
+        else if ((in & 0x3b200000u) == 0x38000000u)
+            m &= ~(0x1ffu << 12); /* unscaled immediate */
+        else if ((in & 0x3a000000u) == 0x28000000u)
+            m &= ~(0x7fu << 15); /* pair immediate */
+    }
+    if (jit_guest_bus_active()) {
+        /* Preserve the exact EA, then restore scratch registers before
+           emit_spill captures the architectural register file.  Spilling Sb,
+           T, T2, or Tm while they contain translator temporaries silently
+           corrupts guest registers on every guarded miss. */
+        e_str(Sb, CPUREG, OFF_FAULT_ADDR);
+        if (regoff) e_ldr(Tm, CPUREG, M + 56);
+        e_ldr(Sb, CPUREG, M + 32);
+        e_ldr(T, CPUREG, M + 40);
+        e_ldr(T2, CPUREG, M + 48);
+        emit_a64_bus_guard_saved(a64_mem_bytes(in), g_emit_gpc);
+        e_ldr(Sb, CPUREG, OFF_FAULT_ADDR);
     }
     if (uses_x18(m, emask))
         emit_mangled_x18(m, emask); // stolen Rt/Rt2/Rs (base now names non-stolen Sb)
@@ -447,6 +560,8 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     // De-index to the no-offset form against Sb: clear post-index (bit23) and Rm[20:16], rebase Xn -> Sb. The
     // V-register list, opcode, R, and size fields are untouched, so the transfer is identical -- only its
     // address is now the biased high pointer.
+    emit_a64_bus_guard(Sb, (uint64_t)advsimd_struct_bytes(in), g_emit_gpc);
+    if (jit_guest_bus_active()) e_ldr(Sb, CPUREG, OFF_FAULT_ADDR);
     emit32((in & ~(1u << 23) & ~(0x1Fu << 16) & ~(0x1Fu << 5)) | ((unsigned)Sb << 5));
     if (post) { // writeback the LOW guest base: Xn += (Rm==31 ? bytes transferred : Xm)
         if (rm == 31) {
@@ -1762,6 +1877,8 @@ static void *translate_block(uint64_t gpc) {
             if (is_stolen(rt)) {
                 if (stealfast_on()) {
                     e_movconst(16, gpc + off);
+                    emit_a64_bus_guard(16, is64 ? 8 : 4, gpc);
+                    if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                     if (is64)
                         e_ldr(16, 16, 0);
                     else
@@ -1770,6 +1887,8 @@ static void *translate_block(uint64_t gpc) {
                 } else {
                     x18_prolog();
                     e_movconst(0, gpc + off);
+                    emit_a64_bus_guard(0, is64 ? 8 : 4, gpc);
+                    if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                     if (is64)
                         e_ldr(0, 0, 0);
                     else
@@ -1779,6 +1898,8 @@ static void *translate_block(uint64_t gpc) {
                 }
             } else {
                 e_movconst(rt, gpc + off);
+                emit_a64_bus_guard(rt, is64 ? 8 : 4, gpc);
+                if (jit_guest_bus_active()) e_ldr(rt, CPUREG, OFF_FAULT_ADDR);
                 if (is64)
                     e_ldr(rt, rt, 0);
                 else
@@ -1800,17 +1921,23 @@ static void *translate_block(uint64_t gpc) {
             if (is_stolen(rt)) {
                 if (stealfast_on()) {
                     e_movconst(16, gpc + off);            // x16 = guest literal address
+                    emit_a64_bus_guard(16, 4, gpc);
+                    if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                     emit32(0xB9800000u | (16 << 5) | 16); // ldrsw x16, [x16]
                     e_str(16, CPUREG, rt * 8);
                 } else {
                     x18_prolog();
                     e_movconst(0, gpc + off);
+                    emit_a64_bus_guard(0, 4, gpc);
+                    if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                     emit32(0xB9800000u | (0 << 5) | 0); // ldrsw x0, [x0]
                     e_str(0, 1, rt * 8);
                     x18_epilog();
                 }
             } else {
                 e_movconst(rt, gpc + off);
+                emit_a64_bus_guard(rt, 4, gpc);
+                if (jit_guest_bus_active()) e_ldr(rt, CPUREG, OFF_FAULT_ADDR);
                 emit32(0xB9800000u | (rt << 5) | rt); // ldrsw xt, [xt]
             }
             gpc += 4;
@@ -1831,10 +1958,14 @@ static void *translate_block(uint64_t gpc) {
             if (stealfast_on()) {
                 // stealfast: x16 is engine-dead -> no stash/restore around the address materialization
                 e_movconst(16, gpc + off);              // x16 = guest literal address
+                emit_a64_bus_guard(16, UINT64_C(4) << sz, gpc);
+                if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                 emit32(ld | (16u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x16]
             } else {
                 x18_prolog();                          // stash x0/x1 in the red zone; x0 becomes the address scratch
                 e_movconst(0, gpc + off);              // x0 = guest literal address (PIE: pcrel_base is identity)
+                emit_a64_bus_guard(0, UINT64_C(4) << sz, gpc);
+                if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                 emit32(ld | (0u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x0]
                 x18_epilog();
             }
@@ -1874,7 +2005,7 @@ static void *translate_block(uint64_t gpc) {
         // clear the monitor) and only for a non-SP base (the stack is always high). The AdvSIMD load/store
         // structure family (ld1/st1.., ld1r) has no offset/index so is_foldable_mem omits it -- fold it via
         // its own emitter (else glibc's NEON strlen/memcpy trap once per access on the image). Inert for PIE.
-        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31) {
+        if ((guestbase_on() || jit_guest_bus_active()) && !in_excl && ((in >> 5) & 31) != 31) {
             if (is_foldable_mem(in)) {
                 emit_fold_mem(in);
                 gpc += 4;
@@ -1885,6 +2016,33 @@ static void *translate_block(uint64_t gpc) {
                 gpc += 4;
                 continue;
             }
+        }
+        if (jit_guest_bus_active()) {
+            /* Pair pre/post-index forms are deliberately not bias-folded.  Guard
+               their architectural access address, then preserve the native
+               writeback opcode verbatim below. */
+            if ((in & 0x3A000000u) == 0x28000000u) {
+                int mode = (in >> 23) & 3;
+                if (mode == 1 || mode == 3) {
+                    uint64_t total = a64_mem_bytes(in);
+                    int64_t imm = sext((in >> 15) & 0x7f, 7) * (int64_t)(total / 2);
+                    emit_a64_bus_guard_base((in >> 5) & 31, mode == 3 ? imm : 0, total, gpc);
+                }
+            }
+            /* Guard once at the load-exclusive edge.  No call is injected
+               between LDXR/LDXP and STXR/STXP, which would clear the host
+               exclusive monitor; activation cannot publish a new BUS range
+               until this thread reaches the dispatcher. */
+            if ((in & 0x3FC00000u) == 0x08400000u) {
+                uint64_t bytes = UINT64_C(1) << ((in >> 30) & 3);
+                if ((in >> 21) & 1) bytes *= 2;
+                emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
+            }
+            /* DC ZVA writes one synthetic 64-byte D-cache line (matching the
+               CTR_EL0 value exposed above), so it is a real guest store for
+               EOF/BUS purposes even though the opcode is copied natively. */
+            if ((in & 0xFFFFFFE0u) == 0xD50B7420u)
+                emit_a64_bus_guard_base(in & 31, 0, 64, gpc);
         }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);

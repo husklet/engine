@@ -1,6 +1,7 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 #include "../host/range.h"
+#include "bus.h"
 
 // ---------------- syscalls ----------------
 // ---------------- threads & futex ----------------
@@ -319,6 +320,144 @@ static struct {
 static int g_ngro;
 static void gro_clear(uint64_t lo, uint64_t hi);
 
+struct guest_bus_range { uint64_t lo, hi; };
+static struct guest_bus_range g_gbus[GNA_MAX];
+static _Atomic int g_ngbus;
+static _Atomic uint64_t g_bus_generation = 1;
+static atomic_flag g_bus_lock = ATOMIC_FLAG_INIT;
+static int g_bus_fail_closed;
+static uint32_t g_bus_prepares;
+static hl_linux_bus_change_fn g_bus_callback;
+static void *g_bus_callback_opaque;
+static pthread_once_t g_bus_atfork_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_bus_transition = PTHREAD_MUTEX_INITIALIZER;
+static void gbus_clear(uint64_t lo, uint64_t hi);
+static int gbus_clear_locked(uint64_t lo, uint64_t hi) {
+    int changed = 0;
+    for (int index = 0; index < g_ngbus;) {
+        uint64_t base = g_gbus[index].lo, end = g_gbus[index].hi;
+        if (lo >= end || hi <= base) { index++; continue; }
+        changed = 1;
+        int head = base < lo, tail = hi < end;
+        if (!head && !tail) { g_gbus[index] = g_gbus[--g_ngbus]; continue; }
+        if (head) g_gbus[index].hi = lo; else g_gbus[index].lo = hi;
+        if (head && tail) {
+            if (g_ngbus < GNA_MAX) g_gbus[g_ngbus++] = (struct guest_bus_range){hi, end};
+            else g_bus_fail_closed = 1;
+        }
+        index++;
+    }
+    return changed;
+}
+
+static void gbus_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_bus_lock, memory_order_acquire)) sched_yield();
+}
+static void gbus_unlock(void) { atomic_flag_clear_explicit(&g_bus_lock, memory_order_release); }
+static void gbus_atfork_prepare(void) { pthread_mutex_lock(&g_bus_transition); gbus_lock(); }
+static void gbus_atfork_parent(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
+static void gbus_atfork_child(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
+static void gbus_atfork_install(void) { (void)pthread_atfork(gbus_atfork_prepare, gbus_atfork_parent, gbus_atfork_child); }
+static void gbus_notify(uint64_t generation, int active) {
+    gbus_lock();
+    hl_linux_bus_change_fn callback = g_bus_callback;
+    void *opaque = g_bus_callback_opaque;
+    gbus_unlock();
+    if (callback != NULL) callback(opaque, generation, active);
+}
+
+static void gbus_prepare(void) {
+    (void)pthread_once(&g_bus_atfork_once, gbus_atfork_install);
+    pthread_mutex_lock(&g_bus_transition);
+    gbus_lock();
+    int was_active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    if (g_bus_prepares != UINT32_MAX)
+        g_bus_prepares++;
+    else
+        g_bus_fail_closed = 1;
+    uint64_t generation = !was_active ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
+                                      : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
+    gbus_unlock();
+    if (!was_active) gbus_notify(generation, 1); /* synchronous STW before host mapping publication */
+    /* Keep the transition lock through host publication and commit/release. This serializes
+       concurrent mapping transactions and prevents fork from inheriting an orphan prepare token. */
+}
+
+static void gbus_prepare_release(void) {
+    gbus_lock();
+    if (g_bus_prepares != 0) g_bus_prepares--;
+    int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    uint64_t generation = !active ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
+                                  : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
+    gbus_unlock();
+    if (!active) gbus_notify(generation, 0);
+    pthread_mutex_unlock(&g_bus_transition);
+}
+
+void hl_linux_bus_set_change_callback(hl_linux_bus_change_fn callback, void *opaque) {
+    gbus_lock();
+    g_bus_callback_opaque = opaque;
+    g_bus_callback = callback;
+    uint64_t generation = atomic_load_explicit(&g_bus_generation, memory_order_acquire);
+    int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    gbus_unlock();
+    if (callback != NULL) callback(opaque, generation, active);
+}
+
+static int gbus_add(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return 0;
+    (void)pthread_once(&g_bus_atfork_once, gbus_atfork_install);
+    gbus_lock();
+    (void)gbus_clear_locked(lo, hi);
+    int ok = g_ngbus < GNA_MAX;
+    if (ok)
+        g_gbus[g_ngbus++] = (struct guest_bus_range){lo, hi};
+    else
+        g_bus_fail_closed = 1;
+    uint64_t generation = atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1;
+    int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    gbus_unlock();
+    gbus_notify(generation, active);
+    return ok ? 0 : -1;
+}
+
+static void gbus_clear(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    gbus_lock();
+    int changed = gbus_clear_locked(lo, hi);
+    uint64_t generation = changed ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
+                                  : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
+    int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    gbus_unlock();
+    if (changed) gbus_notify(generation, active);
+}
+
+uint64_t hl_linux_bus_fault(uint64_t address, uint64_t length) {
+    if (length == 0) return 0;
+    if (address > UINT64_MAX - length) return address != 0 ? address : 1;
+    uint64_t end = address + length;
+    gbus_lock();
+    if (g_bus_fail_closed) { gbus_unlock(); return address != 0 ? address : 1; }
+    for (int index = 0; index < g_ngbus; ++index)
+        if (address < g_gbus[index].hi && end > g_gbus[index].lo) {
+            uint64_t fault = address > g_gbus[index].lo ? address : g_gbus[index].lo;
+            gbus_unlock();
+            return fault != 0 ? fault : 1;
+        }
+    gbus_unlock();
+    return 0;
+}
+
+int hl_linux_bus_hit(uint64_t address, uint64_t length) { return hl_linux_bus_fault(address, length) != 0; }
+
+uint64_t hl_linux_bus_generation(void) { return atomic_load_explicit(&g_bus_generation, memory_order_acquire); }
+int hl_linux_bus_active(void) {
+    gbus_lock();
+    int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    gbus_unlock();
+    return active;
+}
+
 static void gna_add(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     gna_clear(lo, hi); // coalesce: drop any prior coverage so re-marking never double-counts
@@ -416,6 +555,17 @@ static int gro_hit(uint64_t a, uint64_t len) {
 static void gna_reset(void) {
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_bus_transition);
+    gbus_lock();
+    int changed = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    atomic_store_explicit(&g_ngbus, 0, memory_order_release);
+    g_bus_fail_closed = 0;
+    g_bus_prepares = 0;
+    uint64_t generation = changed ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
+                                  : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
+    gbus_unlock();
+    if (changed) gbus_notify(generation, 0);
+    pthread_mutex_unlock(&g_bus_transition);
 }
 
 // True iff host virtual address `a` is currently mapped. mincore() is useless on macOS (returns 0 for ANY
@@ -506,7 +656,7 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     if (end < a) return 0; // wrap -> bogus pointer
     // A guest PROT_NONE mapping is physically R+W under hl (see the g_gna registry above), so the page
     // probe below would call it mapped; the kernel's copy_to/from_user faults it. Reject up front.
-    if (gna_hit((uint64_t)a, (uint64_t)len)) return 0;
+    if (gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
     uintptr_t lo = a & ~(uintptr_t)0xfff;
     if (g_hrm_slow < 0) g_hrm_slow = 0;
     if (g_hrm_slow) {

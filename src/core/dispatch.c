@@ -1,5 +1,35 @@
 // Engine host<->guest boundary: entry trampoline + run_guest() dispatcher loop.
 
+static jit_guest_bus_query g_guest_bus_query;
+static _Atomic uint64_t g_guest_bus_generation;
+static _Atomic int g_guest_bus_enabled;
+static _Atomic int g_guest_bus_cache_dirty;
+
+void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
+    uint64_t seen = atomic_load_explicit(&g_guest_bus_generation, memory_order_acquire);
+    (void)opaque;
+    while (generation > seen && !atomic_compare_exchange_weak_explicit(&g_guest_bus_generation, &seen, generation,
+                                                                        memory_order_acq_rel, memory_order_acquire)) {}
+    if (generation < seen) return;
+    int was_active = atomic_load_explicit(&g_guest_bus_enabled, memory_order_acquire);
+    /* Publish first; the activation gate prevents any peer from entering a block
+       until every old translation has been retired. */
+    atomic_store_explicit(&g_guest_bus_enabled, active != 0, memory_order_release);
+    if (active && !was_active)
+        stw_force_dispatch_flush();
+    atomic_store_explicit(&g_guest_bus_cache_dirty, active ? 0 : 1, memory_order_release);
+}
+
+void jit_guest_bus_bind(jit_guest_bus_query query, int active, uint64_t generation) {
+    g_guest_bus_query = query;
+    jit_guest_bus_changed(NULL, generation, active);
+}
+
+int jit_guest_bus_active(void) { return atomic_load_explicit(&g_guest_bus_enabled, memory_order_acquire); }
+uint64_t jit_guest_bus_fault(uint64_t address, uint64_t size) {
+    return g_guest_bus_query != NULL ? g_guest_bus_query(address, size) : 0;
+}
+
 // ---------------- host entry trampoline ----------------
 // run_block(cpu, code): save host callee-saved into cpu, set env=x28, jump to code.
 // The block tail-calls block_return, which restores host state and returns here's
@@ -87,7 +117,7 @@ static void run_guest(struct cpu *c) {
     // Join the stop-the-world thread registry so a peer's cache-full flush can quiesce us at a safepoint
     // (and so we are enumerated when WE flush). Unregistered after the loop -> an exited thread is never
     // signalled.
-    stw_register();
+    stw_register(c);
     // Join the tid->thread registry so a tkill()/tgkill() to this thread can find it (thread-directed
     // signal delivery via cpu->tpending); left at loop exit so a dead thread is never targeted.
     thread_register(c);
@@ -124,6 +154,19 @@ static void run_guest(struct cpu *c) {
         // that makes a peer thread's freshly-emitted+icache-flushed code visible.
         // Single-threaded skips the lock entirely (g_threaded == 0).
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
+        if (atomic_exchange_explicit(&g_guest_bus_cache_dirty, 0, memory_order_acq_rel)) {
+            if (g_threaded && stw_peers_live()) {
+                stw_flush();
+            } else {
+                jit_wprot(0);
+                g_cp = g_cache;
+                memset(g_map, 0, sizeof g_map);
+                memset(g_ibtc, 0, sizeof g_ibtc);
+                g_npend = 0;
+                G_SHADOW_CLEAR(c);
+                jit_wprot(1);
+            }
+        }
         void *code = map_host(G_PC(c));
         if (!code) {
             uint64_t _t0 =
@@ -188,6 +231,7 @@ static void run_guest(struct cpu *c) {
         // that was current under the lock -- so J_RX(code) must use the matching g_rw2rx. (Single-threaded
         // takes no lock and cannot race a flush; the computation is identical.)
         void *rxcode = J_RX(code);
+        uint64_t selected_bus_epoch = atomic_load_explicit(&g_dispatch_request, memory_order_acquire);
         // Publish the generation of the cache we are about to execute so a peer's stop-the-world flush can
         // reclaim a retired cache only once no thread is still running in it (see reclaim_retired). Done
         // under g_jit_lock (a flush holds it) so the value is consistent with g_cache_gen; threaded-only,
@@ -198,8 +242,10 @@ static void run_guest(struct cpu *c) {
         G_TRACE_DUMP(c);
         c->reason = 0;
         hl_dispatch_profile_crossing(&g_dispatch_profile);
+        if (!stw_before_translated(selected_bus_epoch)) continue;
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
         run_block(c, rxcode);
+        stw_after_translated();
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);

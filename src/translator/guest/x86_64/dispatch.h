@@ -323,6 +323,10 @@ static int smc_on_write(uint64_t a) {
         (c)->exit_code = 128 + ((int)((c)->divop & 0xff));                                                             \
         break;                                                                                                         \
     }                                                                                                                  \
+    if ((c)->reason == R_BUS) {                                                                                        \
+        if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
+        break;                                                                                                         \
+    }                                                                                                                  \
     if ((c)->reason == R_SYSCALL) {                                                                                    \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \

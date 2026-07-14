@@ -90,6 +90,8 @@ struct cpu {
     // pushfq(9C). Formerly DF was translate-time-only (g_df), which ran a cross-block `std; rep movs` FORWARD.
     // 0 = forward (SysV ABI entry invariant; zero-initialized cpu => forward by default), 1 = backward.
     uint64_t df;
+    /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
+    uint64_t fault_addr;
 };
 
 #define OFF_FCPTR ((int)__builtin_offsetof(struct cpu, fastclk_ptr))
@@ -191,6 +193,8 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 // offset 32+. cpu->x87_ea carries the FXSAVE area base. See x86_ops.c do_fxsave()/do_fxrstor().
 #define R_FXSAVE 15
 #define R_FXRSTOR 16
+#define R_BUS 17
+#define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
 
 enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
 

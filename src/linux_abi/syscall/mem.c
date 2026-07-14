@@ -168,6 +168,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // physical release below is partial -- the guest's mapping is logically gone either way.
         gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
         gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+        gbus_clear(a0, a0 + a1);
         // A non-fixed anon mapping carries a 64 KB guard tail that mmap (case 222) reserved
         // past the guest's logical length (so glibc's vectorized over-reads land in mapped memory).
         // The guest only knows its logical length a1, so a plain munmap(a0, a1) leaves that tail mapped
@@ -442,6 +443,18 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t hp = (size_t)getpagesize();
         void *r;
         int off_emul = 0;
+        uint64_t bus_accessible = a1;
+        int bus_prepared = 0;
+        if (!(a3 & 0x20) && (a3 & 0x02) && (int)a4 >= 0) {
+            struct stat metadata;
+            if (fstat((int)a4, &metadata) == 0) {
+                uint64_t available = (uint64_t)metadata.st_size > a5 ? (uint64_t)metadata.st_size - a5 : 0;
+                bus_accessible = available > UINT64_MAX - UINT64_C(4095)
+                                     ? UINT64_MAX
+                                     : (available + UINT64_C(4095)) & ~UINT64_C(4095);
+                if (bus_accessible < a1) { gbus_prepare(); bus_prepared = 1; }
+            }
+        }
         uint64_t pc_hint = 0;
         (void)pc_hint;
         // checkpoint/restore: hint a kernel-placed (a0==0), non-fixed guest map into the deterministic high
@@ -580,12 +593,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 r = fr;                        // mapping now lives at the requested cage-relative hint
             }
         }
+        if (bus_prepared) {
+            if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1);
+            if (r != MAP_FAILED && gbus_add((uint64_t)(uintptr_t)r + bus_accessible,
+                                            (uint64_t)(uintptr_t)r + a1) != 0) {
+                munmap(r, (size_t)a1 + guard);
+                r = MAP_FAILED;
+                errno = ENOMEM;
+            }
+            gbus_prepare_release();
+        }
         // refund
         if (r == MAP_FAILED && charge) {
             atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
             acct_publish_mem(); // publish the refunded charge into this process's cross-process slot
         }
         if (r != MAP_FAILED) {
+            if (!bus_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             gmap_set_glen((uint64_t)r, (uint64_t)a1);    // /proc maps report the guest length (sans guard)
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently

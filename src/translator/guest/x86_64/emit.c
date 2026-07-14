@@ -699,6 +699,37 @@ static void emit_spill(void) {
     e_str(31, 28, OFF_VDIRTY); // full spill republishes cpu->V -> clear the dirty flag (str xzr)
 }
 
+static void emit_reload_full(void) {
+    e_nzcv_load();
+    for (int t = 0; t < 16; t += 2) e_ldp_q(t, t + 1, 28, OFF_V + t * 16);
+    for (int r = 1; r <= 15; ++r) e_ldr(r, 28, R_OFF(r));
+    e_ldr(0, 28, R_OFF(0));
+}
+
+/* Emitted only in BUS-active translation generations. */
+static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
+    if (!jit_guest_bus_active()) return;
+    e_str(address_register, 28, OFF_FAULT_ADDR);
+    emit_spill();
+    e_ldr(0, 28, OFF_FAULT_ADDR);
+    e_movconst(1, size);
+    emit_host_ptr(16, (uint64_t)(uintptr_t)&jit_guest_bus_fault, PRELOC_HOSTGLOBAL);
+    emit32(0xD63F0000u | (16 << 5));
+    uint32_t *clear = (uint32_t *)g_cp;
+    emit32(0);
+    e_str(0, 28, OFF_FAULT_ADDR);
+    e_movconst(16, rip);
+    e_str(16, 28, OFF_RIP);
+    e_movconst(16, R_BUS);
+    e_str(16, 28, OFF_RSN);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+    uint8_t *resume = g_cp;
+    *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7FFFF) << 5);
+    emit_reload_full();
+    e_ldr(address_register, 28, OFF_FAULT_ADDR);
+}
+
 static void emit_exit_const(uint64_t rip, uint64_t reason) {
     // a plain R_SYSCALL exit skips the xmm spill WHEN cpu->V is current (cpu->vdirty==0); else
     // full. Runtime check (blocks chain without spilling). x16 is engine scratch here (guest is x0..x15).
