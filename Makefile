@@ -130,8 +130,8 @@ MEMORY_CASE_SOURCES := $(sort $(wildcard tests/compat/memory/*.c))
 MEMORY_CASE_NAMES := $(basename $(notdir $(MEMORY_CASE_SOURCES)))
 MEMORY_CASE_BINS := $(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/aarch64/%) \
 	$(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/x86_64/%)
-FILESYSTEM_CASE_SOURCES := $(sort $(wildcard tests/compat/filesystem/*.c))
-FILESYSTEM_CASE_NAMES := $(basename $(notdir $(FILESYSTEM_CASE_SOURCES)))
+FILESYSTEM_CASE_SOURCES := $(sort $(wildcard tests/compat/filesystem/*.c tests/compat/filesystem/*/*.c))
+FILESYSTEM_CASE_NAMES := $(patsubst tests/compat/filesystem/%.c,%,$(FILESYSTEM_CASE_SOURCES))
 FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aarch64/%) \
 	$(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/x86_64/%)
 SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
@@ -412,6 +412,22 @@ $(BUILD)/compat/signals/aarch64/%: tests/compat/signals/%.c
 	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/signals/x86_64/%: tests/compat/signals/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/filesystem/aarch64/dentry/%: tests/compat/filesystem/dentry/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/filesystem/x86_64/dentry/%: tests/compat/filesystem/dentry/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/filesystem/aarch64/pcachex/%: tests/compat/filesystem/pcachex/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/filesystem/x86_64/pcachex/%: tests/compat/filesystem/pcachex/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
