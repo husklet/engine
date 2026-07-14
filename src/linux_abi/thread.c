@@ -339,6 +339,9 @@ static _Atomic int g_bus_filter_force;
 static _Atomic uint64_t g_bus_page_filter[BUS_FILTER_WORDS];
 static hl_linux_bus_change_fn g_bus_callback;
 static void *g_bus_callback_opaque;
+static hl_linux_bus_transition_fn g_bus_transition_begin;
+static hl_linux_bus_transition_fn g_bus_transition_end;
+static void *g_bus_transition_opaque;
 static pthread_once_t g_bus_atfork_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_bus_transition = PTHREAD_MUTEX_INITIALIZER;
 static void gbus_clear(uint64_t lo, uint64_t hi);
@@ -571,6 +574,7 @@ static void gbus_prepare(void) {
        before that peer can acknowledge the STW.  The caller has not changed
        the host mapping yet, so the old empty answer remains correct. */
     if (!was_active) gbus_notify(generation, 1);
+    if (g_bus_transition_begin != NULL) g_bus_transition_begin(g_bus_transition_opaque);
     gbus_lock();
     /* From this point through host mapping publication and ledger commit,
        already-guarded code must use the precise transition path. */
@@ -599,6 +603,7 @@ static void gbus_prepare_release(void) {
     gbus_unlock();
     atomic_store_explicit(&g_bus_filter_force, active ? 1 : 0, memory_order_release);
     if (!active) gbus_notify(generation, 0);
+    if (g_bus_transition_end != NULL) g_bus_transition_end(g_bus_transition_opaque);
     pthread_mutex_unlock(&g_bus_transition);
 }
 
@@ -634,6 +639,15 @@ void hl_linux_bus_set_change_callback(hl_linux_bus_change_fn callback, void *opa
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
     gbus_unlock();
     if (callback != NULL) callback(opaque, generation, active);
+}
+
+void hl_linux_bus_set_transition_callbacks(hl_linux_bus_transition_fn begin, hl_linux_bus_transition_fn end,
+                                           void *opaque) {
+    pthread_mutex_lock(&g_bus_transition);
+    g_bus_transition_begin = begin;
+    g_bus_transition_end = end;
+    g_bus_transition_opaque = opaque;
+    pthread_mutex_unlock(&g_bus_transition);
 }
 
 static int gbus_add(uint64_t lo, uint64_t hi) {

@@ -853,6 +853,44 @@ static void stw_force_dispatch_flush(void) {
     pthread_mutex_unlock(&g_jit_lock);
 }
 
+/* Hold every translated peer at a dispatcher boundary while a host mapping
+   and its BUS ledger are changed as one transaction.  Unlike cache rotation,
+   this preserves the current arena: only the mapping publisher is active
+   until stw_mapping_end releases the gate. */
+static void stw_mapping_begin(void) {
+    pthread_t me = pthread_self();
+    pthread_mutex_lock(&g_jit_lock);
+    uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        if (pthread_equal(g_stw_threads[i].th, me))
+            atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
+        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire))
+            pthread_kill(g_stw_threads[i].th, STW_SIG);
+    }
+    for (;;) {
+        int pending = 0;
+        for (int i = 0; i < STW_MAXTHREAD; i++)
+            if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
+                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
+                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) < request) {
+                pending = 1;
+                break;
+            }
+        if (!pending) break;
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void stw_mapping_end(void) {
+    atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
+    pthread_mutex_unlock(&g_stw_reg_lock);
+    pthread_mutex_unlock(&g_jit_lock);
+}
+
 // # of OTHER live guest threads (excludes the caller). 0 -> the cheap in-place flush is safe.
 static int stw_peers_live(void) {
     pthread_t me = pthread_self();

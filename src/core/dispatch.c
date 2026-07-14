@@ -31,6 +31,16 @@ uint64_t jit_guest_bus_fault(uint64_t address, uint64_t size) {
     return g_guest_bus_query != NULL ? g_guest_bus_query(address, size) : 0;
 }
 
+void jit_guest_bus_transition_begin(void *opaque) {
+    (void)opaque;
+    stw_mapping_begin();
+}
+
+void jit_guest_bus_transition_end(void *opaque) {
+    (void)opaque;
+    stw_mapping_end();
+}
+
 // ---------------- host entry trampoline ----------------
 // run_block(cpu, code): save host callee-saved into cpu, set env=x28, jump to code.
 // The block tail-calls block_return, which restores host state and returns here's
