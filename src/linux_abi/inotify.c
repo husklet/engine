@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 enum { HL_LINUX_OBJECT_INOTIFY = 0x696e6f74u };
 
@@ -21,6 +22,8 @@ typedef struct inotify_watch {
 } inotify_watch;
 
 typedef struct inotify_object {
+    pthread_mutex_t snapshot_lock;
+    uint64_t mutation_epoch;
     const hl_linux_inotify_provider_ops *provider;
     void *provider_context;
     inotify_watch *watches;
@@ -32,6 +35,16 @@ typedef struct inotify_object {
     int32_t next_wd;
     uint32_t nonblocking;
 } inotify_object;
+
+static void mutation_begin(inotify_object *object) {
+    pthread_mutex_lock(&object->snapshot_lock);
+    object->mutation_epoch++;
+}
+
+static void mutation_end(inotify_object *object) {
+    object->mutation_epoch++;
+    pthread_mutex_unlock(&object->snapshot_lock);
+}
 
 static int64_t inotify_error(hl_status status) {
     switch (status) {
@@ -96,9 +109,17 @@ static hl_status inotify_pump(inotify_object *object) {
     hl_linux_inotify_provider_event events[32];
     uint32_t count = 0;
     uint32_t index;
-    hl_status status = object->provider->drain(object->provider_context, events, 32, &count);
-    if (status == HL_STATUS_WOULD_BLOCK) return HL_STATUS_OK;
-    if (status != HL_STATUS_OK) return status;
+    hl_status status;
+    mutation_begin(object);
+    status = object->provider->drain(object->provider_context, events, 32, &count);
+    if (status == HL_STATUS_WOULD_BLOCK) {
+        mutation_end(object);
+        return HL_STATUS_OK;
+    }
+    if (status != HL_STATUS_OK) {
+        mutation_end(object);
+        return status;
+    }
     for (index = 0; index < count; ++index) {
         inotify_watch *watch = watch_token(object, events[index].token);
         uint32_t mask;
@@ -109,7 +130,10 @@ static hl_status inotify_pump(inotify_object *object) {
             continue;
         status = queue_event(object, watch == NULL ? -1 : watch->wd, mask, events[index].cookie, events[index].name,
                              events[index].name_size);
-        if (status != HL_STATUS_OK) return status;
+        if (status != HL_STATUS_OK) {
+            mutation_end(object);
+            return status;
+        }
         if (watch != NULL && ((watch->mask & HL_LINUX_IN_ONESHOT) != 0 || (mask & HL_LINUX_IN_IGNORED) != 0)) {
             int32_t wd = watch->wd;
             uint64_t token = watch->token;
@@ -117,12 +141,16 @@ static hl_status inotify_pump(inotify_object *object) {
             if ((mask & HL_LINUX_IN_IGNORED) == 0) {
                 (void)object->provider->remove(object->provider_context, token);
                 status = queue_event(object, wd, HL_LINUX_IN_IGNORED, 0, NULL, 0);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    mutation_end(object);
+                    return status;
+                }
             }
             free(watch->path);
             object->watches[position] = object->watches[--object->watch_count];
         }
     }
+    mutation_end(object);
     return HL_STATUS_OK;
 }
 
@@ -139,6 +167,7 @@ static int64_t inotify_read(void *opaque, void *buffer, size_t size) {
     }
     if (object->queue_size == 0) return -HL_LINUX_EAGAIN;
     if (size < 16) return -HL_LINUX_EINVAL;
+    mutation_begin(object);
     while (offset + 16 <= object->queue_size) {
         uint32_t length;
         size_t record;
@@ -147,76 +176,107 @@ static int64_t inotify_read(void *opaque, void *buffer, size_t size) {
         if (record > size - offset) break;
         offset += record;
     }
-    if (offset == 0) return -HL_LINUX_EINVAL;
+    if (offset == 0) {
+        mutation_end(object);
+        return -HL_LINUX_EINVAL;
+    }
     memcpy(buffer, object->queue, offset);
     object->queue_size -= offset;
     if (object->queue_size != 0) memmove(object->queue, object->queue + offset, object->queue_size);
+    mutation_end(object);
     return (int64_t)offset;
 }
 
 static uint32_t inotify_ready(void *opaque, uint32_t interests) {
     inotify_object *object = opaque;
+    uint32_t ready;
     if ((interests & HL_LINUX_READY_READ) == 0) return 0;
     if (object->queue_size == 0) (void)inotify_pump(object);
-    return object->queue_size != 0 || object->provider->readiness(object->provider_context) != 0 ? HL_LINUX_READY_READ
-                                                                                                 : 0;
+    pthread_mutex_lock(&object->snapshot_lock);
+    ready = object->queue_size != 0 || object->provider->readiness(object->provider_context) != 0;
+    pthread_mutex_unlock(&object->snapshot_lock);
+    return ready != 0 ? HL_LINUX_READY_READ : 0;
 }
 
 static hl_host_result inotify_wait_handle(void *opaque) {
     inotify_object *object = opaque;
-    return object->provider->wait_handle(object->provider_context);
+    hl_host_result result;
+    pthread_mutex_lock(&object->snapshot_lock);
+    result = object->provider->wait_handle(object->provider_context);
+    pthread_mutex_unlock(&object->snapshot_lock);
+    return result;
 }
 
 static hl_status inotify_subscribe(void *opaque, void (*notify)(void *, uint64_t), void *observer, uint64_t token) {
     inotify_object *object = opaque;
+    hl_status status;
     if (object->provider->subscribe == NULL) return HL_STATUS_NOT_SUPPORTED;
-    return object->provider->subscribe(object->provider_context, notify, observer, token);
+    pthread_mutex_lock(&object->snapshot_lock);
+    status = object->provider->subscribe(object->provider_context, notify, observer, token);
+    pthread_mutex_unlock(&object->snapshot_lock);
+    return status;
 }
 
 static void inotify_unsubscribe(void *opaque, void *observer, uint64_t token) {
     inotify_object *object = opaque;
-    if (object->provider->unsubscribe != NULL) object->provider->unsubscribe(object->provider_context, observer, token);
+    if (object->provider->unsubscribe != NULL) {
+        pthread_mutex_lock(&object->snapshot_lock);
+        object->provider->unsubscribe(object->provider_context, observer, token);
+        pthread_mutex_unlock(&object->snapshot_lock);
+    }
 }
 
 static hl_status inotify_clone(void *opaque, void **out_context) {
     inotify_object *source = opaque;
-    inotify_object *copy = calloc(1, sizeof(*copy));
+    inotify_object *copy;
     uint32_t index;
     hl_status status;
+    copy = calloc(1, sizeof(*copy));
     if (copy == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&copy->snapshot_lock, NULL) != 0) {
+        free(copy);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
+    pthread_mutex_lock(&source->snapshot_lock);
     copy->provider = source->provider;
-    copy->next_wd = source->next_wd;
-    copy->nonblocking = source->nonblocking;
     status = source->provider->clone(source->provider_context, &copy->provider_context);
     if (status != HL_STATUS_OK) {
+        pthread_mutex_unlock(&source->snapshot_lock);
+        pthread_mutex_destroy(&copy->snapshot_lock);
         free(copy);
         return status;
     }
+    copy->next_wd = source->next_wd;
+    copy->nonblocking = source->nonblocking;
+    copy->mutation_epoch = 0;
     if (source->watch_capacity != 0) {
         copy->watches = calloc(source->watch_capacity, sizeof(*copy->watches));
-        if (copy->watches == NULL) goto no_memory;
+        if (copy->watches == NULL) goto no_memory_locked;
         copy->watch_capacity = source->watch_capacity;
         copy->watch_count = source->watch_count;
         for (index = 0; index < source->watch_count; ++index) {
             copy->watches[index] = source->watches[index];
             copy->watches[index].path = malloc(source->watches[index].path_size + 1u);
-            if (copy->watches[index].path == NULL) goto no_memory;
+            if (copy->watches[index].path == NULL) goto no_memory_locked;
             memcpy(copy->watches[index].path, source->watches[index].path, source->watches[index].path_size + 1u);
         }
     }
     if (source->queue_size != 0) {
         copy->queue = malloc(source->queue_size);
-        if (copy->queue == NULL) goto no_memory;
+        if (copy->queue == NULL) goto no_memory_locked;
         memcpy(copy->queue, source->queue, source->queue_size);
         copy->queue_size = copy->queue_capacity = source->queue_size;
     }
+    pthread_mutex_unlock(&source->snapshot_lock);
     *out_context = copy;
     return HL_STATUS_OK;
-no_memory:
+no_memory_locked:
+    pthread_mutex_unlock(&source->snapshot_lock);
     for (index = 0; index < copy->watch_count; ++index)
         free(copy->watches[index].path);
     free(copy->watches);
     (void)copy->provider->close(copy->provider_context);
+    pthread_mutex_destroy(&copy->snapshot_lock);
     free(copy);
     return HL_STATUS_OUT_OF_MEMORY;
 }
@@ -230,11 +290,13 @@ static hl_status inotify_close(void *opaque) {
     free(object->watches);
     free(object->queue);
     status = object->provider->close(object->provider_context);
+    pthread_mutex_destroy(&object->snapshot_lock);
     free(object);
     return status;
 }
 
 static const hl_linux_object_ops inotify_ops = {.read = inotify_read,
+                                                .fork_while_active_safe = 1,
                                                 .readiness = inotify_ready,
                                                 .wait_handle = inotify_wait_handle,
                                                 .subscribe = inotify_subscribe,
@@ -254,6 +316,10 @@ int64_t hl_linux_inotify_create(hl_linux_abi *linux_abi, const hl_linux_inotify_
         return -HL_LINUX_EINVAL;
     object = calloc(1, sizeof(*object));
     if (object == NULL) return -HL_LINUX_ENOMEM;
+    if (pthread_mutex_init(&object->snapshot_lock, NULL) != 0) {
+        free(object);
+        return -HL_LINUX_ENOMEM;
+    }
     object->provider = provider;
     object->provider_context = provider_context;
     object->next_wd = 1;
@@ -262,6 +328,7 @@ int64_t hl_linux_inotify_create(hl_linux_abi *linux_abi, const hl_linux_inotify_
                                      descriptor_flags, &fd);
     if (status != HL_STATUS_OK) {
         (void)provider->close(provider_context);
+        pthread_mutex_destroy(&object->snapshot_lock);
         free(object);
         return inotify_error(status);
     }
@@ -280,6 +347,10 @@ int64_t hl_linux_inotify_create_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
         return -HL_LINUX_EINVAL;
     object = calloc(1, sizeof(*object));
     if (object == NULL) return -HL_LINUX_ENOMEM;
+    if (pthread_mutex_init(&object->snapshot_lock, NULL) != 0) {
+        free(object);
+        return -HL_LINUX_ENOMEM;
+    }
     object->provider = provider;
     object->provider_context = provider_context;
     object->next_wd = 1;
@@ -288,6 +359,7 @@ int64_t hl_linux_inotify_create_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
                                         status_flags, descriptor_flags);
     if (status != HL_STATUS_OK) {
         (void)provider->close(provider_context);
+        pthread_mutex_destroy(&object->snapshot_lock);
         free(object);
         return inotify_error(status);
     }
@@ -311,6 +383,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
         return -HL_LINUX_EINVAL;
     }
     object = pin.context;
+    mutation_begin(object);
     for (index = 0; index < object->watch_count; ++index)
         if (object->watches[index].path_size == path_size && !memcmp(object->watches[index].path, path, path_size)) {
             watch = &object->watches[index];
@@ -319,6 +392,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
     if (watch != NULL) {
         uint32_t previous;
         if ((mask & HL_LINUX_IN_MASK_CREATE) != 0) {
+            mutation_end(object);
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_EEXIST;
         }
@@ -335,6 +409,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
             uint32_t capacity = object->watch_capacity == 0 ? 8u : object->watch_capacity * 2u;
             grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
             if (grown == NULL) {
+                mutation_end(object);
                 hl_linux_object_unpin(&pin);
                 return -HL_LINUX_ENOMEM;
             }
@@ -343,6 +418,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
         }
         saved = malloc(path_size + 1u);
         if (saved == NULL) {
+            mutation_end(object);
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_ENOMEM;
         }
@@ -350,6 +426,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
         saved[path_size] = 0;
         if (object->next_wd <= 0 || object->next_wd == INT32_MAX) {
             free(saved);
+            mutation_end(object);
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_ENOSYS;
         }
@@ -363,6 +440,7 @@ int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char
         else
             free(saved);
     }
+    mutation_end(object);
     hl_linux_object_unpin(&pin);
     return status == HL_STATUS_OK ? (int64_t)index : inotify_error(status);
 }
@@ -379,8 +457,10 @@ int64_t hl_linux_inotify_remove(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t
         return -HL_LINUX_EINVAL;
     }
     object = pin.context;
+    mutation_begin(object);
     watch = watch_id(object, wd);
     if (watch == NULL) {
+        mutation_end(object);
         hl_linux_object_unpin(&pin);
         return -HL_LINUX_EINVAL;
     }
@@ -392,6 +472,7 @@ int64_t hl_linux_inotify_remove(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t
         object->watches[index] = object->watches[--object->watch_count];
         status = HL_STATUS_OK;
     }
+    mutation_end(object);
     hl_linux_object_unpin(&pin);
     return inotify_error(status);
 }

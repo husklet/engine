@@ -315,14 +315,16 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
         epoll->watches[index].disabled = 0;
         pthread_mutex_unlock(&epoll->lock);
     } else if (operation == HL_LINUX_EPOLL_DELETE) {
+        hl_linux_epoll_watch removed;
         if (index < 0) {
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_ENOENT;
         }
-        epoll_unsubscribe(epoll, &epoll->watches[index]);
         pthread_mutex_lock(&epoll->lock);
+        removed = epoll->watches[index];
         epoll->watches[index] = epoll->watches[--epoll->count];
         pthread_mutex_unlock(&epoll->lock);
+        epoll_unsubscribe(epoll, &removed);
     } else {
         hl_linux_object_unpin(&pin);
         return -HL_LINUX_EINVAL;

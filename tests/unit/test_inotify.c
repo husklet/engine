@@ -6,15 +6,17 @@
 #include "../../src/linux_abi/epoll.h"
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
+#include <pthread.h>
 
 typedef struct provider_root {
-    uint32_t adds;
-    uint32_t modifies;
-    uint32_t removes;
-    uint32_t clones;
-    uint32_t closes;
-    uint32_t last_mask;
+    _Atomic uint32_t adds;
+    _Atomic uint32_t modifies;
+    _Atomic uint32_t removes;
+    _Atomic uint32_t clones;
+    _Atomic uint32_t closes;
+    _Atomic uint32_t last_mask;
     hl_status clone_status;
 } provider_root;
 
@@ -27,6 +29,12 @@ typedef struct provider {
     void *observer;
     uint64_t observer_token;
 } provider;
+
+typedef struct fork_stress {
+    hl_linux_abi *abi;
+    hl_linux_fd fd;
+    _Atomic uint32_t failed;
+} fork_stress;
 
 static hl_status provider_add(void *opaque, const char *path, size_t size, uint64_t token, uint32_t mask) {
     provider *state = opaque;
@@ -139,6 +147,37 @@ static void emit(provider *state, uint64_t token, uint32_t mask, uint32_t cookie
     if (state->notify != NULL) state->notify(state->observer, state->observer_token);
 }
 
+static void *mutation_stress_thread(void *opaque) {
+    fork_stress *stress = opaque;
+    unsigned char event[16];
+    for (uint32_t index = 0; index < 200; ++index) {
+        int64_t wd = hl_linux_inotify_add(stress->abi, stress->fd, "/tmp/race", 9, HL_LINUX_IN_CREATE);
+        if (wd <= 0 || hl_linux_inotify_remove(stress->abi, stress->fd, (int32_t)wd) != 0 ||
+            hl_linux_read(stress->abi, stress->fd, event, sizeof(event)) != (int64_t)sizeof(event)) {
+            atomic_store_explicit(&stress->failed, 1, memory_order_release);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void *fork_stress_thread(void *opaque) {
+    fork_stress *stress = opaque;
+    hl_linux_fork_record records[16];
+    for (uint32_t index = 0; index < 200; ++index) {
+        hl_linux_fork_plan plan = {.abi = HL_LINUX_ABI_VERSION,
+                                   .size = sizeof(plan),
+                                   .records = records,
+                                   .capacity = HL_ARRAY_COUNT(records)};
+        if (hl_linux_abi_fork_prepare(stress->abi, &plan) != HL_STATUS_OK ||
+            hl_linux_abi_fork_parent(stress->abi, &plan) != HL_STATUS_OK) {
+            atomic_store_explicit(&stress->failed, 1, memory_order_release);
+            break;
+        }
+    }
+    return NULL;
+}
+
 int main(void) {
     hl_fake_host fake;
     hl_host_services services;
@@ -216,15 +255,33 @@ int main(void) {
     HL_CHECK(value == HL_LINUX_IN_IGNORED && root.removes == 2);
 
     {
+        fork_stress stress = {.abi = &abi, .fd = (hl_linux_fd)alias};
+        pthread_t mutation_thread;
+        pthread_t clone_thread;
+        HL_CHECK(pthread_create(&mutation_thread, NULL, mutation_stress_thread, &stress) == 0);
+        HL_CHECK(pthread_create(&clone_thread, NULL, fork_stress_thread, &stress) == 0);
+        HL_CHECK(pthread_join(mutation_thread, NULL) == 0);
+        HL_CHECK(pthread_join(clone_thread, NULL) == 0);
+        HL_CHECK(atomic_load_explicit(&stress.failed, memory_order_acquire) == 0);
+    }
+
+    {
+        uint32_t clones_before = atomic_load_explicit(&root.clones, memory_order_acquire);
+        uint32_t closes_before = atomic_load_explicit(&root.closes, memory_order_acquire);
         hl_status fork_status = hl_linux_abi_fork_prepare(&abi, &plan);
         HL_CHECK(fork_status == HL_STATUS_OK);
-        HL_CHECK(root.clones == 1);
+        HL_CHECK(root.clones == clones_before + 1u);
+        HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK && root.closes == closes_before + 1u);
     }
-    HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK && root.closes == 1);
+    {
+        uint32_t clones_before = atomic_load_explicit(&root.clones, memory_order_acquire);
+        uint32_t closes_before = atomic_load_explicit(&root.closes, memory_order_acquire);
     root.clone_status = HL_STATUS_OUT_OF_MEMORY;
-    HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OUT_OF_MEMORY && root.clones == 2);
+        HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OUT_OF_MEMORY &&
+                 root.clones == clones_before + 1u);
     root.clone_status = HL_STATUS_OK;
-    HL_CHECK(hl_linux_close(&abi, (hl_linux_fd)alias) == 0 && root.closes == 2);
+        HL_CHECK(hl_linux_close(&abi, (hl_linux_fd)alias) == 0 && root.closes == closes_before + 1u);
+    }
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);
     return EXIT_SUCCESS;
 }
