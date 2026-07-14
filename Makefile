@@ -17,7 +17,7 @@ CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 DEPFLAGS := -MMD -MP
-PRIVATE_HEADERS := src/core/cli.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \
+PRIVATE_HEADERS := src/core/cli.h src/core/target/native.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \
 	src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
@@ -81,7 +81,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi linux_fork range seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
+UNIT_NAMES := affinity arena cli clock codegen config decoder device digest emit fdcache file gmap host_services identity ir launch linux_abi linux_fork native range seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -285,6 +285,11 @@ $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-en
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
+
+$(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_fdcache: tests/unit/test_fdcache.c $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
@@ -1114,9 +1119,14 @@ $(BUILD)/tests/range-macos: tests/unit/test_range.c src/host/range.c src/host/ma
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/range-macos
+$(BUILD)/tests/native-macos: tests/unit/test_native.c $(MAC_LIBS)
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(MAC_LIBS) -o $@
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/range-macos $(BUILD)/tests/native-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
+	$(MAC) $(abspath $(BUILD)/tests/native-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)
