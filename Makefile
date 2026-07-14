@@ -43,7 +43,7 @@ LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c
 	src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
-MACOS_HOST_SOURCES := src/host/macos/host.c
+MACOS_HOST_SOURCES := src/host/macos/host.c src/host/macos/range.c
 COMMON_HOST_SOURCES := src/host/range.c src/host/sync.c
 MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
 MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
@@ -59,7 +59,7 @@ TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
-LINUX_HOST_SOURCES := src/host/linux/host.c $(COMMON_HOST_SOURCES)
+LINUX_HOST_SOURCES := src/host/linux/host.c src/host/linux/range.c $(COMMON_HOST_SOURCES)
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
 ifeq ($(HOST),linux)
@@ -329,7 +329,7 @@ $(BUILD)/tests/test_file: tests/unit/test_file.c src/host/file.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
-$(BUILD)/tests/test_range: tests/unit/test_range.c src/host/range.c
+$(BUILD)/tests/test_range: tests/unit/test_range.c src/host/range.c src/host/linux/range.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -1110,8 +1110,13 @@ $(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/sync.c s
 		src/host/macos/host.c src/host/sync.c src/core/host_services.c src/core/log.c src/host/clock.c \
 		src/host/file.c -o $@
 
-test-macos: $(BUILD)/tests/macos
+$(BUILD)/tests/range-macos: tests/unit/test_range.c src/host/range.c src/host/macos/range.c
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/range-macos
 	$(MAC) $(abspath $<)
+	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)
