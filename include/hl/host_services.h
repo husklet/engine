@@ -12,7 +12,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI_13 13u
 #define HL_HOST_FILE_ABI_14 14u
-#define HL_HOST_FILE_ABI 15u
+#define HL_HOST_FILE_ABI_15 15u
+#define HL_HOST_FILE_ABI 16u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -320,6 +321,8 @@ typedef struct hl_host_file_services {
                                      uint64_t size);
     hl_host_result (*filesystem_metadata)(void *context, hl_host_handle file,
                                           hl_host_filesystem_metadata *output);
+    /* Change only permission bits on an opaque file. Guest ownership virtualization is a Linux-front job. */
+    hl_host_result (*set_permissions)(void *context, hl_host_handle file, uint32_t permissions);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

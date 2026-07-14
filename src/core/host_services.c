@@ -15,7 +15,8 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
     const size_t abi13_size = offsetof(hl_host_file_services, allocate_range);
     return file != NULL &&
            ((file->abi == HL_HOST_FILE_ABI_13 && file->size >= abi13_size) ||
-            (file->abi == HL_HOST_FILE_ABI_14 && file->size >= sizeof(*file)) ||
+            ((file->abi == HL_HOST_FILE_ABI_14 || file->abi == HL_HOST_FILE_ABI_15) &&
+             file->size >= offsetof(hl_host_file_services, set_permissions)) ||
             (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
 }
 
@@ -61,7 +62,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->sync_range == NULL || services->file->sync_filesystem == NULL ||
          services->file->open_beneath == NULL ||
          (services->file->abi == HL_HOST_FILE_ABI &&
-          (services->file->allocate_range == NULL || services->file->filesystem_metadata == NULL))))
+          (services->file->allocate_range == NULL || services->file->filesystem_metadata == NULL ||
+           services->file->set_permissions == NULL))))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

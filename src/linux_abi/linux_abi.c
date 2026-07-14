@@ -136,7 +136,8 @@ static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi
         host->file == NULL ||
         !((host->file->abi == HL_HOST_FILE_ABI_13 &&
            host->file->size >= offsetof(hl_host_file_services, allocate_range)) ||
-          (host->file->abi == HL_HOST_FILE_ABI_14 && host->file->size >= sizeof(*host->file)) ||
+          ((host->file->abi == HL_HOST_FILE_ABI_14 || host->file->abi == HL_HOST_FILE_ABI_15) &&
+           host->file->size >= offsetof(hl_host_file_services, set_permissions)) ||
           (host->file->abi == HL_HOST_FILE_ABI && host->file->size >= sizeof(*host->file))))
         return NULL;
     return host->file;

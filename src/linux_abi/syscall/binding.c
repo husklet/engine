@@ -1461,6 +1461,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             hl_host_result status =
                 g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
             if (status.status == HL_STATUS_OK && metadata.type == HL_HOST_FILE_TYPE_REGULAR)
+                flock_on_close_identity((int)source.fd, metadata.stable_device, metadata.stable_object);
+            if (status.status == HL_STATUS_OK && metadata.type == HL_HOST_FILE_TYPE_REGULAR)
                 poslk_on_close_identity(metadata.stable_device, metadata.stable_object);
         }
         result = hl_linux_close(g_linux_box, source.fd);
@@ -1552,6 +1554,25 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
         if (result == 0 && !host_range_mapped((uintptr_t)a1, GUEST_LINUX_STAT_BYTES)) result = -EFAULT;
+        if (result == 0) {
+            char path[HL_LINUX_PATH_MAX + 1];
+            hl_host_result named = g_host_services->file->path(
+                g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+            if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
+                int uid, gid;
+                struct stat native;
+                path[named.value] = 0;
+                uint64_t dev = status.device, ino = status.object;
+                if (stat(path, &native) == 0) {
+                    dev = (uint64_t)native.st_dev;
+                    ino = (uint64_t)native.st_ino;
+                }
+                if (chown_xattr_get(path, -1, dev, ino, &uid, &gid)) {
+                    if (uid >= 0) status.user = (uint32_t)uid;
+                    if (gid >= 0) status.group = (uint32_t)gid;
+                }
+            }
+        }
         if (result == 0) fill_linux_bound_stat((uint8_t *)(uintptr_t)a1, &status);
         break;
     }
@@ -1616,6 +1637,52 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             bound_mapping_file_data_changed(&source, after.stable_device, after.stable_object);
         }
         if (prepared) gbus_prepare_release();
+        break;
+    }
+    case 52: {
+        if (g_host_services->file->set_permissions == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        hl_host_result status =
+            g_host_services->file->set_permissions(g_host_services->context, source.host_handle, (uint32_t)a1 & 07777u);
+        result = bound_host_error(status.status);
+        if (result == 0) {
+            char path[HL_LINUX_PATH_MAX + 1];
+            hl_host_result named = g_host_services->file->path(
+                g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+            if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
+                path[named.value] = 0;
+                fc_evict_path(path);
+            }
+        }
+        break;
+    }
+    case 55: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        hl_host_result status = g_host_services->file->path(
+            g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+        if (status.status != HL_STATUS_OK || status.value > HL_LINUX_PATH_MAX) {
+            result = bound_host_error(status.status);
+            break;
+        }
+        path[status.value] = 0;
+        chown_xattr_set_path(path, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2, 0);
+        hl_xattr_cache_invalidate();
+        result = 0;
+        break;
+    }
+    case 32: {
+        hl_host_file_metadata metadata;
+        hl_host_result status =
+            g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+        if (status.status != HL_STATUS_OK) {
+            result = bound_host_error(status.status);
+            break;
+        }
+        result = hl_flock_identity((int)source.fd, metadata.stable_device, metadata.stable_object, (int)a1) < 0
+                     ? -(int64_t)errno
+                     : 0;
         break;
     }
     case 23: result = bound_dup_at_least(source.fd, 0, 0); break;
@@ -1755,9 +1822,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 21:           /* epoll_ctl */
     case 22:           /* epoll_pwait */
     case 29:           /* ioctl */
-    case 32:           /* flock */
-    case 52:           /* fchmod */
-    case 55:           /* fchown */
     case 61:           /* getdents64 */
     case 71:           /* sendfile */
     case 75:           /* vmsplice */

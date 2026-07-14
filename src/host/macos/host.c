@@ -961,6 +961,17 @@ static hl_host_result hl_macos_file_set_owner(void *context, hl_host_handle file
     return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_file_set_permissions(void *context, hl_host_handle file, uint32_t permissions) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    int status;
+    if (descriptor < 0 || (permissions & ~07777u) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    do
+        status = fchmod(descriptor, (mode_t)permissions);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append) {
     hl_macos_file *file;
     int descriptor;
@@ -3495,7 +3506,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_sync_filesystem,
                                                hl_macos_file_open_beneath,
                                                hl_macos_file_allocate_range,
-                                               hl_macos_file_filesystem_metadata};
+                                               hl_macos_file_filesystem_metadata,
+                                               hl_macos_file_set_permissions};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

@@ -68,18 +68,16 @@ static int g_nflkcomp;
 // Companion index for the file underlying guest `fd` (opening/caching it on first use). -1 (errno set) on
 // failure. The companion is pushed to a high descriptor so it never collides with the guest's low fds
 // (mirrors engine_fd_reloc); CLOEXEC keeps it out of any real host exec while still inheriting across fork.
-static int flock_companion(int fd) {
-    struct stat st;
-    if (fstat(fd, &st) < 0) return -1;
+static int flock_companion_identity(uint64_t device, uint64_t object) {
     for (int i = 0; i < g_nflkcomp; i++)
-        if (g_flkcomp[i].dev == st.st_dev && g_flkcomp[i].ino == st.st_ino) return i;
+        if ((uint64_t)g_flkcomp[i].dev == device && (uint64_t)g_flkcomp[i].ino == object) return i;
     if (g_nflkcomp >= (int)(sizeof g_flkcomp / sizeof g_flkcomp[0])) {
         errno = ENOLCK;
         return -1;
     }
     mkdir(FLOCK_DIR, 0777);
     char p[80];
-    snprintf(p, sizeof p, FLOCK_DIR "/%llx.%llx", (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+    snprintf(p, sizeof p, FLOCK_DIR "/%llx.%llx", (unsigned long long)device, (unsigned long long)object);
     int c = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
     if (c < 0) return -1;
     int hi = fcntl(c, F_DUPFD_CLOEXEC, 1 << 20);
@@ -88,11 +86,17 @@ static int flock_companion(int fd) {
         close(c);
         c = hi;
     }
-    g_flkcomp[g_nflkcomp].dev = st.st_dev;
-    g_flkcomp[g_nflkcomp].ino = st.st_ino;
+    g_flkcomp[g_nflkcomp].dev = (dev_t)device;
+    g_flkcomp[g_nflkcomp].ino = (ino_t)object;
     g_flkcomp[g_nflkcomp].fd = c;
     g_flkcomp[g_nflkcomp].refs = 0;
     return g_nflkcomp++;
+}
+
+static int flock_companion(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return -1;
+    return flock_companion_identity((uint64_t)st.st_dev, (uint64_t)st.st_ino);
 }
 
 // flock(2): whole-file advisory lock delegated to the companion. Returns 0 or -1 (host errno set); the
@@ -118,6 +122,41 @@ static int hl_flock(int fd, int op) {
         g_flock_type[fd] = (uint8_t)base;
     }
     return r;
+}
+
+static int hl_flock_identity(int fd, uint64_t device, uint64_t object, int op) {
+    int idx = flock_companion_identity(device, object);
+    if (idx < 0) return -1;
+    int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
+    struct flock fl = {.l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+    if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) {
+        errno = EINVAL;
+        return -1;
+    }
+    fl.l_type = base == LOCK_UN ? F_UNLCK : base == LOCK_SH ? F_RDLCK : F_WRLCK;
+    int r = fcntl(comp, base == LOCK_UN || (op & LOCK_NB) ? F_SETLK : F_SETLKW, &fl);
+    if (r == 0 && fd >= 0 && fd < HL_NFD) {
+        if (base == LOCK_UN) {
+            if (g_flock_type[fd] && --g_flkcomp[idx].refs < 0) g_flkcomp[idx].refs = 0;
+            g_flock_type[fd] = 0;
+        } else {
+            if (!g_flock_type[fd]) g_flkcomp[idx].refs++;
+            g_flock_type[fd] = (uint8_t)base;
+        }
+    }
+    return r;
+}
+
+static void flock_on_close_identity(int fd, uint64_t device, uint64_t object) {
+    if (fd < 0 || fd >= HL_NFD || !g_flock_type[fd]) return;
+    g_flock_type[fd] = 0;
+    int idx = flock_companion_identity(device, object);
+    if (idx < 0) return;
+    if (--g_flkcomp[idx].refs <= 0) {
+        g_flkcomp[idx].refs = 0;
+        struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+        (void)fcntl(g_flkcomp[idx].fd, F_SETLK, &fl);
+    }
 }
 
 // close() hook: drop the flock this fd contributed; release the companion lock once its last holder in

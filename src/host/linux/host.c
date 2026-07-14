@@ -1043,6 +1043,21 @@ static hl_host_result hl_linux_file_set_owner(void *context, hl_host_handle file
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handle file, uint32_t permissions) {
+    hl_host_linux *host = context;
+    int descriptor;
+    int status;
+    if ((permissions & ~07777u) != 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    do
+        status = fchmod(descriptor, (mode_t)permissions);
+    while (status != 0 && errno == EINTR);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_read(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {
     hl_host_linux *host = context;
     int descriptor;
@@ -3029,7 +3044,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_sync_filesystem,
                                                hl_linux_file_open_beneath,
                                                hl_linux_file_allocate_range,
-                                               hl_linux_file_filesystem_metadata};
+                                               hl_linux_file_filesystem_metadata,
+                                               hl_linux_file_set_permissions};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,
