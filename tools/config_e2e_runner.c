@@ -83,25 +83,37 @@ static int run_config(const char *bridge, const char *engine, const char *config
 
 int main(int argc, char **argv) {
     char directory[1024];
-    char path[128];
-    int expected_exit;
-    if (argc != 5) {
-        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT\n");
+    char path[1200];
+    int expected_exit, repetitions = 1;
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [REPETITIONS]\n");
         return 2;
     }
     expected_exit = atoi(argv[4]);
+    if (argc == 6) {
+        char *end = NULL;
+        long parsed;
+        errno = 0;
+        parsed = strtol(argv[5], &end, 10);
+        if (errno != 0 || end == argv[5] || *end != 0 || parsed < 1 || parsed > 10000) return 2;
+        repetitions = (int)parsed;
+    }
     if (getcwd(directory, sizeof directory) == NULL) {
         perror("getcwd");
         return 1;
     }
-    if (snprintf(path, sizeof path, "%s/.hl-config-%ld", directory, (long)getpid()) >= (int)sizeof path) {
-        fprintf(stderr, "config path is too long\n");
-        return 1;
+    for (int iteration = 0; iteration < repetitions; ++iteration) {
+        if (snprintf(path, sizeof path, "%s/.hl-config-%ld-%d", directory, (long)getpid(), iteration) >=
+            (int)sizeof path) {
+            fprintf(stderr, "config path is too long\n");
+            return 1;
+        }
+        if (make_config(path, argv[3]) != 0) {
+            perror("make config");
+            unlink(path);
+            return 1;
+        }
+        if (run_config(argv[1], argv[2], path, expected_exit) != 0) return 1;
     }
-    if (make_config(path, argv[3]) != 0) {
-        perror("make config");
-        unlink(path);
-        return 1;
-    }
-    return run_config(argv[1], argv[2], path, expected_exit);
+    return 0;
 }

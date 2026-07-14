@@ -767,6 +767,31 @@ static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
     return hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)value, snapshot) == HL_STATUS_OK;
 }
 
+/* Publish descriptors supplied through the embedding API as logical guest
+ * descriptors too.  In particular, typed stdin/stdout/stderr intentionally
+ * do not occupy native fds 0..2: those numbers remain available to the engine
+ * process itself.  /proc/self/fd must nevertheless describe the supplied
+ * Linux descriptors, not whichever engine-private objects happen to occupy
+ * the same native numbers. */
+static int bound_fdvis_publish_snapshot(int fd, const hl_linux_fd_snapshot *snapshot) {
+    hl_host_file_metadata metadata = {0};
+    uint32_t kind = HL_HOST_FD_OTHER;
+    if (snapshot == NULL || g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->file->metadata == NULL)
+        return proc_fdvis_publish(fd, kind, 0, 0);
+    if (g_host_services->file->metadata(g_host_services->context, snapshot->host_handle, &metadata).status ==
+        HL_STATUS_OK) {
+        if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+            metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+            kind = HL_HOST_FD_FILE;
+        else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+            kind = HL_HOST_FD_PIPE;
+        else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+            kind = HL_HOST_FD_SOCKET;
+    }
+    return proc_fdvis_publish(fd, kind, metadata.stable_device, metadata.stable_object);
+}
+
 static int bound_shadow_reserve(int minimum) {
     int candidate;
     if (g_bound_sentinel < 0 || minimum < 0) {
@@ -869,12 +894,17 @@ static int bound_shadow_activate(void) {
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
-        if (fd < 3) continue;
-        shadow = bound_shadow_install((int)fd);
-        if (shadow != (int)fd) {
-            int error = shadow < 0 ? errno : EBUSY;
-            if (shadow >= 0) close(shadow);
-            errno = error;
+        if (fd >= 3) {
+            shadow = bound_shadow_install((int)fd);
+            if (shadow != (int)fd) {
+                int error = shadow < 0 ? errno : EBUSY;
+                if (shadow >= 0) close(shadow);
+                errno = error;
+                goto activation_failed;
+            }
+        }
+        if (bound_fdvis_publish_snapshot((int)fd, &snapshot) != 0) {
+            errno = ENOSPC;
             goto activation_failed;
         }
     }
@@ -883,8 +913,11 @@ static int bound_shadow_activate(void) {
 activation_failed: {
     int error = errno;
     uint32_t rollback;
-    for (rollback = 3; rollback < fd; ++rollback)
-        if (hl_linux_fd_snapshot_get(g_linux_box, rollback, &snapshot) == HL_STATUS_OK) close((int)rollback);
+    for (rollback = 0; rollback <= fd && rollback < g_linux_box->fd_capacity; ++rollback)
+        if (hl_linux_fd_snapshot_get(g_linux_box, rollback, &snapshot) == HL_STATUS_OK) {
+            proc_fdvis_close((int)rollback);
+            if (rollback >= 3) close((int)rollback);
+        }
     close(g_bound_sentinel);
     g_bound_sentinel = -1;
     errno = error;
@@ -1597,24 +1630,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         int guest_fd = procfd_num((const char *)(uintptr_t)a1);
         hl_linux_fd_snapshot target;
         if (guest_fd >= 0 && bound_snapshot((uint64_t)(uint32_t)guest_fd, &target)) {
-            int native_fd;
-            int borrowed = bound_attachment_borrow(guest_fd, &native_fd);
-            if (borrowed < 0) {
-                G_RET(c) = (uint64_t)(int64_t)borrowed;
-                return 1;
-            }
-            char host_path[4200];
-            int path_status = hl_native_fd_path(native_fd, host_path, sizeof(host_path));
-            if (borrowed > 0) bound_attachment_release(native_fd);
-            /* Pipes, sockets, and anonymous descriptors have no native path. Leave those to the common
-             * proc-fd route, which reports Linux's pipe:[ino], socket:[ino], and anon_inode:[...] targets. */
-            if (path_status != 0) return 0;
-            char guest_path[4200];
-            guest_from_host(host_path, guest_path, sizeof(guest_path));
-            size_t length = strlen(guest_path);
-            if (length > (size_t)a3) length = (size_t)a3;
-            memcpy((void *)(uintptr_t)a2, guest_path, length);
-            G_RET(c) = (uint64_t)length;
+            char target_path[4200];
+            int length = proc_fd_link_pid((int)getpid(), guest_fd, target_path, sizeof target_path);
+            if (length < 0) return 0;
+            size_t copied = (size_t)length > (size_t)a3 ? (size_t)a3 : (size_t)length;
+            memcpy((void *)(uintptr_t)a2, target_path, copied);
+            G_RET(c) = (uint64_t)copied;
             return 1;
         }
     }

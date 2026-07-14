@@ -905,6 +905,15 @@ test-linux-production-core-abi: $(BUILD)/linux-production/hl-engine-linux-x86_64
 	$(BUILD)/tools/linux-matrix --suite $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/core/abi/x86_64 tests/compat/core/abi
 
+.PHONY: test-linux-production-config
+test-linux-production-config: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/tools/config-e2e-runner $(BUILD)/tools/remote-supervisor $(BUILD)/e2e/guest-exit-x86_64
+	$(BUILD)/tools/config-e2e-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42 32
+	$(BUILD)/tools/config-e2e-runner $(abspath $(BUILD)/tools/remote-supervisor) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42 32
+
 LINUX_PRODUCTION_COMPAT_BINS := $(filter %/x86_64/%,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) $(LIBC_CASE_BINS) \
 	$(COMPLETENESS_BINS) $(POSIX_CASE_BINS) $(SYSCALL_CASE_BINS) $(NETWORK_CASE_BINS) $(PROCFS_CASE_BINS) \
 	$(MEMORY_CASE_BINS) $(FILESYSTEM_CASE_BINS) $(SIGNALS_CASE_BINS) $(PROCESS_CASE_BINS) $(TIME_CASE_BINS) \
@@ -916,7 +925,8 @@ define HL_LINUX_PRODUCTION_SUITE
 endef
 
 .PHONY: test-linux-production-full
-test-linux-production-full: $(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/tools/linux-matrix \
+test-linux-production-full: test-linux-production-config $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/tools/linux-matrix \
 	$(LINUX_PRODUCTION_COMPAT_BINS)
 	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/abi/x86_64,tests/compat/abi)
 	$(call HL_LINUX_PRODUCTION_SUITE,$(BUILD)/compat/abi-corpus/x86_64,tests/compat/abi/corpus)

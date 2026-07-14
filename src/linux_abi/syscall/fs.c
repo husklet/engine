@@ -2809,6 +2809,26 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = l;
                 break;
             }
+            /* A descriptor supplied through the engine API may deliberately
+             * have no native descriptor at the same number (typed stdio is
+             * the important case).  Resolve its published logical identity
+             * before inspecting the engine process's unrelated native fd. */
+            {
+                uint32_t kind;
+                uint64_t device, object;
+                if (proc_fdvis_lookup((int)getpid(), pfn, &kind, &device, &object)) {
+                    char target[4200];
+                    int length = proc_fd_link_pid((int)getpid(), pfn, target, sizeof target);
+                    if (length < 0) {
+                        G_RET(c) = (uint64_t)(-ENOENT);
+                    } else {
+                        size_t copied = (size_t)length > bs ? bs : (size_t)length;
+                        memcpy(buf, target, copied);
+                        G_RET(c) = (uint64_t)copied;
+                    }
+                    break;
+                }
+            }
             /* Linux exposes anonymous pipes through native /proc, while macOS has no native fd path for
                them.  Prefer the engine's OFD identity on both hosts so self and peer procfs views report
                the same object.  A named FIFO has no pipe identity and still follows its filesystem path. */
