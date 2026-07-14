@@ -44,7 +44,7 @@
 #define HL_MACOS_DIRECTORY_CAPACITY 128u
 #define HL_MACOS_DIRECTORY_WATCH_CAPACITY 256u
 #define HL_MACOS_WATCH_CAPACITY 128u
-#define HL_MACOS_COUNTER_SUBSCRIPTIONS 128u
+#define HL_MACOS_COUNTER_SUBSCRIPTIONS_INITIAL 128u
 
 typedef struct hl_macos_mapping {
     uint32_t generation;
@@ -138,6 +138,7 @@ typedef struct hl_macos_counter {
 typedef struct hl_macos_counter_subscription {
     uint32_t generation;
     uint32_t active;
+    uint32_t retiring;
     hl_host_handle counter;
     int descriptor;
     int wake[2];
@@ -189,7 +190,8 @@ struct hl_host_macos {
     uint32_t event_capacity;
     hl_macos_counter *counters;
     uint32_t counter_capacity;
-    hl_macos_counter_subscription counter_subscriptions[HL_MACOS_COUNTER_SUBSCRIPTIONS];
+    hl_macos_counter_subscription **counter_subscriptions;
+    uint32_t counter_subscription_capacity;
     hl_macos_transfer *transfers;
     uint32_t transfer_capacity;
     hl_macos_directory *directories;
@@ -3025,11 +3027,28 @@ static hl_host_result hl_macos_counter_subscribe(void *context, hl_host_handle c
         return hl_macos_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
     }
     descriptor = entry == NULL ? -1 : dup(entry->object->readable);
-    for (index = 0; descriptor >= 0 && index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index)
-        if (!host->counter_subscriptions[index].active) {
-            subscription = &host->counter_subscriptions[index];
+    for (index = 0; descriptor >= 0 && index < host->counter_subscription_capacity; ++index)
+        if (host->counter_subscriptions[index] == NULL ||
+            (!host->counter_subscriptions[index]->active && !host->counter_subscriptions[index]->retiring)) {
+            subscription = host->counter_subscriptions[index];
             break;
         }
+    if (descriptor >= 0 && index == host->counter_subscription_capacity) {
+        uint32_t capacity = host->counter_subscription_capacity ? host->counter_subscription_capacity * 2u
+                                                               : HL_MACOS_COUNTER_SUBSCRIPTIONS_INITIAL;
+        void *grown = realloc(host->counter_subscriptions, (size_t)capacity * sizeof(*host->counter_subscriptions));
+        if (grown != NULL) {
+            host->counter_subscriptions = grown;
+            memset(host->counter_subscriptions + host->counter_subscription_capacity, 0,
+                   (size_t)(capacity - host->counter_subscription_capacity) * sizeof(*host->counter_subscriptions));
+            host->counter_subscription_capacity = capacity;
+            subscription = calloc(1, sizeof(*subscription));
+            host->counter_subscriptions[index] = subscription;
+        }
+    } else if (descriptor >= 0 && subscription == NULL) {
+        subscription = calloc(1, sizeof(*subscription));
+        host->counter_subscriptions[index] = subscription;
+    }
     if (subscription != NULL) {
         subscription->generation++;
         if (subscription->generation == 0) subscription->generation = 1;
@@ -3070,15 +3089,20 @@ static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle
     uint32_t index;
     hl_macos_counter_subscription *subscription;
     uint8_t byte = 1;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_SUBSCRIPTION, HL_MACOS_COUNTER_SUBSCRIPTIONS, &index))
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_SUBSCRIPTION, host->counter_subscription_capacity, &index))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
-    subscription = &host->counter_subscriptions[index];
+    subscription = host->counter_subscriptions[index];
+    if (subscription == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     if (!subscription->active || subscription->generation != (uint32_t)(handle >> 32)) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     subscription->active = 0;
+    subscription->retiring = 1;
     pthread_mutex_unlock(&host->lock);
     (void)write(subscription->wake[1], &byte, 1);
     (void)pthread_join(subscription->thread, NULL);
@@ -3088,19 +3112,24 @@ static hl_host_result hl_macos_counter_unsubscribe(void *context, hl_host_handle
     close(subscription->wake[0]);
     close(subscription->wake[1]);
     close(subscription->descriptor);
+    pthread_mutex_lock(&host->lock);
     subscription->counter = HL_HOST_HANDLE_INVALID;
     subscription->notify = NULL;
     subscription->observer = NULL;
+    subscription->retiring = 0;
+    pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
 static void hl_macos_counter_unsubscribe_all(hl_host_macos *host, hl_host_handle counter) {
     uint32_t index;
-    for (index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
+    for (index = 0; index < host->counter_subscription_capacity; ++index) {
         hl_host_handle subscription = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
-        if (host->counter_subscriptions[index].active && host->counter_subscriptions[index].counter == counter)
-            subscription = ((uint64_t)host->counter_subscriptions[index].generation << 32) | (uint64_t)(index + 1u);
+        if (host->counter_subscriptions[index] != NULL && host->counter_subscriptions[index]->active &&
+            host->counter_subscriptions[index]->counter == counter)
+            subscription = hl_macos_handle(HL_MACOS_HANDLE_SUBSCRIPTION, index,
+                                           host->counter_subscriptions[index]->generation);
         pthread_mutex_unlock(&host->lock);
         if (subscription != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_unsubscribe(host, subscription);
     }
@@ -3885,8 +3914,9 @@ static hl_host_result hl_macos_fork_complete(void *context) {
 static hl_host_result hl_macos_fork_child(void *context) {
     hl_host_macos *host = context;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
-    for (uint32_t index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
-        hl_macos_counter_subscription *subscription = &host->counter_subscriptions[index];
+    for (uint32_t index = 0; index < host->counter_subscription_capacity; ++index) {
+        hl_macos_counter_subscription *subscription = host->counter_subscriptions[index];
+        if (subscription == NULL) continue;
         if (!subscription->active) continue;
         hl_host_process_fd_private_remove(subscription->descriptor);
         hl_host_process_fd_private_remove(subscription->wake[0]);
@@ -4168,12 +4198,12 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_mutex_unlock(&host->lock);
     /* Subscription threads may call user code and own three descriptors each.
      * Join them before releasing counters or any storage they can observe. */
-    for (index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
+    for (index = 0; index < host->counter_subscription_capacity; ++index) {
         hl_host_handle handle = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
-        if (host->counter_subscriptions[index].active)
+        if (host->counter_subscriptions[index] != NULL && host->counter_subscriptions[index]->active)
             handle = hl_macos_handle(HL_MACOS_HANDLE_SUBSCRIPTION, index,
-                                     host->counter_subscriptions[index].generation);
+                                     host->counter_subscriptions[index]->generation);
         pthread_mutex_unlock(&host->lock);
         if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_unsubscribe(host, handle);
     }
@@ -4241,6 +4271,8 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
+    for (index = 0; index < host->counter_subscription_capacity; ++index) free(host->counter_subscriptions[index]);
+    free(host->counter_subscriptions);
     free(host->watches);
     free(host->events);
     free(host->files);

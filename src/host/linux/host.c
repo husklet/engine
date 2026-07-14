@@ -35,7 +35,7 @@
 
 #define HL_LINUX_HANDLE_CAPACITY 4096u
 #define HL_LINUX_TIMER_CAPACITY 256u
-#define HL_LINUX_COUNTER_SUBSCRIPTIONS 128u
+#define HL_LINUX_COUNTER_SUBSCRIPTIONS_INITIAL 128u
 
 typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_NONE = 0,
@@ -88,6 +88,7 @@ typedef struct hl_linux_counter_subscription {
     struct hl_host_linux *host;
     uint32_t generation;
     uint32_t active;
+    uint32_t retiring;
     hl_host_handle counter;
     int descriptor;
     int wake[2];
@@ -126,7 +127,8 @@ struct hl_host_linux {
     uint32_t handle_capacity;
     hl_linux_timer_entry *timers;
     uint32_t timer_capacity;
-    hl_linux_counter_subscription counter_subscriptions[HL_LINUX_COUNTER_SUBSCRIPTIONS];
+    hl_linux_counter_subscription **counter_subscriptions;
+    uint32_t counter_subscription_capacity;
 };
 
 static hl_host_result hl_linux_fork_complete(void *context);
@@ -2557,11 +2559,28 @@ static hl_host_result hl_linux_counter_subscribe(void *context, hl_host_handle c
         return hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
     }
     descriptor = entry == NULL ? -1 : dup(entry->descriptor);
-    for (index = 0; descriptor >= 0 && index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index)
-        if (!host->counter_subscriptions[index].active) {
-            subscription = &host->counter_subscriptions[index];
+    for (index = 0; descriptor >= 0 && index < host->counter_subscription_capacity; ++index)
+        if (host->counter_subscriptions[index] == NULL ||
+            (!host->counter_subscriptions[index]->active && !host->counter_subscriptions[index]->retiring)) {
+            subscription = host->counter_subscriptions[index];
             break;
         }
+    if (descriptor >= 0 && index == host->counter_subscription_capacity) {
+        uint32_t capacity = host->counter_subscription_capacity ? host->counter_subscription_capacity * 2u
+                                                               : HL_LINUX_COUNTER_SUBSCRIPTIONS_INITIAL;
+        void *grown = realloc(host->counter_subscriptions, (size_t)capacity * sizeof(*host->counter_subscriptions));
+        if (grown != NULL) {
+            host->counter_subscriptions = grown;
+            memset(host->counter_subscriptions + host->counter_subscription_capacity, 0,
+                   (size_t)(capacity - host->counter_subscription_capacity) * sizeof(*host->counter_subscriptions));
+            host->counter_subscription_capacity = capacity;
+            subscription = calloc(1, sizeof(*subscription));
+            host->counter_subscriptions[index] = subscription;
+        }
+    } else if (descriptor >= 0 && subscription == NULL) {
+        subscription = calloc(1, sizeof(*subscription));
+        host->counter_subscriptions[index] = subscription;
+    }
     if (subscription != NULL) {
         subscription->generation++;
         if (subscription->generation == 0) subscription->generation = 1;
@@ -2600,14 +2619,20 @@ static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle
     hl_linux_counter_subscription *subscription;
     uint8_t byte = 1;
     ssize_t ignored;
-    if (low == 0 || low > HL_LINUX_COUNTER_SUBSCRIPTIONS) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (low == 0 || low > host->counter_subscription_capacity)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
-    subscription = &host->counter_subscriptions[low - 1u];
+    subscription = host->counter_subscriptions[low - 1u];
+    if (subscription == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     if (!subscription->active || subscription->generation != (uint32_t)(handle >> 32)) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     subscription->active = 0;
+    subscription->retiring = 1;
     pthread_mutex_unlock(&host->lock);
     ignored = write(subscription->wake[1], &byte, 1);
     (void)ignored;
@@ -2615,19 +2640,23 @@ static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle
     close(subscription->wake[0]);
     close(subscription->wake[1]);
     close(subscription->descriptor);
+    pthread_mutex_lock(&host->lock);
     subscription->counter = HL_HOST_HANDLE_INVALID;
     subscription->notify = NULL;
     subscription->observer = NULL;
+    subscription->retiring = 0;
+    pthread_mutex_unlock(&host->lock);
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
 static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter) {
     uint32_t index;
-    for (index = 0; index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index) {
+    for (index = 0; index < host->counter_subscription_capacity; ++index) {
         hl_host_handle subscription = HL_HOST_HANDLE_INVALID;
         pthread_mutex_lock(&host->lock);
-        if (host->counter_subscriptions[index].active && host->counter_subscriptions[index].counter == counter)
-            subscription = ((uint64_t)host->counter_subscriptions[index].generation << 32) | (uint64_t)(index + 1u);
+        if (host->counter_subscriptions[index] != NULL && host->counter_subscriptions[index]->active &&
+            host->counter_subscriptions[index]->counter == counter)
+            subscription = ((uint64_t)host->counter_subscriptions[index]->generation << 32) | (uint64_t)(index + 1u);
         pthread_mutex_unlock(&host->lock);
         if (subscription != HL_HOST_HANDLE_INVALID) (void)hl_linux_counter_unsubscribe(host, subscription);
     }
@@ -3157,8 +3186,9 @@ static hl_host_result hl_linux_fork_child(void *context) {
     hl_host_linux *host = context;
     uint32_t index;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
-    for (index = 0; index < HL_LINUX_COUNTER_SUBSCRIPTIONS; ++index) {
-        hl_linux_counter_subscription *subscription = &host->counter_subscriptions[index];
+    for (index = 0; index < host->counter_subscription_capacity; ++index) {
+        hl_linux_counter_subscription *subscription = host->counter_subscriptions[index];
+        if (subscription == NULL) continue;
         if (!subscription->active) continue;
         close(subscription->descriptor);
         close(subscription->wake[0]);
@@ -3362,6 +3392,14 @@ void hl_host_linux_destroy(hl_host_linux *host) {
         pthread_cond_wait(&host->process_changed, &host->lock);
     }
     pthread_mutex_unlock(&host->lock);
+    for (i = 0; i < host->counter_subscription_capacity; ++i) {
+        hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->counter_subscriptions[i] != NULL && host->counter_subscriptions[i]->active)
+            handle = ((uint64_t)host->counter_subscriptions[i]->generation << 32) | (uint64_t)(i + 1u);
+        pthread_mutex_unlock(&host->lock);
+        if (handle != HL_HOST_HANDLE_INVALID) (void)hl_linux_counter_unsubscribe(host, handle);
+    }
     for (i = 0; i < host->handle_capacity; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
@@ -3398,6 +3436,8 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
+    for (i = 0; i < host->counter_subscription_capacity; ++i) free(host->counter_subscriptions[i]);
+    free(host->counter_subscriptions);
     free(host->handles);
     free(host->timers);
     free(host);

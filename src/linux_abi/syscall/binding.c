@@ -2101,7 +2101,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 struct timespec delay = {0, 1000000};
                 nanosleep(&delay, NULL);
             }
-            result = lock_result;
+            /* poslk_apply is shared with the legacy Darwin syscall path and therefore reports native
+             * errno numbers. This typed route bypasses svc_done(), so translate at this boundary. */
+            result = lock_result < 0 ? -hl_linux_errno_from_macos(-lock_result) : lock_result;
         } else {
             result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
         }
