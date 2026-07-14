@@ -1706,6 +1706,25 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
+    case 33: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        if (((mode_t)a2 & S_IFMT) != S_IFIFO || a3 != 0) return 0;
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        if (g_host_services->file->abi != HL_HOST_FILE_ABI ||
+            g_host_services->file->size < sizeof(*g_host_services->file) ||
+            g_host_services->file->make_fifo == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        result = bound_host_error(g_host_services->file
+                                      ->make_fifo(g_host_services->context, source.host_handle, path, path_size,
+                                                  (uint32_t)a2 & 07777u)
+                                      .status);
+        break;
+    }
     case 34: {
         char path[HL_LINUX_PATH_MAX + 1];
         size_t path_size;

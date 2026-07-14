@@ -2010,6 +2010,19 @@ static hl_host_result hl_macos_file_mkdir(void *context, hl_host_handle director
                                                                   : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_file_fifo(void *context, hl_host_handle directory, const char *path,
+                                         size_t path_size, uint32_t permissions) {
+    hl_host_macos *host = context;
+    char local[PATH_MAX];
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local) || (permissions & ~07777u) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size); local[path_size] = 0;
+    int directory_fd = hl_macos_file_directory(host, directory);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return mkfifoat(directory_fd, local, (mode_t)permissions) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
+                                                                   : hl_macos_errno();
+}
+
 static hl_host_result hl_macos_file_symlink(void *context, const char *target, size_t target_size,
                                             hl_host_handle directory, const char *path, size_t path_size) {
     hl_host_macos *host = context;
@@ -4083,7 +4096,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_read_directory,
                                                hl_macos_file_mkdir,
                                                hl_macos_file_symlink,
-                                               hl_macos_file_link};
+                                               hl_macos_file_link,
+                                               hl_macos_file_fifo};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

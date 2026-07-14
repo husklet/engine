@@ -265,6 +265,17 @@ int main(void) {
     malformed_file.size = sizeof(malformed_file);
     malformed_file.make_link = NULL;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI_19;
+    malformed_file.size = (uint32_t)offsetof(hl_host_file_services, make_fifo);
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_OK);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.make_fifo = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
 
     truncated = services;
     truncated.size = 8;
