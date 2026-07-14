@@ -37,12 +37,15 @@
 
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
+#include "hl/macos.h"
 #include "../launch.h"
 #include "../options.h"
 #include "../cli.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
 static const hl_host_services *g_host_services;
+static hl_host_macos *g_native_host;
+static hl_host_services g_jit_services;
 static hl_linux_abi *g_linux_box;
 static uint64_t g_host_launch_monotonic_ns;
 
@@ -57,6 +60,25 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/container/state.c"
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
+
+static int jit_host_bind(const hl_host_services *host) {
+    if (g_jit_services.abi != 0) {
+        if (host != NULL)
+            return host->context == g_jit_services.context && host->memory == g_jit_services.memory &&
+                           host->clock == g_jit_services.clock
+                       ? 0
+                       : -1;
+        return g_native_host != NULL ? 0 : -1;
+    }
+    if (host != NULL)
+        g_jit_services = *host;
+    else if (hl_host_macos_create(&g_native_host, &g_jit_services) != HL_STATUS_OK)
+        return -1;
+    return hl_host_services_validate(&g_jit_services,
+                                     HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK
+               ? 0
+               : -1;
+}
 // code cache + block map + chaining
 #include "../../translator/cache.c"
 
@@ -620,6 +642,7 @@ static void container_init(const char *rootfs) {
 // (g_engine_inited), so the resident fork-server parent pays this once and the standalone path runs it
 // exactly as before.
 static int engine_global_init(void) {
+    if (jit_host_bind(g_host_services) != 0) return 1;
     if (g_engine_inited) return 0;
     // Serve a non-PIE ET_EXEC's absolute data references at their biased host address. Faults not
     // belonging to this compatibility path are re-raised with the default action.

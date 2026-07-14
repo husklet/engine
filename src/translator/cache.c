@@ -2,7 +2,6 @@
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
-#include "../../include/hl/macos.h"
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
 #include "../host/file.h"
@@ -29,8 +28,6 @@ static hl_emit_state g_emit;
 // only the few ABSOLUTE handoffs (run_block target, IBTC/IC body literals, icache flush)
 // convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
 // region's W^X per translation/IC-fill (NODUALMAP=1).
-static hl_host_macos *g_jit_host;
-static hl_host_services g_jit_services;
 static hl_log_context g_jit_log;
 #define J_RX(p) hl_emit_rx(&g_emit, (const void *)(uintptr_t)(p)) // RW alias addr -> RX alias addr
 #define J_RW(p) hl_emit_rw(&g_emit, (const void *)(uintptr_t)(p)) // RX alias addr -> RW alias addr
@@ -50,11 +47,30 @@ static inline void jit_wprot(int enable_exec) {
     pthread_jit_write_protect_np(enable_exec);
 }
 
+static void jit_publish_code(const void *address, size_t size) {
+    uintptr_t current = (uintptr_t)address;
+    uintptr_t writable = (uintptr_t)g_cache;
+    uintptr_t executable = (uintptr_t)J_RX(g_cache);
+    uint64_t offset;
+    hl_host_result result;
+    if (current >= writable && current - writable <= CACHE_SZ && size <= CACHE_SZ - (current - writable))
+        offset = (uint64_t)(current - writable);
+    else if (current >= executable && current - executable <= CACHE_SZ && size <= CACHE_SZ - (current - executable))
+        offset = (uint64_t)(current - executable);
+    else {
+        fprintf(stderr, "hl-engine: code publication outside JIT mapping\n");
+        _exit(70);
+    }
+    result = g_jit_services.memory->publish_code(g_jit_services.context, g_code_mapping.handle, offset, size);
+    if (result.status != HL_STATUS_OK) {
+        fprintf(stderr, "hl-engine: unable to publish translated code\n");
+        _exit(70);
+    }
+}
+
 static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
-    if (g_jit_host == NULL &&
-        (hl_host_macos_create(&g_jit_host, &g_jit_services) != HL_STATUS_OK ||
-         hl_host_services_validate(&g_jit_services,
-                                   HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK))
+    if (hl_host_services_validate(&g_jit_services,
+                                  HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK)
         return -1;
     if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
     return hl_arena_reserve(&g_jit_services, CACHE_SZ, 16384, dual_alias, mapping);
@@ -568,7 +584,7 @@ static void patch_links_to(uint64_t gpc, void *body) {
             *g_pend[i].slot =
                 // bl / b target.body (+8: forward edge skips the entry poll under IRQSLIM)
                 (g_pend[i].is_bl ? 0x94000000u : 0x14000000u) | ((uint32_t)d & 0x3FFFFFFu);
-            sys_icache_invalidate(g_pend[i].slot, 4);
+            jit_publish_code(g_pend[i].slot, 4);
             // swap-remove
             g_pend[i] = g_pend[--g_npend];
         } else

@@ -381,7 +381,7 @@ static int pcache_load(uint64_t entry_jump) {
     memcpy(g_cache, abuf, h.arena_used);
     pcache_relocate();
     jit_wprot(1);
-    sys_icache_invalidate(J_RX(g_cache), h.arena_used);
+    jit_publish_code(J_RX(g_cache), h.arena_used);
     memset(g_ibtc, 0, sizeof g_ibtc); // shared IBTC data table: refills lazily
     free(abuf);
     g_pcache_loaded = 1;

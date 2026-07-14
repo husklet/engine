@@ -60,12 +60,15 @@
 
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
+#include "hl/macos.h"
 #include "../launch.h"
 #include "../options.h"
 #include "../cli.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
 static const hl_host_services *g_host_services;
+static hl_host_macos *g_native_host;
+static hl_host_services g_jit_services;
 static hl_linux_abi *g_linux_box;
 static uint64_t g_host_launch_monotonic_ns;
 
@@ -73,6 +76,25 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
 #include "../../translator/guest/x86_64/stat.c"     // per-arch struct-stat layout os/linux fills
+
+static int jit_host_bind(const hl_host_services *host) {
+    if (g_jit_services.abi != 0) {
+        if (host != NULL)
+            return host->context == g_jit_services.context && host->memory == g_jit_services.memory &&
+                           host->clock == g_jit_services.clock
+                       ? 0
+                       : -1;
+        return g_native_host != NULL ? 0 : -1;
+    }
+    if (host != NULL)
+        g_jit_services = *host;
+    else if (hl_host_macos_create(&g_native_host, &g_jit_services) != HL_STATUS_OK)
+        return -1;
+    return hl_host_services_validate(&g_jit_services,
+                                     HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK
+               ? 0
+               : -1;
+}
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
 #define GUEST_LINUX_STAT_BYTES 144
@@ -223,6 +245,7 @@ static void container_init(const char *rootfs) {
 // on success, nonzero exit code on failure. First call wins; later calls are no-ops (g_engine_inited),
 // so the resident parent pays this once and the standalone path runs it exactly as before.
 static int engine_global_init(void) {
+    if (jit_host_bind(g_host_services) != 0) return 1;
     if (g_engine_inited) return 0;
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {
         perror("pthread_key_create");

@@ -459,7 +459,7 @@ static int pcache_load(uint64_t entry_jump) {
     pthread_jit_write_protect_np(0);
     pcache_relocate(h.block_return_at);
     pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(g_cache, h.arena_used);
+    jit_publish_code(g_cache, h.arena_used);
     memset(g_ibtc, 0, sizeof g_ibtc); // runtime cache: repopulates lazily
     g_pcache_loaded = 1;
     g_pc_restored_n = nlive + g_pc_ndefer; // what the warm-stat measures waste against
