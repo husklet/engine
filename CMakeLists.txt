@@ -11,6 +11,7 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 add_library(hl-translator STATIC
     src/translator/codegen.c
     src/translator/host/aarch64/codegen.c
+    src/translator/host/x86_64/codegen.c
     src/translator/ir/interpreter.c
     src/translator/ir/ir.c)
 target_include_directories(hl-translator PUBLIC include)
@@ -22,6 +23,11 @@ add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_s
 target_include_directories(hl-engine PUBLIC include)
 target_compile_definitions(hl-engine PUBLIC HL_ENABLE_LOGGING=$<BOOL:${HL_ENABLE_LOGGING}>)
 target_link_libraries(hl-engine PUBLIC hl-translator hl-linux-abi)
+
+add_library(hl-production-xattr-cache OBJECT src/production/os/linux/container/xattr_cache.c)
+target_include_directories(hl-production-xattr-cache PRIVATE src/production/os/linux/container)
+target_compile_options(hl-production-xattr-cache PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                         -Wstrict-prototypes -Wmissing-prototypes)
 
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes

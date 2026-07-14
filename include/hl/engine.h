@@ -6,7 +6,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_ENGINE_ABI 1u
+#define HL_ENGINE_ABI 2u
 
 typedef struct hl_engine hl_engine;
 
@@ -27,8 +27,11 @@ typedef struct hl_engine_config {
     uint64_t memory_limit;
     uint32_t pid_limit;
     uint32_t cpu_limit;
+    /* Optional opaque program image/state owned by the caller for the engine lifetime. */
     const void *payload;
     size_t payload_size;
+    /* Optional Linux root filesystem path owned by the caller for the engine lifetime. */
+    const char *rootfs;
 } hl_engine_config;
 
 typedef struct hl_engine_exit {

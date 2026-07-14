@@ -35,6 +35,8 @@
 #include <sys/resource.h>
 #include <stdatomic.h>
 
+#include "hl/engine.h"
+
 #include "../include/cpu_aarch64.h"
 #include "../engine/options.c"
 #include "../translate/aarch64/abi.h"       // the cpu interface os/linux/ is written against
@@ -898,9 +900,11 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
+#ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
     return hl_engine_entry(argc, argv);
 }
+#endif
 int hl_engine_entry(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;

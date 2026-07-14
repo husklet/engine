@@ -12,7 +12,7 @@ CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
-PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h
+PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
 # translator, and Linux-personality implementation. Make cannot discover those nested includes from the
@@ -24,7 +24,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/production/,*.c) \
 	$(call rwildcard,src/production/,*.h) $(call rwildcard,include/hl/,*.h))
 
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
-IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src/translator/ir/interpreter.c \
+IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
 FAKE_HOST_SOURCES := src/host/fake/fake_host.c
@@ -42,7 +42,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := codegen config host_services ir linux_abi engine log
+UNIT_NAMES := codegen config host_services ir linux_abi engine log xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -96,6 +96,10 @@ $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
 
+$(BUILD)/tests/test_xattr_cache: tests/unit/test_xattr_cache.c src/production/os/linux/container/xattr_cache.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/fixtures/%: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(CC) -O2 -g -std=gnu11 -Wall -Wextra $< -pthread -o $@
@@ -121,6 +125,7 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch6
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/production/os/linux/container/xattr_cache.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -129,12 +134,38 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+		src/production/os/linux/container/xattr_cache.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
-e2e-compat: test-macos-host compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+$(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c \
+	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
+	src/host/macos/host_macos.c packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
+		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
+		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c src/core/config.c \
+		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/lifecycle_adapter.c \
+		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+
+$(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c \
+	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
+	src/host/macos/host_macos.c packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
+		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
+		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c src/core/config.c \
+		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/lifecycle_adapter.c \
+		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host_macos.c
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+
+e2e-compat: test-macos-host compat-engines $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
@@ -143,6 +174,10 @@ e2e-compat: test-macos-host compat-engines $(BUILD)/e2e/guest-exit-aarch64 $(BUI
 	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
 
 define HL_E2E_CASE_RULE

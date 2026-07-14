@@ -56,6 +56,8 @@
 #include <stdatomic.h>
 #include <libkern/OSCacheControl.h>
 
+#include "hl/engine.h"
+
 #include "../include/cpu_x86_64.h"
 #include "../engine/options.c"
 #include "../translate/x86_64/abi.h"            // cpu-interface seam (G_* contract + sysmap + normalize)
@@ -389,9 +391,11 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
+#ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
     return hl_engine_entry(argc, argv);
 }
+#endif
 int hl_engine_entry(int argc, char **argv) {
     int ai = 1;
     const char *rootfs = NULL;

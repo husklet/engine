@@ -25,6 +25,14 @@ int main(void) {
     hl_ir_value sum;
     uint8_t storage[64];
     hl_code_buffer code;
+    static const uint8_t expected_x86_64[] = {
+        0x48, 0xb8, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* movabs rax, 40 */
+        0x48, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* movabs rcx, 2 */
+        0x48, 0x89, 0xc2,                                           /* mov rdx, rax */
+        0x48, 0x01, 0xca,                                           /* add rdx, rcx */
+        0x48, 0x89, 0xd0,                                           /* mov rax, rdx */
+        0xc3                                                        /* ret */
+    };
 
     HL_CHECK(hl_ir_block_init(&block, 0x400000, instructions, HL_ARRAY_COUNT(instructions)) == HL_STATUS_OK);
     current = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_I64);
@@ -50,5 +58,11 @@ int main(void) {
     HL_CHECK(word(storage + 8) == UINT32_C(0x8b010002));
     HL_CHECK(word(storage + 12) == UINT32_C(0xaa0203e0));
     HL_CHECK(word(storage + 16) == UINT32_C(0xd65f03c0));
+
+    memset(storage, 0, sizeof(storage));
+    HL_CHECK(hl_code_buffer_init(&code, storage, sizeof(storage)) == HL_STATUS_OK);
+    HL_CHECK(hl_codegen_block(HL_HOST_ISA_X86_64, &block, &code) == HL_STATUS_OK);
+    HL_CHECK(code.code_size == sizeof(expected_x86_64));
+    HL_CHECK(memcmp(storage, expected_x86_64, sizeof(expected_x86_64)) == 0);
     return EXIT_SUCCESS;
 }

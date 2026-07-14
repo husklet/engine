@@ -58,6 +58,7 @@ hl_status hl_ir_interpret(const hl_ir_block *block, hl_ir_exit *out_exit) {
             return HL_STATUS_OK;
         default: free(values); return HL_STATUS_NOT_SUPPORTED;
         }
+        if (instruction->result.type == HL_IR_TYPE_I32) result &= UINT32_MAX;
         if (instruction->result.id != 0) {
             values[instruction->result.id].bits = result;
             values[instruction->result.id].type = instruction->result.type;

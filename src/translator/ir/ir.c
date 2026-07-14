@@ -11,6 +11,11 @@ static int hl_ir_is_integer(uint16_t type) {
     return type == HL_IR_TYPE_I32 || type == HL_IR_TYPE_I64 || type == HL_IR_TYPE_GUEST_ADDRESS;
 }
 
+static int hl_ir_opcode_is_reserved(uint16_t opcode) {
+    return opcode == HL_IR_OP_LOAD || opcode == HL_IR_OP_STORE || opcode == HL_IR_OP_COMPARE ||
+           opcode == HL_IR_OP_BRANCH || opcode == HL_IR_OP_BRANCH_CONDITIONAL || opcode == HL_IR_OP_GUEST_CALL;
+}
+
 static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
     switch (instruction->opcode) {
     case HL_IR_OP_CONSTANT: return instruction->operand_count == 0 && instruction->result.type != HL_IR_TYPE_NONE;
@@ -33,7 +38,7 @@ static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
     case HL_IR_OP_COMPARE:
     case HL_IR_OP_BRANCH:
     case HL_IR_OP_BRANCH_CONDITIONAL:
-    case HL_IR_OP_GUEST_CALL: return 1;
+    case HL_IR_OP_GUEST_CALL: return 0;
     default: return 0;
     }
 }
@@ -59,6 +64,8 @@ hl_status hl_ir_append(hl_ir_block *block, const hl_ir_instruction *instruction,
     if (instruction->opcode == HL_IR_OP_INVALID || instruction->opcode >= HL_IR_OP_COUNT ||
         instruction->operand_count > HL_IR_MAX_OPERANDS)
         return HL_STATUS_INVALID_ARGUMENT;
+    if (hl_ir_opcode_is_reserved(instruction->opcode)) return HL_STATUS_NOT_SUPPORTED;
+    if (!hl_ir_signature_valid(instruction)) return HL_STATUS_INVALID_ARGUMENT;
     if (block->instruction_count == block->instruction_capacity) return HL_STATUS_RESOURCE_LIMIT;
     copy = *instruction;
     if (copy.result.type != HL_IR_TYPE_NONE) {

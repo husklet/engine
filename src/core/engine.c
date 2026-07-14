@@ -1,11 +1,20 @@
 #include "hl/engine.h"
+#include "engine_backend.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+static const hl_engine_backend *production_backend;
+
+void hl_engine_backend_register(const hl_engine_backend *backend) {
+    production_backend = backend;
+}
+
 struct hl_engine {
     hl_engine_config config;
     hl_host_services host;
+    const hl_engine_backend *backend;
+    int has_run;
 };
 
 uint32_t hl_engine_abi(void) {
@@ -31,6 +40,7 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     if (engine == NULL) return HL_STATUS_OUT_OF_MEMORY;
     memcpy(&engine->config, config, sizeof(*config));
     memcpy(&engine->host, host, sizeof(*host));
+    engine->backend = production_backend;
     *out_engine = engine;
     return HL_STATUS_OK;
 }
@@ -39,10 +49,15 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
     if (engine == NULL || argc < 0 || (argc != 0 && argv == NULL) || out_exit == NULL)
         return HL_STATUS_INVALID_ARGUMENT;
     if (out_exit->abi != HL_ENGINE_ABI || out_exit->size < sizeof(*out_exit)) return HL_STATUS_ABI_MISMATCH;
+    if (engine->has_run) return HL_STATUS_BUSY;
     out_exit->kind = HL_ENGINE_EXIT_ENGINE_ERROR;
     out_exit->guest_status = HL_STATUS_NOT_SUPPORTED;
     out_exit->detail = engine->config.guest_isa;
-    return HL_STATUS_NOT_SUPPORTED;
+    if (engine->backend == NULL || engine->backend->guest_isa != engine->config.guest_isa ||
+        engine->backend->run_process == NULL)
+        return HL_STATUS_NOT_SUPPORTED;
+    engine->has_run = 1;
+    return engine->backend->run_process(engine->config.rootfs, argc, argv, out_exit);
 }
 
 hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size) {
