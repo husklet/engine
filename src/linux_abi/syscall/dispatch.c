@@ -23,11 +23,11 @@ int g_rwx_guest;
 #include <stdlib.h>
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
-#include "../../../../linux_abi/errno.h"
+#include "../errno.h"
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
-#include "../seccomp.c"
+#include "../../production/os/linux/seccomp.c"
 // macOS renamex_np/renameatx_np flags (Linux renameat2 flags map onto these)
 #ifndef RENAME_SWAP
 #define RENAME_SWAP 0x00000002 // atomic swap  <- Linux RENAME_EXCHANGE(2)
@@ -409,7 +409,7 @@ static int linux_online_cpus(void) {
 // Current CPU-affinity mask (process-global; default = all online CPUs). sched_setaffinity records the
 // guest's chosen mask so sched_getaffinity round-trips it (pin-to-CPU0 then read back), while a fresh
 // process still advertises every online CPU so glibc/tcmalloc size their per-CPU tables correctly.
-#include "../../../../linux_abi/affinity.h"
+#include "../affinity.h"
 static struct hl_linux_affinity g_affinity;
 
 // Lowest CPU id in the current affinity mask. getcpu(2) must return a CPU the task is allowed to run

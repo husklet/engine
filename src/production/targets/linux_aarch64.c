@@ -69,7 +69,7 @@
 // ELF fwd-decls + FS-metadata cache
 #include "../os/linux/fscache.c"
 // the syscall layer (service())
-#include "../os/linux/syscall/dispatch.c"
+#include "../../linux_abi/syscall/dispatch.c"
 // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted; OFF by default)
 #include "../os/linux/sentry.c"
 // native checkpoint/restore control seam: the shared dispatcher (engine/dispatch.c) polls G_CKPT_POLL at
