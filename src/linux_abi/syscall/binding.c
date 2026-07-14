@@ -33,9 +33,29 @@ static int bound_shadow_matches(int fd) {
            (sentinel_status.st_mode & S_IFMT) == (shadow_status.st_mode & S_IFMT);
 }
 
+static int bound_private_dup(int source, int minimum) {
+    hl_linux_fd_snapshot snapshot;
+    int candidate = minimum;
+    for (;;) {
+        int duplicate = fcntl(source, F_DUPFD_CLOEXEC, candidate);
+        if (duplicate < 0) return -1;
+        if (!bound_snapshot((uint64_t)(unsigned)duplicate, &snapshot)) return duplicate;
+        close(duplicate);
+        if (duplicate == INT_MAX) {
+            errno = EMFILE;
+            return -1;
+        }
+        candidate = duplicate + 1;
+    }
+}
+
 /* Called once in the isolated worker, before any guest-visible native descriptor allocation. */
 static int bound_shadow_activate(void) {
     hl_linux_fd_snapshot snapshot;
+    int stdio_backup[3] = {-1, -1, -1};
+    int stdio_flags[3] = {0, 0, 0};
+    uint8_t stdio_open[3] = {0, 0, 0};
+    uint8_t stdio_installed[3] = {0, 0, 0};
     uint32_t fd;
     int opened;
     if (g_linux_box == NULL) return 0;
@@ -48,26 +68,70 @@ static int bound_shadow_activate(void) {
     }
     opened = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (opened < 0) return -1;
-    g_bound_sentinel = engine_fd_hoist(opened);
-    if (g_bound_sentinel < 0) return -1;
+    g_bound_sentinel = bound_private_dup(opened, 64);
+    if (g_bound_sentinel < 0) {
+        int error = errno;
+        close(opened);
+        errno = error;
+        return -1;
+    }
+    close(opened);
+    for (fd = 0; fd < 3; ++fd) {
+        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
+        engine_fd_vacate((int)fd);
+        stdio_flags[fd] = fcntl((int)fd, F_GETFD);
+        stdio_backup[fd] = bound_private_dup((int)fd, 64);
+        if (stdio_backup[fd] >= 0) {
+            stdio_open[fd] = 1;
+        } else if (errno != EBADF) {
+            goto activation_failed;
+        }
+    }
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
-        shadow = bound_shadow_reserve((int)fd, (int)snapshot.descriptor_flags);
+        if (fd < 3) {
+            shadow = dup2(g_bound_sentinel, (int)fd);
+            if (shadow == (int)fd) {
+                stdio_installed[fd] = 1;
+                if (fcntl(shadow, F_SETFD, (snapshot.descriptor_flags & HL_LINUX_FD_CLOEXEC) != 0 ? FD_CLOEXEC : 0) !=
+                    0)
+                    shadow = -1;
+            }
+        } else {
+            shadow = bound_shadow_reserve((int)fd, (int)snapshot.descriptor_flags);
+        }
         if (shadow != (int)fd) {
             int error = shadow < 0 ? errno : EBUSY;
             if (shadow >= 0) close(shadow);
-            while (fd != 0) {
-                --fd;
-                if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK) close((int)fd);
-            }
-            close(g_bound_sentinel);
-            g_bound_sentinel = -1;
             errno = error;
-            return -1;
+            goto activation_failed;
         }
     }
+    for (fd = 0; fd < 3; ++fd)
+        if (stdio_backup[fd] >= 0) close(stdio_backup[fd]);
     return 0;
+
+activation_failed: {
+    int error = errno;
+    uint32_t rollback;
+    for (rollback = 3; rollback < fd; ++rollback)
+        if (hl_linux_fd_snapshot_get(g_linux_box, rollback, &snapshot) == HL_STATUS_OK) close((int)rollback);
+    for (rollback = 0; rollback < 3; ++rollback) {
+        if (stdio_installed[rollback]) {
+            if (stdio_open[rollback])
+                (void)dup2(stdio_backup[rollback], (int)rollback);
+            else
+                close((int)rollback);
+            if (stdio_open[rollback]) (void)fcntl((int)rollback, F_SETFD, stdio_flags[rollback]);
+        }
+        if (stdio_backup[rollback] >= 0) close(stdio_backup[rollback]);
+    }
+    close(g_bound_sentinel);
+    g_bound_sentinel = -1;
+    errno = error;
+    return -1;
+}
 }
 
 static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t descriptor_flags) {

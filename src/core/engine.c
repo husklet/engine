@@ -71,7 +71,6 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
             uint32_t previous;
             if (binding->abi != HL_ENGINE_ABI || binding->size < sizeof(*binding) ||
                 binding->host_handle == HL_HOST_HANDLE_INVALID || binding->guest_fd >= HL_LINUX_FD_LIMIT ||
-                binding->guest_fd < 3 ||
                 (binding->ownership != HL_ENGINE_FD_TRANSFER && binding->ownership != HL_ENGINE_FD_BORROW)) {
                 status = HL_STATUS_INVALID_ARGUMENT;
                 goto fail;
