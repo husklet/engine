@@ -123,7 +123,8 @@ struct hl_host_linux {
     hl_host_sync_registry *sync;
     hl_linux_handle_entry *handles;
     uint32_t handle_capacity;
-    hl_linux_timer_entry timers[HL_LINUX_TIMER_CAPACITY];
+    hl_linux_timer_entry *timers;
+    uint32_t timer_capacity;
     hl_linux_counter_subscription counter_subscriptions[HL_LINUX_COUNTER_SUBSCRIPTIONS];
 };
 
@@ -2211,7 +2212,7 @@ static hl_host_result hl_linux_event_wake(void *context, hl_host_handle pollset)
 
 static hl_linux_timer_entry *hl_linux_event_timer(hl_host_linux *host, hl_host_handle pollset, uint64_t token) {
     uint32_t index;
-    for (index = 0; index < HL_LINUX_TIMER_CAPACITY; ++index)
+    for (index = 0; index < host->timer_capacity; ++index)
         if (host->timers[index].descriptor >= 0 && host->timers[index].pollset == pollset &&
             host->timers[index].token == token)
             return &host->timers[index];
@@ -2237,11 +2238,24 @@ static hl_host_result hl_linux_event_arm_timer(void *context, hl_host_handle pol
     }
     timer = hl_linux_event_timer(host, pollset, token);
     if (timer == NULL) {
-        for (index = 0; index < HL_LINUX_TIMER_CAPACITY; ++index)
+        for (index = 0; index < host->timer_capacity; ++index)
             if (host->timers[index].descriptor < 0) {
                 timer = &host->timers[index];
                 break;
             }
+        if (timer == NULL) {
+            uint32_t capacity = host->timer_capacity * 2u;
+            hl_linux_timer_entry *grown = realloc(host->timers, (size_t)capacity * sizeof(*grown));
+            if (grown != NULL) {
+                for (index = host->timer_capacity; index < capacity; ++index) {
+                    grown[index] = (hl_linux_timer_entry){0};
+                    grown[index].descriptor = -1;
+                }
+                timer = &grown[host->timer_capacity];
+                host->timers = grown;
+                host->timer_capacity = capacity;
+            }
+        }
         if (timer == NULL) {
             pthread_mutex_unlock(&host->lock);
             return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
@@ -2298,7 +2312,7 @@ static hl_host_result hl_linux_event_close(void *context, hl_host_handle pollset
     hl_host_linux *host = context;
     uint32_t index;
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_LINUX_TIMER_CAPACITY; ++index) {
+    for (index = 0; index < host->timer_capacity; ++index) {
         hl_linux_timer_entry *timer = &host->timers[index];
         if (timer->descriptor < 0 || timer->pollset != pollset) continue;
         close(timer->descriptor);
@@ -3211,18 +3225,24 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     host = calloc(1, sizeof(*host));
     if (host == NULL) return HL_STATUS_OUT_OF_MEMORY;
     host->handles = calloc(HL_LINUX_HANDLE_CAPACITY, sizeof(*host->handles));
-    if (host->handles == NULL) {
+    host->timers = calloc(HL_LINUX_TIMER_CAPACITY, sizeof(*host->timers));
+    if (host->handles == NULL || host->timers == NULL) {
+        free(host->timers);
+        free(host->handles);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
     host->handle_capacity = HL_LINUX_HANDLE_CAPACITY;
+    host->timer_capacity = HL_LINUX_TIMER_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
+        free(host->timers);
         free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (pthread_mutex_init(&host->fork_gate, NULL) != 0) {
         pthread_mutex_destroy(&host->lock);
+        free(host->timers);
         free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
@@ -3230,6 +3250,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     if (pthread_cond_init(&host->process_changed, NULL) != 0) {
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->timers);
         free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
@@ -3238,6 +3259,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         pthread_cond_destroy(&host->process_changed);
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->timers);
         free(host->handles);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
@@ -3246,7 +3268,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         host->handles[i].descriptor = -1;
         host->handles[i].wake_descriptor = -1;
     }
-    for (i = 0; i < HL_LINUX_TIMER_CAPACITY; ++i)
+    for (i = 0; i < host->timer_capacity; ++i)
         host->timers[i].descriptor = -1;
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
@@ -3327,5 +3349,6 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
     free(host->handles);
+    free(host->timers);
     free(host);
 }
