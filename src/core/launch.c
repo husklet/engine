@@ -195,10 +195,12 @@ static int hl_read_config_file(int fd) {
         hl_option_unset("HL_PCACHE");
         hl_option_unset("HL_PCACHE_DIR");
     }
-    // untrusted-guest sentry: both gates as the engine reads them.
+    // Untrusted sentry routing is independently useful for compatibility/security tests; public sandbox
+    // mode additionally confines the worker. Value 1 retains the ABI4 public behavior, while value 2 selects
+    // sentry-only routing without applying a Seatbelt profile to paths supplied by a developer harness.
     if (cfg.sandbox) {
         hl_option_set("HL_UNTRUSTED", "1", 1);
-        hl_option_set("HL_SANDBOX", "1", 1);
+        if (cfg.sandbox == HL_CONFIG_SANDBOX_ENABLED) hl_option_set("HL_SANDBOX", "1", 1);
     }
 
     // guest argv: NUL-separated, double-NUL terminated, at argv_off. Count, then point argv2[] into the pool.

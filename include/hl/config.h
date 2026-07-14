@@ -7,6 +7,8 @@ HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
 #define HL_CONFIG_ABI 4u
+#define HL_CONFIG_SANDBOX_ENABLED 1u
+#define HL_CONFIG_UNTRUSTED_ONLY 2u
 
 typedef struct hl_launch_config {
     uint32_t magic;

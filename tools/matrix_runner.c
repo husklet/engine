@@ -240,6 +240,12 @@ static int config_option(config_wire *wire, const char *name, const char *value)
     } else if (strcmp(name, "HL_ROOTFS_RO") == 0) {
         if (strcmp(value, "1") != 0) return 1;
         wire->config.rootfs_read_only = 1;
+    } else if (strcmp(name, "HL_SANDBOX") == 0) {
+        if (strcmp(value, "1") != 0) return 1;
+        wire->config.sandbox = HL_CONFIG_SANDBOX_ENABLED;
+    } else if (strcmp(name, "HL_UNTRUSTED") == 0) {
+        if (strcmp(value, "1") != 0) return 1;
+        wire->config.sandbox = HL_CONFIG_UNTRUSTED_ONLY;
     } else if (strcmp(name, "HL_ULIMITS") == 0) {
         return pool_string(wire, value, &wire->config.limits_offset);
     } else if (strcmp(name, "HL_VOLUMES") == 0) {
