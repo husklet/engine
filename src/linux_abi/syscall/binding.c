@@ -1788,8 +1788,32 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     if (nr == 24 && !source_bound) {
         hl_linux_fd_snapshot target;
         if (bound_snapshot(a1, &target)) {
-            G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
-            return 1;
+            unsigned flags = (unsigned)a2;
+            int is_dup2 = (flags & 0x40000000u) != 0;
+            int source_fd = (int)a0;
+            int target_fd = (int)a1;
+            flags &= ~0x40000000u;
+            if (source_fd == target_fd) {
+                G_RET(c) = is_dup2 ? (uint64_t)(unsigned)target_fd : (uint64_t)(int64_t)-EINVAL;
+                return 1;
+            }
+            if ((!is_dup2 && (flags & ~HL_LINUX_O_CLOEXEC) != 0) || target_fd < 0 ||
+                target_fd >= guest_nofile_cur()) {
+                G_RET(c) = (uint64_t)(int64_t)(target_fd < 0 || target_fd >= guest_nofile_cur() ? -EBADF : -EINVAL);
+                return 1;
+            }
+            /* Validate the native source before displacing the typed target: dup2 must leave target
+             * untouched when oldfd is invalid.  Once validated, retire the opaque target and let the
+             * common native dup path install oldfd at the exact guest number. */
+            if (source_fd < 0 || fcntl(source_fd, F_GETFD) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)-EBADF;
+                return 1;
+            }
+            flock_broker_detach(&target);
+            (void)hl_linux_close(g_linux_box, target.fd);
+            proc_fdvis_close(target_fd);
+            (void)close(target_fd);
+            return 0;
         }
     }
     if (nr == 21 && !source_bound) {

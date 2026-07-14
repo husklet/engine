@@ -78,6 +78,12 @@ static int sig_is_sync(int s) {
     // ILL TRAP BUS FPE SEGV (Linux nums)
 }
 
+#if defined(__linux__)
+#define HOST_SIGNAL_HAS_FAULT_ADDRESS(si) ((si) != NULL && (si)->si_code > 0)
+#else
+#define HOST_SIGNAL_HAS_FAULT_ADDRESS(si) ((si) != NULL)
+#endif
+
 // Does signal `sig`'s DEFAULT action terminate the process (Term or Core)? False for the signals whose
 // default action is ignore (CHLD/CONT/URG/WINCH) or stop (STOP/TSTP/TTIN/TTOU); true for every other
 // deliverable signal (HUP/INT/QUIT/TERM/USRn/PIPE/ALRM/SEGV/... and the realtime signals 32..64).
@@ -535,7 +541,7 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     // handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it. A genuine SIGBUS on
     // MAPPED memory (misalignment, file mapping past EOF) is left as SIGBUS. Only host SIGBUS needs the check
     // (host SIGSEGV already maps to Linux SIGSEGV), so the common fault path pays no extra probe.
-    if (hostsig == SIGBUS && si && si->si_addr &&
+    if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
         (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr)))
         sig = 11;
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
@@ -718,7 +724,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     if (sig < 1 || sig > 64 || !ucv) return 0;
     // Bad-address fault normalization (see deliver_guest_fault): macOS raises a PROT_NONE/guard access as host
     // SIGBUS -> Linux SIGBUS(7), but Linux reports SIGSEGV. Rewrite to SIGSEGV(11) for a guard/unmapped fault.
-    if (hostsig == SIGBUS && si && si->si_addr &&
+    if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
         (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr)))
         sig = 11;
     if (g_sigact[sig].handler > 1) return 0; // a guest handler exists -> not ours (deliver_guest_fault owns it)

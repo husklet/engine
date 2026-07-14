@@ -789,6 +789,12 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // serve the probe fault with a fresh mapping, flipping a correct EFAULT into a bogus success (and
     // burning lazy-map budget); nonpie_fixup would likewise emulate the probe load at +bias and resume.
     if (hrm_fault_hook(si)) return; // never actually returns on a claim (siglongjmp); shape-only
+#if defined(__linux__)
+    /* Linux distinguishes an externally sent fault-class signal from a hardware fault in si_code.
+     * Route it before the lazy-map classifier examines si_addr: SI_USER/SI_TKILL/SI_QUEUE may carry an
+     * address-shaped union value, but they must interrupt pause/read/etc., never allocate a guest page. */
+    if (si && si->si_code <= 0 && deliver_guest_fault(sig, si, uc)) return;
+#endif
     // a bad guest RESULT pointer in the vDSO fast-clock inline path (emit_fast_syscall). Recover
     // it as -EFAULT BEFORE the lazy-map/guest-fault paths below, matching the slow svc_time() path exactly.
     if (fastclk_fault_fixup(si, uc)) return;
