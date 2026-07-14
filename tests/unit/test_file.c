@@ -19,6 +19,10 @@ typedef struct file_test {
     unsigned char written[64];
     size_t written_size;
     size_t write_limit;
+    char old_path[64];
+    char new_path[64];
+    char unlinked_path[64];
+    hl_status namespace_status;
 } file_test;
 
 static hl_host_result file_open(void *context, hl_host_handle directory, const char *path, size_t path_size,
@@ -52,12 +56,37 @@ static hl_host_result file_write(void *context, hl_host_handle file, const void 
     return (hl_host_result){HL_STATUS_OK, 0, count, 0};
 }
 
+static hl_host_result file_rename(void *context, hl_host_handle old_directory, const char *old_path,
+                                  size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                  size_t new_path_size) {
+    file_test *test = context;
+    if (old_directory != HL_HOST_HANDLE_CWD || new_directory != HL_HOST_HANDLE_CWD ||
+        old_path_size >= sizeof(test->old_path) || new_path_size >= sizeof(test->new_path))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    memcpy(test->old_path, old_path, old_path_size);
+    test->old_path[old_path_size] = '\0';
+    memcpy(test->new_path, new_path, new_path_size);
+    test->new_path[new_path_size] = '\0';
+    return (hl_host_result){test->namespace_status, 0, 0, 0};
+}
+
+static hl_host_result file_unlink(void *context, hl_host_handle directory, const char *path, size_t path_size) {
+    file_test *test = context;
+    if (directory != HL_HOST_HANDLE_CWD || path_size >= sizeof(test->unlinked_path))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    memcpy(test->unlinked_path, path, path_size);
+    test->unlinked_path[path_size] = '\0';
+    return (hl_host_result){test->namespace_status, 0, 0, 0};
+}
+
 int main(void) {
     static const hl_host_file_services file = {.abi = HL_HOST_FILE_ABI,
                                                .size = sizeof(file),
                                                .open_relative = file_open,
                                                .close = file_close,
-                                               .write = file_write};
+                                               .write = file_write,
+                                               .rename_relative = file_rename,
+                                               .unlink_relative = file_unlink};
     file_test test = {0};
     hl_host_services services = {
         .abi = HL_HOST_SERVICES_ABI,
@@ -112,6 +141,19 @@ int main(void) {
 
     errno = 0;
     HL_CHECK(hl_host_file_store(&services, "registry", 0644, NULL, 1) == -1 && errno == EINVAL);
+
+    memset(&test, 0, sizeof(test));
+    HL_CHECK(hl_host_file_rename(&services, "temporary", "published") == 0);
+    HL_CHECK(strcmp(test.old_path, "temporary") == 0 && strcmp(test.new_path, "published") == 0);
+    HL_CHECK(hl_host_file_unlink(&services, "published") == 0);
+    HL_CHECK(strcmp(test.unlinked_path, "published") == 0);
+
+    memset(&test, 0, sizeof(test));
+    test.namespace_status = HL_STATUS_PERMISSION_DENIED;
+    errno = 0;
+    HL_CHECK(hl_host_file_rename(&services, "temporary", "published") == -1 && errno == EIO);
+    errno = 0;
+    HL_CHECK(hl_host_file_unlink(&services, "published") == -1 && errno == EIO);
     errno = 0;
     HL_CHECK(hl_host_file_create(NULL, "marker", 0644) == -1 && errno == EINVAL);
     errno = 0;

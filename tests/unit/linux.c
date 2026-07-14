@@ -46,6 +46,22 @@ typedef struct process_wait_context {
     hl_host_result result;
 } process_wait_context;
 
+typedef struct clock_interrupt_context {
+    pthread_t target;
+} clock_interrupt_context;
+
+static void clock_interrupt_handler(int signal_number) {
+    (void)signal_number;
+}
+
+static void *interrupt_clock_sleep(void *opaque) {
+    const clock_interrupt_context *interrupt = opaque;
+    const struct timespec delay = {0, 20 * 1000 * 1000};
+    (void)nanosleep(&delay, NULL);
+    (void)pthread_kill(interrupt->target, SIGUSR1);
+    return NULL;
+}
+
 static void *wait_for_process(void *opaque) {
     process_wait_context *waiter = opaque;
     waiter->result =
@@ -90,6 +106,54 @@ int main(void) {
                                                       HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.clock->realtime_ns(services.context).status == HL_STATUS_OK);
+    {
+        hl_host_result raw_before = services.clock->raw_monotonic_ns(services.context);
+        hl_host_result process_before = services.clock->process_cpu_ns(services.context);
+        hl_host_result thread_before = services.clock->thread_cpu_ns(services.context);
+        volatile uint64_t work = 0;
+        uint64_t index;
+        hl_host_result raw_after;
+        hl_host_result process_after;
+        hl_host_result thread_after;
+        hl_host_result deadline;
+        struct sigaction action = {0};
+        struct sigaction previous;
+        clock_interrupt_context interrupt = {pthread_self()};
+        pthread_t interrupter;
+
+        HL_CHECK(raw_before.status == HL_STATUS_OK && process_before.status == HL_STATUS_OK &&
+                 thread_before.status == HL_STATUS_OK);
+        for (index = 0; index < UINT64_C(1000000); ++index)
+            work += index;
+        HL_CHECK(work != 0);
+        raw_after = services.clock->raw_monotonic_ns(services.context);
+        process_after = services.clock->process_cpu_ns(services.context);
+        thread_after = services.clock->thread_cpu_ns(services.context);
+        HL_CHECK(raw_after.status == HL_STATUS_OK && raw_after.value >= raw_before.value);
+        HL_CHECK(process_after.status == HL_STATUS_OK && process_after.value > process_before.value);
+        HL_CHECK(thread_after.status == HL_STATUS_OK && thread_after.value > thread_before.value);
+
+        deadline = services.clock->monotonic_ns(services.context);
+        HL_CHECK(deadline.status == HL_STATUS_OK);
+        deadline.value += UINT64_C(5000000);
+        HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_MONOTONIC, deadline.value).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline.value);
+        HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_PROCESS_CPU, 0).status ==
+                 HL_STATUS_NOT_SUPPORTED);
+
+        action.sa_handler = clock_interrupt_handler;
+        HL_CHECK(sigemptyset(&action.sa_mask) == 0);
+        HL_CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+        deadline = services.clock->monotonic_ns(services.context);
+        HL_CHECK(deadline.status == HL_STATUS_OK);
+        HL_CHECK(pthread_create(&interrupter, NULL, interrupt_clock_sleep, &interrupt) == 0);
+        HL_CHECK(services.clock
+                     ->sleep_until(services.context, HL_HOST_CLOCK_MONOTONIC, deadline.value + UINT64_C(2000000000))
+                     .status == HL_STATUS_INTERRUPTED);
+        HL_CHECK(pthread_join(interrupter, NULL) == 0);
+        HL_CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
+    }
     {
         const uint32_t count = 65536;
         hl_host_handle *mutexes = calloc(count, sizeof(*mutexes));
@@ -148,7 +212,10 @@ int main(void) {
     HL_CHECK(services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){contents, sizeof(contents)})
                  .value == sizeof(contents));
     snprintf(moved_path, sizeof(moved_path), "%s.moved", path);
-    HL_CHECK(rename(path, moved_path) == 0);
+    HL_CHECK(services.file
+                 ->rename_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_HANDLE_CWD,
+                                   moved_path, strlen(moved_path))
+                 .status == HL_STATUS_OK);
     {
         int replacement = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
         const hl_host_iovec append_vectors[] = {{(uint64_t)(uintptr_t)suffix, 3},
@@ -173,8 +240,21 @@ int main(void) {
                  read(descriptor, replacement, sizeof(replacement)) == (ssize_t)sizeof(replacement) &&
                  memcmp(replacement, "replacement", sizeof(replacement)) == 0 && close(descriptor) == 0);
     }
-    unlink(path);
-    unlink(moved_path);
+    HL_CHECK(services.file
+                 ->rename_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path),
+                                   HL_HOST_HANDLE_CWD, path, strlen(path))
+                 .status == HL_STATUS_OK);
+    {
+        char published[sizeof(readback)] = {0};
+        int descriptor = open(path, O_RDONLY);
+        HL_CHECK(descriptor >= 0 && read(descriptor, published, sizeof(published)) == (ssize_t)sizeof(published) &&
+                 memcmp(published, readback, sizeof(published)) == 0 && close(descriptor) == 0);
+    }
+    HL_CHECK(services.file->unlink_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path)).status ==
+             HL_STATUS_OK);
+    HL_CHECK(
+        services.file->unlink_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path)).status ==
+        HL_STATUS_NOT_FOUND);
 
     HL_CHECK(services.network->socket(services.context, 99, HL_HOST_NETWORK_DATAGRAM, 0).status ==
              HL_STATUS_INVALID_ARGUMENT);

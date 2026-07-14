@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -351,6 +352,42 @@ static hl_host_result hl_macos_realtime(void *context) {
     return hl_macos_clock(CLOCK_REALTIME);
 }
 
+static hl_host_result hl_macos_raw_monotonic(void *context) {
+    (void)context;
+    return hl_macos_clock(CLOCK_MONOTONIC_RAW);
+}
+
+static hl_host_result hl_macos_process_cpu(void *context) {
+    (void)context;
+    return hl_macos_clock(CLOCK_PROCESS_CPUTIME_ID);
+}
+
+static hl_host_result hl_macos_thread_cpu(void *context) {
+    (void)context;
+    return hl_macos_clock(CLOCK_THREAD_CPUTIME_ID);
+}
+
+static hl_host_result hl_macos_clock_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
+    clockid_t clock_id;
+    struct timespec now, delay;
+    uint64_t now_ns, remaining;
+    (void)context;
+    switch (clock_kind) {
+    case HL_HOST_CLOCK_MONOTONIC: clock_id = CLOCK_MONOTONIC; break;
+    /* A relative nanosleep preserves an absolute monotonic deadline and EINTR, but cannot promise
+     * realtime-adjustment wakeups. Do not advertise unsupported absolute-clock semantics. */
+    default: return hl_macos_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    }
+    if (clock_gettime(clock_id, &now) != 0) return hl_macos_errno();
+    now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+    if (now_ns >= deadline_ns) return hl_macos_result(HL_STATUS_OK, 0, 0);
+    remaining = deadline_ns - now_ns;
+    delay.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
+    delay.tv_nsec = (long)(remaining % UINT64_C(1000000000));
+    if (nanosleep(&delay, NULL) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_macos_file *hl_macos_file_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t low = (uint32_t)handle;
     uint32_t index;
@@ -574,6 +611,54 @@ static hl_host_result hl_macos_file_sync(void *context, hl_host_handle file) {
     int descriptor = hl_macos_file_descriptor(context, file, 0);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     return fsync(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static int hl_macos_file_directory(hl_host_macos *host, hl_host_handle directory) {
+    int descriptor = AT_FDCWD;
+    if (directory == HL_HOST_HANDLE_CWD) return descriptor;
+    pthread_mutex_lock(&host->lock);
+    hl_macos_file *file = hl_macos_file_lookup(host, directory);
+    descriptor = file != NULL ? file->descriptor : -1;
+    pthread_mutex_unlock(&host->lock);
+    return descriptor;
+}
+
+static hl_host_result hl_macos_file_rename(void *context, hl_host_handle old_directory, const char *old_path,
+                                           size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                           size_t new_path_size) {
+    hl_host_macos *host = context;
+    char old_local[PATH_MAX];
+    char new_local[PATH_MAX];
+    int old_fd;
+    int new_fd;
+    if (old_path == NULL || new_path == NULL || old_path_size == 0 || new_path_size == 0 ||
+        old_path_size >= sizeof(old_local) || new_path_size >= sizeof(new_local))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(old_local, old_path, old_path_size);
+    old_local[old_path_size] = '\0';
+    memcpy(new_local, new_path, new_path_size);
+    new_local[new_path_size] = '\0';
+    old_fd = hl_macos_file_directory(host, old_directory);
+    new_fd = hl_macos_file_directory(host, new_directory);
+    if ((old_fd < 0 && old_directory != HL_HOST_HANDLE_CWD) || (new_fd < 0 && new_directory != HL_HOST_HANDLE_CWD))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (renameat(old_fd, old_local, new_fd, new_local) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_file_unlink(void *context, hl_host_handle directory, const char *path,
+                                           size_t path_size) {
+    hl_host_macos *host = context;
+    char local[PATH_MAX];
+    int directory_fd;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    directory_fd = hl_macos_file_directory(host, directory);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (unlinkat(directory_fd, local, 0) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
 static hl_host_result hl_macos_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
@@ -889,8 +974,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,    sizeof(memory),      hl_macos_reserve,
                                                    hl_macos_protect,      hl_macos_release,    hl_macos_publish,
                                                    hl_macos_reserve_code, hl_macos_repair_code};
-    static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_macos_monotonic,
-                                                 hl_macos_realtime};
+    static const hl_host_clock_services clock = {
+        HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_macos_monotonic,  hl_macos_realtime,
+        hl_macos_raw_monotonic, hl_macos_process_cpu, hl_macos_thread_cpu, hl_macos_clock_sleep_until};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),
@@ -911,7 +997,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_appendv,
                                                hl_macos_file_truncate,
                                                hl_macos_file_sync,
-                                               hl_macos_file_sync};
+                                               hl_macos_file_sync,
+                                               hl_macos_file_rename,
+                                               hl_macos_file_unlink};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

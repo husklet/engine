@@ -69,11 +69,21 @@ static clockid_t gtimer_hostclock(int clk) {
 }
 
 static int engine_clock_gettime(clockid_t clock_id, struct timespec *output) {
-    if (clock_id == CLOCK_REALTIME)
-        return hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, output);
-    if (clock_id == CLOCK_MONOTONIC)
-        return hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, output);
-    return clock_gettime(clock_id, output);
+    int service_clock;
+    switch (clock_id) {
+    case CLOCK_REALTIME: service_clock = HL_PRODUCTION_CLOCK_REALTIME; break;
+    case CLOCK_MONOTONIC: service_clock = HL_PRODUCTION_CLOCK_MONOTONIC; break;
+    case CLOCK_MONOTONIC_RAW: service_clock = HL_PRODUCTION_CLOCK_RAW_MONOTONIC; break;
+    case CLOCK_PROCESS_CPUTIME_ID: service_clock = HL_PRODUCTION_CLOCK_PROCESS_CPU; break;
+    case CLOCK_THREAD_CPUTIME_ID: service_clock = HL_PRODUCTION_CLOCK_THREAD_CPU; break;
+    default: errno = EINVAL; return -1;
+    }
+    return hl_production_clock_gettime(effective_host_services(), service_clock, output);
+}
+
+static int engine_sleep_until_monotonic(const struct timespec *deadline) {
+    uint64_t nanoseconds = (uint64_t)deadline->tv_sec * UINT64_C(1000000000) + (uint64_t)deadline->tv_nsec;
+    return hl_production_clock_sleep_until(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, nanoseconds);
 }
 
 // arm/re-arm slot `id`'s EVFILT_TIMER. Caller holds g_gtimer_lk. value_ns = delay to the next fire
@@ -249,7 +259,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 r = 0;
                 break;
             } // deadline reached
-            r = nanosleep(&d, NULL);
+            r = engine_sleep_until_monotonic(&deadline);
             if (r == 0) break;
             if (svc_poll_retry(c)) continue; // internal/spurious wakeup -> re-sleep the true remainder
             // A deliverable guest signal (or a real error): surface it, writing the remaining time to rem.
@@ -442,7 +452,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rr = 0;
                 break;
             } // deadline reached
-            rr = nanosleep(&d, NULL);
+            rr = engine_sleep_until_monotonic(&deadline);
             if (rr == 0) break;
             if (svc_poll_retry(c)) continue; // internal/spurious wakeup -> re-sleep the true remainder
             if (a3) {                        // deliverable guest signal: report the remaining time in rem

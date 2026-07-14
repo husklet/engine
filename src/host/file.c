@@ -68,3 +68,34 @@ int hl_host_file_store(const hl_host_services *services, const char *path, uint3
     }
     return 0;
 }
+
+int hl_host_file_rename(const hl_host_services *services, const char *old_path, const char *new_path) {
+    hl_host_result result;
+    if (services == NULL || services->file == NULL || services->file->rename_relative == NULL || old_path == NULL ||
+        old_path[0] == '\0' || new_path == NULL || new_path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    result = services->file->rename_relative(services->context, HL_HOST_HANDLE_CWD, old_path, strlen(old_path),
+                                             HL_HOST_HANDLE_CWD, new_path, strlen(new_path));
+    if (result.status != HL_STATUS_OK) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+int hl_host_file_unlink(const hl_host_services *services, const char *path) {
+    hl_host_result result;
+    if (services == NULL || services->file == NULL || services->file->unlink_relative == NULL || path == NULL ||
+        path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    result = services->file->unlink_relative(services->context, HL_HOST_HANDLE_CWD, path, strlen(path));
+    if (result.status != HL_STATUS_OK) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}

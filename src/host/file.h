@@ -8,5 +8,7 @@ int hl_host_file_exclusive(const hl_host_services *services, const char *path, u
 int hl_host_file_reset(const hl_host_services *services, const char *path, uint32_t permissions);
 int hl_host_file_store(const hl_host_services *services, const char *path, uint32_t permissions, const void *data,
                        size_t size);
+int hl_host_file_rename(const hl_host_services *services, const char *old_path, const char *new_path);
+int hl_host_file_unlink(const hl_host_services *services, const char *path);
 
 #endif

@@ -54,6 +54,35 @@ static hl_host_result hl_fake_realtime(void *context) {
     return hl_fake_result(fake, fake->realtime_ns++);
 }
 
+static hl_host_result hl_fake_raw_monotonic(void *context) {
+    hl_fake_host *fake = context;
+    return hl_fake_result(fake, fake->raw_monotonic_ns++);
+}
+
+static hl_host_result hl_fake_process_cpu(void *context) {
+    hl_fake_host *fake = context;
+    return hl_fake_result(fake, fake->process_cpu_ns++);
+}
+
+static hl_host_result hl_fake_thread_cpu(void *context) {
+    hl_fake_host *fake = context;
+    return hl_fake_result(fake, fake->thread_cpu_ns++);
+}
+
+static hl_host_result hl_fake_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
+    hl_fake_host *fake = context;
+    uint64_t *clock;
+    switch (clock_kind) {
+    case HL_HOST_CLOCK_MONOTONIC: clock = &fake->monotonic_ns; break;
+    case HL_HOST_CLOCK_REALTIME: clock = &fake->realtime_ns; break;
+    case HL_HOST_CLOCK_RAW_MONOTONIC: clock = &fake->raw_monotonic_ns; break;
+    default: return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+    }
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK && *clock < deadline_ns) *clock = deadline_ns;
+    return result;
+}
+
 static hl_host_result hl_fake_spawn_cloned(void *context, hl_host_process_entry entry, void *entry_context) {
     hl_fake_host *fake = context;
     hl_host_result result;
@@ -180,7 +209,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_publish,
                                                    NULL,
                                                    NULL};
-    static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_fake_monotonic, hl_fake_realtime};
+    static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI,  sizeof(clock),         hl_fake_monotonic,
+                                                 hl_fake_realtime,   hl_fake_raw_monotonic, hl_fake_process_cpu,
+                                                 hl_fake_thread_cpu, hl_fake_sleep_until};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
@@ -191,6 +222,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
     fake->realtime_ns = 2000;
+    fake->raw_monotonic_ns = 3000;
+    fake->process_cpu_ns = 4000;
+    fake->thread_cpu_ns = 5000;
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_CODE;
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);

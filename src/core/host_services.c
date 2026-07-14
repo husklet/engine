@@ -31,7 +31,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_CLOCK) != 0) {
         const hl_host_clock_services *clock = services->clock;
         if (clock == NULL || clock->abi != HL_HOST_CLOCK_ABI || clock->size < sizeof(*clock) ||
-            clock->monotonic_ns == NULL || clock->realtime_ns == NULL)
+            clock->monotonic_ns == NULL || clock->realtime_ns == NULL || clock->raw_monotonic_ns == NULL ||
+            clock->process_cpu_ns == NULL || clock->thread_cpu_ns == NULL || clock->sleep_until == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_LOG) != 0 &&
@@ -42,7 +43,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
          services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL ||
          services->file->read == NULL || services->file->write == NULL || services->file->clone_for_fork == NULL ||
-         services->file->seek == NULL))
+         services->file->seek == NULL || services->file->rename_relative == NULL ||
+         services->file->unlink_relative == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

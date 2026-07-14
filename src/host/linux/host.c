@@ -351,6 +351,41 @@ static hl_host_result hl_linux_realtime(void *context) {
     return hl_linux_clock(CLOCK_REALTIME);
 }
 
+static hl_host_result hl_linux_raw_monotonic(void *context) {
+    (void)context;
+    return hl_linux_clock(CLOCK_MONOTONIC_RAW);
+}
+
+static hl_host_result hl_linux_process_cpu(void *context) {
+    (void)context;
+    return hl_linux_clock(CLOCK_PROCESS_CPUTIME_ID);
+}
+
+static hl_host_result hl_linux_thread_cpu(void *context) {
+    (void)context;
+    return hl_linux_clock(CLOCK_THREAD_CPUTIME_ID);
+}
+
+static hl_host_result hl_linux_clock_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
+    clockid_t clock_id;
+    struct timespec deadline;
+    int error;
+    (void)context;
+    switch (clock_kind) {
+    case HL_HOST_CLOCK_MONOTONIC: clock_id = CLOCK_MONOTONIC; break;
+    case HL_HOST_CLOCK_REALTIME: clock_id = CLOCK_REALTIME; break;
+    default: return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    }
+    deadline.tv_sec = (time_t)(deadline_ns / UINT64_C(1000000000));
+    deadline.tv_nsec = (long)(deadline_ns % UINT64_C(1000000000));
+    error = clock_nanosleep(clock_id, TIMER_ABSTIME, &deadline, NULL);
+    if (error != 0) {
+        errno = error;
+        return hl_linux_errno_result();
+    }
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static void hl_linux_log(void *context, uint32_t event, const char *message, size_t message_size) {
     size_t written = 0;
     (void)context;
@@ -641,6 +676,48 @@ static hl_host_result hl_linux_file_data_sync(void *context, hl_host_handle file
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     return fdatasync(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_rename(void *context, hl_host_handle old_directory, const char *old_path,
+                                           size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                           size_t new_path_size) {
+    hl_host_linux *host = context;
+    char old_local[PATH_MAX];
+    char new_local[PATH_MAX];
+    int old_fd;
+    int new_fd;
+    if (old_path == NULL || new_path == NULL || old_path_size == 0 || new_path_size == 0 ||
+        old_path_size >= sizeof(old_local) || new_path_size >= sizeof(new_local))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(old_local, old_path, old_path_size);
+    old_local[old_path_size] = '\0';
+    memcpy(new_local, new_path, new_path_size);
+    new_local[new_path_size] = '\0';
+    pthread_mutex_lock(&host->lock);
+    old_fd = hl_linux_descriptor(host, old_directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    new_fd = hl_linux_descriptor(host, new_directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if ((old_fd < 0 && old_directory != HL_HOST_HANDLE_CWD) || (new_fd < 0 && new_directory != HL_HOST_HANDLE_CWD))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (renameat(old_fd, old_local, new_fd, new_local) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_file_unlink(void *context, hl_host_handle directory, const char *path,
+                                           size_t path_size) {
+    hl_host_linux *host = context;
+    char local[PATH_MAX];
+    int directory_fd;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    pthread_mutex_lock(&host->lock);
+    directory_fd = hl_linux_descriptor(host, directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (unlinkat(directory_fd, local, 0) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
 static hl_host_result hl_linux_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
@@ -1202,8 +1279,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
         hl_linux_memory_release, hl_linux_memory_publish, hl_linux_memory_reserve_code, hl_linux_memory_repair_code};
-    static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_linux_monotonic,
-                                                 hl_linux_realtime};
+    static const hl_host_clock_services clock = {
+        HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
+        hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),
@@ -1224,7 +1302,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_appendv,
                                                hl_linux_file_truncate,
                                                hl_linux_file_sync,
-                                               hl_linux_file_data_sync};
+                                               hl_linux_file_data_sync,
+                                               hl_linux_file_rename,
+                                               hl_linux_file_unlink};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};

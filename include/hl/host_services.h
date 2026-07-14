@@ -7,9 +7,9 @@ HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 2u
 #define HL_HOST_MEMORY_ABI 1u
-#define HL_HOST_CLOCK_ABI 1u
+#define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 7u
+#define HL_HOST_FILE_ABI 8u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
@@ -128,7 +128,20 @@ typedef struct hl_host_clock_services {
     HL_ABI_HEADER;
     hl_host_result (*monotonic_ns)(void *context);
     hl_host_result (*realtime_ns)(void *context);
+    hl_host_result (*raw_monotonic_ns)(void *context);
+    hl_host_result (*process_cpu_ns)(void *context);
+    hl_host_result (*thread_cpu_ns)(void *context);
+    /* Sleep until an absolute deadline. EINTR is returned as HL_STATUS_INTERRUPTED, never retried here. */
+    hl_host_result (*sleep_until)(void *context, uint32_t clock_kind, uint64_t deadline_ns);
 } hl_host_clock_services;
+
+typedef enum hl_host_clock_kind {
+    HL_HOST_CLOCK_MONOTONIC = 1,
+    HL_HOST_CLOCK_REALTIME = 2,
+    HL_HOST_CLOCK_RAW_MONOTONIC = 3,
+    HL_HOST_CLOCK_PROCESS_CPU = 4,
+    HL_HOST_CLOCK_THREAD_CPU = 5
+} hl_host_clock_kind;
 
 typedef struct hl_host_log_services {
     HL_ABI_HEADER;
@@ -181,6 +194,11 @@ typedef struct hl_host_file_services {
     hl_host_result (*truncate)(void *context, hl_host_handle file, uint64_t size);
     hl_host_result (*sync)(void *context, hl_host_handle file);
     hl_host_result (*data_sync)(void *context, hl_host_handle file);
+    /* Path namespace operations are appended in ABI 8; rename replaces the destination atomically. */
+    hl_host_result (*rename_relative)(void *context, hl_host_handle old_directory, const char *old_path,
+                                      size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                      size_t new_path_size);
+    hl_host_result (*unlink_relative)(void *context, hl_host_handle directory, const char *path, size_t path_size);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

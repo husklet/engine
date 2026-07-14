@@ -249,6 +249,27 @@ static hl_host_result test_data_sync(void *context, hl_host_handle file) {
     return file_result(HL_STATUS_OK, 0);
 }
 
+static hl_host_result test_rename(void *context, hl_host_handle old_directory, const char *old_path,
+                                  size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                  size_t new_path_size) {
+    (void)context;
+    (void)old_directory;
+    (void)old_path;
+    (void)old_path_size;
+    (void)new_directory;
+    (void)new_path;
+    (void)new_path_size;
+    return file_result(HL_STATUS_OK, 0);
+}
+
+static hl_host_result test_unlink(void *context, hl_host_handle directory, const char *path, size_t path_size) {
+    (void)context;
+    (void)directory;
+    (void)path;
+    (void)path_size;
+    return file_result(HL_STATUS_OK, 0);
+}
+
 static hl_host_result test_clone(void *context, hl_host_handle file) {
     (void)context;
     return file == 55 ? file_result(HL_STATUS_OK, 56) : file_result(HL_STATUS_INVALID_ARGUMENT, 0);
@@ -321,7 +342,9 @@ int main(void) {
                                    .appendv = test_appendv,
                                    .truncate = test_truncate,
                                    .sync = test_sync,
-                                   .data_sync = test_data_sync};
+                                   .data_sync = test_data_sync,
+                                   .rename_relative = test_rename,
+                                   .unlink_relative = test_unlink};
     char buffer[8] = {0};
 
     file_host.size = 6;

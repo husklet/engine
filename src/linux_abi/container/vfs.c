@@ -2064,11 +2064,11 @@ static char g_reg_last_exe[4200];
 
 static void proc_reg_unlink(void) {
     if (g_reg_file[0]) {
-        unlink(g_reg_file);
+        (void)hl_host_file_unlink(&g_jit_services, g_reg_file);
         g_reg_file[0] = 0;
     }
     if (g_reg_exe_file[0]) {
-        unlink(g_reg_exe_file);
+        (void)hl_host_file_unlink(&g_jit_services, g_reg_exe_file);
         g_reg_exe_file[0] = 0;
     }
 }
@@ -2079,10 +2079,10 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
     if (hl_host_file_store(&g_jit_services, tmp, 0644, buf, (size_t)len) != 0) return;
     char final[128];
     snprintf(final, sizeof final, "%s/%d", dir, (int)getpid());
-    if (rename(tmp, final) == 0)
+    if (hl_host_file_rename(&g_jit_services, tmp, final) == 0)
         snprintf(g_reg_file, sizeof g_reg_file, "%s", final);
     else
-        unlink(tmp);
+        (void)hl_host_file_unlink(&g_jit_services, tmp);
     // Publish the CANONICAL exe path as a sibling "x<pid>" record so a PEER process can serve
     // readlink("/proc/<pid>/exe") for this one (`ls -l /proc/<pid>`, ps tooling). The non-digit-leading
     // name keeps it invisible to the pid enumerators (proc_reg_count / the /proc listing digit scan).
@@ -2091,10 +2091,10 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
         snprintf(xtmp, sizeof xtmp, "%s/.xt%d", dir, (int)getpid());
         snprintf(xfin, sizeof xfin, "%s/x%d", dir, (int)getpid());
         if (hl_host_file_store(&g_jit_services, xtmp, 0644, exe, strlen(exe)) == 0) {
-            if (rename(xtmp, xfin) == 0)
+            if (hl_host_file_rename(&g_jit_services, xtmp, xfin) == 0)
                 snprintf(g_reg_exe_file, sizeof g_reg_exe_file, "%s", xfin);
             else
-                unlink(xtmp);
+                (void)hl_host_file_unlink(&g_jit_services, xtmp);
         }
     }
 }
