@@ -59,9 +59,10 @@ TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/%.o)
 LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
-ifeq ($(HOST),linux)
 LINUX_HOST_SOURCES := src/host/linux/host.c $(COMMON_HOST_SOURCES)
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
+
+ifeq ($(HOST),linux)
 LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-linux
 endif
@@ -209,11 +210,19 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
+.PHONY: all linux-compile clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
+
+# Truthful Linux-host compile/link gate. This covers every currently portable engine, translator,
+# Linux ABI, common-host, and Linux-host unit. The production unity JIT remains macOS-only and is
+# deliberately excluded until its remaining Mach, libkern, and kqueue dependencies are extracted.
+linux-compile: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
+	$(BUILD)/lib/libhl-host-fake.a $(BUILD)/lib/libhl-host-linux.a $(BUILD)/bin/hl-engine-runner \
+	$(BUILD)/tests/linux
+	@echo 'linux-compile: portable libraries, Linux host archive, runner, and host test linked'
 
 $(BUILD)/src/%.o: src/%.c
 	@mkdir -p $(@D)
@@ -1132,6 +1141,7 @@ clean:
 
 help:
 	@echo 'make all           build pure-C static libraries and runner'
+	@echo 'make linux-compile compile/link every portable unit and Linux host (not the macOS-only unity JIT)'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
 	@echo 'make compat-build  compile every Linux behavior fixture'
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
