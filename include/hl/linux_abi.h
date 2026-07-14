@@ -135,6 +135,7 @@ typedef struct hl_linux_fork_plan {
     uint32_t capacity;
     uint32_t count;
     uint32_t armed;
+    uint32_t host_completed;
 } hl_linux_fork_plan;
 
 enum { HL_LINUX_STAT_AARCH64_SIZE = 128, HL_LINUX_STAT_X86_64_SIZE = 144 };
@@ -170,6 +171,8 @@ HL_API hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_servic
 HL_API hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi);
 /* Caller must quiesce every concurrent operation on linux_abi until parent/child completion. */
 HL_API hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
+/* Marks that process.spawn_prepared already completed the inherited host fork bracket. */
+HL_API hl_status hl_linux_abi_fork_host_completed(hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan);
 HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,

@@ -52,6 +52,7 @@ typedef struct hl_macos_process {
 
 struct hl_host_macos {
     pthread_mutex_t lock;
+    pthread_mutex_t fork_gate;
     pthread_cond_t process_changed;
     uint32_t destroying;
     hl_host_sync_registry *sync;
@@ -59,6 +60,8 @@ struct hl_host_macos {
     hl_macos_file files[HL_MACOS_FILE_CAPACITY];
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
 };
+
+static hl_host_result hl_macos_fork_complete(void *context);
 
 static uint64_t hl_macos_monotonic_value(void) {
     struct timespec now;
@@ -586,14 +589,42 @@ static hl_macos_process *hl_macos_process_lookup(hl_host_macos *host, hl_host_ha
     return &host->processes[index];
 }
 
-static hl_host_result hl_macos_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process_entry entry, void *entry_context,
+                                                  int prepared) {
     hl_host_macos *host = context;
     hl_host_handle handle = 0;
     uint32_t index;
     pid_t pid;
+    int fork_error;
     if (entry == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (!prepared && pthread_mutex_lock(&host->fork_gate) != 0)
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     pid = fork();
-    if (pid < 0) return hl_macos_errno();
+    fork_error = errno;
+    if (prepared) {
+        hl_host_result completed = hl_macos_fork_complete(host);
+        if (completed.status != HL_STATUS_OK) {
+            if (pid > 0) {
+                int status;
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            }
+            if (pid == 0) _exit(255);
+            return completed;
+        }
+    } else if (pthread_mutex_unlock(&host->fork_gate) != 0) {
+        if (pid > 0) {
+            int status;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+        if (pid == 0) _exit(255);
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
+    if (pid < 0) {
+        errno = fork_error;
+        return hl_macos_errno();
+    }
     if (pid == 0) _exit(entry(entry_context) & 255);
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < HL_MACOS_PROCESS_CAPACITY; ++index) {
@@ -619,6 +650,14 @@ static hl_host_result hl_macos_process_spawn(void *context, hl_host_process_entr
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
     return hl_macos_result(HL_STATUS_OK, handle, 0);
+}
+
+static hl_host_result hl_macos_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+    return hl_macos_process_spawn_mode(context, entry, entry_context, 0);
+}
+
+static hl_host_result hl_macos_process_spawn_prepared(void *context, hl_host_process_entry entry, void *entry_context) {
+    return hl_macos_process_spawn_mode(context, entry, entry_context, 1);
 }
 
 static hl_host_result hl_macos_process_wait(void *context, hl_host_handle handle, uint64_t deadline_ns) {
@@ -748,9 +787,16 @@ static hl_host_result hl_macos_mutex_close(void *context, hl_host_handle handle)
 static hl_host_result hl_macos_fork_prepare(void *context) {
     hl_host_macos *host = context;
     hl_host_result result;
-    if (pthread_mutex_lock(&host->lock) != 0) return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_lock(&host->fork_gate) != 0) return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_lock(&host->lock) != 0) {
+        pthread_mutex_unlock(&host->fork_gate);
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
     result = hl_host_sync_fork_prepare(host->sync);
-    if (result.status != HL_STATUS_OK) pthread_mutex_unlock(&host->lock);
+    if (result.status != HL_STATUS_OK) {
+        pthread_mutex_unlock(&host->lock);
+        pthread_mutex_unlock(&host->fork_gate);
+    }
     return result;
 }
 
@@ -758,7 +804,9 @@ static hl_host_result hl_macos_fork_complete(void *context) {
     hl_host_macos *host = context;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
     if (pthread_mutex_unlock(&host->lock) != 0 && result.status == HL_STATUS_OK)
-        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+        result = hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_unlock(&host->fork_gate) != 0 && result.status == HL_STATUS_OK)
+        result = hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     return result;
 }
 
@@ -796,9 +844,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_write_sequential,
                                                hl_macos_file_clone_for_fork,
                                                hl_macos_file_seek};
-    static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
-                                                     hl_macos_process_spawn,     hl_macos_process_wait,
-                                                     hl_macos_process_terminate, hl_macos_process_close};
+    static const hl_host_process_services process = {
+        HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
+        hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
                                                hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
                                                hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_complete};
@@ -812,13 +860,20 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (pthread_mutex_init(&host->fork_gate, NULL) != 0) {
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     if (pthread_cond_init(&host->process_changed, NULL) != 0) {
+        pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (hl_host_sync_registry_create(&host->sync) != HL_STATUS_OK) {
         pthread_cond_destroy(&host->process_changed);
+        pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
@@ -877,6 +932,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
     }
     pthread_cond_destroy(&host->process_changed);
+    pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
     free(host);
 }

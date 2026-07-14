@@ -276,8 +276,7 @@ static int hl_forkserver_guest_environment(char *const envv[]) {
         return -1;
     }
     free(serialized);
-    if (hl_option_set("HL_GUEST_ENV_ESC", "1", 1) != 0 || hl_option_set("HL_GUEST_ENV_EXACT", "1", 1) != 0)
-        return -1;
+    if (hl_option_set("HL_GUEST_ENV_ESC", "1", 1) != 0 || hl_option_set("HL_GUEST_ENV_EXACT", "1", 1) != 0) return -1;
     return 0;
 }
 
@@ -353,7 +352,8 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
         hl_option_unset("HL_PCACHE");
         hl_option_unset("HL_PCACHE_DIR");
     }
-    _exit(hl_run_linux_guest(g_host_services, g_srv_rootfs[0] ? g_srv_rootfs : NULL, (uint32_t)argc, argv));
+    _exit(
+        hl_run_linux_guest(g_host_services, g_linux_box, g_srv_rootfs[0] ? g_srv_rootfs : NULL, (uint32_t)argc, argv));
 }
 
 // ---- server ----

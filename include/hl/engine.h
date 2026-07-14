@@ -6,7 +6,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_ENGINE_ABI 2u
+#define HL_ENGINE_ABI 3u
 
 typedef struct hl_engine hl_engine;
 
@@ -25,6 +25,22 @@ typedef enum hl_engine_request_kind {
     HL_ENGINE_REQUEST_FORCE_STOP = 2
 } hl_engine_request_kind;
 
+typedef enum hl_engine_fd_ownership {
+    /* Ownership transfers only after hl_engine_create succeeds. */
+    HL_ENGINE_FD_TRANSFER = 1,
+    /* Engine clones the handle and never closes the caller's original. */
+    HL_ENGINE_FD_BORROW = 2
+} hl_engine_fd_ownership;
+
+typedef struct hl_engine_fd_binding {
+    HL_ABI_HEADER;
+    uint32_t guest_fd;
+    uint32_t status_flags;
+    uint32_t descriptor_flags;
+    uint32_t ownership;
+    hl_host_handle host_handle;
+} hl_engine_fd_binding;
+
 typedef struct hl_engine_config {
     HL_ABI_HEADER;
     uint32_t guest_isa;
@@ -37,6 +53,9 @@ typedef struct hl_engine_config {
     size_t payload_size;
     /* Optional Linux root filesystem path owned by the caller for the engine lifetime. */
     const char *rootfs;
+    const hl_engine_fd_binding *fd_bindings;
+    uint32_t fd_binding_count;
+    uint32_t reserved;
 } hl_engine_config;
 
 typedef struct hl_engine_exit {

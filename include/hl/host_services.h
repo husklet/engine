@@ -10,7 +10,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI 5u
-#define HL_HOST_PROCESS_ABI 2u
+#define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
@@ -190,6 +190,8 @@ typedef struct hl_host_process_services {
     hl_host_result (*wait)(void *context, hl_host_handle process, uint64_t deadline_ns);
     hl_host_result (*terminate)(void *context, hl_host_handle process, uint32_t reason);
     hl_host_result (*close)(void *context, hl_host_handle process);
+    /* Consume a fork bracket previously acquired through sync.fork_prepare. */
+    hl_host_result (*spawn_prepared)(void *context, hl_host_process_entry entry, void *entry_context);
 } hl_host_process_services;
 
 typedef struct hl_host_event_record {

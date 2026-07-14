@@ -19,6 +19,21 @@ typedef struct churn_thread {
     _Atomic uint32_t operations;
 } churn_thread;
 
+typedef struct prepared_child {
+    hl_linux_abi *abi;
+    hl_linux_fork_plan *plan;
+} prepared_child;
+
+static int32_t run_prepared_child(void *opaque) {
+    prepared_child *child = opaque;
+    char byte;
+    if (hl_linux_abi_fork_host_completed(child->plan) != HL_STATUS_OK) return 20;
+    if (hl_linux_abi_fork_child(child->abi, child->plan) != HL_STATUS_OK) return 21;
+    if (hl_linux_read(child->abi, 9, &byte, 1) != 0) return 22;
+    if (hl_linux_close(child->abi, 9) != 0) return 23;
+    return 0;
+}
+
 static void *churn_mutexes(void *opaque) {
     churn_thread *thread = opaque;
     while (atomic_load(&thread->stop) == 0) {
@@ -54,6 +69,9 @@ int main(void) {
     hl_linux_fork_plan plan = {
         .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
     hl_host_result opened;
+    hl_host_result spawned;
+    hl_host_result waited;
+    prepared_child prepared = {&abi, &plan};
     char path[128], bytes[3] = {0};
     churn_thread churn = {0};
     pthread_t locker;
@@ -105,8 +123,17 @@ int main(void) {
     close(ready[1]);
     HL_CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     HL_CHECK(hl_linux_read(&abi, 9, bytes, 2) == 2 && memcmp(bytes, "ef", 2) == 0);
+    /* The explicit process operation consumes the prepared host bracket in both fork branches. */
+    HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OK);
+    spawned = services.process->spawn_prepared(services.context, run_prepared_child, &prepared);
+    HL_CHECK(hl_linux_abi_fork_host_completed(&plan) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_abi_fork_parent(&abi, &plan) == HL_STATUS_OK);
+    HL_CHECK(spawned.status == HL_STATUS_OK);
+    waited = services.process->wait(services.context, spawned.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(waited.status == HL_STATUS_OK && waited.detail == HL_HOST_PROCESS_EXIT_CODE && waited.value == 0);
+    HL_CHECK(services.process->close(services.context, spawned.value).status == HL_STATUS_OK);
     HL_CHECK(hl_linux_close(&abi, 9) == 0);
-    HL_CHECK(atomic_load(clone_count) == 2 && atomic_load(close_count) == 5);
+    HL_CHECK(atomic_load(clone_count) == 3 && atomic_load(close_count) == 8);
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);
     unlink(path);
     hl_host_linux_destroy(host);

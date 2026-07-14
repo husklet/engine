@@ -53,11 +53,14 @@ typedef struct hl_linux_handle_entry {
 
 struct hl_host_linux {
     pthread_mutex_t lock;
+    pthread_mutex_t fork_gate;
     pthread_cond_t process_changed;
     uint32_t destroying;
     hl_host_sync_registry *sync;
     hl_linux_handle_entry handles[HL_LINUX_HANDLE_CAPACITY];
 };
+
+static hl_host_result hl_linux_fork_complete(void *context);
 
 static uint64_t hl_linux_monotonic_value(void) {
     struct timespec now;
@@ -871,13 +874,36 @@ static hl_host_result hl_linux_shared_resize(void *context, hl_host_handle objec
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
-static hl_host_result hl_linux_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+static hl_host_result hl_linux_process_spawn_mode(void *context, hl_host_process_entry entry, void *entry_context,
+                                                  int prepared) {
     hl_host_linux *host = context;
     hl_host_result result;
     pid_t pid;
+    int fork_error;
     if (entry == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (!prepared && pthread_mutex_lock(&host->fork_gate) != 0)
+        return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     pid = fork();
-    if (pid < 0) return hl_linux_errno_result();
+    fork_error = errno;
+    if (prepared) {
+        result = hl_linux_fork_complete(host);
+    } else {
+        result = pthread_mutex_unlock(&host->fork_gate) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0)
+                                                             : hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
+    if (pid < 0) {
+        errno = fork_error;
+        return result.status == HL_STATUS_OK ? hl_linux_errno_result() : result;
+    }
+    if (result.status != HL_STATUS_OK) {
+        if (pid > 0) {
+            int status;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+        if (pid == 0) _exit(255);
+        return result;
+    }
     if (pid == 0) _exit(entry(entry_context) & 255);
     result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_PROCESS, pid, NULL, NULL, 0, -1);
     if (result.status != HL_STATUS_OK) {
@@ -886,6 +912,14 @@ static hl_host_result hl_linux_process_spawn(void *context, hl_host_process_entr
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     }
     return result;
+}
+
+static hl_host_result hl_linux_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+    return hl_linux_process_spawn_mode(context, entry, entry_context, 0);
+}
+
+static hl_host_result hl_linux_process_spawn_prepared(void *context, hl_host_process_entry entry, void *entry_context) {
+    return hl_linux_process_spawn_mode(context, entry, entry_context, 1);
 }
 
 static hl_host_result hl_linux_process_wait(void *context, hl_host_handle handle, uint64_t deadline_ns) {
@@ -1016,9 +1050,16 @@ static hl_host_result hl_linux_mutex_close(void *context, hl_host_handle handle)
 static hl_host_result hl_linux_fork_prepare(void *context) {
     hl_host_linux *host = context;
     hl_host_result result;
-    if (pthread_mutex_lock(&host->lock) != 0) return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_lock(&host->fork_gate) != 0) return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_lock(&host->lock) != 0) {
+        pthread_mutex_unlock(&host->fork_gate);
+        return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    }
     result = hl_host_sync_fork_prepare(host->sync);
-    if (result.status != HL_STATUS_OK) pthread_mutex_unlock(&host->lock);
+    if (result.status != HL_STATUS_OK) {
+        pthread_mutex_unlock(&host->lock);
+        pthread_mutex_unlock(&host->fork_gate);
+    }
     return result;
 }
 
@@ -1026,7 +1067,9 @@ static hl_host_result hl_linux_fork_complete(void *context) {
     hl_host_linux *host = context;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
     if (pthread_mutex_unlock(&host->lock) != 0 && result.status == HL_STATUS_OK)
-        return hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+        result = hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    if (pthread_mutex_unlock(&host->fork_gate) != 0 && result.status == HL_STATUS_OK)
+        result = hl_linux_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
     return result;
 }
 
@@ -1058,9 +1101,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_linux_shared_create,    hl_linux_shared_open,
                                                                  hl_linux_shared_resize,    hl_linux_close_descriptor};
-    static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
-                                                     hl_linux_process_spawn,     hl_linux_process_wait,
-                                                     hl_linux_process_terminate, hl_linux_process_close};
+    static const hl_host_process_services process = {
+        HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
+        hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create,
                                                hl_linux_mutex_lock,   hl_linux_mutex_unlock,  hl_linux_mutex_close,
                                                hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_complete};
@@ -1075,13 +1118,20 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (pthread_mutex_init(&host->fork_gate, NULL) != 0) {
+        pthread_mutex_destroy(&host->lock);
+        free(host);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     if (pthread_cond_init(&host->process_changed, NULL) != 0) {
+        pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (hl_host_sync_registry_create(&host->sync) != HL_STATUS_OK) {
         pthread_cond_destroy(&host->process_changed);
+        pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
@@ -1145,6 +1195,7 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     }
     hl_host_sync_registry_destroy(host->sync);
     pthread_cond_destroy(&host->process_changed);
+    pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
     free(host);
 }

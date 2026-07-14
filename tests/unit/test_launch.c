@@ -5,6 +5,7 @@
 #include "../../src/core/launch.h"
 #include "hl/config.h"
 #include "hl/host_services.h"
+#include "hl/linux_abi.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,10 +13,13 @@
 #include <string.h>
 #include <unistd.h>
 
-int hl_run_linux_guest(const hl_host_services *host, const char *rootfs, uint32_t argc, char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
+                       char *const argv[]);
 
-int hl_run_linux_guest(const hl_host_services *host, const char *rootfs, uint32_t argc, char *const argv[]) {
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
+                       char *const argv[]) {
     (void)host;
+    (void)box;
     (void)rootfs;
     (void)argc;
     (void)argv;

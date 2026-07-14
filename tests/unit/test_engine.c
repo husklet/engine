@@ -13,10 +13,11 @@ static int32_t fake_entry(void *context) {
     return 0;
 }
 
-static hl_status fake_start(const hl_host_services *host, const char *rootfs, uint32_t argc, const char *const argv[],
-                            hl_host_handle *process) {
+static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
+                            const char *const argv[], hl_host_handle *process) {
     hl_host_result spawned;
     (void)rootfs;
+    (void)box;
     (void)argc;
     (void)argv;
     spawned = host->process->spawn_cloned(host->context, fake_entry, NULL);

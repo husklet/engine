@@ -181,9 +181,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    NULL,
                                                    NULL};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_fake_monotonic, hl_fake_realtime};
-    static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,       sizeof(process),
-                                                     hl_fake_spawn_cloned,      hl_fake_process_wait,
-                                                     hl_fake_process_terminate, hl_fake_process_close};
+    static const hl_host_process_services process = {
+        HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
+        hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
     static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,
                                                hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
                                                hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle};

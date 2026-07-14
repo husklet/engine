@@ -158,6 +158,7 @@ hl_status hl_linux_abi_fork_prepare(hl_linux_abi *linux_abi, hl_linux_fork_plan 
         return HL_STATUS_NOT_SUPPORTED;
     plan->count = 0;
     plan->armed = 0;
+    plan->host_completed = 0;
     hl_linux_lock(linux_abi);
     for (index = 1; index < linux_abi->ofd_capacity; ++index) {
         hl_linux_ofd_entry *entry = &linux_abi->ofds[index];
@@ -223,6 +224,14 @@ arm_failed:
     return HL_STATUS_BUSY;
 }
 
+hl_status hl_linux_abi_fork_host_completed(hl_linux_fork_plan *plan) {
+    if (plan == NULL || plan->abi != HL_LINUX_ABI_VERSION || plan->size < sizeof(*plan) || plan->armed == 0 ||
+        plan->host_completed != 0)
+        return HL_STATUS_INVALID_ARGUMENT;
+    plan->host_completed = 1;
+    return HL_STATUS_OK;
+}
+
 hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *plan) {
     const hl_host_file_services *files;
     const hl_host_sync_services *sync;
@@ -234,8 +243,10 @@ hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *
         return HL_STATUS_NOT_SUPPORTED;
     if (plan->armed == 0) return HL_STATUS_INVALID_ARGUMENT;
     {
-        hl_host_result completed = sync->fork_parent(linux_abi->host->context);
+        hl_host_result completed = {HL_STATUS_OK, 1, 0, 0};
+        if (plan->host_completed == 0) completed = sync->fork_parent(linux_abi->host->context);
         plan->armed = 0;
+        plan->host_completed = 0;
         hl_linux_unlock(linux_abi);
         if (completed.status != HL_STATUS_OK) status = (hl_status)completed.status;
     }
@@ -257,10 +268,12 @@ hl_status hl_linux_abi_fork_child(hl_linux_abi *linux_abi, hl_linux_fork_plan *p
         sync->mutex_close == NULL || sync->fork_child == NULL || plan->armed == 0)
         return HL_STATUS_NOT_SUPPORTED;
     {
-        hl_host_result completed = sync->fork_child(linux_abi->host->context);
+        hl_host_result completed = {HL_STATUS_OK, 1, 0, 0};
+        if (plan->host_completed == 0) completed = sync->fork_child(linux_abi->host->context);
         if (completed.status != HL_STATUS_OK) return (hl_status)completed.status;
     }
     plan->armed = 0;
+    plan->host_completed = 0;
     atomic_flag_clear(&linux_abi->table_lock);
     /* Phase one validates every record and allocates every replacement lock without mutating an OFD. */
     for (index = 0; index < plan->count; ++index) {
