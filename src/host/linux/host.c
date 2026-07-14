@@ -115,6 +115,8 @@ static hl_host_result hl_linux_fork_child(void *context);
 static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle subscription);
 static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle handle);
 static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter);
+static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_linux_handle_kind first,
+                               hl_linux_handle_kind second);
 
 static uint64_t hl_linux_monotonic_value(void) {
     struct timespec now;
@@ -291,6 +293,93 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
     }
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle file, uint64_t requested_address,
+                                               uint64_t offset, uint64_t size, uint32_t protection, uint32_t flags,
+                                               hl_host_file_mapping *output) {
+    hl_host_linux *host = context;
+    hl_host_result registered;
+    void *address;
+    int descriptor;
+    long page = sysconf(_SC_PAGESIZE);
+    int native_flags;
+    uint32_t placement = flags & (HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE);
+    uint32_t sharing = flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE);
+    if (output == NULL || output->abi != HL_HOST_FILE_MAPPING_ABI || output->size < sizeof(*output) || size == 0 ||
+        size > SIZE_MAX || offset > INT64_MAX || page <= 0 || offset % (uint64_t)page != 0 ||
+        requested_address > UINTPTR_MAX || (requested_address != 0 && requested_address % (uint64_t)page != 0) ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED |
+                             HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
+        (sharing != HL_HOST_MEMORY_SHARED && sharing != HL_HOST_MEMORY_PRIVATE) ||
+        (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
+        (placement != 0 && requested_address == 0))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    native_flags = sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE;
+    if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
+#ifdef MAP_FIXED_NOREPLACE
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) native_flags |= MAP_FIXED_NOREPLACE;
+#else
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+#endif
+    address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags,
+                   descriptor, (off_t)offset);
+    if (address == MAP_FAILED) return hl_linux_errno_result();
+    registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, address, NULL, size, -1);
+    if (registered.status != HL_STATUS_OK) {
+        (void)munmap(address, (size_t)size);
+        return registered;
+    }
+    output->handle = registered.value;
+    output->address = (uint64_t)(uintptr_t)address;
+    output->mapped_size = size;
+    output->reserved = 0;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_memory_sync(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    int status;
+    if (size == 0 || size > SIZE_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, mapping, HL_LINUX_HANDLE_MAPPING);
+    if (entry == NULL || offset > entry->size || size > entry->size - offset) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    status = msync((char *)entry->address + offset, (size_t)size, MS_SYNC);
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_memory_unmap_range(void *context, hl_host_handle mapping, uint64_t offset,
+                                                  uint64_t size) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    int status;
+    long page = sysconf(_SC_PAGESIZE);
+    if (size == 0 || size > SIZE_MAX || page <= 0 || offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, mapping, HL_LINUX_HANDLE_MAPPING);
+    if (entry == NULL || offset > entry->size || size > entry->size - offset) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    status = munmap((char *)entry->address + offset, (size_t)size);
+    if (status == 0 && offset == 0 && size == entry->size) {
+        entry->kind = HL_LINUX_HANDLE_NONE;
+        entry->address = NULL;
+        entry->size = 0;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
 static hl_host_result hl_linux_memory_publish(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
@@ -2316,7 +2405,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_reserve,      hl_linux_memory_protect,
                                                    hl_linux_memory_release,      hl_linux_memory_publish,
                                                    hl_linux_memory_reserve_code, hl_linux_memory_repair_code,
-                                                   hl_linux_memory_code_write,   hl_linux_memory_code_write};
+                                                   hl_linux_memory_code_write,   hl_linux_memory_code_write,
+                                                   hl_linux_memory_map_file,     hl_linux_memory_sync,
+                                                   hl_linux_memory_unmap_range};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};

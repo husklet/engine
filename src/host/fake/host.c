@@ -44,6 +44,42 @@ static hl_host_result hl_fake_publish(void *context, hl_host_handle mapping, uin
     return hl_fake_protect(context, mapping, offset, size, 0);
 }
 
+static hl_host_result hl_fake_map_file(void *context, hl_host_handle file, uint64_t address, uint64_t offset,
+                                       uint64_t size, uint32_t protection, uint32_t flags,
+                                       hl_host_file_mapping *output) {
+    hl_fake_host *fake = context;
+    hl_host_result result;
+    (void)offset;
+    (void)protection;
+    if (file == 0 || size == 0 || output == NULL || output->abi != HL_HOST_FILE_MAPPING_ABI ||
+        output->size < sizeof(*output) ||
+        ((flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE)) != HL_HOST_MEMORY_SHARED &&
+         (flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE)) != HL_HOST_MEMORY_PRIVATE))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status != HL_STATUS_OK) return result;
+    fake->live_mappings++;
+    output->handle = result.value;
+    output->address = address != 0 ? address : UINT64_C(0x10000000) + result.value * UINT64_C(0x10000);
+    output->mapped_size = size;
+    output->reserved = 0;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_mapping_sync(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
+    return hl_fake_protect(context, mapping, offset, size, 0);
+}
+
+static hl_host_result hl_fake_unmap_range(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
+    hl_fake_host *fake = context;
+    (void)offset;
+    if (mapping == 0 || size == 0 || fake->live_mappings == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK) fake->live_mappings--;
+    return result;
+}
+
 static hl_host_result hl_fake_monotonic(void *context) {
     hl_fake_host *fake = context;
     return hl_fake_result(fake, fake->monotonic_ns++);
@@ -783,7 +819,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    NULL,
                                                    NULL,
                                                    hl_fake_begin_code_write,
-                                                   hl_fake_end_code_write};
+                                                   hl_fake_end_code_write,
+                                                   hl_fake_map_file,
+                                                   hl_fake_mapping_sync,
+                                                   hl_fake_unmap_range};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI,  sizeof(clock),         hl_fake_monotonic,
                                                  hl_fake_realtime,   hl_fake_raw_monotonic, hl_fake_process_cpu,
                                                  hl_fake_thread_cpu, hl_fake_sleep_until};

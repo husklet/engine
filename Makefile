@@ -1147,11 +1147,11 @@ $(BUILD)/tests/linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/li
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
-$(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/sync.c src/core/host_services.c \
+$(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/sync.c src/host/resolve.c src/core/host_services.c \
 	src/core/log.c src/host/clock.c src/host/file.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
-		src/host/macos/host.c src/host/sync.c src/core/host_services.c src/core/log.c src/host/clock.c \
+	src/host/macos/host.c src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c \
 		src/host/file.c -o $@
 
 $(BUILD)/tests/range-macos: tests/unit/test_range.c src/host/range.c src/host/macos/range.c

@@ -6,7 +6,8 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 2u
-#define HL_HOST_MEMORY_ABI 2u
+#define HL_HOST_MEMORY_ABI 3u
+#define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI 11u
@@ -94,6 +95,13 @@ typedef struct hl_host_network_address {
 
 enum { HL_HOST_MEMORY_READ = 1u << 0, HL_HOST_MEMORY_WRITE = 1u << 1, HL_HOST_MEMORY_EXECUTE = 1u << 2 };
 
+enum {
+    HL_HOST_MEMORY_SHARED = 1u << 0,
+    HL_HOST_MEMORY_PRIVATE = 1u << 1,
+    HL_HOST_MEMORY_FIXED = 1u << 2,
+    HL_HOST_MEMORY_FIXED_NOREPLACE = 1u << 3
+};
+
 enum { HL_HOST_CODE_DUAL_ALIAS = 1u << 0 };
 
 enum { HL_HOST_EVENT_ADD = 1, HL_HOST_EVENT_MODIFY = 2, HL_HOST_EVENT_DELETE = 3 };
@@ -134,6 +142,14 @@ typedef struct hl_host_code_mapping {
     uint64_t reserved;
 } hl_host_code_mapping;
 
+typedef struct hl_host_file_mapping {
+    HL_ABI_HEADER;
+    hl_host_handle handle;
+    uint64_t address;
+    uint64_t mapped_size;
+    uint64_t reserved;
+} hl_host_file_mapping;
+
 typedef struct hl_host_memory_services {
     HL_ABI_HEADER;
     hl_host_result (*reserve)(void *context, uint64_t size, uint64_t alignment, uint32_t flags);
@@ -146,6 +162,13 @@ typedef struct hl_host_memory_services {
     /* Per-thread W^X gate. begin enables writes; end restores execution. Dual-alias hosts may no-op. */
     hl_host_result (*begin_code_write)(void *context);
     hl_host_result (*end_code_write)(void *context);
+    /* Map an opaque file handle. offset and size must satisfy the native VM page granularity. */
+    hl_host_result (*map_file)(void *context, hl_host_handle file, uint64_t address, uint64_t offset, uint64_t size,
+                               uint32_t protection, uint32_t flags, hl_host_file_mapping *output);
+    /* Flush a range of a shared file mapping to its backing object. */
+    hl_host_result (*sync)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
+    /* Unmap a page-aligned subrange. A full-range unmap consumes the mapping handle. */
+    hl_host_result (*unmap_range)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

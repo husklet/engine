@@ -104,6 +104,49 @@ int main(void) {
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     {
+        long page = sysconf(_SC_PAGESIZE);
+        char map_path[128];
+        hl_host_file_mapping shared_map = {HL_HOST_FILE_MAPPING_ABI, sizeof(shared_map), 0, 0, 0, 0};
+        hl_host_file_mapping private_map = {HL_HOST_FILE_MAPPING_ABI, sizeof(private_map), 0, 0, 0, 0};
+        hl_host_result mapped_file;
+        char disk = 0;
+        snprintf(map_path, sizeof(map_path), "/tmp/hl_file_map_linux_%ld", (long)getpid());
+        mapped_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, map_path, strlen(map_path),
+                                                   HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                                   HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
+        HL_CHECK(page > 0 && mapped_file.status == HL_STATUS_OK);
+        HL_CHECK(services.file->truncate(services.context, mapped_file.value, (uint64_t)page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page,
+                                           HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_SHARED,
+                                           &shared_map).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, mapped_file.value).status == HL_STATUS_OK);
+        ((char *)(uintptr_t)shared_map.address)[0] = 'S';
+        HL_CHECK(services.memory->sync(services.context, shared_map.handle, 0, (uint64_t)page).status == HL_STATUS_OK);
+        mapped_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, map_path, strlen(map_path),
+                                                   HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
+        HL_CHECK(mapped_file.status == HL_STATUS_OK);
+        HL_CHECK(services.file->read_at(services.context, mapped_file.value, 0, (hl_host_bytes){&disk, 1}).status ==
+                     HL_STATUS_OK &&
+                 disk == 'S');
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page,
+                                           HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                                           &private_map).status == HL_STATUS_OK);
+        ((char *)(uintptr_t)private_map.address)[0] = 'P';
+        HL_CHECK(services.memory->sync(services.context, private_map.handle, 0, (uint64_t)page).status == HL_STATUS_OK);
+        disk = 0;
+        HL_CHECK(services.file->read_at(services.context, mapped_file.value, 0, (hl_host_bytes){&disk, 1}).status ==
+                     HL_STATUS_OK &&
+                 disk == 'S');
+        HL_CHECK(services.memory->protect(services.context, private_map.handle, 0, (uint64_t)page,
+                                          HL_HOST_MEMORY_READ).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, private_map.handle, 0, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, shared_map.handle, 0, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, mapped_file.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(map_path) == 0);
+    }
+    {
         hl_host_result stream = services.file->standard_stream(services.context, HL_HOST_STANDARD_OUTPUT);
         HL_CHECK(stream.status == HL_STATUS_OK && (stream.detail & HL_HOST_FILE_WRITE) != 0);
         HL_CHECK(services.file->close(services.context, stream.value).status == HL_STATUS_OK);
