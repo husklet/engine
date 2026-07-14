@@ -121,9 +121,15 @@ static int parse_exit(const char *text, int *value) {
 
 static int run_suite(const char *engine, const char *binary_root, const char *suite_root) {
     char manifest[1024], *line = NULL;
+    const char *architecture = strrchr(binary_root, '/');
     size_t capacity = 0, passed = 0, unsupported = 0, excluded = 0;
     ssize_t length;
     FILE *file;
+    architecture = architecture == NULL ? binary_root : architecture + 1;
+    if (strcmp(architecture, "aarch64") != 0 && strcmp(architecture, "x86_64") != 0) {
+        fprintf(stderr, "linux-matrix: binary root must end in aarch64 or x86_64: %s\n", binary_root);
+        return 1;
+    }
     if (snprintf(manifest, sizeof(manifest), "%s/manifest.tsv", suite_root) >= (int)sizeof(manifest) ||
         (file = fopen(manifest, "r")) == NULL) {
         perror("linux matrix manifest");
@@ -151,7 +157,7 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
         }
         if (count == 7) {
             source_size = strlen(fields[0]);
-            if (!has_token(fields[2], "x86_64")) {
+            if (!has_token(fields[2], architecture)) {
                 excluded++;
                 continue;
             }
@@ -174,7 +180,7 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             passed++;
             continue;
         }
-        if (strncmp(fields[11], "excluded-", 9) == 0 || !has_token(fields[4], "x86_64")) {
+        if (strncmp(fields[11], "excluded-", 9) == 0 || !has_token(fields[4], architecture)) {
             excluded++;
             continue;
         }
@@ -199,7 +205,7 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             }
             memcpy(binary, fields[2], source_size - 2);
             binary[source_size - 2] = 0;
-        } else if (strncmp(fields[5], "prebuilt:", 9) == 0 && source_size != 0 && source_size < sizeof(binary)) {
+        } else if (strncmp(fields[5], "prebuilt", 8) == 0 && source_size != 0 && source_size < sizeof(binary)) {
             memcpy(binary, fields[2], source_size + 1);
         } else {
             fprintf(stderr, "linux-matrix: invalid source %s\n", fields[2]);
@@ -223,8 +229,8 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
     }
     free(line);
     if (fclose(file) != 0) return 1;
-    printf("linux-matrix: %zu active x86-64 cases passed; %zu require typed launch; %zu excluded or other ISA\n",
-           passed, unsupported, excluded);
+    printf("linux-matrix: %zu active %s cases passed; %zu require typed launch; %zu excluded or other ISA\n",
+           passed, architecture, unsupported, excluded);
     return passed == 0;
 }
 
