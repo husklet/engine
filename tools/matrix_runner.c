@@ -223,6 +223,25 @@ static int config_option(config_wire *wire, const char *name, const char *value)
     if (strcmp(name, "HL_NET_ISOLATE") == 0) {
         if (strcmp(value, "1") != 0) return 1;
         wire->config.network_isolated = 1;
+    } else if (strcmp(name, "HL_CPUS") == 0) {
+        char *end;
+        unsigned long parsed;
+        errno = 0;
+        parsed = strtoul(value, &end, 10);
+        if (errno != 0 || *value == 0 || *end != 0 || parsed == 0 || parsed > UINT32_MAX) return 1;
+        wire->config.cpu_limit = (uint32_t)parsed;
+    } else if (strcmp(name, "HL_MEM_MAX") == 0) {
+        char *end;
+        unsigned long long parsed;
+        errno = 0;
+        parsed = strtoull(value, &end, 10);
+        if (errno != 0 || *value == 0 || *end != 0 || parsed == 0) return 1;
+        wire->config.memory_limit = (uint64_t)parsed;
+    } else if (strcmp(name, "HL_ROOTFS_RO") == 0) {
+        if (strcmp(value, "1") != 0) return 1;
+        wire->config.rootfs_read_only = 1;
+    } else if (strcmp(name, "HL_ULIMITS") == 0) {
+        return pool_string(wire, value, &wire->config.limits_offset);
     } else if (strcmp(name, "HL_VOLUMES") == 0) {
         return pool_string(wire, value, &wire->config.volumes_offset);
     } else if (strcmp(name, "HL_NETNS") == 0) {
