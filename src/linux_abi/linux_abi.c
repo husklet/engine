@@ -1375,7 +1375,8 @@ static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_f
                                        int32_t directory_fd, const char *path, size_t path_size, uint32_t flags,
                                        uint32_t mode) {
     const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
-                               HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
+                               HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK | HL_LINUX_O_NOFOLLOW | HL_LINUX_O_DIRECTORY |
+                               HL_LINUX_O_PATH | HL_LINUX_O_CLOEXEC;
     const hl_host_file_services *files;
     const hl_linux_ofd_entry *found;
     hl_linux_ofd_entry *directory_ofd = NULL;
@@ -1393,7 +1394,10 @@ static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_f
     default: return -HL_LINUX_EINVAL;
     }
     if ((flags & HL_LINUX_O_APPEND) != 0) access |= HL_HOST_FILE_APPEND;
+    if ((flags & HL_LINUX_O_NONBLOCK) != 0) access |= HL_HOST_FILE_NONBLOCK;
+    if ((flags & HL_LINUX_O_NOFOLLOW) != 0) access |= HL_HOST_FILE_NOFOLLOW;
     if ((flags & HL_LINUX_O_DIRECTORY) != 0) access |= HL_HOST_FILE_DIRECTORY;
+    if ((flags & HL_LINUX_O_PATH) != 0) access |= HL_HOST_FILE_PATH_ONLY;
     if ((flags & HL_LINUX_O_CREAT) != 0) creation |= HL_HOST_FILE_CREATE;
     if ((flags & HL_LINUX_O_EXCL) != 0) creation |= HL_HOST_FILE_EXCLUSIVE;
     if ((flags & HL_LINUX_O_TRUNC) != 0) creation |= HL_HOST_FILE_TRUNCATE;
