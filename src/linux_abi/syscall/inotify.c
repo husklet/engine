@@ -391,6 +391,13 @@ static void bound_inotify_move_side(bound_inotify_provider *provider, const char
             memcmp(watch->path, path, directory_size) != 0 || (watch->mask & mask) == 0)
             continue;
         (void)bound_inotify_queue(provider, watch->token, mask, cookie, slash + 1, strlen(slash + 1));
+        {
+            char *current = dir_snapshot(watch->path);
+            if (current != NULL) {
+                free(watch->snapshot);
+                watch->snapshot = current;
+            }
+        }
     }
 }
 
