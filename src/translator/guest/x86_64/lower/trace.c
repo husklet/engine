@@ -145,7 +145,7 @@ static int loop_flags_dead(uint64_t start) {
     int produced = 0;
     for (int n = 0; n < 256; n++) {
         struct insn I;
-        decode(gpc, &I);
+        hl_x86_decode(gpc, &I);
         if (I.len == 0) return 0;
         uint8_t op = I.op;
         // terminator of a self-loop block: the loop jcc (reads flags produced THIS iter iff produced)
@@ -388,7 +388,7 @@ static int x86_flags_livein(uint64_t pc, uint64_t anchor) {
     for (int n = 0; n < XSCAN_INSNS; n++) {
         if (!xf_scan_ok(pc, anchor)) break;
         struct insn I;
-        decode(pc, &I);
+        hl_x86_decode(pc, &I);
         if (I.len <= 0) break;
         int rd, wr;
         int kind = x86_flag_rw(&I, &rd, &wr);

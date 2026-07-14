@@ -231,7 +231,7 @@ static float avx_f16_to_f32(uint16_t bits) {
 
 static void do_avx(struct cpu *c) {
     struct insn I;
-    decode(c->rip, &I);
+    hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + I.len;
     int L = I.vex_l;                            // 0=128,1=256,2=512
     int W = (L == 0) ? 16 : (L == 1) ? 32 : 64; // operation width in bytes
@@ -1276,7 +1276,7 @@ static void sse42_mask(struct cpu *c, int res, int imm, int n) {
 
 static void do_sse3b(struct cpu *c) {
     struct insn I;
-    decode(c->rip, &I);
+    hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + I.len;
     int map = I.map3, op = I.op;
     xs_note(0, map, op, c->rip);              // EXITSTAT diagnostic (no-op unless env set)

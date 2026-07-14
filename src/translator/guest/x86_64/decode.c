@@ -1,36 +1,11 @@
 // translator/guest/x86_64 -- the x86-64 instruction decoder (prefixes, ModRM/SIB, the insn IR).
 
-// ---------------- x86-64 decoder ----------------
-struct insn {
-    int len;
-    int rexW, rexR, rexX, rexB, has_rex;
-    int opsize; // operand size in bytes: 1/2/4/8
-    int p66;    // 0x66 prefix seen (mandatory-prefix for SSE; distinct from opsize)
-    int addr32; // 0x67
-    int seg;    // 0 none, 1 fs, 2 gs
-    int lock, rep, repne;
-    int two;    // 0F escape seen
-    int map3;   // legacy 3-byte escape: 2 = 0F 38, 3 = 0F 3A (0 otherwise). op holds the final byte.
-    uint8_t op; // opcode byte after escape
-    int has_modrm;
-    uint8_t modrm;
-    int mod, reg, rm;
-    int is_mem; // operand-in-memory (mod != 3)
-    int m_base, m_index, m_scale;
-    int64_t disp;
-    int rip_rel;
-    int m_hasbase, m_hasindex;
-    int rm_reg; // when mod==3: the r/m register number
-    int64_t imm;
-    int imm_bytes;
-    // ---- VEX/EVEX (AVX/AVX2/AVX-512). vex=1 means a C4/C5/62-prefixed insn; the shared exit-to-C AVX
-    // emulator (avx.c) reads these. vex_map: 1=0F,2=0F38,3=0F3A. vex_pp: 0=none,1=66,2=F3,3=F2.
-    // vex_l: vector length (0=128/xmm,1=256/ymm,2=512/zmm). vvvv: 2nd source reg (already un-inverted).
-    int vex, evex;
-    int vex_map, vex_pp, vex_l, vex_w, vvvv;
-    int evex_mask, evex_z, evex_b; // EVEX: opmask k-reg (aaa), zeroing, broadcast/rc
-};
+#include "decoder.h"
 
+#ifndef HL_X86_DECODER_EXTERNAL
+#include <string.h>
+
+// ---------------- x86-64 decoder ----------------
 static int op_has_modrm(int two, uint8_t op) {
     if (two) {
         if (op == 0x05) return 0;                             // syscall
@@ -121,7 +96,7 @@ static int op_imm_bytes(struct insn *I) {
 
 // returns instruction length, fills I. On a decode it can't handle for length, returns
 // the bytes consumed so far so the reporter can show them.
-static int decode(uint64_t pc, struct insn *I) {
+int hl_x86_decode(uint64_t pc, hl_x86_insn *I) {
     memset(I, 0, sizeof *I);
     const uint8_t *p = (const uint8_t *)pc;
     int n = 0;
@@ -286,13 +261,15 @@ static int decode(uint64_t pc, struct insn *I) {
             }
             // displacement
             if (I->rip_rel) {
-                I->disp = (int32_t)(p[n] | (p[n + 1] << 8) | (p[n + 2] << 16) | ((uint32_t)p[n + 3] << 24));
+                I->disp = (int32_t)((uint32_t)p[n] | ((uint32_t)p[n + 1] << 8) | ((uint32_t)p[n + 2] << 16) |
+                                    ((uint32_t)p[n + 3] << 24));
                 n += 4;
             } else if (I->mod == 1) {
                 I->disp = (int8_t)p[n];
                 n += 1;
             } else if (I->mod == 2 || (!I->m_hasbase && I->rm == 4)) {
-                I->disp = (int32_t)(p[n] | (p[n + 1] << 8) | (p[n + 2] << 16) | ((uint32_t)p[n + 3] << 24));
+                I->disp = (int32_t)((uint32_t)p[n] | ((uint32_t)p[n + 1] << 8) | ((uint32_t)p[n + 2] << 16) |
+                                    ((uint32_t)p[n + 3] << 24));
                 n += 4;
             }
         }
@@ -311,6 +288,9 @@ static int decode(uint64_t pc, struct insn *I) {
     return n;
 }
 
+#endif
+
+#ifdef HL_X86_DECODER_EXTERNAL
 // x17 += d  (signed displacement), folded into add/sub-immediate(s) instead of a 64-bit
 // movconst+add.  d is the sign-extension of an x86 disp8/disp32, so |d| <= 2^31.
 // imm12 (1 insn) covers all disp8 and small disp32; 24-bit (2 insns via LSL#12) covers most
@@ -441,3 +421,4 @@ static void emit_load_mem(struct insn *I, uint64_t next, int w, int rt) {
         e_load(w, rt, 17);
     }
 }
+#endif

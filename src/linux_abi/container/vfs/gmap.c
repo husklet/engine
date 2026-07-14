@@ -1,241 +1,255 @@
-// Extracted from ../vfs.c: guest address-space mapping registry (g_gmap + gmap_add/del/find_len/reset_all)
-// Not standalone -- #included by ../vfs.c at the original position (verbatim move, identical
-// preprocessed TU). Relies on ../vfs.c's preceding globals/headers; see vfs.c for context.
-// Guest address-space registry. Every guest mapping (ELF image, interp, heap, stack, anon/file mmap) is
-// tracked so execve() can tear the inherited space down before loading the new image. Without this a
-// post-fork exec keeps the PARENT's dense layout, and load_elf must bias a non-PIE ET_EXEC off its fixed
-// vaddr (macOS __PAGEZERO reserves the low 4 GB) -> the image's baked absolute refs collide with the
-// densely-packed inherited maps -> SIGSEGV. Resetting reproduces the clean fresh-exec layout that works.
-#define GMAP_N 8192 // was 1024 -- a heavy guest overflowed it, leaking the untracked mappings at execve teardown
+// hl/linux_abi -- guest mapping and Linux memory-lock state.
+#include "gmap.h"
 
-// `len` is the FULL tracked extent (incl. the 64 KB guard tail dd reserves past a guest anon mapping,
-// so glibc's vectorized over-reads stay mapped) -- used for execve teardown / munmap / mremap. `glen`
-// is the guest-VISIBLE logical length (== len for guard-less mappings); /proc/[pid]/{,s}maps reports it
-// so a mapping's Size/Rss matches what the guest asked for, not dd's over-reservation (LTP mlock05 Rss).
-static struct {
-    uint64_t addr, len, glen;
-} g_gmap[GMAP_N];
+#include <errno.h>
+#include <sys/mman.h>
 
-static int g_ngmap;
+#define MLK_N 1024
+#define HL_GUEST_RLIMIT_MEMLOCK 8
 
-static void gmap_add(uint64_t addr, uint64_t len) {
-    if (!addr || addr == (uint64_t)-1 || len == 0 || g_ngmap >= GMAP_N) return;
-    g_gmap[g_ngmap].addr = addr;
-    g_gmap[g_ngmap].len = len;
-    g_gmap[g_ngmap].glen = len; // default: no guard tail; the anon-map paths override via gmap_set_glen
-    g_ngmap++;
+struct hl_gmap_lock_range {
+    uint64_t low;
+    uint64_t high;
+};
+
+struct hl_gmap_context {
+    hl_gmap_entry mappings[HL_GMAP_CAPACITY];
+    size_t mapping_count;
+    struct hl_gmap_lock_range locks[MLK_N];
+    size_t lock_count;
+    int lock_all;
+    int lock_future;
+    const hl_limit_table *limits;
+};
+
+static struct hl_gmap_context g_gmap;
+
+void hl_gmap_bind_limits(const hl_limit_table *limits) {
+    g_gmap.limits = limits;
 }
 
-// Record a mapping's guest-visible logical length (< its full tracked extent when a guard tail rides
-// along). Called right after gmap_add on the guard-reserving anon mmap/mremap paths.
-static void gmap_set_glen(uint64_t addr, uint64_t glen) {
-    for (int i = 0; i < g_ngmap; i++)
-        if (g_gmap[i].addr == addr) {
-            g_gmap[i].glen = glen;
+size_t hl_gmap_count(void) {
+    return g_gmap.mapping_count;
+}
+
+int hl_gmap_get(size_t index, hl_gmap_entry *entry) {
+    if (!entry || index >= g_gmap.mapping_count) return 0;
+    *entry = g_gmap.mappings[index];
+    return 1;
+}
+
+void hl_gmap_add(uint64_t address, uint64_t length) {
+    hl_gmap_entry *entry;
+    if (!address || address == UINT64_MAX || !length || g_gmap.mapping_count >= HL_GMAP_CAPACITY) return;
+    entry = &g_gmap.mappings[g_gmap.mapping_count++];
+    entry->address = address;
+    entry->length = length;
+    entry->guest_length = length;
+}
+
+void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) {
+            g_gmap.mappings[index].guest_length = guest_length;
             return;
         }
 }
 
-static void gmap_del(uint64_t addr) {
-    for (int i = 0; i < g_ngmap; i++)
-        if (g_gmap[i].addr == addr) {
-            g_gmap[i] = g_gmap[--g_ngmap];
+void hl_gmap_remove(uint64_t address) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) {
+            g_gmap.mappings[index] = g_gmap.mappings[--g_gmap.mapping_count];
             return;
         }
 }
 
-// The tracked extent (incl. any guard tail) of a mapping that starts at addr, or 0 if untracked.
-static uint64_t gmap_find_len(uint64_t addr) {
-    for (int i = 0; i < g_ngmap; i++)
-        if (g_gmap[i].addr == addr) return g_gmap[i].len;
+uint64_t hl_gmap_find_length(uint64_t address) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) return g_gmap.mappings[index].length;
     return 0;
 }
 
-static void gmap_reset_all(void) { // munmap every tracked guest mapping; the caller reloads fresh
-    for (int i = 0; i < g_ngmap; i++)
-        munmap((void *)g_gmap[i].addr, (size_t)g_gmap[i].len);
-    g_ngmap = 0;
+int hl_gmap_contains(uint64_t address, uint64_t length) {
+    uint64_t end = address + length;
+    if (end < address) return 0;
+    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+        const hl_gmap_entry *entry = &g_gmap.mappings[index];
+        if (entry->address <= address && end <= entry->address + entry->length) return 1;
+    }
+    return 0;
 }
 
-// ---- mlock accounting (LTP mlock05 / munlockall01) -----------------------------------------------
-// macOS has no mlock/mlockall equivalent, so "keep resident" is a pure no-op AT THE HOST -- but Linux
-// software observes the lock STATE back through /proc/self/smaps ("Locked:") and /proc/self/status
-// ("VmLck:"). Track the guest's locked byte ranges (non-overlapping, page-aligned) so those files
-// report the truth. mlockall(MCL_CURRENT|MCL_FUTURE) locks everything -> a whole-process flag.
-// mlock/munlock maintained by mem.c (228/229); mlockall/munlockall by rare.c (230/231).
-#define MLK_N 1024
-
-static struct {
-    uint64_t lo, hi;
-} g_mlk[MLK_N];
-
-static int g_nmlk;
-static int g_mlock_all;    // mlockall(MCL_CURRENT|MCL_FUTURE) set; munlockall clears it + every range
-static int g_mlock_future; // MCL_FUTURE armed: a fresh mmap (mem.c case 222) is wired resident on creation
-
-// Remove [addr,addr+len) from the locked set, splitting any straddled range (mirrors pn_del).
-static void mlk_del(uint64_t addr, uint64_t len) {
-    if (!len || !g_nmlk) return;
-    uint64_t rlo = addr & ~(uint64_t)0xfff, rhi = (addr + len + 0xfff) & ~(uint64_t)0xfff;
-    for (int i = 0; i < g_nmlk;) {
-        uint64_t lo = g_mlk[i].lo, hi = g_mlk[i].hi;
-        if (rhi <= lo || rlo >= hi) {
-            i++;
+void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
+    for (size_t index = 0; index < g_gmap.mapping_count;) {
+        hl_gmap_entry *entry = &g_gmap.mappings[index];
+        uint64_t base = entry->address;
+        uint64_t mapped_end = base + entry->length;
+        if (end <= base || start >= mapped_end) {
+            index++;
             continue;
-        } // no overlap
-        int keep_head = lo < rlo, keep_tail = rhi < hi;
-        if (!keep_head && !keep_tail) {
-            g_mlk[i] = g_mlk[--g_nmlk];
-            continue;
-        } // fully covered -> drop
-        if (keep_head)
-            g_mlk[i].hi = rlo;
-        else
-            g_mlk[i].lo = rhi;
-        if (keep_head && keep_tail && g_nmlk < MLK_N) {
-            g_mlk[g_nmlk].lo = rhi;
-            g_mlk[g_nmlk].hi = hi;
-            g_nmlk++;
         }
-        i++;
+        int keep_head = base < start;
+        int keep_tail = end < mapped_end;
+        if (!keep_head && !keep_tail) {
+            *entry = g_gmap.mappings[--g_gmap.mapping_count];
+            continue;
+        }
+        if (keep_head)
+            entry->length = entry->guest_length = start - base;
+        else
+            entry->address = end, entry->length = entry->guest_length = mapped_end - end;
+        if (keep_head && keep_tail) hl_gmap_add(end, mapped_end - end);
+        index++;
     }
 }
 
-// Add [addr,addr+len) to the locked set. Delete-then-insert keeps the ranges non-overlapping so the
-// byte-coverage sums below can never double-count.
-static void mlk_add(uint64_t addr, uint64_t len) {
-    if (!len) return;
-    uint64_t lo = addr & ~(uint64_t)0xfff, hi = (addr + len + 0xfff) & ~(uint64_t)0xfff;
-    if (hi <= lo) return;
-    mlk_del(lo, hi - lo);
-    if (g_nmlk >= MLK_N) return; // registry full -> best effort (report under-counts, never faults)
-    g_mlk[g_nmlk].lo = lo;
-    g_mlk[g_nmlk].hi = hi;
-    g_nmlk++;
+void hl_gmap_reset(void) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        munmap((void *)(uintptr_t)g_gmap.mappings[index].address, (size_t)g_gmap.mappings[index].length);
+    g_gmap.mapping_count = 0;
 }
 
-static void mlk_reset(void) {
-    g_nmlk = 0;
-    g_mlock_all = 0;
-    g_mlock_future = 0;
-} // execve replaces the address space
+void hl_gmap_lock_remove(uint64_t address, uint64_t length) {
+    if (!length || !g_gmap.lock_count) return;
+    uint64_t remove_low = address & ~UINT64_C(0xfff);
+    uint64_t remove_high = (address + length + UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+    for (size_t index = 0; index < g_gmap.lock_count;) {
+        uint64_t low = g_gmap.locks[index].low;
+        uint64_t high = g_gmap.locks[index].high;
+        if (remove_high <= low || remove_low >= high) {
+            index++;
+            continue;
+        }
+        int keep_head = low < remove_low;
+        int keep_tail = remove_high < high;
+        if (!keep_head && !keep_tail) {
+            g_gmap.locks[index] = g_gmap.locks[--g_gmap.lock_count];
+            continue;
+        }
+        if (keep_head)
+            g_gmap.locks[index].high = remove_low;
+        else
+            g_gmap.locks[index].low = remove_high;
+        if (keep_head && keep_tail && g_gmap.lock_count < MLK_N) {
+            g_gmap.locks[g_gmap.lock_count].low = remove_high;
+            g_gmap.locks[g_gmap.lock_count].high = high;
+            g_gmap.lock_count++;
+        }
+        index++;
+    }
+}
 
-// mlockall(MCL_CURRENT): actually WIRE every currently-mapped guest range resident via the host mlock(2)
-// (macOS has mlock, same as mlock(2)/case 228 uses). Best-effort: a range the host refuses (RLIMIT_MEMLOCK
-// exhausted) is left pageable rather than aborting the whole call -- Linux would ENOMEM, but dd keeps the
-// call succeeding with honest /proc state (the wired ranges are real; see the residual note in
-// syscall-compat.md). Returns the number of ranges the host declined (0 = fully wired).
-static int mlk_wire_current(void) {
+void hl_gmap_lock_add(uint64_t address, uint64_t length) {
+    if (!length) return;
+    uint64_t low = address & ~UINT64_C(0xfff);
+    uint64_t high = (address + length + UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+    if (high <= low) return;
+    hl_gmap_lock_remove(low, high - low);
+    if (g_gmap.lock_count >= MLK_N) return;
+    g_gmap.locks[g_gmap.lock_count].low = low;
+    g_gmap.locks[g_gmap.lock_count].high = high;
+    g_gmap.lock_count++;
+}
+
+void hl_gmap_lock_reset(void) {
+    g_gmap.lock_count = 0;
+    g_gmap.lock_all = 0;
+    g_gmap.lock_future = 0;
+}
+
+int hl_gmap_lock_wire_current(void) {
     int failed = 0;
-    for (int i = 0; i < g_ngmap; i++) {
-        if (!g_gmap[i].addr || !g_gmap[i].len) continue;
-        if (mlock((void *)g_gmap[i].addr, (size_t)g_gmap[i].len) != 0) failed++;
+    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+        hl_gmap_entry *entry = &g_gmap.mappings[index];
+        if (!entry->address || !entry->length) continue;
+        if (mlock((void *)(uintptr_t)entry->address, (size_t)entry->length) != 0) failed++;
     }
     return failed;
 }
 
-// munlockall(): drop the host wiring on every tracked guest range (mirrors mlk_wire_current). Failures are
-// ignored -- an unwired/never-wired range simply stays unwired.
-static void mlk_unwire_all(void) {
-    for (int i = 0; i < g_ngmap; i++) {
-        if (!g_gmap[i].addr || !g_gmap[i].len) continue;
-        munlock((void *)g_gmap[i].addr, (size_t)g_gmap[i].len);
+void hl_gmap_lock_unwire_all(void) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+        hl_gmap_entry *entry = &g_gmap.mappings[index];
+        if (!entry->address || !entry->length) continue;
+        munlock((void *)(uintptr_t)entry->address, (size_t)entry->length);
     }
 }
 
-// Locked bytes within [lo,hi) -- for a single /proc/.../smaps region's "Locked:" field.
-static uint64_t mlk_region_locked(uint64_t lo, uint64_t hi) {
-    if (hi <= lo) return 0;
-    if (g_mlock_all) return hi - lo;
+uint64_t hl_gmap_lock_region_bytes(uint64_t low, uint64_t high) {
+    if (high <= low) return 0;
+    if (g_gmap.lock_all) return high - low;
     uint64_t sum = 0;
-    for (int i = 0; i < g_nmlk; i++) {
-        uint64_t a = g_mlk[i].lo > lo ? g_mlk[i].lo : lo;
-        uint64_t b = g_mlk[i].hi < hi ? g_mlk[i].hi : hi;
-        if (b > a) sum += b - a;
+    for (size_t index = 0; index < g_gmap.lock_count; index++) {
+        uint64_t start = g_gmap.locks[index].low > low ? g_gmap.locks[index].low : low;
+        uint64_t end = g_gmap.locks[index].high < high ? g_gmap.locks[index].high : high;
+        if (end > start) sum += end - start;
     }
     return sum;
 }
 
-// Total locked bytes -- for /proc/.../status "VmLck:". With MCL_CURRENT|MCL_FUTURE every mapping is
-// locked, so report the whole tracked guest address space (sum of visible mapping lengths; always
-// non-zero once the image is loaded -- g_mem_charged is only maintained under a cgroup cap, so it can't
-// be used here). Otherwise sum the explicitly mlock'd ranges.
-static uint64_t mlk_total_locked(void) {
+uint64_t hl_gmap_lock_total_bytes(void) {
     uint64_t sum = 0;
-    if (g_mlock_all) {
-        for (int i = 0; i < g_ngmap; i++)
-            sum += g_gmap[i].glen;
+    if (g_gmap.lock_all) {
+        for (size_t index = 0; index < g_gmap.mapping_count; index++)
+            sum += g_gmap.mappings[index].guest_length;
         return sum;
     }
-    for (int i = 0; i < g_nmlk; i++)
-        sum += g_mlk[i].hi - g_mlk[i].lo;
+    for (size_t index = 0; index < g_gmap.lock_count; index++)
+        sum += g_gmap.locks[index].high - g_gmap.locks[index].low;
     return sum;
 }
 
-// ---- RLIMIT_MEMLOCK enforcement (LTP mlock05 rlimit half) -----------------------------------------
-// The container runs UNPRIVILEGED (no CAP_IPC_LOCK -- see proc.c sched_setscheduler, which EPERMs RT
-// scheduling for the same reason), so mlock/mlock2/mlockall must honor RLIMIT_MEMLOCK exactly as Linux
-// mm/mlock.c does, rather than only relying on the macOS host mlock (which is bounded by the HOST's limit,
-// not the guest's):
-//   * can_do_mlock(): a soft limit of 0 (unprivileged) refuses the op outright with EPERM.
-//   * mlock/mlock2: (already-locked + newly-locked) bytes over the soft limit -> ENOMEM, nothing wired.
-//   * mlockall(MCL_CURRENT): total mapped bytes over the soft limit -> ENOMEM.
-//   * mmap under MCL_FUTURE: a new mapping that would push locked bytes over the limit is left unwired and
-//     uncounted (the mmap still succeeds), so the tracked locked total never exceeds the limit.
-// The soft limit is the guest's RLIMIT_MEMLOCK (resource 8): a docker --ulimit / guest setrlimit override
-// in g_limits, else RLIM_INFINITY -- unset means "not enforced", preserving the legacy best-effort path.
-#define HL_GUEST_RLIMIT_MEMLOCK 8
-
-static uint64_t mlk_memlock_limit(void) {
-    uint64_t current = ~0ull;
-    hl_limit_table_get(&g_limits, HL_GUEST_RLIMIT_MEMLOCK, &current, NULL);
+static uint64_t hl_gmap_memlock_limit(void) {
+    uint64_t current = UINT64_MAX;
+    if (g_gmap.limits) hl_limit_table_get(g_gmap.limits, HL_GUEST_RLIMIT_MEMLOCK, &current, NULL);
     return current;
 }
 
-// Explicitly mlock()'d bytes (sum of the tracked ranges) -- the accounting base for the rlimit check.
-// Distinct from mlk_total_locked(), which reports the WHOLE address space under mlockall for /proc.
-static uint64_t mlk_locked_bytes(void) {
-    uint64_t s = 0;
-    for (int i = 0; i < g_nmlk; i++)
-        s += g_mlk[i].hi - g_mlk[i].lo;
-    return s;
+static uint64_t hl_gmap_locked_bytes(void) {
+    uint64_t sum = 0;
+    for (size_t index = 0; index < g_gmap.lock_count; index++)
+        sum += g_gmap.locks[index].high - g_gmap.locks[index].low;
+    return sum;
 }
 
-// Page-rounded bytes of [addr,addr+len) NOT already counted as locked (so re-locking an overlapping range
-// does not double-charge, matching Linux's per-page locked_vm accounting).
-static uint64_t mlk_uncounted_bytes(uint64_t addr, uint64_t len) {
-    if (!len) return 0;
-    uint64_t lo = addr & ~(uint64_t)0xfff, hi = (addr + len + 0xfff) & ~(uint64_t)0xfff;
-    if (hi <= lo) return 0;
+static uint64_t hl_gmap_uncounted_bytes(uint64_t address, uint64_t length) {
+    if (!length) return 0;
+    uint64_t low = address & ~UINT64_C(0xfff);
+    uint64_t high = (address + length + UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+    if (high <= low) return 0;
     uint64_t already = 0;
-    for (int i = 0; i < g_nmlk; i++) {
-        uint64_t a = g_mlk[i].lo > lo ? g_mlk[i].lo : lo;
-        uint64_t b = g_mlk[i].hi < hi ? g_mlk[i].hi : hi;
-        if (b > a) already += b - a;
+    for (size_t index = 0; index < g_gmap.lock_count; index++) {
+        uint64_t start = g_gmap.locks[index].low > low ? g_gmap.locks[index].low : low;
+        uint64_t end = g_gmap.locks[index].high < high ? g_gmap.locks[index].high : high;
+        if (end > start) already += end - start;
     }
-    return (hi - lo) - already;
+    return (high - low) - already;
 }
 
-// mlock/mlock2 rlimit gate. Returns 0 if the lock may proceed, else -EPERM (soft limit 0) / -ENOMEM
-// (would exceed). RLIM_INFINITY / unset -> always 0 (legacy best-effort, no enforcement).
-static int mlk_rlimit_gate(uint64_t addr, uint64_t len) {
-    uint64_t lim = mlk_memlock_limit();
-    if (lim == ~0ull) return 0;  // unlimited / unset -> not enforced
-    if (lim == 0) return -EPERM; // can_do_mlock(): no locking allowed at all
-    if (!len) return 0;
-    if (mlk_locked_bytes() + mlk_uncounted_bytes(addr, len) > lim) return -ENOMEM;
+int hl_gmap_lock_limit_range(uint64_t address, uint64_t length) {
+    uint64_t limit = hl_gmap_memlock_limit();
+    if (limit == UINT64_MAX) return 0;
+    if (!limit) return -EPERM;
+    if (!length) return 0;
+    if (hl_gmap_locked_bytes() + hl_gmap_uncounted_bytes(address, length) > limit) return -ENOMEM;
     return 0;
 }
 
-// mlockall(MCL_CURRENT) rlimit gate: the whole mapped address space is about to be wired. Returns 0 /
-// -EPERM (soft limit 0) / -ENOMEM (total mapped bytes exceed the soft limit).
-static int mlk_rlimit_gate_all(void) {
-    uint64_t lim = mlk_memlock_limit();
-    if (lim == ~0ull) return 0;
-    if (lim == 0) return -EPERM;
+int hl_gmap_lock_limit_all(void) {
+    uint64_t limit = hl_gmap_memlock_limit();
+    if (limit == UINT64_MAX) return 0;
+    if (!limit) return -EPERM;
     uint64_t total = 0;
-    for (int i = 0; i < g_ngmap; i++)
-        total += g_gmap[i].glen;
-    if (total > lim) return -ENOMEM;
-    return 0;
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        total += g_gmap.mappings[index].guest_length;
+    return total > limit ? -ENOMEM : 0;
+}
+
+int hl_gmap_lock_future(void) {
+    return g_gmap.lock_future;
+}
+
+void hl_gmap_lock_all(int future) {
+    if (future) g_gmap.lock_future = 1;
+    g_gmap.lock_all = 1;
 }

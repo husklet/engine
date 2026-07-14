@@ -1128,7 +1128,7 @@ static void *translate_block(uint64_t gpc) {
         } // 1 insn/block: per-instruction register dump
         struct insn I;
         g_emit_gpc = gpc; // IRQSLIM: tag chain emission with the current branch's rip
-        decode(gpc, &I);
+        hl_x86_decode(gpc, &I);
         uint64_t next = gpc + I.len;
         uint8_t op = I.op;
         int sf = I.opsize == 8;
@@ -1226,7 +1226,7 @@ static void *translate_block(uint64_t gpc) {
         g_pfaf_dead = 0;
         if (pfaf_elim_on() && insn_writes_pfaf(&I)) {
             struct insn NI;
-            decode(next, &NI);
+            hl_x86_decode(next, &NI);
             g_pfaf_dead = insn_kills_pfaf(&NI);
             // x86-xflags: the producer is the LAST flag op before a direct branch (cmp/test + jcc is
             // THE hot pattern) -> its PF/AF are still dead if EVERY successor entry provably

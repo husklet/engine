@@ -128,9 +128,9 @@ static void unix_bind_clear(int fd) {
     if (fd >= 0 && fd < DD_NFD) g_unix_bind[fd][0] = 0;
 }
 // /dev/dri/renderD128: the synthesized GPU render node (GPU rung 2). 1 = this fd is the render node, so
-// its ioctl routes to the dd GPU allocator. Set only when DD_GPU_IOSURFACE gates the path on.
+// its ioctl routes to the GPU allocator. Set only when HL_GPU_IOSURFACE gates the path on.
 static uint8_t g_devdri[DD_NFD];
-// DD_GPU_IOSURFACE opt-in: the whole host-IOSurface GPU path (render-node synth + alloc ioctl) is inert
+// HL_GPU_IOSURFACE opt-in: the whole host-IOSurface GPU path (render-node synth + alloc ioctl) is inert
 // unless the typed launch configuration enables it. Cached; -1 = unqueried.
 static int g_gpu_iosurface = -1;
 static int gpu_iosurface_on(void) {
@@ -564,7 +564,6 @@ static void memf_try_adopt(uint64_t dev, uint64_t ino) {
     memf_attach(found, s.st_size, lseek(found, 0, SEEK_CUR)); // I/O the kernel would reject with EBADF (F2).
 }
 
-#include "vfs/gmap.c"
 // A non-PIE ET_EXEC is linked at a fixed low vaddr but __PAGEZERO forbids mapping there, so load_elf biases
 // it high. Its un-relocated absolute refs still point at the low link range; when the guest takes an
 // absolute jump there, the dispatcher redirects pc into the biased image (pc += bias) instead of faulting
@@ -1131,7 +1130,7 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
     return buf;
 }
 
-// Copy the container's PATH value (from the daemon-forwarded DD_GUEST_ENV, "K=V\nK=V") into `out`, or
+// Copy the container's PATH value (from the forwarded HL_GUEST_ENV, "K=V\nK=V") into `out`, or
 // leave "" if PATH is unset/empty. This is the image-config PATH (e.g. golang's /usr/local/go/bin:...)
 // merged with any `docker run/exec -e PATH=` override -- the authoritative search path for bare commands.
 static void container_path_env(char *out, size_t n) {
@@ -1517,7 +1516,7 @@ static int maprow_cmp(const void *a, const void *b) {
 }
 
 // Synthesize /proc/[pid]/maps (smaps=0) or /proc/[pid]/smaps (smaps=1) from the tracked guest mappings
-// (g_gmap), the published main-stack bounds, and the brk arena ([heap]). Rows are collected, sorted by
+// from the guest-map registry, the published main-stack bounds, and the brk arena ([heap]). Rows are sorted by
 // ascending start address (the kernel invariant), then emitted. The [stack] line (with a guard line
 // below it, as the kernel shows) is what glibc's pthread_getattr_np scans for; [heap] is what jemalloc/
 // glibc-malloc/redis/pmap look for. Returns an anonymous fd holding the content, or -1 on error.
@@ -1528,9 +1527,10 @@ static int proc_maps_fd(int smaps) {
     if (fd < DD_NFD) g_proc_text_ro[fd] = 1;
     unlink(tn);
     char b[768];
-    // Collect every row on the heap (g_ngmap can be thousands) so the file can be address-sorted before
+    // Collect every row on the heap (the registry can hold thousands) so the file can be address-sorted before
     // emit. Capacity: main-exe PT_LOAD segs + stack + guard + heap split + one row per gmap entry.
-    int cap = g_ngmap + 32;
+    size_t mapping_count = hl_gmap_count();
+    int cap = (int)mapping_count + 32;
     struct maprow *rows = (struct maprow *)calloc((size_t)cap, sizeof *rows);
     if (!rows) {
         close(fd);
@@ -1568,10 +1568,12 @@ static int proc_maps_fd(int smaps) {
     // 256 MB anon region no real container has. jemalloc/glibc-malloc/redis/pmap look for this [heap] line.
     int have_heap = brk_hi && brk_cur > brk_lo;
     if (have_heap) MAPROW_ADD((unsigned long)brk_lo, (unsigned long)((brk_cur + 0xfff) & ~0xfffULL), "rw-p", "[heap]");
-    for (int i = 0; i < g_ngmap; i++) {
+    for (size_t i = 0; i < mapping_count; i++) {
+        hl_gmap_entry mapping;
+        if (!hl_gmap_get(i, &mapping)) continue;
         // report the guest-VISIBLE length (glen) so a mapping's Size/Rss matches the guest's mmap length,
         // not dd's full extent including the 64 KB guard tail it reserves past anon maps (LTP mlock05 Rss).
-        unsigned long lo = (unsigned long)g_gmap[i].addr, hi = lo + (unsigned long)g_gmap[i].glen;
+        unsigned long lo = (unsigned long)mapping.address, hi = lo + (unsigned long)mapping.guest_length;
         if (g_stack_hi && lo >= (unsigned long)g_stack_lo && hi <= (unsigned long)g_stack_hi)
             continue; // already emitted as [stack]
         if (brk_hi && lo == (unsigned long)brk_lo)
@@ -1689,11 +1691,11 @@ static int proc_stat_text(char *b, size_t n) {
 }
 
 // /proc/[pid]/environ -- the guest environment as NUL-separated KEY=VALUE. The authoritative source is
-// DD_GUEST_ENV (the container env the daemon forwards, "K=V\nK=V"); absent it (manual/direct mode), fall
+// HL_GUEST_ENV (the serialized guest environment, "K=V\nK=V"); absent it (direct mode), fall
 // back to the same defaults build_stack hands the guest. Returns the byte count written.
 // The running process's FINAL environment (container env + merged engine defaults), captured by build_stack
 // -- the exact set placed on the guest stack, i.e. what hl_option_get() sees. /proc/self/environ was generated from
-// the RAW DD_GUEST_ENV instead, omitting the defaults (HOME/LANG/…) build_stack adds, so procfs disagreed
+// the raw HL_GUEST_ENV instead, omitting the defaults (HOME/LANG/…) build_stack adds, so procfs disagreed
 // with getenv. Using this blob makes them consistent. (build_stack in elf.c is compiled after vfs.c.)
 static char g_self_environ[16384];
 static int g_self_environ_len = 0;
@@ -1997,7 +1999,7 @@ static int proc_mountinfo_text(char *b, size_t n) {
 #include <mach/processor_info.h> // host_processor_info(PROCESSOR_CPU_LOAD_INFO) — real PER-CORE ticks
 #include <mach/vm_map.h>         // vm_deallocate for the processor_info array
 
-// The registry directory is keyed per-container (DD_NETNS / DD_HOSTNAME are set once by the daemon and
+// The registry directory is keyed per-container (HL_NETNS / HL_HOSTNAME are set once at launch and
 // inherited across fork + survive guest execve), so two containers on the same host never collide; a
 // direct-mode run with neither falls back to the host session id. All peers compute the SAME key.
 static void proc_reg_key(char *out, size_t n) {
@@ -2574,7 +2576,7 @@ static int ns_link_target(const char *name, char *out, size_t cap) {
 // the guest pid. That let a guest kill(2)/pidfd_send_signal an ARBITRARY same-user HOST pid -- a sibling
 // engine (another container), the launcher, or any of the dd user's processes -- because the target was
 // resolved straight to the host with no namespace boundary. The per-container process REGISTRY (proc_reg_*,
-// keyed by DD_NETNS/DD_HOSTNAME so every engine process of ONE container agrees and two containers never
+// keyed by HL_NETNS/HL_HOSTNAME so every engine process of one guest agrees and two guests never
 // collide) is that boundary: a host pid belongs to this container iff it published a `<dir>/<hostpid>`
 // record. The signal syscalls resolve the guest target to a host pid and then require membership here,
 // turning "any host pid" into "only a process inside THIS container" (a non-member -> ESRCH), exactly like
@@ -3379,12 +3381,12 @@ static int uuid_fmt(char *out, size_t cap, uint8_t b[16]) {
 // The 16 raw bytes of the container's boot identity. Must be STABLE for the container's whole life AND
 // IDENTICAL across every process in it (each guest process is a separate host engine, so a per-process
 // arc4random value would disagree between peers). Derived DETERMINISTICALLY from the per-container
-// registry key (DD_NETNS, minted+exported at startup and inherited across fork/execve so every peer
+// registry key (HL_NETNS, minted at startup and inherited across fork/execve so every peer
 // agrees -- see proc_reg_key) via FNV-1a expanded to 16 bytes. Same container -> same bytes everywhere;
 // different containers -> different bytes. Backs both boot_id (UUID) and machine-id (32 hex).
 static void boot_id_bytes(uint8_t b[16]) {
     char key[80];
-    proc_reg_key(key, sizeof key);       // DD_NETNS -> DD_HOSTNAME -> session id fallback
+    proc_reg_key(key, sizeof key);       // HL_NETNS -> HL_HOSTNAME -> session id fallback
     uint64_t h = 1469598103934665603ULL; // FNV-1a offset basis
     for (const char *p = key; *p; p++) {
         h ^= (uint8_t)*p;
@@ -4610,7 +4612,7 @@ typedef struct {
 // compositor isn't up (no service), silently skip — the alloc still succeeds for the guest.
 static void dd_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf) {
     mach_port_t server = MACH_PORT_NULL;
-    // DD_GPU_BRIDGE_NAME lets multiple dd-display instances coexist (one per agent/benchmark); the
+    // HL_GPU_BRIDGE_NAME lets multiple compositor bridge instances coexist; the
     // compositor registers under the SAME name. Unset → the historical singleton "com.dd.display.gpu".
     const char *bridge = hl_option_get("HL_GPU_BRIDGE_NAME");
     if (!bridge || !*bridge) bridge = "com.dd.display.gpu";
@@ -5201,7 +5203,7 @@ static void container_populate_machine_id(void) {
 
 // -> macOS struct stat for a synth file
 // ================= DRM render-node synthesis =================
-// Gated on DD_GPU_IOSURFACE. libdrm's drmGetDevices2() enumerates /dev/dri, stats each node's st_rdev ->
+// Gated on HL_GPU_IOSURFACE. libdrm's drmGetDevices2() enumerates /dev/dri, stats each node's st_rdev ->
 // major:minor, then walks /sys/dev/char/<maj>:<min>/... to classify the DRM device's bus. We advertise
 // ONE platform DRM device with a primary node (card0 = 226:0) and a render node (renderD128 = 226:128),
 // both parented to a single platform device ("dd-gpu") so libdrm MERGES them into one drmDevice exposing a
@@ -5528,7 +5530,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         s->st_nlink = 2;
         return 1;
     }
-    if (drm_synth_stat(gp, s)) return 1; // /dev/dri + DRM sysfs (DD_GPU_IOSURFACE)
+    if (drm_synth_stat(gp, s)) return 1; // /dev/dri + DRM sysfs (HL_GPU_IOSURFACE)
     // The controlling terminal, named /dev/pts/0 in the container: fstat the real pty slave so it reports as
     // a character device with the correct rdev. ttyname(3) reads /proc/self/fd/0 -> "/dev/pts/0", then
     // stat()s it and checks S_ISCHR + rdev == fstat(0).rdev; this makes that check pass so `tty` prints

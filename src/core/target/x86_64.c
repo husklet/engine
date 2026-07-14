@@ -71,10 +71,13 @@
 
 #include "../../linux_abi/container/state.c" // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
 #include "../../linux_abi/fdcache.h"
+#include "../../linux_abi/container/vfs/gmap.h"
 #include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
 #include "../../translator/cache.c"          // SHARED translator: code cache + block map
 #include "../../translator/guest/x86_64/emit.c"      // x86 engine: arm64 emitters + SSE + x87
-#include "../../translator/guest/x86_64/decode.c"    // x86-64 decoder
+#define HL_X86_DECODER_EXTERNAL 1
+#include "../../translator/guest/x86_64/decode.c" // x86-64 effective-address emission; decoder is in its archive
+#undef HL_X86_DECODER_EXTERNAL
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c" // SHARED: clone->pthread, per-thread cpu, futex
@@ -106,6 +109,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 static int g_engine_inited;
 
 static void container_init(const char *rootfs) {
+    hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1. Record the init's real host pid so the shared Linux
     // personality can virtualize just the init's identity (getpid()==1, host pgid<->guest pgid 1) and
     // pass real child pids straight through -- this is what makes bash job control (setpgid / TIOCSPGRP)
@@ -367,7 +371,7 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     int sb_new =
         resolve_shebang_chain(sb_argv, sb_argc, 256, sb_prog_host, sb_store, sb_fhb, sizeof sb_fhb, &sb_finalhost);
     if (sb_new < 0) {
-        fprintf(stderr, "dd: too many nested #! interpreters (ELOOP): %s\n", argv[0]);
+        fprintf(stderr, "hl-engine: too many nested #! interpreters (ELOOP): %s\n", argv[0]);
         return 40; // ELOOP
     }
     if (sb_new != sb_argc) { // a shebang chain resolved -> run the final interpreter, not the script

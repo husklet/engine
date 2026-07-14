@@ -263,8 +263,11 @@ static int ckpt_region_prot(uint64_t addr, uint64_t glen) {
 static int ckpt_dump_pages(FILE *f, size_t pagesz, uint64_t *out_n) {
     uint64_t nreg = 0;
     static uint8_t zero[65536];
-    for (int i = 0; i < g_ngmap; i++) {
-        uint64_t addr = g_gmap[i].addr, len = g_gmap[i].len, glen = g_gmap[i].glen;
+    size_t mapping_count = hl_gmap_count();
+    for (size_t i = 0; i < mapping_count; i++) {
+        hl_gmap_entry mapping;
+        if (!hl_gmap_get(i, &mapping)) continue;
+        uint64_t addr = mapping.address, len = mapping.length, glen = mapping.guest_length;
         if (!addr || !len) continue;
         struct ckpt_region reg;
         memset(&reg, 0, sizeof reg);
@@ -588,7 +591,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         fprintf(stderr, "[restore] open %s: %s\n", pf, strerror(errno));
         return -1;
     }
-    uint64_t mapped_a[GMAP_N], mapped_e[GMAP_N];
+    uint64_t mapped_a[HL_GMAP_CAPACITY], mapped_e[HL_GMAP_CAPACITY];
     int nmapped = 0;
     for (uint64_t i = 0; i < m->n_regions; i++) {
         struct ckpt_region reg;
@@ -612,7 +615,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 fclose(f);
                 return -1;
             }
-            if (nmapped < GMAP_N) {
+            if (nmapped < HL_GMAP_CAPACITY) {
                 mapped_a[nmapped] = a;
                 mapped_e[nmapped] = e;
                 nmapped++;

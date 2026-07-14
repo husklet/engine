@@ -49,6 +49,7 @@
 // container/ns config state + parsers (early globals)
 #include "../../linux_abi/container/state.c"
 #include "../../linux_abi/fdcache.h"
+#include "../../linux_abi/container/vfs/gmap.h"
 // code cache + block map + chaining
 #include "../../translator/cache.c"
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
@@ -515,6 +516,7 @@ static void install_mach_exc(void) {
 static int g_engine_inited;
 
 static void container_init(const char *rootfs) {
+    hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1
     if (rootfs) g_init_hostpid = getpid();
     // cross-engine-process cgroup accounting: a FRESH shared slot table for THIS container init, inherited
@@ -802,7 +804,7 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     int sb_new =
         resolve_shebang_chain(sb_argv, sb_argc, 256, prog_host, sb_store, sb_fhb, sizeof sb_fhb, &sb_finalhost);
     if (sb_new < 0) {
-        fprintf(stderr, "dd: too many nested #! interpreters (ELOOP): %s\n", prog);
+        fprintf(stderr, "hl-engine: too many nested #! interpreters (ELOOP): %s\n", prog);
         return 40; // ELOOP
     }
     if (sb_new != sb_argc) { // a shebang chain resolved -> run the final interpreter, not the script

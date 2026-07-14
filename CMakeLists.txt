@@ -14,6 +14,7 @@ add_library(hl-translator STATIC
     src/translator/arena.c
     src/translator/codegen.c
     src/translator/digest.c
+    src/translator/guest/x86_64/decode.c
     src/translator/identity.c
     src/translator/reloc.c
     src/translator/window.c
@@ -25,6 +26,7 @@ target_include_directories(hl-translator PUBLIC include)
 
 add_library(hl-linux-abi STATIC
     src/linux_abi/affinity.c
+    src/linux_abi/container/vfs/gmap.c
     src/linux_abi/device.c
     src/linux_abi/encode.c
     src/linux_abi/errno.c
@@ -84,11 +86,12 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name arena cli codegen config emit fdcache host_services identity ir launch linux_abi stat engine log namespace options profile)
+    foreach(test_name arena cli codegen config decoder emit fdcache gmap host_services identity ir launch linux_abi stat engine log namespace options profile)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)
-        if(test_name STREQUAL "linux_abi" OR test_name STREQUAL "stat" OR test_name STREQUAL "fdcache")
+        if(test_name STREQUAL "linux_abi" OR test_name STREQUAL "stat" OR test_name STREQUAL "fdcache" OR
+           test_name STREQUAL "gmap")
             target_link_libraries(test-${test_name} PRIVATE hl-linux-abi)
         endif()
         if(test_name STREQUAL "fdcache")

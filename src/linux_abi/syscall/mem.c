@@ -36,50 +36,10 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
     return total;
 }
 
-// True if [addr,addr+len) lies entirely within a single tracked GUEST mapping (the gmap registry that
-// records every guest mmap). Used to confine the cage-hint honoring in case 222 to memory the guest
-// itself reserved -- never the engine's own internal allocations.
-static int gmap_contains(uint64_t addr, uint64_t len) {
-    uint64_t end = addr + len;
-    for (int i = 0; i < g_ngmap; i++)
-        if (g_gmap[i].addr <= addr && end <= g_gmap[i].addr + g_gmap[i].len) return 1;
-    return 0;
-}
-
-// A munmap of [ustart,uend) removed those bytes from the address space; keep the gmap registry
-// consistent with what is STILL mapped. A full-cover unmap drops the whole entry (execve teardown no
-// longer needs it); a PARTIAL unmap must NOT drop the survivors -- otherwise the still-mapped head/tail
-// leaks past execve() teardown and gmap_find_len (the mremap in-place-grow path, case 216) can no longer
-// size it. So for each overlapping tracked mapping keep the surviving sub-region(s): resize the entry to
-// its head (tail unmap) or its tail (head unmap), and for a middle unmap add a second entry for the tail.
-// The 64 KB guard tail the anon mmap reserved is just the region's last bytes, so it rides along with
-// whichever survivor it belongs to. Multiple entries may overlap (defensive); handle them all.
-static void gmap_split_unmap(uint64_t ustart, uint64_t uend) {
-    for (int i = 0; i < g_ngmap;) {
-        uint64_t base = g_gmap[i].addr, end = base + g_gmap[i].len;
-        if (ustart >= end || uend <= base) { // no overlap
-            i++;
-            continue;
-        }
-        int keep_head = base < ustart; // [base, ustart) survives below the unmapped range
-        int keep_tail = uend < end;    // [uend, end)   survives above it
-        if (!keep_head && !keep_tail) {
-            g_gmap[i] = g_gmap[--g_ngmap]; // fully covered -> drop the whole entry (order-independent)
-            continue;
-        }
-        if (keep_head)
-            g_gmap[i].len = g_gmap[i].glen = ustart - base; // addr unchanged; trim to the surviving head
-        else                                                // keep_tail only
-            g_gmap[i].addr = uend, g_gmap[i].len = g_gmap[i].glen = end - uend;
-        if (keep_head && keep_tail) gmap_add(uend, end - uend); // middle unmap -> tail becomes a 2nd entry
-        i++;
-    }
-}
-
 // Mirror of gmap_split_unmap for the DONTNEED private-anon registry: keep the surviving sub-region(s)
 // (with their prot) tracked so madvise(MADV_DONTNEED) still gives Linux semantics on what remains,
 // instead of forgetting the whole entry on a partial unmap. A non-anon range has no entry here and is
-// left untouched. gmap_add/anon_track append past g_ngmap/g_nanonmap, and the appended tail starts at
+// left untouched. gmap_add/anon_track append to their registries, and the appended tail starts at
 // uend so it never re-overlaps [ustart,uend) -- the loop terminates.
 static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
     for (int i = 0; i < g_nanonmap;) {
@@ -422,7 +382,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // maps the dumb buffer for CPU software rendering; the buffer is an IOSurface that already lives at
         // a host VA (== guest VA in this in-process JIT), so decode the handle from the fake offset MAP_DUMB
         // handed back, look up the surface, and return its base VA directly — no real mmap. Gated on the
-        // render-node tag, so no other mmap is affected (inert unless DD_GPU_IOSURFACE).
+        // render-node tag, so no other mmap is affected (inert unless HL_GPU_IOSURFACE).
         if (gpu_iosurface_on() && !(a3 & 0x20) && (int)a4 >= 0 && (int)a4 < 1024 && g_devdri[(int)a4]) {
             uint32_t handle = (uint32_t)((uint64_t)a5 >> 12);
             int gi = dd_gpu_reg_by_handle(handle);
@@ -652,11 +612,11 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 futex_shared_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5);
             // mlockall(MCL_FUTURE): a mapping created while future-locking is armed must be wired resident on
             // creation (Linux mm/mlock.c). Best-effort (a RLIMIT_MEMLOCK refusal leaves it pageable); the
-            // mlk_add records it so /proc Locked:/VmLck: reports the range even under g_mlock_all reporting.
+            // mlk_add records it so /proc Locked:/VmLck: reports the range under whole-map locking too.
             // MCL_FUTURE accounting: only wire+count the new mapping while it stays within RLIMIT_MEMLOCK.
             // A mapping that would push the locked total over the guest's limit is left pageable/uncounted
             // (the mmap still succeeds) so the tracked locked bytes never exceed the limit.
-            if (g_mlock_future && mlk_rlimit_gate((uint64_t)r, (uint64_t)a1) == 0) {
+            if (hl_gmap_lock_future() && mlk_rlimit_gate((uint64_t)r, (uint64_t)a1) == 0) {
                 mlock(r, (size_t)a1 + guard);
                 mlk_add((uint64_t)r, (uint64_t)a1);
             }
