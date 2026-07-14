@@ -119,7 +119,8 @@ struct hl_host_linux {
     pthread_cond_t process_changed;
     uint32_t destroying;
     hl_host_sync_registry *sync;
-    hl_linux_handle_entry handles[HL_LINUX_HANDLE_CAPACITY];
+    hl_linux_handle_entry *handles;
+    uint32_t handle_capacity;
     hl_linux_timer_entry timers[HL_LINUX_TIMER_CAPACITY];
     hl_linux_counter_subscription counter_subscriptions[HL_LINUX_COUNTER_SUBSCRIPTIONS];
 };
@@ -226,7 +227,7 @@ static hl_linux_handle_entry *hl_linux_lookup_locked(hl_host_linux *host, hl_hos
     hl_linux_handle_entry *entry;
     if (low == 0) return NULL;
     index = low - 1u;
-    if (index >= HL_LINUX_HANDLE_CAPACITY) return NULL;
+    if (index >= host->handle_capacity) return NULL;
     entry = &host->handles[index];
     if (entry->generation != generation || entry->kind != kind) return NULL;
     return entry;
@@ -240,7 +241,7 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
     if (descriptor >= 0) hl_host_process_fd_private_add(descriptor);
     if (wake_descriptor >= 0) hl_host_process_fd_private_add(wake_descriptor);
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_LINUX_HANDLE_CAPACITY; ++index) {
+    for (index = 0; index < host->handle_capacity; ++index) {
         hl_linux_handle_entry *entry = &host->handles[index];
         if (entry->kind == HL_LINUX_HANDLE_NONE) {
             entry->generation++;
@@ -253,6 +254,33 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
             entry->wake_descriptor = wake_descriptor;
             handle = hl_linux_encode_handle(index, entry->generation);
             break;
+        }
+    }
+    if (handle == 0) {
+        uint32_t capacity = host->handle_capacity > (UINT32_MAX - 1u) / 2u
+                                ? UINT32_MAX - 1u
+                                : host->handle_capacity * 2u;
+        hl_linux_handle_entry *grown = capacity > host->handle_capacity
+                                           ? realloc(host->handles, (size_t)capacity * sizeof(*grown))
+                                           : NULL;
+        if (grown != NULL) {
+            for (index = host->handle_capacity; index < capacity; ++index) {
+                grown[index] = (hl_linux_handle_entry){0};
+                grown[index].descriptor = -1;
+                grown[index].wake_descriptor = -1;
+            }
+            index = host->handle_capacity;
+            host->handles = grown;
+            host->handle_capacity = capacity;
+            hl_linux_handle_entry *entry = &host->handles[index];
+            entry->generation = 1;
+            entry->kind = (uint16_t)kind;
+            entry->descriptor = descriptor;
+            entry->address = address;
+            entry->executable_address = executable_address;
+            entry->size = size;
+            entry->wake_descriptor = wake_descriptor;
+            handle = hl_linux_encode_handle(index, entry->generation);
         }
     }
     pthread_mutex_unlock(&host->lock);
@@ -365,7 +393,7 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
         pthread_mutex_lock(&host->lock);
-        for (uint32_t index = 0; index < HL_LINUX_HANDLE_CAPACITY; ++index) {
+        for (uint32_t index = 0; index < host->handle_capacity; ++index) {
             hl_linux_handle_entry *entry = &host->handles[index];
             uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
             if (entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
@@ -702,7 +730,7 @@ static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_li
     if (handle == HL_HOST_HANDLE_CWD) return AT_FDCWD;
     if (low == 0) return -1;
     index = low - 1u;
-    if (index >= HL_LINUX_HANDLE_CAPACITY) return -1;
+    if (index >= host->handle_capacity) return -1;
     entry = &host->handles[index];
     if (entry->generation != (uint32_t)(handle >> 32) || (entry->kind != first && entry->kind != second)) return -1;
     return entry->descriptor;
@@ -1123,7 +1151,7 @@ static hl_host_result hl_linux_file_clone_for_fork(void *context, hl_host_handle
     int append_descriptor = -1;
     int needs_append = 0;
     pthread_mutex_lock(&host->lock);
-    if (low != 0 && low - 1u < HL_LINUX_HANDLE_CAPACITY) entry = &host->handles[low - 1u];
+    if (low != 0 && low - 1u < host->handle_capacity) entry = &host->handles[low - 1u];
     if (entry != NULL && entry->generation == (uint32_t)(file >> 32) && entry->kind == HL_LINUX_HANDLE_FILE) {
         needs_append = entry->wake_descriptor >= 0;
         descriptor = dup(entry->descriptor);
@@ -1166,7 +1194,7 @@ static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, h
     ssize_t count;
     if (input.size != 0 && input.data == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
-    if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) {
+    if (low == 0 || low - 1u >= host->handle_capacity) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
@@ -1191,7 +1219,7 @@ static hl_host_result hl_linux_file_vector(void *context, hl_host_handle file, c
     uint32_t index;
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
-    if (operation == 4 && (uint32_t)file != 0 && (uint32_t)file - 1u < HL_LINUX_HANDLE_CAPACITY) {
+    if (operation == 4 && (uint32_t)file != 0 && (uint32_t)file - 1u < host->handle_capacity) {
         hl_linux_handle_entry *entry = &host->handles[(uint32_t)file - 1u];
         descriptor = entry->generation == (uint32_t)(file >> 32) && entry->kind == HL_LINUX_HANDLE_FILE
                          ? entry->wake_descriptor
@@ -1530,7 +1558,7 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     int descriptor;
     int wake_descriptor;
     int result;
-    if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (low == 0 || low - 1u >= host->handle_capacity) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     hl_linux_counter_unsubscribe_all(host, handle);
     pthread_mutex_lock(&host->lock);
     entry = &host->handles[low - 1u];
@@ -1934,7 +1962,7 @@ static hl_host_result hl_linux_watch_drain(void *context, hl_host_handle handle,
 static hl_host_result hl_linux_watch_close(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
     uint32_t low = (uint32_t)handle;
-    if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (low == 0 || low - 1u >= host->handle_capacity) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_WATCH);
     if (entry == NULL) { pthread_mutex_unlock(&host->lock); return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0); }
@@ -3093,18 +3121,27 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     memset(out_services, 0, sizeof(*out_services));
     host = calloc(1, sizeof(*host));
     if (host == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    host->handles = calloc(HL_LINUX_HANDLE_CAPACITY, sizeof(*host->handles));
+    if (host->handles == NULL) {
+        free(host);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
+    host->handle_capacity = HL_LINUX_HANDLE_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
+        free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (pthread_mutex_init(&host->fork_gate, NULL) != 0) {
         pthread_mutex_destroy(&host->lock);
+        free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (pthread_cond_init(&host->process_changed, NULL) != 0) {
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->handles);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3112,10 +3149,11 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         pthread_cond_destroy(&host->process_changed);
         pthread_mutex_destroy(&host->fork_gate);
         pthread_mutex_destroy(&host->lock);
+        free(host->handles);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
-    for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
+    for (i = 0; i < host->handle_capacity; ++i) {
         host->handles[i].descriptor = -1;
         host->handles[i].wake_descriptor = -1;
     }
@@ -3152,19 +3190,19 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     if (host == NULL) return;
     pthread_mutex_lock(&host->lock);
     host->destroying = 1;
-    for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
+    for (i = 0; i < host->handle_capacity; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_PROCESS && !entry->process_reaped) kill(entry->descriptor, SIGKILL);
     }
     for (;;) {
         uint32_t waiters = 0;
-        for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i)
+        for (i = 0; i < host->handle_capacity; ++i)
             waiters += host->handles[i].process_waiters;
         if (waiters == 0) break;
         pthread_cond_wait(&host->process_changed, &host->lock);
     }
     pthread_mutex_unlock(&host->lock);
-    for (i = 0; i < HL_LINUX_HANDLE_CAPACITY; ++i) {
+    for (i = 0; i < host->handle_capacity; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
             munmap(entry->address, (size_t)entry->size);
@@ -3199,5 +3237,6 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     pthread_cond_destroy(&host->process_changed);
     pthread_mutex_destroy(&host->fork_gate);
     pthread_mutex_destroy(&host->lock);
+    free(host->handles);
     free(host);
 }
