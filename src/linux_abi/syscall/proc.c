@@ -249,21 +249,43 @@ static void fork_child_hooks(struct cpu *c) {
 
 typedef struct bound_fork_state {
     hl_linux_fork_plan plan;
+    hl_linux_watch_fork_plan watch_plan;
+    int watch_prepared;
 } bound_fork_state;
 
 static int bound_fork_prepare(bound_fork_state *state) {
     hl_status status;
     memset(state, 0, sizeof(*state));
     if (g_linux_box == NULL) return 0;
+    state->watch_plan.capacity = bound_mapping_watch_capacity();
+    state->watch_plan.records =
+        state->watch_plan.capacity == 0 ? NULL : calloc(state->watch_plan.capacity, sizeof(*state->watch_plan.records));
+    if (state->watch_plan.capacity != 0 && state->watch_plan.records == NULL) return -ENOMEM;
+    if (bound_mapping_fork_prepare(&state->watch_plan) != 0) {
+        free(state->watch_plan.records);
+        state->watch_plan.records = NULL;
+        return -EIO;
+    }
+    state->watch_prepared = 1;
     state->plan.abi = HL_LINUX_ABI_VERSION;
     state->plan.size = sizeof(state->plan);
     state->plan.capacity = g_linux_box->ofd_capacity;
     state->plan.records = calloc(state->plan.capacity, sizeof(*state->plan.records));
-    if (state->plan.records == NULL) return -ENOMEM;
+    if (state->plan.records == NULL) {
+        (void)bound_mapping_fork_complete(&state->watch_plan, 0);
+        state->watch_prepared = 0;
+        free(state->watch_plan.records);
+        state->watch_plan.records = NULL;
+        return -ENOMEM;
+    }
     status = hl_linux_abi_fork_prepare(g_linux_box, &state->plan);
     if (status != HL_STATUS_OK) {
+        (void)bound_mapping_fork_complete(&state->watch_plan, 0);
+        state->watch_prepared = 0;
         free(state->plan.records);
         state->plan.records = NULL;
+        free(state->watch_plan.records);
+        state->watch_plan.records = NULL;
         return status == HL_STATUS_BUSY ? -EAGAIN : status == HL_STATUS_OUT_OF_MEMORY ? -ENOMEM : -EIO;
     }
     return 0;
@@ -274,8 +296,13 @@ static int bound_fork_complete(bound_fork_state *state, int child) {
     if (g_linux_box == NULL) return 0;
     status = child ? hl_linux_abi_fork_child(g_linux_box, &state->plan)
                    : hl_linux_abi_fork_parent(g_linux_box, &state->plan);
+    if (state->watch_prepared && bound_mapping_fork_complete(&state->watch_plan, child) != 0 &&
+        status == HL_STATUS_OK)
+        status = HL_STATUS_PLATFORM_FAILURE;
     free(state->plan.records);
     state->plan.records = NULL;
+    free(state->watch_plan.records);
+    state->watch_plan.records = NULL;
     return status == HL_STATUS_OK ? 0 : -EIO;
 }
 

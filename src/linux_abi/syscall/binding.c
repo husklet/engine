@@ -2,13 +2,51 @@
 
 #include "../object.h"
 #include "../epoll.h"
+#include "../watch.h"
+#include "../bus.h"
 
 static int g_bound_sentinel = -1;
 
+typedef struct bound_watch_source {
+    uint64_t token;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size;
+    hl_host_handle file;
+    hl_host_handle watch;
+    size_t references;
+    struct bound_watch_source *next;
+} bound_watch_source;
+
+typedef struct bound_watch_state {
+    pthread_mutex_t lock;
+    pthread_t thread;
+    hl_linux_watch_set changes;
+    bound_watch_source *sources;
+    hl_host_handle pollset;
+    int initialized;
+    int running;
+    int stopping;
+} bound_watch_state;
+
+static bound_watch_state g_bound_watches = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .pollset = HL_HOST_HANDLE_INVALID,
+};
+static pthread_mutex_t g_bound_mapping_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_bound_mapping_gate = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct bound_mapping_object {
     hl_host_handle handle;
+    hl_host_handle file;
     uint64_t address;
     uint64_t size;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t known_size;
+    bound_watch_source *source;
+    uint32_t identity_valid;
+    uint32_t shared;
     size_t references;
 } bound_mapping_object;
 
@@ -16,14 +54,298 @@ typedef struct bound_mapping {
     uint64_t address;
     uint64_t size;
     uint64_t object_offset;
+    uint64_t file_offset;
+    uint64_t follow_lo;
+    uint64_t follow_hi;
     bound_mapping_object *object;
     struct bound_mapping *next;
 } bound_mapping;
+
+static void bound_watch_release(bound_watch_source *source);
 
 static bound_mapping **bound_mapping_head(void) {
     size_t required = offsetof(hl_linux_abi, vma_state) + sizeof(g_linux_box->vma_state);
     if (g_linux_box == NULL || g_linux_box->abi != HL_LINUX_ABI_VERSION || g_linux_box->size < required) return NULL;
     return (bound_mapping **)&g_linux_box->vma_state;
+}
+
+static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
+                                            const hl_host_file_metadata *metadata, int have_metadata,
+                                            uint64_t old_size, uint64_t new_size,
+                                            hl_linux_bus_transition *transition);
+
+static bound_watch_source *bound_watch_find_token(uint64_t token) {
+    for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next)
+        if (source->token == token) return source;
+    return NULL;
+}
+
+static bound_watch_source *bound_watch_find_identity(uint64_t device, uint64_t inode) {
+    for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next)
+        if (source->device == device && source->inode == inode) return source;
+    return NULL;
+}
+
+static void bound_watch_publish_size(uint64_t device, uint64_t inode, uint64_t size) {
+    pthread_mutex_lock(&g_bound_watches.lock);
+    bound_watch_source *source = bound_watch_find_identity(device, inode);
+    if (source != NULL) source->size = size;
+    pthread_mutex_unlock(&g_bound_watches.lock);
+}
+
+static void bound_watch_apply(void *opaque, const hl_linux_watch_change *change) {
+    (void)opaque;
+    pthread_mutex_lock(&g_bound_watches.lock);
+    bound_watch_source *source = bound_watch_find_token(change->token);
+    if (source == NULL || change->new_size == source->size) {
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        return;
+    }
+    source->references++;
+    hl_linux_fd_snapshot file = {.host_handle = source->file};
+    hl_host_file_metadata metadata = {.stable_device = source->device, .stable_object = source->inode};
+    uint64_t old_size = source->size;
+    source->size = change->new_size;
+    pthread_mutex_unlock(&g_bound_watches.lock);
+    hl_linux_bus_transition transition = {0};
+    if (hl_linux_bus_transition_begin(&transition) != 0) {
+        bound_watch_release(source);
+        return;
+    }
+    pthread_mutex_lock(&g_bound_mapping_lock);
+    bound_mapping_file_size_changed(&file, &metadata, 1, old_size, change->new_size, &transition);
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    bound_watch_release(source);
+    hl_linux_bus_transition_end(&transition);
+}
+
+static void *bound_watch_waiter(void *opaque) {
+    (void)opaque;
+    for (;;) {
+        hl_host_event_record events[16];
+        hl_host_result ready = g_host_services->event->wait(g_host_services->context, g_bound_watches.pollset,
+                                                             events, 16, HL_HOST_DEADLINE_INFINITE);
+        int drain_changes = 0;
+        pthread_mutex_lock(&g_bound_watches.lock);
+        if (g_bound_watches.stopping) {
+            pthread_mutex_unlock(&g_bound_watches.lock);
+            break;
+        }
+        if (ready.status == HL_STATUS_OK) {
+            for (uint64_t index = 0; index < ready.value; ++index) {
+                bound_watch_source *source = bound_watch_find_token(events[index].token);
+                hl_host_watch_record record = {0};
+                if (source == NULL) continue;
+                hl_host_result drained =
+                    g_host_services->watch->drain(g_host_services->context, source->watch, &record, 1);
+                if (drained.status == HL_STATUS_OK && drained.value != 0)
+                    drain_changes |= hl_linux_watch_enqueue(&g_bound_watches.changes, source->token, record.size,
+                                                            record.changes) == HL_STATUS_OK;
+            }
+        }
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        if (drain_changes) {
+            size_t count = 0;
+            (void)hl_linux_watch_drain(&g_bound_watches.changes, bound_watch_apply, NULL, &count);
+        }
+        if (ready.status != HL_STATUS_OK && ready.status != HL_STATUS_INTERRUPTED) break;
+    }
+    return NULL;
+}
+
+static int bound_watch_host_start_locked(void) {
+    if (g_bound_watches.running || g_bound_watches.sources == NULL) return 1;
+    hl_host_result pollset = g_host_services->event->create(g_host_services->context);
+    if (pollset.status != HL_STATUS_OK) return 0;
+    g_bound_watches.pollset = pollset.value;
+    for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next) {
+        hl_host_result watched = g_host_services->watch->open(g_host_services->context, source->file);
+        if (watched.status != HL_STATUS_OK) goto fail;
+        source->watch = watched.value;
+        if (g_host_services->event
+                ->control(g_host_services->context, g_bound_watches.pollset, HL_HOST_EVENT_ADD, source->watch,
+                          source->token, HL_HOST_READY_READ | HL_HOST_READY_EDGE)
+                .status != HL_STATUS_OK)
+            goto fail;
+    }
+    g_bound_watches.stopping = 0;
+    if (pthread_create(&g_bound_watches.thread, NULL, bound_watch_waiter, NULL) != 0) goto fail;
+    g_bound_watches.running = 1;
+    return 1;
+fail:
+    for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next) {
+        if (source->watch == HL_HOST_HANDLE_INVALID) continue;
+        (void)g_host_services->watch->close(g_host_services->context, source->watch);
+        source->watch = HL_HOST_HANDLE_INVALID;
+    }
+    (void)g_host_services->event->close(g_host_services->context, g_bound_watches.pollset);
+    g_bound_watches.pollset = HL_HOST_HANDLE_INVALID;
+    return 0;
+}
+
+static void bound_watch_host_stop(int close_handles) {
+    pthread_mutex_lock(&g_bound_watches.lock);
+    if (g_bound_watches.running) {
+        g_bound_watches.stopping = 1;
+        (void)g_host_services->event->wake(g_host_services->context, g_bound_watches.pollset);
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        (void)pthread_join(g_bound_watches.thread, NULL);
+        pthread_mutex_lock(&g_bound_watches.lock);
+        g_bound_watches.running = 0;
+    }
+    if (close_handles && g_bound_watches.pollset != HL_HOST_HANDLE_INVALID) {
+        for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next) {
+            if (source->watch == HL_HOST_HANDLE_INVALID) continue;
+            (void)g_host_services->event->control(g_host_services->context, g_bound_watches.pollset,
+                                                  HL_HOST_EVENT_DELETE, source->watch, source->token,
+                                                  HL_HOST_READY_READ);
+            (void)g_host_services->watch->close(g_host_services->context, source->watch);
+            source->watch = HL_HOST_HANDLE_INVALID;
+        }
+        (void)g_host_services->event->close(g_host_services->context, g_bound_watches.pollset);
+        g_bound_watches.pollset = HL_HOST_HANDLE_INVALID;
+    }
+    pthread_mutex_unlock(&g_bound_watches.lock);
+}
+
+static bound_watch_source *bound_watch_retain(const hl_linux_fd_snapshot *file, uint64_t device, uint64_t inode,
+                                               uint64_t size) {
+    if (g_host_services == NULL || g_host_services->watch == NULL || g_host_services->event == NULL ||
+        g_host_services->file == NULL || g_host_services->file->clone_for_fork == NULL ||
+        (g_host_services->capabilities & (HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT)) !=
+            (HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT))
+        return NULL;
+    pthread_mutex_lock(&g_bound_watches.lock);
+    bound_watch_source *source = bound_watch_find_identity(device, inode);
+    if (source != NULL) {
+        source->references++;
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        return source;
+    }
+    if (!g_bound_watches.initialized) {
+        if (hl_linux_watch_init(&g_bound_watches.changes) != HL_STATUS_OK) {
+            pthread_mutex_unlock(&g_bound_watches.lock);
+            return NULL;
+        }
+        g_bound_watches.initialized = 1;
+    }
+    hl_host_result cloned = g_host_services->file->clone_for_fork(g_host_services->context, file->host_handle);
+    source = cloned.status == HL_STATUS_OK ? calloc(1, sizeof(*source)) : NULL;
+    if (source == NULL) {
+        if (cloned.status == HL_STATUS_OK) (void)g_host_services->file->close(g_host_services->context, cloned.value);
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        return NULL;
+    }
+    int created = 0;
+    if (hl_linux_watch_retain(&g_bound_watches.changes, device, inode, size, &source->token, &created) !=
+            HL_STATUS_OK ||
+        !created) {
+        (void)g_host_services->file->close(g_host_services->context, cloned.value);
+        free(source);
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        return NULL;
+    }
+    *source = (bound_watch_source){source->token, device, inode, size, cloned.value, HL_HOST_HANDLE_INVALID, 1,
+                                   g_bound_watches.sources};
+    g_bound_watches.sources = source;
+    int attached = 1;
+    if (g_bound_watches.running) {
+        hl_host_result watched = g_host_services->watch->open(g_host_services->context, source->file);
+        attached = watched.status == HL_STATUS_OK;
+        if (attached) {
+            source->watch = watched.value;
+            attached = g_host_services->event
+                           ->control(g_host_services->context, g_bound_watches.pollset, HL_HOST_EVENT_ADD,
+                                     source->watch, source->token, HL_HOST_READY_READ | HL_HOST_READY_EDGE)
+                           .status == HL_STATUS_OK;
+        }
+        if (!attached && source->watch != HL_HOST_HANDLE_INVALID) {
+            (void)g_host_services->watch->close(g_host_services->context, source->watch);
+            source->watch = HL_HOST_HANDLE_INVALID;
+        }
+    } else {
+        attached = bound_watch_host_start_locked();
+    }
+    if (!attached) {
+        int removed = 0;
+        g_bound_watches.sources = source->next;
+        (void)hl_linux_watch_release(&g_bound_watches.changes, source->token, &removed);
+        (void)g_host_services->file->close(g_host_services->context, source->file);
+        free(source);
+        source = NULL;
+    }
+    pthread_mutex_unlock(&g_bound_watches.lock);
+    return source;
+}
+
+static void bound_watch_release(bound_watch_source *source) {
+    if (source == NULL) return;
+    pthread_mutex_lock(&g_bound_watches.lock);
+    if (--source->references == 0) {
+        bound_watch_source **link = &g_bound_watches.sources;
+        while (*link != NULL && *link != source) link = &(*link)->next;
+        if (*link == source) *link = source->next;
+        if (source->watch != HL_HOST_HANDLE_INVALID) {
+            (void)g_host_services->event->control(g_host_services->context, g_bound_watches.pollset,
+                                                  HL_HOST_EVENT_DELETE, source->watch, source->token,
+                                                  HL_HOST_READY_READ);
+            (void)g_host_services->watch->close(g_host_services->context, source->watch);
+        }
+        int removed = 0;
+        (void)hl_linux_watch_release(&g_bound_watches.changes, source->token, &removed);
+        (void)g_host_services->file->close(g_host_services->context, source->file);
+        free(source);
+    }
+    pthread_mutex_unlock(&g_bound_watches.lock);
+}
+
+static size_t bound_mapping_watch_capacity(void) {
+    return g_linux_box == NULL ? 0 : g_linux_box->ofd_capacity;
+}
+
+static void bound_watch_fork_rebuild(void *opaque, uint64_t token, uint64_t device, uint64_t object) {
+    (void)opaque;
+    bound_watch_source *source = bound_watch_find_identity(device, object);
+    if (source != NULL) source->token = token;
+}
+
+static int bound_mapping_fork_prepare(hl_linux_watch_fork_plan *plan) {
+    if (!g_bound_watches.initialized) return 0;
+    pthread_mutex_lock(&g_bound_mapping_gate);
+    bound_watch_host_stop(1);
+    pthread_mutex_lock(&g_bound_mapping_lock);
+    if (hl_linux_watch_fork_snapshot(&g_bound_watches.changes, plan) == HL_STATUS_OK) {
+        return 0;
+    }
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
+    return -1;
+}
+
+static int bound_mapping_fork_complete(hl_linux_watch_fork_plan *plan, int child) {
+    hl_status status;
+    if (!g_bound_watches.initialized) return 0;
+    if (child) {
+        pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+        memcpy(&g_bound_watches.lock, &fresh, sizeof(fresh));
+        g_bound_watches.running = 0;
+        g_bound_watches.stopping = 0;
+        g_bound_watches.pollset = HL_HOST_HANDLE_INVALID;
+        status = hl_linux_watch_fork_child(&g_bound_watches.changes, plan, bound_watch_fork_rebuild, NULL);
+    } else {
+        status = HL_STATUS_OK;
+    }
+    if (status != HL_STATUS_OK) {
+        pthread_mutex_unlock(&g_bound_mapping_lock);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
+        return -1;
+    }
+    pthread_mutex_lock(&g_bound_watches.lock);
+    int started = bound_watch_host_start_locked();
+    pthread_mutex_unlock(&g_bound_watches.lock);
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
+    return started ? 0 : -1;
 }
 
 static int64_t bound_host_error(int32_t status) {
@@ -58,6 +380,7 @@ static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
     else *head = entry->next;
     free(entry);
     if (--object->references == 0) {
+        bound_watch_release(object->source);
         (void)g_host_services->memory->release(g_host_services->context, object->handle);
         free(object);
     }
@@ -80,8 +403,8 @@ static void bound_mapping_retire(uint64_t address, uint64_t size) {
         } else if (address > base && end < mapped_end) {
             bound_mapping *tail = malloc(sizeof(*tail));
             if (tail != NULL) {
-                *tail = (bound_mapping){end, mapped_end - end, entry->object_offset + end - base, entry->object,
-                                        entry->next};
+                *tail = (bound_mapping){end, mapped_end - end, entry->object_offset + end - base,
+                                        entry->file_offset + end - base, 0, 0, entry->object, entry->next};
                 entry->object->references++;
                 entry->next = tail;
                 entry->size = address - base;
@@ -91,6 +414,7 @@ static void bound_mapping_retire(uint64_t address, uint64_t size) {
             uint64_t cut = end - base;
             entry->address += cut;
             entry->object_offset += cut;
+            entry->file_offset += cut;
             entry->size -= cut;
             previous = entry;
         } else {
@@ -104,7 +428,18 @@ static void bound_mapping_retire(uint64_t address, uint64_t size) {
 static void bound_mapping_reset(void) {
     bound_mapping **head = bound_mapping_head();
     if (head == NULL) return;
+    pthread_mutex_lock(&g_bound_mapping_gate);
+    bound_watch_host_stop(1);
+    pthread_mutex_lock(&g_bound_mapping_lock);
     while (*head != NULL) bound_mapping_drop(*head, NULL);
+    pthread_mutex_lock(&g_bound_watches.lock);
+    if (g_bound_watches.initialized) {
+        hl_linux_watch_close(&g_bound_watches.changes);
+        g_bound_watches.initialized = 0;
+    }
+    pthread_mutex_unlock(&g_bound_watches.lock);
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
 }
 
 static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t address, uint64_t size, uint32_t protection,
@@ -116,10 +451,13 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     bound_mapping **head = bound_mapping_head();
     int64_t result;
     uint64_t bus_accessible = size;
+    uint64_t stable_device = 0, stable_object = 0, known_size = 0;
+    int identity_valid = 0;
     int bus_prepared = 0;
     if (head == NULL || g_host_services == NULL || g_host_services->memory == NULL ||
         g_host_services->memory->map_file == NULL)
         return -ENOSYS;
+    pthread_mutex_lock(&g_bound_mapping_gate);
     if (linux_flags & 0x10u) flags |= HL_HOST_MEMORY_FIXED;
     if (linux_flags & 0x100000u) flags = (flags & ~HL_HOST_MEMORY_FIXED) | HL_HOST_MEMORY_FIXED_NOREPLACE;
     object = calloc(1, sizeof(*object));
@@ -127,6 +465,7 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     if (object == NULL || entry == NULL) {
         free(object);
         free(entry);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
         return -ENOMEM;
     }
     if (g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
@@ -134,6 +473,10 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         hl_host_result status =
             g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
         if (status.status == HL_STATUS_OK) {
+            stable_device = metadata.stable_device;
+            stable_object = metadata.stable_object;
+            known_size = metadata.size;
+            identity_valid = 1;
             uint64_t available = metadata.size > offset ? metadata.size - offset : 0;
             bus_accessible = available > UINT64_MAX - UINT64_C(4095)
                                  ? UINT64_MAX
@@ -149,15 +492,23 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         if (bus_prepared) gbus_prepare_release();
         free(object);
         free(entry);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
         return result;
     }
+    pthread_mutex_lock(&g_bound_mapping_lock);
     if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
-    *object = (bound_mapping_object){mapped.handle, mapped.address, mapped.mapped_size, 1};
-    *entry = (bound_mapping){mapped.address, mapped.mapped_size, mapped.reserved, object, *head};
+    bound_watch_source *source =
+        identity_valid ? bound_watch_retain(file, stable_device, stable_object, known_size) : NULL;
+    *object = (bound_mapping_object){mapped.handle, file->host_handle, mapped.address, mapped.mapped_size,
+                                     stable_device, stable_object, known_size,
+                                     source, (uint32_t)identity_valid, (uint32_t)((linux_flags & 1u) != 0), 1};
+    *entry = (bound_mapping){mapped.address, mapped.mapped_size, mapped.reserved, offset, 0, 0, object, *head};
     *head = entry;
     if (mapped.address == 0 || mapped.mapped_size < size || mapped.address > UINT64_MAX - size) {
         if (bus_prepared) gbus_prepare_release();
         bound_mapping_drop(entry, NULL);
+        pthread_mutex_unlock(&g_bound_mapping_lock);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
         return -EIO;
     }
     gmap_add(mapped.address, mapped.mapped_size);
@@ -167,10 +518,109 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         gbus_prepare_release();
         bound_mapping_drop(entry, NULL);
         gmap_split_unmap(mapped.address, mapped.address + mapped.mapped_size);
+        pthread_mutex_unlock(&g_bound_mapping_lock);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
         return -ENOMEM;
     }
     if (bus_prepared) gbus_prepare_release();
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
     return (int64_t)mapped.address;
+}
+
+static uint64_t bound_file_accessible(const bound_mapping *mapping, uint64_t file_size) {
+    uint64_t available, rounded;
+    if (file_size <= mapping->file_offset) return 0;
+    available = file_size - mapping->file_offset;
+    if (available > UINT64_MAX - UINT64_C(4095)) return mapping->size;
+    rounded = (available + UINT64_C(4095)) & ~UINT64_C(4095);
+    return rounded < mapping->size ? rounded : mapping->size;
+}
+
+static int bound_mapping_same_file(const bound_mapping_object *object, const hl_linux_fd_snapshot *file,
+                                   const hl_host_file_metadata *metadata, int have_metadata) {
+    if (have_metadata && object->identity_valid)
+        return object->device == metadata->stable_device && object->inode == metadata->stable_object;
+    return object->file == file->host_handle;
+}
+
+/* Recompute every VMA of the truncated inode, including mappings made through
+   dup'd descriptors or a separately opened handle with the same stable host
+   identity.  Shrink is called while gbus_prepare owns the activation
+   transition, so no old translated block can touch the host mapping before the
+   newly invalid pages are published. */
+static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
+                                            const hl_host_file_metadata *metadata, int have_metadata,
+                                            uint64_t old_size, uint64_t new_size,
+                                            hl_linux_bus_transition *transition) {
+    bound_mapping **head = bound_mapping_head();
+    if (head == NULL) return;
+    for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+        uint64_t old_accessible, new_accessible;
+        if (!bound_mapping_same_file(entry->object, file, metadata, have_metadata)) continue;
+        entry->object->known_size = new_size;
+        old_accessible = bound_file_accessible(entry, old_size);
+        new_accessible = bound_file_accessible(entry, new_size);
+        if (new_size < old_size && new_size > entry->file_offset &&
+            new_size < entry->file_offset + entry->size) {
+            uint64_t tail = new_size - entry->file_offset;
+            uint64_t partial_end = (tail + UINT64_C(4095)) & ~UINT64_C(4095);
+            if (partial_end > entry->size) partial_end = entry->size;
+            if (partial_end > tail)
+                memset((void *)(uintptr_t)(entry->address + tail), 0, (size_t)(partial_end - tail));
+        }
+        if (new_accessible < old_accessible) {
+            if (transition != NULL)
+                (void)hl_linux_bus_transition_add(transition, entry->address + new_accessible,
+                                                  entry->address + entry->size);
+            else
+                (void)gbus_add(entry->address + new_accessible, entry->address + entry->size);
+        }
+        else if (new_accessible > old_accessible) {
+            if (!entry->object->shared) {
+                entry->follow_lo = old_accessible;
+                entry->follow_hi = new_accessible;
+            }
+            if (transition != NULL)
+                hl_linux_bus_transition_clear(transition, entry->address + old_accessible,
+                                              entry->address + new_accessible);
+            else
+                gbus_clear(entry->address + old_accessible, entry->address + new_accessible);
+        }
+    }
+}
+
+static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_t offset, uint64_t size) {
+    bound_mapping **head = bound_mapping_head();
+    hl_host_file_metadata metadata = {0};
+    int have_metadata = 0;
+    if (head == NULL || size == 0 || offset > UINT64_MAX - size || g_host_services == NULL ||
+        g_host_services->file == NULL || g_host_services->file->read_at == NULL)
+        return;
+    if (g_host_services->file->metadata != NULL) {
+        hl_host_result status =
+            g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
+        have_metadata = status.status == HL_STATUS_OK;
+    }
+    uint64_t end = offset + size;
+    pthread_mutex_lock(&g_bound_mapping_gate);
+    pthread_mutex_lock(&g_bound_mapping_lock);
+    for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+        if (entry->object->shared || entry->follow_hi <= entry->follow_lo ||
+            !bound_mapping_same_file(entry->object, file, &metadata, have_metadata))
+            continue;
+        uint64_t map_lo = entry->file_offset + entry->follow_lo;
+        uint64_t map_hi = entry->file_offset + entry->follow_hi;
+        uint64_t lo = offset > map_lo ? offset : map_lo;
+        uint64_t hi = end < map_hi ? end : map_hi;
+        if (hi > lo) {
+            hl_host_bytes output = {(void *)(uintptr_t)(entry->address + lo - entry->file_offset),
+                                    (size_t)(hi - lo)};
+            (void)g_host_services->file->read_at(g_host_services->context, file->host_handle, lo, output);
+        }
+    }
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
 }
 
 static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
@@ -298,18 +748,17 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
     return result;
 }
 
-static int64_t bound_open_handle(hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
-                                 uint32_t mode) {
-    hl_linux_fd_reservation reservation;
+static int bound_handle_reserve(void *opaque) {
+    bound_handle_slot *slot = opaque;
     hl_status status;
     int shadow = bound_shadow_reserve(0);
-    int64_t result;
+    if (slot == NULL || slot->active) return -EINVAL;
     if (shadow < 0 || shadow >= guest_nofile_cur()) {
         if (shadow >= 0) close(shadow);
         return -EMFILE;
     }
     for (;;) {
-        status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
+        status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &slot->reservation);
         if (status != HL_STATUS_ALREADY_EXISTS) break;
         close(shadow);
         shadow = bound_shadow_reserve(shadow + 1);
@@ -319,12 +768,39 @@ static int64_t bound_open_handle(hl_host_handle directory, const char *path, siz
         if (shadow >= 0) close(shadow);
         return -EMFILE;
     }
-    result = hl_linux_openat_handle_reserved(g_linux_box, &reservation, directory, path, path_size, flags, mode);
+    slot->shadow = shadow;
+    slot->active = 1;
+    return 0;
+}
+
+static void bound_handle_cancel(bound_handle_slot *slot) {
+    if (slot == NULL || !slot->active) return;
+    (void)hl_linux_fd_cancel(g_linux_box, &slot->reservation);
+    close(slot->shadow);
+    slot->active = 0;
+}
+
+static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags) {
+    if (slot == NULL || !slot->active) return -EMFILE;
+    int64_t result = hl_linux_file_adopt_reserved(g_linux_box, &slot->reservation, file, flags);
     if (result < 0) {
-        (void)hl_linux_fd_cancel(g_linux_box, &reservation);
-        close(shadow);
+        bound_handle_cancel(slot);
+    } else {
+        slot->active = 0;
     }
     return result;
+}
+
+static int bound_handle_dirfd_error(int fd) {
+    hl_linux_fd_snapshot snapshot;
+    hl_host_file_metadata metadata;
+    if (fd < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return -EBADF;
+    if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
+        return -ENOTDIR;
+    hl_host_result result =
+        g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata);
+    if (result.status != HL_STATUS_OK) return bound_host_error(result.status);
+    return metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ? -EACCES : -ENOTDIR;
 }
 
 /* Resolution may temporarily occupy low native descriptors. Once its opaque
@@ -333,10 +809,15 @@ static int64_t bound_open_handle(hl_host_handle directory, const char *path, siz
 static int64_t bound_relocate_lowest(int64_t opened) {
     int shadow;
     int64_t duplicated;
+    hl_linux_fd_snapshot snapshot;
     if (opened < 0) return opened;
     shadow = bound_shadow_reserve(0);
     if (shadow < 0) return opened;
-    duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)opened, (hl_linux_fd)shadow, 0);
+    uint32_t flags = hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)opened, &snapshot) == HL_STATUS_OK &&
+                             snapshot.descriptor_flags != 0
+                         ? HL_LINUX_O_CLOEXEC
+                         : 0;
+    duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)opened, (hl_linux_fd)shadow, flags);
     if (duplicated < 0) {
         close(shadow);
         return opened;
@@ -789,6 +1270,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
     }
     if (nr == 215 || nr == 226 || nr == 227) {
+        pthread_mutex_lock(&g_bound_mapping_gate);
+        pthread_mutex_lock(&g_bound_mapping_lock);
         bound_mapping *mapping = bound_mapping_find(a0, a1);
         if (mapping != NULL) {
             uint64_t offset = a0 - mapping->address;
@@ -797,9 +1280,15 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
              * typed file mapping to host protect applies macOS's 16 KiB granularity and can protect
              * adjacent ELF segments, breaking ld.so RELRO. Keep the typed mapping ledger, but let the
              * common guest-logical path validate the range and update permissions. */
-            if (nr == 226) return 0;
+            if (nr == 226) {
+                pthread_mutex_unlock(&g_bound_mapping_lock);
+                pthread_mutex_unlock(&g_bound_mapping_gate);
+                return 0;
+            }
             if (nr == 227 && (((a2 & ~(uint64_t)7u) != 0) || (a2 & 5u) == 0 || (a2 & 5u) == 5u)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                pthread_mutex_unlock(&g_bound_mapping_lock);
+                pthread_mutex_unlock(&g_bound_mapping_gate);
                 return 1;
             }
             if (nr == 215)
@@ -814,8 +1303,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 gbus_clear(a0, a0 + a1);
             }
             G_RET(c) = (uint64_t)bound_host_error(operation.status);
+            pthread_mutex_unlock(&g_bound_mapping_lock);
+            pthread_mutex_unlock(&g_bound_mapping_gate);
             return 1;
         }
+        pthread_mutex_unlock(&g_bound_mapping_lock);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
     }
     if (nr == 71 || nr == 77) {
         hl_linux_fd_snapshot second;
@@ -938,6 +1431,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EFAULT;
         else
             result = hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)a2, a3);
+        if (result > 0) bound_mapping_file_written(&source, a3, (uint64_t)result);
         break;
     case 65:
     case 66:
@@ -956,7 +1450,36 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
         break;
     }
-    case 46: result = hl_linux_ftruncate(g_linux_box, source.fd, a1); break;
+    case 46: {
+        hl_host_file_metadata metadata = {0};
+        int have_metadata = 0, prepared = 0;
+        if (g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            have_metadata = status.status == HL_STATUS_OK;
+        }
+        if (have_metadata && a1 < metadata.size) {
+            gbus_prepare();
+            prepared = 1;
+        }
+        result = hl_linux_ftruncate(g_linux_box, source.fd, a1);
+        if (result == 0 && have_metadata) {
+            /* The local truncate is authoritative. Publish its generation
+             * before releasing the BUS transition so the host watcher drops
+             * the matching notification instead of replaying the shrink. */
+            bound_watch_publish_size(metadata.stable_device, metadata.stable_object, a1);
+            pthread_mutex_lock(&g_bound_mapping_gate);
+            pthread_mutex_lock(&g_bound_mapping_lock);
+            bound_mapping_file_size_changed(&source, &metadata, 1, metadata.size, a1, NULL);
+            pthread_mutex_unlock(&g_bound_mapping_lock);
+            pthread_mutex_unlock(&g_bound_mapping_gate);
+        }
+        if (prepared) {
+            gbus_prepare_release();
+        }
+        break;
+    }
     case 82: result = hl_linux_fsync(g_linux_box, source.fd); break;
     case 83: result = hl_linux_fdatasync(g_linux_box, source.fd); break;
     case 84:

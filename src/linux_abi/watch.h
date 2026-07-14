@@ -46,6 +46,10 @@ void hl_linux_watch_shutdown(hl_linux_watch_set *set);
 
 /* Called around fork in the thread which invokes fork. */
 hl_status hl_linux_watch_fork_prepare(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan);
+/* Snapshot after the owner has joined every producer/consumer and excluded
+   retain/release.  Unlike fork_prepare this does not carry a locked pthread
+   mutex across fork. */
+hl_status hl_linux_watch_fork_snapshot(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan);
 void hl_linux_watch_fork_parent(hl_linux_watch_set *set);
 hl_status hl_linux_watch_fork_child(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan,
                                     hl_linux_watch_rebuild_fn rebuild, void *opaque);

@@ -485,6 +485,13 @@ int main(void) {
                                           0) == 6);
         HL_CHECK(hl_linux_fd_cancel(&linux_abi, &reservation) == HL_STATUS_NOT_FOUND);
         HL_CHECK(hl_linux_close(&linux_abi, 6) == 0);
+        HL_CHECK(hl_linux_fd_reserve_at(&linux_abi, 6, &reservation) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_file_adopt_reserved(&linux_abi, &reservation, 55,
+                                              HL_LINUX_O_RDONLY | HL_LINUX_O_CLOEXEC) == 6);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, 6, &snapshot) == HL_STATUS_OK &&
+                 snapshot.host_handle == 55 && snapshot.status_flags == HL_LINUX_O_RDONLY &&
+                 snapshot.descriptor_flags == HL_LINUX_FD_CLOEXEC);
+        HL_CHECK(hl_linux_close(&linux_abi, 6) == 0);
         file_host.closes = 0;
         file_host.opens = 0;
     }

@@ -219,6 +219,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // (PROT_NONE coverage was already dropped above via gna_clear over the guest-logical range.)
             gmap_split_unmap(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
+            filemap_unmap(u_lo, u_hi);
             futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
             wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
             mlk_del(u_lo, u_hi - u_lo);      // an unmapped range is implicitly unlocked (mlock -> VmLck)
@@ -609,9 +610,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             acct_publish_mem(); // publish the refunded charge into this process's cross-process slot
         }
         if (r != MAP_FAILED) {
+            if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             gmap_set_glen((uint64_t)r, (uint64_t)a1);    // /proc maps report the guest length (sans guard)
+            if (!(a3 & 0x20) && (int)a4 >= 0)
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range

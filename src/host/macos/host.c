@@ -1578,8 +1578,11 @@ static hl_host_result hl_macos_file_open_beneath(void *context, hl_host_handle r
     if (path == NULL || path_size == 0 || path[0] == '/' || memchr(path, '\0', path_size) != NULL ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0)
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    result = hl_macos_file_resolve_beneath(context, root, path, path_size, policy | HL_HOST_RESOLVE_ALLOW_MISSING,
-                                           &resolved);
+    uint32_t resolve_policy = policy | HL_HOST_RESOLVE_ALLOW_MISSING;
+    if ((creation & (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE)) ==
+        (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE))
+        resolve_policy |= HL_HOST_RESOLVE_NOFOLLOW_FINAL;
+    result = hl_macos_file_resolve_beneath(context, root, path, path_size, resolve_policy, &resolved);
     if (result.status != HL_STATUS_OK) return result;
     result = hl_macos_file_open(context, resolved.parent, resolved.final, resolved.final_size,
                                 access | HL_HOST_FILE_NOFOLLOW, creation, permissions);

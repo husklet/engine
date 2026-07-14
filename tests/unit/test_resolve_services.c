@@ -128,11 +128,30 @@ int main(void) {
     /* A final link is rejected when requested; it cannot be swapped into an escape. */
     HL_CHECK(symlink("../../../../etc/passwd", fifo) != 0); /* fifo already occupies the name */
     HL_CHECK(unlink(fifo) == 0);
-    HL_CHECK(symlink("../../../../etc/passwd", fifo) == 0);
+    HL_CHECK(symlink("file", fifo) == 0);
+    read = services.file->open_beneath(services.context, root.value, "a/fifo", 6, HL_HOST_FILE_READ, 0, 0, 0);
+    HL_CHECK(read.status == HL_STATUS_OK);
+    value = 0;
+    HL_CHECK(services.file->read(services.context, read.value, &value, 1).status == HL_STATUS_OK && value == 'x');
+    HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
     HL_CHECK(services.file
                  ->open_beneath(services.context, root.value, "a/fifo", 6, HL_HOST_FILE_READ, 0, 0,
                                 HL_HOST_RESOLVE_NOFOLLOW_FINAL)
                  .status != HL_STATUS_OK);
+    /* O_CREAT|O_EXCL observes the directory entry itself: both a link whose
+       target exists and a dangling link are EEXIST, and neither is followed. */
+    HL_CHECK(services.file
+                 ->open_beneath(services.context, root.value, "a/fifo", 6,
+                                HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0)
+                 .status == HL_STATUS_ALREADY_EXISTS);
+    HL_CHECK(unlink(fifo) == 0);
+    HL_CHECK(symlink("missing-target", fifo) == 0);
+    HL_CHECK(services.file
+                 ->open_beneath(services.context, root.value, "a/fifo", 6,
+                                HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0)
+                 .status == HL_STATUS_ALREADY_EXISTS);
     HL_CHECK(services.file->close(services.context, root.value).status == HL_STATUS_OK);
     test_destroy(host);
     unlink(fifo);

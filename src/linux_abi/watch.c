@@ -244,6 +244,28 @@ hl_status hl_linux_watch_fork_prepare(hl_linux_watch_set *set, hl_linux_watch_fo
     return HL_STATUS_OK;
 }
 
+hl_status hl_linux_watch_fork_snapshot(hl_linux_watch_set *set, hl_linux_watch_fork_plan *plan) {
+    watch_state *state;
+    size_t index;
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    if (set == NULL || set->state == NULL || plan == NULL || (plan->capacity != 0 && plan->records == NULL))
+        return HL_STATUS_INVALID_ARGUMENT;
+    state = set->state;
+    /* The caller proved there is no live owner.  Replacing the bytes also
+       avoids depending on a libc's post-fork representation of an unlocked
+       process-private mutex. */
+    memcpy(&state->lock, &fresh, sizeof(fresh));
+    plan->count = 0;
+    for (index = 0; index < state->count; ++index) {
+        watch_slot *slot = &state->slots[index];
+        if (slot->references == 0) continue;
+        if (plan->count == plan->capacity) return HL_STATUS_RESOURCE_LIMIT;
+        plan->records[plan->count++] = (hl_linux_watch_fork_record){watch_token(index, slot->generation),
+                                                                    slot->device, slot->object};
+    }
+    return HL_STATUS_OK;
+}
+
 void hl_linux_watch_fork_parent(hl_linux_watch_set *set) {
     if (set != NULL && set->state != NULL) pthread_mutex_unlock(&((watch_state *)set->state)->lock);
 }

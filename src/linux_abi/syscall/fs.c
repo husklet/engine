@@ -12,8 +12,15 @@ static int jail_routed_at(int dirfd, const char *path) {
     confine(path, normalized, sizeof normalized);
     return jail_match(normalized) >= 0;
 }
-static int64_t bound_open_handle(hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
-                                 uint32_t mode);
+typedef struct bound_handle_slot {
+    hl_linux_fd_reservation reservation;
+    int shadow;
+    int active;
+} bound_handle_slot;
+static int bound_handle_reserve(void *opaque);
+static void bound_handle_cancel(bound_handle_slot *slot);
+static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags);
+static int bound_handle_dirfd_error(int fd);
 static int64_t bound_relocate_lowest(int64_t opened);
 
 static uint32_t typed_open_flags(uint64_t guest) {
@@ -26,6 +33,30 @@ static uint32_t typed_open_flags(uint64_t guest) {
     if (guest & G_O_DIRECTORY) flags |= HL_LINUX_O_DIRECTORY;
     if (guest & G_O_NOFOLLOW) flags |= HL_LINUX_O_NOFOLLOW;
     return flags;
+}
+
+static uint32_t typed_host_access(uint64_t guest, int path_only) {
+    uint32_t access;
+    if (path_only)
+        access = HL_HOST_FILE_PATH_ONLY;
+    else if ((guest & 3u) == 2u)
+        access = HL_HOST_FILE_READ | HL_HOST_FILE_WRITE;
+    else if ((guest & 3u) == 1u)
+        access = HL_HOST_FILE_WRITE;
+    else
+        access = HL_HOST_FILE_READ;
+    if (guest & 0x400u) access |= HL_HOST_FILE_APPEND;
+    if (guest & G_O_DIRECTORY) access |= HL_HOST_FILE_DIRECTORY;
+    if (guest & G_O_NOFOLLOW) access |= HL_HOST_FILE_NOFOLLOW;
+    return access;
+}
+
+static uint32_t typed_host_creation(uint64_t guest) {
+    uint32_t creation = 0;
+    if (guest & 0x40u) creation |= HL_HOST_FILE_CREATE;
+    if (guest & 0x80u) creation |= HL_HOST_FILE_EXCLUSIVE;
+    if (guest & 0x200u) creation |= HL_HOST_FILE_TRUNCATE;
+    return creation;
 }
 
 // A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
@@ -1598,7 +1629,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = 0;
             break;
         }
+        struct stat before;
+        int have_before = fstat((int)a0, &before) == 0;
+        int bus_prepared = 0;
+        if (have_before && a1 < (uint64_t)before.st_size) {
+            gbus_prepare();
+            bus_prepared = 1;
+        }
         int r = ftruncate((int)a0, (off_t)a1);
+        if (r == 0 && have_before)
+            filemap_resize((int)a0, (uint64_t)before.st_size, a1);
+        if (bus_prepared) gbus_prepare_release();
         fd_evict((int)a0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -2470,6 +2511,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             char fin[512];
             hl_open_plan plan;
+            int typed_created = 0;
+            bound_handle_slot typed_slot = {0};
             uint32_t intent = (lf & 3) == 0 ? HL_OPEN_READ : HL_OPEN_WRITE;
             if (lf & 0x40) intent |= HL_OPEN_CREATE;
             if (lf & 0x200) intent |= HL_OPEN_TRUNCATE;
@@ -2477,9 +2520,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (is_opath) intent |= HL_OPEN_PATH_ONLY;
             if (lf & G_O_NOFOLLOW) intent |= HL_OPEN_NOFOLLOW;
             if (lf & G_O_DIRECTORY) intent |= HL_OPEN_DIRECTORY;
+            if (is_opath)
+                intent &= ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE |
+                                      HL_OPEN_APPEND);
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
-            int pfd = jail_open_plan((int)a0, (const char *)a1, intent, fin, sizeof fin, &plan);
+            int pfd = jail_open_plan((int)a0, (const char *)a1, intent, typed_host_access(a2, is_opath),
+                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3,
+                                     !g_untrusted && !nf_want, bound_handle_reserve, &typed_slot,
+                                     bound_handle_dirfd_error, &typed_created, fin, sizeof fin, &plan);
             if (pfd < 0) {
+                bound_handle_cancel(&typed_slot);
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
@@ -2487,22 +2537,23 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // probe pre-existence (relative to the resolved parent) so we stamp ONLY a fresh create.
             int nf_new = nf_want && faccessat(pfd, fin, F_OK, AT_SYMLINK_NOFOLLOW) != 0;
             /* The sentry wire still transports native descriptors; typed publication is safe only locally. */
-            if (!g_untrusted && plan.directory != HL_HOST_HANDLE_INVALID &&
-                (plan.target_type == HL_HOST_FILE_TYPE_REGULAR ||
-                 (plan.target == HL_HOST_HANDLE_INVALID && (lf & 0x40))) &&
+            if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID &&
+                plan.target != HL_HOST_HANDLE_INVALID && plan.target_type == HL_HOST_FILE_TYPE_REGULAR &&
                 !(lf & G_O_DIRECTORY)) {
                 int64_t opened;
                 close(pfd);
-                if (plan.target) (void)g_host_services->file->close(g_host_services->context, plan.target);
-                opened =
-                    bound_open_handle(plan.directory, plan.path, plan.path_size, typed_open_flags(a2), (uint32_t)a3);
-                (void)g_host_services->file->close(g_host_services->context, plan.directory);
+                opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));
+                if (opened < 0)
+                    (void)g_host_services->file->close(g_host_services->context, plan.target);
                 opened = bound_relocate_lowest(opened);
                 G_RET(c) = (uint64_t)opened;
                 break;
             }
-            if (plan.target) (void)g_host_services->file->close(g_host_services->context, plan.target);
-            if (plan.directory) (void)g_host_services->file->close(g_host_services->context, plan.directory);
+            bound_handle_cancel(&typed_slot);
+            if (plan.target != HL_HOST_HANDLE_INVALID)
+                (void)g_host_services->file->close(g_host_services->context, plan.target);
+            if (plan.directory != HL_HOST_HANDLE_INVALID)
+                (void)g_host_services->file->close(g_host_services->context, plan.directory);
             // O_PATH|O_NOFOLLOW on a symlink -> open the LINK via O_SYMLINK (else O_NOFOLLOW ELOOPs); a
             // regular O_NOFOLLOW open keeps ELOOPing on a symlink as Linux does.
             int r = openat(pfd, fin, mf | (osymlink ? O_SYMLINK : O_NOFOLLOW), (mode_t)a3);

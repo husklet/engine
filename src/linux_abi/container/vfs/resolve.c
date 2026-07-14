@@ -306,10 +306,31 @@ static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofol
  * contract.  Replacing this executor can therefore publish a host handle
  * without changing path classification again.
  */
-static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, char *final, size_t final_size,
-                          hl_open_plan *plan) {
+static int vfs_host_error(hl_status status) {
+    switch (status) {
+    case HL_STATUS_NOT_FOUND: return -ENOENT;
+    case HL_STATUS_PERMISSION_DENIED: return -EACCES;
+    case HL_STATUS_ALREADY_EXISTS: return -EEXIST;
+    case HL_STATUS_RESOURCE_LIMIT: return -EMFILE;
+    case HL_STATUS_OUT_OF_MEMORY: return -ENOMEM;
+    case HL_STATUS_INVALID_ARGUMENT: return -EINVAL;
+    case HL_STATUS_NOT_DIRECTORY: return -ENOTDIR;
+    case HL_STATUS_IS_DIRECTORY: return -EISDIR;
+    case HL_STATUS_SYMLINK_LOOP: return -ELOOP;
+    case HL_STATUS_NAME_TOO_LONG: return -ENAMETOOLONG;
+    case HL_STATUS_READ_ONLY: return -EROFS;
+    default: return -EIO;
+    }
+}
+
+static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t host_access,
+                          uint32_t host_creation, uint32_t permissions, int typed,
+                          int (*reserve)(void *), void *reserve_opaque, int (*dirfd_error)(int), int *created,
+                          char *final, size_t final_size, hl_open_plan *plan) {
     char absolute[8192];
     hl_open_request request;
+    int native_parent;
+    if (created != NULL) *created = 0;
     if (raw[0] == '/')
         snprintf(absolute, sizeof absolute, "%s", raw);
     else if (dirfd == -100)
@@ -319,11 +340,15 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, char *fin
         if (strncmp(guest_directory, g_rootfs_canon, g_rootfs_canon_len) == 0) guest_directory += g_rootfs_canon_len;
         snprintf(absolute, sizeof absolute, "/%s/%s", guest_directory, raw);
     } else {
-        return -EACCES;
+        return dirfd_error != NULL ? dirfd_error(dirfd) : -EBADF;
     }
     request = (hl_open_request){
         absolute, strlen(absolute), HL_HOST_HANDLE_INVALID, intent, g_nlower != 0, jail_ro(absolute), 0};
     if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
+    /* Complete namespace/read-only/overlay validation before open_beneath can
+       create or truncate the host object. */
+    native_parent = jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);
+    if (native_parent < 0) return native_parent;
     if (plan->kind == HL_OPEN_HOST_PATH && g_host_services &&
         g_host_services->file && g_host_services->file->resolve_beneath) {
         char rooted[8192];
@@ -356,7 +381,58 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, char *fin
             plan->target_type = resolved.target_type;
             plan->path_size = resolved.final_size;
             memcpy(plan->path, resolved.final, resolved.final_size + 1);
+            if (typed && g_host_services->file->open_beneath != NULL &&
+                (resolved.target_type == HL_HOST_FILE_TYPE_REGULAR ||
+                 (resolved.target == HL_HOST_HANDLE_INVALID && (intent & HL_OPEN_CREATE) != 0))) {
+                int opened_created = 0;
+                uint32_t open_policy = policy & ~(uint32_t)HL_HOST_RESOLVE_ALLOW_MISSING;
+                hl_host_result opened;
+                int reserve_result = reserve != NULL ? reserve(reserve_opaque) : 0;
+                if (reserve_result < 0) {
+                    if (resolved.target != HL_HOST_HANDLE_INVALID)
+                        (void)g_host_services->file->close(g_host_services->context, resolved.target);
+                    (void)g_host_services->file->close(g_host_services->context, resolved.parent);
+                    close(native_parent);
+                    return reserve_result;
+                }
+                if ((host_creation & HL_HOST_FILE_CREATE) != 0) {
+                    opened = g_host_services->file->open_beneath(
+                        g_host_services->context, route_root, relative, strlen(relative),
+                        host_access | HL_HOST_FILE_NONBLOCK,
+                        host_creation | HL_HOST_FILE_EXCLUSIVE, permissions, open_policy);
+                    if (opened.status == HL_STATUS_OK)
+                        opened_created = 1;
+                    else if (opened.status == HL_STATUS_ALREADY_EXISTS &&
+                             (host_creation & HL_HOST_FILE_EXCLUSIVE) == 0)
+                        opened = g_host_services->file->open_beneath(
+                            g_host_services->context, route_root, relative, strlen(relative),
+                            host_access | HL_HOST_FILE_NONBLOCK, host_creation, permissions, open_policy);
+                } else {
+                    opened = g_host_services->file->open_beneath(
+                        g_host_services->context, route_root, relative, strlen(relative),
+                        host_access | HL_HOST_FILE_NONBLOCK, host_creation, permissions, open_policy);
+                }
+                if (resolved.target != HL_HOST_HANDLE_INVALID)
+                    (void)g_host_services->file->close(g_host_services->context, resolved.target);
+                (void)g_host_services->file->close(g_host_services->context, resolved.parent);
+                plan->directory = HL_HOST_HANDLE_INVALID;
+                plan->target = opened.status == HL_STATUS_OK ? opened.value : HL_HOST_HANDLE_INVALID;
+                if (opened.status != HL_STATUS_OK) {
+                    close(native_parent);
+                    return vfs_host_error((hl_status)opened.status);
+                }
+                if (created != NULL) *created = opened_created;
+                /* A successful exclusive create produces a regular file even
+                 * when a later metadata probe is unavailable. Do not fall
+                 * back to a second native O_EXCL open and turn this success
+                 * into a synthetic EEXIST. */
+                if (opened_created) plan->target_type = HL_HOST_FILE_TYPE_REGULAR;
+                hl_host_file_metadata metadata;
+                if (g_host_services->file->metadata(g_host_services->context, plan->target, &metadata).status ==
+                    HL_STATUS_OK)
+                    plan->target_type = metadata.type;
+            }
         }
     }
-    return jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);
+    return native_parent;
 }

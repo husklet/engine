@@ -844,6 +844,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         do {
             r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        if (r > 0) filemap_written((int)a0, a3, (uint64_t)r);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }

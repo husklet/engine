@@ -1710,6 +1710,16 @@ int64_t hl_linux_openat_handle_reserved(hl_linux_abi *linux_abi, const hl_linux_
     return hl_linux_openat_install(linux_abi, reservation, HL_LINUX_AT_FDCWD, directory, path, path_size, flags, mode);
 }
 
+int64_t hl_linux_file_adopt_reserved(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
+                                     hl_host_handle file, uint32_t flags) {
+    hl_status status;
+    if (linux_abi == NULL || reservation == NULL || file == HL_HOST_HANDLE_INVALID) return -HL_LINUX_EINVAL;
+    status = hl_linux_fd_commit(linux_abi, reservation, file, flags & ~(uint32_t)HL_LINUX_O_CLOEXEC,
+                                (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+    if (status == HL_STATUS_OK) return (int64_t)reservation->fd;
+    return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE : hl_linux_error(status);
+}
+
 int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {
     const hl_host_file_services *files;
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;

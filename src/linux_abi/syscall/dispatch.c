@@ -490,8 +490,12 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
 // this file's local helpers (overlay_*/proc_self_exe/synth_str_fd for fs; nonpie_p/cpu_online_mask/
 // affinity_mask for proc; svc_adjtimex/pidfd_*/mq_* for rare) defined just above, so they must be
 // included AFTER them.
+#include "../watch.h"
 #include "fs.c"
 static void bound_mapping_reset(void);
+static size_t bound_mapping_watch_capacity(void);
+static int bound_mapping_fork_prepare(hl_linux_watch_fork_plan *plan);
+static int bound_mapping_fork_complete(hl_linux_watch_fork_plan *plan, int child);
 #include "proc.c"
 #include "rare.c"
 #include "ptrace.c" // bug real ptrace tracer/tracee coordination (uses helpers above + G_* macros)
