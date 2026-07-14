@@ -848,6 +848,7 @@ LINUX_PRODUCTION_MATRIX_CASES := \
 	$(BUILD)/compat/posix/x86_64/mmapfile \
 	$(BUILD)/compat/core/syscall/x86_64/epoll \
 	$(BUILD)/compat/core/syscall/x86_64/epoll_edge \
+	$(BUILD)/compat/core/syscall/x86_64/epoll_dup_lifetime \
 	$(BUILD)/e2e/epoll_oneshot-x86_64
 
 $(BUILD)/tools/linux-matrix: tools/linux_matrix.c
@@ -869,6 +870,7 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/posix/x86_64/mmapfile tests/compat/posix/expected/mmapfile.out 0 \
 		$(BUILD)/compat/core/syscall/x86_64/epoll tests/compat/core/syscall/expected/epoll.out 0 \
 		$(BUILD)/compat/core/syscall/x86_64/epoll_edge tests/compat/core/syscall/expected/epoll_edge.out 0 \
+		$(BUILD)/compat/core/syscall/x86_64/epoll_dup_lifetime tests/compat/core/syscall/expected/epoll_dup_lifetime.out 0 \
 		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \

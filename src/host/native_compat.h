@@ -109,6 +109,33 @@ static inline hl_native_kregistration *hl_native_kfind(dev_t device, ino_t inode
     return NULL;
 }
 
+static inline int hl_native_kevent_rehome(int descriptor, int old_target, int new_target) {
+    dev_t device;
+    ino_t inode;
+    hl_native_kregistration *entry;
+    struct epoll_event event = {0};
+    if (hl_native_kidentity(descriptor, &device, &inode) != 0) return -1;
+    pthread_mutex_lock(&hl_native_klock);
+    entry = hl_native_kfind(device, inode, old_target);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&hl_native_klock);
+        errno = ENOENT;
+        return -1;
+    }
+    event.events = (entry->read ? EPOLLIN : 0u) | (entry->write ? EPOLLOUT : 0u);
+    if ((entry->flags & EV_CLEAR) != 0) event.events |= EPOLLET;
+    if ((entry->flags & EV_ONESHOT) != 0) event.events |= EPOLLONESHOT;
+    event.data.ptr = entry;
+    if (epoll_ctl(descriptor, EPOLL_CTL_DEL, old_target, NULL) != 0 ||
+        epoll_ctl(descriptor, EPOLL_CTL_ADD, new_target, &event) != 0) {
+        pthread_mutex_unlock(&hl_native_klock);
+        return -1;
+    }
+    entry->target = new_target;
+    pthread_mutex_unlock(&hl_native_klock);
+    return 0;
+}
+
 static inline int kqueue(void) {
     return epoll_create1(EPOLL_CLOEXEC);
 }

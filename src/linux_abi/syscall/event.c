@@ -165,7 +165,18 @@ static void ep_close_rehome(int fd) {
     int y = ofd_surviving_alias(fd);
     if (y < 0 || y >= HL_NFD || y == fd) return; // last OFD reference is closing -> let the knote die
     if (g_ep_owner[y]) return;                   // the alias is already a watched fd of its own -> don't clobber
-    ep_rearm_from_interest(ep, y, fd);           // arm the surviving alias with the closing fd's events+udata
+#if defined(__linux__)
+    if (g_ep_chgn[ep] > 0) {
+        (void)kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL);
+        g_ep_chgn[ep] = 0;
+    }
+    (void)hl_native_kevent_rehome(ep, fd, y);
+#else
+    ep_rearm_from_interest(ep, y, fd); // kqueue keys interest by descriptor number, so move its knotes
+#endif
+    /* Native epoll keys the registration by the watched open-file description and retains it until its
+       final alias closes.  Re-adding y would create or collide with a second registration; only the guest
+       bookkeeping needs to follow the surviving descriptor. */
     g_ep_owner[y] = ep + 1;
     g_ep_events[y] = g_ep_events[fd];
     g_ep_udata[y] = g_ep_udata[fd];
