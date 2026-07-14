@@ -162,6 +162,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     (void)fcntl((int)fd, F_SETFD, FD_CLOEXEC);
                 } else {
                     (void)hl_linux_close(g_linux_box, fd);
+                    proc_fdvis_close((int)fd);
                     close((int)fd);
                 }
                 continue;

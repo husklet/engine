@@ -1,20 +1,5 @@
 #include "../system.h"
 
-#include <stdatomic.h>
-
-static _Atomic uint16_t hl_private_fds[1 << 20];
-void hl_host_process_fd_private_add(int fd) {
-    if (fd >= 0 && fd < (int)(sizeof hl_private_fds / sizeof *hl_private_fds))
-        (void)atomic_fetch_add_explicit(&hl_private_fds[fd], 1, memory_order_relaxed);
-}
-void hl_host_process_fd_private_remove(int fd) {
-    uint16_t value;
-    if (fd < 0 || fd >= (int)(sizeof hl_private_fds / sizeof *hl_private_fds)) return;
-    value = atomic_load_explicit(&hl_private_fds[fd], memory_order_relaxed);
-    while (value != 0 && !atomic_compare_exchange_weak_explicit(&hl_private_fds[fd], &value, value - 1,
-                                                                memory_order_relaxed, memory_order_relaxed)) {}
-}
-
 #include <libproc.h>
 #include <mach/host_info.h>
 #include <mach/mach_host.h>
@@ -110,6 +95,8 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     info->process_group = bsd.pbi_pgid;
     info->session = getsid((pid_t)pid);
     info->start_time_seconds = bsd.pbi_start_tvsec;
+    info->start_time_ns =
+        (uint64_t)bsd.pbi_start_tvsec * UINT64_C(1000000000) + (uint64_t)bsd.pbi_start_tvusec * UINT64_C(1000);
     info->threads = 1;
     switch (bsd.pbi_status) {
     case 2: info->state = 'R'; break;
@@ -140,7 +127,9 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     int received;
     struct proc_fdinfo *native;
     size_t total;
+    hl_host_process_info process;
     if (count == NULL || pid <= 0 || pid > INT32_MAX || (capacity != 0 && entries == NULL)) return 0;
+    if (!hl_host_process_read(pid, &process)) return 0;
     bytes = proc_pidinfo((int)pid, PROC_PIDLISTFDS, 0, NULL, 0);
     if (bytes <= 0) return 0;
     native = malloc((size_t)bytes);
@@ -154,8 +143,12 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     for (size_t index = 0; index < total && index < capacity; ++index) {
         entries[index].descriptor = native[index].proc_fd;
         entries[index].kind = hl_macos_fd_kind(native[index].proc_fdtype);
-        entries[index].flags = native[index].proc_fd < (int)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[native[index].proc_fd]
-                                   ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+        entries[index].flags = hl_host_process_fd_private_is(pid, process.start_time_ns, native[index].proc_fd)
+                                   ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE
+                                   : 0;
+        entries[index].reserved = 0;
+        entries[index].stable_device = 0;
+        entries[index].stable_object = 0;
     }
     free(native);
     *count = total;
@@ -169,9 +162,11 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
     size_t count;
     uint32_t kind = HL_HOST_FD_OTHER;
     int found = 0;
+    hl_host_process_info process;
     if (entry == NULL || path_size == NULL || pid <= 0 || descriptor < 0 || (path_capacity != 0 && path == NULL) ||
         pid > INT32_MAX)
         return 0;
+    if (!hl_host_process_read(pid, &process)) return 0;
     if (proc_pidfdinfo((int)pid, descriptor, PROC_PIDFDVNODEPATHINFO, &info, sizeof info) == (int)sizeof info &&
         info.pvip.vip_path[0] != '\0') {
         size_t length = strnlen(info.pvip.vip_path, sizeof info.pvip.vip_path);
@@ -179,8 +174,12 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
         if (length != 0) memcpy(path, info.pvip.vip_path, length);
         entry->descriptor = descriptor;
         entry->kind = HL_HOST_FD_FILE;
-        entry->flags = descriptor < (int32_t)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[descriptor]
-                           ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+        entry->flags = hl_host_process_fd_private_is(pid, process.start_time_ns, descriptor)
+                           ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE
+                           : 0;
+        entry->reserved = 0;
+        entry->stable_device = info.pvip.vip_vi.vi_stat.vst_dev;
+        entry->stable_object = info.pvip.vip_vi.vi_stat.vst_ino;
         *path_size = length;
         return 1;
     }
@@ -201,6 +200,11 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
     if (!found) return 0;
     entry->descriptor = descriptor;
     entry->kind = kind;
+    entry->flags =
+        hl_host_process_fd_private_is(pid, process.start_time_ns, descriptor) ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+    entry->reserved = 0;
+    entry->stable_device = 0;
+    entry->stable_object = 0;
     *path_size = 0;
     return 1;
 }

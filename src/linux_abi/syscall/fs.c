@@ -12,11 +12,13 @@ static int jail_routed_at(int dirfd, const char *path) {
     confine(path, normalized, sizeof normalized);
     return jail_match(normalized) >= 0;
 }
+
 typedef struct bound_handle_slot {
     hl_linux_fd_reservation reservation;
     int shadow;
     int active;
 } bound_handle_slot;
+
 static int bound_handle_reserve(void *opaque);
 static void bound_handle_cancel(bound_handle_slot *slot);
 static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags);
@@ -211,6 +213,12 @@ static void ptm_apply_to_slave(int ptn, int slavefd) {
 // guarded / idempotent). Mirrors case 57's teardown exactly so close(2) semantics are unchanged.
 static void fd_reset_emul(int fd) {
     if (fd >= 0 && fd < HL_NFD) {
+        if (g_fdvis_private[fd]) {
+            hl_host_process_fd_private_remove(fd);
+            g_fdvis_private[fd] = 0;
+        }
+        proc_fdvis_close(fd);
+        g_pipe_identity[fd] = 0;
         if (g_eventfd_peer[fd]) {
             // Refcounted teardown: a dup()'d eventfd shares the peer write end + counter slot, so only close
             // the peer and zero the shared counter when the LAST alias closes -- otherwise closing one
@@ -1561,19 +1569,19 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         uint64_t files = pseudo_zero ? 0 : (uint64_t)hs.f_files;
         uint64_t ffree = pseudo_zero ? 0 : (uint64_t)hs.f_ffree;
         memset(b, 0, 120);
-        *(int64_t *)(b + 0) = f_type;               // f_type (Linux fs magic for the resolved mount)
-        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize;  // f_bsize
-        *(uint64_t *)(b + 16) = blocks;             // f_blocks
-        *(uint64_t *)(b + 24) = bfree;              // f_bfree
-        *(uint64_t *)(b + 32) = bavail;             // f_bavail
-        *(uint64_t *)(b + 40) = files;              // f_files
-        *(uint64_t *)(b + 48) = ffree;              // f_ffree
+        *(int64_t *)(b + 0) = f_type;              // f_type (Linux fs magic for the resolved mount)
+        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize; // f_bsize
+        *(uint64_t *)(b + 16) = blocks;            // f_blocks
+        *(uint64_t *)(b + 24) = bfree;             // f_bfree
+        *(uint64_t *)(b + 32) = bavail;            // f_bavail
+        *(uint64_t *)(b + 40) = files;             // f_files
+        *(uint64_t *)(b + 48) = ffree;             // f_ffree
 #if defined(__linux__)
-        *(int32_t *)(b + 56) = hs.f_fsid.__val[0];  // f_fsid[0]
-        *(int32_t *)(b + 60) = hs.f_fsid.__val[1];  // f_fsid[1]
+        *(int32_t *)(b + 56) = hs.f_fsid.__val[0]; // f_fsid[0]
+        *(int32_t *)(b + 60) = hs.f_fsid.__val[1]; // f_fsid[1]
 #else
-        *(int32_t *)(b + 56) = hs.f_fsid.val[0];    // f_fsid[0]
-        *(int32_t *)(b + 60) = hs.f_fsid.val[1];    // f_fsid[1]
+        *(int32_t *)(b + 56) = hs.f_fsid.val[0]; // f_fsid[0]
+        *(int32_t *)(b + 60) = hs.f_fsid.val[1]; // f_fsid[1]
 #endif
         *(int64_t *)(b + 64) = 255;                 // f_namelen (NAME_MAX)
         *(int64_t *)(b + 72) = (int64_t)hs.f_bsize; // f_frsize
@@ -1642,8 +1650,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             bus_prepared = 1;
         }
         int r = ftruncate((int)a0, (off_t)a1);
-        if (r == 0 && have_before)
-            filemap_resize((int)a0, (uint64_t)before.st_size, a1);
+        if (r == 0 && have_before) filemap_resize((int)a0, (uint64_t)before.st_size, a1);
         if (bus_prepared) gbus_prepare_release();
         fd_evict((int)a0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -2346,7 +2353,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 memf_materialize(pfn); // reopen-by-fd would expose the real file -> flush RAM cache first
                 char gp[4200];
                 int r = -1;
-                if (hl_native_fd_path(pfn, gp, sizeof gp) == 0 && gp[0]) r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
+                if (hl_native_fd_path(pfn, gp, sizeof gp) == 0 && gp[0])
+                    r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
                 if (r < 0) r = dup(pfn); // anonymous/pipe/socket fd -> share the description
                 if (r >= 0) {
                     char tp[4200];
@@ -2528,13 +2536,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (lf & G_O_NOFOLLOW) intent |= HL_OPEN_NOFOLLOW;
             if (lf & G_O_DIRECTORY) intent |= HL_OPEN_DIRECTORY;
             if (is_opath)
-                intent &= ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE |
-                                      HL_OPEN_APPEND);
+                intent &=
+                    ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE | HL_OPEN_APPEND);
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
             int pfd = jail_open_plan((int)a0, (const char *)a1, intent, typed_host_access(a2, is_opath),
-                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3,
-                                     !g_untrusted && !nf_want, bound_handle_reserve, &typed_slot,
-                                     bound_handle_dirfd_error, &typed_created, fin, sizeof fin, &plan);
+                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3, !g_untrusted && !nf_want,
+                                     bound_handle_reserve, &typed_slot, bound_handle_dirfd_error, &typed_created, fin,
+                                     sizeof fin, &plan);
             if (pfd < 0) {
                 bound_handle_cancel(&typed_slot);
                 G_RET(c) = (uint64_t)(int64_t)pfd;
@@ -2548,15 +2556,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int typed_directory = plan.target_type == HL_HOST_FILE_TYPE_DIRECTORY && (lf & G_O_DIRECTORY) &&
                                   (!g_nlower || jail_is_vol(typed_guest_path));
             /* The sentry wire still transports native descriptors; typed publication is safe only locally. */
-            if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID &&
-                plan.target != HL_HOST_HANDLE_INVALID &&
-                ((plan.target_type == HL_HOST_FILE_TYPE_REGULAR && !(lf & G_O_DIRECTORY)) ||
-                 typed_directory)) {
+            if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID && plan.target != HL_HOST_HANDLE_INVALID &&
+                ((plan.target_type == HL_HOST_FILE_TYPE_REGULAR && !(lf & G_O_DIRECTORY)) || typed_directory)) {
                 int64_t opened;
                 close(pfd);
                 opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));
-                if (opened < 0)
-                    (void)g_host_services->file->close(g_host_services->context, plan.target);
+                if (opened < 0) (void)g_host_services->file->close(g_host_services->context, plan.target);
                 opened = bound_relocate_lowest(opened);
                 G_RET(c) = (uint64_t)opened;
                 break;
@@ -2803,6 +2808,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = l;
                 break;
             }
+            /* Linux exposes anonymous pipes through native /proc, while macOS has no native fd path for
+               them.  Prefer the engine's OFD identity on both hosts so self and peer procfs views report
+               the same object.  A named FIFO has no pipe identity and still follows its filesystem path. */
+            if (pfn >= 0 && pfn < HL_NFD && g_pipe_identity[pfn] != 0) {
+                char syn[64];
+                int sl = snprintf(syn, sizeof syn, "pipe:[%llu]", (unsigned long long)g_pipe_identity[pfn]);
+                size_t l = (size_t)sl > bs ? bs : (size_t)sl;
+                memcpy(buf, syn, l);
+                G_RET(c) = (uint64_t)l;
+                break;
+            }
             char gp[4200];
             if (hl_native_fd_path(pfn, gp, sizeof gp) != 0) {
                 // A pathless fd (pipe/socket/eventfd/timerfd/anon inode): Linux still resolves
@@ -2820,7 +2836,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char syn[64];
                 int sl;
                 if (have && S_ISFIFO(ss.st_mode))
-                    sl = snprintf(syn, sizeof syn, "pipe:[%llu]", (unsigned long long)ss.st_ino);
+                    sl = snprintf(
+                        syn, sizeof syn, "pipe:[%llu]",
+                        (unsigned long long)(g_pipe_identity[pfn] ? g_pipe_identity[pfn] : (uint64_t)ss.st_ino));
                 else if (have && S_ISSOCK(ss.st_mode))
                     sl = snprintf(syn, sizeof syn, "socket:[%llu]", (unsigned long long)ss.st_ino);
                 else if (pfn >= 0 && pfn < HL_NFD && g_eventfd_peer[pfn])

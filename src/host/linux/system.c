@@ -1,21 +1,6 @@
 #define _GNU_SOURCE
 #include "../system.h"
 
-#include <stdatomic.h>
-
-static _Atomic uint16_t hl_private_fds[1 << 20];
-void hl_host_process_fd_private_add(int fd) {
-    if (fd >= 0 && fd < (int)(sizeof hl_private_fds / sizeof *hl_private_fds))
-        (void)atomic_fetch_add_explicit(&hl_private_fds[fd], 1, memory_order_relaxed);
-}
-void hl_host_process_fd_private_remove(int fd) {
-    uint16_t value;
-    if (fd < 0 || fd >= (int)(sizeof hl_private_fds / sizeof *hl_private_fds)) return;
-    value = atomic_load_explicit(&hl_private_fds[fd], memory_order_relaxed);
-    while (value != 0 && !atomic_compare_exchange_weak_explicit(&hl_private_fds[fd], &value, value - 1,
-                                                                memory_order_relaxed, memory_order_relaxed)) {}
-}
-
 #include <errno.h>
 #include <dirent.h>
 #include <limits.h>
@@ -23,6 +8,7 @@ void hl_host_process_fd_private_remove(int fd) {
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -130,8 +116,11 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     if (ticks <= 0) ticks = 100;
     info->user_time_ns = fields[14] * UINT64_C(1000000000) / (uint64_t)ticks;
     info->system_time_ns = fields[15] * UINT64_C(1000000000) / (uint64_t)ticks;
-    if (hl_host_system_read(&system, NULL, 0))
+    if (hl_host_system_read(&system, NULL, 0)) {
         info->start_time_seconds = system.boot_time_seconds + fields[22] / (uint64_t)ticks;
+        info->start_time_ns = system.boot_time_seconds * UINT64_C(1000000000) +
+                              fields[22] * UINT64_C(1000000000) / (uint64_t)ticks;
+    }
     info->virtual_bytes = fields[23];
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
@@ -150,16 +139,26 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
     char link[96];
     char target[PATH_MAX + 1];
     ssize_t length;
+    hl_host_process_info process;
     if (entry == NULL || path_size == NULL || pid <= 0 || descriptor < 0 || (path_capacity != 0 && path == NULL))
         return 0;
+    if (!hl_host_process_read(pid, &process)) return 0;
     snprintf(link, sizeof link, "/proc/%lld/fd/%d", (long long)pid, descriptor);
     length = readlink(link, target, sizeof target - 1);
     if (length < 0) return 0;
     target[length] = '\0';
     entry->descriptor = descriptor;
     entry->kind = hl_linux_fd_kind(target);
-    entry->flags = descriptor < (int32_t)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[descriptor]
+    entry->flags = hl_host_process_fd_private_is(pid, process.start_time_ns, descriptor)
                        ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+    entry->reserved = 0;
+    entry->stable_device = 0;
+    entry->stable_object = 0;
+    struct stat status;
+    if (stat(link, &status) == 0) {
+        entry->stable_device = (uint64_t)status.st_dev;
+        entry->stable_object = (uint64_t)status.st_ino;
+    }
     *path_size = 0;
     if (entry->kind == HL_HOST_FD_FILE) {
         size_t copied = (size_t)length < path_capacity ? (size_t)length : path_capacity;
@@ -174,7 +173,9 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     DIR *directory;
     struct dirent *item;
     size_t total = 0;
+    hl_host_process_info process;
     if (count == NULL || pid <= 0 || (capacity != 0 && entries == NULL)) return 0;
+    if (!hl_host_process_read(pid, &process)) return 0;
     snprintf(path, sizeof path, "/proc/%lld/fd", (long long)pid);
     directory = opendir(path);
     if (directory == NULL) return 0;
@@ -187,8 +188,11 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
         if (total < capacity) {
             entries[total].descriptor = (int32_t)descriptor;
             entries[total].kind = HL_HOST_FD_OTHER;
-            entries[total].flags = descriptor < (long)(sizeof hl_private_fds / sizeof *hl_private_fds) && hl_private_fds[descriptor]
+            entries[total].flags = hl_host_process_fd_private_is(pid, process.start_time_ns, (int)descriptor)
                                        ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+            entries[total].reserved = 0;
+            entries[total].stable_device = 0;
+            entries[total].stable_object = 0;
         }
         total++;
     }

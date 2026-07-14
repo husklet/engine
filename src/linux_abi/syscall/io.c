@@ -33,6 +33,10 @@ static void fd_carry_virt(int newfd, int oldfd) {
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
+    if (g_pipe_identity[oldfd] != 0) {
+        g_pipe_identity[newfd] = g_pipe_identity[oldfd];
+        (void)proc_fdvis_publish(newfd, HL_HOST_FD_PIPE, 1, g_pipe_identity[newfd]);
+    }
     // eventfd: share the peer write end + counter slot; bump the slot refcount so closing either alias does
     // not tear the shared object down until the last one closes (see fd_reset_emul / g_eventfd_refs).
     if (g_eventfd_peer[oldfd]) {
@@ -103,9 +107,8 @@ static off_t sparse_seek_fallback(int fd, off_t offset, int guest_whence) {
         return -1;
     }
     while (cursor < metadata.st_size) {
-        size_t amount = (uint64_t)(metadata.st_size - cursor) < sizeof(bytes)
-                            ? (size_t)(metadata.st_size - cursor)
-                            : sizeof(bytes);
+        size_t amount =
+            (uint64_t)(metadata.st_size - cursor) < sizeof(bytes) ? (size_t)(metadata.st_size - cursor) : sizeof(bytes);
         ssize_t count = pread(fd, bytes, amount, cursor);
         if (count <= 0) {
             if (count == 0) errno = ENXIO;
@@ -1500,6 +1503,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (fl & 0x800) {
             fcntl(fds[0], F_SETFL, O_NONBLOCK);
             fcntl(fds[1], F_SETFL, O_NONBLOCK);
+        }
+        if (proc_fdvis_publish_pipe_pair(fds[0], fds[1]) != 0) {
+            close(fds[0]);
+            close(fds[1]);
+            G_RET(c) = (uint64_t)(-EMFILE);
+            break;
         }
         ((int *)a0)[0] = fds[0];
         ((int *)a0)[1] = fds[1];

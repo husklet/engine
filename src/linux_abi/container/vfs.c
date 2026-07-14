@@ -245,6 +245,249 @@ struct ts_slot {
 #define TS_N 4096 // power of two; open-addressed by host pid
 static struct ts_slot *g_ts_tab;
 
+/* Cross-process view of typed logical descriptors. The host fd table contains reservation shadows at
+ * guest-visible numbers, so peer /proc/<pid>/fd resolves the logical fd's stable OFD identity to a persistent
+ * peer descriptor before asking the host process service for vnode/socket information. Entries live in
+ * pre-fork shared memory and are generation stamped so readers never combine old identity with fd reuse. */
+#define FDVIS_N 131072
+
+struct fdvis_slot {
+    uint64_t key; /* host pid in high 32 bits; guest fd + 1 in low 32 bits; 0 = free */
+    uint64_t generation;
+    uint64_t owner_start_ns;
+    uint32_t kind;
+    uint32_t reserved;
+    uint64_t device;
+    uint64_t object;
+};
+static struct fdvis_slot *g_fdvis;
+
+struct fdvis_control {
+    _Atomic uint64_t owner;
+    uint64_t generation;
+};
+static struct fdvis_control *g_fdvis_control;
+static int g_fdvis_fork_parent;
+static uint64_t g_fdvis_fork_parent_start;
+static uint64_t g_pipe_identity[HL_NFD];
+static uint8_t g_fdvis_private[HL_NFD];
+static _Atomic uint64_t g_pipe_identity_next = 1;
+static void proc_fdvis_cleanup(void);
+static void proc_fdvis_close(int guest_fd);
+
+static uint64_t fdvis_key(int pid, int fd) {
+    return pid > 0 && fd >= 0 ? ((uint64_t)(uint32_t)pid << 32) | ((uint32_t)fd + 1u) : 0;
+}
+
+static uint64_t fdvis_process_token(int pid) {
+    hl_host_process_info info;
+    return pid > 0 && hl_host_process_read(pid, &info) ? info.start_time_ns : 0;
+}
+
+static uint64_t fdvis_identity(int pid, uint64_t start_ns) {
+    uint32_t fingerprint = (uint32_t)start_ns ^ (uint32_t)(start_ns >> 32);
+    return ((uint64_t)(uint32_t)pid << 32) | fingerprint;
+}
+
+static void fdvis_init(void) {
+    size_t bytes = sizeof(struct fdvis_slot) * FDVIS_N + sizeof(*g_fdvis_control);
+    void *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (memory == MAP_FAILED) return;
+    g_fdvis = memory;
+    g_fdvis_control = (void *)((unsigned char *)memory + sizeof(struct fdvis_slot) * FDVIS_N);
+    (void)atexit(proc_fdvis_cleanup);
+}
+
+__attribute__((constructor)) static void fdvis_ctor(void) {
+    fdvis_init();
+}
+
+static struct fdvis_slot *fdvis_find(uint64_t key, uint64_t owner_start_ns, int claim) {
+    if (!g_fdvis || key == 0) return NULL;
+    unsigned start = (unsigned)((key ^ (key >> 32)) * UINT64_C(2654435761)) & (FDVIS_N - 1);
+    for (unsigned probe = 0; probe < FDVIS_N; ++probe) {
+        struct fdvis_slot *slot = &g_fdvis[(start + probe) & (FDVIS_N - 1)];
+        uint64_t present = slot->key;
+        if (present == key) {
+            if (slot->owner_start_ns == owner_start_ns) return slot;
+            if (!claim) return NULL;
+            memset(slot, 0, sizeof *slot);
+            slot->key = key;
+            slot->owner_start_ns = owner_start_ns;
+            return slot;
+        }
+        if (claim && present == 0) {
+            slot->key = key;
+            slot->owner_start_ns = owner_start_ns;
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static void fdvis_lock(void) {
+    int me = (int)getpid();
+    uint64_t mine = fdvis_identity(me, fdvis_process_token(me));
+    for (unsigned spin = 0;; ++spin) {
+        uint64_t expected = 0;
+        if (atomic_compare_exchange_weak_explicit(&g_fdvis_control->owner, &expected, mine, memory_order_acquire,
+                                                  memory_order_relaxed))
+            return;
+        if ((spin & 1023u) == 1023u) {
+            uint64_t owner = atomic_load_explicit(&g_fdvis_control->owner, memory_order_relaxed);
+            int owner_pid = (int)(uint32_t)(owner >> 32);
+            uint64_t live_start = fdvis_process_token(owner_pid);
+            if (owner != 0 && (live_start == 0 || fdvis_identity(owner_pid, live_start) != owner) &&
+                atomic_compare_exchange_strong_explicit(&g_fdvis_control->owner, &owner, mine, memory_order_acquire,
+                                                        memory_order_relaxed))
+                return;
+            sched_yield();
+        }
+    }
+}
+
+static void fdvis_unlock(void) {
+    atomic_store_explicit(&g_fdvis_control->owner, 0, memory_order_release);
+}
+
+static void fdvis_sweep_stale_locked(void) {
+    for (unsigned index = 0; index < FDVIS_N; ++index) {
+        struct fdvis_slot *slot = &g_fdvis[index];
+        int owner = (int)(uint32_t)(slot->key >> 32);
+        if (owner <= 0) continue;
+        uint64_t live_start = fdvis_process_token(owner);
+        if (live_start == 0 || live_start != slot->owner_start_ns) memset(slot, 0, sizeof *slot);
+    }
+}
+
+static int proc_fdvis_publish(int guest_fd, uint32_t kind, uint64_t device, uint64_t object) {
+    int pid = (int)getpid();
+    uint64_t owner_start = fdvis_process_token(pid);
+    if (!g_fdvis_control) return -ENOSPC;
+    fdvis_lock();
+    struct fdvis_slot *slot = fdvis_find(fdvis_key(pid, guest_fd), owner_start, 1);
+    if (!slot) {
+        fdvis_sweep_stale_locked();
+        slot = fdvis_find(fdvis_key(pid, guest_fd), owner_start, 1);
+    }
+    if (!slot) {
+        fdvis_unlock();
+        return -ENOSPC;
+    }
+    uint64_t generation = ++g_fdvis_control->generation;
+    slot->device = device;
+    slot->object = object;
+    slot->kind = kind;
+    slot->generation = generation;
+    fdvis_unlock();
+    return 0;
+}
+
+static int proc_fdvis_publish_pipe_pair(int first, int second) {
+    uint64_t sequence = atomic_fetch_add_explicit(&g_pipe_identity_next, 1, memory_order_relaxed);
+    uint64_t identity = fdvis_identity((int)getpid(), fdvis_process_token((int)getpid())) ^ sequence;
+    if (identity == 0) identity = sequence ? sequence : 1;
+    if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD) return -EINVAL;
+    if (proc_fdvis_publish(first, HL_HOST_FD_PIPE, 1, identity) != 0) return -ENOSPC;
+    if (proc_fdvis_publish(second, HL_HOST_FD_PIPE, 1, identity) != 0) {
+        proc_fdvis_close(first);
+        return -ENOSPC;
+    }
+    g_pipe_identity[first] = identity;
+    g_pipe_identity[second] = identity;
+    return 0;
+}
+
+static void proc_fdvis_close(int guest_fd) {
+    if (!g_fdvis_control) return;
+    fdvis_lock();
+    int pid = (int)getpid();
+    uint64_t owner_start = fdvis_process_token(pid);
+    struct fdvis_slot *slot = fdvis_find(fdvis_key(pid, guest_fd), owner_start, 0);
+    if (slot) memset(slot, 0, sizeof *slot);
+    fdvis_unlock();
+}
+
+static int proc_fdvis_lookup(int pid, int guest_fd, uint32_t *kind, uint64_t *device, uint64_t *object) {
+    if (!g_fdvis_control) return 0;
+    fdvis_lock();
+    struct fdvis_slot *slot = fdvis_find(fdvis_key(pid, guest_fd), fdvis_process_token(pid), 0);
+    if (slot) {
+        if (kind) *kind = slot->kind;
+        if (device) *device = slot->device;
+        if (object) *object = slot->object;
+    }
+    fdvis_unlock();
+    return slot != NULL;
+}
+
+struct fdvis_view {
+    int guest_fd;
+    uint32_t kind;
+    uint64_t device;
+    uint64_t object;
+};
+
+static size_t proc_fdvis_list(int pid, struct fdvis_view *views, size_t capacity) {
+    uint64_t owner_start = fdvis_process_token(pid);
+    size_t count = 0;
+    if (!g_fdvis || !g_fdvis_control || owner_start == 0) return 0;
+    fdvis_lock();
+    for (unsigned index = 0; index < FDVIS_N; ++index) {
+        struct fdvis_slot *slot = &g_fdvis[index];
+        if ((int)(uint32_t)(slot->key >> 32) != pid || slot->owner_start_ns != owner_start) continue;
+        if (count < capacity) {
+            views[count].guest_fd = (int)(uint32_t)slot->key - 1;
+            views[count].kind = slot->kind;
+            views[count].device = slot->device;
+            views[count].object = slot->object;
+        }
+        ++count;
+    }
+    fdvis_unlock();
+    return count;
+}
+
+static void proc_fdvis_fork_prepare(void) {
+    g_fdvis_fork_parent = (int)getpid();
+    g_fdvis_fork_parent_start = fdvis_process_token(g_fdvis_fork_parent);
+}
+
+static void proc_fdvis_after_fork(void) {
+    int parent = g_fdvis_fork_parent;
+    int child = (int)getpid();
+    uint64_t parent_start = g_fdvis_fork_parent_start;
+    uint64_t child_start = fdvis_process_token(child);
+    if (!g_fdvis || !g_fdvis_control || parent <= 0 || parent == child) return;
+    fdvis_lock();
+    for (unsigned index = 0; index < FDVIS_N; ++index) {
+        uint64_t key = g_fdvis[index].key;
+        if ((int)(uint32_t)(key >> 32) != parent || g_fdvis[index].owner_start_ns != parent_start) continue;
+        int guest_fd = (int)(uint32_t)key - 1;
+        struct fdvis_slot *copy = fdvis_find(fdvis_key(child, guest_fd), child_start, 1);
+        if (copy) {
+            *copy = g_fdvis[index];
+            copy->key = fdvis_key(child, guest_fd);
+            copy->owner_start_ns = child_start;
+            copy->generation = ++g_fdvis_control->generation;
+        }
+    }
+    g_fdvis_fork_parent = child;
+    g_fdvis_fork_parent_start = child_start;
+    fdvis_unlock();
+}
+
+static void proc_fdvis_cleanup(void) {
+    int owner = (int)getpid();
+    uint64_t owner_start = fdvis_process_token(owner);
+    if (!g_fdvis || !g_fdvis_control) return;
+    fdvis_lock();
+    for (unsigned index = 0; index < FDVIS_N; ++index)
+        if ((int)(uint32_t)(g_fdvis[index].key >> 32) == owner && g_fdvis[index].owner_start_ns == owner_start)
+            memset(&g_fdvis[index], 0, sizeof g_fdvis[index]);
+    fdvis_unlock();
+}
+
 static void ts_init(void) {
     if (g_ts_tab) return;
     size_t sz = sizeof(struct ts_slot) * TS_N;
@@ -759,12 +1002,12 @@ struct vol {
     size_t hlen;
     int fd;
     hl_host_handle handle; /* opaque twin of fd; rooted at the directory jail (or file parent) */
-    int ro;     // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
-    int isfile; // 1 = single-file bind (`-v host/f:/ctr/f`): `fd` is the host file's PARENT dir, `hcanon`
-                // is the file itself, and `guest` matches ONLY its exact path (a file has no children).
-    int dead;   // 1 = detached by a runtime umount2(2): skipped by jail_match/jail_is_vol so the mount
-                // point reverts to the underlying rootfs/overlay content (the slot is never compacted --
-                // append-only keeps concurrent path resolves race-free).
+    int ro;                // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
+    int isfile;            // 1 = single-file bind (`-v host/f:/ctr/f`): `fd` is the host file's PARENT dir, `hcanon`
+                           // is the file itself, and `guest` matches ONLY its exact path (a file has no children).
+    int dead;              // 1 = detached by a runtime umount2(2): skipped by jail_match/jail_is_vol so the mount
+                           // point reverts to the underlying rootfs/overlay content (the slot is never compacted --
+                           // append-only keeps concurrent path resolves race-free).
 };
 static struct vol g_vols[32];
 static int g_nvols;
@@ -773,12 +1016,12 @@ static void vol_handle_bind(struct vol *volume, const char *directory) {
     hl_host_result opened;
     if (volume == NULL) return;
     volume->handle = HL_HOST_HANDLE_INVALID;
-    if (g_host_services == NULL || g_host_services->file == NULL ||
-        g_host_services->file->open_relative == NULL || directory == NULL)
+    if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->open_relative == NULL ||
+        directory == NULL)
         return;
-    opened = g_host_services->file->open_relative(
-        g_host_services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
-        HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
+    opened =
+        g_host_services->file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+                                             HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
     if (opened.status == HL_STATUS_OK) volume->handle = opened.value;
 }
 
@@ -1872,47 +2115,13 @@ static void procfd_dirs_atexit(void) {
     procfd_dirs_reap(1);
 }
 
+static int proc_fd_dir_pid_open(int host);
+
 // Build the temp dir of fd symlinks and return its fd. The guest fd numbers ARE the host fd numbers here,
 // so this process's open fds are exactly the guest's; each link's target is the fd's path (or an
 // anon_inode placeholder for a pipe/socket/eventfd with no path). -1 on error.
 static int proc_fd_dir_open(void) {
-    static int registered = 0;
-    if (!registered) {
-        atexit(procfd_dirs_atexit);
-        registered = 1;
-    }
-    procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.hl-fd-dirXXXXXX";
-    if (!mkdtemp(tmpl)) return -1;
-    for (int fd = 0; fd < HL_NFD; fd++) {
-        if (eventfd_hidden_peer_fd(fd)) continue;
-        if (fcntl(fd, F_GETFD) == -1) continue; // not open
-        char tgt[4200];
-        if (hl_native_fd_path(fd, tgt, sizeof tgt) == 0 && tgt[0]) {
-            if (g_rootfs && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len)) {
-                const char *g = tgt + g_rootfs_canon_len;
-                if (!g[0]) g = "/";
-                memmove(tgt, g, strlen(g) + 1);
-            }
-        } else {
-            snprintf(tgt, sizeof tgt, "anon_inode:[%d]", fd);
-        }
-        char link[64];
-        snprintf(link, sizeof link, "%s/%d", tmpl, fd);
-        if (symlink(tgt, link) != 0) {}
-    }
-    int d = open(tmpl, O_RDONLY | O_DIRECTORY);
-    if (d < 0) {
-        procfd_dir_rm(tmpl);
-        return -1;
-    }
-    for (int i = 0; i < 64; i++)
-        if (!g_procfd_dirs[i].path[0]) {
-            g_procfd_dirs[i].fd = d;
-            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
-            break;
-        }
-    return d;
+    return proc_fd_dir_pid_open((int)getpid());
 }
 
 static void proc_dir_register(int fd, const char *tmpl, const char *guestpath); // defined below (dir synth)
@@ -2294,12 +2503,44 @@ static int hl_get_procinfo(int pid, struct hl_procinfo *pi) {
 }
 
 // Rebase a host vnode path into the container's guest namespace (strip the rootfs prefix), in place.
-static void proc_fd_rebase(char *tgt) {
-    if (g_rootfs && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len)) {
-        const char *g = tgt + g_rootfs_canon_len;
-        if (!g[0]) g = "/";
-        memmove(tgt, g, strlen(g) + 1);
+static void proc_fd_rebase(char *tgt, size_t capacity) {
+    int mapped = g_rootfs != NULL;
+    for (int index = 0; !mapped && index < g_nvols; ++index)
+        if (!g_vols[index].dead && !strncmp(tgt, g_vols[index].hcanon, g_vols[index].hlen) &&
+            (tgt[g_vols[index].hlen] == '/' || tgt[g_vols[index].hlen] == 0))
+            mapped = 1;
+    if (mapped) {
+        char guest[4200];
+        guest_from_host(tgt, guest, sizeof guest);
+        snprintf(tgt, capacity, "%s", guest);
     }
+}
+
+static int proc_fdvis_resolve_host(int host, int guest_fd) {
+    uint32_t kind;
+    uint64_t device, object;
+    size_t count = 0;
+    if (!proc_fdvis_lookup(host, guest_fd, &kind, &device, &object)) return guest_fd;
+    if (device == 0 || object == 0 || !hl_host_process_fds(host, NULL, 0, &count)) return -1;
+    hl_host_process_fd *entries = count ? malloc(count * sizeof *entries) : NULL;
+    if (count && !entries) return -1;
+    if (!hl_host_process_fds(host, entries, count, &count)) {
+        free(entries);
+        return -1;
+    }
+    int resolved = -1;
+    for (size_t index = 0; index < count; ++index) {
+        hl_host_process_fd detail;
+        size_t ignored;
+        if (hl_host_process_fd_read(host, entries[index].descriptor, &detail, NULL, 0, &ignored) &&
+            detail.stable_device == device && detail.stable_object == object &&
+            (kind == HL_HOST_FD_OTHER || detail.kind == kind)) {
+            resolved = entries[index].descriptor;
+            break;
+        }
+    }
+    free(entries);
+    return resolved;
 }
 
 // The /proc/<pid>/fd/<fd> readlink target for a PEER container process (host pid `host`), the SYMLINK-TARGET
@@ -2313,11 +2554,27 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
     hl_host_process_fd entry;
     char tgt[4200] = {0};
     size_t target_size = 0;
+    int inspected_fd;
     if (host <= 0 || fd < 0) return -1;
-    if (!hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size)) return -1;
+    uint32_t logical_kind = HL_HOST_FD_OTHER;
+    uint64_t logical_device = 0, logical_object = 0;
+    if (proc_fdvis_lookup(host, fd, &logical_kind, &logical_device, &logical_object) &&
+        logical_kind != HL_HOST_FD_FILE && logical_object != 0) {
+        const char *logical_name = logical_kind == HL_HOST_FD_SOCKET ? "socket"
+                                   : logical_kind == HL_HOST_FD_PIPE ? "pipe"
+                                                                     : "anon_inode";
+        char logical[64];
+        int length = snprintf(logical, sizeof logical, "%s:[%llu]", logical_name, (unsigned long long)logical_object);
+        if ((size_t)length > n) length = (int)n;
+        memcpy(out, logical, (size_t)length);
+        return length;
+    }
+    inspected_fd = proc_fdvis_resolve_host(host, fd);
+    if (inspected_fd < 0) return -1;
+    if (!hl_host_process_fd_read(host, inspected_fd, &entry, tgt, sizeof tgt - 1, &target_size)) return -1;
     if (entry.kind == HL_HOST_FD_FILE && target_size != 0) {
         tgt[target_size] = 0;
-        proc_fd_rebase(tgt);
+        proc_fd_rebase(tgt, sizeof tgt);
         size_t l = strlen(tgt);
         if (l > n) l = n;
         memcpy(out, tgt, l);
@@ -2336,7 +2593,11 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
 static int proc_fd_pid_open_one(int host, int fd) {
     hl_host_process_fd entry;
     size_t path_size;
-    return host > 0 && fd >= 0 && hl_host_process_fd_read(host, fd, &entry, NULL, 0, &path_size);
+    int inspected_fd;
+    if (host <= 0 || fd < 0) return 0;
+    inspected_fd = proc_fdvis_resolve_host(host, fd);
+    if (inspected_fd < 0) return 0;
+    return hl_host_process_fd_read(host, inspected_fd, &entry, NULL, 0, &path_size);
 }
 
 // Build a temp dir of "N -> target" symlinks for a PEER container process's open fds (host pid `host`), so
@@ -2347,7 +2608,7 @@ static int proc_fd_pid_open_one(int host, int fd) {
 // /proc/<pid>/fd/N as a working descriptor) needs the owner to hand the real fd across processes
 // (SCM_RIGHTS-level fd passing) -- deferred; open of a peer fd link still ENOENTs.
 static int proc_fd_dir_pid_open(int host) {
-    if (host == (int)getpid()) return proc_fd_dir_open(); // self: exact host fd table + pty/anon fixups
+    int self = host == (int)getpid();
     static int registered = 0;
     if (!registered) {
         atexit(procfd_dirs_atexit);
@@ -2364,8 +2625,19 @@ static int proc_fd_dir_pid_open(int host) {
         return -1;
     }
     if (nfd > fd_capacity) nfd = fd_capacity;
+    size_t nviews = proc_fdvis_list(host, NULL, 0);
+    struct fdvis_view *views = nviews ? malloc(nviews * sizeof *views) : NULL;
+    if (nviews && !views) {
+        free(fds);
+        return -1;
+    }
+    if (nviews) {
+        size_t copied = proc_fdvis_list(host, views, nviews);
+        if (copied < nviews) nviews = copied;
+    }
     char tmpl[] = "/tmp/.hl-proc-fd-dirXXXXXX";
     if (!mkdtemp(tmpl)) {
+        free(views);
         free(fds);
         return -1;
     }
@@ -2376,10 +2648,19 @@ static int proc_fd_dir_pid_open(int host) {
         hl_host_process_fd entry = {.descriptor = -1};
         int have = hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size) &&
                    entry.kind == HL_HOST_FD_FILE && target_size != 0;
+        int hidden = (fds[i].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0;
+        for (size_t view = 0; view < nviews && !hidden; ++view)
+            if (views[view].guest_fd == fd) hidden = 1;
+        if (!hidden && have && strstr(tgt, "/.hl-proc-fd-dir") != NULL)
+            for (size_t view = 0; view < nviews && !hidden; ++view)
+                if (entry.stable_device != 0 && entry.stable_object != 0 && views[view].device == entry.stable_device &&
+                    views[view].object == entry.stable_object)
+                    hidden = 1;
+        if (hidden) continue;
         if (entry.descriptor == fd) fds[i].kind = entry.kind;
         if (have) {
             tgt[target_size] = 0;
-            proc_fd_rebase(tgt);
+            proc_fd_rebase(tgt, sizeof tgt);
             have = tgt[0] != 0;
         }
         if (!have) {
@@ -2392,11 +2673,39 @@ static int proc_fd_dir_pid_open(int host) {
         snprintf(link, sizeof link, "%s/%d", tmpl, fd);
         if (symlink(tgt, link) != 0) {}
     }
+    for (size_t view = 0; view < nviews; ++view) {
+        char tgt[4200] = {0};
+        int length = proc_fd_link_pid(host, views[view].guest_fd, tgt, sizeof tgt - 1);
+        if (length <= 0) continue;
+        tgt[length] = 0;
+        char link[80];
+        snprintf(link, sizeof link, "%s/%d", tmpl, views[view].guest_fd);
+        if (symlink(tgt, link) != 0) {}
+    }
+    free(views);
     free(fds);
     int d = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (d < 0) {
         procfd_dir_rm(tmpl);
         return -1;
+    }
+    if (self) {
+        struct stat status;
+        char link[80];
+        char target[64];
+        snprintf(link, sizeof link, "%s/%d", tmpl, d);
+        snprintf(target, sizeof target, "/proc/self/fd/%d", d);
+        if (symlink(target, link) != 0 && errno != EEXIST) {}
+        if (fstat(d, &status) == 0) {
+            if (hl_host_process_fd_private_add(d) != 0 ||
+                proc_fdvis_publish(d, HL_HOST_FD_FILE, (uint64_t)status.st_dev, (uint64_t)status.st_ino) != 0) {
+                hl_host_process_fd_private_remove(d);
+                close(d);
+                procfd_dir_rm(tmpl);
+                return -1;
+            }
+            if (d >= 0 && d < HL_NFD) g_fdvis_private[d] = 1;
+        }
     }
     for (int i = 0; i < 64; i++)
         if (!g_procfd_dirs[i].path[0]) {
@@ -2424,9 +2733,8 @@ static long host_btime(void) {
     static long bt = 0;
     if (bt) return bt;
     hl_host_system_info info;
-    bt = hl_host_system_read(&info, NULL, 0) && info.boot_time_seconds <= LONG_MAX
-             ? (long)info.boot_time_seconds
-             : time(NULL);
+    bt = hl_host_system_read(&info, NULL, 0) && info.boot_time_seconds <= LONG_MAX ? (long)info.boot_time_seconds
+                                                                                   : time(NULL);
     return bt;
 }
 

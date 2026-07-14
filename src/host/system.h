@@ -31,6 +31,7 @@ typedef struct hl_host_process_info {
     uint64_t user_time_ns;
     uint64_t system_time_ns;
     uint64_t start_time_seconds;
+    uint64_t start_time_ns;
     uint32_t threads;
     char state;
     char name[32];
@@ -48,6 +49,9 @@ typedef struct hl_host_process_fd {
     int32_t descriptor;
     uint32_t kind;
     uint32_t flags;
+    uint32_t reserved;
+    uint64_t stable_device;
+    uint64_t stable_object;
 } hl_host_process_fd;
 
 typedef struct hl_host_process_peer {
@@ -62,8 +66,12 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info);
 
 /* Enumerate descriptor numbers. kind may remain OTHER until fd_read; count includes truncated entries. */
 int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count);
-void hl_host_process_fd_private_add(int descriptor);
+int hl_host_process_fd_private_add(int descriptor);
 void hl_host_process_fd_private_remove(int descriptor);
+int hl_host_process_fd_private_is(int64_t pid, uint64_t start_ns, int descriptor);
+int hl_host_process_fd_private_fork_prepare(void);
+int hl_host_process_fd_private_fork_complete(int child);
+void hl_host_process_fd_private_cleanup(void);
 
 /* Query one open descriptor and, for files, copy its native absolute path without a trailing NUL. */
 int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,

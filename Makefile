@@ -45,7 +45,7 @@ LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c \
 	src/host/macos/system.c
-COMMON_HOST_SOURCES := src/host/child.c src/host/range.c src/host/resolve.c src/host/sync.c
+COMMON_HOST_SOURCES := src/host/child.c src/host/private.c src/host/range.c src/host/resolve.c src/host/sync.c
 MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
 MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
 MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
@@ -84,7 +84,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan pipe pipe_linux placement process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -298,6 +298,10 @@ $(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
+$(BUILD)/tests/test_private: tests/unit/test_private.c $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-host-linux.a -o $@
+
 $(BUILD)/tests/native-capacity: tests/unit/test_native_capacity.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
@@ -391,7 +395,7 @@ $(BUILD)/tests/test_range: tests/unit/test_range.c src/host/range.c src/host/lin
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
-$(BUILD)/tests/test_system: tests/unit/test_system.c src/host/linux/system.c
+$(BUILD)/tests/test_system: tests/unit/test_system.c src/host/linux/system.c src/host/private.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -859,7 +863,8 @@ LINUX_PRODUCTION_MATRIX_CASES := \
 	$(BUILD)/e2e/eventfd_nonblock-x86_64 \
 	$(BUILD)/e2e/timerfd-x86_64 \
 	$(BUILD)/e2e/timerfd_interval-x86_64 \
-	$(BUILD)/e2e/epoll_oneshot-x86_64
+	$(BUILD)/e2e/epoll_oneshot-x86_64 \
+	$(BUILD)/compat/procfs/x86_64/peerfd
 
 $(BUILD)/tools/linux-matrix: tools/linux_matrix.c
 	@mkdir -p $(@D)
@@ -891,7 +896,8 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/e2e/eventfd_nonblock-x86_64 tests/compat/syscall/expected/eventfd_nonblock.out 0 \
 		$(BUILD)/e2e/timerfd-x86_64 tests/compat/core/syscall/expected/timerfd.out 0 \
 		$(BUILD)/e2e/timerfd_interval-x86_64 tests/compat/syscall/expected/timerfd_interval.out 0 \
-		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0
+		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0 \
+		$(BUILD)/compat/procfs/x86_64/peerfd tests/compat/procfs/expected/shared/peerfd.out 0
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
 	$(BUILD)/production/hl-remote-supervisor
@@ -1267,18 +1273,19 @@ $(BUILD)/tests/linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $(BUILD)/li
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/macos/system.c src/host/sync.c src/host/resolve.c src/core/host_services.c \
-	src/core/log.c src/host/clock.c src/host/file.c include/hl/macos.h include/hl/host_services.h
+	src/core/log.c src/host/clock.c src/host/file.c src/host/private.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
 	src/host/macos/host.c src/host/macos/system.c src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c \
-		src/host/file.c -o $@
+		src/host/file.c src/host/private.c -o $@
 
 .PHONY: run-unit-macos-destroy
 run-unit-macos-destroy: $(BUILD)/tests/macos-destroy
 	$(MAC) $<
 
 $(BUILD)/tests/macos-destroy: tests/unit/test_macos_destroy.c src/host/macos/host.c src/host/macos/system.c \
-	src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c src/host/file.c
+	src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c src/host/file.c \
+	src/host/private.c
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -1286,7 +1293,11 @@ $(BUILD)/tests/range-macos: tests/unit/test_range.c src/host/range.c src/host/ma
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
-$(BUILD)/tests/system-macos: tests/unit/test_system.c src/host/macos/system.c
+$(BUILD)/tests/system-macos: tests/unit/test_system.c src/host/macos/system.c src/host/private.c
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/private-macos: tests/unit/test_private.c src/host/private.c src/host/macos/system.c
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -1322,11 +1333,12 @@ $(BUILD)/tests/resolve-services-macos: tests/unit/test_resolve_services.c $(BUIL
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_HOST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< \
 		$(BUILD)/mac/lib/libhl-host-macos.a -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-services-macos)
+	$(MAC) $(abspath $(BUILD)/tests/private-macos)
 	$(MAC) $(abspath $(BUILD)/tests/process-macos)
 	$(MAC) $(abspath $(BUILD)/tests/range-macos)
 	$(MAC) $(abspath $(BUILD)/tests/system-macos)

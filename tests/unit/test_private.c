@@ -4,12 +4,22 @@
 #include "../../src/host/system.h"
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-enum { TEST_FD = 173, OTHER_FD = 174, STRESS_ROUNDS = 20000 };
+enum {
+    TEST_FD = 173,
+    OTHER_FD = 174,
+    MUTATION_FD = 175,
+    SPILL_FD_BASE = 10000,
+    SPILL_FD_COUNT = 600,
+    STRESS_ROUNDS = 20000
+};
 
 static uint64_t process_start(pid_t pid) {
     hl_host_process_info process;
@@ -62,7 +72,7 @@ static int test_fork_snapshot(void) {
     if (child < 0) return -1;
     if (child == 0) {
         close(report[0]);
-        hl_host_process_fd_private_fork_complete(1);
+        if (hl_host_process_fd_private_fork_complete(1) != 0) _exit(2);
         uint64_t child_start = process_start(getpid());
         int ok = child_start != 0 && hl_host_process_fd_private_is((int64_t)getpid(), child_start, TEST_FD) &&
                  hl_host_process_fd_private_is(parent_pid, parent_start, TEST_FD);
@@ -74,7 +84,7 @@ static int test_fork_snapshot(void) {
         (void)write_byte(report[1], ok ? '1' : '0');
         _exit(ok ? 0 : 1);
     }
-    hl_host_process_fd_private_fork_complete(0);
+    if (hl_host_process_fd_private_fork_complete(0) != 0) return -1;
     close(report[1]);
     char result = 0;
     int status = 0;
@@ -124,9 +134,156 @@ static int test_process_concurrency(void) {
     return ok ? 0 : -1;
 }
 
+typedef struct worker_fork_case {
+    int report;
+    int result;
+} worker_fork_case;
+
+static void *worker_fork_main(void *opaque) {
+    worker_fork_case *test = opaque;
+    int64_t parent = (int64_t)getpid();
+    uint64_t parent_start = process_start((pid_t)parent);
+    if (parent_start == 0 || hl_host_process_fd_private_fork_prepare() != 0) {
+        test->result = -1;
+        return NULL;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        hl_host_process_fd_private_fork_complete(0);
+        test->result = -1;
+        return NULL;
+    }
+    if (child == 0) {
+        if (hl_host_process_fd_private_fork_complete(1) != 0) _exit(2);
+        uint64_t child_start = process_start(getpid());
+        char result = child_start != 0 && hl_host_process_fd_private_is(getpid(), child_start, TEST_FD) &&
+                              hl_host_process_fd_private_is(parent, parent_start, TEST_FD)
+                          ? '1'
+                          : '0';
+        (void)write_byte(test->report, result);
+        _exit(result == '1' ? 0 : 1);
+    }
+    if (hl_host_process_fd_private_fork_complete(0) != 0) {
+        test->result = -1;
+        return NULL;
+    }
+    int status = 0;
+    test->result = waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    return NULL;
+}
+
+static int test_worker_thread_fork(void) {
+    int report[2];
+    pthread_t worker;
+    worker_fork_case test = {.report = -1, .result = -1};
+    int64_t pid = (int64_t)getpid();
+    uint64_t start = process_start((pid_t)pid);
+    if (start == 0 || pipe(report) != 0 || hl_host_process_fd_private_add(TEST_FD) != 0) return -1;
+    test.report = report[1];
+    if (pthread_create(&worker, NULL, worker_fork_main, &test) != 0) return -1;
+    char result = 0;
+    int joined = pthread_join(worker, NULL) == 0;
+    close(report[1]);
+    int ok = joined && read_byte(report[0], &result) == 0 && result == '1' && test.result == 0 &&
+             hl_host_process_fd_private_is(pid, start, TEST_FD);
+    close(report[0]);
+    hl_host_process_fd_private_remove(TEST_FD);
+    return ok ? 0 : -1;
+}
+
+typedef struct mutation_case {
+    _Atomic int begin;
+    _Atomic int attempted;
+    _Atomic int finished;
+    int result;
+} mutation_case;
+
+static void *mutation_main(void *opaque) {
+    mutation_case *test = opaque;
+    while (!atomic_load_explicit(&test->begin, memory_order_acquire)) sched_yield();
+    atomic_store_explicit(&test->attempted, 1, memory_order_release);
+    test->result = hl_host_process_fd_private_add(MUTATION_FD);
+    atomic_store_explicit(&test->finished, 1, memory_order_release);
+    return NULL;
+}
+
+static int test_mutation_serialized_across_fork(void) {
+    mutation_case test = {0};
+    pthread_t mutator;
+    int64_t parent = (int64_t)getpid();
+    uint64_t parent_start = process_start((pid_t)parent);
+    if (parent_start == 0 || hl_host_process_fd_private_add(TEST_FD) != 0 ||
+        pthread_create(&mutator, NULL, mutation_main, &test) != 0 ||
+        hl_host_process_fd_private_fork_prepare() != 0)
+        return -1;
+    atomic_store_explicit(&test.begin, 1, memory_order_release);
+    while (!atomic_load_explicit(&test.attempted, memory_order_acquire)) sched_yield();
+    for (int spin = 0; spin < 1000; ++spin) sched_yield();
+    if (atomic_load_explicit(&test.finished, memory_order_acquire)) {
+        hl_host_process_fd_private_fork_complete(0);
+        (void)pthread_join(mutator, NULL);
+        return -1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        hl_host_process_fd_private_fork_complete(0);
+        (void)pthread_join(mutator, NULL);
+        return -1;
+    }
+    if (child == 0) {
+        hl_host_process_fd_private_fork_complete(1);
+        uint64_t start = process_start(getpid());
+        int ok = start != 0 && hl_host_process_fd_private_is(getpid(), start, TEST_FD) &&
+                 !hl_host_process_fd_private_is(getpid(), start, MUTATION_FD);
+        _exit(ok ? 0 : 1);
+    }
+    hl_host_process_fd_private_fork_complete(0);
+    int status = 0;
+    int ok = waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             pthread_join(mutator, NULL) == 0 && test.result == 0 &&
+             hl_host_process_fd_private_is(parent, parent_start, MUTATION_FD);
+    hl_host_process_fd_private_remove(MUTATION_FD);
+    hl_host_process_fd_private_remove(TEST_FD);
+    return ok ? 0 : -1;
+}
+
+static int test_cell_spill_and_child_replay(void) {
+    int64_t parent = (int64_t)getpid();
+    uint64_t parent_start = process_start((pid_t)parent);
+    if (parent_start == 0) return -1;
+    int added = 0;
+    for (; added < SPILL_FD_COUNT; ++added)
+        if (hl_host_process_fd_private_add(SPILL_FD_BASE + added) != 0) break;
+    if (added != SPILL_FD_COUNT || hl_host_process_fd_private_fork_prepare() != 0) goto failed;
+    pid_t child = fork();
+    if (child < 0) {
+        (void)hl_host_process_fd_private_fork_complete(0);
+        goto failed;
+    }
+    if (child == 0) {
+        if (hl_host_process_fd_private_fork_complete(1) != 0) _exit(2);
+        uint64_t start = process_start(getpid());
+        int ok = start != 0;
+        for (int index = 0; ok && index < SPILL_FD_COUNT; ++index)
+            ok = hl_host_process_fd_private_is(getpid(), start, SPILL_FD_BASE + index);
+        _exit(ok ? 0 : 1);
+    }
+    if (hl_host_process_fd_private_fork_complete(0) != 0) goto failed;
+    int status = 0;
+    int ok = waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    return ok ? 0 : -1;
+failed:
+    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    return -1;
+}
+
 int main(void) {
     HL_CHECK(test_refcounts_and_reuse() == 0);
     HL_CHECK(test_fork_snapshot() == 0);
     HL_CHECK(test_process_concurrency() == 0);
+    HL_CHECK(test_worker_thread_fork() == 0);
+    HL_CHECK(test_mutation_serialized_across_fork() == 0);
+    HL_CHECK(test_cell_spill_and_child_replay() == 0);
     return 0;
 }

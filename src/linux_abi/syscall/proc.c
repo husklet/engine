@@ -134,7 +134,10 @@ static int exec_close_bound_cloexec(int fd) {
         hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &(hl_linux_fd_snapshot){0}) != HL_STATUS_OK)
         return 0;
     status = hl_linux_fd_exec(g_linux_box, (hl_linux_fd)fd, &closed);
-    if (status == HL_STATUS_OK && closed != 0) close(fd);
+    if (status == HL_STATUS_OK && closed != 0) {
+        proc_fdvis_close(fd);
+        close(fd);
+    }
     return 1;
 }
 
@@ -243,6 +246,7 @@ static void fork_child_hooks(struct cpu *c) {
     poslk_after_fork();          // re-cache pid; child inherits NONE of the parent's fcntl record locks
     flock_broker_after_fork();   // flock ownership is OFD-scoped and IS inherited across fork
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
+    proc_fdvis_after_fork();     // republish typed logical-fd visibility under the child's host pid
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
     mlk_reset();                 // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
@@ -252,16 +256,23 @@ typedef struct bound_fork_state {
     hl_linux_fork_plan plan;
     hl_linux_watch_fork_plan watch_plan;
     int watch_prepared;
+    int private_prepared;
 } bound_fork_state;
 
 static int bound_fork_prepare(bound_fork_state *state) {
     hl_status status;
     memset(state, 0, sizeof(*state));
-    if (g_linux_box == NULL) return 0;
+    if (g_linux_box == NULL) {
+        int private_status = hl_host_process_fd_private_fork_prepare();
+        if (private_status != 0) return private_status;
+        state->private_prepared = 1;
+        proc_fdvis_fork_prepare();
+        return 0;
+    }
     state->watch_plan.capacity = bound_mapping_watch_capacity();
     state->watch_plan.records =
         state->watch_plan.capacity == 0 ? NULL : calloc(state->watch_plan.capacity, sizeof(*state->watch_plan.records));
-    if (state->watch_plan.capacity != 0 && state->watch_plan.records == NULL) return -ENOMEM;
+    if (state->watch_plan.capacity != 0 && state->watch_plan.records == NULL) { return -ENOMEM; }
     if (bound_mapping_fork_prepare(&state->watch_plan) != 0) {
         free(state->watch_plan.records);
         state->watch_plan.records = NULL;
@@ -289,17 +300,33 @@ static int bound_fork_prepare(bound_fork_state *state) {
         state->watch_plan.records = NULL;
         return status == HL_STATUS_BUSY ? -EAGAIN : status == HL_STATUS_OUT_OF_MEMORY ? -ENOMEM : -EIO;
     }
+    {
+        int private_status = hl_host_process_fd_private_fork_prepare();
+        if (private_status != 0) {
+            (void)hl_linux_abi_fork_parent(g_linux_box, &state->plan);
+            (void)bound_mapping_fork_complete(&state->watch_plan, 0);
+            state->watch_prepared = 0;
+            free(state->plan.records);
+            state->plan.records = NULL;
+            free(state->watch_plan.records);
+            state->watch_plan.records = NULL;
+            return private_status;
+        }
+    }
+    state->private_prepared = 1;
+    proc_fdvis_fork_prepare();
     return 0;
 }
 
 static int bound_fork_complete(bound_fork_state *state, int child) {
     hl_status status;
-    if (g_linux_box == NULL) return 0;
+    int private_status = state->private_prepared ? hl_host_process_fd_private_fork_complete(child) : 0;
+    if (g_linux_box == NULL) return private_status;
     status = child ? hl_linux_abi_fork_child(g_linux_box, &state->plan)
                    : hl_linux_abi_fork_parent(g_linux_box, &state->plan);
-    if (state->watch_prepared && bound_mapping_fork_complete(&state->watch_plan, child) != 0 &&
-        status == HL_STATUS_OK)
+    if (state->watch_prepared && bound_mapping_fork_complete(&state->watch_plan, child) != 0 && status == HL_STATUS_OK)
         status = HL_STATUS_PLATFORM_FAILURE;
+    if (private_status != 0 && status == HL_STATUS_OK) status = HL_STATUS_OUT_OF_MEMORY;
     free(state->plan.records);
     state->plan.records = NULL;
     free(state->watch_plan.records);
@@ -571,8 +598,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         futex_robust_exit(c); // robust mutexes still held by the calling thread -> OWNER_DIED + wake waiters
         acct_proc_leave();    // release this process's cgroup accounting slot (_exit bypasses atexit)
         proc_reg_unlink();    // drop our /proc process-table entry (_exit bypasses the atexit handler)
-        poslk_on_exit();      // release this process's in-engine fcntl advisory locks
-        sysv_on_exit();       // apply SEM_UNDO + GC this container's SysV objects (_exit skips atexit)
+        proc_fdvis_cleanup(); // retire typed logical-fd identities (_exit bypasses the atexit handler)
+        hl_host_process_fd_private_cleanup(); // retire provider-private descriptors for this process identity
+        poslk_on_exit();                      // release this process's in-engine fcntl advisory locks
+        sysv_on_exit();                       // apply SEM_UNDO + GC this container's SysV objects (_exit skips atexit)
         _exit((int)a0);
     case 96:
         // set_tid_address(tidptr): store tidptr as this thread's clear_child_tid so thread exit zeroes it and

@@ -69,9 +69,8 @@ static bound_mapping **bound_mapping_head(void) {
     return (bound_mapping **)&g_linux_box->vma_state;
 }
 
-static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
-                                            const hl_host_file_metadata *metadata, int have_metadata,
-                                            uint64_t old_size, uint64_t new_size,
+static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file, const hl_host_file_metadata *metadata,
+                                            int have_metadata, uint64_t old_size, uint64_t new_size,
                                             hl_linux_bus_transition *transition);
 static void bound_mapping_file_data_changed(const hl_linux_fd_snapshot *file, uint64_t device, uint64_t inode);
 
@@ -137,8 +136,8 @@ static void *bound_watch_waiter(void *opaque) {
     (void)opaque;
     for (;;) {
         hl_host_event_record events[16];
-        hl_host_result ready = g_host_services->event->wait(g_host_services->context, g_bound_watches.pollset,
-                                                             events, 16, HL_HOST_DEADLINE_INFINITE);
+        hl_host_result ready = g_host_services->event->wait(g_host_services->context, g_bound_watches.pollset, events,
+                                                            16, HL_HOST_DEADLINE_INFINITE);
         int drain_changes = 0;
         pthread_mutex_lock(&g_bound_watches.lock);
         if (g_bound_watches.stopping) {
@@ -223,7 +222,7 @@ static void bound_watch_host_stop(int close_handles) {
 }
 
 static bound_watch_source *bound_watch_retain(const hl_linux_fd_snapshot *file, uint64_t device, uint64_t inode,
-                                               uint64_t size) {
+                                              uint64_t size) {
     if (g_host_services == NULL || g_host_services->watch == NULL || g_host_services->event == NULL ||
         g_host_services->file == NULL || g_host_services->file->clone_for_fork == NULL ||
         (g_host_services->capabilities & (HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT)) !=
@@ -259,7 +258,7 @@ static bound_watch_source *bound_watch_retain(const hl_linux_fd_snapshot *file, 
         pthread_mutex_unlock(&g_bound_watches.lock);
         return NULL;
     }
-    *source = (bound_watch_source){source->token, device, inode, size, cloned.value, HL_HOST_HANDLE_INVALID, 1,
+    *source = (bound_watch_source){source->token,          device, inode, size, cloned.value, HL_HOST_HANDLE_INVALID, 1,
                                    g_bound_watches.sources};
     g_bound_watches.sources = source;
     int attached = 1;
@@ -297,7 +296,8 @@ static void bound_watch_release(bound_watch_source *source) {
     pthread_mutex_lock(&g_bound_watches.lock);
     if (--source->references == 0) {
         bound_watch_source **link = &g_bound_watches.sources;
-        while (*link != NULL && *link != source) link = &(*link)->next;
+        while (*link != NULL && *link != source)
+            link = &(*link)->next;
         if (*link == source) *link = source->next;
         if (source->watch != HL_HOST_HANDLE_INVALID) {
             (void)g_host_services->event->control(g_host_services->context, g_bound_watches.pollset,
@@ -328,9 +328,7 @@ static int bound_mapping_fork_prepare(hl_linux_watch_fork_plan *plan) {
     pthread_mutex_lock(&g_bound_mapping_gate);
     bound_watch_host_stop(1);
     pthread_mutex_lock(&g_bound_mapping_lock);
-    if (hl_linux_watch_fork_snapshot(&g_bound_watches.changes, plan) == HL_STATUS_OK) {
-        return 0;
-    }
+    if (hl_linux_watch_fork_snapshot(&g_bound_watches.changes, plan) == HL_STATUS_OK) { return 0; }
     pthread_mutex_unlock(&g_bound_mapping_lock);
     pthread_mutex_unlock(&g_bound_mapping_gate);
     return -1;
@@ -408,8 +406,7 @@ static void bound_fill_statx(uint8_t *output, const hl_linux_file_status *status
     *(uint64_t *)(output + 32) = status->object;
     *(uint64_t *)(output + 40) = status->size;
     *(uint64_t *)(output + 48) = status->blocks_512;
-    const uint64_t timestamps[4] = {status->accessed_ns, status->created_ns, status->changed_ns,
-                                    status->modified_ns};
+    const uint64_t timestamps[4] = {status->accessed_ns, status->created_ns, status->changed_ns, status->modified_ns};
     for (size_t index = 0; index < 4; ++index) {
         size_t offset = 64 + index * 16;
         *(int64_t *)(output + offset) = (int64_t)(timestamps[index] / UINT64_C(1000000000));
@@ -423,8 +420,8 @@ static void bound_fill_statx(uint8_t *output, const hl_linux_file_status *status
 
 static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_file_status *status) {
     char path[HL_LINUX_PATH_MAX + 1];
-    hl_host_result named = g_host_services->file->path(
-        g_host_services->context, file->host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+    hl_host_result named = g_host_services->file->path(g_host_services->context, file->host_handle,
+                                                       (hl_host_bytes){path, HL_LINUX_PATH_MAX});
     if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
         int uid, gid;
         struct stat native;
@@ -485,8 +482,10 @@ static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
     bound_mapping **head = bound_mapping_head();
     bound_mapping_object *object = entry->object;
     if (head == NULL) return;
-    if (previous != NULL) previous->next = entry->next;
-    else *head = entry->next;
+    if (previous != NULL)
+        previous->next = entry->next;
+    else
+        *head = entry->next;
     free(entry);
     if (--object->references == 0) {
         bound_watch_release(object->source);
@@ -512,8 +511,14 @@ static void bound_mapping_retire(uint64_t address, uint64_t size) {
         } else if (address > base && end < mapped_end) {
             bound_mapping *tail = malloc(sizeof(*tail));
             if (tail != NULL) {
-                *tail = (bound_mapping){end, mapped_end - end, entry->object_offset + end - base,
-                                        entry->file_offset + end - base, 0, 0, entry->object, entry->next};
+                *tail = (bound_mapping){end,
+                                        mapped_end - end,
+                                        entry->object_offset + end - base,
+                                        entry->file_offset + end - base,
+                                        0,
+                                        0,
+                                        entry->object,
+                                        entry->next};
                 entry->object->references++;
                 entry->next = tail;
                 entry->size = address - base;
@@ -540,7 +545,8 @@ static void bound_mapping_reset(void) {
     pthread_mutex_lock(&g_bound_mapping_gate);
     bound_watch_host_stop(1);
     pthread_mutex_lock(&g_bound_mapping_lock);
-    while (*head != NULL) bound_mapping_drop(*head, NULL);
+    while (*head != NULL)
+        bound_mapping_drop(*head, NULL);
     pthread_mutex_lock(&g_bound_watches.lock);
     if (g_bound_watches.initialized) {
         hl_linux_watch_close(&g_bound_watches.changes);
@@ -579,17 +585,15 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     }
     if (g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
         hl_host_file_metadata metadata;
-        hl_host_result status =
-            g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
+        hl_host_result status = g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
         if (status.status == HL_STATUS_OK) {
             stable_device = metadata.stable_device;
             stable_object = metadata.stable_object;
             known_size = metadata.size;
             identity_valid = 1;
             uint64_t available = metadata.size > offset ? metadata.size - offset : 0;
-            bus_accessible = available > UINT64_MAX - UINT64_C(4095)
-                                 ? UINT64_MAX
-                                 : (available + UINT64_C(4095)) & ~UINT64_C(4095);
+            bus_accessible =
+                available > UINT64_MAX - UINT64_C(4095) ? UINT64_MAX : (available + UINT64_C(4095)) & ~UINT64_C(4095);
             if (bus_accessible < size) {
                 gbus_prepare();
                 bus_prepared = 1;
@@ -608,9 +612,17 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
     bound_watch_source *source =
         identity_valid ? bound_watch_retain(file, stable_device, stable_object, known_size) : NULL;
-    *object = (bound_mapping_object){mapped.handle, file->host_handle, mapped.address, mapped.mapped_size,
-                                     stable_device, stable_object, known_size,
-                                     source, (uint32_t)identity_valid, (uint32_t)((linux_flags & 1u) != 0), 1};
+    *object = (bound_mapping_object){mapped.handle,
+                                     file->host_handle,
+                                     mapped.address,
+                                     mapped.mapped_size,
+                                     stable_device,
+                                     stable_object,
+                                     known_size,
+                                     source,
+                                     (uint32_t)identity_valid,
+                                     (uint32_t)((linux_flags & 1u) != 0),
+                                     1};
     *entry = (bound_mapping){mapped.address, mapped.mapped_size, mapped.reserved, offset, 0, 0, object, *head};
     *head = entry;
     if (mapped.address == 0 || mapped.mapped_size < size || mapped.address > UINT64_MAX - size) {
@@ -658,9 +670,8 @@ static int bound_mapping_same_file(const bound_mapping_object *object, const hl_
    identity.  Shrink is called while gbus_prepare owns the activation
    transition, so no old translated block can touch the host mapping before the
    newly invalid pages are published. */
-static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
-                                            const hl_host_file_metadata *metadata, int have_metadata,
-                                            uint64_t old_size, uint64_t new_size,
+static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file, const hl_host_file_metadata *metadata,
+                                            int have_metadata, uint64_t old_size, uint64_t new_size,
                                             hl_linux_bus_transition *transition) {
     bound_mapping **head = bound_mapping_head();
     if (head == NULL) return;
@@ -670,13 +681,11 @@ static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
         entry->object->known_size = new_size;
         old_accessible = bound_file_accessible(entry, old_size);
         new_accessible = bound_file_accessible(entry, new_size);
-        if (new_size < old_size && new_size > entry->file_offset &&
-            new_size < entry->file_offset + entry->size) {
+        if (new_size < old_size && new_size > entry->file_offset && new_size < entry->file_offset + entry->size) {
             uint64_t tail = new_size - entry->file_offset;
             uint64_t partial_end = (tail + UINT64_C(4095)) & ~UINT64_C(4095);
             if (partial_end > entry->size) partial_end = entry->size;
-            if (partial_end > tail)
-                memset((void *)(uintptr_t)(entry->address + tail), 0, (size_t)(partial_end - tail));
+            if (partial_end > tail) memset((void *)(uintptr_t)(entry->address + tail), 0, (size_t)(partial_end - tail));
         }
         if (new_accessible < old_accessible) {
             if (transition != NULL)
@@ -684,8 +693,7 @@ static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
                                                   entry->address + entry->size);
             else
                 (void)gbus_add(entry->address + new_accessible, entry->address + entry->size);
-        }
-        else if (new_accessible > old_accessible) {
+        } else if (new_accessible > old_accessible) {
             if (!entry->object->shared) {
                 entry->follow_lo = old_accessible;
                 entry->follow_hi = new_accessible;
@@ -707,8 +715,7 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
         g_host_services->file == NULL || g_host_services->file->read_at == NULL)
         return;
     if (g_host_services->file->metadata != NULL) {
-        hl_host_result status =
-            g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
+        hl_host_result status = g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
         have_metadata = status.status == HL_STATUS_OK;
     }
     uint64_t end = offset + size;
@@ -723,8 +730,7 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
         uint64_t lo = offset > map_lo ? offset : map_lo;
         uint64_t hi = end < map_hi ? end : map_hi;
         if (hi > lo) {
-            hl_host_bytes output = {(void *)(uintptr_t)(entry->address + lo - entry->file_offset),
-                                    (size_t)(hi - lo)};
+            hl_host_bytes output = {(void *)(uintptr_t)(entry->address + lo - entry->file_offset), (size_t)(hi - lo)};
             (void)g_host_services->file->read_at(g_host_services->context, file->host_handle, lo, output);
         }
     }
@@ -801,6 +807,24 @@ static int bound_shadow_matches(int fd) {
            (sentinel_status.st_mode & S_IFMT) == (shadow_status.st_mode & S_IFMT);
 }
 
+static int bound_shadow_install(int fd) {
+    int shadow;
+    if (g_bound_sentinel < 0 || fd < 0 || fd >= guest_nofile_cur()) {
+        errno = EBADF;
+        return -1;
+    }
+    engine_fd_vacate(fd);
+    shadow = dup2(g_bound_sentinel, fd);
+    if (shadow < 0) return -1;
+    if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) {
+        int error = errno;
+        close(shadow);
+        errno = error;
+        return -1;
+    }
+    return shadow;
+}
+
 static int bound_private_dup(int source, int minimum) {
     hl_linux_fd_snapshot snapshot;
     int candidate = minimum;
@@ -846,7 +870,7 @@ static int bound_shadow_activate(void) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
         if (fd < 3) continue;
-        shadow = bound_shadow_reserve((int)fd);
+        shadow = bound_shadow_install((int)fd);
         if (shadow != (int)fd) {
             int error = shadow < 0 ? errno : EBUSY;
             if (shadow >= 0) close(shadow);
@@ -913,6 +937,8 @@ static void bound_handle_cancel(bound_handle_slot *slot) {
     slot->active = 0;
 }
 
+static void bound_fdvis_publish(int guest_fd);
+
 static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags) {
     if (slot == NULL || !slot->active) return -EMFILE;
     int64_t result = hl_linux_file_adopt_reserved(g_linux_box, &slot->reservation, file, flags);
@@ -921,6 +947,7 @@ static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, 
     } else {
         slot->active = 0;
     }
+    if (result >= 0) bound_fdvis_publish((int)result);
     return result;
 }
 
@@ -930,8 +957,7 @@ static int bound_handle_dirfd_error(int fd) {
     if (fd < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return -EBADF;
     if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
         return -ENOTDIR;
-    hl_host_result result =
-        g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata);
+    hl_host_result result = g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata);
     if (result.status != HL_STATUS_OK) return bound_host_error(result.status);
     return metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ? -EACCES : -ENOTDIR;
 }
@@ -956,7 +982,9 @@ static int64_t bound_relocate_lowest(int64_t opened) {
         return opened;
     }
     (void)hl_linux_close(g_linux_box, (hl_linux_fd)opened);
+    proc_fdvis_close((int)opened);
     (void)close((int)opened);
+    bound_fdvis_publish((int)duplicated);
     return duplicated;
 }
 
@@ -1374,6 +1402,25 @@ static void bound_attachment_release(int native_fd) {
         close(native_fd);
 }
 
+static void bound_fdvis_publish(int guest_fd) {
+    hl_linux_fd_snapshot snapshot;
+    hl_host_file_metadata metadata = {0};
+    uint32_t kind = HL_HOST_FD_OTHER;
+    if (guest_fd < 0 || !bound_snapshot((uint64_t)(uint32_t)guest_fd, &snapshot)) return;
+    if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL ||
+        g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata).status !=
+            HL_STATUS_OK)
+        return;
+    if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
+        metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+        kind = HL_HOST_FD_FILE;
+    else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
+        kind = HL_HOST_FD_PIPE;
+    else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
+        kind = HL_HOST_FD_SOCKET;
+    (void)proc_fdvis_publish(guest_fd, kind, metadata.stable_device, metadata.stable_object);
+}
+
 static int64_t bound_stream_read(const hl_linux_fd_snapshot *file, int native_fd, void *buffer, size_t size,
                                  off_t *offset) {
     if (file != NULL)
@@ -1392,9 +1439,8 @@ static int64_t bound_stream_write(const hl_linux_fd_snapshot *file, int native_f
     return count < 0 ? -errno : count;
 }
 
-static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
-                              const hl_linux_fd_snapshot *input, int input_fd, uint64_t offset_address,
-                              uint64_t count) {
+static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd, const hl_linux_fd_snapshot *input,
+                              int input_fd, uint64_t offset_address, uint64_t count) {
     off_t supplied_offset = 0;
     off_t *input_offset = NULL;
     uint64_t done = 0;
@@ -1404,8 +1450,7 @@ static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
         struct stat metadata;
         if (fstat(input_fd, &metadata) != 0) return -errno;
         if (!S_ISREG(metadata.st_mode)) return -EINVAL;
-    } else if (g_host_services != NULL && g_host_services->file != NULL &&
-               g_host_services->file->metadata != NULL) {
+    } else if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
         hl_host_file_metadata metadata;
         hl_host_result status =
             g_host_services->file->metadata(g_host_services->context, input->host_handle, &metadata);
@@ -1436,8 +1481,7 @@ static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
             break;
         }
         if (input_offset != NULL) *input_offset += (off_t)written;
-        if (output != NULL)
-            bound_mapping_file_written(output, output->offset + done, (uint64_t)written);
+        if (output != NULL) bound_mapping_file_written(output, output->offset + done, (uint64_t)written);
         done += (uint64_t)written;
         if (written != read_count) {
             if (input_offset == NULL)
@@ -1446,8 +1490,7 @@ static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
             break;
         }
     }
-    if (offset_address != 0)
-        *(off_t *)(uintptr_t)offset_address = supplied_offset;
+    if (offset_address != 0) *(off_t *)(uintptr_t)offset_address = supplied_offset;
     return done != 0 ? (int64_t)done : error;
 }
 
@@ -1476,8 +1519,7 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     if (size > sizeof(buffer)) size = sizeof(buffer);
     if (size == 0) return 0;
     if (input_pipe) pushed = pipe_pushback_take(input_fd, buffer, (size_t)size);
-    read_count = pushed != 0 ? (int64_t)pushed
-                             : bound_stream_read(input, input_fd, buffer, (size_t)size, input_offset);
+    read_count = pushed != 0 ? (int64_t)pushed : bound_stream_read(input, input_fd, buffer, (size_t)size, input_offset);
     if (read_count <= 0) return read_count;
     write_count = bound_stream_write(output, output_fd, buffer, (size_t)read_count, output_offset);
     if (write_count < 0) {
@@ -1495,8 +1537,7 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     if (write_count == 0) return write_error;
     if (input_offset != NULL) *input_offset += (off_t)write_count;
     if (output != NULL)
-        bound_mapping_file_written(output,
-                                   output_offset != NULL ? (uint64_t)*output_offset : output->offset,
+        bound_mapping_file_written(output, output_offset != NULL ? (uint64_t)*output_offset : output->offset,
                                    (uint64_t)write_count);
     if (output_offset != NULL) *output_offset += (off_t)write_count;
     return write_count;
@@ -1506,8 +1547,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = bound_snapshot(a0, &source);
-    if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0 &&
-        host_range_mapped((uintptr_t)a1, 1) && host_range_mapped((uintptr_t)a2, (size_t)a3)) {
+    if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0 && host_range_mapped((uintptr_t)a1, 1) &&
+        host_range_mapped((uintptr_t)a2, (size_t)a3)) {
         int guest_fd = procfd_num((const char *)(uintptr_t)a1);
         hl_linux_fd_snapshot target;
         if (guest_fd >= 0 && bound_snapshot((uint64_t)(uint32_t)guest_fd, &target)) {
@@ -1520,10 +1561,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             char host_path[4200];
             int path_status = hl_native_fd_path(native_fd, host_path, sizeof(host_path));
             if (borrowed > 0) bound_attachment_release(native_fd);
-            if (path_status != 0) {
-                G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
-                return 1;
-            }
+            /* Pipes, sockets, and anonymous descriptors have no native path. Leave those to the common
+             * proc-fd route, which reports Linux's pipe:[ino], socket:[ino], and anon_inode:[...] targets. */
+            if (path_status != 0) return 0;
             char guest_path[4200];
             guest_from_host(host_path, guest_path, sizeof(guest_path));
             size_t length = strlen(guest_path);
@@ -1593,8 +1633,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_fd_snapshot second;
         int second_bound = bound_snapshot(a1, &second);
         if (source_bound || second_bound) {
-            G_RET(c) = (uint64_t)bound_sendfile(source_bound ? &source : NULL, (int)a0,
-                                                second_bound ? &second : NULL, (int)a1, a2, a3);
+            G_RET(c) = (uint64_t)bound_sendfile(source_bound ? &source : NULL, (int)a0, second_bound ? &second : NULL,
+                                                (int)a1, a2, a3);
             return 1;
         }
     }
@@ -1602,8 +1642,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_fd_snapshot second;
         int second_bound = bound_snapshot(a2, &second);
         if (source_bound || second_bound) {
-            G_RET(c) = (uint64_t)bound_splice(source_bound ? &source : NULL, (int)a0, a1,
-                                              second_bound ? &second : NULL, (int)a2, a3, G_A4(c), G_A5(c));
+            G_RET(c) = (uint64_t)bound_splice(source_bound ? &source : NULL, (int)a0, a1, second_bound ? &second : NULL,
+                                              (int)a2, a3, G_A4(c), G_A5(c));
             return 1;
         }
     }
@@ -1627,8 +1667,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = bound_path_copy(a0, target, &target_size);
             if (result == 0) result = bound_path_copy(a2, path, &path_size);
             if (result == 0 && path[0] == '/') return 0;
-            if (result == 0 && (!bound_file_abi14() || g_host_services->file->make_symlink == NULL))
-                result = -ENOSYS;
+            if (result == 0 && (!bound_file_abi14() || g_host_services->file->make_symlink == NULL)) result = -ENOSYS;
             if (result == 0)
                 result = bound_host_error(g_host_services->file
                                               ->make_symlink(g_host_services->context, target, target_size,
@@ -1670,11 +1709,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 else if (g_host_services->file->rename_relative == NULL)
                     result = -ENOSYS;
                 else if (result == 0)
-                    result = bound_host_error(g_host_services->file
-                                                  ->rename_relative(g_host_services->context, source.host_handle,
-                                                                    old_path, old_size, destination.host_handle,
-                                                                    new_path, new_size)
-                                                  .status);
+                    result =
+                        bound_host_error(g_host_services->file
+                                             ->rename_relative(g_host_services->context, source.host_handle, old_path,
+                                                               old_size, destination.host_handle, new_path, new_size)
+                                             .status);
             }
             G_RET(c) = (uint64_t)result;
             return 1;
@@ -1714,15 +1753,14 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (result != 0) break;
         if (path[0] == '/') return 0;
         if (g_host_services->file->abi != HL_HOST_FILE_ABI ||
-            g_host_services->file->size < sizeof(*g_host_services->file) ||
-            g_host_services->file->make_fifo == NULL) {
+            g_host_services->file->size < sizeof(*g_host_services->file) || g_host_services->file->make_fifo == NULL) {
             result = -ENOSYS;
             break;
         }
-        result = bound_host_error(g_host_services->file
-                                      ->make_fifo(g_host_services->context, source.host_handle, path, path_size,
-                                                  (uint32_t)a2 & 07777u)
-                                      .status);
+        result = bound_host_error(
+            g_host_services->file
+                ->make_fifo(g_host_services->context, source.host_handle, path, path_size, (uint32_t)a2 & 07777u)
+                .status);
         break;
     }
     case 34: {
@@ -1735,10 +1773,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOSYS;
             break;
         }
-        result = bound_host_error(g_host_services->file
-                                      ->make_directory(g_host_services->context, source.host_handle, path, path_size,
-                                                       (uint32_t)a2 & 07777u)
-                                      .status);
+        result = bound_host_error(
+            g_host_services->file
+                ->make_directory(g_host_services->context, source.host_handle, path, path_size, (uint32_t)a2 & 07777u)
+                .status);
         break;
     }
     case 35: {
@@ -1755,9 +1793,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOSYS;
             break;
         }
-        result = bound_host_error(g_host_services->file
-                                      ->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
-                                      .status);
+        result = bound_host_error(
+            g_host_services->file->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
+                .status);
         break;
     }
     case 53:
@@ -1778,15 +1816,15 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
         uint32_t access = HL_HOST_FILE_PATH_ONLY;
         if ((flags & UINT64_C(0x100)) != 0) access |= HL_HOST_FILE_NOFOLLOW;
-        hl_host_result opened = g_host_services->file->open_relative(
-            g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+        hl_host_result opened = g_host_services->file->open_relative(g_host_services->context, source.host_handle, path,
+                                                                     path_size, access, 0, 0);
         if (opened.status != HL_STATUS_OK) {
             result = bound_host_error(opened.status);
             break;
         }
-        result = bound_host_error(g_host_services->file
-                                      ->set_permissions(g_host_services->context, opened.value, (uint32_t)a2 & 07777u)
-                                      .status);
+        result = bound_host_error(
+            g_host_services->file->set_permissions(g_host_services->context, opened.value, (uint32_t)a2 & 07777u)
+                .status);
         (void)g_host_services->file->close(g_host_services->context, opened.value);
         break;
     }
@@ -1806,8 +1844,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if ((a2 & 4u) != 0) access |= HL_HOST_FILE_READ;
         if ((a2 & 2u) != 0) access |= HL_HOST_FILE_WRITE;
         if ((a2 & 1u) != 0) access |= HL_HOST_FILE_PATH_ONLY;
-        hl_host_result opened = g_host_services->file->open_relative(
-            g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+        hl_host_result opened = g_host_services->file->open_relative(g_host_services->context, source.host_handle, path,
+                                                                     path_size, access, 0, 0);
         result = bound_host_error(opened.status);
         if (opened.status == HL_STATUS_OK) {
             if ((a2 & 1u) != 0) {
@@ -1843,8 +1881,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (!empty) {
             uint32_t access = HL_HOST_FILE_PATH_ONLY;
             if ((a3 & UINT64_C(0x100)) != 0) access |= HL_HOST_FILE_NOFOLLOW;
-            hl_host_result opened = g_host_services->file->open_relative(
-                g_host_services->context, source.host_handle, path, path_size, access, 0, 0);
+            hl_host_result opened = g_host_services->file->open_relative(g_host_services->context, source.host_handle,
+                                                                         path, path_size, access, 0, 0);
             if (opened.status != HL_STATUS_OK) {
                 result = bound_host_error(opened.status);
                 break;
@@ -1877,15 +1915,15 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = bound_path_copy(a1, path, &path_size);
         if (result != 0) break;
         if (path[0] == '/') return 0;
-        hl_host_result opened = g_host_services->file->open_relative(
-            g_host_services->context, source.host_handle, path, path_size,
-            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        hl_host_result opened =
+            g_host_services->file->open_relative(g_host_services->context, source.host_handle, path, path_size,
+                                                 HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_NOFOLLOW, 0, 0);
         if (opened.status != HL_STATUS_OK) {
             result = bound_host_error(opened.status);
             break;
         }
-        hl_host_result read = g_host_services->file->readlink(
-            g_host_services->context, opened.value, (hl_host_bytes){(void *)(uintptr_t)a2, (size_t)a3});
+        hl_host_result read = g_host_services->file->readlink(g_host_services->context, opened.value,
+                                                              (hl_host_bytes){(void *)(uintptr_t)a2, (size_t)a3});
         result = read.status == HL_STATUS_OK ? (int64_t)read.value : bound_host_error(read.status);
         (void)g_host_services->file->close(g_host_services->context, opened.value);
         break;
@@ -1932,13 +1970,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (result < 0) {
             (void)hl_linux_fd_cancel(g_linux_box, &reservation);
             close(shadow);
-        }
+        } else
+            bound_fdvis_publish((int)result);
         break;
     }
     case 57: /* close */
         flock_broker_detach(&source);
-        if (g_host_services != NULL && g_host_services->file != NULL &&
-            g_host_services->file->metadata != NULL) {
+        if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
             hl_host_file_metadata metadata;
             hl_host_result status =
                 g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
@@ -1948,6 +1986,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 poslk_on_close_identity(metadata.stable_device, metadata.stable_object);
         }
         result = hl_linux_close(g_linux_box, source.fd);
+        proc_fdvis_close((int)source.fd);
         (void)close((int)source.fd);
         break;
     case 62: result = hl_linux_lseek(g_linux_box, source.fd, (int64_t)a1, (int32_t)a2); break;
@@ -1997,14 +2036,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_host_file_metadata metadata;
         if ((int64_t)a1 < 0)
             result = -EINVAL;
-        else if (g_host_services == NULL || g_host_services->file == NULL ||
-                 g_host_services->file->metadata == NULL)
+        else if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
             result = -95; /* Linux EOPNOTSUPP; this route bypasses the native-to-Linux errno mapper. */
         else {
             hl_host_result status =
                 g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
-            result = status.status != HL_STATUS_OK ? bound_host_error(status.status)
-                     : metadata.type != HL_HOST_FILE_TYPE_REGULAR ? -EINVAL
+            result = status.status != HL_STATUS_OK                               ? bound_host_error(status.status)
+                     : metadata.type != HL_HOST_FILE_TYPE_REGULAR                ? -EINVAL
                      : hl_linux_pread64(g_linux_box, source.fd, NULL, 0, a1) < 0 ? -EBADF
                                                                                  : 0;
         }
@@ -2040,8 +2078,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 46: {
         hl_host_file_metadata metadata = {0};
         int have_metadata = 0, prepared = 0;
-        if (g_host_services != NULL && g_host_services->file != NULL &&
-            g_host_services->file->metadata != NULL) {
+        if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
             hl_host_result status =
                 g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
             have_metadata = status.status == HL_STATUS_OK;
@@ -2062,9 +2099,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             pthread_mutex_unlock(&g_bound_mapping_lock);
             pthread_mutex_unlock(&g_bound_mapping_gate);
         }
-        if (prepared) {
-            gbus_prepare_release();
-        }
+        if (prepared) { gbus_prepare_release(); }
         break;
     }
     case 82: result = hl_linux_fsync(g_linux_box, source.fd); break;
@@ -2184,8 +2219,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = bound_host_error(status.status);
         if (result == 0) {
             char path[HL_LINUX_PATH_MAX + 1];
-            hl_host_result named = g_host_services->file->path(
-                g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+            hl_host_result named = g_host_services->file->path(g_host_services->context, source.host_handle,
+                                                               (hl_host_bytes){path, HL_LINUX_PATH_MAX});
             if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
                 path[named.value] = 0;
                 fc_evict_path(path);
@@ -2195,8 +2230,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     case 55: {
         char path[HL_LINUX_PATH_MAX + 1];
-        hl_host_result status = g_host_services->file->path(
-            g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+        hl_host_result status = g_host_services->file->path(g_host_services->context, source.host_handle,
+                                                            (hl_host_bytes){path, HL_LINUX_PATH_MAX});
         if (status.status != HL_STATUS_OK || status.value > HL_LINUX_PATH_MAX) {
             result = bound_host_error(status.status);
             break;
@@ -2220,9 +2255,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
         if (a1 != 0) {
             result = bound_path_copy(a1, relative, &relative_size);
-            if (result != 0) {
-                break;
-            }
+            if (result != 0) { break; }
             /* Absolute paths ignore dirfd and remain on the common namespace route. Relative paths
              * resolve beneath the opaque directory and update the independently opened target. */
             if (relative[0] == '/') return 0;
@@ -2232,8 +2265,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             }
             uint32_t access = HL_HOST_FILE_PATH_ONLY;
             if (a3 & UINT64_C(0x100)) access |= HL_HOST_FILE_NOFOLLOW;
-            hl_host_result opened = g_host_services->file->open_relative(
-                g_host_services->context, source.host_handle, relative, relative_size, access, 0, 0);
+            hl_host_result opened = g_host_services->file->open_relative(g_host_services->context, source.host_handle,
+                                                                         relative, relative_size, access, 0, 0);
             if (opened.status != HL_STATUS_OK) {
                 result = bound_host_error(opened.status);
                 break;
@@ -2286,8 +2319,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 29: {
         uint32_t request = (uint32_t)a1;
         if (request == 0x5451u || request == 0x5450u) { /* FIOCLEX / FIONCLEX */
-            result = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFD,
-                                    request == 0x5451u ? HL_LINUX_FD_CLOEXEC : 0);
+            result =
+                hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFD, request == 0x5451u ? HL_LINUX_FD_CLOEXEC : 0);
         } else if (request == 0x5421u) { /* FIONBIO */
             if (!host_range_mapped((uintptr_t)a2, sizeof(int))) {
                 result = -EFAULT;
@@ -2332,8 +2365,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
-        if (a1 == 0 || byte_capacity > SIZE_MAX ||
-            !host_range_mapped((uintptr_t)a1, (size_t)byte_capacity)) {
+        if (a1 == 0 || byte_capacity > SIZE_MAX || !host_range_mapped((uintptr_t)a1, (size_t)byte_capacity)) {
             result = -EFAULT;
             break;
         }
@@ -2343,8 +2375,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOMEM;
             break;
         }
-        hl_host_result read = g_host_services->file->read_directory(
-            g_host_services->context, source.host_handle, entries, capacity, (uint32_t)byte_capacity);
+        hl_host_result read = g_host_services->file->read_directory(g_host_services->context, source.host_handle,
+                                                                    entries, capacity, (uint32_t)byte_capacity);
         if (read.status != HL_STATUS_OK) {
             result = bound_host_error(read.status);
             free(entries);
@@ -2406,6 +2438,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = hl_linux_dup3(g_linux_box, source.fd, (hl_linux_fd)target,
                                    flags & HL_LINUX_O_CLOEXEC ? HL_LINUX_O_CLOEXEC : 0);
             if (result < 0 && !target_bound) close(shadow);
+            if (result >= 0) bound_fdvis_publish(target);
         }
         break;
     }
@@ -2416,6 +2449,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             else
                 result = bound_dup_at_least(source.fd, (int)a2,
                                             (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
+            if (result >= 0) bound_fdvis_publish((int)result);
         } else if (a1 == 5 || a1 == 6 || a1 == 7) {
             uint8_t *lock = (uint8_t *)(uintptr_t)a2;
             hl_host_file_metadata metadata;
@@ -2431,8 +2465,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 result = -EINVAL;
                 break;
             }
-            if (g_host_services == NULL || g_host_services->file == NULL ||
-                g_host_services->file->metadata == NULL) {
+            if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL) {
                 result = -ENOSYS;
                 break;
             }
@@ -2453,11 +2486,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 }
             }
             for (;;) {
-                (void)poslk_op_identity(metadata.stable_device, metadata.stable_object, current, metadata.size,
-                                        (int)a1, lock, &lock_result);
+                (void)poslk_op_identity(metadata.stable_device, metadata.stable_object, current, metadata.size, (int)a1,
+                                        lock, &lock_result);
                 if (a1 != 7 || lock_result != -EAGAIN) break;
-                uint64_t pending = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) |
-                                   __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+                uint64_t pending =
+                    __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
                 int interrupted = 0;
                 for (int signal_number = 1; signal_number < 64; ++signal_number)
                     if ((pending & (UINT64_C(1) << signal_number)) &&
@@ -2486,7 +2519,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         size_t done = 0;
         char buffer[8192];
         result = 0;
-        if (!bound_snapshot(a2, &output)) { result = -ENOSYS; break; }
+        if (!bound_snapshot(a2, &output)) {
+            result = -ENOSYS;
+            break;
+        }
         if ((input_offset && !host_range_mapped((uintptr_t)input_offset, sizeof(*input_offset))) ||
             (output_offset && !host_range_mapped((uintptr_t)output_offset, sizeof(*output_offset)))) {
             result = -EFAULT;
@@ -2498,12 +2534,17 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             int64_t nr_read = input_offset
                                   ? hl_linux_pread64(g_linux_box, source.fd, buffer, chunk, (uint64_t)*input_offset)
                                   : hl_linux_read(g_linux_box, source.fd, buffer, chunk);
-            if (nr_read <= 0) { if (!done) result = nr_read; break; }
-            int64_t nr_written = output_offset
-                                     ? hl_linux_pwrite64(g_linux_box, output.fd, buffer, (size_t)nr_read,
-                                                         (uint64_t)*output_offset)
-                                     : hl_linux_write(g_linux_box, output.fd, buffer, (size_t)nr_read);
-            if (nr_written < 0) { if (!done) result = nr_written; break; }
+            if (nr_read <= 0) {
+                if (!done) result = nr_read;
+                break;
+            }
+            int64_t nr_written = output_offset ? hl_linux_pwrite64(g_linux_box, output.fd, buffer, (size_t)nr_read,
+                                                                   (uint64_t)*output_offset)
+                                               : hl_linux_write(g_linux_box, output.fd, buffer, (size_t)nr_read);
+            if (nr_written < 0) {
+                if (!done) result = nr_written;
+                break;
+            }
             done += (size_t)nr_written;
             if (input_offset) *input_offset += (off_t)nr_written;
             if (output_offset) *output_offset += (off_t)nr_written;
