@@ -900,6 +900,10 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
+
+static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[]) {
+    return hl_native_engine_run(HL_GUEST_ISA_AARCH64, rootfs, argc, argv);
+}
 #ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
     return hl_engine_entry(argc, argv);
@@ -911,7 +915,7 @@ int hl_engine_entry(int argc, char **argv) {
     const char *rootfs = NULL;
     hl_option_reset();
     // Final-product launch: the host provides one serialized, validated HL config file.
-    if (route.mode == HL_CLI_CONFIG) return hl_run_config_file(route.config_path);
+    if (route.mode == HL_CLI_CONFIG) return hl_run_config_file_with(route.config_path, hl_standalone_run);
     // fork-server dispatch (gated; standalone path untouched when neither flag is present):
     //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run the resident engine server
     //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to that server
@@ -956,8 +960,7 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
-    if (hl_option_get("HL_RESTORE_DIR"))
-        return hl_run_linux_guest(NULL, NULL, rootfs, 0, NULL); // resume without an ELF arg
+    if (hl_option_get("HL_RESTORE_DIR")) return hl_standalone_run(rootfs, 0, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
                 "usage: %s [--rootfs DIR] [--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
@@ -967,5 +970,5 @@ int hl_engine_entry(int argc, char **argv) {
                 argv[0], argv[0]);
         return 2;
     }
-    return hl_run_linux_guest(NULL, NULL, rootfs, (uint32_t)(argc - ai), argv + ai);
+    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai);
 }

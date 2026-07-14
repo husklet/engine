@@ -771,16 +771,16 @@ $(BUILD)/mac/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
 
-$(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(MAC_LIBS) \
+$(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $< $(MAC_LIBS)
+	$(MAC) clang -o $@ $< $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-$(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(MAC_LIBS) \
+$(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -o $@ $< $(MAC_LIBS)
+	$(MAC) clang -o $@ $< $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64

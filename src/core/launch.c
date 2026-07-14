@@ -76,7 +76,7 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
 
 // Read an hl launch config from an already-open file, populate launch state, rebuild the guest argv, and
 // enter the Linux guest. Private: hl_run_config_file() is the sole launch protocol.
-static int hl_read_config_file(int fd) {
+static int hl_read_config_file(int fd, hl_launch_runner runner) {
     enum { HL_LAUNCH_HEADER_LIMIT = 4096, HL_LAUNCH_POOL_LIMIT = 64 * 1024 * 1024 };
 
     hl_launch_config cfg;
@@ -223,14 +223,19 @@ static int hl_read_config_file(int fd) {
 
     // rootfs: "" (bare launch) maps to NULL, matching the flag path's `rootfs = NULL` default.
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
-    int rc = hl_run_linux_guest(NULL, NULL, rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2);
+    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
     free(wire);
     return rc;
 }
 
-int hl_run_config_file(const char *path) {
+static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[]) {
+    return hl_run_linux_guest(NULL, NULL, rootfs, argc, argv);
+}
+
+int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
+    if (runner == NULL) return 78;
     if (!path || !path[0]) return 78;
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -238,7 +243,11 @@ int hl_run_config_file(const char *path) {
         return 78;
     }
     unlink(path);
-    int rc = hl_read_config_file(fd);
+    int rc = hl_read_config_file(fd, runner);
     close(fd);
     return rc;
+}
+
+int hl_run_config_file(const char *path) {
+    return hl_run_config_file_with(path, hl_legacy_launch);
 }
