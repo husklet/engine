@@ -47,6 +47,11 @@
 // engine keeps its own guest-`ic ivau` (smc_icflush) coherence model, so the shared-path seam is a no-op.
 #define G_SMC_UNMAP(lo, hi) ((void)(lo), (void)(hi))
 #define G_SHADOW_RESET(c) ((c)->ssp = 0) // reset the §B shadow stack (fork/exec); no-op on engines without it
+/* A BUS-guard activation retires every pre-guard translation.  Clear cached
+   host return PCs while all registered CPUs are at the dispatcher so none can
+   return directly into a retired, unguarded arena. */
+#define G_ACTIVATION_CLEAR_CPU(c) ((c)->ssp = 0)
+#define G_ACTIVATION_CLEAR_GLOBAL() ((void)0)
 
 // Child thread resume PC: aarch64 services a syscall with pc still at the SVC, so advance +4.
 #define G_THREAD_RESUME(child, parent) ((child)->pc = (parent)->pc + 4)

@@ -80,6 +80,10 @@ struct cpu {
     uint64_t vdirty;
     /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
     uint64_t fault_addr;
+    /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
+    uint64_t bus_filter;
+    uint64_t bus_force;
+    uint64_t bus_scratch[3];
 };
 
 #define OFF_VDIRTY ((int)offsetof(struct cpu, vdirty))
@@ -150,3 +154,6 @@ static int is_stolen(int r) {
 #define R_SYSCALL 1
 #define R_BUS 5
 #define OFF_FAULT_ADDR ((int)offsetof(struct cpu, fault_addr))
+#define OFF_BUS_FILTER ((int)offsetof(struct cpu, bus_filter))
+#define OFF_BUS_FORCE ((int)offsetof(struct cpu, bus_force))
+#define OFF_BUS_SCRATCH ((int)offsetof(struct cpu, bus_scratch))

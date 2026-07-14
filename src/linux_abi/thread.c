@@ -327,11 +327,22 @@ static _Atomic uint64_t g_bus_generation = 1;
 static atomic_flag g_bus_lock = ATOMIC_FLAG_INIT;
 static int g_bus_fail_closed;
 static uint32_t g_bus_prepares;
+/* Conservative lock-free rejection envelope for translated memory guards.
+   A miss is definitive; an envelope hit takes the precise ledger lock. */
+static _Atomic uint64_t g_bus_filter_lo = UINT64_MAX;
+static _Atomic uint64_t g_bus_filter_hi;
+/* Runtime guard state: 0 inactive, 1 active/filterable, 3 transition/precise.
+   Bit encoding lets emitted guards test it without disturbing guest flags. */
+static _Atomic int g_bus_filter_force;
+#define BUS_FILTER_WORDS 1024u
+#define BUS_FILTER_BITS (BUS_FILTER_WORDS * 64u)
+static _Atomic uint64_t g_bus_page_filter[BUS_FILTER_WORDS];
 static hl_linux_bus_change_fn g_bus_callback;
 static void *g_bus_callback_opaque;
 static pthread_once_t g_bus_atfork_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_bus_transition = PTHREAD_MUTEX_INITIALIZER;
 static void gbus_clear(uint64_t lo, uint64_t hi);
+static int gbus_add(uint64_t lo, uint64_t hi);
 static int gbus_clear_locked(uint64_t lo, uint64_t hi) {
     int changed = 0;
     for (int index = 0; index < g_ngbus;) {
@@ -350,10 +361,190 @@ static int gbus_clear_locked(uint64_t lo, uint64_t hi) {
     return changed;
 }
 
+/* File identity for legacy native-descriptor VMAs.  Typed mappings carry the
+   same information in binding.c; this registry keeps the production legacy
+   mmap path coherent when ftruncate is issued through a dup or reopened fd. */
+struct guest_file_mapping {
+    uint64_t lo, hi, offset, device, inode;
+    uint64_t follow_lo, follow_hi;
+    uint32_t shared;
+};
+static struct guest_file_mapping g_filemap[GNA_MAX];
+static int g_nfilemap;
+static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t filemap_accessible(const struct guest_file_mapping *mapping, uint64_t size) {
+    if (size <= mapping->offset) return 0;
+    uint64_t available = size - mapping->offset;
+    if (available > UINT64_MAX - UINT64_C(4095)) return mapping->hi - mapping->lo;
+    uint64_t rounded = (available + UINT64_C(4095)) & ~UINT64_C(4095);
+    uint64_t length = mapping->hi - mapping->lo;
+    return rounded < length ? rounded : length;
+}
+
+static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t offset, int shared) {
+    struct stat st;
+    if (size == 0 || address > UINT64_MAX - size || fstat(fd, &st) != 0) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    if (g_nfilemap < GNA_MAX)
+        g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
+                                                              (uint64_t)st.st_dev, (uint64_t)st.st_ino,
+                                                              0, 0, (uint32_t)shared};
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static void filemap_unmap(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int i = 0; i < g_nfilemap;) {
+        struct guest_file_mapping *mapping = &g_filemap[i];
+        if (hi <= mapping->lo || lo >= mapping->hi) { i++; continue; }
+        uint64_t old_lo = mapping->lo, old_hi = mapping->hi;
+        if (lo <= old_lo && hi >= old_hi) {
+            g_filemap[i] = g_filemap[--g_nfilemap];
+            continue;
+        }
+        if (lo > old_lo && hi < old_hi && g_nfilemap < GNA_MAX) {
+            struct guest_file_mapping tail = *mapping;
+            tail.lo = hi;
+            tail.offset += hi - old_lo;
+            mapping->hi = lo;
+            g_filemap[g_nfilemap++] = tail;
+            i++;
+            continue;
+        }
+        if (lo <= old_lo) {
+            uint64_t cut = hi - old_lo;
+            mapping->lo = hi;
+            mapping->offset += cut;
+        } else {
+            mapping->hi = lo;
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static void filemap_resize(int fd, uint64_t old_size, uint64_t new_size) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int i = 0; i < g_nfilemap; ++i) {
+        struct guest_file_mapping *mapping = &g_filemap[i];
+        if (mapping->device != (uint64_t)st.st_dev || mapping->inode != (uint64_t)st.st_ino) continue;
+        uint64_t old_accessible = filemap_accessible(mapping, old_size);
+        uint64_t new_accessible = filemap_accessible(mapping, new_size);
+        if (new_size < old_size && new_size > mapping->offset && new_size < mapping->offset + (mapping->hi - mapping->lo)) {
+            uint64_t tail = new_size - mapping->offset;
+            uint64_t partial_end = (tail + UINT64_C(4095)) & ~UINT64_C(4095);
+            if (partial_end > mapping->hi - mapping->lo) partial_end = mapping->hi - mapping->lo;
+            if (partial_end > tail) memset((void *)(uintptr_t)(mapping->lo + tail), 0, (size_t)(partial_end - tail));
+        }
+        if (new_accessible < old_accessible)
+            (void)gbus_add(mapping->lo + new_accessible, mapping->hi);
+        else if (new_accessible > old_accessible) {
+            /* macOS may retain stale private-page cache (or an anonymous quiet
+               EOF tail) across shrink+extend.  Recreate each newly valid host
+               page as a private snapshot while preserving the previously
+               valid prefix, exactly matching Linux MAP_PRIVATE regrowth. */
+            if (!mapping->shared) {
+                mapping->follow_lo = old_accessible;
+                mapping->follow_hi = new_accessible;
+                long hp = sysconf(_SC_PAGESIZE);
+                uint64_t cursor = old_accessible;
+                while (hp > 0 && cursor < new_accessible) {
+                    uint64_t absolute = mapping->lo + cursor;
+                    uint64_t page_lo = absolute & ~((uint64_t)hp - 1u);
+                    uint64_t page_off = page_lo - mapping->lo;
+                    /* Invalidate clean private file pages instead of copying
+                       bytes into them: copying would COW the whole 16K host
+                       page and later file writes would stop being visible to
+                       Linux's independently clean 4K subpages. Dirty private
+                       pages are retained by MS_INVALIDATE. */
+                    (void)msync((void *)(uintptr_t)page_lo, (size_t)hp, MS_INVALIDATE);
+                    cursor = page_off + (uint64_t)hp;
+                }
+            }
+            gbus_clear(mapping->lo + old_accessible, mapping->lo + new_accessible);
+        }
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static void filemap_written(int fd, uint64_t offset, uint64_t size) {
+    struct stat st;
+    if (size == 0 || offset > UINT64_MAX - size || fstat(fd, &st) != 0) return;
+    uint64_t end = offset + size;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int i = 0; i < g_nfilemap; ++i) {
+        struct guest_file_mapping *mapping = &g_filemap[i];
+        if (mapping->shared || mapping->follow_hi <= mapping->follow_lo ||
+            mapping->device != (uint64_t)st.st_dev || mapping->inode != (uint64_t)st.st_ino)
+            continue;
+        uint64_t map_lo = mapping->offset + mapping->follow_lo;
+        uint64_t map_hi = mapping->offset + mapping->follow_hi;
+        uint64_t lo = offset > map_lo ? offset : map_lo;
+        uint64_t hi = end < map_hi ? end : map_hi;
+        if (hi > lo)
+            (void)pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo),
+                        (off_t)lo);
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
 static void gbus_lock(void) {
     while (atomic_flag_test_and_set_explicit(&g_bus_lock, memory_order_acquire)) sched_yield();
 }
 static void gbus_unlock(void) { atomic_flag_clear_explicit(&g_bus_lock, memory_order_release); }
+static void gbus_filter_rebuild_locked(void) {
+    uint64_t lo = UINT64_MAX, hi = 0;
+    if (g_bus_fail_closed || g_bus_prepares != 0) {
+        lo = 0;
+        hi = UINT64_MAX;
+    } else {
+        for (int index = 0; index < g_ngbus; ++index) {
+            if (g_gbus[index].lo < lo) lo = g_gbus[index].lo;
+            if (g_gbus[index].hi > hi) hi = g_gbus[index].hi;
+        }
+    }
+    atomic_store_explicit(&g_bus_filter_lo, lo, memory_order_relaxed);
+    atomic_store_explicit(&g_bus_filter_hi, hi, memory_order_release);
+}
+static unsigned gbus_page_hash(uint64_t page) {
+    return (unsigned)page & (BUS_FILTER_BITS - 1u);
+}
+static void gbus_page_mark_locked(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    uint64_t first = lo >> 12;
+    uint64_t last = (hi - 1) >> 12;
+    /* Mark the preceding page too: a single instruction may begin there and
+       cross into the first BUS page.  Guards then need only hash their start. */
+    if (first != 0) first--;
+    if (last - first >= BUS_FILTER_BITS) {
+        for (unsigned i = 0; i < BUS_FILTER_WORDS; ++i)
+            atomic_store_explicit(&g_bus_page_filter[i], UINT64_MAX, memory_order_release);
+        return;
+    }
+    for (uint64_t page = first;; ++page) {
+        unsigned bit = gbus_page_hash(page);
+        atomic_fetch_or_explicit(&g_bus_page_filter[bit >> 6], UINT64_C(1) << (bit & 63u), memory_order_release);
+        if (page == last) break;
+    }
+}
+static void gbus_page_reset_locked(void) {
+    for (unsigned i = 0; i < BUS_FILTER_WORDS; ++i)
+        atomic_store_explicit(&g_bus_page_filter[i], 0, memory_order_release);
+}
+static void gbus_page_rebuild_locked(void) {
+    gbus_page_reset_locked();
+    if (g_bus_fail_closed) {
+        for (unsigned i = 0; i < BUS_FILTER_WORDS; ++i)
+            atomic_store_explicit(&g_bus_page_filter[i], UINT64_MAX, memory_order_release);
+        return;
+    }
+    for (int index = 0; index < g_ngbus; ++index)
+        gbus_page_mark_locked(g_gbus[index].lo, g_gbus[index].hi);
+}
 static void gbus_atfork_prepare(void) { pthread_mutex_lock(&g_bus_transition); gbus_lock(); }
 static void gbus_atfork_parent(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
 static void gbus_atfork_child(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
@@ -371,14 +562,24 @@ static void gbus_prepare(void) {
     pthread_mutex_lock(&g_bus_transition);
     gbus_lock();
     int was_active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    uint64_t generation = !was_active ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
+                                      : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
+    gbus_unlock();
+    /* On first activation guarded code does not exist yet.  Complete the
+       synchronous STW while the old empty ledger remains queryable; forcing
+       queries to wait on a prepare here deadlocks a peer inside its guard
+       before that peer can acknowledge the STW.  The caller has not changed
+       the host mapping yet, so the old empty answer remains correct. */
+    if (!was_active) gbus_notify(generation, 1);
+    gbus_lock();
+    /* From this point through host mapping publication and ledger commit,
+       already-guarded code must use the precise transition path. */
+    atomic_store_explicit(&g_bus_filter_force, 3, memory_order_release);
     if (g_bus_prepares != UINT32_MAX)
         g_bus_prepares++;
     else
         g_bus_fail_closed = 1;
-    uint64_t generation = !was_active ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
-                                      : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
     gbus_unlock();
-    if (!was_active) gbus_notify(generation, 1); /* synchronous STW before host mapping publication */
     /* Keep the transition lock through host publication and commit/release. This serializes
        concurrent mapping transactions and prevents fork from inheriting an orphan prepare token. */
 }
@@ -386,12 +587,43 @@ static void gbus_prepare(void) {
 static void gbus_prepare_release(void) {
     gbus_lock();
     if (g_bus_prepares != 0) g_bus_prepares--;
+    /* force remains set until publication below, so no translated guard can
+       observe the temporary zeroes.  Rebuilding on every completed mapping
+       transaction prevents a long-lived range plus distinct-page churn from
+       monotonically saturating the fast rejection filter. */
+    gbus_page_rebuild_locked();
+    gbus_filter_rebuild_locked();
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
     uint64_t generation = !active ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
                                   : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
     gbus_unlock();
+    atomic_store_explicit(&g_bus_filter_force, active ? 1 : 0, memory_order_release);
     if (!active) gbus_notify(generation, 0);
     pthread_mutex_unlock(&g_bus_transition);
+}
+
+int hl_linux_bus_transition_begin(hl_linux_bus_transition *transition) {
+    if (transition == NULL || transition->held != 0) return -1;
+    gbus_prepare();
+    transition->generation = atomic_load_explicit(&g_bus_generation, memory_order_acquire);
+    transition->held = 1;
+    return 0;
+}
+
+int hl_linux_bus_transition_add(hl_linux_bus_transition *transition, uint64_t lo, uint64_t hi) {
+    if (transition == NULL || transition->held == 0) return -1;
+    return gbus_add(lo, hi);
+}
+
+void hl_linux_bus_transition_clear(hl_linux_bus_transition *transition, uint64_t lo, uint64_t hi) {
+    if (transition != NULL && transition->held != 0) gbus_clear(lo, hi);
+}
+
+void hl_linux_bus_transition_end(hl_linux_bus_transition *transition) {
+    if (transition == NULL || transition->held == 0) return;
+    transition->held = 0;
+    gbus_prepare_release();
+    transition->generation = atomic_load_explicit(&g_bus_generation, memory_order_acquire);
 }
 
 void hl_linux_bus_set_change_callback(hl_linux_bus_change_fn callback, void *opaque) {
@@ -414,8 +646,11 @@ static int gbus_add(uint64_t lo, uint64_t hi) {
         g_gbus[g_ngbus++] = (struct guest_bus_range){lo, hi};
     else
         g_bus_fail_closed = 1;
+    gbus_page_mark_locked(lo, hi);
+    gbus_filter_rebuild_locked();
     uint64_t generation = atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1;
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    atomic_store_explicit(&g_bus_filter_force, g_bus_prepares != 0 ? 3 : (active ? 1 : 0), memory_order_release);
     gbus_unlock();
     gbus_notify(generation, active);
     return ok ? 0 : -1;
@@ -425,9 +660,14 @@ static void gbus_clear(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     gbus_lock();
     int changed = gbus_clear_locked(lo, hi);
+    if (changed && g_ngbus == 0 && !g_bus_fail_closed) gbus_page_reset_locked();
+    if (changed) gbus_filter_rebuild_locked();
     uint64_t generation = changed ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
                                   : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
+    if (changed)
+        atomic_store_explicit(&g_bus_filter_force, g_bus_prepares != 0 ? 3 : (active ? 1 : 0),
+                              memory_order_release);
     gbus_unlock();
     if (changed) gbus_notify(generation, active);
 }
@@ -436,7 +676,23 @@ uint64_t hl_linux_bus_fault(uint64_t address, uint64_t length) {
     if (length == 0) return 0;
     if (address > UINT64_MAX - length) return address != 0 ? address : 1;
     uint64_t end = address + length;
+    if (atomic_load_explicit(&g_bus_filter_force, memory_order_acquire) != 3) {
+        uint64_t lo = atomic_load_explicit(&g_bus_filter_lo, memory_order_relaxed);
+        uint64_t hi = atomic_load_explicit(&g_bus_filter_hi, memory_order_acquire);
+        if (address >= hi || end <= lo) return 0;
+    }
+retry:
     gbus_lock();
+    /* A prepare spans activation, host mapping publication, and precise-ledger
+       commit.  Wait out that short transaction rather than treating every
+       address as BUS: unrelated translated threads must not receive a
+       synchronous SIGBUS merely because a mapper is between publication and
+       ledger insertion. */
+    if (g_bus_prepares != 0) {
+        gbus_unlock();
+        sched_yield();
+        goto retry;
+    }
     if (g_bus_fail_closed) { gbus_unlock(); return address != 0 ? address : 1; }
     for (int index = 0; index < g_ngbus; ++index)
         if (address < g_gbus[index].hi && end > g_gbus[index].lo) {
@@ -555,12 +811,18 @@ static int gro_hit(uint64_t a, uint64_t len) {
 static void gna_reset(void) {
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_filemap_lock);
+    g_nfilemap = 0;
+    pthread_mutex_unlock(&g_filemap_lock);
     pthread_mutex_lock(&g_bus_transition);
     gbus_lock();
     int changed = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
     atomic_store_explicit(&g_ngbus, 0, memory_order_release);
     g_bus_fail_closed = 0;
     g_bus_prepares = 0;
+    gbus_page_reset_locked();
+    gbus_filter_rebuild_locked();
+    atomic_store_explicit(&g_bus_filter_force, 0, memory_order_release);
     uint64_t generation = changed ? atomic_fetch_add_explicit(&g_bus_generation, 1, memory_order_release) + 1
                                   : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
     gbus_unlock();
@@ -1304,6 +1566,8 @@ static void thread_wait_clear(void) {
 }
 
 static void thread_register(struct cpu *c) {
+    c->bus_filter = (uint64_t)(uintptr_t)g_bus_page_filter;
+    c->bus_force = (uint64_t)(uintptr_t)&g_bus_filter_force;
     pthread_once(&g_thread_int_once, thread_int_install);
     // Keep THREAD_INT_SIG deliverable on this thread so a peer's execve teardown can interrupt its syscalls.
     sigset_t unb;

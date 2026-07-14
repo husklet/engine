@@ -3,7 +3,6 @@
 static jit_guest_bus_query g_guest_bus_query;
 static _Atomic uint64_t g_guest_bus_generation;
 static _Atomic int g_guest_bus_enabled;
-static _Atomic int g_guest_bus_cache_dirty;
 
 void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
     uint64_t seen = atomic_load_explicit(&g_guest_bus_generation, memory_order_acquire);
@@ -12,12 +11,14 @@ void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
                                                                         memory_order_acq_rel, memory_order_acquire)) {}
     if (generation < seen) return;
     int was_active = atomic_load_explicit(&g_guest_bus_enabled, memory_order_acquire);
-    /* Publish first; the activation gate prevents any peer from entering a block
-       until every old translation has been retired. */
-    atomic_store_explicit(&g_guest_bus_enabled, active != 0, memory_order_release);
-    if (active && !was_active)
+    /* Instrumentation is deliberately sticky.  Once an EOF/BUS mapping has
+       existed, retaining guarded translations is both safe (an empty ledger
+       returns no fault) and avoids rotating the whole cache for every later
+       map/unmap cycle.  Only the first activation retires pre-guard code. */
+    if (active && !was_active) {
+        atomic_store_explicit(&g_guest_bus_enabled, 1, memory_order_release);
         stw_force_dispatch_flush();
-    atomic_store_explicit(&g_guest_bus_cache_dirty, active ? 0 : 1, memory_order_release);
+    }
 }
 
 void jit_guest_bus_bind(jit_guest_bus_query query, int active, uint64_t generation) {
@@ -154,19 +155,6 @@ static void run_guest(struct cpu *c) {
         // that makes a peer thread's freshly-emitted+icache-flushed code visible.
         // Single-threaded skips the lock entirely (g_threaded == 0).
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
-        if (atomic_exchange_explicit(&g_guest_bus_cache_dirty, 0, memory_order_acq_rel)) {
-            if (g_threaded && stw_peers_live()) {
-                stw_flush();
-            } else {
-                jit_wprot(0);
-                g_cp = g_cache;
-                memset(g_map, 0, sizeof g_map);
-                memset(g_ibtc, 0, sizeof g_ibtc);
-                g_npend = 0;
-                G_SHADOW_CLEAR(c);
-                jit_wprot(1);
-            }
-        }
         void *code = map_host(G_PC(c));
         if (!code) {
             uint64_t _t0 =

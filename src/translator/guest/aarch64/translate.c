@@ -283,6 +283,24 @@ static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
    complete architectural file, query the generic core seam, and either return
    to the dispatcher as R_BUS or reload byte-for-byte state and continue. */
 static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
+    /* x16 carries the state loaded by the caller. */
+    e_str(9, CPUREG, OFF_BUS_SCRATCH);
+    uint32_t *force_slow = (uint32_t *)g_cp;
+    emit32(0); /* tbnz w16,#1,slow */
+    e_ldr(16, CPUREG, OFF_FAULT_ADDR);
+    emit32(0xD3400000u | (12u << 16) | (63u << 10) | (16u << 5) | 16u);
+    e_movr(17, 16);
+    emit32(0xD3400000u | (6u << 16) | (15u << 10) | (16u << 5) | 16u);
+    e_ldr(9, CPUREG, OFF_BUS_FILTER);
+    emit32(0x8B000000u | (16u << 16) | (3u << 10) | (9u << 5) | 9u);
+    e_ldr(9, 9, 0);
+    emit32(0x9AC02400u | (17u << 16) | (9u << 5) | 9u);
+    uint32_t *filter_miss = (uint32_t *)g_cp;
+    emit32(0); /* tbz x18,#0,resume */
+    uint8_t *slow = g_cp;
+    *force_slow = 0x37000000u | (1u << 19) |
+                  (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
+    e_ldr(9, CPUREG, OFF_BUS_SCRATCH);
     emit_spill();
     e_ldr(0, CPUREG, OFF_FAULT_ADDR);
     e_movconst(1, bytes);
@@ -308,12 +326,23 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     for (int r = 1; r <= 30; r++)
         if (!is_stolen(r)) e_ldr(r, CPUREG, r * 8);
     e_ldr(0, CPUREG, 0);
+    uint8_t *resume_fast = g_cp;
+    e_ldr(9, CPUREG, OFF_BUS_SCRATCH);
+    *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 9u;
 }
 
 static void emit_a64_bus_guard(int ea, uint64_t bytes, uint64_t pc) {
     if (!jit_guest_bus_active()) return;
     e_str(ea, CPUREG, OFF_FAULT_ADDR);
+    e_ldr(16, CPUREG, OFF_BUS_FORCE);
+    emit32(0xB9400000u | (16u << 5) | 16u);
+    uint32_t *inactive_fast = (uint32_t *)g_cp;
+    emit32(0);
     emit_a64_bus_guard_saved(bytes, pc);
+    uint8_t *resume_inactive = g_cp;
+    e_ldr(ea, CPUREG, OFF_FAULT_ADDR);
+    *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
+                     16u;
 }
 
 static void emit_a64_bus_guard_base(int base, int64_t offset, uint64_t bytes, uint64_t pc) {
@@ -442,12 +471,19 @@ static void emit_fold_mem(uint32_t in) {
            T, T2, or Tm while they contain translator temporaries silently
            corrupts guest registers on every guarded miss. */
         e_str(Sb, CPUREG, OFF_FAULT_ADDR);
+        e_ldr(16, CPUREG, OFF_BUS_FORCE);
+        emit32(0xB9400000u | (16u << 5) | 16u);
+        uint32_t *inactive_fast = (uint32_t *)g_cp;
+        emit32(0);
         if (regoff) e_ldr(Tm, CPUREG, M + 56);
         e_ldr(Sb, CPUREG, M + 32);
         e_ldr(T, CPUREG, M + 40);
         e_ldr(T2, CPUREG, M + 48);
         emit_a64_bus_guard_saved(a64_mem_bytes(in), g_emit_gpc);
         e_ldr(Sb, CPUREG, OFF_FAULT_ADDR);
+        uint8_t *resume_inactive = g_cp;
+        *inactive_fast = 0x36000000u |
+                         (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
     }
     if (uses_x18(m, emask))
         emit_mangled_x18(m, emask); // stolen Rt/Rt2/Rs (base now names non-stolen Sb)
@@ -561,7 +597,6 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     // V-register list, opcode, R, and size fields are untouched, so the transfer is identical -- only its
     // address is now the biased high pointer.
     emit_a64_bus_guard(Sb, (uint64_t)advsimd_struct_bytes(in), g_emit_gpc);
-    if (jit_guest_bus_active()) e_ldr(Sb, CPUREG, OFF_FAULT_ADDR);
     emit32((in & ~(1u << 23) & ~(0x1Fu << 16) & ~(0x1Fu << 5)) | ((unsigned)Sb << 5));
     if (post) { // writeback the LOW guest base: Xn += (Rm==31 ? bytes transferred : Xm)
         if (rm == 31) {
@@ -1878,7 +1913,6 @@ static void *translate_block(uint64_t gpc) {
                 if (stealfast_on()) {
                     e_movconst(16, gpc + off);
                     emit_a64_bus_guard(16, is64 ? 8 : 4, gpc);
-                    if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                     if (is64)
                         e_ldr(16, 16, 0);
                     else
@@ -1888,7 +1922,6 @@ static void *translate_block(uint64_t gpc) {
                     x18_prolog();
                     e_movconst(0, gpc + off);
                     emit_a64_bus_guard(0, is64 ? 8 : 4, gpc);
-                    if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                     if (is64)
                         e_ldr(0, 0, 0);
                     else
@@ -1899,7 +1932,6 @@ static void *translate_block(uint64_t gpc) {
             } else {
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, is64 ? 8 : 4, gpc);
-                if (jit_guest_bus_active()) e_ldr(rt, CPUREG, OFF_FAULT_ADDR);
                 if (is64)
                     e_ldr(rt, rt, 0);
                 else
@@ -1922,14 +1954,12 @@ static void *translate_block(uint64_t gpc) {
                 if (stealfast_on()) {
                     e_movconst(16, gpc + off);            // x16 = guest literal address
                     emit_a64_bus_guard(16, 4, gpc);
-                    if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                     emit32(0xB9800000u | (16 << 5) | 16); // ldrsw x16, [x16]
                     e_str(16, CPUREG, rt * 8);
                 } else {
                     x18_prolog();
                     e_movconst(0, gpc + off);
                     emit_a64_bus_guard(0, 4, gpc);
-                    if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                     emit32(0xB9800000u | (0 << 5) | 0); // ldrsw x0, [x0]
                     e_str(0, 1, rt * 8);
                     x18_epilog();
@@ -1937,7 +1967,6 @@ static void *translate_block(uint64_t gpc) {
             } else {
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, 4, gpc);
-                if (jit_guest_bus_active()) e_ldr(rt, CPUREG, OFF_FAULT_ADDR);
                 emit32(0xB9800000u | (rt << 5) | rt); // ldrsw xt, [xt]
             }
             gpc += 4;
@@ -1959,13 +1988,11 @@ static void *translate_block(uint64_t gpc) {
                 // stealfast: x16 is engine-dead -> no stash/restore around the address materialization
                 e_movconst(16, gpc + off);              // x16 = guest literal address
                 emit_a64_bus_guard(16, UINT64_C(4) << sz, gpc);
-                if (jit_guest_bus_active()) e_ldr(16, CPUREG, OFF_FAULT_ADDR);
                 emit32(ld | (16u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x16]
             } else {
                 x18_prolog();                          // stash x0/x1 in the red zone; x0 becomes the address scratch
                 e_movconst(0, gpc + off);              // x0 = guest literal address (PIE: pcrel_base is identity)
                 emit_a64_bus_guard(0, UINT64_C(4) << sz, gpc);
-                if (jit_guest_bus_active()) e_ldr(0, CPUREG, OFF_FAULT_ADDR);
                 emit32(ld | (0u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x0]
                 x18_epilog();
             }

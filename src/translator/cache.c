@@ -800,17 +800,25 @@ static int stw_before_translated(uint64_t selected_epoch) {
 }
 
 static void stw_after_translated(void) {
-    if (g_my_stw_slot >= 0)
+    if (g_my_stw_slot >= 0) {
         atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 0, memory_order_release);
+        /* Dispatcher/service state holds no code-cache PC.  Drop the generation
+           pin now so repeated BUS activations can reclaim retired arenas. */
+        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].exec_gen, 0, memory_order_release);
+    }
     stw_dispatch_safepoint();
 }
 
 static void stw_force_dispatch_flush(void) {
+    pthread_t me = pthread_self();
+    /* Serialize activation ownership before publishing its epoch/gate.  If two
+       callbacks publish first and lock second, the first can clear the second's
+       gate; its signal is then mistaken for an ordinary park and its peer never
+       acknowledges the newer epoch. */
+    pthread_mutex_lock(&g_jit_lock);
     uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
     atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
-    pthread_t me = pthread_self();
     /* Preserve the global lock order used by ordinary STW: jit -> registry. */
-    pthread_mutex_lock(&g_jit_lock);
     pthread_mutex_lock(&g_stw_reg_lock);
     for (int i = 0; i < STW_MAXTHREAD; i++) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
@@ -827,7 +835,7 @@ static void stw_force_dispatch_flush(void) {
         for (int i = 0; i < STW_MAXTHREAD; i++)
             if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
                 atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
-                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) != request) {
+                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) < request) {
                 pending = 1;
                 break;
             }
@@ -835,6 +843,10 @@ static void stw_force_dispatch_flush(void) {
         struct timespec ts = {0, 50000};
         nanosleep(&ts, NULL);
     }
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu)
+            G_ACTIVATION_CLEAR_CPU(g_stw_threads[i].cpu);
+    G_ACTIVATION_CLEAR_GLOBAL();
     jit_flush_to_fresh();
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
@@ -994,6 +1006,9 @@ static void stw_after_fork(void) {
     struct cpu *survivor = g_my_stw_slot >= 0 ? g_stw_threads[g_my_stw_slot].cpu : NULL;
     atomic_store_explicit(&g_stw_active, 0, memory_order_relaxed);
     atomic_store_explicit(&g_stw_parked, 0, memory_order_relaxed);
+    /* A sibling may have owned an activation gate at fork.  It does not exist
+       in the child, so inheriting its closed gate would deadlock first re-entry. */
+    atomic_store_explicit(&g_dispatch_gate, 0, memory_order_relaxed);
     pthread_mutex_init(&g_stw_reg_lock, NULL);
     for (int i = 0; i < STW_MAXTHREAD; i++)
         atomic_store_explicit(&g_stw_threads[i].used, 0, memory_order_relaxed);
@@ -1042,12 +1057,22 @@ static void jit_after_fork(void) {
     pthread_mutex_init(&g_jit_lock, NULL);
     pthread_mutex_init(&g_cache_lock, NULL);
     preserve = !g_threaded || !g_dualmap;
+    /* In a threaded child the fresh dual-map allocation may reuse one of the
+       inherited retired RX holes (VM_INHERIT_NONE).  Release retired mappings
+       before allocating; releasing them afterward can otherwise unmap the new
+       cache through a stale executable address.  The preserving path remaps at
+       its fixed current RX address and can retain the former ordering. */
+    if (!preserve) {
+        for (int i = 0; i < g_nretired; i++)
+            cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
+        g_nretired = 0;
+    }
     if (hl_arena_repair(&g_jit_services, &g_emit, preserve) != 0) cache_oom_abort();
-    // The child inherited the parent's retired-cache list as COW copies but will never resume a parent peer
-    // into them; drop the bookkeeping and unmap them so the child does not carry the parent's retired VA.
-    for (int i = 0; i < g_nretired; i++)
-        cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
-    g_nretired = 0;
+    if (preserve) {
+        for (int i = 0; i < g_nretired; i++)
+            cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
+        g_nretired = 0;
+    }
     g_fork_preserved = preserve;
     if (!preserve) {
         memset(g_map, 0, sizeof g_map);

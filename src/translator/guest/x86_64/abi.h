@@ -36,6 +36,10 @@
 // unmap/remap" bug. (aarch64 keeps its own smc_icflush model, so its seam is a no-op.)
 #define G_SMC_UNMAP(lo, hi) jit86_drop_range_translations((lo), (hi))
 #define G_SHADOW_RESET(c) ((void)0) // no §B shadow stack on the x86 frontend
+/* x86 has no per-CPU shadow stack, but its second-level indirect target cache
+   also contains host code pointers and must not survive an arena rotation. */
+#define G_ACTIVATION_CLEAR_CPU(c) ((void)(c))
+#define G_ACTIVATION_CLEAR_GLOBAL() memset(g_xibtc, 0, sizeof g_xibtc)
 
 // Child thread resume PC: x86 pre-advances rip past `syscall` before servicing, so the copy is correct.
 #define G_THREAD_RESUME(child, parent) ((void)0)

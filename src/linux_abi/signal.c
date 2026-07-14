@@ -585,7 +585,9 @@ static int raise_guest_bus(struct cpu *c) {
     g_sigcode[7] = 2; /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
-    __atomic_or_fetch(&g_pending, 1ull << 7, __ATOMIC_SEQ_CST);
+    /* A synchronous memory fault belongs to the faulting thread.  Process-wide
+       pending delivery can run the handler on an unrelated mapper thread. */
+    __atomic_or_fetch(&c->tpending, 1ull << 7, __ATOMIC_SEQ_CST);
     return 1;
 }
 

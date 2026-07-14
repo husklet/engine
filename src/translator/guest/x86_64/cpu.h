@@ -92,6 +92,10 @@ struct cpu {
     uint64_t df;
     /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
     uint64_t fault_addr;
+    /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
+    uint64_t bus_filter;
+    uint64_t bus_force;
+    uint64_t bus_scratch[3];
 };
 
 #define OFF_FCPTR ((int)__builtin_offsetof(struct cpu, fastclk_ptr))
@@ -195,6 +199,9 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_FXRSTOR 16
 #define R_BUS 17
 #define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
+#define OFF_BUS_FILTER ((int)__builtin_offsetof(struct cpu, bus_filter))
+#define OFF_BUS_FORCE ((int)__builtin_offsetof(struct cpu, bus_force))
+#define OFF_BUS_SCRATCH ((int)__builtin_offsetof(struct cpu, bus_scratch))
 
 enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
 

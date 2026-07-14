@@ -716,7 +716,34 @@ static void emit_reload_full(void) {
 /* Emitted only in BUS-active translation generations. */
 static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     if (!jit_guest_bus_active()) return;
+    /* Sticky guarded translations become nearly inert after the final BUS
+       range is released: two loads plus this flag-free state branch, with no
+       architectural stores or register spill. */
+    e_ldr(16, 28, OFF_BUS_FORCE);
+    emit32(0xB9400000u | (16 << 5) | 16); /* ldr w16,[x16] */
+    uint32_t *inactive_fast = (uint32_t *)g_cp;
+    emit32(0); /* tbz w16,#0,resume-inactive */
     e_str(address_register, 28, OFF_FAULT_ADDR);
+    e_str(9, 28, OFF_BUS_SCRATCH);
+    /* Flag-free monotonic page filter.  The transition force flag sends every
+       access to the precise helper while a host mapping is being published;
+       otherwise a definite filter miss skips the full architectural spill. */
+    uint32_t *force_slow = (uint32_t *)g_cp;
+    emit32(0); /* tbnz w16,#1,slow */
+    e_ldr(16, 28, OFF_FAULT_ADDR);
+    e_lsr_i(16, 16, 12, 1);
+    e_mov_rr(17, 16, 1);
+    emit32(0xD3400000u | (6u << 16) | (15u << 10) | (16u << 5) | 16u);
+    e_ldr(9, 28, OFF_BUS_FILTER);
+    e_rrr(A_ADD, 9, 9, 16, 1, 3);
+    e_ldr(9, 9, 0);
+    e_shv(S_LSRV, 9, 9, 17, 1);
+    uint32_t *filter_miss = (uint32_t *)g_cp;
+    emit32(0); /* tbz x18,#0,resume */
+    uint8_t *slow = g_cp;
+    *force_slow = 0x37000000u | (1u << 19) |
+                  (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
     emit_spill();
     e_ldr(0, 28, OFF_FAULT_ADDR);
     e_movconst(1, size);
@@ -734,7 +761,13 @@ static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     uint8_t *resume = g_cp;
     *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7FFFF) << 5);
     emit_reload_full();
+    uint8_t *resume_fast = g_cp;
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
     e_ldr(address_register, 28, OFF_FAULT_ADDR);
+    *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 9u;
+    uint8_t *resume_inactive = g_cp;
+    *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
+                     16u;
 }
 
 static void emit_bus_guard_mem17(uint64_t size, int offset) {

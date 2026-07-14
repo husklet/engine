@@ -104,6 +104,13 @@ int main(void) {
         (void)*(volatile uint32_t *)(void *)(mapping + 8190);
     else
         crossing_bus = 1;
+    expected_address = mapping + 8192;
+    int atomic_bus = 0;
+    if (sigsetjmp(jump, 1) == 0)
+        (void)atomic_exchange_explicit((_Atomic uint32_t *)(void *)(mapping + 8192), UINT32_C(0xabcdef01),
+                                       memory_order_seq_cst);
+    else
+        atomic_bus = 1;
     pid_t child = fork();
     if (child == 0) {
         signal(SIGBUS, SIG_DFL);
@@ -119,14 +126,14 @@ int main(void) {
     _Atomic uint32_t *word = (_Atomic uint32_t *)(void *)(mapping + 8192);
     uint32_t old = atomic_exchange_explicit(word, UINT32_C(0x12345678), memory_order_seq_cst);
     int replacement = old == 0x71 && atomic_load_explicit(word, memory_order_relaxed) == UINT32_C(0x12345678);
-    printf("eof-bus partial=%d load=%d far=%d store=%d crossing=%d metadata=%d default=%d replacement=%d canary-miss=%d canary-hit=%d signals=%d\n",
-           partial_zero, load_bus, far_bus, store_bus, crossing_bus, metadata_ok == bus_count, default_bus,
+    printf("eof-bus partial=%d load=%d far=%d store=%d crossing=%d atomic=%d metadata=%d default=%d replacement=%d canary-miss=%d canary-hit=%d signals=%d\n",
+           partial_zero, load_bus, far_bus, store_bus, crossing_bus, atomic_bus, metadata_ok == bus_count, default_bus,
            replacement, canary_miss, canary_hit, (int)bus_count);
     munmap(mapping, 16384);
     close(descriptor);
     unlink(path);
-    return partial_zero && load_bus && far_bus && store_bus && crossing_bus && metadata_ok == bus_count &&
-                   default_bus && replacement && canary_miss && canary_hit && bus_count == 5
+    return partial_zero && load_bus && far_bus && store_bus && crossing_bus && atomic_bus &&
+                   metadata_ok == bus_count && default_bus && replacement && canary_miss && canary_hit && bus_count == 6
                ? 0
                : 5;
 }

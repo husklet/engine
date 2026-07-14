@@ -1994,6 +1994,16 @@ static void *translate_block(uint64_t gpc) {
                     // helper -- both can escape, so make cpu->fptop reflect the (pre-op) shadow first.
                     fp_materialize();
                     emit_ea(&I, next);
+                    int x87_bytes = (op == 0xD8 || op == 0xDA) ? 4 : op == 0xDC ? 8 : op == 0xDE ? 2 : 0;
+                    if (op == 0xD9)
+                        x87_bytes = reg == 6 || reg == 4 ? 28 : (reg == 5 || reg == 7 ? 2 : 4);
+                    else if (op == 0xDD)
+                        x87_bytes = reg == 7 ? 2 : 8;
+                    else if (op == 0xDB)
+                        x87_bytes = reg == 5 || reg == 7 ? 10 : 4;
+                    else if (op == 0xDF)
+                        x87_bytes = reg == 5 || reg == 7 ? 8 : 2;
+                    if (x87_bytes) emit_bus_guard(17, (uint64_t)x87_bytes, gpc);
                     e_mov_rr(19, 17, 1); // x19 = EA (helpers clobber x17)
                     if (op == 0xD9) {    // f32 mem
                         if (reg == 0) {
