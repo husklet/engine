@@ -1590,6 +1590,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     }
     case 57: /* close */
+        flock_broker_detach(&source);
         if (g_host_services != NULL && g_host_services->file != NULL &&
             g_host_services->file->metadata != NULL) {
             hl_host_file_metadata metadata;
@@ -1906,8 +1907,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = bound_host_error(status.status);
             break;
         }
-        result = hl_flock_identity((int)source.fd, metadata.stable_device, metadata.stable_object, (int)a1) < 0
-                     ? -(int64_t)errno
+        result = hl_flock_identity(&source, metadata.stable_device, metadata.stable_object, (int)a1) < 0
+                     ? -(int64_t)(errno == EWOULDBLOCK ? 11 : errno)
                      : 0;
         break;
     }

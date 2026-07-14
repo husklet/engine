@@ -241,6 +241,7 @@ static void fork_child_hooks(struct cpu *c) {
     eventfd_after_fork();        // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
     ts_after_fork();             // drop the inherited task-state slot cache so the child re-claims its own
     poslk_after_fork();          // re-cache pid; child inherits NONE of the parent's fcntl record locks
+    flock_broker_after_fork();   // flock ownership is OFD-scoped and IS inherited across fork
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork

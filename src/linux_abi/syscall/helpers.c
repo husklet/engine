@@ -64,6 +64,7 @@ static struct {
 } g_flkcomp[256];
 
 static int g_nflkcomp;
+static int flock_broker_apply(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int operation);
 
 // Companion index for the file underlying guest `fd` (opening/caching it on first use). -1 (errno set) on
 // failure. The companion is pushed to a high descriptor so it never collides with the guest's low fds
@@ -124,7 +125,9 @@ static int hl_flock(int fd, int op) {
     return r;
 }
 
-static int hl_flock_identity(int fd, uint64_t device, uint64_t object, int op) {
+static int hl_flock_identity(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int op) {
+    if (flock_broker_apply(source, device, object, op) != 0) return -1;
+    int fd = (int)source->fd;
     int idx = flock_companion_identity(device, object);
     if (idx < 0) return -1;
     int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
@@ -197,6 +200,15 @@ static void flock_on_close(int fd) {
 #include <sched.h>
 #include <stdint.h>
 #define POSLK_MAX 8192
+#define FLOCK_BROKER_MAX 512
+#define FLOCK_HOLDERS_MAX 32
+
+struct flock_broker_record {
+    uint64_t device, object, token;
+    int32_t holders[FLOCK_HOLDERS_MAX];
+    uint8_t mode;
+    uint8_t active;
+};
 
 struct poslk_rec {
     uint64_t device;
@@ -210,6 +222,8 @@ struct poslk_shm {
     _Atomic int32_t lockword; // 0 = free, else host pid of the holder (spinlock; stolen from a dead holder)
     int32_t hi;               // high-water slot count (bounds the linear scan)
     struct poslk_rec rec[POSLK_MAX];
+    _Atomic uint64_t flock_generation;
+    struct flock_broker_record flock[FLOCK_BROKER_MAX];
 };
 static struct poslk_shm *g_poslk;
 // PERF: the hot path must issue ZERO host syscalls (the point of). Two process-local caches make that
@@ -269,6 +283,96 @@ static void poslk_lock(void) {
 
 static void poslk_unlock(void) {
     atomic_store_explicit(&g_poslk->lockword, 0, memory_order_release);
+}
+
+static int flock_holder_find(struct flock_broker_record *record, int32_t pid) {
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] == pid) return index;
+    return -1;
+}
+static int flock_holder_add(struct flock_broker_record *record, int32_t pid) {
+    if (flock_holder_find(record, pid) >= 0) return 0;
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] == 0) {
+        record->holders[index] = pid; return 0;
+    }
+    errno = ENOLCK; return -1;
+}
+static int flock_has_holders(const struct flock_broker_record *record) {
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] != 0) return 1;
+    return 0;
+}
+static int flock_broker_apply(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int operation) {
+    if (g_poslk == NULL || source->flock_token == 0) { errno = ENOLCK; return -1; }
+    int base = operation & ~LOCK_NB;
+    if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) { errno = EINVAL; return -1; }
+    for (;;) {
+        struct flock_broker_record *own = NULL, *free_record = NULL;
+        int conflict = 0;
+        uint64_t before = atomic_load_explicit(&g_poslk->flock_generation, memory_order_acquire);
+        poslk_lock();
+        for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
+            struct flock_broker_record *record = &g_poslk->flock[index];
+            if (!record->active) { if (free_record == NULL) free_record = record; continue; }
+            for (int holder = 0; holder < FLOCK_HOLDERS_MAX; ++holder)
+                if (record->holders[holder] > 0 && kill(record->holders[holder], 0) < 0 && errno == ESRCH)
+                    record->holders[holder] = 0;
+            if (!flock_has_holders(record)) {
+                memset(record, 0, sizeof(*record));
+                if (free_record == NULL) free_record = record;
+                continue;
+            }
+            if (record->token == source->flock_token) { own = record; continue; }
+            if (record->device == device && record->object == object && record->mode != 0 && base != LOCK_UN &&
+                (base == LOCK_EX || record->mode == LOCK_EX)) conflict = 1;
+        }
+        if (!conflict && base == LOCK_UN) {
+            if (own != NULL) own->mode = 0;
+        } else if (!conflict) {
+            if (own == NULL) {
+                if (free_record == NULL) { poslk_unlock(); errno = ENOLCK; return -1; }
+                own = free_record;
+                memset(own, 0, sizeof(*own));
+                own->device = device; own->object = object; own->token = source->flock_token; own->active = 1;
+            }
+            if (flock_holder_add(own, getpid()) != 0) { poslk_unlock(); return -1; }
+            own->mode = (uint8_t)base;
+        }
+        if (!conflict) atomic_fetch_add_explicit(&g_poslk->flock_generation, 1, memory_order_release);
+        poslk_unlock();
+        if (!conflict) return 0;
+        if (operation & LOCK_NB) { errno = EWOULDBLOCK; return -1; }
+        do { struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL); }
+        while (atomic_load_explicit(&g_poslk->flock_generation, memory_order_acquire) == before);
+    }
+}
+
+static void flock_broker_detach(const hl_linux_fd_snapshot *source) {
+    if (g_poslk == NULL || source->flock_token == 0 || source->descriptor_references != 1) return;
+    poslk_lock();
+    for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
+        struct flock_broker_record *record = &g_poslk->flock[index];
+        if (!record->active || record->token != source->flock_token) continue;
+        int holder = flock_holder_find(record, getpid());
+        if (holder >= 0) record->holders[holder] = 0;
+        if (!flock_has_holders(record)) memset(record, 0, sizeof(*record));
+        atomic_fetch_add_explicit(&g_poslk->flock_generation, 1, memory_order_release);
+        break;
+    }
+    poslk_unlock();
+}
+
+static void flock_broker_after_fork(void) {
+    if (g_poslk == NULL || g_linux_box == NULL) return;
+    poslk_lock();
+    for (uint32_t fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
+        hl_linux_fd_snapshot source;
+        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &source) != HL_STATUS_OK || source.flock_token == 0) continue;
+        for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
+            struct flock_broker_record *record = &g_poslk->flock[index];
+            if (record->active && record->token == source.flock_token) (void)flock_holder_add(record, getpid());
+        }
+    }
+    atomic_fetch_add_explicit(&g_poslk->flock_generation, 1, memory_order_release);
+    poslk_unlock();
 }
 
 // A free slot (reuse a vacated one, else grow the high-water). NULL when the table is full.
