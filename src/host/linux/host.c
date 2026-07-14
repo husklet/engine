@@ -44,7 +44,8 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_PROCESS = 6,
     HL_LINUX_HANDLE_COUNTER = 7,
     HL_LINUX_HANDLE_TRANSFER = 8,
-    HL_LINUX_HANDLE_DIRECTORY = 9
+    HL_LINUX_HANDLE_DIRECTORY = 9,
+    HL_LINUX_HANDLE_WATCH = 10
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -68,6 +69,16 @@ typedef struct hl_linux_timer_entry {
     uint64_t token;
     int descriptor;
 } hl_linux_timer_entry;
+
+typedef struct hl_linux_watch {
+    int watched_descriptor;
+    int watch_id;
+    uint64_t delivered_generation;
+    uint64_t modified_ns;
+    uint64_t changed_ns;
+    nlink_t links;
+    hl_host_watch_record record;
+} hl_linux_watch;
 
 typedef struct hl_linux_counter_subscription {
     struct hl_host_linux *host;
@@ -1409,6 +1420,135 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
     return close(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static int hl_linux_watch_refresh(hl_linux_watch *watch) {
+    struct stat status;
+    if (fstat(watch->watched_descriptor, &status) != 0) return -1;
+    uint64_t modified = (uint64_t)status.st_mtim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtim.tv_nsec;
+    uint64_t changed = (uint64_t)status.st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_ctim.tv_nsec;
+    uint64_t size = status.st_size < 0 ? 0 : (uint64_t)status.st_size;
+    uint32_t changes = 0;
+    if ((uint64_t)status.st_dev != watch->record.stable_device ||
+        (uint64_t)status.st_ino != watch->record.stable_object)
+        changes |= HL_HOST_WATCH_IDENTITY;
+    if (size != watch->record.size) changes |= HL_HOST_WATCH_SIZE;
+    if (modified != watch->modified_ns || changed != watch->changed_ns) changes |= HL_HOST_WATCH_DATA;
+    if (status.st_nlink == 0 && watch->links != 0) changes |= HL_HOST_WATCH_DELETED;
+    if (changes != 0) {
+        if (watch->record.generation != watch->delivered_generation) changes |= watch->record.changes;
+        watch->record.generation++;
+        if (watch->record.generation == 0) watch->record.generation = 1;
+        watch->record.stable_device = (uint64_t)status.st_dev;
+        watch->record.stable_object = (uint64_t)status.st_ino;
+        watch->record.size = size;
+        watch->record.changes = changes;
+        watch->modified_ns = modified;
+        watch->changed_ns = changed;
+        watch->links = status.st_nlink;
+    }
+    return 0;
+}
+
+static hl_host_result hl_linux_watch_open(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    int source, watched = -1, notify = -1, watch_id = -1;
+    pthread_mutex_lock(&host->lock);
+    source = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    if (source >= 0) watched = fcntl(source, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (watched < 0) return source < 0 ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0) : hl_linux_errno_result();
+    notify = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    char path[64];
+    if (notify >= 0 && snprintf(path, sizeof path, "/proc/self/fd/%d", watched) < (int)sizeof path)
+        watch_id = inotify_add_watch(notify, path, IN_MODIFY | IN_ATTRIB | IN_MOVE_SELF | IN_DELETE_SELF);
+    struct stat status;
+    if (notify < 0 || watch_id < 0 || fstat(watched, &status) != 0) {
+        hl_host_result error = hl_linux_errno_result();
+        if (notify >= 0) close(notify);
+        close(watched);
+        return error;
+    }
+    hl_linux_watch *watch = calloc(1, sizeof(*watch));
+    if (watch == NULL) { close(notify); close(watched); return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0); }
+    watch->watched_descriptor = watched;
+    watch->watch_id = watch_id;
+    watch->record = (hl_host_watch_record){1, (uint64_t)status.st_dev, (uint64_t)status.st_ino,
+                                           status.st_size < 0 ? 0 : (uint64_t)status.st_size, 0, 0};
+    watch->delivered_generation = 1;
+    watch->modified_ns = (uint64_t)status.st_mtim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtim.tv_nsec;
+    watch->changed_ns = (uint64_t)status.st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_ctim.tv_nsec;
+    watch->links = status.st_nlink;
+    hl_host_result result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_WATCH, notify, watch, NULL, 0, watched);
+    if (result.status != HL_STATUS_OK) { close(notify); close(watched); free(watch); }
+    return result;
+}
+
+static hl_host_result hl_linux_watch_query(void *context, hl_host_handle handle, hl_host_watch_record *record) {
+    hl_host_linux *host = context;
+    if (record == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_WATCH);
+    hl_linux_watch *watch = entry == NULL ? NULL : entry->address;
+    int result = watch == NULL ? -2 : hl_linux_watch_refresh(watch);
+    if (result == 0) *record = watch->record;
+    pthread_mutex_unlock(&host->lock);
+    if (result == -2) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_watch_drain(void *context, hl_host_handle handle, hl_host_watch_record *records,
+                                           size_t capacity) {
+    hl_host_linux *host = context;
+    char buffer[4096];
+    if (records == NULL || capacity == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_WATCH);
+    hl_linux_watch *watch = entry == NULL ? NULL : entry->address;
+    if (watch == NULL) { pthread_mutex_unlock(&host->lock); return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0); }
+    uint32_t native_changes = 0;
+    for (;;) {
+        ssize_t count = read(entry->descriptor, buffer, sizeof buffer);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (count <= 0) break;
+        for (size_t offset = 0; offset < (size_t)count;) {
+            struct inotify_event *event = (struct inotify_event *)(void *)(buffer + offset);
+            native_changes |= event->mask;
+            offset += sizeof(*event) + event->len;
+        }
+    }
+    if (native_changes != 0) {
+        watch->record.generation++;
+        if (watch->record.generation == 0) watch->record.generation = 1;
+        watch->record.changes = 0;
+        if (native_changes & (IN_MODIFY | IN_ATTRIB)) watch->record.changes |= HL_HOST_WATCH_DATA;
+        if (native_changes & IN_MOVE_SELF) watch->record.changes |= HL_HOST_WATCH_IDENTITY;
+        if (native_changes & (IN_DELETE_SELF | IN_IGNORED)) watch->record.changes |= HL_HOST_WATCH_DELETED;
+    }
+    int refreshed = hl_linux_watch_refresh(watch);
+    int available = refreshed == 0 && watch->record.generation != watch->delivered_generation;
+    if (available) { records[0] = watch->record; watch->delivered_generation = watch->record.generation; }
+    pthread_mutex_unlock(&host->lock);
+    if (refreshed < 0) return hl_linux_errno_result();
+    return available ? hl_linux_result(HL_STATUS_OK, 1, 0) : hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+}
+
+static hl_host_result hl_linux_watch_close(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    uint32_t low = (uint32_t)handle;
+    if (low == 0 || low - 1u >= HL_LINUX_HANDLE_CAPACITY) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_WATCH);
+    if (entry == NULL) { pthread_mutex_unlock(&host->lock); return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0); }
+    int notify = entry->descriptor, watched = entry->wake_descriptor;
+    hl_linux_watch *watch = entry->address;
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    entry->descriptor = -1; entry->wake_descriptor = -1; entry->address = NULL;
+    pthread_mutex_unlock(&host->lock);
+    hl_host_process_fd_private_remove(notify); hl_host_process_fd_private_remove(watched);
+    close(notify); close(watched); free(watch);
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_linux_event_create(void *context) {
     hl_host_linux *host = context;
     struct epoll_event event = {0};
@@ -1461,19 +1601,26 @@ static hl_host_result hl_linux_event_control(void *context, hl_host_handle polls
         object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_DIRECTORY, HL_LINUX_HANDLE_DIRECTORY);
     if (object_fd < 0)
         object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_TRANSFER, HL_LINUX_HANDLE_TRANSFER);
-    pthread_mutex_unlock(&host->lock);
-    if (pollset_fd < 0 || object_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (token == 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (object_fd < 0)
+        object_fd = hl_linux_descriptor(host, object, HL_LINUX_HANDLE_WATCH, HL_LINUX_HANDLE_WATCH);
+    if (pollset_fd < 0 || object_fd < 0 || token == 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     if (operation == HL_HOST_EVENT_ADD)
         native_operation = EPOLL_CTL_ADD;
     else if (operation == HL_HOST_EVENT_MODIFY)
         native_operation = EPOLL_CTL_MOD;
     else if (operation == HL_HOST_EVENT_DELETE)
         native_operation = EPOLL_CTL_DEL;
-    else
+    else {
+        pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    return epoll_ctl(pollset_fd, native_operation, object_fd, &event) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0)
-                                                                           : hl_linux_errno_result();
+    }
+    int result = epoll_ctl(pollset_fd, native_operation, object_fd, &event);
+    hl_host_result output = result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+    pthread_mutex_unlock(&host->lock);
+    return output;
 }
 
 static hl_host_result hl_linux_event_wait(void *context, hl_host_handle pollset, hl_host_event_record *events,
@@ -2521,6 +2668,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_linux_directory_create, hl_linux_directory_add,
         hl_linux_directory_modify, hl_linux_directory_remove, hl_linux_directory_read,   hl_linux_directory_duplicate,
         hl_linux_directory_close};
+    static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), hl_linux_watch_open,
+                                                  hl_linux_watch_query, hl_linux_watch_drain,
+                                                  hl_linux_watch_close};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
@@ -2567,7 +2717,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_NETWORK |
                                  HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING |
-                                 HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY;
+                                 HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY |
+                                 HL_HOST_CAP_WATCH;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -2581,6 +2732,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->counter = &counter;
     out_services->transfer = &transfer;
     out_services->directory = &directory;
+    out_services->watch = &watch;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -2624,6 +2776,10 @@ void hl_host_linux_destroy(hl_host_linux *host) {
                 free(object->pending);
                 free(object);
             }
+        } else if (entry->kind == HL_LINUX_HANDLE_WATCH) {
+            close(entry->descriptor);
+            close(entry->wake_descriptor);
+            free(entry->address);
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);
