@@ -1,7 +1,7 @@
 # Architecture contract
 
-The only guest operating-system personality in the portable engine is Linux. Guest ISA and host CPU are independent
-axes. Host operating-system behavior enters only through `hl_host_services`.
+The engine has one guest operating-system personality: Linux. Guest ISA and host CPU are independent axes. The
+portable contract requires host operating-system behavior to enter through `hl_host_services`.
 
 ## Boundary rules
 
@@ -32,6 +32,12 @@ contracts.
 parts of the translator and Linux ABI and therefore compile as unity objects. Independently compiled core, translator,
 Linux ABI, and host-service sources live in their corresponding archives. New shared behavior belongs in those
 archives; shrinking the two target roots must preserve both guest ISAs and the public lifecycle contract.
+
+macOS is the current production host. These unity roots still reach macOS mechanisms directly, including Mach fault
+and process inspection, `kqueue`, JIT write protection, instruction-cache maintenance, and parts of fork and signal
+handling. The translator cache also creates a macOS host backend instead of receiving the engine's selected services.
+Those paths are implementation debt, not exceptions to the boundary rules above. The Linux host backend implements
+and tests service groups, but no production Linux-host guest executable is currently built or exercised end to end.
 
 ## Rebranding
 

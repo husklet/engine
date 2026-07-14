@@ -1,8 +1,9 @@
 # hl-engine
 
-Standalone, pure-C execution engine for Linux guests. Guest instruction translation and the Linux ABI are independent
-of the host operating system; host behavior is supplied through a small service interface. macOS is the primary host
-today. Linux has a native host-service backend, with its supported service groups tested independently.
+Standalone, pure-C execution engine for Linux guests. macOS is the current production host. A typed host-service ABI
+defines the portable boundary, and Linux has a native backend whose implemented service groups are tested
+independently. The production target roots do not yet use that boundary exclusively, so Linux-host execution is not
+end-to-end production-ready.
 
 ## Build and test
 
@@ -13,13 +14,14 @@ make compat-build
 make format-check
 ```
 
-Make orchestrates the C compiler and archiver. Project tooling and tests are C; there are no Python or shell-script
-build/test helpers. CMake metadata is also provided for installation and Rust `build.rs` consumers.
+Make orchestrates the C compiler and archiver. Maintained tooling and tests are C, and the normal build and test path
+does not require Python or shell-script helpers. CMake metadata is also provided for installation and Rust `build.rs`
+consumers.
 
-Tagged logging is absent from release call sites. Build with `make DEBUG=1` to compile it in, then select tags with
-`HL_LOG=log:fs,log:jit` or the launch wire's `debug_log_offset`. Available tags are `fs`, `jit`, `syscall`, `process`,
-`network`, `signal`, and `translate`; `log:all` enables every tag. Filtering is common portable-core behavior,
-while each host backend only supplies the final byte sink.
+Tagged logging calls compile to no-ops in release builds. Build with `make DEBUG=1` to compile them in, then select
+tags with `HL_LOG=log:fs,log:jit` or the launch wire's `debug_log_offset`. Available tags are `fs`, `jit`, `syscall`,
+`process`, `network`, `signal`, and `translate`; `log:all` enables every tag. Filtering is common portable-core
+behavior, while each host backend only supplies the final byte sink.
 
 ## Domains
 
@@ -36,8 +38,9 @@ while each host backend only supplies the final byte sink.
   includes the remaining target-specific translator and Linux ABI implementation.
 - `tests` — C unit and Linux compatibility tests.
 
-The dependency direction is `runner -> core -> translator + linux_abi -> host_services <- host backend`.
-Platform headers are forbidden in portable source and checked by a C domain tool.
+The intended dependency direction is `runner -> core -> translator + linux_abi -> host_services <- host backend`.
+Independently compiled portable sources follow this rule and are checked by a C domain tool. The current production
+unity roots still include platform-dependent implementation files, as described below.
 
 The build emits separate `libhl-engine`, `libhl-translator`, `libhl-linux-abi`, and host-backend archives. Code already
 listed as a standalone archive source is compiled independently. The two target roots remain unity objects and link
@@ -45,8 +48,9 @@ against those archives; their textual includes are the remaining boundary to rem
 
 ## Current status
 
-The libraries provide ABI validation, IR construction and validation, concurrent Linux fd/OFD semantics, host
-services, tagged debug logging, and the public lifecycle. The macOS executables run AArch64 and x86-64 Linux guests
-through the typed `hl_launch_config` wire. macOS is a host backend only; Linux is the sole guest personality.
+The libraries provide ABI validation, IR construction and validation, Linux fd/OFD semantics, host services, tagged
+debug logging, and the public lifecycle. The macOS executables run AArch64 and x86-64 Linux guests through the typed
+`hl_launch_config` wire. Linux is the sole guest personality; native macOS programs are not a supported guest. The
+Linux backend is currently validated at the service and unit-test boundaries, not by a production guest run.
 
 See `docs/ARCHITECTURE.md` for the dependency and ownership rules.
