@@ -218,7 +218,7 @@ static int cmsg_level_m2l(int lv) {
 
 static int cmsg_eventfd_marker(const struct dd_cmsg_eventfd_meta *m) {
     if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
-    char tn[] = "/tmp/.ddcmsgXXXXXX";
+    char tn[] = "/tmp/.hl-cmsgXXXXXX";
     int fd = mkstemp(tn);
     if (fd < 0) return -1;
     unlink(tn);
@@ -798,8 +798,8 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // Generalizes the loopback redirect from "127/8 -> per-container dir" to "this user network's subnet ->
 // SHARED per-network dir". A guest TCP socket whose peer is ANOTHER container's IP on the same user
 // network (same /16 as our own HL_IP, and not 127/8) is routed to an AF_UNIX socket at
-//   /tmp/.ddbr-<HL_NETBR>/<ip>:<port>
-// The listening container (bind 0.0.0.0:<port> or its own IP) LISTENS on /tmp/.ddbr-<netid>/<ownip>:<port>;
+//   /tmp/.hl-bridge-<HL_NETBR>/<ip>:<port>
+// The listening container listens on /tmp/.hl-bridge-<netid>/<ownip>:<port>;
 // a peer connect(<ownip>:<port>) dials the same path. Because every container on the host is a JIT
 // process under the same user, the two AF_UNIX endpoints rendezvous with no bridge / TUN / root. The dir
 // is keyed by <netid> (mode 0700, the guest is path-jailed) so other networks never share sockets. The
@@ -906,7 +906,7 @@ static void br_init(void) {
     g_br_init = 1;
     const char *nbr = hl_option_get("HL_NETBR");
     if (nbr && nbr[0]) {
-        snprintf(g_netbr, sizeof g_netbr, "/tmp/.ddbr-%.40s", nbr);
+        snprintf(g_netbr, sizeof g_netbr, "/tmp/.hl-bridge-%.40s", nbr);
         mkdir(g_netbr, 0700); // shared per-network dir; EEXIST is fine (peers share it)
     }
     const char *dip = hl_option_get("HL_IP");
@@ -1351,7 +1351,7 @@ static void *udp_fwd_thread(void *p) {
         return NULL;
     }
     f->hs = hs;
-    snprintf(f->pdir, sizeof f->pdir, "/tmp/.ddudp.%d.%u", (int)getpid(), (unsigned)f->hport);
+    snprintf(f->pdir, sizeof f->pdir, "/tmp/.hl-udp.%d.%u", (int)getpid(), (unsigned)f->hport);
     mkdir(f->pdir, 0700);
     char buf[65536];
     for (;;) {
@@ -1784,7 +1784,7 @@ static void abs_init(void) {
     if (g_abs_init) return;
     g_abs_init = 1;
     const char *ns = hl_option_get("HL_NETNS"); // same key used by ipc_ns_key (service.c)
-    snprintf(g_absdir, sizeof g_absdir, "/tmp/.ddabs-%.40s", (ns && ns[0]) ? ns : "default");
+    snprintf(g_absdir, sizeof g_absdir, "/tmp/.hl-abstract-%.40s", (ns && ns[0]) ? ns : "default");
     mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
 }
 

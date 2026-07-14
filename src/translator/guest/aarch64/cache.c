@@ -191,8 +191,8 @@ static uint64_t pcache_id_of(const char *path) {
     return hl_digest_bytes(h, path, strlen(path));
 }
 
-// Per-engine-build tag so the cache self-invalidates across dd rebuilds (host bytes from a different build
-// must never load). __DATE__/__TIME__ change every (re)build -> a user who updates dd gets a fresh cache
+// Per-engine-build tag so the cache self-invalidates across engine rebuilds (host bytes from another build
+// must never load). __DATE__/__TIME__ change every (re)build, so an update gets a fresh cache
 // transparently (old files just go unreferenced; harmless cruft in the cache dir).
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
@@ -216,7 +216,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 
 static void pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
-    if (!dir || !dir[0]) dir = "/tmp/ddjit-pcache-arm64";
+    if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-aarch64";
     mkdir(dir, 0700);
     snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
 }

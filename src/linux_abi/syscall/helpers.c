@@ -53,7 +53,7 @@ static int nofile_gate(int r) {
 // fcntl record locks stay on the real fd, disjoint from the companion. LOCK_SH->F_RDLCK, LOCK_EX->F_WRLCK,
 // LOCK_NB->F_SETLK (else F_SETLKW), LOCK_UN->F_UNLCK. Per-fd state (fd<DD_NFD) drives release-on-close so a
 // held flock is dropped when its last fd closes, matching flock's "released on last close" semantics.
-#define FLOCK_DIR "/tmp/.ddflock"
+#define FLOCK_DIR "/tmp/.hl-flock"
 static uint8_t g_flock_type[DD_NFD]; // per guest fd: 0 none, else LOCK_SH / LOCK_EX currently held via companion
 
 static struct {

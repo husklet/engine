@@ -27,7 +27,7 @@ static hl_option_definition hl_option_definitions[] = {
     HL_RUNTIME_OPTION("HL_EGRESS_SOCKS", "configured external network egress proxy"),
     HL_RUNTIME_OPTION("HL_FSGEN_FILE", "shared filesystem-generation state"),
     HL_RUNTIME_OPTION("HL_GID", "initial guest group identity"),
-    HL_RUNTIME_OPTION("HL_GPU_BRIDGE_NAME", "compositor bridge endpoint"),
+    HL_RUNTIME_OPTION("HL_GPU_BRIDGE_NAME", "explicit macOS presentation-service endpoint"),
     HL_RUNTIME_OPTION("HL_GPU_IOSURFACE", "enable the configured macOS GPU presentation path"),
     HL_RUNTIME_OPTION("HL_GPU_POOL", "shared GPU buffer-pool descriptor"),
     HL_RUNTIME_OPTION("HL_GPU_POOL_N", "shared GPU buffer-pool capacity"),

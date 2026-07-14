@@ -81,9 +81,9 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // fork and preserved across dd's in-process execve -- matching Linux's SECCOMP_FILTER semantics.
     case 277: { // seccomp(op, flags, args)
         unsigned op = (unsigned)a0;
-        if (op == DD_SECCOMP_SET_MODE_FILTER) {
+        if (op == HL_LINUX_SECCOMP_SET_MODE_FILTER) {
             G_RET(c) = (uint64_t)(int64_t)seccomp_install_filter(a2, (uint32_t)a1);
-        } else if (op == DD_SECCOMP_SET_MODE_STRICT) {
+        } else if (op == HL_LINUX_SECCOMP_SET_MODE_STRICT) {
             // strict takes no flags/args (SECCOMP_SET_MODE_STRICT): both must be zero, else -EINVAL.
             G_RET(c) = (a1 || a2) ? (uint64_t)(-EINVAL) : (uint64_t)(int64_t)seccomp_set_strict();
         } else {
@@ -114,7 +114,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
         }
-        char tn[] = "/tmp/.ddmemfdXXXXXX";
+        char tn[] = "/tmp/.hl-memfdXXXXXX";
         int fd = mkstemp(tn);
         if (fd >= 0) {
             unlink(tn);

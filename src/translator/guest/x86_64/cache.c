@@ -147,7 +147,7 @@ static uint64_t pcache_id_of(const char *path) {
 // A per-engine-build tag mixed into every cache id so the cache self-invalidates across dd versions:
 // host code emitted by a DIFFERENT engine build is never loaded (loading it would crash). __DATE__/
 // __TIME__ change on every (re)build, so a user who updates dd transparently gets a fresh cache --
-// they never need to clear ~/.dd/pcache by hand. (Old files just go unreferenced; harmless cruft.)
+// stale files become unreferenced automatically when the engine build changes.
 static uint64_t pcache_engine_id(void) {
     uint64_t h = 1469598103934665603ull;
     for (const char *p = __DATE__ " " __TIME__; *p; p++) {
@@ -173,7 +173,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 
 static void pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
-    if (!dir || !dir[0]) dir = "/tmp/ddjit-pcache";
+    if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-x86_64";
     mkdir(dir, 0700);
     snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
 }

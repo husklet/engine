@@ -218,7 +218,7 @@ static void fd_reset_emul(int fd) {
         g_devtty[fd] = 0;
         unix_bind_clear(fd);
 #ifdef __APPLE__
-        if (g_devdri[fd]) dd_gpu_free_fd(fd); // release the render node's IOSurfaces on close
+        if (g_devdri[fd]) hl_gpu_free_fd(fd); // release the render node's IOSurfaces on close
 #endif
         g_devdri[fd] = 0;
         g_lo_port[fd] = 0;
@@ -278,11 +278,11 @@ static int at_dirfd_check(int dirfd, const char *raw) {
 // ---- guest xattr passthrough (overlay G5) -----------------------------------------------------------
 // Real overlayfs exposes a file's xattrs (file caps, SELinux labels, user.* attrs) and copies them up on
 // write; dd used to stub set->ignore / get->ENODATA / list->empty, silently dropping them (a correctness
-// trap -- setcap "succeeded" but getcap saw nothing). We namespace guest xattrs under `user.ddx.` on the
-// host backing inode so they round-trip AND survive copy-up (ovl_copy_xattrs carries `user.ddx.*`),
-// without colliding with dd's own `user.dd.*` owner attrs or host/macOS attrs. The macOS errno is mapped
+// trap -- setcap "succeeded" but getcap saw nothing). We namespace guest xattrs under `user.hl.guest.` on
+// the host backing inode so they round-trip AND survive copy-up, without colliding with the engine's
+// `user.hl.owner.*` attrs or host/macOS attrs. The macOS errno is mapped
 // to Linux at the dispatch boundary (ENOATTR->ENODATA).
-#define DDX_PFX "user.ddx."
+#define HL_GUEST_XATTR_PREFIX "user.hl.guest."
 
 // Host backing path for a path-based xattr op. forwrite copies a lower-only file up first (attr lands on
 // the writable upper). Returns 0 (host filled) or -errno.
@@ -309,9 +309,10 @@ static int xattr_hostpath(const char *path, int nofollow, int forwrite, char *ho
 // (an if/else-if), so CREATE+REPLACE on an existing attr yields EEXIST, on a missing one yields ENODATA.
 // So we resolve the create/replace precondition ourselves against a host existence probe and hand macOS
 // a plain set (flags=0), which reproduces the kernel byte-for-byte and never leaks macOS's EINVAL.
-static long ddx_set(const char *host, const char *name, const void *val, size_t sz, uint64_t lflags, int nofollow) {
+static long guest_xattr_set(const char *host, const char *name, const void *val, size_t sz, uint64_t lflags,
+                            int nofollow) {
     char hn[512];
-    snprintf(hn, sizeof hn, "%s%s", DDX_PFX, name ? name : "");
+    snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
     int opt = nofollow ? XATTR_NOFOLLOW : 0;
     if (lflags & 3) { // XATTR_CREATE(1) | XATTR_REPLACE(2)
         int exists = getxattr(host, hn, NULL, 0, 0, opt) >= 0;
@@ -321,30 +322,30 @@ static long ddx_set(const char *host, const char *name, const void *val, size_t 
     return setxattr(host, hn, val, sz, 0, opt) < 0 ? -errno : 0;
 }
 
-static long ddx_get(const char *host, const char *name, void *val, size_t sz, int opt) {
+static long guest_xattr_get(const char *host, const char *name, void *val, size_t sz, int opt) {
     char hn[512];
-    snprintf(hn, sizeof hn, "%s%s", DDX_PFX, name ? name : "");
+    snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
     ssize_t r = getxattr(host, hn, val, sz, 0, opt);
     return r < 0 ? -errno : r;
 }
 
-static long ddx_remove(const char *host, const char *name, int opt) {
+static long guest_xattr_remove(const char *host, const char *name, int opt) {
     char hn[512];
-    snprintf(hn, sizeof hn, "%s%s", DDX_PFX, name ? name : "");
+    snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
     return removexattr(host, hn, opt) < 0 ? -errno : 0;
 }
 
-// List only the guest-visible (user.ddx.*) attrs, prefix stripped, into the guest buffer. sz==0 -> size.
-static long ddx_list(const char *host, char *out, size_t sz, int opt) {
+// List only guest-visible attrs, prefix stripped, into the guest buffer. sz==0 returns the required size.
+static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
     char raw[65536];
     ssize_t n = listxattr(host, raw, sizeof raw, opt);
     if (n < 0) return -errno;
-    size_t need = 0, pl = strlen(DDX_PFX);
+    size_t need = 0, pl = strlen(HL_GUEST_XATTR_PREFIX);
     for (ssize_t i = 0; i < n;) {
         const char *nm = raw + i;
         size_t l = strlen(nm);
         i += l + 1;
-        if (l > pl && !strncmp(nm, DDX_PFX, pl)) {
+        if (l > pl && !strncmp(nm, HL_GUEST_XATTR_PREFIX, pl)) {
             const char *g = nm + pl;
             size_t gl = strlen(g) + 1;
             if (sz) {
@@ -426,7 +427,7 @@ static int64_t svc_mount(struct cpu *c, uint64_t a_src, uint64_t a_tgt, uint64_t
         return 0;
     // tmpfs / ramfs: back the mount point with a fresh, empty host scratch dir.
     if (!strcmp(ft, "tmpfs") || !strcmp(ft, "ramfs")) {
-        char tmpl[] = "/tmp/.ddtmpfsXXXXXX";
+        char tmpl[] = "/tmp/.hl-tmpfsXXXXXX";
         if (!mkdtemp(tmpl)) return -errno;
         int64_t r = rt_add_vol(tgt, tmpl, (fl & 0x1) ? 1 : 0);
         if (r < 0) rmdir(tmpl);
@@ -518,7 +519,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) = (uint64_t)(int64_t)ddx_set(host, (const char *)a1, (const void *)a2, (size_t)a3, a4, nr == 6);
+        G_RET(c) =
+            (uint64_t)(int64_t)guest_xattr_set(host, (const char *)a1, (const void *)a2, (size_t)a3, a4, nr == 6);
         break;
     }
     // getxattr(8)/lgetxattr(9)/fgetxattr(10): a0=path|fd, a1=name, a2=val, a3=size
@@ -536,7 +538,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         G_RET(c) =
-            (uint64_t)(int64_t)ddx_get(host, (const char *)a1, (void *)a2, (size_t)a3, nr == 9 ? XATTR_NOFOLLOW : 0);
+            (uint64_t)(int64_t)guest_xattr_get(host, (const char *)a1, (void *)a2, (size_t)a3,
+                                               nr == 9 ? XATTR_NOFOLLOW : 0);
         break;
     }
     // listxattr(11)/llistxattr(12)/flistxattr(13): a0=path|fd, a1=list, a2=size
@@ -553,7 +556,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) = (uint64_t)(int64_t)ddx_list(host, (char *)a1, (size_t)a2, nr == 12 ? XATTR_NOFOLLOW : 0);
+        G_RET(c) =
+            (uint64_t)(int64_t)guest_xattr_list(host, (char *)a1, (size_t)a2, nr == 12 ? XATTR_NOFOLLOW : 0);
         break;
     }
     // removexattr(14)/lremovexattr(15)/fremovexattr(16): a0=path|fd, a1=name
@@ -570,7 +574,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)e;
             break;
         }
-        G_RET(c) = (uint64_t)(int64_t)ddx_remove(host, (const char *)a1, nr == 15 ? XATTR_NOFOLLOW : 0);
+        G_RET(c) =
+            (uint64_t)(int64_t)guest_xattr_remove(host, (const char *)a1, nr == 15 ? XATTR_NOFOLLOW : 0);
         break;
     }
     case 17: {
@@ -2053,7 +2058,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int fd = -1, e = ENOENT;
             for (int t = 0; t < 64; t++) {
                 char nm[40];
-                snprintf(nm, sizeof nm, ".dd_tmpfile_%d_%d", (int)getpid(), rand());
+                snprintf(nm, sizeof nm, ".hl-tmpfile-%d-%d", (int)getpid(), rand());
                 fd = openat(dfd, nm, O_CREAT | O_EXCL | O_RDWR, (mode_t)(a3 ? a3 : 0600));
                 e = errno;
                 if (fd >= 0) {
@@ -2161,7 +2166,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
                 // /proc/[self|pid]/auxv (rustix/libc read it)
                 if (strstr(rp, "/auxv")) {
-                    char tn[] = "/tmp/.ddauxvXXXXXX";
+                    char tn[] = "/tmp/.hl-auxvXXXXXX";
                     int afd = mkstemp(tn);
                     if (afd >= 0) {
                         unlink(tn);

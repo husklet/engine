@@ -400,7 +400,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        // NET bridge: bind(0.0.0.0 / own-ip / in-subnet :port) -> LISTEN on /tmp/.ddbr-<netid>/<ownip>:<port>.
+        // NET bridge: bind(0.0.0.0 / own-ip / in-subnet :port) -> the namespace's private bridge path.
         // A dual-stack listener that binds `::` (busybox nc's default, and many servers') is the IPv6 analogue
         // of 0.0.0.0 and takes the same path (br6_any_is), so it's reachable by peer containers over the switch
         // instead of landing on the isolated per-container loopback (which broke cross-container reach-by-name).
@@ -683,7 +683,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
-        // NET bridge: connect(peer-ip:port in our subnet) -> dial /tmp/.ddbr-<netid>/<peerip>:<port>
+        // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
         if (br_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_stream[(int)a0] && br_connect_is(sa, (socklen_t)a2)) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));

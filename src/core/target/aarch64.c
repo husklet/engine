@@ -508,7 +508,7 @@ static void install_mach_exc(void) {
 
 // Fork-server seam: the original guest entry inlined (1)
 // container init, (2) engine init (signal handlers + pthread key + code-cache arena + env flags), and
-// (3) per-launch load+run. The resident ddjitd parent must pay (1)+(2) ONCE and share them COW with
+// (3) per-launch load+run. The resident engine server pays (1)+(2) once and shares them COW with
 // every forked worker, so those phases are factored into container_init()/engine_global_init().
 // engine_global_init() is idempotent (g_engine_inited) so the standalone path is unchanged: standalone
 // hl_run_linux_guest() composes container_init -> engine_global_init -> load_program -> run_loaded in the exact
@@ -556,7 +556,7 @@ static void container_init(const char *rootfs) {
                 snprintf(key, sizeof key, "%.39s", nn);
             else
                 snprintf(key, sizeof key, "%d", (int)getpid());
-            snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", key);
+            snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", key);
             // Export the minted key so children/exec + abstract-AF_UNIX/IPC/bridge share this
             // container's namespace (hl_option_get("HL_NETNS")); a daemon-supplied key is already in the env.
             if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(nn && nn[0])) hl_option_set("HL_NETNS", key, 1);
@@ -676,7 +676,7 @@ static int engine_global_init(void) {
     // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
     // never be mid-flight when a guest forks without exec (which would abort the child via libobjc's
     // fork-safety guard). Gated on HL_GPU_IOSURFACE; a no-op for every other workload.
-    dd_gpu_prewarm_fork_safety();
+    hl_gpu_prewarm_fork_safety();
     g_engine_inited = 1;
     return 0;
 }
@@ -832,7 +832,7 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     return ec;
 }
 
-// resident ddjitd fork-server (server/client/worker), SHARED with linux_x86_64.c through the
+// resident engine fork server (server/client/worker), shared with the x86-64 target through the
 // container-init/engine-init/load/run seam above. aarch64 has no
 // g_loadbase and its container model never chdir()s the engine into the rootfs (those knobs stay
 // default no-ops), but its load_elf applies per-segment W^X to the guest image (.text R+X, .rodata R;
@@ -886,10 +886,10 @@ int hl_engine_entry(int argc, char **argv) {
     // Final-product launch: the host provides one serialized, validated HL config file.
     if (route.mode == HL_CLI_CONFIG) return hl_run_config_file(route.config_path);
     // fork-server dispatch (gated; standalone path untouched when neither flag is present):
-    //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run resident ddjitd, listen on SOCK
-    //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to a ddjitd
-    if (route.mode == HL_CLI_SERVER) return ddjitd_server_main(argc, argv);
-    if (route.mode == HL_CLI_CLIENT) return ddjitd_client_main(argc, argv);
+    //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run the resident engine server
+    //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to that server
+    if (route.mode == HL_CLI_SERVER) return hl_server_main(argc, argv);
+    if (route.mode == HL_CLI_CLIENT) return hl_client_main(argc, argv);
     // container flags (SentryConfig)
     while (ai < argc && argv[ai][0] == '-' && argv[ai][1] == '-') {
         if (!strcmp(argv[ai], "--rootfs") && ai + 1 < argc) {
@@ -915,7 +915,7 @@ int hl_engine_entry(int argc, char **argv) {
             ai += 2;
             // ro overlay lower layer
         } else if (!strcmp(argv[ai], "--netns") && ai + 1 < argc) {
-            snprintf(g_netns, sizeof g_netns, "/tmp/.ddnet-%.40s", argv[ai + 1]);
+            snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", argv[ai + 1]);
             mkdir(g_netns, 0700);
             ai += 2;
             // private loopback ns

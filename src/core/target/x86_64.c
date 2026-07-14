@@ -101,7 +101,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 // ---------------- entry ----------------
 // Fork-server refactor: the original guest entry inlined container init, engine init,
 // (pthread key + MAP_JIT arena + signal handlers + trace env), and (3) per-launch load+run. The
-// resident ddjitd parent must pay (1)+(2) ONCE and share them COW with every forked worker, so
+// resident engine server pays (1)+(2) once and shares them COW with every forked worker, so
 // those two phases are factored into container_init()/engine_global_init(). engine_global_init()
 // is idempotent (g_engine_inited) so the standalone path is byte-for-byte unchanged: standalone
 // hl_run_linux_guest() composes container_init -> engine_global_init -> load_program -> run_loaded in the
@@ -165,7 +165,7 @@ static void container_init(const char *rootfs) {
             snprintf(key, sizeof key, "%.39s", ns);
         else
             snprintf(key, sizeof key, "%d", (int)getpid());
-        snprintf(g_netns, sizeof g_netns, "/tmp/dd-lo-%s", key);
+        snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", key);
         if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(ns && ns[0])) hl_option_set("HL_NETNS", key, 1);
     }
     {
@@ -257,7 +257,7 @@ static int engine_global_init(void) {
     // inits to completion HERE, single-threaded and BEFORE any guest thread/fork, so a lazy +initialize can
     // never be mid-flight when a guest forks (which would abort the child via libobjc's fork-safety guard).
     // Gated on HL_GPU_IOSURFACE; a no-op for every other workload. Mirrors targets/linux_aarch64.c.
-    dd_gpu_prewarm_fork_safety();
+    hl_gpu_prewarm_fork_safety();
     g_engine_inited = 1;
     return 0;
 }
@@ -392,7 +392,7 @@ int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]) {
     return ec;
 }
 
-// resident ddjitd fork-server (server/client/worker) -- SHARED with linux_aarch64.c, driven
+// resident engine fork server (server/client/worker), shared with the AArch64 target and driven
 // through the container-init/engine-init/load/run seam defined above.
 // x86-only knobs: the warm re-run must re-point g_loadbase, and the x86 container model chdir()s the
 // engine process into the rootfs (container_init does; the warm path must match it per request).
@@ -427,10 +427,10 @@ int hl_engine_entry(int argc, char **argv) {
     // Final-product launch: the host provides one serialized, validated HL config file.
     if (route.mode == HL_CLI_CONFIG) return hl_run_config_file(route.config_path);
     // W3D fork-server dispatch (gated; standalone path untouched when neither flag is present):
-    //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run resident ddjitd, listen on SOCK
-    //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to a ddjitd
-    if (route.mode == HL_CLI_SERVER) return ddjitd_server_main(argc, argv);
-    if (route.mode == HL_CLI_CLIENT) return ddjitd_client_main(argc, argv);
+    //   --server SOCK [--rootfs DIR] [--prewarm PROG] : run the resident engine server
+    //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to that server
+    if (route.mode == HL_CLI_SERVER) return hl_server_main(argc, argv);
+    if (route.mode == HL_CLI_CLIENT) return hl_client_main(argc, argv);
     while (ai + 1 < argc) { // --rootfs DIR / --vol guest:host (repeatable)
         if (strcmp(argv[ai], "--rootfs") == 0) {
             rootfs = argv[ai + 1];

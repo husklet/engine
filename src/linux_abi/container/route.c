@@ -15,7 +15,7 @@ static const char *shm_backing_path(const char *guest, char *buf, size_t n) {
     if (!guest || guest[0] != '/' || strncmp(guest, "/dev/shm/", 9)) return NULL;
     const char *name = guest + 9;
     int pfx = g_vfs_namespace.root_canonical[0] ? snprintf(buf, n, "%s/dev/shm/", g_vfs_namespace.root_canonical)
-                                                : snprintf(buf, n, "/tmp/.ddshm-");
+                                                : snprintf(buf, n, "/tmp/.hl-shm-");
     if (pfx < 0 || pfx >= (int)n - 1) return NULL;
     int m = pfx + snprintf(buf + pfx, n - (size_t)pfx, "%s", name);
     if (m > (int)n - 1) m = (int)n - 1;

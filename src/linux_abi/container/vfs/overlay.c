@@ -399,7 +399,7 @@ static void overlay_mkparents(const char *guest) {
 // write touched them, and reproducible builds saw wrong timestamps. These helpers carry the full metadata.
 
 // Copy every xattr from src host file to dst (final component; NOFOLLOW). Carries guest-visible xattrs
-// (the user.ddx.* namespace, file caps) AND dd's own owner xattrs (user.dd.uid/gid) across a copy-up.
+// (the user.hl.guest.* namespace, file caps) and engine owner xattrs (user.hl.owner.*) across a copy-up.
 static void ovl_copy_xattrs(const char *src, const char *dst) {
     char names[16384];
     ssize_t n = listxattr(src, names, sizeof names, XATTR_NOFOLLOW);

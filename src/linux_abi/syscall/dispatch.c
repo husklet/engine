@@ -1,7 +1,7 @@
 // brk arena
 static uint64_t brk_lo, brk_cur, brk_hi;
 // W3D fork-server prewarm/worker: when set, the guest's exit_group UNWINDS run_guest (sets c->exited
-// + c->exit_code) instead of _exit()ing, so the resident ddjitd parent survives pre-translating a
+// + c->exit_code) instead of _exit()ing, so the resident engine server survives pre-translating a
 // binary into the COW arena and a worker can report its exit code before dying. 0 on every normal
 // (standalone) run -> exit_group behaves exactly as before.
 int g_noexit;
@@ -392,7 +392,7 @@ static struct hl_linux_affinity g_affinity;
 // Back a short synthesized sysfs string with an anonymous temp fd (the same trick proc_open uses for
 // the macOS-has-no-/proc case). Returns a readable fd positioned at offset 0, or -1 on error.
 static int synth_str_fd(const char *s) {
-    char tn[] = "/tmp/.ddcpuXXXXXX";
+    char tn[] = "/tmp/.hl-cpuXXXXXX";
     int fd = mkstemp(tn);
     if (fd < 0) return -1;
     unlink(tn);

@@ -364,7 +364,7 @@ static void srv_sigint(int s) {
     g_srv_stop = 1;
 }
 
-static int ddjitd_server_main(int argc, char **argv) {
+static int hl_server_main(int argc, char **argv) {
     const char *sock = NULL, *rootfs = NULL, *prewarm = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--server") == 0 && i + 1 < argc)
@@ -375,7 +375,7 @@ static int ddjitd_server_main(int argc, char **argv) {
             prewarm = argv[++i];
     }
     if (!sock) {
-        fprintf(stderr, "usage: ddjit --server SOCK [--rootfs DIR] [--prewarm PROG]\n");
+        fprintf(stderr, "usage: hl-engine --server SOCK [--rootfs DIR] [--prewarm PROG]\n");
         return 2;
     }
     if (rootfs) snprintf(g_srv_rootfs, sizeof g_srv_rootfs, "%s", rootfs);
@@ -445,7 +445,8 @@ static int ddjitd_server_main(int argc, char **argv) {
         close(sv1);
         close(sv2);
         g_warm_ready = 1;
-        fprintf(stderr, "[ddjitd] prewarmed %s: arena=%lld KB\n", prewarm, (long long)((g_cp - g_cache) / 1024));
+        fprintf(stderr, "[hl-engine-server] prewarmed %s: arena=%lld KB\n", prewarm,
+                (long long)((g_cp - g_cache) / 1024));
     }
 
     // SIGCHLD stays at the DEFAULT disposition: runners are reaped by the kqueue EVFILT_PROC handler
@@ -479,7 +480,7 @@ static int ddjitd_server_main(int argc, char **argv) {
         perror("listen");
         return 1;
     }
-    fprintf(stderr, "[ddjitd] listening on %s (warm=%d rootfs=%s)\n", sock, g_warm_ready,
+    fprintf(stderr, "[hl-engine-server] listening on %s (warm=%d rootfs=%s)\n", sock, g_warm_ready,
             g_srv_rootfs[0] ? g_srv_rootfs : "(none)");
 
     g_fsrv_ls = ls;
@@ -646,7 +647,7 @@ static void fwd_sig(int s) {
     if (p > 0) kill(p, s);
 }
 
-static int ddjitd_client_main(int argc, char **argv) {
+static int hl_client_main(int argc, char **argv) {
     const char *sock = NULL;
     int ai = 1;
     while (ai < argc) {
@@ -659,7 +660,7 @@ static int ddjitd_client_main(int argc, char **argv) {
             break;
     }
     if (!sock || ai >= argc) {
-        fprintf(stderr, "usage: ddjit --client SOCK [--rootfs DIR] PROG [args...]\n");
+        fprintf(stderr, "usage: hl-engine --client SOCK [--rootfs DIR] PROG [args...]\n");
         return 2;
     }
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -686,7 +687,7 @@ static int ddjitd_client_main(int argc, char **argv) {
     int32_t cl = cwd[0] ? (int32_t)strlen(cwd) + 1 : 0;
     if (pack_strvec(buf, sizeof buf, &o, argc - ai, argv + ai) != 0 ||
         pack_strvec(buf, sizeof buf, &o, nenv, environ) != 0 || o + 4 + (size_t)cl > sizeof buf) {
-        fprintf(stderr, "ddjit --client: request too large\n");
+        fprintf(stderr, "hl-engine --client: request too large\n");
         return 1;
     }
     memcpy(buf + o, &cl, 4);

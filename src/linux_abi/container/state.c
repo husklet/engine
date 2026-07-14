@@ -412,11 +412,11 @@ static int cgid(void) {
 // "don't change" (POSIX chown) -> leave that xattr untouched so the other id / the default survives.
 // xattrs live on the real APFS upper file, so they persist across a re-stat AND across processes.
 #include <sys/xattr.h>
-#define DD_XATTR_UID "user.dd.uid"
-#define DD_XATTR_GID "user.dd.gid"
+#define HL_OWNER_XATTR_UID "user.hl.owner.uid"
+#define HL_OWNER_XATTR_GID "user.hl.owner.gid"
 // PERF (sqlite-select / any stat-heavy workload): reading the guest-chown xattr back on EVERY stat cost
 // two macOS fgetxattr/getxattr per stat (~2.5us each on APFS even for a MISS -> ~5us/stat, 40-50x native
-// fstat). But the dd.uid/dd.gid xattr is set ONLY by an explicit guest chown or a cred-dropped create
+// fstat). But the owner uid/gid xattr is set ONLY by an explicit guest chown or a cred-dropped create
 // (chown_xattr_set_*); the overwhelmingly common file has none. So keep a per-inode NEGATIVE cache: once
 // we confirm an inode carries no dd xattr, skip the syscalls on repeat stats of the same inode. A global
 // generation counter (bumped on every set) invalidates the whole cache the instant any chown xattr is
@@ -429,11 +429,11 @@ static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nof
     int opt = nofollow ? XATTR_NOFOLLOW : 0;
     if (uid >= 0) {
         uint32_t v = (uint32_t)uid;
-        setxattr(hostpath, DD_XATTR_UID, &v, sizeof v, 0, opt);
+        setxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, opt);
     }
     if (gid >= 0) {
         uint32_t v = (uint32_t)gid;
-        setxattr(hostpath, DD_XATTR_GID, &v, sizeof v, 0, opt);
+        setxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, opt);
     }
     if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
 }
@@ -441,11 +441,11 @@ static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nof
 static void chown_xattr_set_fd(int fd, int uid, int gid) {
     if (uid >= 0) {
         uint32_t v = (uint32_t)uid;
-        fsetxattr(fd, DD_XATTR_UID, &v, sizeof v, 0, 0);
+        fsetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0);
     }
     if (gid >= 0) {
         uint32_t v = (uint32_t)gid;
-        fsetxattr(fd, DD_XATTR_GID, &v, sizeof v, 0, 0);
+        fsetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0);
     }
     if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
 }
@@ -462,20 +462,20 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
     uint32_t v;
     int present = 0;
     if (fd >= 0) {
-        if (fgetxattr(fd, DD_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (fgetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *uid = (int)v;
             present = 1;
         }
-        if (fgetxattr(fd, DD_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (fgetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *gid = (int)v;
             present = 1;
         }
     } else {
-        if (getxattr(hostpath, DD_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (getxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *uid = (int)v;
             present = 1;
         }
-        if (getxattr(hostpath, DD_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (getxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *gid = (int)v;
             present = 1;
         }

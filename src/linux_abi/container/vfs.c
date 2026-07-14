@@ -121,22 +121,27 @@ static uint8_t g_devtty[DD_NFD];
 // tools). Recorded on a successful AF_UNIX bind (net.c); a pathname keeps its guest path, an abstract name
 // is stored as "@name". Empty slot = not a bound unix socket. Process-local (one net-namespace per engine).
 static char g_unix_bind[DD_NFD][108];
+
 static void unix_bind_note(int fd, const char *guestname) {
     if (fd >= 0 && fd < DD_NFD && guestname) snprintf(g_unix_bind[fd], sizeof g_unix_bind[fd], "%s", guestname);
 }
+
 static void unix_bind_clear(int fd) {
     if (fd >= 0 && fd < DD_NFD) g_unix_bind[fd][0] = 0;
 }
+
 // /dev/dri/renderD128: the synthesized GPU render node (GPU rung 2). 1 = this fd is the render node, so
 // its ioctl routes to the GPU allocator. Set only when HL_GPU_IOSURFACE gates the path on.
 static uint8_t g_devdri[DD_NFD];
 // HL_GPU_IOSURFACE opt-in: the whole host-IOSurface GPU path (render-node synth + alloc ioctl) is inert
 // unless the typed launch configuration enables it. Cached; -1 = unqueried.
 static int g_gpu_iosurface = -1;
+
 static int gpu_iosurface_on(void) {
     if (g_gpu_iosurface < 0) g_gpu_iosurface = hl_option_get("HL_GPU_IOSURFACE") != NULL ? 1 : 0;
     return g_gpu_iosurface;
 }
+
 // Overlay merged-getdents snapshot cursor reset (rewinddir/seekdir on an overlay dir). Defined in fs.c
 // where g_ovldents lives, but the lseek handler (io.c) is included before fs.c, so forward-declare it.
 static void ovldents_rewind(int fd, int pos);
@@ -177,7 +182,10 @@ static void eventfd_count_init(void) {
 // guest's REAL blocking/non-blocking intent lives here instead; the read path consults it and blocks via
 // poll() when the guest asked to block. Propagated on dup + SCM_RIGHTS import alongside the peer/slot.
 static uint8_t g_eventfd_gnb[DD_NFD];
-static int eventfd_guest_nb(int fd) { return (fd >= 0 && fd < DD_NFD) ? g_eventfd_gnb[fd] : 0; }
+
+static int eventfd_guest_nb(int fd) {
+    return (fd >= 0 && fd < DD_NFD) ? g_eventfd_gnb[fd] : 0;
+}
 
 __attribute__((constructor)) static void eventfd_count_ctor(void) {
     eventfd_count_init();
@@ -195,7 +203,10 @@ __attribute__((constructor)) static void eventfd_count_ctor(void) {
 // private (in-process multi-threading is the case that matters -- the counter's own MAP_SHARED cross-fork
 // sharing stays best-effort, unchanged); re-init in the fork child so an inherited-locked copy can't wedge.
 static pthread_mutex_t g_eventfd_lock = PTHREAD_MUTEX_INITIALIZER;
-static void eventfd_after_fork(void) { pthread_mutex_init(&g_eventfd_lock, NULL); }
+
+static void eventfd_after_fork(void) {
+    pthread_mutex_init(&g_eventfd_lock, NULL);
+}
 
 static uint8_t g_eventfd_sema[DD_NFD]; // EFD_SEMAPHORE: read() returns 1 and decrements by 1, not the whole counter
 // Alias refcount per counter-slot: a dup() of an eventfd creates a second guest fd that shares the SAME
@@ -204,10 +215,12 @@ static uint8_t g_eventfd_sema[DD_NFD]; // EFD_SEMAPHORE: read() returns 1 and de
 // LAST alias closes, so closing one duplicate never tears the object out from under the others. A non-dup'd
 // eventfd keeps refs==1, so its close path is byte-identical to before.
 static int g_eventfd_refs[DD_NFD];
+
 static int eventfd_counter_slot(int fd) {
     if (fd >= 0 && fd < DD_NFD && g_eventfd_cslot[fd] > 0) return g_eventfd_cslot[fd] - 1;
     return fd;
 }
+
 static int eventfd_hidden_peer_fd(int fd) {
     if (fd < 0) return 0;
     for (int i = 0; i < DD_NFD; i++)
@@ -601,10 +614,12 @@ static uint8_t g_memfd_is[DD_NFD];
 static int g_memfd_seal[DD_NFD];
 
 #define MEMFD_REG_MAX 4096
+
 struct memfd_reg_ent {
     uint64_t dev, ino;
     int seals;
 };
+
 struct memfd_reg {
     volatile int lock;
     int n;
@@ -695,6 +710,7 @@ static int memfd_seals_fd(int fd) {
     if (!memfd_ensure_fd(fd)) return 0;
     return (fd >= 0 && fd < DD_NFD) ? g_memfd_seal[fd] : 0;
 }
+
 // pipe read-pushback (tee(2)): tee() consumes bytes from the source pipe to copy them, then re-queues them
 // here so the next read()/readv() on that fd re-serves them -> tee leaves the source pipe intact.
 static uint8_t *g_fd_pushback[DD_NFD];
@@ -1212,7 +1228,7 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
 // Back a synthesized text file with an anonymous temp fd (mkstemp + immediate unlink): the fd holds the
 // content, has no name, and behaves like an ordinary read-only file. Returns the fd, or -1 on error.
 static int proc_text_fd(const char *buf, int n) {
-    char tn[] = "/tmp/.ddprocXXXXXX";
+    char tn[] = "/tmp/.hl-procXXXXXX";
     int fd = mkstemp(tn);
     if (fd >= 0) {
         unlink(tn);
@@ -1227,9 +1243,7 @@ static char g_proc_text_desc[DD_NFD][64];
 
 static int proc_text_fd_tagged(const char *buf, int n, const char *desc) {
     int fd = proc_text_fd(buf, n);
-    if (fd >= 0 && fd < DD_NFD && desc) {
-        snprintf(g_proc_text_desc[fd], sizeof g_proc_text_desc[fd], "%s", desc);
-    }
+    if (fd >= 0 && fd < DD_NFD && desc) { snprintf(g_proc_text_desc[fd], sizeof g_proc_text_desc[fd], "%s", desc); }
     return fd;
 }
 
@@ -1237,7 +1251,7 @@ static int proc_text_host_path(const char *path) {
     if (!path || !path[0]) return 0;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    return !strncmp(base, ".ddproc", 7);
+    return !strncmp(base, ".hl-proc", 8);
 }
 
 // ---- guest comm + canonical-exe tracking (the /proc/self/exe surface) ----
@@ -1471,14 +1485,23 @@ static int maps_phdr_segs(struct mseg *seg, int maxn) {
         uint64_t hi = (bias + vaddr + memsz + 0xfff) & ~0xfffULL;
         int prot = ((flags & 4) ? 4 : 0) | ((flags & 2) ? 2 : 0) | ((flags & 1) ? 1 : 0); // R|W|X
         // A writable segment whose start is covered by relro: emit the relro prefix as r--p, the rest rw-p.
-        if ((prot & 2) && relro_hi > relro_lo && relro_lo >= lo && relro_hi <= hi && relro_hi > lo &&
-            nseg + 1 < maxn) {
-            if (relro_lo > lo) { seg[nseg].lo = lo; seg[nseg].hi = relro_lo; seg[nseg].prot = prot; nseg++; }
+        if ((prot & 2) && relro_hi > relro_lo && relro_lo >= lo && relro_hi <= hi && relro_hi > lo && nseg + 1 < maxn) {
+            if (relro_lo > lo) {
+                seg[nseg].lo = lo;
+                seg[nseg].hi = relro_lo;
+                seg[nseg].prot = prot;
+                nseg++;
+            }
             seg[nseg].lo = relro_lo > lo ? relro_lo : lo;
             seg[nseg].hi = relro_hi;
             seg[nseg].prot = 4; // r--p (read-only after relocation)
             nseg++;
-            if (relro_hi < hi) { seg[nseg].lo = relro_hi; seg[nseg].hi = hi; seg[nseg].prot = prot; nseg++; }
+            if (relro_hi < hi) {
+                seg[nseg].lo = relro_hi;
+                seg[nseg].hi = hi;
+                seg[nseg].prot = prot;
+                nseg++;
+            }
             continue;
         }
         seg[nseg].lo = lo;
@@ -1521,7 +1544,7 @@ static int maprow_cmp(const void *a, const void *b) {
 // below it, as the kernel shows) is what glibc's pthread_getattr_np scans for; [heap] is what jemalloc/
 // glibc-malloc/redis/pmap look for. Returns an anonymous fd holding the content, or -1 on error.
 static int proc_maps_fd(int smaps) {
-    char tn[] = "/tmp/.ddprocXXXXXX";
+    char tn[] = "/tmp/.hl-procXXXXXX";
     int fd = mkstemp(tn);
     if (fd < 0) return -1;
     if (fd < DD_NFD) g_proc_text_ro[fd] = 1;
@@ -1662,8 +1685,8 @@ static int proc_status_text(char *b, size_t n) {
         "Speculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\tunknown\n"
         "Cpus_allowed:\t%s\nCpus_allowed_list:\t%s\nvoluntary_ctxt_switches:\t1\n"
         "nonvoluntary_ctxt_switches:\t0\n",
-        comm, pid, pid, ppid, uid_r, uid_e, uid_s, uid_fs, gid_r, gid_e, gid_s, gid_fs, groups, vsz, vsz, vmlck,
-        rss, rss, rss, threads, (unsigned long long)DD_CAP_DEFAULT, (unsigned long long)g_cap_eff,
+        comm, pid, pid, ppid, uid_r, uid_e, uid_s, uid_fs, gid_r, gid_e, gid_s, gid_fs, groups, vsz, vsz, vmlck, rss,
+        rss, rss, threads, (unsigned long long)DD_CAP_DEFAULT, (unsigned long long)g_cap_eff,
         (unsigned long long)g_cap_bnd, g_nnp, cpumask, cpulist);
 }
 
@@ -1699,6 +1722,7 @@ static int proc_stat_text(char *b, size_t n) {
 // with getenv. Using this blob makes them consistent. (build_stack in elf.c is compiled after vfs.c.)
 static char g_self_environ[16384];
 static int g_self_environ_len = 0;
+
 static void set_guest_environ(const char *const *env, int envc) {
     int o = 0;
     for (int i = 0; i < envc && env && env[i]; i++) {
@@ -1798,7 +1822,7 @@ static int proc_fd_dir_open(void) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddfddirXXXXXX";
+    char tmpl[] = "/tmp/.hl-fd-dirXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     for (int fd = 0; fd < DD_NFD; fd++) {
         if (eventfd_hidden_peer_fd(fd)) continue;
@@ -1844,7 +1868,7 @@ static int proc_fdinfo_dir_open(const char *guestpath) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddfdinfoXXXXXX";
+    char tmpl[] = "/tmp/.hl-fd-infoXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     for (int fd = 0; fd < DD_NFD; fd++) {
         if (eventfd_hidden_peer_fd(fd)) continue;
@@ -1882,6 +1906,7 @@ static int proc_reg_read(int hostpid, char *comm, size_t csz, char *cmd, size_t 
 // otherwise lost every argument after an exec with many args.
 static char g_self_cmdline[8192];
 static int g_self_cmdline_len = 0;
+
 static void set_guest_cmdline(int argc, char *const argv[]) {
     int o = 0;
     for (int i = 0; i < argc && argv && argv[i]; i++) {
@@ -1967,15 +1992,16 @@ static int proc_mountinfo_text(char *b, size_t n) {
     //  - /dev/shm is its OWN tmpfs mount with src name "shm" (glibc shm_open/DSM back onto it); size=65536k
     //    is docker's default 64M (the host may enlarge it -- size is a host-variant field).
     //  - cgroup2 leaf is ro with src "cgroup" + nsdelegate (JVM/systemd v2 detection keys on this line).
-    int len = snprintf(b, n,
-                       "23 0 0:24 / / rw,relatime - overlay overlay rw\n"
-                       "24 23 0:25 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
-                       "25 23 0:26 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755\n"
-                       "26 25 0:27 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666\n"
-                       "27 23 0:28 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro\n"
-                       "28 27 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate\n"
-                       "29 25 0:30 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw\n"
-                       "30 25 0:31 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k\n");
+    int len =
+        snprintf(b, n,
+                 "23 0 0:24 / / rw,relatime - overlay overlay rw\n"
+                 "24 23 0:25 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+                 "25 23 0:26 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755\n"
+                 "26 25 0:27 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666\n"
+                 "27 23 0:28 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro\n"
+                 "28 27 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate\n"
+                 "29 25 0:30 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw\n"
+                 "30 25 0:31 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k\n");
     if (len < 0 || (size_t)len >= n) return len;
     return (int)mount_binds_append(b, n, (size_t)len, 0);
 }
@@ -2012,11 +2038,11 @@ static void proc_reg_key(char *out, size_t n) {
             if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')) s[o++] = *p;
         s[o] = 0;
         if (o) {
-            snprintf(out, n, "/tmp/.ddpids.%s", s);
+            snprintf(out, n, "/tmp/.hl-pids.%s", s);
             return;
         }
     }
-    snprintf(out, n, "/tmp/.ddpids.s%d", (int)getsid(0));
+    snprintf(out, n, "/tmp/.hl-pids.s%d", (int)getsid(0));
 }
 
 // This process's own registry file (unlinked on exit; the exit_group path calls proc_reg_unlink since
@@ -2325,7 +2351,7 @@ static int proc_fd_dir_pid_open(int host) {
     if (!fds) return -1;
     int got = proc_pidinfo(host, PROC_PIDLISTFDS, 0, fds, cap);
     int nfd = got > 0 ? got / (int)sizeof(struct proc_fdinfo) : 0;
-    char tmpl[] = "/tmp/.ddpfddirXXXXXX";
+    char tmpl[] = "/tmp/.hl-proc-fd-dirXXXXXX";
     if (!mkdtemp(tmpl)) {
         free(fds);
         return -1;
@@ -2344,9 +2370,9 @@ static int proc_fd_dir_pid_open(int host) {
             }
         }
         if (!have) {
-            const char *k = fds[i].proc_fdtype == PROX_FDTYPE_SOCKET
-                                ? "socket"
-                                : fds[i].proc_fdtype == PROX_FDTYPE_PIPE ? "pipe" : "anon_inode";
+            const char *k = fds[i].proc_fdtype == PROX_FDTYPE_SOCKET ? "socket"
+                            : fds[i].proc_fdtype == PROX_FDTYPE_PIPE ? "pipe"
+                                                                     : "anon_inode";
             snprintf(tgt, sizeof tgt, "%s:[%d]", k, fd);
         }
         char link[80];
@@ -2472,8 +2498,7 @@ static int cgroup_procs_text(char *buf, size_t n, int with_threads) {
         }
         closedir(d);
     }
-    if (!have_self && (size_t)o < n - 16)
-        o += snprintf(buf + o, n - (size_t)o, "%d\n", container_pid());
+    if (!have_self && (size_t)o < n - 16) o += snprintf(buf + o, n - (size_t)o, "%d\n", container_pid());
     if (with_threads && (size_t)o < n - 16) {
         int tids[256];
         int self_gp = container_pid();
@@ -2567,10 +2592,12 @@ static int ns_link_target(const char *name, char *out, size_t cap) {
               {"user", 4026531837u},
               {"uts", 4026531838u},
               {0, 0}};
+
     for (int i = 0; NS[i].nm; i++)
         if (!strcmp(name, NS[i].nm)) return snprintf(out, cap, "%s:[%u]", NS[i].nm, NS[i].ino);
     return -1;
 }
+
 // ================= guest-pid namespace (kill/pidfd host-authority containment) =================
 // dd runs every guest process as a real host (macOS) process, and historically used the host pid 1:1 as
 // the guest pid. That let a guest kill(2)/pidfd_send_signal an ARBITRARY same-user HOST pid -- a sibling
@@ -2602,6 +2629,7 @@ static int container_host_member(int h) {
 // Resolve a GUEST pid to its container-local host pid and require membership. gp==1 -> the init. Returns 1
 // and fills *hostout when gp names a process inside this container; 0 (leaving *hostout resolved) otherwise.
 static int container_gpid_member(int gp, int *hostout) __attribute__((unused));
+
 static int container_gpid_member(int gp, int *hostout) {
     int host = (gp == 1 && g_init_hostpid) ? g_init_hostpid : gp;
     if (hostout) *hostout = host;
@@ -2758,9 +2786,8 @@ static int proc_status_pid_text(char *b, size_t n, int gp, int host) {
         "Speculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\tunknown\n"
         "Cpus_allowed:\t%s\nCpus_allowed_list:\t%s\nvoluntary_ctxt_switches:\t1\n"
         "nonvoluntary_ctxt_switches:\t0\n",
-        comm, state, state_name, gp, gp, ppid, groups, vsz, vsz, rss, rss, rss, 1,
-        (unsigned long long)DD_CAP_DEFAULT, (unsigned long long)DD_CAP_DEFAULT, (unsigned long long)DD_CAP_DEFAULT,
-        cpumask, cpulist);
+        comm, state, state_name, gp, gp, ppid, groups, vsz, vsz, rss, rss, rss, 1, (unsigned long long)DD_CAP_DEFAULT,
+        (unsigned long long)DD_CAP_DEFAULT, (unsigned long long)DD_CAP_DEFAULT, cpumask, cpulist);
 }
 
 // /proc/<pid>/cmdline for a peer -- the published NUL-separated argv (fallback: the comm).
@@ -2848,15 +2875,14 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddppidXXXXXX";
+    char tmpl[] = "/tmp/.hl-proc-pidXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     // The per-pid file set. Direct open/stat serve every name here (proc_open), so listing them makes
     // readdir-based discovery agree with direct probing (mountinfo/limits/environ/smaps/pagemap/io were
     // openable but hidden from `ls /proc/self`).
-    static const char *const files[] = {"stat",      "statm",         "status",  "cmdline",   "comm",
-                                        "maps",      "oom_score_adj", "oom_adj", "oom_score", "mountinfo",
-                                        "limits",    "environ",       "smaps",   "pagemap",   "io",
-                                        "mounts",    "cgroup",        0};
+    static const char *const files[] = {"stat",          "statm",   "status",    "cmdline",   "comm",   "maps",
+                                        "oom_score_adj", "oom_adj", "oom_score", "mountinfo", "limits", "environ",
+                                        "smaps",         "pagemap", "io",        "mounts",    "cgroup", 0};
     for (int i = 0; files[i]; i++) {
         char p[64];
         snprintf(p, sizeof p, "%s/%s", tmpl, files[i]);
@@ -2893,7 +2919,7 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
 // single-threaded case; enough for htop to count the process). Returns the fd or -1.
 static int proc_task_dir_open(int gp) {
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddptaskXXXXXX";
+    char tmpl[] = "/tmp/.hl-proc-taskXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     char p[64];
     snprintf(p, sizeof p, "%s/%d", tmpl, gp);
@@ -2928,8 +2954,10 @@ static int proc_task_dir_open(int gp) {
 static const char *proc_deself(const char *rp, char *out, size_t osz) {
     if (!rp) return rp;
     const char *tail = NULL;
-    if (!strncmp(rp, "/proc/self/", 11)) tail = rp + 10; // keep the leading '/'
-    else if (!strncmp(rp, "/proc/thread-self/", 18)) tail = rp + 17;
+    if (!strncmp(rp, "/proc/self/", 11))
+        tail = rp + 10; // keep the leading '/'
+    else if (!strncmp(rp, "/proc/thread-self/", 18))
+        tail = rp + 17;
     if (!tail) return rp;
     snprintf(out, osz, "/proc/%d%s", container_pid(), tail);
     return out;
@@ -2995,7 +3023,7 @@ static int proc_root_dir_open(void) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddprootXXXXXX";
+    char tmpl[] = "/tmp/.hl-proc-rootXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     // ONLY names proc_open()/synth_stat actually serve -- listing an unserved name makes `ls /proc` stat it
     // and print "No such file or directory". "self" is the magic symlink (handled in synth_stat).
@@ -3083,7 +3111,7 @@ static int sysnet_dir_open(const char *gp) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddnetXXXXXX";
+    char tmpl[] = "/tmp/.hl-netXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     for (int i = 0; entries[i]; i++) {
         char p[96];
@@ -3142,7 +3170,7 @@ static int syscpu_dir_open(const char *gp) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddcpudXXXXXX";
+    char tmpl[] = "/tmp/.hl-cpu-dirXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     char gpath[48];
     if (is_base) {
@@ -3183,7 +3211,7 @@ static int synth_names_dir_open(const char *guestpath, const char *const *names,
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddsdirXXXXXX";
+    char tmpl[] = "/tmp/.hl-sys-dirXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     for (int i = 0; names[i]; i++) {
         char p[160];
@@ -3246,9 +3274,9 @@ static int synth_misc_dir_open(const char *gp) {
     if (!strcmp(gp, "/dev/fd") || !strcmp(gp, "/dev/fd/")) return proc_fd_dir_open(); // /dev/fd == /proc/self/fd
     // /proc/net: direct leaves (tcp/dev/unix/…) exist but the dir must enumerate them too.
     if (!strcmp(gp, "/proc/net") || !strcmp(gp, "/proc/net/")) {
-        static const char *const net[] = {"tcp",   "tcp6",     "udp",  "udp6",  "unix", "dev",
-                                          "route", "if_inet6", "snmp", "snmp6", "netstat",
-                                          "sockstat", "sockstat6", "ipv6_route", 0};
+        static const char *const net[] = {"tcp",     "tcp6",     "udp",       "udp6",       "unix",
+                                          "dev",     "route",    "if_inet6",  "snmp",       "snmp6",
+                                          "netstat", "sockstat", "sockstat6", "ipv6_route", 0};
         return synth_names_dir_open("/proc/net", net, 0);
     }
     // /proc/tty: tty discovery tools (agetty, `ls /proc/tty`) walk this before reading drivers.
@@ -3266,8 +3294,9 @@ static int synth_misc_dir_open(const char *gp) {
             while (q[i] >= '0' && q[i] <= '9')
                 i++;
             if (i > 0 && (!strcmp(q + i, "/ns") || !strcmp(q + i, "/ns/"))) {
-                static const char *const ns[] = {"cgroup", "ipc", "mnt",  "net", "pid", "pid_for_children",
-                                                 "time",   "time_for_children", "user", "uts", 0};
+                static const char *const ns[] = {
+                    "cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "time", "time_for_children",
+                    "user",   "uts", 0};
                 return synth_names_dir_open(rp, ns, 1);
             }
             if (i > 0 && (!strcmp(q + i, "/fdinfo") || !strcmp(q + i, "/fdinfo/"))) return proc_fdinfo_dir_open(rp);
@@ -3275,16 +3304,41 @@ static int synth_misc_dir_open(const char *gp) {
     }
     // /sys/fs/cgroup root: advertised in mountinfo, so a directory walk of the hierarchy must list it.
     if (!strcmp(gp, "/sys/fs/cgroup") || !strcmp(gp, "/sys/fs/cgroup/")) {
-        static const char *const cg[] = {
-            "cgroup.controllers", "cgroup.subtree_control", "cgroup.type",      "cgroup.procs",
-            "cgroup.threads",     "cgroup.events",          "cgroup.stat",      "cgroup.max.depth",
-            "cgroup.max.descendants", "cpu.max",            "cpu.stat",         "cpu.weight",
-            "cpuset.cpus",        "cpuset.mems",            "cpuset.cpus.effective", "cpuset.mems.effective",
-            "memory.max",         "memory.min",             "memory.low",       "memory.high",
-            "memory.current",     "memory.peak",            "memory.events",    "memory.stat",
-            "memory.swap.max",    "memory.swap.current",    "memory.oom.group", "pids.max",
-            "pids.current",       "pids.peak",              "pids.events",      "io.max",
-            "io.stat",            "io.weight",              0};
+        static const char *const cg[] = {"cgroup.controllers",
+                                         "cgroup.subtree_control",
+                                         "cgroup.type",
+                                         "cgroup.procs",
+                                         "cgroup.threads",
+                                         "cgroup.events",
+                                         "cgroup.stat",
+                                         "cgroup.max.depth",
+                                         "cgroup.max.descendants",
+                                         "cpu.max",
+                                         "cpu.stat",
+                                         "cpu.weight",
+                                         "cpuset.cpus",
+                                         "cpuset.mems",
+                                         "cpuset.cpus.effective",
+                                         "cpuset.mems.effective",
+                                         "memory.max",
+                                         "memory.min",
+                                         "memory.low",
+                                         "memory.high",
+                                         "memory.current",
+                                         "memory.peak",
+                                         "memory.events",
+                                         "memory.stat",
+                                         "memory.swap.max",
+                                         "memory.swap.current",
+                                         "memory.oom.group",
+                                         "pids.max",
+                                         "pids.current",
+                                         "pids.peak",
+                                         "pids.events",
+                                         "io.max",
+                                         "io.stat",
+                                         "io.weight",
+                                         0};
         return synth_names_dir_open("/sys/fs/cgroup", cg, 0);
     }
     // /sys/class/block + /sys/block: storage sysfs (lsblk/installers). No real block devices are backed,
@@ -3301,10 +3355,18 @@ static int synth_misc_dir_open(const char *gp) {
             while (*d >= '0' && *d <= '9')
                 d++;
             if (!strcmp(d, "/topology") || !strcmp(d, "/topology/")) {
-                static const char *const topo[] = {
-                    "core_id",          "physical_package_id", "cluster_id",        "thread_siblings",
-                    "thread_siblings_list", "core_siblings",   "core_siblings_list", "core_cpus",
-                    "core_cpus_list",   "package_cpus",        "package_cpus_list", 0};
+                static const char *const topo[] = {"core_id",
+                                                   "physical_package_id",
+                                                   "cluster_id",
+                                                   "thread_siblings",
+                                                   "thread_siblings_list",
+                                                   "core_siblings",
+                                                   "core_siblings_list",
+                                                   "core_cpus",
+                                                   "core_cpus_list",
+                                                   "package_cpus",
+                                                   "package_cpus_list",
+                                                   0};
                 return synth_names_dir_open(gp, topo, 0);
             }
         }
@@ -3517,7 +3579,7 @@ static int empty_dir_fd(const char *guestpath) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.ddmaskXXXXXX";
+    char tmpl[] = "/tmp/.hl-maskXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
@@ -3605,8 +3667,8 @@ static int proc_open(const char *rp) {
                 // magic name -- /proc/self/task/<tid>/<leaf> must fold just like the numeric form (else a
                 // task walker that descends /proc/self/task/<tid> can list but not open its files).
                 int seglen = (int)(t - q);
-                int is_self = (seglen == 4 && !strncmp(q, "self", 4)) ||
-                              (seglen == 11 && !strncmp(q, "thread-self", 11));
+                int is_self =
+                    (seglen == 4 && !strncmp(q, "self", 4)) || (seglen == 11 && !strncmp(q, "thread-self", 11));
                 int is_num = (k > 0 && q + k == t);
                 if (!is_self && !is_num) return -2;
                 char tbuf[16];
@@ -3708,8 +3770,9 @@ static int proc_open(const char *rp) {
         if (fl && gp2 > 0) {
             int host;
             int is_oom_leaf = !strcmp(fl, "oom_score_adj") || !strcmp(fl, "oom_adj") || !strcmp(fl, "oom_score");
-            if (proc_pid_member(gp2, &host) || (is_oom_leaf && (host = (gp2 == 1 && g_init_hostpid) ? g_init_hostpid : gp2) > 0 &&
-                                                !(kill(host, 0) != 0 && errno == ESRCH))) {
+            if (proc_pid_member(gp2, &host) ||
+                (is_oom_leaf && (host = (gp2 == 1 && g_init_hostpid) ? g_init_hostpid : gp2) > 0 &&
+                 !(kill(host, 0) != 0 && errno == ESRCH))) {
                 // Peer /proc/<pid>/fd: a listable dir of symlinks built from the peer's libproc fd list, so
                 // each entry readlinks to the fd's target. (Opening a peer fd link stays deferred -- needs
                 // cross-process fd passing; see proc_fd_dir_pid_open.)
@@ -3845,8 +3908,7 @@ static int proc_open(const char *rp) {
                      "cgroup /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate 0 0\n"
                      "mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0\n"
                      "shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0\n");
-        if (n > 0 && (size_t)n < sizeof buf)
-            n = (int)mount_binds_append(buf, sizeof buf, (size_t)n, 1);
+        if (n > 0 && (size_t)n < sizeof buf) n = (int)mount_binds_append(buf, sizeof buf, (size_t)n, 1);
     } else if (!strcmp(rp, "/proc/uptime")) {
         unsigned long long t[4];
         host_cpu_ticks(t);
@@ -3891,8 +3953,7 @@ static int proc_open(const char *rp) {
     } else if (!strcmp(rp, "/proc/version")) {
         // The version banner embeds the build ISA; x86_64 guests see `uname -m`=x86_64, so /proc/version
         // must agree (a mismatched aarch64 token here confuses platform probes and diagnostics).
-        n = snprintf(buf, sizeof buf, "Linux version 6.1.0 (ddockerd) %s\n",
-                     guest_is_x86() ? "x86_64" : "aarch64");
+        n = snprintf(buf, sizeof buf, "Linux version 6.1.0 (ddockerd) %s\n", guest_is_x86() ? "x86_64" : "aarch64");
         // ---- container network introspection: lo + eth0 (see netif_* in state.c) --------------
     } else if (!strcmp(rp, "/proc/net/dev")) {
         // per-interface counters; zeros are fine (dd runs no real stack -- this is introspection only).
@@ -4013,15 +4074,13 @@ static int proc_open(const char *rp) {
         n = snprintf(buf, sizeof buf, "%d\n", acct_pids_total()); // no historical peak tracked -> live
     } else if (!strcmp(rp, "/sys/fs/cgroup/pids.events") || !strcmp(rp, "/sys/fs/cgroup/pids.events.local")) {
         n = snprintf(buf, sizeof buf, "max 0\n"); // pids limit never hit (structural)
-    } else if (!strcmp(rp, "/sys/fs/cgroup/cpuset.cpus.effective") ||
-               !strcmp(rp, "/sys/fs/cgroup/cpuset.cpus")) {
+    } else if (!strcmp(rp, "/sys/fs/cgroup/cpuset.cpus.effective") || !strcmp(rp, "/sys/fs/cgroup/cpuset.cpus")) {
         // The CPUs this cgroup may run on. cpuset.cpus.effective is what cpuset-aware runtimes read; advertise
         // the container's online set so a cpuset walk sees a populated range (was ENOENT -> walk failed).
         int nc = container_online_cpus();
         if (nc < 1) nc = 1;
         n = (nc == 1) ? snprintf(buf, sizeof buf, "0\n") : snprintf(buf, sizeof buf, "0-%d\n", nc - 1);
-    } else if (!strcmp(rp, "/sys/fs/cgroup/cpuset.mems.effective") ||
-               !strcmp(rp, "/sys/fs/cgroup/cpuset.mems")) {
+    } else if (!strcmp(rp, "/sys/fs/cgroup/cpuset.mems.effective") || !strcmp(rp, "/sys/fs/cgroup/cpuset.mems")) {
         n = snprintf(buf, sizeof buf, "0\n"); // single (emulated) memory node
     } else if (!strcmp(rp, "/sys/fs/cgroup/cpu.stat.local")) {
         n = snprintf(buf, sizeof buf, "throttled_usec 0\n");
@@ -4186,10 +4245,12 @@ static int proc_open(const char *rp) {
         // kernel: a bound listener is Flags 00010000, St 01 (LISTEN); the inode is a stable synthetic id.
         for (int fd = 0; fd < DD_NFD && n < (int)sizeof buf - 128; fd++) {
             if (!g_unix_bind[fd][0]) continue;
-            if (fcntl(fd, F_GETFD) == -1) { g_unix_bind[fd][0] = 0; continue; } // closed -> drop
-            n += snprintf(buf + n, sizeof buf - (size_t)n,
-                          "%016x: %08x %08x %08x %04x %02x %5d %s\n", fd, 2u, 0u, 0x10000u, 1u, 1u,
-                          100000 + fd, g_unix_bind[fd]);
+            if (fcntl(fd, F_GETFD) == -1) {
+                g_unix_bind[fd][0] = 0;
+                continue;
+            } // closed -> drop
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%016x: %08x %08x %08x %04x %02x %5d %s\n", fd, 2u, 0u,
+                          0x10000u, 1u, 1u, 100000 + fd, g_unix_bind[fd]);
         }
     } else if (!strcmp(rp, "/proc/net/snmp")) {
         // The full protocol-counter table `netstat -s` / `ss -s` parse: paired header+value lines for
@@ -4465,8 +4526,8 @@ static char g_pts_slavename[DEVPTS_MAX][64]; // pts index N -> host slave device
                                              // (e.g. the parent) holds the master -- so /dev/pts/N must resolve
                                              // by this cached host path. A host open() of it naturally succeeds
                                              // iff the pty is still alive and fails once it is truly gone.
-static int g_fd_ptsn[DD_NFD];                  // host fd -> (pts index + 1); 0 = not a pty fd
-static uint8_t g_fd_ptsmaster[DD_NFD];         // 1 = this fd is the MASTER end, 0 = a slave
+static int g_fd_ptsn[DD_NFD];                // host fd -> (pts index + 1); 0 = not a pty fd
+static uint8_t g_fd_ptsmaster[DD_NFD];       // 1 = this fd is the MASTER end, 0 = a slave
 
 // Materialize/remove the on-disk /dev/pts/<N> node so `ls /dev/pts` reflects the live slaves (devpts
 // creates the node when a slave is allocated and drops it when the pty is gone). Backed by an empty upper
@@ -4586,7 +4647,7 @@ static const char *dev_node_hostpath(const char *gp) {
                                          : NULL;
 }
 
-// ================= dd GPU rung 2: host-IOSurface-backed guest buffer =================
+// ================= macOS IOSurface-backed guest buffer =================
 // See include/gpu.h. Entirely gated behind HL_GPU_IOSURFACE (gpu_iosurface_on()); the code compiles
 // always (the engine is always a macOS binary) but never runs for existing workloads / the gate.
 #include "../gpu.h"
@@ -4597,8 +4658,7 @@ static const char *dev_node_hostpath(const char *gp) {
 #include <mach/vm_map.h> // vm_inherit + VM_INHERIT_SHARE (pre-fork share-inherited IOSurface pool)
 #include <servers/bootstrap.h>
 
-// Mach message carrying an IOSurface send-right + its id to dd-display (must match dd-display's
-// mach_bridge.c dd_gpu_msg_t exactly).
+// Mach message carrying an IOSurface send-right, id, and generation to the configured presentation service.
 typedef struct {
     mach_msg_header_t header;
     mach_msg_body_t body;
@@ -4606,23 +4666,21 @@ typedef struct {
     uint32_t id;
     uint32_t generation; // allocation generation for `id` (0 = unversioned); the compositor stores it
                          // and rejects a guest dmabuf whose modifier carries a stale generation.
-} dd_gpu_msg_t;
+} hl_gpu_message;
 
-// Send the IOSurface's send-right + id to dd-display's bootstrap mach service. Best-effort: if the
-// compositor isn't up (no service), silently skip — the alloc still succeeds for the guest.
-static void dd_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf) {
+// Send the IOSurface right to the explicitly configured bootstrap service. Allocation remains useful for
+// local DRM clients when no presentation service was configured or the service is not running.
+static void hl_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf) {
     mach_port_t server = MACH_PORT_NULL;
-    // HL_GPU_BRIDGE_NAME lets multiple compositor bridge instances coexist; the
-    // compositor registers under the SAME name. Unset → the historical singleton "com.dd.display.gpu".
     const char *bridge = hl_option_get("HL_GPU_BRIDGE_NAME");
-    if (!bridge || !*bridge) bridge = "com.dd.display.gpu";
+    if (!bridge || !*bridge) return;
     if (bootstrap_look_up(bootstrap_port, (char *)bridge, &server) != KERN_SUCCESS) return;
     mach_port_t port = IOSurfaceCreateMachPort(surf);
     if (port == MACH_PORT_NULL) {
         mach_port_deallocate(mach_task_self(), server);
         return;
     }
-    dd_gpu_msg_t msg;
+    hl_gpu_message msg;
     memset(&msg, 0, sizeof msg);
     msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
     msg.header.msgh_size = sizeof msg;
@@ -4651,9 +4709,9 @@ static void dd_gpu_send_port(uint32_t id, uint32_t generation, IOSurfaceRef surf
 // The only memory a fork()-no-exec child can touch is memory that was mapped, as SHARED-inherited, at the
 // instant IT was forked. So we PRE-CREATE the IOSurfaces in the non-forked ROOT engine (a valid
 // WindowServer session), mark each surface's backing pages VM_INHERIT_SHARE so children inherit the SAME
-// physical pages, announce them to dd-display (which composites by id), and register them. A forked child
+// physical pages, announce them to the configured presentation service, and register them. A forked child
 // then hands out a distinct pre-created surface from the COW-inherited registry using ONLY plain data
-// (base VA / id / stride) — never an IOSurface API call. dd-display composites the same surface by id.
+// (base VA / id / stride) — never an IOSurface API call. The presentation service resolves it by id.
 //
 // g_gpu_root_pid: the pid of the non-forked root (recorded before any guest fork); only it may create.
 // g_gpu_fork_child: set in fork_child_hooks so the child never attempts a (fatal) create.
@@ -4662,12 +4720,14 @@ static int g_gpu_fork_child = 0;
 
 // Called from fork_child_hooks (child side) after every guest fork: this process can no longer create or
 // touch a freshly-created IOSurface, only reuse the pre-fork share-inherited pool it inherited.
-void dd_gpu_after_fork(void) { g_gpu_fork_child = 1; }
+void hl_gpu_after_fork(void) {
+    g_gpu_fork_child = 1;
+}
 
 #ifdef __APPLE__
 // Force an IOSurface's backing pages to be SHARE-inherited by future fork() children (default is
 // NONE/COPY, which leaves the child with no valid mapping and a fault on first touch). Page-aligned.
-static void dd_gpu_share_inherit(void *base, size_t size) {
+static void hl_gpu_share_inherit(void *base, size_t size) {
     if (!base || !size) return;
     size_t pg = (size_t)getpagesize();
     vm_address_t a = (vm_address_t)base & ~(vm_address_t)(pg - 1);
@@ -4680,36 +4740,37 @@ static void dd_gpu_share_inherit(void *base, size_t size) {
 // Per-render-node IOSurface registry: reuse a same-size surface across frames (a guest redraws into the
 // same buffer each frame) and release every surface a render-node fd owns when it closes — so a
 // long-running presentation workload doesn't accumulate IOSurfaces. Bounded, gated (only the GPU path touches it).
-#define DD_GPU_REG_MAX 256
-static struct dd_gpu_reg_ent {
-    int owner_fd;  // the render-node fd that checked this surface out, or -1 = a FREE pool surface
-    int pool;      // 1 = a pre-created, VM_INHERIT_SHARE'd pool surface (never per-fd CFRelease'd)
+#define HL_GPU_REG_MAX 256
+
+static struct hl_gpu_registry_entry {
+    int owner_fd; // the render-node fd that checked this surface out, or -1 = a FREE pool surface
+    int pool;     // 1 = a pre-created, VM_INHERIT_SHARE'd pool surface (never per-fd CFRelease'd)
     uint32_t id, w, h, stride;
-    uint32_t gen;  // allocation generation for this surface's id: 1 at creation, bumped on each pool
-                   // re-checkout (a fresh logical allocation reusing a recycled id). Carried to the
-                   // guest (ioctl reply) and the compositor (mach) so a stale reference is rejected.
+    uint32_t gen; // allocation generation for this surface's id: 1 at creation, bumped on each pool
+                  // re-checkout (a fresh logical allocation reusing a recycled id). Carried to the
+                  // guest (ioctl reply) and the compositor (mach) so a stale reference is rejected.
     IOSurfaceRef surf;
     void *base;
-} g_gpu_reg[DD_GPU_REG_MAX];
+} g_gpu_reg[HL_GPU_REG_MAX];
 
-static int dd_gpu_reg_find(int fd, uint32_t w, uint32_t h) {
-    for (int i = 0; i < DD_GPU_REG_MAX; i++)
-        if (g_gpu_reg[i].surf && g_gpu_reg[i].owner_fd == fd && g_gpu_reg[i].w == w && g_gpu_reg[i].h == h)
-            return i;
+static int hl_gpu_registry_find(int fd, uint32_t w, uint32_t h) {
+    for (int i = 0; i < HL_GPU_REG_MAX; i++)
+        if (g_gpu_reg[i].surf && g_gpu_reg[i].owner_fd == fd && g_gpu_reg[i].w == w && g_gpu_reg[i].h == h) return i;
     return -1;
 }
+
 // Claim a FREE (owner_fd==-1) pool surface of size (w,h) for `fd`. Works in a forked child: it only reads
 // inherited plain data and writes owner_fd in the child's own COW copy — no IOSurface API call. Returns the
 // index or -1 if the pool has no free surface of that size.
-static int dd_gpu_reg_take_pool(int fd, uint32_t w, uint32_t h) {
-    for (int i = 0; i < DD_GPU_REG_MAX; i++)
+static int hl_gpu_registry_take_pool(int fd, uint32_t w, uint32_t h) {
+    for (int i = 0; i < HL_GPU_REG_MAX; i++)
         if (g_gpu_reg[i].surf && g_gpu_reg[i].pool && g_gpu_reg[i].owner_fd == -1 && g_gpu_reg[i].w == w &&
             g_gpu_reg[i].h == h) {
             g_gpu_reg[i].owner_fd = fd;
             // A re-checkout of a recycled id is a fresh logical allocation → advance the generation so a
             // stale reference to the previous checkout is rejected. Only the non-forked path bumps: a
             // forked child cannot re-announce the new generation to the compositor over mach (see
-            // dd_gpu_surface), so it keeps the inherited generation the compositor already knows (no
+            // hl_gpu_surface), so it keeps the inherited generation the presentation service already knows (no
             // versioning, but also no false rejection of the child's own frames). 15-bit field, never 0.
             if (!g_gpu_fork_child) {
                 uint32_t g = (g_gpu_reg[i].gen + 1) & 0x7fff;
@@ -4719,9 +4780,10 @@ static int dd_gpu_reg_take_pool(int fd, uint32_t w, uint32_t h) {
         }
     return -1;
 }
-static void dd_gpu_reg_add(int fd, int pool, uint32_t id, uint32_t gen, uint32_t w, uint32_t h,
-                           uint32_t stride, IOSurfaceRef surf, void *base) {
-    for (int i = 0; i < DD_GPU_REG_MAX; i++)
+
+static void hl_gpu_registry_add(int fd, int pool, uint32_t id, uint32_t gen, uint32_t w, uint32_t h, uint32_t stride,
+                                IOSurfaceRef surf, void *base) {
+    for (int i = 0; i < HL_GPU_REG_MAX; i++)
         if (!g_gpu_reg[i].surf) {
             g_gpu_reg[i].owner_fd = fd;
             g_gpu_reg[i].pool = pool;
@@ -4736,12 +4798,13 @@ static void dd_gpu_reg_add(int fd, int pool, uint32_t id, uint32_t gen, uint32_t
         }
     // Registry full: keep the surface live (bounded leak) rather than churn.
 }
+
 // Release/return every surface a render-node fd held (the node closed). Called from fd_reset_emul. A pool
 // surface is RETURNED to the pool (owner_fd=-1), never released — it is shared, inherited, and reused for
 // the process lifetime. Only a legacy (non-pool) surface is CFRelease'd, and never from a forked child
 // (CFRelease could run a fork-unsafe IOSurface dealloc).
-static void dd_gpu_free_fd(int fd) {
-    for (int i = 0; i < DD_GPU_REG_MAX; i++)
+static void hl_gpu_free_fd(int fd) {
+    for (int i = 0; i < HL_GPU_REG_MAX; i++)
         if (g_gpu_reg[i].surf && g_gpu_reg[i].owner_fd == fd) {
             if (g_gpu_reg[i].pool) {
                 g_gpu_reg[i].owner_fd = -1; // back to the free pool
@@ -4751,17 +4814,19 @@ static void dd_gpu_free_fd(int fd) {
             }
         }
 }
+
 // Locate a registered surface by its DRM handle (== IOSurface global id). Used by the dumb-buffer
 // ioctls (MAP/DESTROY/GEM_CLOSE/PRIME) and the mem.c MAP_DUMB mmap branch. Returns index or -1.
-static int dd_gpu_reg_by_handle(uint32_t handle) {
-    for (int i = 0; i < DD_GPU_REG_MAX; i++)
+static int hl_gpu_registry_by_handle(uint32_t handle) {
+    for (int i = 0; i < HL_GPU_REG_MAX; i++)
         if (g_gpu_reg[i].surf && g_gpu_reg[i].id == handle) return i;
     return -1;
 }
+
 // Release/return the surface for a DRM handle (DESTROY_DUMB / GEM_CLOSE). Pool surfaces are returned to the
 // pool (kept alive for reuse); legacy surfaces are released (never from a forked child).
-static void dd_gpu_free_handle(uint32_t handle) {
-    int i = dd_gpu_reg_by_handle(handle);
+static void hl_gpu_free_handle(uint32_t handle) {
+    int i = hl_gpu_registry_by_handle(handle);
     if (i >= 0) {
         if (g_gpu_reg[i].pool) {
             g_gpu_reg[i].owner_fd = -1;
@@ -4775,10 +4840,10 @@ static void dd_gpu_free_handle(uint32_t handle) {
 
 // Core IOSurface allocator shared by HL_IOCTL_GPU_ALLOC (glmark2/EGL shim path) and the DRM
 // CREATE_DUMB ioctl (Mesa kms_swrast path). Reuse-or-create a host IOSurface for
-// (owner_fd,w,h), announce it to dd-display over mach, register it under owner_fd, and hand back its
+// (owner_fd,w,h), announce it to the configured service, register it under owner_fd, and hand back its
 // id/stride/base. `reuse` selects redraw-in-place (glmark2) vs a fresh distinct surface per call
 // (gbm bo pool). Returns 0 or -errno. Gated: only ever reached on a render-node fd with the GPU path on.
-static uint32_t dd_gpu_align_u32(uint32_t v, uint32_t align) {
+static uint32_t hl_gpu_align_u32(uint32_t v, uint32_t align) {
     return (v + align - 1) & ~(align - 1);
 }
 
@@ -4791,19 +4856,19 @@ static int gpu_alloc_dbg(void) {
 
 // Create ONE pool surface of (w,h) in the NON-forked root: IOSurfaceCreate, capture its mapped base,
 // mark the backing pages VM_INHERIT_SHARE so every future fork() child inherits the SAME physical memory,
-// announce it to dd-display (composites by id), and register it as a FREE pool entry. Returns 0 or -errno.
+// announce it to the presentation service, and register it as a FREE pool entry. Returns 0 or -errno.
 // MUST run in the root (a forked child's IOSurfaceCreate returns NULL).
-static int dd_gpu_pool_make_one(uint32_t w, uint32_t h) {
-    uint32_t stride = dd_gpu_align_u32(w * 4, 16);
+static int hl_gpu_pool_make_one(uint32_t w, uint32_t h) {
+    uint32_t stride = hl_gpu_align_u32(w * 4, 16);
     CFMutableDictionaryRef props =
         CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     if (!props) return -ENOMEM;
     int32_t iw = (int32_t)w, ih = (int32_t)h, ibpe = 4, istride = (int32_t)stride, ione = 1;
     int32_t pf = 0x42475241; // 'BGRA'
     CFNumberRef n;
-#define PUT(key, val)                                      \
-    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &(val)); \
-    CFDictionarySetValue(props, key, n);                   \
+#define PUT(key, val)                                                                                                  \
+    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &(val));                                                             \
+    CFDictionarySetValue(props, key, n);                                                                               \
     CFRelease(n)
     PUT(kIOSurfaceWidth, iw);
     PUT(kIOSurfaceHeight, ih);
@@ -4823,9 +4888,9 @@ static int dd_gpu_pool_make_one(uint32_t w, uint32_t h) {
     void *base = IOSurfaceGetBaseAddress(surf);
     IOSurfaceUnlock(surf, 0, NULL);
     uint32_t astride = (uint32_t)IOSurfaceGetBytesPerRow(surf);
-    dd_gpu_share_inherit(base, (size_t)astride * h); // <-- make it survive fork as SHARED memory
-    dd_gpu_send_port(id, 1, surf);                   // dd-display caches it by id + generation 1
-    dd_gpu_reg_add(-1, 1, id, 1, w, h, astride, surf, base); // free pool entry (owner_fd=-1, pool=1, gen=1)
+    hl_gpu_share_inherit(base, (size_t)astride * h); // make it survive fork as shared memory
+    hl_gpu_send_port(id, 1, surf);
+    hl_gpu_registry_add(-1, 1, id, 1, w, h, astride, surf, base); // free pool entry
     if (gpu_alloc_dbg())
         fprintf(stderr, "[gpu-alloc-dbg] pool+ %ux%u id=%u stride=%u base=%p pid=%d\n", w, h, id, astride, base,
                 (int)getpid());
@@ -4833,10 +4898,10 @@ static int dd_gpu_pool_make_one(uint32_t w, uint32_t h) {
 }
 #endif
 
-static int dd_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint32_t *out_id,
-                          uint32_t *out_stride, void **out_base, uint32_t *out_gen) {
+static int hl_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint32_t *out_id, uint32_t *out_stride,
+                          void **out_base, uint32_t *out_gen) {
     if (w == 0 || h == 0 || w > 16384 || h > 16384) return -EINVAL;
-    uint32_t stride = dd_gpu_align_u32(w * 4, 16);
+    uint32_t stride = hl_gpu_align_u32(w * 4, 16);
     size_t size = (size_t)stride * h;
     (void)size;
     void *base = NULL;
@@ -4845,9 +4910,9 @@ static int dd_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint3
     // reuse=1 (EGL shim redraw-in-place): if this fd already holds a same-size surface, return it. Same
     // live allocation → same generation, no re-announce.
     if (reuse) {
-        int r = dd_gpu_reg_find(owner_fd, w, h);
+        int r = hl_gpu_registry_find(owner_fd, w, h);
         if (r >= 0) {
-            struct dd_gpu_reg_ent *e = &g_gpu_reg[r];
+            struct hl_gpu_registry_entry *e = &g_gpu_reg[r];
             *out_id = e->id;
             *out_stride = e->stride;
             *out_base = e->base;
@@ -4858,36 +4923,36 @@ static int dd_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint3
     // Take a distinct FREE surface from the pre-fork, share-inherited pool. THIS is the fork-safe path: it
     // works identically in the root and in a forked child, because it only reads
     // inherited plain data (base/id/stride) — no IOSurface API call, which would fault/NULL in the child.
-    int pi = dd_gpu_reg_take_pool(owner_fd, w, h);
+    int pi = hl_gpu_registry_take_pool(owner_fd, w, h);
     if (pi < 0 && !g_gpu_fork_child) {
         // Root, no free pool surface of this size yet: create a small BATCH so this alloc AND the sibling
         // buffers a forked child will soon request (gbm keeps a 2-4 bo pool) are all covered before the fork.
         int batch = 4;
         for (int k = 0; k < batch; k++)
-            if (dd_gpu_pool_make_one(w, h) != 0) break;
-        pi = dd_gpu_reg_take_pool(owner_fd, w, h);
+            if (hl_gpu_pool_make_one(w, h) != 0) break;
+        pi = hl_gpu_registry_take_pool(owner_fd, w, h);
     }
     if (pi < 0) {
         // Forked child needing a size the root never pre-created: cannot create here (fork-unsafe). Fail the
         // alloc cleanly (the guest retries / falls back) instead of returning a NULL surface.
         if (gpu_alloc_dbg())
-            fprintf(stderr, "[gpu-alloc-dbg] MISS %ux%u reuse=%d fork_child=%d pid=%d root=%d (pool exhausted)\n",
-                    w, h, reuse, g_gpu_fork_child, (int)getpid(), g_gpu_root_pid);
+            fprintf(stderr, "[gpu-alloc-dbg] MISS %ux%u reuse=%d fork_child=%d pid=%d root=%d (pool exhausted)\n", w, h,
+                    reuse, g_gpu_fork_child, (int)getpid(), g_gpu_root_pid);
         return -ENOMEM;
     }
-    struct dd_gpu_reg_ent *e = &g_gpu_reg[pi];
+    struct hl_gpu_registry_entry *e = &g_gpu_reg[pi];
     id = e->id;
     stride = e->stride;
     base = e->base;
-    gen = e->gen; // bumped by dd_gpu_reg_take_pool on the non-forked path
+    gen = e->gen; // bumped by hl_gpu_registry_take_pool on the non-forked path
     // Re-announce the id's new generation to the compositor so its authentication matches this fresh
     // checkout. Only the non-forked path can do this (it re-creates the send-right via an IOSurface API,
     // fork-unsafe in a child); a forked child left `gen` unbumped and the compositor keeps the generation
     // it already has, so the child's own frames still validate.
-    if (!g_gpu_fork_child) dd_gpu_send_port(id, gen, e->surf);
+    if (!g_gpu_fork_child) hl_gpu_send_port(id, gen, e->surf);
     if (gpu_alloc_dbg())
-        fprintf(stderr, "[gpu-alloc-dbg] take %ux%u id=%u gen=%u stride=%u base=%p reuse=%d fork_child=%d pid=%d\n",
-                w, h, id, gen, stride, base, reuse, g_gpu_fork_child, (int)getpid());
+        fprintf(stderr, "[gpu-alloc-dbg] take %ux%u id=%u gen=%u stride=%u base=%p reuse=%d fork_child=%d pid=%d\n", w,
+                h, id, gen, stride, base, reuse, g_gpu_fork_child, (int)getpid());
 #else
     base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (base == MAP_FAILED) return -ENOMEM;
@@ -4913,12 +4978,12 @@ static int64_t hl_gpu_alloc(int owner_fd, void *arg) {
     uint32_t id = 0, stride = 0, gen = 0;
     void *base = NULL;
     // reuse=1: redraw-in-place across frames (the EGL shim redraws the same-size surface each frame).
-    int rc = (int)dd_gpu_surface(owner_fd, r->width, r->height, 1, &id, &stride, &base, &gen);
+    int rc = (int)hl_gpu_surface(owner_fd, r->width, r->height, 1, &id, &stride, &base, &gen);
     if (rc) return rc;
     size_t size = (size_t)stride * r->height;
-    // A throwaway anonymous fd to satisfy linux-dmabuf's params.add (its pages are unused; dd-display
-    // resolves the IOSurface by id from the modifier).
-    char tn[] = "/tmp/.ddgpuXXXXXX";
+    // A throwaway anonymous fd for the generic dma-buf contract; its pages are unused because the
+    // presentation service resolves the IOSurface by id from the modifier.
+    char tn[] = "/tmp/.hlgpuXXXXXX";
     int fd = mkstemp(tn);
     if (fd >= 0) {
         unlink(tn);
@@ -4954,19 +5019,19 @@ static int64_t hl_gpu_alloc(int owner_fd, void *arg) {
 // lazy init to COMPLETION here, before any guest thread/fork exists, closes the race STRUCTURALLY and
 // deterministically, independent of host load (and independent of whether OBJC_DISABLE_INITIALIZE_FORK_-
 // SAFETY reached this process's libobjc at load time).
-static void dd_gpu_prewarm_fork_safety(void) {
+static void hl_gpu_prewarm_fork_safety(void) {
 #ifdef __APPLE__
     if (!gpu_iosurface_on()) return;
-    // Create a throwaway 1x1 BGRA IOSurface exactly the way dd_gpu_surface() does, so the SAME CF/IOSurface
+    // Create a throwaway 1x1 BGRA IOSurface exactly the way hl_gpu_surface() does, so the SAME CF/IOSurface
     // /Foundation lazy inits the first guest alloc triggers happen now instead.
     CFMutableDictionaryRef props =
         CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     if (!props) return;
     int32_t one = 1, bpe = 4, stride = 16, pf = 0x42475241 /* 'BGRA' */;
     CFNumberRef n;
-#define PW(key, val)                                       \
-    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &(val)); \
-    CFDictionarySetValue(props, key, n);                   \
+#define PW(key, val)                                                                                                   \
+    n = CFNumberCreate(NULL, kCFNumberSInt32Type, &(val));                                                             \
+    CFDictionarySetValue(props, key, n);                                                                               \
     CFRelease(n)
     PW(kIOSurfaceWidth, one);
     PW(kIOSurfaceHeight, one);
@@ -4979,8 +5044,8 @@ static void dd_gpu_prewarm_fork_safety(void) {
     CFRelease(props);
     if (!surf) return;
     // Exercise the accessors AND the mach-port announce path (IOSurfaceCreateMachPort + bootstrap_look_up)
-    // that dd_gpu_send_port() uses, so THEIR one-time inits are warmed too — done directly here (not via
-    // dd_gpu_send_port) so it is independent of whether dd-display's mach service is already registered.
+    // that hl_gpu_send_port() uses, so THEIR one-time inits are warmed too. This is done directly so it is
+    // independent of whether a presentation service is configured or registered.
     (void)IOSurfaceGetID(surf);
     IOSurfaceLock(surf, 0, NULL);
     (void)IOSurfaceGetBaseAddress(surf);
@@ -4990,8 +5055,8 @@ static void dd_gpu_prewarm_fork_safety(void) {
     if (port != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), port);
     mach_port_t server = MACH_PORT_NULL;
     const char *bridge = hl_option_get("HL_GPU_BRIDGE_NAME");
-    if (!bridge || !*bridge) bridge = "com.dd.display.gpu";
-    if (bootstrap_look_up(bootstrap_port, (char *)bridge, &server) == KERN_SUCCESS && server != MACH_PORT_NULL)
+    if (bridge && *bridge && bootstrap_look_up(bootstrap_port, (char *)bridge, &server) == KERN_SUCCESS &&
+        server != MACH_PORT_NULL)
         mach_port_deallocate(mach_task_self(), server);
     CFRelease(surf); // drop the throwaway surface; nothing else references it
 
@@ -5001,8 +5066,8 @@ static void dd_gpu_prewarm_fork_safety(void) {
 
     // Pre-fill the share-inherited pool for configured surface sizes BEFORE any guest fork. A forked
     // GPU process cannot create/map an IOSurface, so every surface it will use must exist, mapped SHARED,
-    // at fork time. HL_GPU_POOL="WxH[,WxH...]" names the sizes; HL_GPU_POOL_N sets how many per size (default 6 — covers a
-    // gbm 2-4 bo pool plus slack). Unset → no prefill (root-side on-demand batch-create still amplifies).
+    // at fork time. HL_GPU_POOL="WxH[,WxH...]" names the sizes; HL_GPU_POOL_N sets how many per size (default 6 —
+    // covers a gbm 2-4 bo pool plus slack). Unset → no prefill (root-side on-demand batch-create still amplifies).
     int per = 6;
     const char *pn = hl_option_get("HL_GPU_POOL_N");
     if (pn && *pn) {
@@ -5018,7 +5083,7 @@ static void dd_gpu_prewarm_fork_safety(void) {
             unsigned pw = 0, ph = 0;
             if (sscanf(tok, "%ux%u", &pw, &ph) == 2 && pw && ph)
                 for (int k = 0; k < per; k++)
-                    if (dd_gpu_pool_make_one(pw, ph) != 0) break;
+                    if (hl_gpu_pool_make_one(pw, ph) != 0) break;
         }
     }
 #endif
@@ -5206,18 +5271,25 @@ static void container_populate_machine_id(void) {
 // Gated on HL_GPU_IOSURFACE. libdrm's drmGetDevices2() enumerates /dev/dri, stats each node's st_rdev ->
 // major:minor, then walks /sys/dev/char/<maj>:<min>/... to classify the DRM device's bus. We advertise
 // ONE platform DRM device with a primary node (card0 = 226:0) and a render node (renderD128 = 226:128),
-// both parented to a single platform device ("dd-gpu") so libdrm MERGES them into one drmDevice exposing a
+// both parented to a neutral platform device ("hl-gpu") so libdrm merges them into one drmDevice exposing a
 // render node -- which a Linux DRM client opens instead of deadlocking in its buffer manager
 // fallback. Every sysfs path is matched EXACTLY (no real /sys tree); /dev/dri itself is a real placeholder
 // dir in the writable upper (container_populate_dev) so opendir/readdir just work through the overlay.
-#define DD_DRM_MAJOR 226
+#define HL_DRM_MAJOR 226
 
 // Map a /dev/dri child name to its DRM minor. 1 (+ *minor) on hit, 0 on miss.
 static int drm_dev_minor(const char *name, int *minor) {
-    if (!strcmp(name, "renderD128")) { *minor = 128; return 1; }
-    if (!strcmp(name, "card0")) { *minor = 0; return 1; }
+    if (!strcmp(name, "renderD128")) {
+        *minor = 128;
+        return 1;
+    }
+    if (!strcmp(name, "card0")) {
+        *minor = 0;
+        return 1;
+    }
     return 0;
 }
+
 // Parse the <minor> of a "/sys/dev/char/226:<minor>" path prefix; returns the tail after <minor> (points at
 // '/' or '\0'), or NULL if not a 226:{0,128} node.
 static const char *drm_char_tail(const char *gp, int *minor) {
@@ -5225,7 +5297,8 @@ static const char *drm_char_tail(const char *gp, int *minor) {
     const char *r = gp + 18;
     if (*r < '0' || *r > '9') return NULL;
     int m = 0;
-    for (; *r >= '0' && *r <= '9'; r++) m = m * 10 + (*r - '0');
+    for (; *r >= '0' && *r <= '9'; r++)
+        m = m * 10 + (*r - '0');
     if (m != 0 && m != 128) return NULL;
     *minor = m;
     return r;
@@ -5237,23 +5310,32 @@ static int drm_synth_stat(const char *gp, struct stat *s) {
     if (!gpu_iosurface_on() || !gp) return 0;
     int minor = -1;
     if (!strcmp(gp, "/dev/dri")) {
-        memset(s, 0, sizeof *s); s->st_mode = S_IFDIR | 0755; s->st_nlink = 2; return 1;
+        memset(s, 0, sizeof *s);
+        s->st_mode = S_IFDIR | 0755;
+        s->st_nlink = 2;
+        return 1;
     }
     if (!strncmp(gp, "/dev/dri/", 9) && drm_dev_minor(gp + 9, &minor)) {
         memset(s, 0, sizeof *s);
         s->st_mode = S_IFCHR | 0666;
-        s->st_rdev = (dev_t)(((uint64_t)DD_DRM_MAJOR << 8) | (unsigned)minor); // gnu_dev-decodable 226:minor
+        s->st_rdev = (dev_t)(((uint64_t)HL_DRM_MAJOR << 8) | (unsigned)minor); // gnu_dev-decodable 226:minor
         s->st_nlink = 1;
         return 1;
     }
     if (!strcmp(gp, "/sys/class/drm") || !strcmp(gp, "/sys/class/drm/card0") ||
         !strcmp(gp, "/sys/class/drm/renderD128") || !strcmp(gp, "/sys/class/drm/card0/device") ||
         !strcmp(gp, "/sys/class/drm/renderD128/device")) {
-        memset(s, 0, sizeof *s); s->st_mode = S_IFDIR | 0555; s->st_nlink = 2; return 1;
+        memset(s, 0, sizeof *s);
+        s->st_mode = S_IFDIR | 0555;
+        s->st_nlink = 2;
+        return 1;
     }
     const char *tail = drm_char_tail(gp, &minor);
     if (tail && (*tail == 0 || !strcmp(tail, "/device") || !strcmp(tail, "/device/drm"))) {
-        memset(s, 0, sizeof *s); s->st_mode = S_IFDIR | 0555; s->st_nlink = 2; return 1;
+        memset(s, 0, sizeof *s);
+        s->st_mode = S_IFDIR | 0555;
+        s->st_nlink = 2;
+        return 1;
     }
     return 0;
 }
@@ -5266,7 +5348,7 @@ static int drm_fd_stat_fixup(int fd, struct stat *s) {
     if (!gpu_iosurface_on() || fd < 0 || fd >= DD_NFD || !g_devdri[fd]) return 0;
     int minor = g_devdri[fd] - 1;
     s->st_mode = S_IFCHR | 0666;
-    s->st_rdev = (dev_t)(((uint64_t)DD_DRM_MAJOR << 8) | (unsigned)minor); // gnu_dev-decodable 226:minor
+    s->st_rdev = (dev_t)(((uint64_t)HL_DRM_MAJOR << 8) | (unsigned)minor); // gnu_dev-decodable 226:minor
     s->st_nlink = 1;
     return 1;
 }
@@ -5281,17 +5363,17 @@ static int drm_synth_readlink(const char *gp, char *buf, size_t bs) {
     if (tail) {
         const char *node = (minor == 128) ? "renderD128" : "card0";
         if (*tail == 0)
-            l = snprintf(t, sizeof t, "/sys/devices/platform/dd-gpu/drm/%s", node); // node -> its drm sysdir
+            l = snprintf(t, sizeof t, "/sys/devices/platform/hl-gpu/drm/%s", node); // node -> its drm sysdir
         else if (!strcmp(tail, "/device"))
-            l = snprintf(t, sizeof t, "/sys/devices/platform/dd-gpu"); // -> parent platform device (fullname)
+            l = snprintf(t, sizeof t, "/sys/devices/platform/hl-gpu"); // -> parent platform device (fullname)
         else if (!strcmp(tail, "/device/subsystem"))
             l = snprintf(t, sizeof t, "/sys/bus/platform"); // -> bus type "platform"
     } else if (!strcmp(gp, "/sys/class/drm/renderD128"))
-        l = snprintf(t, sizeof t, "/sys/devices/platform/dd-gpu/drm/renderD128");
+        l = snprintf(t, sizeof t, "/sys/devices/platform/hl-gpu/drm/renderD128");
     else if (!strcmp(gp, "/sys/class/drm/card0"))
-        l = snprintf(t, sizeof t, "/sys/devices/platform/dd-gpu/drm/card0");
+        l = snprintf(t, sizeof t, "/sys/devices/platform/hl-gpu/drm/card0");
     else if (!strcmp(gp, "/sys/class/drm/renderD128/device") || !strcmp(gp, "/sys/class/drm/card0/device"))
-        l = snprintf(t, sizeof t, "/sys/devices/platform/dd-gpu");
+        l = snprintf(t, sizeof t, "/sys/devices/platform/hl-gpu");
     if (l < 0) return -1;
     size_t n = (size_t)l > bs ? bs : (size_t)l;
     memcpy(buf, t, n);
@@ -5305,19 +5387,17 @@ static int drm_synth_content(const char *gp, char *out, size_t n) {
     const char *tail = drm_char_tail(gp, &minor);
     if (tail) {
         const char *node = (minor == 128) ? "renderD128" : "card0";
-        if (!strcmp(tail, "/uevent"))
-            return snprintf(out, n, "MAJOR=226\nMINOR=%d\nDEVNAME=dri/%s\n", minor, node);
+        if (!strcmp(tail, "/uevent")) return snprintf(out, n, "MAJOR=226\nMINOR=%d\nDEVNAME=dri/%s\n", minor, node);
         if (!strcmp(tail, "/dev")) return snprintf(out, n, "226:%d\n", minor);
         // the PARENT platform device's uevent (drmParsePlatformDeviceInfo parses OF_COMPATIBLE_N; absent -> 0)
         if (!strcmp(tail, "/device/uevent"))
-            return snprintf(out, n, "DRIVER=dd_gpu\nOF_NAME=gpu\nOF_FULLNAME=/dd-gpu\n");
+            return snprintf(out, n, "DRIVER=hl_gpu\nOF_NAME=gpu\nOF_FULLNAME=/hl-gpu\n");
     }
     if (!strcmp(gp, "/sys/class/drm/renderD128/dev")) return snprintf(out, n, "226:128\n");
     if (!strcmp(gp, "/sys/class/drm/card0/dev")) return snprintf(out, n, "226:0\n");
     if (!strcmp(gp, "/sys/class/drm/renderD128/uevent"))
         return snprintf(out, n, "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n");
-    if (!strcmp(gp, "/sys/class/drm/card0/uevent"))
-        return snprintf(out, n, "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n");
+    if (!strcmp(gp, "/sys/class/drm/card0/uevent")) return snprintf(out, n, "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n");
     return -1;
 }
 
@@ -5334,9 +5414,12 @@ static int drm_dir_open(const char *rp) {
         want = 1;
     if (!want) return -2;
     static int registered = 0;
-    if (!registered) { atexit(procfd_dirs_atexit); registered = 1; }
+    if (!registered) {
+        atexit(procfd_dirs_atexit);
+        registered = 1;
+    }
     procfd_dirs_reap(0);
-    char tmpl[] = "/tmp/.dddrmXXXXXX";
+    char tmpl[] = "/tmp/.hldrmXXXXXX";
     if (!mkdtemp(tmpl)) return -1;
     static const char *const ent[] = {"card0", "renderD128", 0};
     for (int i = 0; ent[i]; i++) {
@@ -5345,7 +5428,10 @@ static int drm_dir_open(const char *rp) {
         (void)hl_host_file_reset(&g_jit_services, p, 0444);
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) { procfd_dir_rm(tmpl); return -1; }
+    if (fd < 0) {
+        procfd_dir_rm(tmpl);
+        return -1;
+    }
     proc_dir_register(fd, tmpl, rp);
     return fd;
 }
@@ -5367,7 +5453,7 @@ static int64_t drm_synth_ioctl(int fd, unsigned long rq, void *arg) {
         void *base = NULL;
         // The DRM dumb-buffer (Mesa/gbm) path builds its dmabuf modifier in the guest's Mesa winsys, not
         // dd's shim, so it does not carry the dd generation; `gen` is captured but unused here.
-        int rc = (int)dd_gpu_surface(fd, width, height, 0, &id, &stride, &base, &gen);
+        int rc = (int)hl_gpu_surface(fd, width, height, 0, &id, &stride, &base, &gen);
         if (rc) return rc;
         (void)gen;
         uint64_t size = (uint64_t)stride * height;
@@ -5393,7 +5479,7 @@ static int64_t drm_synth_ioctl(int fd, unsigned long rq, void *arg) {
         uint32_t handle;
         memcpy(&handle, d, 4);
 #ifdef __APPLE__
-        dd_gpu_free_handle(handle);
+        hl_gpu_free_handle(handle);
 #endif
         return 0;
     }
@@ -5403,17 +5489,17 @@ static int64_t drm_synth_ioctl(int fd, unsigned long rq, void *arg) {
         uint32_t handle;
         memcpy(&handle, d, 4);
 #ifdef __APPLE__
-        dd_gpu_free_handle(handle);
+        hl_gpu_free_handle(handle);
 #endif
         return 0;
     }
     case 0xc00c642d: { // DRM_IOCTL_PRIME_HANDLE_TO_FD {u32 handle,flags; s32 fd}
-        // Export the dumb buffer as a dmabuf. The fd is a throwaway placeholder — dd-display resolves the
-        // real IOSurface by id (announced over mach at alloc time / carried in the wl dmabuf modifier).
+        // Export the dumb buffer as a dma-buf. The fd is a placeholder; the configured service resolves the
+        // real IOSurface by id announced over Mach and carried in the modifier.
         uint8_t *d = (uint8_t *)arg;
         if (!d) return -EFAULT;
         int32_t ofd = -1;
-        char tn[] = "/tmp/.ddgpuXXXXXX";
+        char tn[] = "/tmp/.hlgpuXXXXXX";
         int nfd = mkstemp(tn);
         if (nfd >= 0) {
             unlink(tn);
@@ -5425,21 +5511,29 @@ static int64_t drm_synth_ioctl(int fd, unsigned long rq, void *arg) {
     case 0xc0406400: { // DRM_IOCTL_VERSION (DRM_IOWR(0x00, struct drm_version), 64-byte arg)
         uint8_t *v = (uint8_t *)arg;
         if (!v) return -EFAULT;
-        static const char NM[] = "dd_gpu", DT[] = "20260707", DS[] = "dd virtual GPU";
+        static const char NM[] = "hl_gpu", DT[] = "20260707", DS[] = "HL virtual GPU";
         int32_t maj = 1, min = 0, pat = 0;
-        memcpy(v + 0, &maj, 4); memcpy(v + 4, &min, 4); memcpy(v + 8, &pat, 4);
+        memcpy(v + 0, &maj, 4);
+        memcpy(v + 4, &min, 4);
+        memcpy(v + 8, &pat, 4);
         uint64_t name_len, date_len, desc_len, name_p, date_p, desc_p;
-        memcpy(&name_len, v + 16, 8); memcpy(&name_p, v + 24, 8);
-        memcpy(&date_len, v + 32, 8); memcpy(&date_p, v + 40, 8);
-        memcpy(&desc_len, v + 48, 8); memcpy(&desc_p, v + 56, 8);
+        memcpy(&name_len, v + 16, 8);
+        memcpy(&name_p, v + 24, 8);
+        memcpy(&date_len, v + 32, 8);
+        memcpy(&date_p, v + 40, 8);
+        memcpy(&desc_len, v + 48, 8);
+        memcpy(&desc_p, v + 56, 8);
         size_t nl = sizeof NM - 1, dl = sizeof DT - 1, sl = sizeof DS - 1;
         if (name_p && name_len >= nl) memcpy((void *)(uintptr_t)name_p, NM, nl);
         if (date_p && date_len >= dl) memcpy((void *)(uintptr_t)date_p, DT, dl);
         if (desc_p && desc_len >= sl) memcpy((void *)(uintptr_t)desc_p, DS, sl);
         uint64_t o;
-        o = nl; memcpy(v + 16, &o, 8);
-        o = dl; memcpy(v + 32, &o, 8);
-        o = sl; memcpy(v + 48, &o, 8);
+        o = nl;
+        memcpy(v + 16, &o, 8);
+        o = dl;
+        memcpy(v + 32, &o, 8);
+        o = sl;
+        memcpy(v + 48, &o, 8);
         return 0;
     }
     case 0xc0106c0c: { // DRM_IOCTL_GET_CAP (DRM_IOWR(0x0c, struct drm_get_cap), {u64 cap; u64 value;})
@@ -5448,9 +5542,9 @@ static int64_t drm_synth_ioctl(int fd, unsigned long rq, void *arg) {
         uint64_t cap, val = 0;
         memcpy(&cap, g, 8);
         switch (cap) {
-        case 0x1: val = 1; break; // DRM_CAP_DUMB_BUFFER
+        case 0x1: val = 1; break;  // DRM_CAP_DUMB_BUFFER
         case 0x2: val = 32; break; // DRM_CAP_DUMB_PREFERRED_DEPTH
-        case 0x3: val = 3; break; // DRM_CAP_PRIME (import|export)
+        case 0x3: val = 3; break;  // DRM_CAP_PRIME (import|export)
         case 0x10: val = 1; break; // DRM_CAP_ADDFB2_MODIFIERS
         default: val = 0;
         }
@@ -5598,10 +5692,10 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         // --network none: eth0 (and its statistics/ subdir) does not exist -- direct stat must ENOENT to
         // match the readdir listing, which already omits eth0 under isolation.
         int eth_ok = !net_isolate();
-        int isdir = (r[0] == 0 || (r[0] == '/' && r[1] == 0) ||                       // /sys/class/net
-                     (r[0] == '/' && (!strcmp(r + 1, "lo") ||                         // iface dir
-                                      (eth_ok && !strcmp(r + 1, "eth0")) ||           // eth0 iface dir
-                                      !strcmp(r + 1, "lo/statistics") ||              // statistics/
+        int isdir = (r[0] == 0 || (r[0] == '/' && r[1] == 0) ||             // /sys/class/net
+                     (r[0] == '/' && (!strcmp(r + 1, "lo") ||               // iface dir
+                                      (eth_ok && !strcmp(r + 1, "eth0")) || // eth0 iface dir
+                                      !strcmp(r + 1, "lo/statistics") ||    // statistics/
                                       (eth_ok && !strcmp(r + 1, "eth0/statistics")))));
         if (isdir) {
             memset(s, 0, sizeof *s);
