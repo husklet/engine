@@ -330,6 +330,21 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags,
                    descriptor, (off_t)offset);
     if (address == MAP_FAILED) return hl_linux_errno_result();
+    /* MAP_FIXED replaced these VMAs atomically. Retire stale ownership handles without unmapping the new VMA. */
+    if (placement == HL_HOST_MEMORY_FIXED) {
+        uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
+        pthread_mutex_lock(&host->lock);
+        for (uint32_t index = 0; index < HL_LINUX_HANDLE_CAPACITY; ++index) {
+            hl_linux_handle_entry *entry = &host->handles[index];
+            uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
+            if (entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
+                entry->kind = HL_LINUX_HANDLE_NONE;
+                entry->address = NULL;
+                entry->size = 0;
+            }
+        }
+        pthread_mutex_unlock(&host->lock);
+    }
     registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, address, NULL, size, -1);
     if (registered.status != HL_STATUS_OK) {
         (void)munmap(address, (size_t)size);

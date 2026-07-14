@@ -8,7 +8,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_LINUX_ABI_VERSION 3u
+#define HL_LINUX_ABI_VERSION 4u
 #define HL_LINUX_FD_LIMIT 65536u
 #define HL_LINUX_OFD_LIMIT 65536u
 
@@ -172,6 +172,8 @@ typedef struct hl_linux_abi {
     uint32_t fd_capacity;
     hl_linux_ofd_entry *ofds;
     uint32_t ofd_capacity;
+    /* Private, dynamically sized virtual-mapping ledger owned by this instance. */
+    void *vma_state;
     /*
      * Serializes only descriptor lookup and OFD lifetime counters. Host calls
      * never hold it; each OFD has independent I/O ownership instead.
@@ -228,6 +230,14 @@ HL_API hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi);
 /* Returns a stable value snapshot; internal entries and mutex-bearing OFDs never escape. */
 HL_API hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linux_fd fd,
                                           hl_linux_fd_snapshot *snapshot);
+/*
+ * Map an ordinary typed file while its open-file-description is pinned. Closing
+ * the guest descriptor concurrently cannot retire the opaque host file until
+ * map_file has returned. The returned mapping owns its independent host handle.
+ */
+HL_API int64_t hl_linux_map_file(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t address, uint64_t offset,
+                                uint64_t size, uint32_t protection, uint32_t flags,
+                                hl_host_file_mapping *mapping);
 
 /*
  * Host-agnostic Linux file-I/O syscall semantics.

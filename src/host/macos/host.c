@@ -376,6 +376,22 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
                    descriptor, (off_t)offset);
     if (address == MAP_FAILED) return hl_macos_errno();
+    /* MAP_FIXED replaced these VMAs atomically. Retire stale handles without unmapping the replacement. */
+    if (placement == HL_HOST_MEMORY_FIXED) {
+        uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
+        pthread_mutex_lock(&host->lock);
+        for (uint32_t index = 0; index < HL_MACOS_MAPPING_CAPACITY; ++index) {
+            hl_macos_mapping *old = &host->mappings[index];
+            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
+            if (old->active && low < old_high && old_low < high) {
+                old->active = 0;
+                old->writable = NULL;
+                old->executable = NULL;
+                old->size = 0;
+            }
+        }
+        pthread_mutex_unlock(&host->lock);
+    }
     registered = hl_macos_register(host, address, NULL, size);
     if (registered.status != HL_STATUS_OK) {
         (void)munmap(address, (size_t)size);

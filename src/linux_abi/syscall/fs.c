@@ -12,6 +12,20 @@ static int jail_routed_at(int dirfd, const char *path) {
     confine(path, normalized, sizeof normalized);
     return jail_match(normalized) >= 0;
 }
+static int64_t bound_open_handle(hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
+                                 uint32_t mode);
+
+static uint32_t typed_open_flags(uint64_t guest) {
+#if G_O_DIRECTORY == 0x4000
+    const uint32_t largefile = 0x20000u;
+#else
+    const uint32_t largefile = 0x8000u;
+#endif
+    uint32_t flags = (uint32_t)guest & ~(largefile | (uint32_t)G_O_DIRECTORY | (uint32_t)G_O_NOFOLLOW);
+    if (guest & G_O_DIRECTORY) flags |= HL_LINUX_O_DIRECTORY;
+    if (guest & G_O_NOFOLLOW) flags |= HL_LINUX_O_NOFOLLOW;
+    return flags;
+}
 
 // A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
 // group raises SIGTTOU on the whole group; with the default disposition that STOPS it. During job-control
@@ -2471,6 +2485,20 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // fin is resolved -> O_NOFOLLOW safe
             // probe pre-existence (relative to the resolved parent) so we stamp ONLY a fresh create.
             int nf_new = nf_want && faccessat(pfd, fin, F_OK, AT_SYMLINK_NOFOLLOW) != 0;
+            /* The sentry wire still transports native descriptors; typed publication is safe only locally. */
+            if (!g_untrusted && plan.directory != HL_HOST_HANDLE_INVALID &&
+                (plan.target_type == HL_HOST_FILE_TYPE_REGULAR ||
+                 (plan.target == HL_HOST_HANDLE_INVALID && (lf & 0x40))) &&
+                !(lf & G_O_DIRECTORY)) {
+                int64_t opened;
+                close(pfd);
+                if (plan.target) (void)g_host_services->file->close(g_host_services->context, plan.target);
+                opened =
+                    bound_open_handle(plan.directory, plan.path, plan.path_size, typed_open_flags(a2), (uint32_t)a3);
+                (void)g_host_services->file->close(g_host_services->context, plan.directory);
+                G_RET(c) = (uint64_t)opened;
+                break;
+            }
             if (plan.target) (void)g_host_services->file->close(g_host_services->context, plan.target);
             if (plan.directory) (void)g_host_services->file->close(g_host_services->context, plan.directory);
             // O_PATH|O_NOFOLLOW on a symlink -> open the LINK via O_SYMLINK (else O_NOFOLLOW ELOOPs); a

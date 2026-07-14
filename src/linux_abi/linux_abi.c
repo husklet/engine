@@ -6,6 +6,10 @@
 
 #define HL_LINUX_FD_RESERVED UINT32_MAX
 
+static hl_status hl_linux_fd_get_unlocked(const hl_linux_abi *linux_abi, hl_linux_fd fd,
+                                          const hl_linux_fd_entry **fd_entry,
+                                          const hl_linux_ofd_entry **ofd_entry);
+
 static void hl_linux_lock(hl_linux_abi *linux_abi) {
     while (atomic_flag_test_and_set_explicit(&linux_abi->table_lock, memory_order_acquire)) {}
 }
@@ -62,6 +66,37 @@ static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi
         host->file == NULL || host->file->abi != HL_HOST_FILE_ABI || host->file->size < sizeof(*host->file))
         return NULL;
     return host->file;
+}
+
+int64_t hl_linux_map_file(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t address, uint64_t offset, uint64_t size,
+                          uint32_t protection, uint32_t flags, hl_host_file_mapping *mapping) {
+    const hl_linux_ofd_entry *found;
+    hl_linux_ofd_entry *ofd;
+    const hl_host_memory_services *memory;
+    hl_host_result result;
+    hl_status status;
+    if (linux_abi == NULL || mapping == NULL) return -HL_LINUX_EBADF;
+    memory = linux_abi->host != NULL ? linux_abi->host->memory : NULL;
+    if (memory == NULL || memory->map_file == NULL) return -HL_LINUX_ENOSYS;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, NULL, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[(size_t)(found - linux_abi->ofds)];
+    if (ofd->object_ops != NULL) {
+        hl_linux_unlock(linux_abi);
+        return -HL_LINUX_EINVAL;
+    }
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    result = memory->map_file(linux_abi->host->context, ofd->host_handle, address, offset, size, protection, flags,
+                              mapping);
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    return result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)result.status);
 }
 
 /* All helpers below through hl_linux_fd_get_unlocked require table_lock. */
@@ -1035,6 +1070,7 @@ static int64_t hl_linux_pread64_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entr
                                       uint64_t offset) {
     const hl_host_file_services *files;
     hl_host_result result;
+    if (ofd->status_flags & HL_LINUX_O_PATH) return -HL_LINUX_EBADF;
     if (size != 0 && buffer == NULL) return -HL_LINUX_EINVAL;
     files = hl_linux_files(linux_abi);
     if (files == NULL || files->read_at == NULL) return -HL_LINUX_ENOSYS;
@@ -1090,7 +1126,9 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_lock(linux_abi, ofd);
     files = hl_linux_files(linux_abi);
-    if (size != 0 && buffer == NULL)
+    if (ofd->status_flags & HL_LINUX_O_PATH)
+        result = -HL_LINUX_EBADF;
+    else if (size != 0 && buffer == NULL)
         result = -HL_LINUX_EINVAL;
     else if (ofd->object_ops != NULL)
         result =
@@ -1118,6 +1156,7 @@ static int64_t hl_linux_write_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry 
                                     uint64_t offset) {
     const hl_host_file_services *files;
     hl_host_result result;
+    if (ofd->status_flags & HL_LINUX_O_PATH) return -HL_LINUX_EBADF;
     if (size != 0 && buffer == NULL) return -HL_LINUX_EINVAL;
     files = hl_linux_files(linux_abi);
     if (files == NULL) return -HL_LINUX_ENOSYS;

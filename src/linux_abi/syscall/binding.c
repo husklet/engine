@@ -4,6 +4,131 @@
 
 static int g_bound_sentinel = -1;
 
+typedef struct bound_mapping_object {
+    hl_host_handle handle;
+    uint64_t address;
+    uint64_t size;
+    size_t references;
+} bound_mapping_object;
+
+typedef struct bound_mapping {
+    uint64_t address;
+    uint64_t size;
+    uint64_t object_offset;
+    bound_mapping_object *object;
+    struct bound_mapping *next;
+} bound_mapping;
+
+static bound_mapping **bound_mapping_head(void) { return (bound_mapping **)&g_linux_box->vma_state; }
+
+static int64_t bound_host_error(int32_t status) {
+    switch ((hl_status)status) {
+    case HL_STATUS_OK: return 0;
+    case HL_STATUS_INVALID_ARGUMENT: return -EINVAL;
+    case HL_STATUS_NOT_FOUND: return -ENOENT;
+    case HL_STATUS_PERMISSION_DENIED: return -EACCES;
+    case HL_STATUS_ALREADY_EXISTS: return -EEXIST;
+    case HL_STATUS_RESOURCE_LIMIT: return -ENOMEM;
+    case HL_STATUS_NOT_SUPPORTED: return -ENOTSUP;
+    case HL_STATUS_INTERRUPTED: return -EINTR;
+    default: return -EIO;
+    }
+}
+
+static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
+    bound_mapping *entry;
+    for (entry = *bound_mapping_head(); entry != NULL; entry = entry->next)
+        if (address >= entry->address && size <= entry->size && address - entry->address <= entry->size - size)
+            return entry;
+    return NULL;
+}
+
+static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
+    bound_mapping_object *object = entry->object;
+    if (previous != NULL) previous->next = entry->next;
+    else *bound_mapping_head() = entry->next;
+    free(entry);
+    if (--object->references == 0) {
+        (void)g_host_services->memory->release(g_host_services->context, object->handle);
+        free(object);
+    }
+}
+
+static void bound_mapping_retire(uint64_t address, uint64_t size) {
+    uint64_t end = address + size;
+    bound_mapping *entry = *bound_mapping_head(), *previous = NULL;
+    while (entry != NULL) {
+        bound_mapping *next = entry->next;
+        uint64_t base = entry->address, mapped_end = base + entry->size;
+        if (end <= base || address >= mapped_end) {
+            previous = entry;
+        } else if (address <= base && end >= mapped_end) {
+            bound_mapping_drop(entry, previous);
+        } else if (address > base && end < mapped_end) {
+            bound_mapping *tail = malloc(sizeof(*tail));
+            if (tail != NULL) {
+                *tail = (bound_mapping){end, mapped_end - end, entry->object_offset + end - base, entry->object,
+                                        entry->next};
+                entry->object->references++;
+                entry->next = tail;
+                entry->size = address - base;
+                previous = tail;
+            }
+        } else if (address <= base) {
+            uint64_t cut = end - base;
+            entry->address += cut;
+            entry->object_offset += cut;
+            entry->size -= cut;
+            previous = entry;
+        } else {
+            entry->size = address - base;
+            previous = entry;
+        }
+        entry = next;
+    }
+}
+
+static void bound_mapping_reset(void) {
+    while (*bound_mapping_head() != NULL) bound_mapping_drop(*bound_mapping_head(), NULL);
+}
+
+static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t address, uint64_t size, uint32_t protection,
+                               uint32_t linux_flags, uint64_t offset) {
+    hl_host_file_mapping mapped = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapped), 0, 0, 0, 0};
+    uint32_t flags = (linux_flags & 1u) ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE;
+    bound_mapping_object *object;
+    bound_mapping *entry;
+    int64_t result;
+    if (g_host_services == NULL || g_host_services->memory == NULL || g_host_services->memory->map_file == NULL)
+        return -ENOSYS;
+    if (linux_flags & 0x10u) flags |= HL_HOST_MEMORY_FIXED;
+    if (linux_flags & 0x100000u) flags = (flags & ~HL_HOST_MEMORY_FIXED) | HL_HOST_MEMORY_FIXED_NOREPLACE;
+    object = calloc(1, sizeof(*object));
+    entry = calloc(1, sizeof(*entry));
+    if (object == NULL || entry == NULL) {
+        free(object);
+        free(entry);
+        return -ENOMEM;
+    }
+    result = hl_linux_map_file(g_linux_box, file->fd, address, offset, size, protection & 7u, flags, &mapped);
+    if (result < 0) {
+        free(object);
+        free(entry);
+        return result;
+    }
+    if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
+    *object = (bound_mapping_object){mapped.handle, mapped.address, mapped.mapped_size, 1};
+    *entry = (bound_mapping){mapped.address, mapped.mapped_size, 0, object, *bound_mapping_head()};
+    *bound_mapping_head() = entry;
+    if (mapped.address == 0 || mapped.mapped_size < size) {
+        bound_mapping_drop(entry, NULL);
+        return -EIO;
+    }
+    gmap_add(mapped.address, mapped.mapped_size);
+    gmap_set_glen(mapped.address, size);
+    return (int64_t)mapped.address;
+}
+
 static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
     if (g_linux_box == NULL || value > UINT32_MAX) return 0;
     return hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)value, snapshot) == HL_STATUS_OK;
@@ -50,10 +175,7 @@ static int bound_shadow_activate(void) {
     uint32_t fd;
     int opened;
     if (g_linux_box == NULL) return 0;
-    for (fd = 3; fd < g_linux_box->fd_capacity; ++fd)
-        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK) break;
-    /* Native stdio remains the host backing for the typed 0/1/2 OFDs and for the sentry helper. */
-    if (fd == g_linux_box->fd_capacity) return 0;
+    /* Typed stdio alone still requires a sentinel so dup/F_DUPFD can allocate guest-number shadows. */
     if (g_bound_sentinel >= 0) {
         for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
             if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) == HL_STATUS_OK && fd >= 3 &&
@@ -108,6 +230,35 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
     }
     result = hl_linux_dup3(g_linux_box, source, (hl_linux_fd)shadow, descriptor_flags != 0 ? HL_LINUX_O_CLOEXEC : 0);
     if (result < 0) close(shadow);
+    return result;
+}
+
+static int64_t bound_open_handle(hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
+                                 uint32_t mode) {
+    hl_linux_fd_reservation reservation;
+    hl_status status;
+    int shadow = bound_shadow_reserve(0);
+    int64_t result;
+    if (shadow < 0 || shadow >= guest_nofile_cur()) {
+        if (shadow >= 0) close(shadow);
+        return -EMFILE;
+    }
+    for (;;) {
+        status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
+        if (status != HL_STATUS_ALREADY_EXISTS) break;
+        close(shadow);
+        shadow = bound_shadow_reserve(shadow + 1);
+        if (shadow < 0 || shadow >= guest_nofile_cur()) break;
+    }
+    if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
+        if (shadow >= 0) close(shadow);
+        return -EMFILE;
+    }
+    result = hl_linux_openat_handle_reserved(g_linux_box, &reservation, directory, path, path_size, flags, mode);
+    if (result < 0) {
+        (void)hl_linux_fd_cancel(g_linux_box, &reservation);
+        close(shadow);
+    }
     return result;
 }
 
@@ -510,7 +661,30 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     if (nr == 222) {
         hl_linux_fd_snapshot mapped;
         if (bound_snapshot(G_A4(c), &mapped)) {
-            G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+            G_RET(c) = (uint64_t)bound_mmap_file(&mapped, a0, a1, (uint32_t)a2, (uint32_t)a3, G_A5(c));
+            return 1;
+        }
+    }
+    if (nr == 215 || nr == 226 || nr == 227) {
+        bound_mapping *mapping = bound_mapping_find(a0, a1);
+        if (mapping != NULL) {
+            uint64_t offset = a0 - mapping->address;
+            hl_host_result operation;
+            if (nr == 215)
+                operation = g_host_services->memory->unmap_range(g_host_services->context, mapping->object->handle,
+                                                                 mapping->object_offset + offset, a1);
+            else if (nr == 226)
+                operation = g_host_services->memory->protect(g_host_services->context, mapping->object->handle,
+                                                             mapping->object_offset + offset, a1,
+                                                             (uint32_t)a2 & 7u);
+            else
+                operation = g_host_services->memory->sync(g_host_services->context, mapping->object->handle,
+                                                          mapping->object_offset + offset, a1);
+            if (operation.status == HL_STATUS_OK && nr == 215) {
+                bound_mapping_retire(a0, a1);
+                gmap_split_unmap(a0, a0 + a1);
+            }
+            G_RET(c) = (uint64_t)bound_host_error(operation.status);
             return 1;
         }
     }

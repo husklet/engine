@@ -491,6 +491,7 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
 // affinity_mask for proc; svc_adjtimex/pidfd_*/mq_* for rare) defined just above, so they must be
 // included AFTER them.
 #include "fs.c"
+static void bound_mapping_reset(void);
 #include "proc.c"
 #include "rare.c"
 #include "ptrace.c" // bug real ptrace tracer/tracee coordination (uses helpers above + G_* macros)

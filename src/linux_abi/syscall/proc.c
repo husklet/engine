@@ -1655,6 +1655,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         for (int i = 0; i < ac && i < HL_MAXARGV - 1; i++)
             xargv[i] = strdup(argv[i]);
         xargv[ac < HL_MAXARGV - 1 ? ac : HL_MAXARGV - 1] = NULL;
+        bound_mapping_reset();
         gmap_reset_all();
         gna_reset();                   // the old image's PROT_NONE ranges are gone with its address space
         mlk_reset();                   // ... and so are its mlock'd ranges (VmLck resets across execve)
