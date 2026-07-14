@@ -5,7 +5,8 @@
 // forcing the DBT to re-translate the whole block each time. This stresses per-address invalidation and
 // code-cache recycle even harder than the single-instruction case: any stale translation returns the old
 // 32-bit value and the checksum diverges. aarch64 machine code only; diffed against a native run (oracle).
-// xfail aarch64: matches the documented SMC gap; mmap(RWX) is also EPERM on darwin W^X (see GAPS.md).
+// The engine maps guest RWX as host RW because guest instructions only execute through the DBT. Each guest
+// cache-maintenance instruction must still invalidate the corresponding translated block before the call.
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>

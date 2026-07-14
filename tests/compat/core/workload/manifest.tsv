@@ -9,7 +9,7 @@ indirect	soak	soak_indirect.c	soak_indirect.c	aarch64,x86_64	-static-pie -O2 -pt
 threadchurn	soak	soak_threadchurn.c	soak_threadchurn.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/soak_threadchurn.out	threads,endurance	active	exact registered golden
 forkchurn	soak	soak_forkchurn.c	soak_forkchurn.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/soak_forkchurn.out	fork/wait,endurance	active	exact registered golden
 allocchurn	soak	soak_allocchurn.c	soak_allocchurn.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/soak_allocchurn.out	heap,endurance	active	exact registered golden
-smc	soak	soak_smc.c	soak_smc.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/soak_smc.out	aarch64-smc,mmap-rwx,endurance	excluded-known-gap	exact AArch64-only source; preserves legacy xfail: mmap(RWX) is denied without MAP_JIT
+smc	soak	soak_smc.c	soak_smc.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/soak_smc.out	aarch64-smc,mmap-rwx,endurance	active	exact AArch64-only source; guest RWX is host RW under DBT and precise icache invalidation observes every rewrite
 smcthreads	soak	smc_threads.c	smc_threads.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/smc_threads.out	aarch64-smc,threads,endurance	active	exact AArch64-only source
 smcselfflush	soak	smc_selfflush.c	smc_selfflush.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/smc_selfflush.out	aarch64-smc,endurance	active	exact AArch64-only source
 smcmprotect	soak	smc_mprotect.c	smc_mprotect.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/smc_mprotect.out	smc,mprotect	active	exact registered golden
