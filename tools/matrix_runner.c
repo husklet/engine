@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -228,6 +229,27 @@ static int write_full(int fd, const void *buffer, size_t size) {
     return 0;
 }
 
+static void remove_tree(const char *path) {
+    DIR *directory = opendir(path);
+    struct dirent *entry;
+    if (directory == NULL) {
+        (void)unlink(path);
+        return;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char child[1200];
+        struct stat status;
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (snprintf(child, sizeof child, "%s/%s", path, entry->d_name) >= (int)sizeof child) continue;
+        if (lstat(child, &status) == 0 && S_ISDIR(status.st_mode))
+            remove_tree(child);
+        else
+            (void)unlink(child);
+    }
+    (void)closedir(directory);
+    (void)rmdir(path);
+}
+
 static int pool_string(config_wire *wire, const char *value, uint32_t *offset) {
     size_t size = strlen(value) + 1;
     if (wire->used + size > sizeof wire->pool || wire->used > UINT32_MAX) return 1;
@@ -286,7 +308,7 @@ static int config_option(config_wire *wire, const char *name, const char *value)
 }
 
 static int make_config(const char *binary_root, const char *guest, const char *argument, const char *rootfs,
-                       const char *encoded, char path[1024]) {
+                       const char *encoded, const char *scratch, char path[1024]) {
     config_wire wire;
     char copy[256], guest_environment[512] = {0}, *cursor;
     size_t environment_size = 0;
@@ -324,6 +346,14 @@ static int make_config(const char *binary_root, const char *guest, const char *a
             cursor = next;
         }
     }
+    if (scratch != NULL) {
+        char volume[1600];
+        const char *declared = wire.config.volumes_offset ? wire.pool + wire.config.volumes_offset : NULL;
+        int length = declared ? snprintf(volume, sizeof volume, "%s,/tmp:%s", declared, scratch)
+                              : snprintf(volume, sizeof volume, "/tmp:%s", scratch);
+        if (length < 0 || length >= (int)sizeof volume || pool_string(&wire, volume, &wire.config.volumes_offset) != 0)
+            return 1;
+    }
     if (environment_size != 0 && pool_string(&wire, guest_environment, &wire.config.environment_offset) != 0) return 1;
     /* argv is a NUL-separated vector terminated by an additional NUL. */
     if (pool_string(&wire, guest, &wire.config.arguments_offset) != 0) return 1;
@@ -352,17 +382,24 @@ static int make_config(const char *binary_root, const char *guest, const char *a
 static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
                      const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
-    char config_path[1024];
+    char config_path[1024], scratch[1024];
     uint64_t deadline;
     pid_t child;
     memset(result, 0, sizeof(*result));
     result->output = malloc(OUTPUT_MAX);
     result->error = malloc(ERROR_MAX);
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
-    if (make_config(binary_root, guest, argument, rootfs, environment, config_path) != 0) return 1;
+    if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", binary_root) >= (int)sizeof scratch ||
+        mkdtemp(scratch) == NULL)
+        return 1;
+    if (make_config(binary_root, guest, argument, rootfs, environment, scratch, config_path) != 0) {
+        remove_tree(scratch);
+        return 1;
+    }
     child = fork();
     if (child < 0) {
         (void)unlink(config_path);
+        remove_tree(scratch);
         return 1;
     }
     if (child == 0) {
@@ -381,6 +418,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     if (fcntl(output_pipe[0], F_SETFL, O_NONBLOCK) < 0 || fcntl(error_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
         terminate(child);
         (void)unlink(config_path);
+        remove_tree(scratch);
         return 1;
     }
     deadline = monotonic_ms() + TIMEOUT_MS;
@@ -392,17 +430,20 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
             close(output_pipe[0]);
             close(error_pipe[0]);
             unlink(config_path);
+            remove_tree(scratch);
             return 2;
         }
         if (poll(descriptors, 2, 10) < 0 && errno != EINTR) {
             terminate(child);
             (void)unlink(config_path);
+            remove_tree(scratch);
             return 1;
         }
         if (drain(output_pipe[0], result->output, &result->output_size, OUTPUT_MAX, &output_eof) != 0 ||
             drain(error_pipe[0], result->error, &result->error_size, ERROR_MAX, &error_eof) != 0) {
             terminate(child);
             (void)unlink(config_path);
+            remove_tree(scratch);
             return 1;
         }
         if (!exited) {
@@ -412,6 +453,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
             else if (waited < 0 && errno != EINTR) {
                 terminate(child);
                 (void)unlink(config_path);
+                remove_tree(scratch);
                 return 1;
             }
         }
@@ -419,6 +461,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     close(output_pipe[0]);
     close(error_pipe[0]);
     (void)unlink(config_path); /* Engine normally unlinks immediately; covers pre-exec failure. */
+    remove_tree(scratch);
     return 0;
 }
 
@@ -477,13 +520,12 @@ static int make_parents(char *path) {
     return 0;
 }
 
-static int stage_rootfs(const char *binary_root, const char *guest, const char *isa, int dynamic,
-                        char rootfs[1024]) {
+static int stage_rootfs(const char *binary_root, const char *guest, const char *isa, int dynamic, char rootfs[1024]) {
     char bin[1024], dev[1024], pts[1024], tmp[1024], staged[1024], loader[1024], libc[1024];
     const char *loader_source = strcmp(isa, "aarch64") == 0 ? AARCH64_DYNAMIC_LOADER : X86_64_DYNAMIC_LOADER;
     const char *libc_source = strcmp(isa, "aarch64") == 0 ? AARCH64_DYNAMIC_LIBC : X86_64_DYNAMIC_LIBC;
-    const char *loader_guest = strcmp(isa, "aarch64") == 0 ? "/lib/ld-linux-aarch64.so.1"
-                                                             : "/lib64/ld-linux-x86-64.so.2";
+    const char *loader_guest =
+        strcmp(isa, "aarch64") == 0 ? "/lib/ld-linux-aarch64.so.1" : "/lib64/ld-linux-x86-64.so.2";
     if (snprintf(rootfs, 1024, "%s/.rootfs-XXXXXX", binary_root) >= 1024 || mkdtemp(rootfs) == NULL ||
         snprintf(bin, sizeof bin, "%s/bin", rootfs) >= (int)sizeof bin ||
         snprintf(dev, sizeof dev, "%s/dev", rootfs) >= (int)sizeof dev ||
@@ -566,7 +608,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         return 1;
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
-    status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest, item->argument,
+    status = run_guest(bridge, engine, item->needs_rootfs ? "/bin/guest" : guest, item->argument,
                        item->needs_rootfs ? rootfs : NULL, item->environment, binary_root, result);
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||

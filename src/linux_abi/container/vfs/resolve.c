@@ -90,7 +90,6 @@ static int path_has_dotdot(const char *p) {
 // unconsumed tail from scratch (`goto restart`), so routing, symlinks, and any outer mount are handled
 // by a fresh confined walk. A `..` at the rootfs root still clamps -> the walk can never escape rootfs.
 static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
-    if (g_root_fd < 0) return -1;
     char gbuf[8192];
     if (g_chroot[0]) // re-root under the guest's chroot, still confined to g_root_fd by the walk below
         chroot_apply(guest, gbuf, sizeof gbuf);
@@ -102,6 +101,16 @@ restart:;
     int volidx;
     // rootfs/overlay or a volume root
     int root_fd = jail_pick_idx(gbuf, &rel, &volidx);
+    // A bare launch has no rootfs fd, but an absolute path inside a registered bind volume has its own
+    // pinned jail fd and is fully resolvable. Reject only after jail selection, not before it.
+    int bare_root_fd = -1;
+    if (root_fd < 0 && !g_rootfs) {
+        bare_root_fd = open("/", O_RDONLY | O_DIRECTORY);
+        root_fd = bare_root_fd;
+        rel = gbuf;
+        volidx = -1;
+    }
+    if (root_fd < 0) return -1;
     if (volidx >= 0 && g_vols[volidx].isfile) {
         // File bind-mount (jail_match matched only the exact mount point): `root_fd` is the host file's
         // PARENT dir. Hand back that parent + the file's basename so the caller's openat opens the bound
@@ -158,6 +167,7 @@ restart:;
     snprintf(rest, sizeof rest, "%s", rel);
     int fds[260], nf = 0, budget = 40, ret = -EACCES;
     fds[nf++] = openat(root_fd, ".", O_RDONLY | O_DIRECTORY);
+    if (bare_root_fd >= 0) close(bare_root_fd);
     if (fds[0] < 0) return -EACCES;
     final[0] = 0;
     for (;;) {
@@ -224,10 +234,13 @@ restart:;
             }
             lk[k] = 0;
             if (lk[0] == '/') {
-                while (nf > 1)
-                    close(fds[--nf]);
-                snprintf(rest, sizeof rest, "%s%s", lk, tail);
-                // abs -> back to root
+                // Absolute link targets restart namespace routing at the guest root.  In particular, a
+                // link inside a bind volume may point outside that mount; bare mode's outer namespace is
+                // the host root, while container mode selects the configured rootfs.
+                for (int i = 0; i < nf; i++)
+                    close(fds[i]);
+                snprintf(gbuf, sizeof gbuf, "%s%s", lk, tail);
+                goto restart;
             } else
                 // tail already carries its leading '/' (or is empty)
                 snprintf(rest, sizeof rest, "%s%s", lk, tail);

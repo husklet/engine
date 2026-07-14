@@ -291,7 +291,8 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
 // read-only --lower (empty upper) is found -- a bare xresolve_exec checks the upper alone and ENOENTs.
 // With no lowers (the flat-rootfs pull case) this is identical to xresolve_exec.
 static const char *xresolve_overlay(const char *p, char *buf, size_t n) {
-    if (!(g_rootfs && p && p[0] == '/')) return p;
+    if (!(p && p[0] == '/')) return p;
+    if (!g_rootfs) return xresolve_exec(p, buf, n);
     overlay_resolve(p, buf, n, 0);
     return buf;
 }

@@ -1074,7 +1074,7 @@ static const struct hl_linux_vfs_namespace g_vfs_namespace = {
 
 // final NOT followed (readlink/lstat)
 static const char *xlate(const char *p, char *buf, size_t n) {
-    if (g_rootfs && p && p[0] == '/') {
+    if (p && p[0] == '/' && (g_rootfs || jail_match(p) >= 0)) {
         secure_resolve(p, buf, n, 1);
         return buf;
     }
@@ -1083,19 +1083,40 @@ static const char *xlate(const char *p, char *buf, size_t n) {
 
 // follow symlinks (open/stat/exec)
 static const char *xresolve(const char *p, char *buf, size_t n) {
-    if (g_rootfs && p && p[0] == '/') {
+    if (p && p[0] == '/' && (g_rootfs || jail_match(p) >= 0)) {
         secure_resolve(p, buf, n, 0);
         return buf;
     }
     return p;
 }
 
+static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofollow);
+
 // Resolve an EXEC entrypoint (or PT_INTERP) to a host path, following symlinks the way the kernel
 // would INSIDE the rootfs: an absolute symlink target (`/bin/sh -> /bin/busybox`) is rootfs-relative,
 // not host-relative -- realpath() can't do this (it follows the target against the host root). Each
 // hop is re-confined via secure_resolve, so an escaping link lands on .jail-escape-denied and fails.
 static const char *xresolve_exec(const char *p, char *buf, size_t n) {
-    if (!(g_rootfs && p && p[0] == '/')) return p;
+    if (!(p && p[0] == '/')) return p;
+    // Bare launches can still have typed bind volumes.  They do not need the rootfs-specific absolute
+    // symlink rewriting below, but must resolve inside the volume jail like every other followed lookup.
+    if (!g_rootfs) {
+        if (jail_match(p) < 0) return p;
+        char final[512];
+        int dfd = jail_at(-100, p, final, sizeof final, 0);
+        if (dfd >= 0) {
+            int fd = openat(dfd, final, O_RDONLY);
+            close(dfd);
+            if (fd >= 0) {
+                if (fcntl(fd, F_GETPATH, buf) == 0) {
+                    close(fd);
+                    return buf;
+                }
+                close(fd);
+            }
+        }
+        return xresolve(p, buf, n);
+    }
     char cur[4200];
     snprintf(cur, sizeof cur, "%s", p);
     // bounded symlink chain

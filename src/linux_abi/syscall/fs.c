@@ -4,6 +4,15 @@
 // cpu_range_str it calls) and before service() -- same TU scope.
 #include "../device.h"
 
+static int jail_routed_at(int dirfd, const char *path) {
+    (void)dirfd;
+    if (g_rootfs) return 1;
+    if (!path || path[0] != '/') return 0;
+    char normalized[4200];
+    confine(path, normalized, sizeof normalized);
+    return jail_match(normalized) >= 0;
+}
+
 // A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
 // group raises SIGTTOU on the whole group; with the default disposition that STOPS it. During job-control
 // handoff a shell's pipeline child briefly sits in a background group between its setpgid() and the
@@ -871,7 +880,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             if (g_nlower) {
                 char gpm[4200];
                 abs_guest((int)a0, (const char *)a1, gpm, sizeof gpm);
@@ -920,7 +929,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             // OVERLAY: recreating a name a lower still provides -> drop any stale `.wh.NAME` whiteout first
             // (else the new dir can be hidden by an order-dependent readdir dedup), and if a lower dir of the
             // same name exists, mark the new upper dir OPAQUE so the lower's stale children never re-surface.
@@ -1083,7 +1092,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (S_ISREG(lst.st_mode) && lst.st_nlink >= 2) mc_evict_ino(lst.st_dev, lst.st_ino);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 1);
             if (pfd < 0) {
@@ -1156,7 +1165,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *target =
             // target is the link CONTENT (unresolved); follow-time confinement guards it
             (const char *)a0;
-        if (g_rootfs) {
+        if (jail_routed_at((int)a1, (const char *)a2)) {
             if (g_nlower) {
                 char gpm[4200];
                 abs_guest((int)a1, (const char *)a2, gpm, sizeof gpm);
@@ -1233,7 +1242,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         int fl = (a4 & 0x400) ? AT_SYMLINK_FOLLOW : 0;
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1) || jail_routed_at((int)a2, (const char *)a3)) {
             // Copy a lower-only SOURCE up first. jail_at(create=1) resolves the source to its UPPER parent
             // dir, but a file that still lives only in the read-only lower is absent there, so linkat would
             // ENOENT (dpkg backs up e.g. /usr/bin/perl via link() on every package upgrade). Mirrors what
@@ -1320,7 +1329,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = renameatx_np(AT_FDCWD, roh, AT_FDCWD, rnh, rxflags) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1) || jail_routed_at((int)a2, (const char *)a3)) {
             // both ends confined (TOCTOU-free). Copy a lower-only SOURCE up first so renameatx_np finds it in
             // the writable upper (jail_at already materializes the dest's upper parent via overlay_mkparents).
             // RECURSIVE for a lower-only directory: the whole subtree must be in the upper before the move,
@@ -1863,7 +1872,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, 0);
@@ -1903,7 +1912,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a4 & 0x100) ? 1 : 0);
@@ -2409,7 +2418,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         // TOCTOU-free per-component resolve in the jail
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             // W4D: openat resolution cache. Memoizes the guest-abs-path -> canonical host path that the
             // jail walk below produces, so a REPEATED open of the same path collapses the ~6-syscall
             // per-component walk to a single open(host, O_NOFOLLOW). The real open ALWAYS still runs (no
@@ -3060,7 +3069,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
-        if (g_rootfs) {
+        if (jail_routed_at((int)a0, (const char *)a1)) {
             overlay_copyup_at((int)a0, (const char *)a1); // bring a lower-only target up so jail_at finds it
             char fin[512];
             int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (a3 & 0x100) ? 1 : 0);
