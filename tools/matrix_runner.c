@@ -21,6 +21,7 @@ typedef struct suite_case {
     char name[128];
     char source[256];
     char expected[256];
+    char environment[256];
     case_isa isa;
     int expected_exit;
     int needs_rootfs;
@@ -59,6 +60,24 @@ static int parse_exit(const char *text, int *value) {
     return 0;
 }
 
+static int valid_environment(const char *text) {
+    const char *cursor = text;
+    if (strcmp(text, "-") == 0) return 1;
+    if (*text == 0 || strlen(text) >= sizeof(((suite_case *)0)->environment)) return 0;
+    while (*cursor) {
+        const char *equals = strchr(cursor, '=');
+        const char *end = strchr(cursor, ';');
+        const char *name;
+        if (end == NULL) end = cursor + strlen(cursor);
+        if (equals == NULL || equals == cursor || equals >= end) return 0;
+        for (name = cursor; name < equals; ++name)
+            if (!((*name >= 'A' && *name <= 'Z') || (*name >= '0' && *name <= '9') || *name == '_')) return 0;
+        cursor = *end == ';' ? end + 1 : end;
+        if (*end == ';' && *cursor == 0) return 0;
+    }
+    return 1;
+}
+
 static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *case_count, size_t *excluded) {
     char path[1024];
     char *line = NULL;
@@ -93,6 +112,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
                 goto invalid;
             cases[*case_count].isa = ISA_BOTH;
             cases[*case_count].needs_rootfs = 0;
+            cases[*case_count].environment[0] = 0;
             if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
                     (int)sizeof(cases[*case_count].name) ||
                 snprintf(cases[*case_count].source, sizeof(cases[*case_count].source), "%s", fields[0]) >=
@@ -109,7 +129,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         }
         if (strcmp(fields[11], "active") != 0 || *case_count == CASE_MAX || !relative_path(fields[2]) ||
             !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 || strcmp(fields[6], "-") != 0 ||
-            strcmp(fields[7], "-") != 0 || parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
+            !valid_environment(fields[7]) || parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
         cases[*case_count].needs_rootfs = strstr(fields[10], "alpine-rootfs") != NULL;
         if (strcmp(fields[4], "aarch64") == 0)
@@ -123,7 +143,9 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
                 (int)sizeof(cases[*case_count].name) ||
             snprintf(cases[*case_count].source, sizeof(cases[*case_count].source), "%s", fields[2]) >=
-                (int)sizeof(cases[*case_count].source) ||
+                    (int)sizeof(cases[*case_count].source) ||
+            snprintf(cases[*case_count].environment, sizeof(cases[*case_count].environment), "%s",
+                     strcmp(fields[7], "-") == 0 ? "" : fields[7]) >= (int)sizeof(cases[*case_count].environment) ||
             snprintf(cases[*case_count].expected, sizeof(cases[*case_count].expected), "%s", fields[9]) >=
                 (int)sizeof(cases[*case_count].expected))
             goto invalid;
@@ -157,7 +179,32 @@ static void terminate(pid_t child) {
     while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
 }
 
-static int run_guest(const char *bridge, const char *engine, const char *guest, const char *rootfs, capture *result) {
+static int install_environment(const char *encoded) {
+    char copy[256], names[256] = {0}, *cursor;
+    size_t names_size = 0;
+    if (*encoded == 0) return 0;
+    memcpy(copy, encoded, strlen(encoded) + 1);
+    cursor = copy;
+    while (cursor != NULL) {
+        char *next = strchr(cursor, ';');
+        char *equals = strchr(cursor, '=');
+        if (next != NULL) *next++ = 0;
+        if (equals == NULL) return 1;
+        *equals++ = 0;
+        if (setenv(cursor, equals, 1) != 0) return 1;
+        if (names_size != 0) names[names_size++] = ':';
+        if (names_size + strlen(cursor) >= sizeof names) return 1;
+        memcpy(names + names_size, cursor, strlen(cursor));
+        names_size += strlen(cursor);
+        names[names_size] = 0;
+        cursor = next;
+    }
+    /* OrbStack's mac bridge forwards only variables named by ORBENV. */
+    return setenv("ORBENV", names, 1) != 0;
+}
+
+static int run_guest(const char *bridge, const char *engine, const char *guest, const char *rootfs,
+                     const char *environment, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
     uint64_t deadline;
     pid_t child;
@@ -172,6 +219,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         close(output_pipe[0]); close(error_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]); close(error_pipe[1]);
+        if (install_environment(environment) != 0) _exit(127);
         if (rootfs != NULL)
             execlp(bridge, bridge, engine, "--rootfs", rootfs, guest, (char *)NULL);
         else
@@ -264,9 +312,15 @@ static int exit_matches(const capture *result, int expected) {
 }
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
     fprintf(stderr, "matrix-runner: %s [%s] %s", item->name, isa, reason);
+    if (result != NULL) {
+        size_t index, shown = result->output_size > 64 ? 64 : result->output_size;
+        fprintf(stderr, ": wait=0x%x stdout=%zuB hex=", result->wait_status, result->output_size);
+        for (index = 0; index < shown; ++index) fprintf(stderr, "%02x", result->output[index]);
+        if (shown < result->output_size) fputs("...", stderr);
+    }
     if (result != NULL && result->error_size != 0) {
         size_t shown = result->error_size > 240 ? 240 : result->error_size;
-        fprintf(stderr, ": stderr="); (void)fwrite(result->error, 1, shown, stderr);
+        fprintf(stderr, " stderr="); (void)fwrite(result->error, 1, shown, stderr);
     }
     fputc('\n', stderr);
 }
@@ -290,7 +344,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
     status = run_guest(bridge, engine, item->needs_rootfs ? "guest" : guest,
-                       item->needs_rootfs ? rootfs : NULL, result);
+                       item->needs_rootfs ? rootfs : NULL, item->environment, result);
     if (item->needs_rootfs) remove_rootfs(rootfs);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
         memcmp(result->output, expected, expected_size) != 0) {

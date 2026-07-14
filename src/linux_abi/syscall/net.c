@@ -2,6 +2,10 @@
 // the private NET-ns loopback (af_l2m / cmsg / msg-flag translation live in container/netns.c). Returns 1 if
 // nr was handled, 0 otherwise. Included by service.c after service/io.c, before service() -- same TU scope.
 
+static inline uint64_t net_nonpie_p(uint64_t address) {
+    return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) ? address + g_nonpie_bias : address;
+}
+
 // A zero-length datagram receive that asks for the sender address. macOS short-circuits any receive with
 // a zero-length buffer (returns 0 at once, filling neither data nor the source address), but Linux blocks
 // until a datagram arrives and reports its sender. busybox `nc -u -l` depends on the Linux behaviour: it
@@ -1165,16 +1169,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // sendmsg/recvmsg -- translate Linux msghdr -> macOS
     case 212: {
         uint8_t *g = (uint8_t *)a1;
+        uint64_t giov_count = *(uint64_t *)(g + 24);
+        struct iovec rebased_iov[1024];
+        struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
+        if (giov_count > 1024 || (giov_count && guest_bad_ptr((uintptr_t)guest_iov,
+                                                              (size_t)giov_count * sizeof *guest_iov))) {
+            G_RET(c) = (uint64_t)(giov_count > 1024 ? -EMSGSIZE : -EFAULT);
+            break;
+        }
+        for (uint64_t i = 0; i < giov_count; ++i) {
+            rebased_iov[i] = guest_iov[i];
+            rebased_iov[i].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[i].iov_base);
+        }
         // Container DNS: a sendmsg carrying a query to 127.0.0.11:53 (or on an already-swapped DNS socket).
         if (nr == 211 && dns_enabled()) {
             int dfd = (int)a0;
-            uint8_t *nm = (uint8_t *)*(uint64_t *)(g + 0);
+            uint8_t *nm = (uint8_t *)net_nonpie_p(*(uint64_t *)(g + 0));
             socklen_t nml = *(uint32_t *)(g + 8);
             if ((dfd >= 0 && dfd < DD_NFD && g_dns_sock[dfd]) || dns_dest_is(nm, nml)) {
-                struct iovec *iv = (struct iovec *)*(uint64_t *)(g + 16);
-                int ivn = (int)*(uint64_t *)(g + 24);
                 uint8_t tmp[2048];
-                size_t tl = dns_gather(iv, ivn, tmp, sizeof tmp);
+                size_t tl = dns_gather(rebased_iov, (int)giov_count, tmp, sizeof tmp);
                 int64_t dret;
                 if (dns_try_send(dfd, tmp, tl, nm, nml, &dret)) {
                     G_RET(c) = (uint64_t)dret;
@@ -1185,10 +1199,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         struct msghdr mh;
         // Linux: iovlen/controllen are 8-byte; macOS 4
         memset(&mh, 0, sizeof mh);
-        mh.msg_name = (void *)*(uint64_t *)(g + 0);
+        mh.msg_name = (void *)net_nonpie_p(*(uint64_t *)(g + 0));
         mh.msg_namelen = *(uint32_t *)(g + 8);
-        mh.msg_iov = (void *)*(uint64_t *)(g + 16);
-        mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
+        mh.msg_iov = rebased_iov;
+        mh.msg_iovlen = (int)giov_count;
         mh.msg_flags = *(uint32_t *)(g + 48);
         // msg_name sockaddr: Linux<->macOS translation through a host scratch (AF_INET/INET6 only).
         struct sockaddr_storage nss;
@@ -1220,7 +1234,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // Ancillary data: the guest control buf is Linux-cmsg layout; macOS reads a different cmsghdr,
         // so route it through a host-layout scratch buffer (NULL-control left untouched, so edge/msgflags
         // with no control buffer stays on the old path).
-        uint8_t *gc = (void *)*(uint64_t *)(g + 32);
+        uint8_t *gc = (void *)net_nonpie_p(*(uint64_t *)(g + 32));
         size_t gcl = *(uint64_t *)(g + 40);
         size_t hcap = 0;
         if (gc && gcl) {
@@ -1344,13 +1358,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 243: {
         uint8_t *vec = (uint8_t *)a1;
         unsigned vlen = (unsigned)a2;
+        if (vlen > 1024) {
+            G_RET(c) = (uint64_t)-EINVAL;
+            break;
+        }
         // mmsghdr = msghdr(56) + msg_len(4) + pad
         // Container DNS: glibc's default parallel A+AAAA lookup sends BOTH queries to the nameserver in one
         // sendmmsg. Answer each submessage via the host resolver; the responses are drained by recvfrom (207).
         if (nr == 269 && dns_enabled() && vlen) {
             int dfd = (int)a0;
             uint8_t *g0 = vec;
-            uint8_t *nm0 = (uint8_t *)*(uint64_t *)(g0 + 0);
+            uint8_t *nm0 = (uint8_t *)net_nonpie_p(*(uint64_t *)(g0 + 0));
             socklen_t nml0 = *(uint32_t *)(g0 + 8);
             int is_dns = (dfd >= 0 && dfd < DD_NFD && g_dns_sock[dfd]);
             if (!is_dns && dns_dest_is(nm0, nml0) &&
@@ -1361,10 +1379,19 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 unsigned n;
                 for (n = 0; n < vlen; n++) {
                     uint8_t *g = vec + (size_t)n * 64;
-                    struct iovec *iv = (struct iovec *)*(uint64_t *)(g + 16);
-                    int ivn = (int)*(uint64_t *)(g + 24);
+                    uint64_t ivn = *(uint64_t *)(g + 24);
+                    struct iovec riv[1024];
+                    struct iovec *iv = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
+                    if (ivn > 1024 || (ivn && guest_bad_ptr((uintptr_t)iv, (size_t)ivn * sizeof *iv))) {
+                        G_RET(c) = (uint64_t)(ivn > 1024 ? -EMSGSIZE : -EFAULT);
+                        goto mmsg_done;
+                    }
+                    for (uint64_t j = 0; j < ivn; ++j) {
+                        riv[j] = iv[j];
+                        riv[j].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)iv[j].iov_base);
+                    }
                     uint8_t tmp[2048];
-                    size_t tl = dns_gather(iv, ivn, tmp, sizeof tmp);
+                    size_t tl = dns_gather(riv, (int)ivn, tmp, sizeof tmp);
                     dns_send(dfd, tmp, tl, stream);
                     *(uint32_t *)(g + 56) = (uint32_t)tl; // msg_len: whole query accepted
                 }
@@ -1381,11 +1408,23 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;
             struct msghdr mh;
+            uint64_t giov_count = *(uint64_t *)(g + 24);
+            struct iovec rebased_iov[1024];
+            struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
+            if (giov_count > 1024 || (giov_count && guest_bad_ptr((uintptr_t)guest_iov,
+                                                                  (size_t)giov_count * sizeof *guest_iov))) {
+                err = giov_count > 1024 ? EMSGSIZE : EFAULT;
+                break;
+            }
+            for (uint64_t j = 0; j < giov_count; ++j) {
+                rebased_iov[j] = guest_iov[j];
+                rebased_iov[j].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[j].iov_base);
+            }
             memset(&mh, 0, sizeof mh);
-            mh.msg_name = (void *)*(uint64_t *)(g + 0);
+            mh.msg_name = (void *)net_nonpie_p(*(uint64_t *)(g + 0));
             mh.msg_namelen = *(uint32_t *)(g + 8);
-            mh.msg_iov = (void *)*(uint64_t *)(g + 16);
-            mh.msg_iovlen = (int)*(uint64_t *)(g + 24);
+            mh.msg_iov = rebased_iov;
+            mh.msg_iovlen = (int)giov_count;
             mh.msg_flags = *(uint32_t *)(g + 48);
             // msg_name sockaddr: Linux<->macOS translation through a host scratch (AF_INET/INET6 only).
             struct sockaddr_storage nss;
@@ -1409,7 +1448,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 mh.msg_namelen = sizeof nss;
             }
             // Ancillary data: route the per-submessage control buf through a host-layout scratch buffer.
-            uint8_t *gc = (void *)*(uint64_t *)(g + 32);
+            uint8_t *gc = (void *)net_nonpie_p(*(uint64_t *)(g + 32));
             size_t gcl = *(uint64_t *)(g + 40);
             size_t hcap = 0;
             if (gc && gcl) {
@@ -1481,6 +1520,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             done++;
         }
         G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
+mmsg_done:
         break;
     }
     default: return 0;

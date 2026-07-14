@@ -118,9 +118,13 @@ SYSCALL_CASE_SOURCES := $(sort $(wildcard tests/compat/syscall/*.c))
 SYSCALL_CASE_NAMES := $(basename $(notdir $(SYSCALL_CASE_SOURCES)))
 SYSCALL_CASE_BINS := $(SYSCALL_CASE_NAMES:%=$(BUILD)/compat/syscall/aarch64/%) \
 	$(SYSCALL_CASE_NAMES:%=$(BUILD)/compat/syscall/x86_64/%)
+NETWORK_CASE_SOURCES := $(sort $(wildcard tests/compat/network/*.c))
+NETWORK_CASE_NAMES := $(basename $(notdir $(NETWORK_CASE_SOURCES)))
+NETWORK_CASE_BINS := $(NETWORK_CASE_NAMES:%=$(BUILD)/compat/network/aarch64/%) \
+	$(NETWORK_CASE_NAMES:%=$(BUILD)/compat/network/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-libc compat-completeness compat-posix compat-syscall $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-libc compat-completeness compat-posix compat-syscall compat-network $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -316,6 +320,14 @@ $(BUILD)/compat/syscall/x86_64/%: tests/compat/syscall/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
+$(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/network/x86_64/%: tests/compat/network/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -466,7 +478,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-libc compat-completeness compat-posix compat-syscall $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-libc compat-completeness compat-posix compat-syscall compat-network $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -555,6 +567,11 @@ compat-syscall: compat-engines $(BUILD)/tools/matrix-runner $(SYSCALL_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/syscall/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/syscall/x86_64) $(abspath tests/compat/syscall)
+
+compat-network: compat-engines $(BUILD)/tools/matrix-runner $(NETWORK_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/network/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network)
 
 $(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
 	@mkdir -p $(@D)
