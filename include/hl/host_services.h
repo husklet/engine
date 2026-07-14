@@ -15,7 +15,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_ABI_15 15u
 #define HL_HOST_FILE_ABI_16 16u
 #define HL_HOST_FILE_ABI_17 17u
-#define HL_HOST_FILE_ABI 18u
+#define HL_HOST_FILE_ABI_18 18u
+#define HL_HOST_FILE_ABI 19u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -372,6 +373,14 @@ typedef struct hl_host_file_services {
     /* Consume complete entries from the open directory's shared OFD cursor. */
     hl_host_result (*read_directory)(void *context, hl_host_handle file, hl_host_file_entry *entries,
                                      uint32_t entry_capacity, uint32_t byte_capacity);
+    /* Relative namespace construction. Paths are byte spans without a trailing NUL. */
+    hl_host_result (*make_directory)(void *context, hl_host_handle directory, const char *path, size_t path_size,
+                                     uint32_t permissions);
+    hl_host_result (*make_symlink)(void *context, const char *target, size_t target_size, hl_host_handle directory,
+                                   const char *path, size_t path_size);
+    hl_host_result (*make_link)(void *context, hl_host_handle old_directory, const char *old_path,
+                                size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                size_t new_path_size, uint32_t flags);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

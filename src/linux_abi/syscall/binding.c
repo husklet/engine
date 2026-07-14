@@ -1619,6 +1619,67 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             return 1;
         }
     }
+    if (nr == 36) {
+        hl_linux_fd_snapshot directory;
+        if (bound_snapshot(a1, &directory)) {
+            char target[HL_LINUX_PATH_MAX + 1], path[HL_LINUX_PATH_MAX + 1];
+            size_t target_size, path_size;
+            result = bound_path_copy(a0, target, &target_size);
+            if (result == 0) result = bound_path_copy(a2, path, &path_size);
+            if (result == 0 && path[0] == '/') return 0;
+            if (result == 0 && (!bound_file_abi14() || g_host_services->file->make_symlink == NULL))
+                result = -ENOSYS;
+            if (result == 0)
+                result = bound_host_error(g_host_services->file
+                                              ->make_symlink(g_host_services->context, target, target_size,
+                                                             directory.host_handle, path, path_size)
+                                              .status);
+            G_RET(c) = (uint64_t)result;
+            return 1;
+        }
+    }
+    if (nr == 37 || nr == 38 || nr == 276) {
+        hl_linux_fd_snapshot destination;
+        int destination_bound = bound_snapshot(a2, &destination);
+        if (source_bound || destination_bound) {
+            char old_path[HL_LINUX_PATH_MAX + 1], new_path[HL_LINUX_PATH_MAX + 1];
+            size_t old_size, new_size;
+            if (!source_bound || !destination_bound) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+                return 1;
+            }
+            result = bound_path_copy(a1, old_path, &old_size);
+            if (result == 0) result = bound_path_copy(a3, new_path, &new_size);
+            if (result == 0 && (old_path[0] == '/' || new_path[0] == '/')) return 0;
+            if (nr == 37) {
+                uint64_t flags = G_A4(c);
+                if ((flags & ~UINT64_C(0x400)) != 0)
+                    result = -EINVAL;
+                else if (!bound_file_abi14() || g_host_services->file->make_link == NULL)
+                    result = -ENOSYS;
+                else if (result == 0)
+                    result = bound_host_error(g_host_services->file
+                                                  ->make_link(g_host_services->context, source.host_handle, old_path,
+                                                              old_size, destination.host_handle, new_path, new_size,
+                                                              (flags & UINT64_C(0x400)) != 0 ? 1u : 0u)
+                                                  .status);
+            } else {
+                uint64_t flags = nr == 276 ? G_A4(c) : 0;
+                if (flags != 0)
+                    result = -ENOSYS;
+                else if (g_host_services->file->rename_relative == NULL)
+                    result = -ENOSYS;
+                else if (result == 0)
+                    result = bound_host_error(g_host_services->file
+                                                  ->rename_relative(g_host_services->context, source.host_handle,
+                                                                    old_path, old_size, destination.host_handle,
+                                                                    new_path, new_size)
+                                                  .status);
+            }
+            G_RET(c) = (uint64_t)result;
+            return 1;
+        }
+    }
     if (nr == 24 && !source_bound) {
         hl_linux_fd_snapshot target;
         if (bound_snapshot(a1, &target)) {
@@ -1645,6 +1706,22 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
+    case 34: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        if (!bound_file_abi14() || g_host_services->file->make_directory == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        result = bound_host_error(g_host_services->file
+                                      ->make_directory(g_host_services->context, source.host_handle, path, path_size,
+                                                       (uint32_t)a2 & 07777u)
+                                      .status);
+        break;
+    }
     case 35: {
         char path[HL_LINUX_PATH_MAX + 1];
         size_t path_size;
@@ -1769,6 +1846,29 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = 0;
         }
         if (close_target) (void)g_host_services->file->close(g_host_services->context, target);
+        break;
+    }
+    case 78: {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        if (a3 == 0 || a3 > SIZE_MAX || !host_range_mapped((uintptr_t)a2, (size_t)a3)) {
+            result = a3 == 0 ? -EINVAL : -EFAULT;
+            break;
+        }
+        result = bound_path_copy(a1, path, &path_size);
+        if (result != 0) break;
+        if (path[0] == '/') return 0;
+        hl_host_result opened = g_host_services->file->open_relative(
+            g_host_services->context, source.host_handle, path, path_size,
+            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        if (opened.status != HL_STATUS_OK) {
+            result = bound_host_error(opened.status);
+            break;
+        }
+        hl_host_result read = g_host_services->file->readlink(
+            g_host_services->context, opened.value, (hl_host_bytes){(void *)(uintptr_t)a2, (size_t)a3});
+        result = read.status == HL_STATUS_OK ? (int64_t)read.value : bound_host_error(read.status);
+        (void)g_host_services->file->close(g_host_services->context, opened.value);
         break;
     }
     case 56: {

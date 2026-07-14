@@ -1996,6 +1996,56 @@ static hl_host_result hl_macos_file_unlink(void *context, hl_host_handle directo
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_macos_file_mkdir(void *context, hl_host_handle directory, const char *path,
+                                          size_t path_size, uint32_t permissions) {
+    hl_host_macos *host = context;
+    char local[PATH_MAX];
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local) || (permissions & ~07777u) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = 0;
+    int directory_fd = hl_macos_file_directory(host, directory);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return mkdirat(directory_fd, local, (mode_t)permissions) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
+                                                                  : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_file_symlink(void *context, const char *target, size_t target_size,
+                                            hl_host_handle directory, const char *path, size_t path_size) {
+    hl_host_macos *host = context;
+    char target_local[PATH_MAX], path_local[PATH_MAX];
+    if (target == NULL || path == NULL || target_size == 0 || path_size == 0 ||
+        target_size >= sizeof(target_local) || path_size >= sizeof(path_local))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(target_local, target, target_size);
+    target_local[target_size] = 0;
+    memcpy(path_local, path, path_size);
+    path_local[path_size] = 0;
+    int directory_fd = hl_macos_file_directory(host, directory);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return symlinkat(target_local, directory_fd, path_local) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
+                                                                  : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_file_link(void *context, hl_host_handle old_directory, const char *old_path,
+                                         size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                         size_t new_path_size, uint32_t flags) {
+    hl_host_macos *host = context;
+    char old_local[PATH_MAX], new_local[PATH_MAX];
+    if (old_path == NULL || new_path == NULL || old_path_size == 0 || new_path_size == 0 ||
+        old_path_size >= sizeof(old_local) || new_path_size >= sizeof(new_local) || (flags & ~1u) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(old_local, old_path, old_path_size); old_local[old_path_size] = 0;
+    memcpy(new_local, new_path, new_path_size); new_local[new_path_size] = 0;
+    int old_fd = hl_macos_file_directory(host, old_directory);
+    int new_fd = hl_macos_file_directory(host, new_directory);
+    if ((old_fd < 0 && old_directory != HL_HOST_HANDLE_CWD) || (new_fd < 0 && new_directory != HL_HOST_HANDLE_CWD))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int native_flags = (flags & 1u) != 0 ? AT_SYMLINK_FOLLOW : 0;
+    return linkat(old_fd, old_local, new_fd, new_local, native_flags) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0)
+                                                                          : hl_macos_errno();
+}
+
 static hl_host_result hl_macos_file_readv_at(void *context, hl_host_handle file, const hl_host_iovec *vectors,
                                              uint32_t count, uint64_t offset) {
     return hl_macos_file_vector(context, file, vectors, count, offset, 2);
@@ -4030,7 +4080,10 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_filesystem_metadata,
                                                hl_macos_file_set_permissions,
                                                hl_macos_file_set_times,
-                                               hl_macos_file_read_directory};
+                                               hl_macos_file_read_directory,
+                                               hl_macos_file_mkdir,
+                                               hl_macos_file_symlink,
+                                               hl_macos_file_link};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
