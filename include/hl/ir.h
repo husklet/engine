@@ -5,7 +5,8 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_IR_ABI 1u
+#define HL_IR_ABI 2u
+#define HL_IR_EXECUTION_ABI 1u
 #define HL_IR_MAX_OPERANDS 4u
 
 typedef enum hl_ir_type {
@@ -47,10 +48,13 @@ typedef enum hl_ir_opcode {
  * native blocks lower the same operations.  A terminator's immediate is its
  * primary exit value unless operand zero supplies that value.  SYSCALL_EXIT
  * and FAULT_EXIT may additionally supply operand one as exit detail.
- * LOAD/STORE have no memory-context contract yet; COMPARE/BRANCH operations
- * have no label/CFG contract; GUEST_CALL has no call-frame contract. Those
- * reserved opcodes are rejected by append and validation until their complete
- * execution interfaces exist.
+ * LOAD/STORE use execution.memory as a zero-based, bounded byte array. Their
+ * width is derived from the loaded result or stored value type (I32=4,
+ * I64/GUEST_ADDRESS=8); accesses are little-endian and may be unaligned. The
+ * unsigned immediate is added to operand zero. Addition overflow or a range
+ * beyond memory_size exits with HL_IR_FAULT_MEMORY and the wrapped effective
+ * address in detail. COMPARE/BRANCH and GUEST_CALL remain rejected until their
+ * complete CFG and call-frame contracts exist.
  */
 
 typedef struct hl_ir_value {
@@ -93,11 +97,20 @@ typedef struct hl_ir_exit {
     uint64_t detail;
 } hl_ir_exit;
 
+typedef enum hl_ir_fault { HL_IR_FAULT_MEMORY = 1 } hl_ir_fault;
+
+typedef struct hl_ir_execution {
+    HL_ABI_HEADER;
+    uint8_t *memory;
+    uint64_t memory_size;
+    hl_ir_exit exit;
+} hl_ir_execution;
+
 HL_API hl_status hl_ir_block_init(hl_ir_block *block, uint64_t guest_pc, hl_ir_instruction *storage, uint32_t capacity);
 HL_API hl_status hl_ir_append(hl_ir_block *block, const hl_ir_instruction *instruction, hl_ir_value *result);
 HL_API hl_status hl_ir_validate(const hl_ir_block *block, uint32_t *bad_instruction);
 HL_API int hl_ir_opcode_is_terminator(uint16_t opcode);
-HL_API hl_status hl_ir_interpret(const hl_ir_block *block, hl_ir_exit *out_exit);
+HL_API hl_status hl_ir_interpret(const hl_ir_block *block, hl_ir_execution *execution);
 
 HL_EXTERN_C_END
 

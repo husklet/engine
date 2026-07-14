@@ -1,6 +1,7 @@
 #include "x86_64_codegen.h"
 
 #include <stdint.h>
+#include <string.h>
 
 /* rdi carries hl_ir_exit *; avoid rsp/rbp and callee-saved registers. */
 static const uint8_t hl_x86_64_registers[] = {0, 1, 2, 6, 8, 9, 10, 11};
@@ -92,13 +93,63 @@ static hl_status hl_x86_64_store_register(hl_code_buffer *output, uint8_t source
     return hl_x86_64_emit_byte(output, displacement);
 }
 
+static hl_status hl_x86_64_emit_memory_fault(hl_code_buffer *output, uint32_t frame_size) {
+    hl_status status;
+    /* kind=fault, reserved=0, value=memory, detail=r12 */
+    static const uint8_t prefix[] = {0xc7, 0x47, 24,   3,  0, 0, 0, 0xc7, 0x47, 28,   0,    0,  0,    0,
+                                     0x48, 0xc7, 0x47, 32, 1, 0, 0, 0,    0x4c, 0x89, 0x67, 40, 0x31, 0xc0};
+    size_t i;
+    for (i = 0; i < sizeof(prefix); ++i) {
+        status = hl_x86_64_emit_byte(output, prefix[i]);
+        if (status != HL_STATUS_OK) return status;
+    }
+    if (frame_size != 0) {
+        static const uint8_t restore[] = {0x48, 0x81, 0xc4};
+        for (i = 0; i < sizeof(restore); ++i) {
+            status = hl_x86_64_emit_byte(output, restore[i]);
+            if (status != HL_STATUS_OK) return status;
+        }
+        status = hl_x86_64_emit_u32(output, frame_size);
+        if (status != HL_STATUS_OK) return status;
+        status = hl_x86_64_emit_byte(output, 0x41);
+        if (status != HL_STATUS_OK) return status;
+        status = hl_x86_64_emit_byte(output, 0x5d);
+        if (status != HL_STATUS_OK) return status;
+        status = hl_x86_64_emit_byte(output, 0x41);
+        if (status != HL_STATUS_OK) return status;
+        status = hl_x86_64_emit_byte(output, 0x5c);
+        if (status != HL_STATUS_OK) return status;
+    }
+    return hl_x86_64_emit_byte(output, 0xc3);
+}
+
+static hl_status hl_x86_64_success_or_fault(hl_code_buffer *output, uint8_t condition, uint32_t frame_size) {
+    size_t displacement_at;
+    hl_status status = hl_x86_64_emit_byte(output, 0x0f);
+    if (status != HL_STATUS_OK) return status;
+    status = hl_x86_64_emit_byte(output, condition);
+    if (status != HL_STATUS_OK) return status;
+    displacement_at = output->code_size;
+    status = hl_x86_64_emit_u32(output, 0);
+    if (status != HL_STATUS_OK) return status;
+    status = hl_x86_64_emit_memory_fault(output, frame_size);
+    if (status != HL_STATUS_OK) return status;
+    {
+        uint32_t displacement = (uint32_t)(output->code_size - displacement_at - 4u);
+        memcpy(output->data + displacement_at, &displacement, sizeof(displacement));
+    }
+    return HL_STATUS_OK;
+}
+
 static hl_status hl_x86_64_exit(hl_code_buffer *output, const hl_ir_instruction *instruction, uint32_t kind,
                                 uint32_t frame_size) {
     const uint8_t scratch = 11;
     uint8_t value_register;
     hl_status status = hl_x86_64_emit_byte(output, UINT8_C(0xc7));
     if (status != HL_STATUS_OK) return status;
-    status = hl_x86_64_emit_byte(output, UINT8_C(0x07));
+    status = hl_x86_64_emit_byte(output, UINT8_C(0x47));
+    if (status != HL_STATUS_OK) return status;
+    status = hl_x86_64_emit_byte(output, UINT8_C(24));
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_u32(output, kind);
     if (status != HL_STATUS_OK) return status;
@@ -106,28 +157,28 @@ static hl_status hl_x86_64_exit(hl_code_buffer *output, const hl_ir_instruction 
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_byte(output, UINT8_C(0x47));
     if (status != HL_STATUS_OK) return status;
-    status = hl_x86_64_emit_byte(output, UINT8_C(0x04));
+    status = hl_x86_64_emit_byte(output, UINT8_C(28));
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_u32(output, 0);
     if (status != HL_STATUS_OK) return status;
     if (instruction->operand_count == 0) {
         status = hl_x86_64_emit_constant(output, scratch, instruction->immediate, 1);
         if (status != HL_STATUS_OK) return status;
-        status = hl_x86_64_store_register(output, scratch, 8);
+        status = hl_x86_64_store_register(output, scratch, 32);
     } else {
         status = hl_x86_64_load_value(output, instruction->operands[0], 12, &value_register);
         if (status != HL_STATUS_OK) return status;
-        status = hl_x86_64_store_register(output, value_register, 8);
+        status = hl_x86_64_store_register(output, value_register, 32);
     }
     if (status != HL_STATUS_OK) return status;
     if (instruction->operand_count < 2) {
         status = hl_x86_64_emit_constant(output, scratch, 0, 1);
         if (status != HL_STATUS_OK) return status;
-        status = hl_x86_64_store_register(output, scratch, 16);
+        status = hl_x86_64_store_register(output, scratch, 40);
     } else {
         status = hl_x86_64_load_value(output, instruction->operands[1], 12, &value_register);
         if (status != HL_STATUS_OK) return status;
-        status = hl_x86_64_store_register(output, value_register, 16);
+        status = hl_x86_64_store_register(output, value_register, 40);
     }
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_byte(output, UINT8_C(0x31));
@@ -162,10 +213,15 @@ static int hl_x86_64_type_supported(uint16_t type) {
 
 hl_status hl_codegen_x86_64(const hl_ir_block *block, hl_code_buffer *output) {
     uint32_t i;
+    int has_memory = 0;
     uint32_t spill_count = block->next_value_id > HL_ARRAY_COUNT(hl_x86_64_registers) + 1u
                                ? block->next_value_id - (uint32_t)HL_ARRAY_COUNT(hl_x86_64_registers) - 1u
                                : 0;
     uint32_t frame_size = (spill_count * 8u + 15u) & ~15u;
+    for (i = 0; i < block->instruction_count; ++i)
+        if (block->instructions[i].opcode == HL_IR_OP_LOAD || block->instructions[i].opcode == HL_IR_OP_STORE)
+            has_memory = 1;
+    if (has_memory) frame_size += 16;
     if (frame_size != 0) {
         static const uint8_t prologue[] = {UINT8_C(0x41), UINT8_C(0x54), UINT8_C(0x41), UINT8_C(0x55),
                                            UINT8_C(0x48), UINT8_C(0x81), UINT8_C(0xec)};
@@ -217,6 +273,85 @@ hl_status hl_codegen_x86_64(const hl_ir_block *block, hl_code_buffer *output) {
             break;
         }
         case HL_IR_OP_SAFEPOINT: status = HL_STATUS_OK; break;
+        case HL_IR_OP_LOAD:
+        case HL_IR_OP_STORE: {
+            uint64_t width = (instruction->opcode == HL_IR_OP_LOAD ? instruction->result.type
+                                                                   : instruction->operands[1].type) == HL_IR_TYPE_I32
+                                 ? 4u
+                                 : 8u;
+            if (instruction->opcode == HL_IR_OP_STORE) {
+                status = hl_x86_64_spill_access(output, 0x89, operand_registers[1], frame_size - 8u);
+                if (status != HL_STATUS_OK) return status;
+            }
+            /* r13=original, r12=effective */
+            status = hl_x86_64_emit_binary(output, 0x89, 13, operand_registers[0], 1);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_binary(output, 0x89, 12, 13, 1);
+            if (status != HL_STATUS_OK) return status;
+            if (instruction->immediate != 0) {
+                status = hl_x86_64_emit_constant(output, 11, instruction->immediate, 1);
+                if (status != HL_STATUS_OK) return status;
+                status = hl_x86_64_emit_binary(output, 0x01, 12, 11, 1);
+                if (status != HL_STATUS_OK) return status;
+                status = hl_x86_64_emit_binary(output, 0x39, 12, 13, 1);
+                if (status != HL_STATUS_OK) return status;
+                status = hl_x86_64_success_or_fault(output, 0x83, frame_size); /* jae */
+                if (status != HL_STATUS_OK) return status;
+            }
+            /* r13=size; require size>=width and effective<=size-width. */
+            status = hl_x86_64_emit_rex(output, 13, 7, 1);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x8b);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x6f); /* r13,[rdi+16] */
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 16);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x49);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x83);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0xfd); /* cmp r13,imm8 */
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, (uint8_t)width);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_success_or_fault(output, 0x83, frame_size);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x49);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x83);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0xed); /* sub r13,imm8 */
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, (uint8_t)width);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_binary(output, 0x39, 12, 13, 1); /* cmp effective,size-width */
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_success_or_fault(output, 0x86, frame_size); /* jbe */
+            if (status != HL_STATUS_OK) return status;
+            /* r13=memory base, [r13+r12]. */
+            status = hl_x86_64_emit_rex(output, 13, 7, 1);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x8b);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x6f);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 8);
+            if (status != HL_STATUS_OK) return status;
+            if (instruction->opcode == HL_IR_OP_STORE) {
+                status = hl_x86_64_spill_access(output, 0x8b, 11, frame_size - 8u);
+                if (status != HL_STATUS_OK) return status;
+            }
+            status = hl_x86_64_emit_rex(output, instruction->opcode == HL_IR_OP_LOAD ? destination : 11, 4, width == 8);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, instruction->opcode == HL_IR_OP_LOAD ? 0x8b : 0x89);
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(
+                output, (uint8_t)(((instruction->opcode == HL_IR_OP_LOAD ? destination : 11) & 7u) << 3 | 0x04));
+            if (status != HL_STATUS_OK) return status;
+            status = hl_x86_64_emit_byte(output, 0x23); /* base=r13,index=r12 */
+            break;
+        }
         case HL_IR_OP_GUEST_RETURN: status = hl_x86_64_exit(output, instruction, HL_IR_EXIT_RETURN, frame_size); break;
         case HL_IR_OP_SYSCALL_EXIT: status = hl_x86_64_exit(output, instruction, HL_IR_EXIT_SYSCALL, frame_size); break;
         case HL_IR_OP_FAULT_EXIT: status = hl_x86_64_exit(output, instruction, HL_IR_EXIT_FAULT, frame_size); break;

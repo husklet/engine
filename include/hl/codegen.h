@@ -5,7 +5,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_CODEGEN_ABI 1u
+#define HL_CODEGEN_ABI 2u
 
 typedef enum hl_host_isa { HL_HOST_ISA_AARCH64 = 1, HL_HOST_ISA_X86_64 = 2 } hl_host_isa;
 
@@ -21,7 +21,7 @@ typedef struct hl_code_buffer {
  * status.  Every successful terminator initializes the complete exit record.
  * The entry owns neither the record nor any memory reachable from it.
  */
-typedef hl_status (*hl_code_entry)(hl_ir_exit *out_exit);
+typedef hl_status (*hl_code_entry)(hl_ir_execution *execution);
 
 HL_API hl_status hl_code_buffer_init(hl_code_buffer *buffer, void *storage, size_t capacity);
 HL_API hl_status hl_codegen_block(uint32_t host_isa, const hl_ir_block *block, hl_code_buffer *output);

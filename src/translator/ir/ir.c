@@ -12,8 +12,8 @@ static int hl_ir_is_integer(uint16_t type) {
 }
 
 static int hl_ir_opcode_is_reserved(uint16_t opcode) {
-    return opcode == HL_IR_OP_LOAD || opcode == HL_IR_OP_STORE || opcode == HL_IR_OP_COMPARE ||
-           opcode == HL_IR_OP_BRANCH || opcode == HL_IR_OP_BRANCH_CONDITIONAL || opcode == HL_IR_OP_GUEST_CALL;
+    return opcode == HL_IR_OP_COMPARE || opcode == HL_IR_OP_BRANCH || opcode == HL_IR_OP_BRANCH_CONDITIONAL ||
+           opcode == HL_IR_OP_GUEST_CALL;
 }
 
 static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
@@ -30,6 +30,12 @@ static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
                instruction->operands[0].type == instruction->result.type &&
                instruction->operands[1].type == instruction->result.type;
     case HL_IR_OP_SAFEPOINT: return instruction->operand_count == 0 && instruction->result.type == HL_IR_TYPE_NONE;
+    case HL_IR_OP_LOAD:
+        return instruction->operand_count == 1 && hl_ir_is_integer(instruction->result.type) &&
+               hl_ir_is_integer(instruction->operands[0].type);
+    case HL_IR_OP_STORE:
+        return instruction->operand_count == 2 && instruction->result.type == HL_IR_TYPE_NONE &&
+               hl_ir_is_integer(instruction->operands[0].type) && hl_ir_is_integer(instruction->operands[1].type);
     case HL_IR_OP_GUEST_RETURN:
         return instruction->operand_count <= 1 && instruction->result.type == HL_IR_TYPE_NONE &&
                (instruction->operand_count == 0 || hl_ir_is_integer(instruction->operands[0].type));
@@ -38,8 +44,6 @@ static int hl_ir_signature_valid(const hl_ir_instruction *instruction) {
         return instruction->operand_count <= 2 && instruction->result.type == HL_IR_TYPE_NONE &&
                (instruction->operand_count == 0 || hl_ir_is_integer(instruction->operands[0].type)) &&
                (instruction->operand_count < 2 || hl_ir_is_integer(instruction->operands[1].type));
-    case HL_IR_OP_LOAD:
-    case HL_IR_OP_STORE:
     case HL_IR_OP_COMPARE:
     case HL_IR_OP_BRANCH:
     case HL_IR_OP_BRANCH_CONDITIONAL:

@@ -21,11 +21,11 @@ int main(void) {
     hl_ir_value first;
     hl_ir_value second;
     hl_ir_value sum;
-    hl_ir_exit ir_exit;
+    hl_ir_execution execution;
+    hl_ir_exit *ir_exit = &execution.exit;
     uint32_t bad;
-    static const uint16_t reserved_opcodes[] = {
-        HL_IR_OP_LOAD,      HL_IR_OP_STORE, HL_IR_OP_COMPARE, HL_IR_OP_BRANCH, HL_IR_OP_BRANCH_CONDITIONAL,
-        HL_IR_OP_GUEST_CALL};
+    static const uint16_t reserved_opcodes[] = {HL_IR_OP_COMPARE, HL_IR_OP_BRANCH, HL_IR_OP_BRANCH_CONDITIONAL,
+                                                HL_IR_OP_GUEST_CALL};
 
     HL_CHECK(hl_ir_block_init(&block, UINT64_C(0x400000), storage, HL_ARRAY_COUNT(storage)) == HL_STATUS_OK);
     constant = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_I64);
@@ -45,8 +45,11 @@ int main(void) {
     exit_instruction.operands[0] = sum;
     HL_CHECK(hl_ir_append(&block, &exit_instruction, NULL) == HL_STATUS_OK);
     HL_CHECK(hl_ir_validate(&block, &bad) == HL_STATUS_OK);
-    HL_CHECK(hl_ir_interpret(&block, &ir_exit) == HL_STATUS_OK);
-    HL_CHECK(ir_exit.kind == HL_IR_EXIT_RETURN && ir_exit.value == 42);
+    memset(&execution, 0, sizeof(execution));
+    execution.abi = HL_IR_EXECUTION_ABI;
+    execution.size = sizeof(execution);
+    HL_CHECK(hl_ir_interpret(&block, &execution) == HL_STATUS_OK);
+    HL_CHECK(ir_exit->kind == HL_IR_EXIT_RETURN && ir_exit->value == 42);
     HL_CHECK(hl_ir_append(&block, &constant, NULL) == HL_STATUS_INVALID_ARGUMENT);
 
     storage[2].operands[1].id = 99;
@@ -68,8 +71,8 @@ int main(void) {
     exit_instruction.operand_count = 1;
     exit_instruction.operands[0] = sum;
     HL_CHECK(hl_ir_append(&block, &exit_instruction, NULL) == HL_STATUS_OK);
-    HL_CHECK(hl_ir_interpret(&block, &ir_exit) == HL_STATUS_OK);
-    HL_CHECK(ir_exit.kind == HL_IR_EXIT_RETURN && ir_exit.value == 1);
+    HL_CHECK(hl_ir_interpret(&block, &execution) == HL_STATUS_OK);
+    HL_CHECK(ir_exit->kind == HL_IR_EXIT_RETURN && ir_exit->value == 1);
 
     /* Exit payload semantics are identical for dispatch and fault boundaries. */
     for (uint16_t opcode = HL_IR_OP_SYSCALL_EXIT; opcode <= HL_IR_OP_FAULT_EXIT; ++opcode) {
@@ -84,11 +87,11 @@ int main(void) {
         exit_instruction.operands[0] = first;
         exit_instruction.operands[1] = second;
         HL_CHECK(hl_ir_append(&block, &exit_instruction, NULL) == HL_STATUS_OK);
-        memset(&ir_exit, 0xa5, sizeof(ir_exit));
-        HL_CHECK(hl_ir_interpret(&block, &ir_exit) == HL_STATUS_OK);
-        HL_CHECK(ir_exit.kind == (opcode == HL_IR_OP_SYSCALL_EXIT ? HL_IR_EXIT_SYSCALL : HL_IR_EXIT_FAULT));
-        HL_CHECK(ir_exit.reserved == 0 && ir_exit.value == UINT64_C(0x1122334455667788) &&
-                 ir_exit.detail == UINT64_C(0x8877665544332211));
+        memset(ir_exit, 0xa5, sizeof(*ir_exit));
+        HL_CHECK(hl_ir_interpret(&block, &execution) == HL_STATUS_OK);
+        HL_CHECK(ir_exit->kind == (opcode == HL_IR_OP_SYSCALL_EXIT ? HL_IR_EXIT_SYSCALL : HL_IR_EXIT_FAULT));
+        HL_CHECK(ir_exit->reserved == 0 && ir_exit->value == UINT64_C(0x1122334455667788) &&
+                 ir_exit->detail == UINT64_C(0x8877665544332211));
     }
 
     /* Reserved operations cannot become apparently valid IR before their execution contracts exist. */
