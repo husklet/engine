@@ -354,6 +354,29 @@ static void *wait_thread(void *opaque) {
     return NULL;
 }
 
+static int test_fork_clone_while_waiting(void) {
+    test_fixture fx;
+    hl_linux_fork_record records[32];
+    hl_linux_fork_plan plan = {
+        .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
+    wait_call call;
+    pthread_t thread;
+    int64_t epoll;
+    HL_CHECK(fixture_init(&fx) == 0);
+    fx.host.event = &blocking_events;
+    epoll = hl_linux_epoll_create(&fx.abi, 0);
+    HL_CHECK(epoll >= 0);
+    call = (wait_call){.fx = &fx, .epoll = (hl_linux_fd)epoll};
+    HL_CHECK(pthread_create(&thread, NULL, wait_thread, &call) == 0);
+    while (atomic_load_explicit(&fx.event_waiting, memory_order_acquire) == 0) {}
+    HL_CHECK(hl_linux_abi_fork_prepare(&fx.abi, &plan) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_abi_fork_parent(&fx.abi, &plan) == HL_STATUS_OK);
+    HL_CHECK(close_fd(&fx, (hl_linux_fd)epoll) == 0);
+    HL_CHECK(pthread_join(thread, NULL) == 0);
+    HL_CHECK(call.result == 0 || call.result == -HL_LINUX_EBADF);
+    return 0;
+}
+
 static int test_wait_wakes_on_control_and_close(void) {
     test_fixture fx;
     ready_object object = {0};
@@ -497,6 +520,7 @@ int main(void) {
     HL_CHECK(test_alias_and_reuse() == 0);
     HL_CHECK(test_distinct_aliases_edge_and_oneshot() == 0);
     HL_CHECK(test_fork_clone() == 0);
+    HL_CHECK(test_fork_clone_while_waiting() == 0);
     HL_CHECK(test_control_errors_and_epoll_dup() == 0);
     HL_CHECK(test_fork_clone_rollback() == 0);
     HL_CHECK(test_wait_wakes_on_control_and_close() == 0);

@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 enum { HL_LINUX_OBJECT_EPOLL = 0x65706f6cu };
 
@@ -35,6 +36,7 @@ typedef struct hl_linux_epoll_watch {
 enum { EPOLL_UNSUBSCRIBED = 0, EPOLL_CALLBACK = 1, EPOLL_HOST = 2, EPOLL_STALE = 3 };
 
 typedef struct hl_linux_epoll {
+    pthread_mutex_t lock;
     hl_linux_abi *linux_abi;
     hl_host_handle wake;
     hl_linux_epoll_watch *watches;
@@ -72,6 +74,7 @@ static hl_status epoll_close(void *opaque) {
         epoll_unsubscribe(epoll, &epoll->watches[index]);
     hl_host_result result = epoll->linux_abi->host->event->close(epoll->linux_abi->host->context, epoll->wake);
     free(epoll->watches);
+    pthread_mutex_destroy(&epoll->lock);
     free(epoll);
     return (hl_status)result.status;
 }
@@ -87,18 +90,29 @@ static hl_status epoll_clone(void *opaque, void **out_context) {
     hl_host_result created;
     copy = calloc(1, sizeof(*copy));
     if (copy == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&copy->lock, NULL) != 0) {
+        free(copy);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
     created = source->linux_abi->host->event->create(source->linux_abi->host->context);
     if (created.status != HL_STATUS_OK) {
+        pthread_mutex_destroy(&copy->lock);
         free(copy);
         return (hl_status)created.status;
     }
-    *copy = *source;
+    pthread_mutex_lock(&source->lock);
+    copy->linux_abi = source->linux_abi;
+    copy->count = source->count;
+    copy->capacity = source->capacity;
+    copy->next_token = source->next_token;
     copy->wake = created.value;
     copy->watches = NULL;
     if (source->capacity != 0) {
         copy->watches = malloc((size_t)source->capacity * sizeof(*copy->watches));
         if (copy->watches == NULL) {
+            pthread_mutex_unlock(&source->lock);
             (void)source->linux_abi->host->event->close(source->linux_abi->host->context, copy->wake);
+            pthread_mutex_destroy(&copy->lock);
             free(copy);
             return HL_STATUS_OUT_OF_MEMORY;
         }
@@ -107,6 +121,7 @@ static hl_status epoll_clone(void *opaque, void **out_context) {
             if (copy->watches[index].subscribed == EPOLL_CALLBACK || copy->watches[index].subscribed == EPOLL_HOST)
                 copy->watches[index].subscribed = EPOLL_UNSUBSCRIBED;
     }
+    pthread_mutex_unlock(&source->lock);
     *out_context = copy;
     return HL_STATUS_OK;
 }
@@ -115,9 +130,17 @@ static uint32_t epoll_ready(void *opaque, uint32_t interests) {
     hl_linux_epoll *epoll = opaque;
     uint32_t index;
     if ((interests & HL_LINUX_READY_READ) == 0) return 0;
-    for (index = 0; index < epoll->count; ++index) {
+    for (index = 0;; ++index) {
         hl_linux_object_pin target;
-        hl_linux_epoll_watch *watch = &epoll->watches[index];
+        hl_linux_epoll_watch snapshot;
+        hl_linux_epoll_watch *watch = &snapshot;
+        pthread_mutex_lock(&epoll->lock);
+        if (index >= epoll->count) {
+            pthread_mutex_unlock(&epoll->lock);
+            break;
+        }
+        snapshot = epoll->watches[index];
+        pthread_mutex_unlock(&epoll->lock);
         if (watch->disabled != 0) continue;
         if (hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target) == HL_STATUS_OK) {
             uint32_t ready = hl_linux_object_ready(&target, watch->interests);
@@ -129,6 +152,7 @@ static uint32_t epoll_ready(void *opaque, uint32_t interests) {
 }
 
 static const hl_linux_object_ops epoll_ops = {
+    .fork_while_active_safe = 1,
     .readiness = epoll_ready,
     .retire = epoll_retire,
     .clone = epoll_clone,
@@ -182,8 +206,13 @@ int64_t hl_linux_epoll_create(hl_linux_abi *linux_abi, uint32_t descriptor_flags
     if (!epoll_services(linux_abi)) return -HL_LINUX_ENOSYS;
     epoll = calloc(1, sizeof(*epoll));
     if (epoll == NULL) return -HL_LINUX_ENOMEM;
+    if (pthread_mutex_init(&epoll->lock, NULL) != 0) {
+        free(epoll);
+        return -HL_LINUX_ENOMEM;
+    }
     created = linux_abi->host->event->create(linux_abi->host->context);
     if (created.status != HL_STATUS_OK) {
+        pthread_mutex_destroy(&epoll->lock);
         free(epoll);
         return epoll_error((hl_status)created.status);
     }
@@ -192,6 +221,7 @@ int64_t hl_linux_epoll_create(hl_linux_abi *linux_abi, uint32_t descriptor_flags
     status = hl_linux_object_install(linux_abi, &epoll_ops, epoll, HL_LINUX_OBJECT_EPOLL, 0, descriptor_flags, &fd);
     if (status != HL_STATUS_OK) {
         (void)linux_abi->host->event->close(linux_abi->host->context, epoll->wake);
+        pthread_mutex_destroy(&epoll->lock);
         free(epoll);
         return epoll_error(status);
     }
@@ -242,10 +272,12 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_EEXIST;
         }
+        pthread_mutex_lock(&epoll->lock);
         if (epoll->count == epoll->capacity) {
             uint32_t capacity = epoll->capacity == 0 ? 8u : epoll->capacity * 2u;
             grown = realloc(epoll->watches, (size_t)capacity * sizeof(*grown));
             if (grown == NULL) {
+                pthread_mutex_unlock(&epoll->lock);
                 hl_linux_object_unpin(&pin);
                 return -HL_LINUX_ENOMEM;
             }
@@ -262,28 +294,35 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
                                                               .wait_handle = HL_HOST_HANDLE_INVALID,
                                                               .data = data,
                                                               .token = epoll->next_token};
+        pthread_mutex_unlock(&epoll->lock);
         status = epoll_subscribe(epoll, &epoll->watches[epoll->count]);
         if (status != HL_STATUS_OK) {
             hl_linux_object_unpin(&pin);
             return epoll_error(status);
         }
+        pthread_mutex_lock(&epoll->lock);
         epoll->count++;
+        pthread_mutex_unlock(&epoll->lock);
     } else if (operation == HL_LINUX_EPOLL_MODIFY) {
         if (index < 0) {
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_ENOENT;
         }
+        pthread_mutex_lock(&epoll->lock);
         epoll->watches[index].interests = interests;
         epoll->watches[index].data = data;
         epoll->watches[index].previous = 0;
         epoll->watches[index].disabled = 0;
+        pthread_mutex_unlock(&epoll->lock);
     } else if (operation == HL_LINUX_EPOLL_DELETE) {
         if (index < 0) {
             hl_linux_object_unpin(&pin);
             return -HL_LINUX_ENOENT;
         }
         epoll_unsubscribe(epoll, &epoll->watches[index]);
+        pthread_mutex_lock(&epoll->lock);
         epoll->watches[index] = epoll->watches[--epoll->count];
+        pthread_mutex_unlock(&epoll->lock);
     } else {
         hl_linux_object_unpin(&pin);
         return -HL_LINUX_EINVAL;
@@ -296,10 +335,18 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
 static int64_t epoll_sample(hl_linux_epoll *epoll, hl_linux_epoll_event *events, uint32_t capacity) {
     uint32_t index;
     uint32_t delivered = 0;
-    for (index = 0; index < epoll->count && delivered < capacity; ++index) {
-        hl_linux_epoll_watch *watch = &epoll->watches[index];
+    for (index = 0; delivered < capacity; ++index) {
+        hl_linux_epoll_watch snapshot;
+        hl_linux_epoll_watch *watch = &snapshot;
         hl_linux_object_pin target;
         uint32_t ready = 0;
+        pthread_mutex_lock(&epoll->lock);
+        if (index >= epoll->count) {
+            pthread_mutex_unlock(&epoll->lock);
+            break;
+        }
+        snapshot = epoll->watches[index];
+        pthread_mutex_unlock(&epoll->lock);
         if (watch->disabled != 0) continue;
         if (watch->subscribed == EPOLL_STALE) continue;
         if (watch->subscribed == EPOLL_UNSUBSCRIBED) (void)epoll_subscribe(epoll, watch);
@@ -314,9 +361,19 @@ static int64_t epoll_sample(hl_linux_epoll *epoll, hl_linux_epoll_event *events,
             watch->previous = ready;
             ready = transition;
         }
+        pthread_mutex_lock(&epoll->lock);
+        for (uint32_t position = 0; position < epoll->count; ++position) {
+            hl_linux_epoll_watch *current = &epoll->watches[position];
+            if (current->token != watch->token) continue;
+            current->subscribed = watch->subscribed;
+            current->wait_handle = watch->wait_handle;
+            current->previous = watch->previous;
+            if (ready != 0 && (watch->interests & HL_LINUX_EPOLL_ONESHOT) != 0) current->disabled = 1;
+            break;
+        }
+        pthread_mutex_unlock(&epoll->lock);
         if (ready != 0) {
             events[delivered++] = (hl_linux_epoll_event){ready, watch->data};
-            if ((watch->interests & HL_LINUX_EPOLL_ONESHOT) != 0) watch->disabled = 1;
         }
     }
     return (int64_t)delivered;
