@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -11,6 +12,18 @@ int main(void) {
     if (pread(64, floor_bytes, sizeof(floor_bytes), 0) != (ssize_t)sizeof(floor_bytes) ||
         memcmp(floor_bytes, "floor", sizeof(floor_bytes)))
         return 9;
+    {
+        int duplicate = dup(64);
+        int high;
+        if (duplicate < 0 || (fcntl(duplicate, F_GETFD) & FD_CLOEXEC) != 0) return 19;
+        high = fcntl(duplicate, F_DUPFD_CLOEXEC, 70);
+        if (high < 70 || (fcntl(high, F_GETFD) & FD_CLOEXEC) == 0) return 20;
+        if (dup2(64, high) != high || (fcntl(high, F_GETFD) & FD_CLOEXEC) != 0) return 21;
+        if (close(duplicate) != 0 || close(high) != 0 || close(high) == 0) return 22;
+        if (pread(64, floor_bytes, sizeof(floor_bytes), 0) != (ssize_t)sizeof(floor_bytes) ||
+            memcmp(floor_bytes, "floor", sizeof(floor_bytes)))
+            return 23;
+    }
     if (fstat(STDIN_FILENO, &input_status) != 0 || input_status.st_size != 5) return 10;
     if (fstat(STDOUT_FILENO, &output_status) != 0 || output_status.st_size != 0) return 11;
     if (lseek(STDIN_FILENO, 0, SEEK_SET) != 0) return 12;

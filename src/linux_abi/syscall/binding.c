@@ -7,20 +7,13 @@ static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
     return hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)value, snapshot) == HL_STATUS_OK;
 }
 
-static int bound_shadow_reserve(int minimum, int descriptor_flags) {
+static int bound_shadow_reserve(int minimum) {
     int fd;
     if (g_bound_sentinel < 0 || minimum < 0) {
         errno = EBADF;
         return -1;
     }
     fd = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, minimum);
-    if (fd < 0) return -1;
-    if (fcntl(fd, F_SETFD, descriptor_flags & HL_LINUX_FD_CLOEXEC ? FD_CLOEXEC : 0) != 0) {
-        int error = errno;
-        close(fd);
-        errno = error;
-        return -1;
-    }
     return fd;
 }
 
@@ -94,12 +87,11 @@ static int bound_shadow_activate(void) {
             shadow = dup2(g_bound_sentinel, (int)fd);
             if (shadow == (int)fd) {
                 stdio_installed[fd] = 1;
-                if (fcntl(shadow, F_SETFD, (snapshot.descriptor_flags & HL_LINUX_FD_CLOEXEC) != 0 ? FD_CLOEXEC : 0) !=
-                    0)
-                    shadow = -1;
+                /* Shadows are engine containment fds; guest CLOEXEC lives only in the Linux fd table. */
+                if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) shadow = -1;
             }
         } else {
-            shadow = bound_shadow_reserve((int)fd, (int)snapshot.descriptor_flags);
+            shadow = bound_shadow_reserve((int)fd);
         }
         if (shadow != (int)fd) {
             int error = shadow < 0 ? errno : EBUSY;
@@ -135,7 +127,7 @@ activation_failed: {
 }
 
 static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t descriptor_flags) {
-    int shadow = bound_shadow_reserve(minimum, (int)descriptor_flags);
+    int shadow = bound_shadow_reserve(minimum);
     int64_t result;
     if (shadow < 0) return -(int64_t)errno;
     if (shadow >= guest_nofile_cur()) {
@@ -320,7 +312,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -HL_LINUX_EINVAL;
             break;
         }
-        shadow = bound_shadow_reserve(0, (a2 & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+        shadow = bound_shadow_reserve(0);
         if (shadow < 0) {
             result = -(int64_t)errno;
             break;
@@ -334,7 +326,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
             if (status != HL_STATUS_ALREADY_EXISTS) break;
             close(shadow);
-            shadow = bound_shadow_reserve(shadow + 1, (a2 & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+            shadow = bound_shadow_reserve(shadow + 1);
             if (shadow < 0 || shadow >= guest_nofile_cur()) break;
         }
         if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
@@ -430,12 +422,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                     result = -(int64_t)errno;
                     break;
                 }
-                (void)fcntl(target, F_SETFD, flags & HL_LINUX_O_CLOEXEC ? FD_CLOEXEC : 0);
+                (void)fcntl(target, F_SETFD, FD_CLOEXEC);
             }
             result = hl_linux_dup3(g_linux_box, source.fd, (hl_linux_fd)target,
                                    flags & HL_LINUX_O_CLOEXEC ? HL_LINUX_O_CLOEXEC : 0);
             if (result < 0 && !target_bound) close(shadow);
-            if (result >= 0) (void)fcntl(target, F_SETFD, flags & HL_LINUX_O_CLOEXEC ? FD_CLOEXEC : 0);
         }
         break;
     }
@@ -448,8 +439,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                             (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
         } else {
             result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
-            if (result >= 0 && (int32_t)a1 == HL_LINUX_F_SETFD)
-                (void)fcntl((int)source.fd, F_SETFD, (a2 & HL_LINUX_FD_CLOEXEC) != 0 ? FD_CLOEXEC : 0);
         }
         break;
     case 20: return 0; /* epoll_create1: a0 is flags, not an fd */
