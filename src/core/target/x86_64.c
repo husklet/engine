@@ -165,12 +165,6 @@ static void container_init(const char *rootfs) {
         g_rootfs_canon_len = strlen(g_rootfs_canon);
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
         g_root_fd = engine_fd_hoist(g_root_fd); // keep it off the guest's low fds (else it squats fd 3)
-        if (g_root_fd >= 0 && g_host_services != NULL && g_host_services->file != NULL) {
-            hl_host_result root = g_host_services->file->open_relative(
-                g_host_services->context, HL_HOST_HANDLE_CWD, g_rootfs_canon, strlen(g_rootfs_canon),
-                HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
-            if (root.status == HL_STATUS_OK) g_root_handle = root.value;
-        }
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
@@ -181,6 +175,7 @@ static void container_init(const char *rootfs) {
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
     }
+    root_handle_bind(g_rootfs_canon[0] ? g_rootfs_canon : "/");
     {
         // HL_NETNS is a short key (not a path) used to derive abstract-socket and IPC identities.
         // The daemon and both guest ISAs share it across exec; the private-loopback directory is derived from it.

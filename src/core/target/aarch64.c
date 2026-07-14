@@ -591,12 +591,6 @@ static void container_init(const char *rootfs) {
         // pinned root for the per-component resolver
         g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
         g_root_fd = engine_fd_hoist(g_root_fd); // keep it off the guest's low fds (else it squats fd 3)
-        if (g_root_fd >= 0 && g_host_services != NULL && g_host_services->file != NULL) {
-            hl_host_result root = g_host_services->file->open_relative(
-                g_host_services->context, HL_HOST_HANDLE_CWD, g_rootfs_canon, strlen(g_rootfs_canon),
-                HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
-            if (root.status == HL_STATUS_OK) g_root_handle = root.value;
-        }
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         if (g_uid < 0) g_uid = 0;
@@ -607,6 +601,7 @@ static void container_init(const char *rootfs) {
         const char *icwd = hl_option_get("HL_CWD");
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     }
+    root_handle_bind(g_rootfs_canon[0] ? g_rootfs_canon : "/");
     // bind-mount volumes: "[ro:]guestpath:hostdir,..." -- delegate to add_vol() (the shared vfs.c parser)
     // so the optional `ro:` read-only marker is handled in ONE place for both engines. Ingested regardless
     // of whether a rootfs is set (matching linux_x86_64.c): add_vol opens the HOST dir directly and the

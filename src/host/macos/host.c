@@ -919,7 +919,9 @@ static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handl
     hl_host_result target = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
     char local[PATH_MAX];
     int root_fd = hl_macos_file_descriptor(host, root, 0);
-    int target_flags = O_RDONLY;
+    /* Resolution is a metadata probe, never an I/O open.  O_NONBLOCK prevents a FIFO/device final
+     * component from stalling the resolver before the Linux ABI can apply its actual open flags. */
+    int target_flags = O_RDONLY | O_NONBLOCK;
     if (root_fd < 0 || output == NULL || path == NULL || path_size == 0 || path_size >= sizeof(local) ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS |
                               HL_HOST_RESOLVE_ALLOW_MISSING)) != 0)

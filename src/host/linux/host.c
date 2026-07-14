@@ -901,7 +901,7 @@ static hl_host_result hl_linux_file_resolve_beneath(void *context, hl_host_handl
     hl_host_result target = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
     char local[PATH_MAX];
     int root_fd;
-    int target_flags = O_RDONLY;
+    int target_flags = O_RDONLY | O_NONBLOCK;
     if (output == NULL || path == NULL || path_size == 0 || path_size >= sizeof(local) ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS |
                               HL_HOST_RESOLVE_ALLOW_MISSING)) != 0)
@@ -912,9 +912,6 @@ static hl_host_result hl_linux_file_resolve_beneath(void *context, hl_host_handl
     root_fd = hl_linux_descriptor(host, root, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
     pthread_mutex_unlock(&host->lock);
     if (root_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-#ifdef O_PATH
-    if ((policy & HL_HOST_RESOLVE_NOFOLLOW_FINAL) != 0) target_flags = O_PATH;
-#endif
     if ((policy & HL_HOST_RESOLVE_ALLOW_MISSING) != 0) target_flags = -1;
     if (hl_host_resolve_beneath(root_fd, local, policy & (HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS),
                                 target_flags, &resolved) != 0)

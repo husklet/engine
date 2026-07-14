@@ -2471,6 +2471,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // fin is resolved -> O_NOFOLLOW safe
             // probe pre-existence (relative to the resolved parent) so we stamp ONLY a fresh create.
             int nf_new = nf_want && faccessat(pfd, fin, F_OK, AT_SYMLINK_NOFOLLOW) != 0;
+            if (plan.target) (void)g_host_services->file->close(g_host_services->context, plan.target);
+            if (plan.directory) (void)g_host_services->file->close(g_host_services->context, plan.directory);
             // O_PATH|O_NOFOLLOW on a symlink -> open the LINK via O_SYMLINK (else O_NOFOLLOW ELOOPs); a
             // regular O_NOFOLLOW open keeps ELOOPing on a symlink as Linux does.
             int r = openat(pfd, fin, mf | (osymlink ? O_SYMLINK : O_NOFOLLOW), (mode_t)a3);

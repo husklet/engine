@@ -710,6 +710,28 @@ static int g_root_fd = -1;
 /* Opaque twin used by the host-service resolver; legacy VFS paths retain g_root_fd until converted. */
 static hl_host_handle g_root_handle = HL_HOST_HANDLE_INVALID;
 
+/*
+ * Pin the namespace root through the host-service ABI.  In container mode this
+ * is the configured rootfs; a bare guest still needs an opaque handle for "/"
+ * so absolute HOST_PATH opens do not fall back to the legacy native-fd lane.
+ * Reinitialization (checkpoint/exec) replaces rather than leaks the old pin.
+ */
+static void root_handle_bind(const char *path) {
+    const hl_host_file_services *file;
+    hl_host_result root;
+
+    if (g_host_services == NULL || g_host_services->file == NULL) return;
+    file = g_host_services->file;
+    if (g_root_handle != HL_HOST_HANDLE_INVALID && file->close != NULL) {
+        file->close(g_host_services->context, g_root_handle);
+        g_root_handle = HL_HOST_HANDLE_INVALID;
+    }
+    if (file->open_relative == NULL || path == NULL || path[0] == '\0') return;
+    root = file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                               HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
+    if (root.status == HL_STATUS_OK) g_root_handle = root.value;
+}
+
 // Engine-private host fds (the rootfs dir-fd + each bind-mount volume dir-fd) share the guest's descriptor
 // table in hl's in-process model. Opened at startup, right after stdio, they otherwise squat the LOW numbers
 // Linux would leave free for the guest: g_root_fd lands on fd 3, shifting every guest fd allocation up by one
@@ -736,6 +758,7 @@ struct vol {
     char hcanon[1024];
     size_t hlen;
     int fd;
+    hl_host_handle handle; /* opaque twin of fd; rooted at the directory jail (or file parent) */
     int ro;     // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
     int isfile; // 1 = single-file bind (`-v host/f:/ctr/f`): `fd` is the host file's PARENT dir, `hcanon`
                 // is the file itself, and `guest` matches ONLY its exact path (a file has no children).
@@ -745,6 +768,19 @@ struct vol {
 };
 static struct vol g_vols[32];
 static int g_nvols;
+
+static void vol_handle_bind(struct vol *volume, const char *directory) {
+    hl_host_result opened;
+    if (volume == NULL) return;
+    volume->handle = HL_HOST_HANDLE_INVALID;
+    if (g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->file->open_relative == NULL || directory == NULL)
+        return;
+    opened = g_host_services->file->open_relative(
+        g_host_services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+        HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
+    if (opened.status == HL_STATUS_OK) volume->handle = opened.value;
+}
 
 // Materialize a volume's mount point (and every ancestor) as empty dirs in the writable rootfs/upper, the
 // way Docker mkdir -p's each mount target inside the container rootfs. Without it a NESTED mount leaves its
@@ -814,8 +850,11 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
         else
             *sl = 0;
         if ((v->fd = open(par, O_RDONLY | O_DIRECTORY)) < 0) return;
+        vol_handle_bind(v, par);
     } else if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0)
         return;
+    else
+        vol_handle_bind(v, v->hcanon);
     v->fd = engine_fd_hoist(v->fd); // keep this engine dir-fd out of the guest's low fd range
     g_nvols++;
     vol_mkmountpoint(v->guest, v->isfile);
@@ -855,8 +894,11 @@ static int rt_add_vol(const char *guest, const char *hostsrc, int ro) {
         else
             *sl = 0;
         if ((v->fd = open(par, O_RDONLY | O_DIRECTORY)) < 0) return -errno;
+        vol_handle_bind(v, par);
     } else if ((v->fd = open(v->hcanon, O_RDONLY | O_DIRECTORY)) < 0)
         return -errno;
+    else
+        vol_handle_bind(v, v->hcanon);
     v->fd = engine_fd_hoist(v->fd);
     vol_mkmountpoint(v->guest, v->isfile);
     __atomic_store_n(&g_nvols, g_nvols + 1, __ATOMIC_RELEASE); // publish the complete entry LAST
@@ -871,6 +913,11 @@ static int rt_del_vol(const char *guest) {
     for (int i = 0; i < nv; i++)
         if (!g_vols[i].dead && !strcmp(g_vols[i].guest, guest)) {
             g_vols[i].dead = 1;
+            if (g_vols[i].handle != HL_HOST_HANDLE_INVALID && g_host_services && g_host_services->file &&
+                g_host_services->file->close) {
+                (void)g_host_services->file->close(g_host_services->context, g_vols[i].handle);
+                g_vols[i].handle = HL_HOST_HANDLE_INVALID;
+            }
             hit = 0;
         }
     return hit;

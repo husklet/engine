@@ -316,14 +316,47 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, char *fin
         snprintf(absolute, sizeof absolute, "%s/%s", g_cwd, raw);
     else if (dirfd >= 0 && dirfd < 1024 && g_fdpath[dirfd][0]) {
         const char *guest_directory = g_fdpath[dirfd];
-        if (strncmp(guest_directory, g_rootfs_canon, g_rootfs_canon_len) == 0)
-            guest_directory += g_rootfs_canon_len;
+        if (strncmp(guest_directory, g_rootfs_canon, g_rootfs_canon_len) == 0) guest_directory += g_rootfs_canon_len;
         snprintf(absolute, sizeof absolute, "/%s/%s", guest_directory, raw);
     } else {
         return -EACCES;
     }
-    request = (hl_open_request){absolute, strlen(absolute), HL_HOST_HANDLE_CWD, intent, g_nlower != 0,
-                                jail_ro(absolute), 0};
+    request = (hl_open_request){
+        absolute, strlen(absolute), HL_HOST_HANDLE_INVALID, intent, g_nlower != 0, jail_ro(absolute), 0};
     if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
+    if (plan->kind == HL_OPEN_HOST_PATH && g_host_services &&
+        g_host_services->file && g_host_services->file->resolve_beneath) {
+        char rooted[8192];
+        const char *relative;
+        hl_host_handle route_root = g_root_handle;
+        hl_host_file_resolution resolved;
+        uint32_t policy = (intent & HL_OPEN_NOFOLLOW) ? HL_HOST_RESOLVE_NOFOLLOW_FINAL : 0;
+        if (intent & HL_OPEN_CREATE) policy |= HL_HOST_RESOLVE_ALLOW_MISSING;
+        if (g_chroot[0])
+            chroot_apply(absolute, rooted, sizeof rooted);
+        else
+            snprintf(rooted, sizeof rooted, "%s", absolute);
+        int volume = jail_match(rooted);
+        if (volume >= 0) {
+            route_root = g_vols[volume].handle;
+            relative = g_vols[volume].isfile ? vol_fbase(volume) : rooted + g_vols[volume].glen;
+        } else {
+            relative = rooted;
+        }
+        while (*relative == '/')
+            relative++;
+        if (!*relative) relative = ".";
+        if (route_root != HL_HOST_HANDLE_INVALID &&
+            g_host_services->file
+                ->resolve_beneath(g_host_services->context, route_root, relative, strlen(relative), policy,
+                                  &resolved)
+                .status == HL_STATUS_OK) {
+            plan->directory = resolved.parent;
+            plan->target = resolved.target;
+            plan->target_type = resolved.target_type;
+            plan->path_size = resolved.final_size;
+            memcpy(plan->path, resolved.final, resolved.final_size + 1);
+        }
+    }
     return jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);
 }
