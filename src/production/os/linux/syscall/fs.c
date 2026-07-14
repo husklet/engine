@@ -2,6 +2,7 @@
 // confined to the rootfs jail (overlay copy-up, /proc/self/exe synth). Returns 1 if nr was handled, 0
 // otherwise. Included by service.c AFTER its local helpers (overlay_*/proc_self_exe/synth_str_fd/
 // cpu_range_str it calls) and before service() -- same TU scope.
+#include "device.h"
 
 // A terminal-control syscall (tcsetpgrp/tcsetattr) issued by a process that is in a BACKGROUND process
 // group raises SIGTTOU on the whole group; with the default disposition that STOPS it. During job-control
@@ -59,14 +60,6 @@ static void tty_ctl_restore(const sigset_t *saved) {
 // single st_dev/st_rdev field that the guest decodes with glibc's gnu_dev_major/minor. fill_linux_stat
 // copies the host dev value into st_dev/st_rdev VERBATIM, so for statx to report the SAME major:minor a
 // caller would compute from fstat/newfstatat, statx must apply those very macros to that same raw value.
-static inline uint32_t lin_dev_major(uint64_t dev) {
-    return (uint32_t)(((dev >> 8) & 0xfffu) | ((uint32_t)(dev >> 32) & ~0xfffu));
-}
-
-static inline uint32_t lin_dev_minor(uint64_t dev) {
-    return (uint32_t)((dev & 0xffu) | ((uint32_t)(dev >> 12) & ~0xffu));
-}
-
 // Overlay getdents64 snapshot cache (case 61): the merged cross-layer listing for a directory fd is taken
 // once on the first getdents call and consumed across the many small reads libc makes. Keyed by guest
 // fd+1 (0 == free). A slot MUST be invalidated on close() -- ovldents_drop, called from case 57 -- so a
@@ -3287,10 +3280,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         *(uint32_t *)(d + 120) = (uint32_t)s.st_mtimespec.tv_nsec;
         // stx_rdev_major @128 / minor @132, stx_dev_major @136 / minor @140 -- decoded from the SAME raw
         // dev values fill_linux_stat packs into st_rdev/st_dev, so a caller sees identical major:minor.
-        *(uint32_t *)(d + 128) = lin_dev_major((uint64_t)s.st_rdev);
-        *(uint32_t *)(d + 132) = lin_dev_minor((uint64_t)s.st_rdev);
-        *(uint32_t *)(d + 136) = lin_dev_major((uint64_t)s.st_dev);
-        *(uint32_t *)(d + 140) = lin_dev_minor((uint64_t)s.st_dev);
+        *(uint32_t *)(d + 128) = hl_linux_device_major((uint64_t)s.st_rdev);
+        *(uint32_t *)(d + 132) = hl_linux_device_minor((uint64_t)s.st_rdev);
+        *(uint32_t *)(d + 136) = hl_linux_device_major((uint64_t)s.st_dev);
+        *(uint32_t *)(d + 140) = hl_linux_device_minor((uint64_t)s.st_dev);
         G_RET(c) = 0;
         break;
     }

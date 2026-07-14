@@ -482,8 +482,7 @@ static void overlay_set_opaque(const char *guest) {
     xresolve_exec(guest, up, sizeof up);
     char opq[4400];
     snprintf(opq, sizeof opq, "%s/%s", up, ".wh..wh..opq");
-    int fd = open(opq, O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) close(fd);
+    (void)hl_production_file_create(&g_jit_services, opq, 0644);
     res_bump(); // an opaque marker appeared: invalidate the dir-verdict memo (and negative caches) so no
                 // pre-marker "lowers contribute" verdict survives within this syscall
 }
@@ -864,8 +863,7 @@ static void overlay_whiteout(const char *guest) {
             }
         mkdir(dir, 0755);
     }
-    int fd = open(wh, O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) close(fd);
+    (void)hl_production_file_create(&g_jit_services, wh, 0644);
     res_bump(); // a whiteout appeared (and the upper subtree was dropped): invalidate the dir-verdict memo
                 // and negative caches so no pre-removal "present" verdict/stat survives this syscall
 }

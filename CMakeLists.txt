@@ -50,8 +50,17 @@ add_library(hl-production-digest OBJECT src/production/translate/digest.c)
 target_include_directories(hl-production-digest PRIVATE src/production/translate)
 target_compile_options(hl-production-digest PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                    -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-production-window OBJECT src/production/translate/window.c)
+target_include_directories(hl-production-window PRIVATE src/production/translate)
+target_compile_options(hl-production-window PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                   -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-production-device OBJECT src/production/os/linux/syscall/device.c)
+target_include_directories(hl-production-device PRIVATE src/production/os/linux/syscall)
+target_compile_options(hl-production-device PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                   -Wstrict-prototypes -Wmissing-prototypes)
 
 add_library(hl-production-clock OBJECT src/production/host/clock.c)
+add_library(hl-production-file OBJECT src/production/host/file.c)
 
 add_library(hl-production-errno OBJECT src/production/os/linux/syscall/errno.c)
 target_include_directories(hl-production-errno PRIVATE src/production/os/linux/syscall)
@@ -64,6 +73,9 @@ target_compile_options(hl-production-number PRIVATE -Wall -Wextra -Wpedantic -Wc
 target_include_directories(hl-production-clock PRIVATE include src/production/host)
 target_compile_options(hl-production-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                   -Wstrict-prototypes -Wmissing-prototypes)
+target_include_directories(hl-production-file PRIVATE include src/production/host)
+target_compile_options(hl-production-file PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                 -Wstrict-prototypes -Wmissing-prototypes)
 
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
@@ -117,6 +129,12 @@ if(BUILD_TESTING)
     add_executable(test-digest tests/unit/test_digest.c $<TARGET_OBJECTS:hl-production-digest>)
     target_include_directories(test-digest PRIVATE include tests/unit src/production/translate)
     add_test(NAME digest COMMAND test-digest)
+    add_executable(test-window tests/unit/test_window.c $<TARGET_OBJECTS:hl-production-window>)
+    target_include_directories(test-window PRIVATE include tests/unit src/production/translate)
+    add_test(NAME window COMMAND test-window)
+    add_executable(test-device tests/unit/test_device.c $<TARGET_OBJECTS:hl-production-device>)
+    target_include_directories(test-device PRIVATE include tests/unit)
+    add_test(NAME device COMMAND test-device)
     add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-production-errno>)
     target_include_directories(test-errno PRIVATE include tests/unit)
     add_test(NAME errno COMMAND test-errno)
@@ -127,6 +145,9 @@ if(BUILD_TESTING)
     target_include_directories(test-clock PRIVATE include tests/unit)
     target_link_libraries(test-clock PRIVATE hl-host-fake)
     add_test(NAME clock COMMAND test-clock)
+    add_executable(test-file tests/unit/test_file.c $<TARGET_OBJECTS:hl-production-file>)
+    target_include_directories(test-file PRIVATE include tests/unit)
+    add_test(NAME file COMMAND test-file)
     if(TARGET hl-host-linux)
         add_executable(test-host_linux tests/unit/linux.c)
         target_include_directories(test-host_linux PRIVATE include tests/unit)

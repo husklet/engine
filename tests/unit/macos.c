@@ -2,6 +2,7 @@
 
 #include "hl/macos.h"
 #include "../../src/production/host/clock.h"
+#include "../../src/production/host/file.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -9,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -118,6 +120,11 @@ int main(void) {
         sizeof(contents));
     HL_CHECK(memcmp(contents, "abc", sizeof(contents)) == 0);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+    {
+        struct stat status;
+        HL_CHECK(hl_production_file_reset(&services, path, 0600) == 0);
+        HL_CHECK(stat(path, &status) == 0 && status.st_size == 0);
+    }
     unlink(path);
     memset(&code, 0, sizeof code);
     HL_CHECK(services.memory->reserve_code(services.context, 16384, 16384, HL_HOST_CODE_DUAL_ALIAS, &code).status ==

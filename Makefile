@@ -42,7 +42,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := clock codegen config digest host_services ir linux_abi stat engine errno limits log number options readonly reloc xattr_cache
+UNIT_NAMES := clock codegen config device digest file host_services ir linux_abi stat engine errno limits log number options readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -116,6 +116,14 @@ $(BUILD)/tests/test_digest: tests/unit/test_digest.c src/production/translate/di
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
+$(BUILD)/tests/test_window: tests/unit/test_window.c src/production/translate/window.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_device: tests/unit/test_device.c src/production/os/linux/syscall/device.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/tests/test_errno: tests/unit/test_errno.c src/production/os/linux/syscall/errno.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
@@ -125,6 +133,10 @@ $(BUILD)/tests/test_number: tests/unit/test_number.c src/production/os/linux/sys
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 $(BUILD)/tests/test_clock: tests/unit/test_clock.c src/production/host/clock.c src/host/fake/host.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_file: tests/unit/test_file.c src/production/host/file.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
@@ -164,11 +176,14 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch6
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/device.c \
 		src/production/os/linux/syscall/errno.c \
 		src/production/os/linux/syscall/number.c \
 		src/production/host/clock.c \
+		src/production/host/file.c \
 		src/production/translate/reloc.c \
 		src/production/translate/digest.c \
+		src/production/translate/window.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -180,11 +195,14 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/device.c \
 		src/production/os/linux/syscall/errno.c \
 		src/production/os/linux/syscall/number.c \
 		src/production/host/clock.c \
+		src/production/host/file.c \
 		src/production/translate/reloc.c \
 		src/production/translate/digest.c \
+		src/production/translate/window.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -200,11 +218,14 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/ta
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/device.c \
 		src/production/os/linux/syscall/errno.c \
 		src/production/os/linux/syscall/number.c \
 		src/production/host/clock.c \
+		src/production/host/file.c \
 		src/production/translate/reloc.c \
 		src/production/translate/digest.c \
+		src/production/translate/window.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
@@ -219,11 +240,14 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/tar
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/device.c \
 		src/production/os/linux/syscall/errno.c \
 		src/production/os/linux/syscall/number.c \
 		src/production/host/clock.c \
+		src/production/host/file.c \
 		src/production/translate/reloc.c \
 		src/production/translate/digest.c \
+		src/production/translate/window.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
@@ -304,10 +328,11 @@ $(BUILD)/tests/test_host_linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test-host-macos: tests/unit/macos.c src/host/macos/host.c src/core/host_services.c \
-	src/core/log.c src/production/host/clock.c include/hl/macos.h include/hl/host_services.h
+	src/core/log.c src/production/host/clock.c src/production/host/file.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
-		src/host/macos/host.c src/core/host_services.c src/core/log.c src/production/host/clock.c -o $@
+		src/host/macos/host.c src/core/host_services.c src/core/log.c src/production/host/clock.c \
+		src/production/host/file.c -o $@
 
 test-macos-host: $(BUILD)/tests/test-host-macos
 	$(MAC) $(abspath $<)

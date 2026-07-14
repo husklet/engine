@@ -52,6 +52,7 @@
 // same atomic temp+rename protocol (the .pcache file itself is NEVER modified after publication).
 
 #include "../digest.h"
+#include "../window.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
 #define PC_VERSION 7 // v7 retires mode-dependent A/B cache identities; production codegen is fixed.
@@ -411,11 +412,12 @@ static int pcache_load(uint64_t entry_jump) {
     }
     // Bounds-validate every record whose offset a later pass writes or branches through.
     for (uint64_t i = 0; ok && i < h.n_reloc; i++)
-        ok = (uint64_t)g_reloc[i].off + 16 <= h.arena_used;
+        ok = hl_window_contains(h.arena_used, g_reloc[i].off, 16, 1);
     for (uint64_t i = 0; ok && i < h.n_mapent; i++)
-        ok = me[i].host_off < h.arena_used && me[i].body_off < h.arena_used;
+        ok = hl_window_contains(h.arena_used, me[i].host_off, 1, 1) &&
+             hl_window_contains(h.arena_used, me[i].body_off, 1, 1);
     for (uint64_t i = 0; ok && i < h.n_pend; i++)
-        ok = pe[i].slot_off + 4 <= h.arena_used;
+        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 1);
     if (!ok) {
         free(me);
         free(pe);

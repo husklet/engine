@@ -78,6 +78,7 @@
 
 #include "../reloc.h"
 #include "../digest.h"
+#include "../window.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
 #define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`
@@ -254,9 +255,8 @@ static void pcache_relocate(void) {
 // the literal pair), so the whole window must be inside the restored arena and naturally aligned.
 static int pc_reloc_ok(hl_reloc r, uint64_t arena_used) {
     int kind = r.info & 0xff, slot = (r.info >> 16) & 0xffff;
-    if ((uint64_t)r.off + 16 > arena_used) return 0;
-    if (kind == RK_ICSITE) return (r.off & 7) == 0;
-    if (r.off & 3) return 0;
+    if (!hl_window_contains(arena_used, r.off, 16, kind == RK_ICSITE ? 8 : 4)) return 0;
+    if (kind == RK_ICSITE) return 1;
     if (((r.info >> 8) & 0xff) > 30) return 0; // rd must be a real GPR (we never bake into sp/xzr)
     if (kind == RK_T2CNT) return slot < T2_MAX;
     return kind == RK_BLOCKRET || kind == RK_IBTC;
@@ -331,10 +331,10 @@ static int pcache_load(uint64_t entry_jump) {
     for (uint64_t i = 0; ok && i < h.n_reloc; i++)
         ok = pc_reloc_ok(re[i], h.arena_used);
     for (uint64_t i = 0; ok && i < h.n_mapent; i++)
-        ok = me[i].host_off < h.arena_used && me[i].body_off < h.arena_used && !(me[i].host_off & 3) &&
-             !(me[i].body_off & 3);
+        ok = hl_window_contains(h.arena_used, me[i].host_off, 1, 4) &&
+             hl_window_contains(h.arena_used, me[i].body_off, 1, 4);
     for (uint64_t i = 0; ok && i < h.n_pend; i++)
-        ok = pe[i].slot_off + 4 <= h.arena_used && !(pe[i].slot_off & 3);
+        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4);
     if (!ok) {
         free(re);
         free(me);

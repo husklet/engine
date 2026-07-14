@@ -5,6 +5,7 @@
 #include "../../../include/hl/macos.h"
 #include "../../../include/hl/log.h"
 #include "../host/clock.h"
+#include "../host/file.h"
 
 #define CACHE_SZ (64u << 20)
 // base, bump pointer
@@ -802,8 +803,7 @@ static void *md_watcher(void *arg) {
             md_dump_to(ppfx);
             char done[1088];
             snprintf(done, sizeof done, "%s.%d.done", pfx, getpid());
-            int fd = open(done, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) close(fd);
+            (void)hl_production_file_reset(&g_jit_services, done, 0644);
         }
         struct timespec ts = {0, 100000000}; // 100ms
         nanosleep(&ts, NULL);
