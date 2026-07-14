@@ -558,7 +558,7 @@ int main(void) {
     }
 
     /* Syscall close closes the host handle exactly once, at the final OFD reference. */
-    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &original) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &original) == HL_STATUS_OK);
     HL_CHECK(hl_linux_fd_dup(&linux_abi, original, 0, &duplicate) == HL_STATUS_OK);
     HL_CHECK(hl_linux_close(&linux_abi, original) == 0 && file_host.closes == 0);
     HL_CHECK(hl_linux_close(&linux_abi, duplicate) == 0 && file_host.closes == 1);
@@ -785,7 +785,7 @@ int main(void) {
         memcpy(file_host.bytes, "abcdef", 6);
         file_host.size = 6;
         file_host.offset = 0;
-        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &first.fd) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &first.fd) == HL_STATUS_OK);
         HL_CHECK(hl_linux_fd_dup(&linux_abi, first.fd, 0, &second.fd) == HL_STATUS_OK);
         HL_CHECK(pthread_create(&first_thread, NULL, read_three_bytes, &first) == 0);
         HL_CHECK(pthread_create(&second_thread, NULL, read_three_bytes, &second) == 0);
@@ -805,8 +805,8 @@ int main(void) {
 
         /* Host calls on unrelated OFDs overlap; table ownership is not held across I/O. */
         file_host.offset = 0;
-        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_HOST_FILE_READ, 0, &first.fd) == HL_STATUS_OK);
-        HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_HOST_FILE_READ, 0, &second.fd) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDONLY, 0, &first.fd) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_LINUX_O_RDONLY, 0, &second.fd) == HL_STATUS_OK);
         atomic_store_explicit(&file_host.concurrent_calls, 0, memory_order_relaxed);
         atomic_store_explicit(&file_host.barrier_enabled, 1, memory_order_release);
         HL_CHECK(pthread_create(&first_thread, NULL, read_one_byte, &first) == 0);
