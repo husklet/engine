@@ -1,0 +1,1 @@
+rt_sigtimedwait ret=10 sig=10

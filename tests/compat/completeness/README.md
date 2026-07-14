@@ -1,16 +1,17 @@
 # Completeness compatibility suite
 
 This directory contains pure-C Linux guests ported from the former Rust-driven
-engine matrix. `manifest.tsv` is the authoritative case registry. There are 159
-registered cases backed by 148 unique C sources; repeated execution modes never
+engine matrix. `manifest.tsv` is the authoritative case registry. There are 160
+registered cases backed by 149 unique C sources; repeated execution modes never
 duplicate a source.
 
 Linux ABI cases are compiled for both guest ISAs. The AArch64 executable runs
 through the AArch64 engine, the x86-64 executable through the x86-64 engine, and
-the gate requires the declared exit status plus byte-identical stdout. This is
-an engine compatibility contract; it does not use a native executable as an
-oracle. Architecture-specific opcode cases run only through their matching
-engine and compare stdout with the checked-in file under `expected/`.
+the gate requires the declared exit status, a byte-exact checked-in stdout under
+`expected/shared/`, and byte-identical output between engines. This is an engine
+compatibility contract; it does not use a native executable as an oracle.
+Architecture-specific opcode cases run only through their matching engine and
+compare stdout with the checked-in ISA-specific file under `expected/`.
 
 Sources are grouped by what they test, not by the host implementation:
 

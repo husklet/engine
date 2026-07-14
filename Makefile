@@ -98,9 +98,17 @@ ABI_CASE_SOURCES := $(sort $(wildcard tests/compat/abi/*.c))
 ABI_CASE_NAMES := $(basename $(notdir $(ABI_CASE_SOURCES)))
 ABI_CASE_BINS := $(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/aarch64/%) \
 	$(ABI_CASE_NAMES:%=$(BUILD)/compat/abi/x86_64/%)
+COMPLETENESS_AARCH64_SOURCES := $(sort $(wildcard tests/compat/completeness/aarch64/*.c))
+COMPLETENESS_X86_64_SOURCES := $(sort $(wildcard tests/compat/completeness/x86_64/*.c))
+COMPLETENESS_SYSCALL_SOURCES := $(sort $(wildcard tests/compat/completeness/syscall/*.c))
+COMPLETENESS_AARCH64_BINS := $(COMPLETENESS_AARCH64_SOURCES:tests/compat/completeness/%.c=$(BUILD)/compat/completeness/aarch64/%) \
+	$(COMPLETENESS_SYSCALL_SOURCES:tests/compat/completeness/%.c=$(BUILD)/compat/completeness/aarch64/%)
+COMPLETENESS_X86_64_BINS := $(COMPLETENESS_X86_64_SOURCES:tests/compat/completeness/%.c=$(BUILD)/compat/completeness/x86_64/%) \
+	$(COMPLETENESS_SYSCALL_SOURCES:tests/compat/completeness/%.c=$(BUILD)/compat/completeness/x86_64/%)
+COMPLETENESS_BINS := $(COMPLETENESS_AARCH64_BINS) $(COMPLETENESS_X86_64_BINS)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-completeness $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -264,6 +272,14 @@ $(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static $< -lm -o $@
 
+$(BUILD)/compat/completeness/aarch64/%: tests/compat/completeness/%.c tests/compat/completeness/compat.h
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
+
+$(BUILD)/compat/completeness/x86_64/%: tests/compat/completeness/%.c tests/compat/completeness/compat.h
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -414,7 +430,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-completeness $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -483,6 +499,11 @@ compat-abi: compat-engines $(BUILD)/tools/matrix-runner $(ABI_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/abi/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/abi/x86_64) $(abspath tests/compat/abi)
+
+compat-completeness: compat-engines $(BUILD)/tools/matrix-runner $(COMPLETENESS_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/completeness/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/completeness/x86_64) $(abspath tests/compat/completeness)
 
 $(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
 	@mkdir -p $(@D)
