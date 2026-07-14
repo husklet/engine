@@ -837,9 +837,13 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
 #ifdef O_DIRECTORY
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
 #endif
-    if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
-    if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
-    if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    /* PATH_ONLY models Linux O_PATH. O_CREAT/O_EXCL/O_TRUNC are ignored by
+       that API even though macOS has no native O_PATH flag. */
+    if ((access & HL_HOST_FILE_PATH_ONLY) == 0) {
+        if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
+        if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
+        if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    }
     if ((access & HL_HOST_FILE_APPEND) != 0) flags |= O_APPEND;
     descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
     if (descriptor < 0) return hl_macos_errno();

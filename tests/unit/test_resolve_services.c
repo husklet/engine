@@ -14,6 +14,7 @@
 #define test_destroy hl_host_linux_destroy
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <string.h>
@@ -63,6 +64,26 @@ int main(void) {
                                            HL_HOST_FILE_READ, 0, 0, 0);
         HL_CHECK(read.status == HL_STATUS_OK);
         HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
+    }
+    /* PATH_ONLY is the portable Linux O_PATH contract: creation and
+       truncation flags are ignored on every host. */
+    read = services.file->open_beneath(services.context, root.value, "a/path-missing", 14,
+                                       HL_HOST_FILE_PATH_ONLY,
+                                       HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0);
+    HL_CHECK(read.status == HL_STATUS_NOT_FOUND);
+    {
+        char path_missing[512];
+        struct stat status;
+        snprintf(path_missing, sizeof(path_missing), "%s/a/path-missing", temporary);
+        HL_CHECK(lstat(path_missing, &status) != 0 && errno == ENOENT);
+    }
+    read = services.file->open_beneath(services.context, root.value, "a/file", 6,
+                                       HL_HOST_FILE_PATH_ONLY, HL_HOST_FILE_TRUNCATE, 0, 0);
+    HL_CHECK(read.status == HL_STATUS_OK);
+    HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
+    {
+        struct stat status;
+        HL_CHECK(stat(file, &status) == 0 && status.st_size == 1);
     }
     /* Resolving a FIFO is a metadata operation and must neither wait for a peer nor consume data. */
     alarm(2);

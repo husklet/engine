@@ -624,9 +624,13 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if ((access & HL_HOST_FILE_NOFOLLOW) != 0) flags |= O_NOFOLLOW;
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) flags |= O_DIRECTORY;
-    if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
-    if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
-    if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    /* Linux O_PATH ignores creation and truncation flags. Keep that contract
+       in the portable service instead of relying on host-specific open flags. */
+    if ((access & HL_HOST_FILE_PATH_ONLY) == 0) {
+        if ((creation & HL_HOST_FILE_CREATE) != 0) flags |= O_CREAT;
+        if ((creation & HL_HOST_FILE_EXCLUSIVE) != 0) flags |= O_EXCL;
+        if ((creation & HL_HOST_FILE_TRUNCATE) != 0) flags |= O_TRUNC;
+    }
     descriptor = openat(directory_fd, local, flags | O_CLOEXEC, (mode_t)(permissions & 07777u));
     if (descriptor < 0) return hl_linux_errno_result();
     if ((access & HL_HOST_FILE_APPEND) != 0) {
