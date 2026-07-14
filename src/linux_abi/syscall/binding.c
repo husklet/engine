@@ -73,6 +73,7 @@ static void bound_mapping_file_size_changed(const hl_linux_fd_snapshot *file,
                                             const hl_host_file_metadata *metadata, int have_metadata,
                                             uint64_t old_size, uint64_t new_size,
                                             hl_linux_bus_transition *transition);
+static void bound_mapping_file_data_changed(const hl_linux_fd_snapshot *file, uint64_t device, uint64_t inode);
 
 static bound_watch_source *bound_watch_find_token(uint64_t token) {
     for (bound_watch_source *source = g_bound_watches.sources; source != NULL; source = source->next)
@@ -97,8 +98,21 @@ static void bound_watch_apply(void *opaque, const hl_linux_watch_change *change)
     (void)opaque;
     pthread_mutex_lock(&g_bound_watches.lock);
     bound_watch_source *source = bound_watch_find_token(change->token);
-    if (source == NULL || change->new_size == source->size) {
+    if (source == NULL) {
         pthread_mutex_unlock(&g_bound_watches.lock);
+        return;
+    }
+    if (change->new_size == source->size) {
+        if ((change->flags & HL_HOST_WATCH_DATA) == 0) {
+            pthread_mutex_unlock(&g_bound_watches.lock);
+            return;
+        }
+        source->references++;
+        hl_linux_fd_snapshot file = {.host_handle = source->file};
+        uint64_t device = source->device, inode = source->inode;
+        pthread_mutex_unlock(&g_bound_watches.lock);
+        bound_mapping_file_data_changed(&file, device, inode);
+        bound_watch_release(source);
         return;
     }
     source->references++;
@@ -618,6 +632,30 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
                                     (size_t)(hi - lo)};
             (void)g_host_services->file->read_at(g_host_services->context, file->host_handle, lo, output);
         }
+    }
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
+}
+
+/* A size-preserving external write may populate pages that became accessible
+ * after EOF was extended. Refresh only that clean private follow range; pages
+ * dirtied before the resize remain private and untouched. */
+static void bound_mapping_file_data_changed(const hl_linux_fd_snapshot *file, uint64_t device, uint64_t inode) {
+    bound_mapping **head = bound_mapping_head();
+    hl_host_file_metadata metadata = {.stable_device = device, .stable_object = inode};
+    if (head == NULL || g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->file->read_at == NULL)
+        return;
+    pthread_mutex_lock(&g_bound_mapping_gate);
+    pthread_mutex_lock(&g_bound_mapping_lock);
+    for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+        if (entry->object->shared || entry->follow_hi <= entry->follow_lo ||
+            !bound_mapping_same_file(entry->object, file, &metadata, 1))
+            continue;
+        hl_host_bytes output = {(void *)(uintptr_t)(entry->address + entry->follow_lo),
+                                (size_t)(entry->follow_hi - entry->follow_lo)};
+        (void)g_host_services->file->read_at(g_host_services->context, file->host_handle,
+                                             entry->file_offset + entry->follow_lo, output);
     }
     pthread_mutex_unlock(&g_bound_mapping_lock);
     pthread_mutex_unlock(&g_bound_mapping_gate);

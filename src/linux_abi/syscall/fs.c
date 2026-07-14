@@ -1568,8 +1568,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         *(uint64_t *)(b + 32) = bavail;             // f_bavail
         *(uint64_t *)(b + 40) = files;              // f_files
         *(uint64_t *)(b + 48) = ffree;              // f_ffree
+#if defined(__linux__)
+        *(int32_t *)(b + 56) = hs.f_fsid.__val[0];  // f_fsid[0]
+        *(int32_t *)(b + 60) = hs.f_fsid.__val[1];  // f_fsid[1]
+#else
         *(int32_t *)(b + 56) = hs.f_fsid.val[0];    // f_fsid[0]
         *(int32_t *)(b + 60) = hs.f_fsid.val[1];    // f_fsid[1]
+#endif
         *(int64_t *)(b + 64) = 255;                 // f_namelen (NAME_MAX)
         *(int64_t *)(b + 72) = (int64_t)hs.f_bsize; // f_frsize
         // f_flags: Linux exposes the mount flags (ST_VALID + mount options). hl's mounts are all relatime;
@@ -3306,8 +3311,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // stx_{atime,btime,ctime,mtime} @64/80/96/112: {s64 tv_sec; u32 tv_nsec} each 16 bytes
         *(int64_t *)(d + 64) = (int64_t)s.st_atimespec.tv_sec;
         *(uint32_t *)(d + 72) = (uint32_t)s.st_atimespec.tv_nsec;
+#if defined(__linux__)
+        *(int64_t *)(d + 80) = 0;
+        *(uint32_t *)(d + 88) = 0;
+#else
         *(int64_t *)(d + 80) = (int64_t)s.st_birthtimespec.tv_sec;
         *(uint32_t *)(d + 88) = (uint32_t)s.st_birthtimespec.tv_nsec;
+#endif
         *(int64_t *)(d + 96) = (int64_t)s.st_ctimespec.tv_sec;
         *(uint32_t *)(d + 104) = (uint32_t)s.st_ctimespec.tv_nsec;
         *(int64_t *)(d + 112) = (int64_t)s.st_mtimespec.tv_sec;
