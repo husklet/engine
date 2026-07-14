@@ -2024,8 +2024,6 @@ static int proc_mountinfo_text(char *b, size_t n) {
 // stats (rss, cpu time, state, ppid) from the host system interface. The union -- registry identity +
 // native-process liveness -- lets any process (e.g. `ps`) enumerate the whole container
 // and synthesize /proc/<pid>/{stat,status,cmdline,comm} for its peers, with GUEST pids throughout.
-#include <libproc.h>
-#include <sys/proc_info.h>
 #include "../../host/system.h"
 
 // The registry directory is keyed per-container (HL_NETNS / HL_HOSTNAME are set once at launch and
@@ -2255,40 +2253,26 @@ static void proc_fd_rebase(char *tgt) {
 
 // The /proc/<pid>/fd/<fd> readlink target for a PEER container process (host pid `host`), the SYMLINK-TARGET
 // view. A guest process is its own macOS process with a PRIVATE fd table, so the peer's fds aren't in our
-// own table (procfd_num rejects a foreign pid) -- read them from the host kernel via libproc: a VNODE fd's
-// path from PROC_PIDFDVNODEPATHINFO (rebased out of the rootfs), a pipe/socket/anon fd as the Linux-style
+// own table (procfd_num rejects a foreign pid) -- read them through host process inspection: a file's
+// native path (rebased out of the rootfs), a pipe/socket/anon fd as the Linux-style
 // "pipe:[..]"/"socket:[..]"/"anon_inode:[..]" name. Returns the byte length written to `out`, or -1 if the
 // peer or fd is not resolvable (-> ENOENT). Guest fd numbers == host fd numbers, the same 1:1 mapping the
 // self /proc/self/fd view relies on.
 static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
+    hl_host_process_fd entry;
+    char tgt[4200] = {0};
+    size_t target_size = 0;
     if (host <= 0 || fd < 0) return -1;
-    struct vnode_fdinfowithpath vi;
-    if (proc_pidfdinfo(host, fd, PROC_PIDFDVNODEPATHINFO, &vi, sizeof vi) == (int)sizeof vi && vi.pvip.vip_path[0]) {
-        char tgt[4200];
-        snprintf(tgt, sizeof tgt, "%s", vi.pvip.vip_path);
+    if (!hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size)) return -1;
+    if (entry.kind == HL_HOST_FD_FILE && target_size != 0) {
+        tgt[target_size] = 0;
         proc_fd_rebase(tgt);
         size_t l = strlen(tgt);
         if (l > n) l = n;
         memcpy(out, tgt, l);
         return (int)l;
     }
-    // Non-vnode fd (pipe/socket/eventfd/...): confirm it is actually OPEN in the peer via the fd list, then
-    // synthesize the Linux-style name; a closed/absent fd -> -1 (ENOENT), never a stale link.
-    int cap = proc_pidinfo(host, PROC_PIDLISTFDS, 0, NULL, 0);
-    if (cap <= 0) return -1;
-    struct proc_fdinfo *fds = malloc((size_t)cap);
-    if (!fds) return -1;
-    int got = proc_pidinfo(host, PROC_PIDLISTFDS, 0, fds, cap);
-    int nfd = got > 0 ? got / (int)sizeof(struct proc_fdinfo) : 0;
-    int type = -1;
-    for (int i = 0; i < nfd; i++)
-        if (fds[i].proc_fd == fd) {
-            type = (int)fds[i].proc_fdtype;
-            break;
-        }
-    free(fds);
-    if (type < 0) return -1; // fd not open in the peer
-    const char *k = type == PROX_FDTYPE_SOCKET ? "socket" : type == PROX_FDTYPE_PIPE ? "pipe" : "anon_inode";
+    const char *k = entry.kind == HL_HOST_FD_SOCKET ? "socket" : entry.kind == HL_HOST_FD_PIPE ? "pipe" : "anon_inode";
     char syn[64];
     int sl = snprintf(syn, sizeof syn, "%s:[%d]", k, fd);
     if ((size_t)sl > n) sl = (int)n;
@@ -2299,26 +2283,14 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
 // Is `fd` currently OPEN in the PEER process `host`? (For peer /proc/<pid>/fd/<N> lstat/stat: a live fd is a
 // symlink, a closed one ENOENTs.) Returns 1 if open, 0 otherwise.
 static int proc_fd_pid_open_one(int host, int fd) {
-    if (host <= 0 || fd < 0) return 0;
-    int cap = proc_pidinfo(host, PROC_PIDLISTFDS, 0, NULL, 0);
-    if (cap <= 0) return 0;
-    struct proc_fdinfo *fds = malloc((size_t)cap);
-    if (!fds) return 0;
-    int got = proc_pidinfo(host, PROC_PIDLISTFDS, 0, fds, cap);
-    int nfd = got > 0 ? got / (int)sizeof(struct proc_fdinfo) : 0;
-    int open_ = 0;
-    for (int i = 0; i < nfd; i++)
-        if (fds[i].proc_fd == fd) {
-            open_ = 1;
-            break;
-        }
-    free(fds);
-    return open_;
+    hl_host_process_fd entry;
+    size_t path_size;
+    return host > 0 && fd >= 0 && hl_host_process_fd_read(host, fd, &entry, NULL, 0, &path_size);
 }
 
 // Build a temp dir of "N -> target" symlinks for a PEER container process's open fds (host pid `host`), so
 // a peer /proc/<pid>/fd is listable (getdents) and each entry readlinks to the fd's target -- the same
-// symlink-dir mechanism proc_fd_dir_open() uses for self, but populated from the peer's libproc fd list
+// symlink-dir mechanism proc_fd_dir_open() uses for self, but populated from the peer descriptor snapshot
 // instead of our own host fd table. Self is delegated to proc_fd_dir_open (exact host table). Returns the
 // dir fd, or -1. NOTE: this is the LISTING + readlink view only; actually OPENING a peer fd (using
 // /proc/<pid>/fd/N as a working descriptor) needs the owner to hand the real fd across processes
@@ -2331,34 +2303,37 @@ static int proc_fd_dir_pid_open(int host) {
         registered = 1;
     }
     procfd_dirs_reap(0);
-    int cap = proc_pidinfo(host, PROC_PIDLISTFDS, 0, NULL, 0);
-    if (cap <= 0) return -1;
-    struct proc_fdinfo *fds = malloc((size_t)cap);
-    if (!fds) return -1;
-    int got = proc_pidinfo(host, PROC_PIDLISTFDS, 0, fds, cap);
-    int nfd = got > 0 ? got / (int)sizeof(struct proc_fdinfo) : 0;
+    size_t nfd = 0;
+    if (!hl_host_process_fds(host, NULL, 0, &nfd)) return -1;
+    size_t fd_capacity = nfd;
+    hl_host_process_fd *fds = fd_capacity != 0 ? malloc(fd_capacity * sizeof *fds) : NULL;
+    if (fd_capacity != 0 && !fds) return -1;
+    if (!hl_host_process_fds(host, fds, fd_capacity, &nfd)) {
+        free(fds);
+        return -1;
+    }
+    if (nfd > fd_capacity) nfd = fd_capacity;
     char tmpl[] = "/tmp/.hl-proc-fd-dirXXXXXX";
     if (!mkdtemp(tmpl)) {
         free(fds);
         return -1;
     }
-    for (int i = 0; i < nfd; i++) {
-        int fd = fds[i].proc_fd;
-        char tgt[4200];
-        int have = 0;
-        if (fds[i].proc_fdtype == PROX_FDTYPE_VNODE) {
-            struct vnode_fdinfowithpath vi;
-            if (proc_pidfdinfo(host, fd, PROC_PIDFDVNODEPATHINFO, &vi, sizeof vi) == (int)sizeof vi &&
-                vi.pvip.vip_path[0]) {
-                snprintf(tgt, sizeof tgt, "%s", vi.pvip.vip_path);
-                proc_fd_rebase(tgt);
-                have = tgt[0] != 0;
-            }
+    for (size_t i = 0; i < nfd; i++) {
+        int fd = fds[i].descriptor;
+        char tgt[4200] = {0};
+        size_t target_size = 0;
+        hl_host_process_fd entry;
+        int have = hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size) &&
+                   entry.kind == HL_HOST_FD_FILE && target_size != 0;
+        if (have) {
+            tgt[target_size] = 0;
+            proc_fd_rebase(tgt);
+            have = tgt[0] != 0;
         }
         if (!have) {
-            const char *k = fds[i].proc_fdtype == PROX_FDTYPE_SOCKET ? "socket"
-                            : fds[i].proc_fdtype == PROX_FDTYPE_PIPE ? "pipe"
-                                                                     : "anon_inode";
+            const char *k = fds[i].kind == HL_HOST_FD_SOCKET ? "socket"
+                            : fds[i].kind == HL_HOST_FD_PIPE ? "pipe"
+                                                             : "anon_inode";
             snprintf(tgt, sizeof tgt, "%s:[%d]", k, fd);
         }
         char link[80];
@@ -2383,7 +2358,7 @@ static int proc_fd_dir_pid_open(int host) {
 // Resident footprint (bytes) for OUR OWN pid's VmRSS / statm-resident / stat-rss. The guest's tracked anon
 // charge (g_mem_charged) is 0 for a process that has only faulted its static image, but a real Linux process
 // ALWAYS has a non-zero VmRSS -- top/htop/ps would otherwise show this process at RES=0, a engine-specific divergence
-// (a PEER pid already reports a live resident size via libproc; self must not read 0). Floor the tracked
+// (a peer pid already reports a live resident size through host process stats; self must not read 0). Floor the tracked
 // charge with this engine process's real resident size so the reported RSS is non-zero and plausible.
 static unsigned long long self_rss_bytes(void) {
     unsigned long long charged = (unsigned long long)atomic_load(&g_mem_charged);
@@ -2490,7 +2465,7 @@ static int cgroup_procs_text(char *buf, size_t n, int with_threads) {
 // /sys/fs/cgroup/memory.current aggregate across the whole container. Under a memory.max cap the
 // per-process anon CHARGE is tracked (bounded, matches enforcement) -> sum the shared accounting slots.
 // With no cap the charge model is inert, so fall back to the REAL resident size of every live container
-// process (libproc) -- what a native cgroup reports, and what makes a forked child's allocation visible
+// process (host process stats) -- what a native cgroup reports, and what makes a forked child's allocation visible
 // to a parent reading memory.current. Cross-process either way (was a single engine process's local value).
 static unsigned long long cgroup_mem_current(void) {
     if (g_mem_max) return acct_mem_total();
@@ -3750,7 +3725,7 @@ static int proc_open(const char *rp) {
             if (proc_pid_member(gp2, &host) ||
                 (is_oom_leaf && (host = (gp2 == 1 && g_init_hostpid) ? g_init_hostpid : gp2) > 0 &&
                  !(kill(host, 0) != 0 && errno == ESRCH))) {
-                // Peer /proc/<pid>/fd: a listable dir of symlinks built from the peer's libproc fd list, so
+                // Peer /proc/<pid>/fd: a listable dir of symlinks built from the peer descriptor snapshot, so
                 // each entry readlinks to the fd's target. (Opening a peer fd link stays deferred -- needs
                 // cross-process fd passing; see proc_fd_dir_pid_open.)
                 if (!strcmp(fl, "fd")) return proc_fd_dir_pid_open(host);
@@ -5098,7 +5073,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         }
     }
     // Peer /proc/<pid>/fd (a directory) and /proc/<pid>/fd/<N> (a symlink to the peer fd's target) -- answer
-    // stat directly (a live peer fd from its libproc table) so lstat/stat see the right type WITHOUT
+    // stat directly (a live peer fd from its host descriptor snapshot) so lstat/stat see the right type WITHOUT
     // proc_open() materializing a temp dir as a side effect. proc_self_leaf matched only our own pid above.
     {
         int peer = -1, hp = 0;

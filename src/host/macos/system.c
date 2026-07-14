@@ -8,6 +8,7 @@
 #include <mach/vm_map.h>
 #include <mach/vm_statistics.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/proc_info.h>
 #include <sys/sysctl.h>
@@ -108,5 +109,78 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
         info->system_time_ns = task.pti_total_system;
         if (task.pti_threadnum > 0) info->threads = (uint32_t)task.pti_threadnum;
     }
+    return 1;
+}
+
+static uint32_t hl_macos_fd_kind(uint32_t kind) {
+    if (kind == PROX_FDTYPE_VNODE) return HL_HOST_FD_FILE;
+    if (kind == PROX_FDTYPE_PIPE) return HL_HOST_FD_PIPE;
+    if (kind == PROX_FDTYPE_SOCKET) return HL_HOST_FD_SOCKET;
+    return HL_HOST_FD_OTHER;
+}
+
+int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count) {
+    int bytes;
+    int received;
+    struct proc_fdinfo *native;
+    size_t total;
+    if (count == NULL || pid <= 0 || pid > INT32_MAX || (capacity != 0 && entries == NULL)) return 0;
+    bytes = proc_pidinfo((int)pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (bytes <= 0) return 0;
+    native = malloc((size_t)bytes);
+    if (native == NULL) return 0;
+    received = proc_pidinfo((int)pid, PROC_PIDLISTFDS, 0, native, bytes);
+    if (received < 0) {
+        free(native);
+        return 0;
+    }
+    total = (size_t)received / sizeof *native;
+    for (size_t index = 0; index < total && index < capacity; ++index) {
+        entries[index].descriptor = native[index].proc_fd;
+        entries[index].kind = hl_macos_fd_kind(native[index].proc_fdtype);
+    }
+    free(native);
+    *count = total;
+    return 1;
+}
+
+int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,
+                            size_t path_capacity, size_t *path_size) {
+    struct vnode_fdinfowithpath info;
+    hl_host_process_fd *entries;
+    size_t count;
+    uint32_t kind = HL_HOST_FD_OTHER;
+    int found = 0;
+    if (entry == NULL || path_size == NULL || pid <= 0 || descriptor < 0 || (path_capacity != 0 && path == NULL) ||
+        pid > INT32_MAX)
+        return 0;
+    if (proc_pidfdinfo((int)pid, descriptor, PROC_PIDFDVNODEPATHINFO, &info, sizeof info) == (int)sizeof info &&
+        info.pvip.vip_path[0] != '\0') {
+        size_t length = strnlen(info.pvip.vip_path, sizeof info.pvip.vip_path);
+        if (length > path_capacity) length = path_capacity;
+        if (length != 0) memcpy(path, info.pvip.vip_path, length);
+        entry->descriptor = descriptor;
+        entry->kind = HL_HOST_FD_FILE;
+        *path_size = length;
+        return 1;
+    }
+    if (!hl_host_process_fds(pid, NULL, 0, &count)) return 0;
+    entries = count != 0 ? malloc(count * sizeof *entries) : NULL;
+    if (count != 0 && entries == NULL) return 0;
+    if (!hl_host_process_fds(pid, entries, count, &count)) {
+        free(entries);
+        return 0;
+    }
+    for (size_t index = 0; index < count; ++index)
+        if (entries[index].descriptor == descriptor) {
+            kind = entries[index].kind;
+            found = 1;
+            break;
+        }
+    free(entries);
+    if (!found) return 0;
+    entry->descriptor = descriptor;
+    entry->kind = kind;
+    *path_size = 0;
     return 1;
 }

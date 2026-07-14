@@ -36,10 +36,29 @@ typedef struct hl_host_process_info {
     char name[32];
 } hl_host_process_info;
 
+enum {
+    HL_HOST_FD_OTHER = 0,
+    HL_HOST_FD_FILE = 1,
+    HL_HOST_FD_PIPE = 2,
+    HL_HOST_FD_SOCKET = 3,
+};
+
+typedef struct hl_host_process_fd {
+    int32_t descriptor;
+    uint32_t kind;
+} hl_host_process_fd;
+
 /* Snapshot host-wide values and up to core_capacity per-core counters. */
 int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, size_t core_capacity);
 
 /* Snapshot one live native process. Returns zero when the pid is absent or inaccessible. */
 int hl_host_process_read(int64_t pid, hl_host_process_info *info);
+
+/* Enumerate a process descriptor table. count receives the total observed, including truncated entries. */
+int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count);
+
+/* Query one open descriptor and, for files, copy its native absolute path without a trailing NUL. */
+int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,
+                            size_t path_capacity, size_t *path_size);
 
 #endif

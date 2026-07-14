@@ -5,6 +5,8 @@
 
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,6 +40,24 @@ int main(void) {
     HL_CHECK(process.state != '\0' && process.name[0] != '\0');
     HL_CHECK(!hl_host_process_read(-1, &process));
     HL_CHECK(!hl_host_process_read((int64_t)getpid(), NULL));
+    char temporary[] = "/tmp/hl-system-XXXXXX";
+    int file = mkstemp(temporary);
+    int pipes[2];
+    HL_CHECK(file >= 0 && pipe(pipes) == 0);
+    hl_host_process_fd descriptor;
+    char target[4096] = {0};
+    size_t target_size = 0;
+    HL_CHECK(hl_host_process_fd_read(getpid(), file, &descriptor, target, sizeof target - 1, &target_size));
+    HL_CHECK(descriptor.descriptor == file && descriptor.kind == HL_HOST_FD_FILE && target_size > 0);
+    target[target_size] = '\0';
+    HL_CHECK(strstr(target, strrchr(temporary, '/') + 1) != NULL);
+    HL_CHECK(hl_host_process_fd_read(getpid(), pipes[0], &descriptor, NULL, 0, &target_size));
+    HL_CHECK(descriptor.kind == HL_HOST_FD_PIPE && target_size == 0);
+    size_t descriptor_count = 0;
+    HL_CHECK(hl_host_process_fds(getpid(), NULL, 0, &descriptor_count) && descriptor_count >= 3);
+    hl_host_process_fd one_descriptor;
+    size_t observed_count = 0;
+    HL_CHECK(hl_host_process_fds(getpid(), &one_descriptor, 1, &observed_count) && observed_count >= 1);
     pid_t child = fork();
     HL_CHECK(child >= 0);
     if (child == 0) {
@@ -46,8 +66,17 @@ int main(void) {
     }
     HL_CHECK(hl_host_process_read(child, &process));
     HL_CHECK(process.parent_pid == getpid() && process.threads > 0);
+    HL_CHECK(hl_host_process_fd_read(child, file, &descriptor, target, sizeof target, &target_size));
+    HL_CHECK(descriptor.kind == HL_HOST_FD_FILE && target_size > 0);
+    HL_CHECK(hl_host_process_fd_read(child, pipes[1], &descriptor, NULL, 0, &target_size));
+    HL_CHECK(descriptor.kind == HL_HOST_FD_PIPE);
     HL_CHECK(kill(child, SIGKILL) == 0);
     HL_CHECK(waitpid(child, NULL, 0) == child);
     HL_CHECK(!hl_host_process_read(child, &process));
+    HL_CHECK(!hl_host_process_fd_read(child, file, &descriptor, target, sizeof target, &target_size));
+    close(file);
+    close(pipes[0]);
+    close(pipes[1]);
+    unlink(temporary);
     return 0;
 }

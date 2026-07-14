@@ -2,6 +2,8 @@
 #include "../system.h"
 
 #include <errno.h>
+#include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,5 +120,59 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
     info->resident_bytes = fields[24] * (uint64_t)page_size;
+    return 1;
+}
+
+static uint32_t hl_linux_fd_kind(const char *target) {
+    if (strncmp(target, "pipe:[", 6) == 0) return HL_HOST_FD_PIPE;
+    if (strncmp(target, "socket:[", 8) == 0) return HL_HOST_FD_SOCKET;
+    return target[0] == '/' ? HL_HOST_FD_FILE : HL_HOST_FD_OTHER;
+}
+
+int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,
+                            size_t path_capacity, size_t *path_size) {
+    char link[96];
+    char target[PATH_MAX + 1];
+    ssize_t length;
+    if (entry == NULL || path_size == NULL || pid <= 0 || descriptor < 0 || (path_capacity != 0 && path == NULL))
+        return 0;
+    snprintf(link, sizeof link, "/proc/%lld/fd/%d", (long long)pid, descriptor);
+    length = readlink(link, target, sizeof target - 1);
+    if (length < 0) return 0;
+    target[length] = '\0';
+    entry->descriptor = descriptor;
+    entry->kind = hl_linux_fd_kind(target);
+    *path_size = 0;
+    if (entry->kind == HL_HOST_FD_FILE) {
+        size_t copied = (size_t)length < path_capacity ? (size_t)length : path_capacity;
+        if (copied != 0) memcpy(path, target, copied);
+        *path_size = copied;
+    }
+    return 1;
+}
+
+int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count) {
+    char path[64];
+    DIR *directory;
+    struct dirent *item;
+    size_t total = 0;
+    if (count == NULL || pid <= 0 || (capacity != 0 && entries == NULL)) return 0;
+    snprintf(path, sizeof path, "/proc/%lld/fd", (long long)pid);
+    directory = opendir(path);
+    if (directory == NULL) return 0;
+    while ((item = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long descriptor;
+        hl_host_process_fd entry;
+        size_t ignored;
+        errno = 0;
+        descriptor = strtol(item->d_name, &end, 10);
+        if (errno != 0 || end == item->d_name || *end != '\0' || descriptor < 0 || descriptor > INT32_MAX) continue;
+        if (!hl_host_process_fd_read(pid, (int32_t)descriptor, &entry, NULL, 0, &ignored)) continue;
+        if (total < capacity) entries[total] = entry;
+        total++;
+    }
+    closedir(directory);
+    *count = total;
     return 1;
 }
