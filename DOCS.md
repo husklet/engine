@@ -10,7 +10,13 @@ The final system has three independent axes:
 
 - **Guest operating system:** Linux.
 - **Guest instruction set:** initially AArch64 and x86-64.
-- **Host platform:** macOS and Linux first, with additional hosts implemented behind the same service contract.
+- **Host platform:** macOS first, Linux second, and Windows last, all behind the same service contract.
+
+This ordering is an implementation priority, not an architectural dependency. The current production effort ports and
+finishes the known-working macOS-hosted Linux engine. Every behavior is separated into translator, Linux ABI, and
+host-service ownership as it is transferred. Once the macOS compatibility and performance gates are complete, the
+same portable layers are used to finish Linux. Windows is an explicit final host target after both POSIX hosts have
+proved the contract; it must not be anticipated by leaking Windows policy into the Linux front or translator.
 
 The engine is deliberately product-neutral. It does not know about windows, browsers, compositors, GPU APIs, display
 servers, application brands, or application-specific command-line modes. A caller may build any of those systems on
@@ -54,13 +60,15 @@ runner / embedding application
  translator  Linux ABI
          \      /
           v    v
-      host-service contract
-        /             \
- host-macos         host-linux
+             host-service contract
+          /             |             \
+ host-macos        host-linux       host-windows
+   current             next            last
 ```
 
-Only arrows shown above are allowed. In particular, host backends do not call into guest translation, and the
-translator does not reach around the service contract to native APIs.
+Only arrows shown above are allowed. `host-windows` is the final planned provider, not current implementation work.
+Host backends do not call into guest translation, and the translator does not reach around the service contract to
+native APIs.
 
 ### 3.1 Public API (`include/hl`)
 
