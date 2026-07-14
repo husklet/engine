@@ -686,6 +686,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (mapping != NULL) {
             uint64_t offset = a0 - mapping->address;
             hl_host_result operation;
+            if (nr == 227 && (((a2 & ~(uint64_t)7u) != 0) || (a2 & 5u) == 0 || (a2 & 5u) == 5u)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                return 1;
+            }
             if (nr == 215)
                 operation = g_host_services->memory->unmap_range(g_host_services->context, mapping->object->handle,
                                                                  mapping->object_offset + offset, a1);

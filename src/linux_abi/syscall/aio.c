@@ -137,15 +137,21 @@ static int64_t aio_do_one(const uint8_t *iocb) {
     uint64_t buf = *(const uint64_t *)(iocb + 24);
     uint64_t nbytes = *(const uint64_t *)(iocb + 32);
     int64_t off = *(const int64_t *)(iocb + 40);
+    hl_linux_fd_snapshot typed;
+    int is_typed = g_linux_box != NULL && fd >= 0 &&
+                   hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &typed) == HL_STATUS_OK;
     memf_materialize(fd); // flush any RAM-backed cache so the real host fd sees/serves the right bytes
     ssize_t r;
     switch (op) {
     case IOCB_CMD_PREAD:
         if (nbytes && !host_range_mapped((uintptr_t)buf, (size_t)nbytes)) return -EFAULT;
+        if (is_typed) return hl_linux_pread64(g_linux_box, typed.fd, (void *)buf, (size_t)nbytes, (uint64_t)off);
         r = pread(fd, (void *)buf, (size_t)nbytes, (off_t)off);
         return r < 0 ? -errno : r;
     case IOCB_CMD_PWRITE:
         if (nbytes && !host_range_mapped((uintptr_t)buf, (size_t)nbytes)) return -EFAULT;
+        if (is_typed)
+            return hl_linux_pwrite64(g_linux_box, typed.fd, (const void *)buf, (size_t)nbytes, (uint64_t)off);
         fd_evict(fd);
         r = pwrite(fd, (const void *)buf, (size_t)nbytes, (off_t)off);
         return r < 0 ? -errno : r;
@@ -154,12 +160,22 @@ static int64_t aio_do_one(const uint8_t *iocb) {
         int niov = (int)nbytes; // for the *V ops aio_nbytes IS the iovec count, aio_buf the array base
         if (niov > 0 && !host_range_mapped((uintptr_t)buf, (size_t)niov * sizeof(struct iovec))) return -EFAULT;
         if (op == IOCB_CMD_PWRITEV) fd_evict(fd);
+        if (is_typed)
+            return op == IOCB_CMD_PREADV
+                       ? hl_linux_preadv(g_linux_box, typed.fd, (const hl_host_iovec *)(uintptr_t)buf, (uint32_t)niov,
+                                         (uint64_t)off)
+                       : hl_linux_pwritev(g_linux_box, typed.fd, (const hl_host_iovec *)(uintptr_t)buf,
+                                          (uint32_t)niov, (uint64_t)off);
         r = op == IOCB_CMD_PREADV ? preadv(fd, (const struct iovec *)buf, niov, (off_t)off)
                                   : pwritev(fd, (const struct iovec *)buf, niov, (off_t)off);
         return r < 0 ? -errno : r;
     }
     case IOCB_CMD_FSYNC:
-    case IOCB_CMD_FDSYNC: return fsync(fd) < 0 ? -errno : 0;
+    case IOCB_CMD_FDSYNC:
+        if (is_typed)
+            return op == IOCB_CMD_FSYNC ? hl_linux_fsync(g_linux_box, typed.fd)
+                                        : hl_linux_fdatasync(g_linux_box, typed.fd);
+        return fsync(fd) < 0 ? -errno : 0;
     default: return -EINVAL; // unsupported opcode (POLL/NOOP)
     }
 }
