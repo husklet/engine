@@ -1094,7 +1094,18 @@ static void jit_after_fork(void) {
     // is covered too.
     pthread_mutex_init(&g_jit_lock, NULL);
     pthread_mutex_init(&g_cache_lock, NULL);
+#if defined(__linux__) && G_GPC_HASH_SHIFT == 2
+    /* The native AArch64 Linux child must not resume the parent's copied
+       translations.  A second fork after any completed child otherwise
+       executes a corrupted libc return path and trips __stack_chk_fail.  The
+       failure persists with direct chaining disabled and with the entire
+       arena copied, so it is not a short-copy or shadow-RAS artifact.  Start
+       this frontend with a private empty cache; x86 Linux and the proven
+       fixed-address macOS repair path retain warm-cache preservation. */
+    preserve = 0;
+#else
     preserve = !g_threaded || !g_dualmap;
+#endif
     /* In a threaded child the fresh dual-map allocation may reuse one of the
        inherited retired RX holes (VM_INHERIT_NONE).  Release retired mappings
        before allocating; releasing them afterward can otherwise unmap the new
