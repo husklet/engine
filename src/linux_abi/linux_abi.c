@@ -1885,6 +1885,7 @@ static int64_t hl_linux_metadata_owned(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     const hl_host_file_services *files = hl_linux_files(linux_abi);
     hl_host_result result;
     if (files == NULL || files->metadata == NULL) return -HL_LINUX_ENOSYS;
+    memset(metadata, 0, sizeof(*metadata));
     result = files->metadata(linux_abi->host->context, ofd->host_handle, metadata);
     return result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)result.status);
 }
