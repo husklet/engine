@@ -36,4 +36,13 @@ hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_lin
 void hl_linux_object_unpin(hl_linux_object_pin *pin);
 uint32_t hl_linux_object_ready(hl_linux_object_pin *pin, uint32_t interests);
 
+typedef struct hl_linux_poll_entry {
+    hl_linux_fd fd;
+    uint32_t interests;
+    uint32_t readiness;
+} hl_linux_poll_entry;
+
+int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entries, uint32_t count,
+                             uint64_t deadline_ns);
+
 #endif

@@ -790,6 +790,7 @@ int main(void) {
     {
         test_object object = {.byte = 'q'};
         hl_linux_object_pin pin;
+        hl_linux_poll_entry poll_entries[2];
         hl_linux_fd typed;
         hl_linux_fd alias;
         hl_linux_fork_record records[8];
@@ -809,6 +810,10 @@ int main(void) {
         HL_CHECK(hl_linux_object_pin_fd(&linux_abi, alias, &pin) == HL_STATUS_OK);
         HL_CHECK(hl_linux_object_ready(&pin, HL_LINUX_READY_READ) == HL_LINUX_READY_READ);
         hl_linux_object_unpin(&pin);
+        poll_entries[0] = (hl_linux_poll_entry){typed, HL_LINUX_READY_READ, 0};
+        poll_entries[1] = (hl_linux_poll_entry){7, HL_LINUX_READY_READ, 0};
+        HL_CHECK(hl_linux_object_poll(&linux_abi, poll_entries, 2, 0) == 2);
+        HL_CHECK(poll_entries[0].readiness == HL_LINUX_READY_READ && poll_entries[1].readiness == HL_LINUX_READY_ERROR);
         HL_CHECK(hl_linux_abi_fork_prepare(&linux_abi, &plan) == HL_STATUS_OK && object.clones == 1);
         HL_CHECK(hl_linux_abi_fork_parent(&linux_abi, &plan) == HL_STATUS_OK && object.closes == 1);
         object.clone_status = HL_STATUS_OUT_OF_MEMORY;

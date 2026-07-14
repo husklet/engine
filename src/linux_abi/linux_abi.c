@@ -621,6 +621,48 @@ uint32_t hl_linux_object_ready(hl_linux_object_pin *pin, uint32_t interests) {
     return pin->ops->readiness(pin->context, interests) & (interests | HL_LINUX_READY_ERROR | HL_LINUX_READY_HANGUP);
 }
 
+int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entries, uint32_t count,
+                             uint64_t deadline_ns) {
+    const hl_host_clock_services *clock;
+    uint32_t index;
+    if (linux_abi == NULL || (count != 0 && entries == NULL)) return -HL_LINUX_EINVAL;
+    clock = linux_abi->host->clock;
+    if (deadline_ns != 0 && ((linux_abi->host->capabilities & HL_HOST_CAP_CLOCK) == 0 || clock == NULL ||
+                             clock->monotonic_ns == NULL || clock->sleep_until == NULL))
+        return -HL_LINUX_ENOSYS;
+    for (;;) {
+        int64_t count_ready = 0;
+        for (index = 0; index < count; ++index) {
+            hl_linux_object_pin pin;
+            hl_status status;
+            entries[index].readiness = 0;
+            status = hl_linux_object_pin_fd(linux_abi, entries[index].fd, &pin);
+            if (status == HL_STATUS_NOT_FOUND) {
+                entries[index].readiness = HL_LINUX_READY_ERROR;
+                count_ready++;
+            } else if (status != HL_STATUS_OK) {
+                return hl_linux_error(status);
+            } else {
+                entries[index].readiness = hl_linux_object_ready(&pin, entries[index].interests);
+                hl_linux_object_unpin(&pin);
+                if (entries[index].readiness != 0) count_ready++;
+            }
+        }
+        if (count_ready != 0 || deadline_ns == 0) return count_ready;
+        {
+            hl_host_result now = clock->monotonic_ns(linux_abi->host->context);
+            uint64_t slice;
+            hl_host_result slept;
+            if (now.status != HL_STATUS_OK) return hl_linux_error((hl_status)now.status);
+            if (now.value >= deadline_ns) return 0;
+            slice = now.value > UINT64_MAX - UINT64_C(1000000) ? deadline_ns : now.value + UINT64_C(1000000);
+            if (slice > deadline_ns) slice = deadline_ns;
+            slept = clock->sleep_until(linux_abi->host->context, HL_HOST_CLOCK_MONOTONIC, slice);
+            if (slept.status != HL_STATUS_OK) return hl_linux_error((hl_status)slept.status);
+        }
+    }
+}
+
 hl_status hl_linux_fd_reserve_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_fd_reservation *reservation) {
     if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || reservation == NULL ||
         fd >= linux_abi->fd_capacity)
