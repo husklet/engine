@@ -298,3 +298,32 @@ static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofol
     overlay_mkparents(abs);
     return resolve_at(abs, final, fn, nofollow);
 }
+
+/*
+ * Compatibility boundary for incremental descriptor-authority conversion.  The
+ * plan contains only guest namespace intent and opaque host-service identity;
+ * the legacy parent fd remains an executor-local result and never enters the
+ * contract.  Replacing this executor can therefore publish a host handle
+ * without changing path classification again.
+ */
+static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, char *final, size_t final_size,
+                          hl_open_plan *plan) {
+    char absolute[8192];
+    hl_open_request request;
+    if (raw[0] == '/')
+        snprintf(absolute, sizeof absolute, "%s", raw);
+    else if (dirfd == -100)
+        snprintf(absolute, sizeof absolute, "%s/%s", g_cwd, raw);
+    else if (dirfd >= 0 && dirfd < 1024 && g_fdpath[dirfd][0]) {
+        const char *guest_directory = g_fdpath[dirfd];
+        if (strncmp(guest_directory, g_rootfs_canon, g_rootfs_canon_len) == 0)
+            guest_directory += g_rootfs_canon_len;
+        snprintf(absolute, sizeof absolute, "/%s/%s", guest_directory, raw);
+    } else {
+        return -EACCES;
+    }
+    request = (hl_open_request){absolute, strlen(absolute), HL_HOST_HANDLE_CWD, intent, g_nlower != 0,
+                                jail_ro(absolute), 0};
+    if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
+    return jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);
+}

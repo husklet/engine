@@ -1,6 +1,8 @@
 // hl/linux_abi/container -- the container VFS: TOCTOU-free path jail, overlay image layers
 // (lower/upper + copy-up + whiteout + merged readdir), and /proc + /sys synthesis.
 
+#include "../open_plan.h"
+
 // ---- rootfs path rewriting (ported from mac_elf.c) ----
 static const char *g_rootfs = NULL;
 // guest CWD (within the rootfs) -- AT_FDCWD resolution + getcwd

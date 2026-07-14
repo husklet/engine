@@ -2454,8 +2454,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             char fin[512];
+            hl_open_plan plan;
+            uint32_t intent = (lf & 3) == 0 ? HL_OPEN_READ : HL_OPEN_WRITE;
+            if (lf & 0x40) intent |= HL_OPEN_CREATE;
+            if (lf & 0x200) intent |= HL_OPEN_TRUNCATE;
+            if (lf & 0x400) intent |= HL_OPEN_APPEND;
+            if (is_opath) intent |= HL_OPEN_PATH_ONLY;
+            if (lf & G_O_NOFOLLOW) intent |= HL_OPEN_NOFOLLOW;
+            if (lf & G_O_DIRECTORY) intent |= HL_OPEN_DIRECTORY;
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
-            int pfd = jail_at((int)a0, (const char *)a1, fin, sizeof fin, (lf & G_O_NOFOLLOW) != 0);
+            int pfd = jail_open_plan((int)a0, (const char *)a1, intent, fin, sizeof fin, &plan);
             if (pfd < 0) {
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
