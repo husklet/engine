@@ -349,14 +349,7 @@ static void pcache_relocate(uint64_t saved_block_return) {
     uint64_t slide = (uint64_t)block_return - saved_block_return;
     for (int i = 0; i < g_nreloc; i++) {
         uint32_t *p = (uint32_t *)(g_cache + g_reloc[i].off);
-        int rd = (int)(p[0] & 0x1f); // movz/movk encode rd in bits[4:0] (same in all 4 words)
-        uint64_t old = (uint64_t)((p[0] >> 5) & 0xffff) | ((uint64_t)((p[1] >> 5) & 0xffff) << 16) |
-                       ((uint64_t)((p[2] >> 5) & 0xffff) << 32) | ((uint64_t)((p[3] >> 5) & 0xffff) << 48);
-        uint64_t v = old + slide;
-        p[0] = 0xD2800000u | (0 << 21) | (((uint32_t)(v) & 0xffff) << 5) | rd;       // movz
-        p[1] = 0xF2800000u | (1 << 21) | (((uint32_t)(v >> 16) & 0xffff) << 5) | rd; // movk #16
-        p[2] = 0xF2800000u | (2 << 21) | (((uint32_t)(v >> 32) & 0xffff) << 5) | rd; // movk #32
-        p[3] = 0xF2800000u | (3 << 21) | (((uint32_t)(v >> 48) & 0xffff) << 5) | rd; // movk #48
+        hl_reloc_slide(p, slide);
     }
 }
 
@@ -452,7 +445,11 @@ static int pcache_load(uint64_t entry_jump) {
     // identity-validated by the cache key itself) go live NOW; manifest (library) blocks are DEFERRED
     // until the guest maps the same file identity at the same base (pcache_note_libmap); anything else
     // is unrevivable and dropped (belt-and-braces: the save side never persists such entries).
-    g_nreloc = (int)h.n_reloc;
+    if (!hl_reloc_import(&g_reloc_table, g_reloc, (size_t)h.n_reloc)) {
+        free(me);
+        free(pe);
+        return 0;
+    }
     g_pc_nlib = (int)h.n_lib;
     g_pc_defer = NULL;
     g_pc_ndefer = 0;
@@ -606,14 +603,14 @@ static void pcache_save(void) {
 //  - wholesale cache-full flush: the arena content the records described is gone -> reset so records stay
 //    in lockstep with what is re-emitted (every baked pointer recorded, by construction).
 static void pcache_after_fork(void) {
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
     g_pcache_forked = 1;
 }
 
 #define PCACHE_FORK_HOOK pcache_after_fork()
 
 static void pcache_after_wholesale_flush(void) {
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
     g_pc_flushed = 1; // any restored blocks are gone; the warm-stat must report the restore dead
     g_pc_ndefer = 0;  // deferred entries pointed into the dropped arena content
 }
@@ -641,7 +638,7 @@ static void pcache_exec_reload(const char *prog_host, const char *interp_host, c
     // execve is a full identity + arena reset (thread_exit_others ran; the old image was unmapped and the
     // arena/map/ibtc flushed by case 221), so the recording state resets with it and saving becomes safe
     // again -- including for a fork child (the fork+execve toolchain storm is exactly the case we cache).
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
     g_pcache_loaded = 0;
     g_pcache_forked = 0;
     g_pcache_skip = 0;

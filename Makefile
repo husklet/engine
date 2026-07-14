@@ -42,7 +42,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := codegen config host_services ir linux_abi stat engine limits log options readonly xattr_cache
+UNIT_NAMES := clock codegen config host_services ir linux_abi stat engine errno limits log options readonly reloc xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -108,6 +108,18 @@ $(BUILD)/tests/test_limits: tests/unit/test_limits.c src/production/os/linux/con
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -pthread -o $@
 
+$(BUILD)/tests/test_reloc: tests/unit/test_reloc.c src/production/translate/reloc.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_errno: tests/unit/test_errno.c src/production/os/linux/syscall/errno.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_clock: tests/unit/test_clock.c src/production/host/clock.c src/host/fake/host.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/fixtures/%: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(CC) -O2 -g -std=gnu11 -Wall -Wextra $< -pthread -o $@
@@ -144,6 +156,9 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch6
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/errno.c \
+		src/production/host/clock.c \
+		src/production/translate/reloc.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -155,6 +170,9 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/errno.c \
+		src/production/host/clock.c \
+		src/production/translate/reloc.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -170,6 +188,9 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/ta
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/errno.c \
+		src/production/host/clock.c \
+		src/production/translate/reloc.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
@@ -184,6 +205,9 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/tar
 		src/production/os/linux/container/xattr_cache.c \
 		src/production/os/linux/container/readonly/table.c \
 		src/production/os/linux/container/limits/table.c \
+		src/production/os/linux/syscall/errno.c \
+		src/production/host/clock.c \
+		src/production/translate/reloc.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
@@ -264,10 +288,10 @@ $(BUILD)/tests/test_host_linux: tests/unit/linux.c $(BUILD)/lib/libhl-engine.a $
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test-host-macos: tests/unit/macos.c src/host/macos/host.c src/core/host_services.c \
-	src/core/log.c include/hl/macos.h include/hl/host_services.h
+	src/core/log.c src/production/host/clock.c include/hl/macos.h include/hl/host_services.h
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) tests/unit/macos.c \
-		src/host/macos/host.c src/core/host_services.c src/core/log.c -o $@
+		src/host/macos/host.c src/core/host_services.c src/core/log.c src/production/host/clock.c -o $@
 
 test-macos-host: $(BUILD)/tests/test-host-macos
 	$(MAC) $(abspath $<)

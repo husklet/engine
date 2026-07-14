@@ -41,6 +41,21 @@ target_include_directories(hl-production-limits PRIVATE src/production/os/linux/
 target_compile_options(hl-production-limits PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                    -Wstrict-prototypes -Wmissing-prototypes)
 
+add_library(hl-production-reloc OBJECT src/production/translate/reloc.c)
+target_include_directories(hl-production-reloc PRIVATE src/production/translate)
+target_compile_options(hl-production-reloc PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                  -Wstrict-prototypes -Wmissing-prototypes)
+
+add_library(hl-production-clock OBJECT src/production/host/clock.c)
+
+add_library(hl-production-errno OBJECT src/production/os/linux/syscall/errno.c)
+target_include_directories(hl-production-errno PRIVATE src/production/os/linux/syscall)
+target_compile_options(hl-production-errno PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                  -Wstrict-prototypes -Wmissing-prototypes)
+target_include_directories(hl-production-clock PRIVATE include src/production/host)
+target_compile_options(hl-production-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                  -Wstrict-prototypes -Wmissing-prototypes)
+
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
                                                   -Wmissing-prototypes)
@@ -87,6 +102,16 @@ if(BUILD_TESTING)
     target_include_directories(test-limits PRIVATE include tests/unit)
     target_link_libraries(test-limits PRIVATE Threads::Threads)
     add_test(NAME limits COMMAND test-limits)
+    add_executable(test-reloc tests/unit/test_reloc.c $<TARGET_OBJECTS:hl-production-reloc>)
+    target_include_directories(test-reloc PRIVATE include tests/unit src/production/translate)
+    add_test(NAME reloc COMMAND test-reloc)
+    add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-production-errno>)
+    target_include_directories(test-errno PRIVATE include tests/unit)
+    add_test(NAME errno COMMAND test-errno)
+    add_executable(test-clock tests/unit/test_clock.c $<TARGET_OBJECTS:hl-production-clock>)
+    target_include_directories(test-clock PRIVATE include tests/unit)
+    target_link_libraries(test-clock PRIVATE hl-host-fake)
+    add_test(NAME clock COMMAND test-clock)
     if(TARGET hl-host-linux)
         add_executable(test-host_linux tests/unit/linux.c)
         target_include_directories(test-host_linux PRIVATE include tests/unit)

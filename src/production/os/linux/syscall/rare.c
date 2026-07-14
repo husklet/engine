@@ -34,7 +34,7 @@ static int mq_check_timeout(uint64_t p, struct timespec *dl, int *have_dl) {
 // single-thread case it blocks exactly as Linux does, since nothing else can change the queue).
 static int mq_block_wait(int have_dl, const struct timespec *dl) {
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    hl_production_clock_gettime(&g_jit_services, HL_PRODUCTION_CLOCK_REALTIME, &now);
     struct timespec slice = {0, 2 * 1000 * 1000}; // 2ms poll granularity
     if (have_dl) {
         long ds = dl->tv_sec - now.tv_sec;

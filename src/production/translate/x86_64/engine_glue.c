@@ -25,6 +25,7 @@ static uint64_t g_repstr_n;     // PROF: rep cmps/scas idiom firings
 static uint64_t g_repstr_elems; // PROF: elements consumed by the rep cmps/scas idiom
 static uint64_t g_repmovs_n;    // PROF: rep movs -> host memcpy fast-path firings (ERMS funnel meter)
 static uint64_t g_repstos_n;    // PROF: rep stos -> host memset fast-path firings
+
 static int norepcmp(void) { return 0; }
 
 // ---- opt2: x86-only 2-way set-associative IBTC (gate IBTC1WAY=1) ----
@@ -88,12 +89,12 @@ enum {
 // construction regardless of table size, so a reload can NEVER jump/read a stale absolute host address.
 #define PC_RELOC_CAP (1u << 20)
 
-static struct {
-    uint32_t off; // byte offset into the arena of a fixed 4-insn movz/movk host-pointer load
-    uint8_t kind; // PRELOC_* (documentary)
-} g_reloc[PC_RELOC_CAP];
+#include "../reloc.h"
 
-static int g_nreloc;
+static hl_reloc g_reloc_storage[PC_RELOC_CAP];
+static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
+#define g_reloc (g_reloc_table.records)
+#define g_nreloc (g_reloc_table.count)
 static int g_pcache_poison; // set if a baked host pointer could not be recorded -> do NOT persist this arena
 
 static uint64_t g_tracecap; // if >0 under trace: stop after this many blocks (runaway guard)
@@ -112,6 +113,7 @@ static const char *g_self_path = ""; // host path to this jit86 binary (for exec
 // g_pmovmskb_n: # of `pmovmskb` sites lowered to the cascading-shift NEON sequence
 // (vs the old per-byte scalar spill loop). Printed under PROF.
 static uint64_t g_pmovmskb_n;
+
 static int nosseopt(void) { return 0; }
 
 // ---- opt7 address-gen / memory-fold fast path (gate NOEAOPT=1) ----
@@ -127,6 +129,7 @@ static int noeaopt(void) { return 0; }
 // forward-declared here (tentative; merge with the real defs set by load_elf in elf.c / translate.c). 0
 // for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
 static uint64_t g_nonpie_lo, g_nonpie_bias;
+
 static int guestfold_on(void) { return g_nonpie_lo != 0; }
 
 // ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----

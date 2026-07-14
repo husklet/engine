@@ -23,6 +23,7 @@ int g_rwx_guest;
 #include <stdlib.h>
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
+#include "errno.h"
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
@@ -1038,6 +1039,6 @@ static void service_local(struct cpu *c) {
     // expects. Skip redirect (sigreturn restored an already-Linux x0 from the signal frame).
     if (!c->redirect) {
         int64_t rv = (int64_t)G_RET(c);
-        if (rv < 0 && rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)m2l_errno((int)(-rv)));
+        if (rv < 0 && rv >= -4095) G_RET(c) = (uint64_t)(-(int64_t)hl_linux_errno_from_macos((int)(-rv)));
     }
 }

@@ -76,16 +76,13 @@
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
 #define PC_RELOC_CAP (1u << 20)              // recorded baked-host-pointer slots (poison if exceeded)
 
+#include "../reloc.h"
+
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
 #define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`
 #define RK_IBTC 2     // 4-insn movz/movk of &g_ibtc into reg `rd`
 #define RK_T2CNT 3    // 4-insn movz/movk of &g_t2cnt[slot] into reg `rd`
 #define RK_ICSITE 4   // 16-byte per-site IC {target,body} literal pair -> zero on load (neutralize)
-
-struct pc_reloc {
-    uint32_t off;  // arena byte offset of the first word (movz/movk kinds) or the literal pair (ICSITE)
-    uint32_t info; // kind | (rd<<8) | (slot<<16)
-};
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
 static int g_pcache;            // persistent cache active (HL_PCACHE=1)
@@ -98,17 +95,15 @@ static int g_pcache_poison;     // an unrecorded baked host pointer may exist ->
 static int g_pcache_loaded;     // this run restored from cache -> never re-save (arena would snowball)
 static int g_pcache_forked;     // this process is a fork child -> never save (stale-bookkeeping guard);
                                 // cleared by pcache_exec_reload (execve fully re-keys + resets the records)
-static struct pc_reloc g_reloc[PC_RELOC_CAP];
-static int g_nreloc;
+static hl_reloc g_reloc_storage[PC_RELOC_CAP];
+static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
+#define g_reloc (g_reloc_table.records)
+#define g_nreloc (g_reloc_table.count)
 
 static void block_return(void); // engine trampoline (also forward-declared in engine/stubs.c)
 
 static void pc_reloc_add(uint32_t off, uint8_t kind, uint8_t rd, uint16_t slot) {
-    if (g_nreloc < (int)PC_RELOC_CAP) {
-        g_reloc[g_nreloc].off = off;
-        g_reloc[g_nreloc].info = (uint32_t)kind | ((uint32_t)rd << 8) | ((uint32_t)slot << 16);
-        g_nreloc++;
-    } else {
+    if (!hl_reloc_add(&g_reloc_table, off, (uint32_t)kind | ((uint32_t)rd << 8) | ((uint32_t)slot << 16))) {
         g_pcache_poison = 1; // table full -> a baked pointer would go unrecorded; refuse to persist
     }
 }
@@ -274,7 +269,7 @@ static void pcache_relocate(void) {
 
 // Validate one reloc record against the arena bounds. 16 bytes are rewritten for every kind (4 insns or
 // the literal pair), so the whole window must be inside the restored arena and naturally aligned.
-static int pc_reloc_ok(struct pc_reloc r, uint64_t arena_used) {
+static int pc_reloc_ok(hl_reloc r, uint64_t arena_used) {
     int kind = r.info & 0xff, slot = (r.info >> 16) & 0xffff;
     if ((uint64_t)r.off + 16 > arena_used) return 0;
     if (kind == RK_ICSITE) return (r.off & 7) == 0;
@@ -313,7 +308,7 @@ static int pcache_load(uint64_t entry_jump) {
         close(fd);
         return 0;
     }
-    struct pc_reloc *re = h.n_reloc ? malloc(h.n_reloc * sizeof *re) : NULL;
+    hl_reloc *re = h.n_reloc ? malloc(h.n_reloc * sizeof *re) : NULL;
     struct pc_mapent *me = h.n_mapent ? malloc(h.n_mapent * sizeof *me) : NULL;
     struct pc_pend *pe = h.n_pend ? malloc(h.n_pend * sizeof *pe) : NULL;
     struct pc_t2 *te = h.n_t2 ? malloc(h.n_t2 * sizeof *te) : NULL;
@@ -367,8 +362,15 @@ static int pcache_load(uint64_t entry_jump) {
     }
 
     // Rebuild engine state from the offset-relative records.
-    g_nreloc = (int)h.n_reloc;
-    memcpy(g_reloc, re, h.n_reloc * sizeof *re);
+    if (!hl_reloc_import(&g_reloc_table, re, (size_t)h.n_reloc)) {
+        free(re);
+        free(me);
+        free(pe);
+        free(te);
+        free(tx);
+        free(abuf);
+        return 0;
+    }
     for (uint64_t i = 0; i < h.n_mapent; i++)
         map_put(me[i].gpc, g_cache + me[i].host_off, g_cache + me[i].body_off);
     g_npend = 0;
@@ -451,15 +453,15 @@ static void pcache_save(void) {
     h.block_return_at = (uint64_t)block_return;
     h.ibtc_at = (uint64_t)g_ibtc;
     // Build the whole image in one heap buffer -> one write() (per-record writes dominated the save cost).
-    size_t total = sizeof h + (size_t)g_nreloc * sizeof(struct pc_reloc) + (size_t)nmap * sizeof(struct pc_mapent) +
+    size_t total = sizeof h + (size_t)g_nreloc * sizeof(hl_reloc) + (size_t)nmap * sizeof(struct pc_mapent) +
                    (size_t)g_npend * sizeof(struct pc_pend) + (size_t)g_t2n * sizeof(struct pc_t2) +
                    (size_t)ntxpg * sizeof(uint64_t) + arena_used;
     uint8_t *buf = malloc(total);
     int ok = buf != NULL;
     if (ok) {
         uint8_t *w = buf + sizeof h; // header written last (its csum covers everything after it)
-        memcpy(w, g_reloc, (size_t)g_nreloc * sizeof(struct pc_reloc));
-        w += (size_t)g_nreloc * sizeof(struct pc_reloc);
+        memcpy(w, g_reloc, (size_t)g_nreloc * sizeof(hl_reloc));
+        w += (size_t)g_nreloc * sizeof(hl_reloc);
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
             if (!g_map[i].host) continue;
             struct pc_mapent e = {g_map[i].gpc, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
@@ -514,7 +516,7 @@ static void pcache_poison_check(void) {
 // image -- so drop the inherited reloc records and bar this process from saving. An in-process execve
 // re-keys everything and lifts the bar (pcache_exec_reload).
 static void pcache_after_fork(void) {
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
     g_pcache_forked = 1;
 }
 
@@ -526,7 +528,7 @@ static void pcache_after_fork(void) {
 // construction after a plain reset. (A restored-then-flushed run is already barred from saving by
 // g_pcache_loaded; this keeps the cold-run bookkeeping correct too.)
 static void pcache_after_wholesale_flush(void) {
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
 }
 
 #define PCACHE_FLUSH_HOOK pcache_after_wholesale_flush()
@@ -551,7 +553,7 @@ static void pcache_exec_reload(const char *prog_host, const char *interp_host, c
     // execve is a full identity + arena reset (thread_exit_others ran; gmap/arena/map/ibtc flushed by
     // case 221), so the recording state resets with it and saving becomes safe again -- including for a
     // fork child (this is exactly the fork+execve toolchain case the cache exists for).
-    g_nreloc = 0;
+    hl_reloc_reset(&g_reloc_table);
     g_t2n = 0;    // fresh tier-2 slot set for the new image (no cross-image alias)
     txpg_clear(); // nothing is translated now; the set re-fills (or is restored by the load below)
     txln_clear();

@@ -1,6 +1,7 @@
 #include "test.h"
 
 #include "hl/macos.h"
+#include "../../src/production/host/clock.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -55,6 +56,13 @@ int main(void) {
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
                                                       HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
+    {
+        struct timespec realtime;
+        struct timespec monotonic;
+        HL_CHECK(hl_production_clock_gettime(&services, HL_PRODUCTION_CLOCK_REALTIME, &realtime) == 0);
+        HL_CHECK(hl_production_clock_gettime(&services, HL_PRODUCTION_CLOCK_MONOTONIC, &monotonic) == 0);
+        HL_CHECK(realtime.tv_sec > 0 && monotonic.tv_sec > 0);
+    }
 
     process = services.process->spawn_cloned(services.context, child_exit_37, (void *)(uintptr_t)37);
     HL_CHECK(process.status == HL_STATUS_OK && process.value != HL_HOST_HANDLE_INVALID);

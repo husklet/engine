@@ -1584,7 +1584,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         const char *sh_finalhost;
         int sh_new = resolve_shebang_chain(na, nn, DD_MAXARGV, p, sh_store, shpb, sizeof shpb, &sh_finalhost);
         if (sh_new < 0) {
-            // too many nested #! -> ELOOP. `-ELOOP` is the HOST (macOS, 62) errno; svc_done's m2l_errno
+            // too many nested #! -> ELOOP. `-ELOOP` is the host macOS errno 62; svc_done's boundary translation
             // maps it to Linux ELOOP (40) at the syscall boundary, exactly like the vfs symlink-loop path.
             G_RET(c) = (uint64_t)(-ELOOP);
             break;

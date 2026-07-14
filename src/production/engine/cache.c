@@ -4,6 +4,7 @@
 // ---------------- JIT code cache ----------------
 #include "../../../include/hl/macos.h"
 #include "../../../include/hl/log.h"
+#include "../host/clock.h"
 
 #define CACHE_SZ (64u << 20)
 // base, bump pointer

@@ -683,7 +683,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             // a redirected TCP dial to a port with no listener fails ENOENT (the per-port unix
             // inode doesn't exist); Linux returns ECONNREFUSED for a closed TCP port. Map it (host
-            // errno, m2l_errno -> Linux 111); other errnos incl. EINPROGRESS pass through.
+            // errno, translated to Linux 111); other errnos including EINPROGRESS pass through.
             G_RET(c) = r < 0 ? (uint64_t)(-(errno == ENOENT ? ECONNREFUSED : errno)) : 0;
             if (r == 0 && (int)a0 >= 0 && (int)a0 < DD_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
