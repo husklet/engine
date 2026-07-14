@@ -154,6 +154,9 @@ HL_API hl_status hl_linux_abi_init(hl_linux_abi *linux_abi, const hl_host_servic
 HL_API hl_status hl_linux_abi_destroy(hl_linux_abi *linux_abi);
 HL_API hl_status hl_linux_fd_install(hl_linux_abi *linux_abi, hl_host_handle host_handle, uint32_t status_flags,
                                      uint32_t descriptor_flags, hl_linux_fd *out_fd);
+/* Installs only at the requested vacant guest descriptor; never exposes or duplicates a native descriptor. */
+HL_API hl_status hl_linux_fd_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle host_handle,
+                                        uint32_t status_flags, uint32_t descriptor_flags);
 HL_API hl_status hl_linux_fd_dup(hl_linux_abi *linux_abi, hl_linux_fd source, uint32_t descriptor_flags,
                                  hl_linux_fd *out_fd);
 HL_API hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle);

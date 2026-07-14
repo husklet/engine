@@ -192,6 +192,16 @@ int main(void) {
     hl_fake_host_fail_next(&file_host.fake, HL_STATUS_IO);
     HL_CHECK(hl_linux_fd_install(&linux_abi, 55, 0, 0, &original) == HL_STATUS_IO);
     HL_CHECK(file_host.fake.live_mutexes == 0);
+    HL_CHECK(hl_linux_fd_install_at(&linux_abi, HL_ARRAY_COUNT(fds), 55, 0, 0) == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(hl_linux_fd_install_at(&linux_abi, 7, 55, 0123, 1) == HL_STATUS_OK);
+    HL_CHECK(file_host.fake.live_mutexes == 1);
+    HL_CHECK(hl_linux_fd_install_at(&linux_abi, 7, 56, 0, 0) == HL_STATUS_ALREADY_EXISTS);
+    HL_CHECK(file_host.fake.live_mutexes == 1);
+    HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, 7, &snapshot) == HL_STATUS_OK);
+    HL_CHECK(snapshot.fd == 7 && snapshot.host_handle == 55 && snapshot.status_flags == 0123 &&
+             snapshot.descriptor_flags == 1);
+    HL_CHECK(hl_linux_fd_close(&linux_abi, 7, &closed) == HL_STATUS_OK && closed == 55);
+    HL_CHECK(file_host.fake.live_mutexes == 0);
     {
         hl_linux_fd capacity_fds[HL_ARRAY_COUNT(ofds) - 1];
         size_t i;

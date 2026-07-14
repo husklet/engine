@@ -180,6 +180,43 @@ done:
     return status;
 }
 
+hl_status hl_linux_fd_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle host_handle,
+                                 uint32_t status_flags, uint32_t descriptor_flags) {
+    hl_linux_ofd ofd;
+    hl_host_handle mutex;
+    hl_host_result created;
+    const hl_host_sync_services *sync;
+    hl_status status;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || fd >= linux_abi->fd_capacity ||
+        host_handle == HL_HOST_HANDLE_INVALID)
+        return HL_STATUS_INVALID_ARGUMENT;
+    sync = hl_linux_sync(linux_abi);
+    if (sync == NULL || sync->mutex_create == NULL || sync->mutex_close == NULL) return HL_STATUS_NOT_SUPPORTED;
+    created = sync->mutex_create(linux_abi->host->context);
+    if (created.status != HL_STATUS_OK || created.value == HL_HOST_HANDLE_INVALID)
+        return created.status == HL_STATUS_OK ? HL_STATUS_RESOURCE_LIMIT : (hl_status)created.status;
+    mutex = created.value;
+    hl_linux_lock(linux_abi);
+    if (linux_abi->fds[fd].ofd != 0) {
+        status = HL_STATUS_ALREADY_EXISTS;
+        goto done;
+    }
+    status = hl_linux_find_ofd(linux_abi, &ofd);
+    if (status != HL_STATUS_OK) goto done;
+    linux_abi->ofds[ofd].host_handle = host_handle;
+    linux_abi->ofds[ofd].status_flags = status_flags;
+    linux_abi->ofds[ofd].io_mutex = mutex;
+    linux_abi->ofds[ofd].references = 1;
+    linux_abi->ofds[ofd].generation++;
+    linux_abi->fds[fd].ofd = ofd;
+    linux_abi->fds[fd].descriptor_flags = descriptor_flags;
+    linux_abi->fds[fd].generation++;
+done:
+    hl_linux_unlock(linux_abi);
+    if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, mutex);
+    return status;
+}
+
 hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_fd_snapshot *snapshot) {
     const hl_linux_fd_entry *fd_entry;
     const hl_linux_ofd_entry *ofd_entry;
