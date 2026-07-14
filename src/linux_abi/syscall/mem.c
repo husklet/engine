@@ -735,7 +735,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // already-written page executable -- the mmap(RW) -> write code -> mprotect(RX) pattern that
             // .NET/Wasm/managed runtimes use (as opposed to the RWX mmap case 222 already covers). It MUST
             // arm SMC the same way case 222 does: setting g_rwx_guest makes smc_protect() (G_AFTER_TRANSLATE,
-            // dispatch_hooks.h) write-protect each translated source page, so a later overwrite -- the
+            // dispatch.h) write-protect each translated source page, so a later overwrite -- the
             // mprotect(RW) + rewrite + mprotect(RX) re-toggle -- traps in jit86_lazyguard -> smc_on_write()
             // drops the stale translation and the new bytes re-translate. Without this the FIRST RX
             // translation is cached forever -> silent miscompile. This mprotect stays a physical no-op

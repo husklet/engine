@@ -59,36 +59,36 @@
 #include "hl/engine.h"
 
 #include "../include/cpu_x86_64.h"
-#include "../engine/options.c"
-#include "../translate/x86_64/abi.h"            // cpu-interface seam (G_* contract + sysmap + normalize)
-#include "../translate/x86_64/dispatch_hooks.h" // x86 dispatch seam for the SHARED engine/dispatch.c (engine-dedup)
-#include "../translate/x86_64/fill_stat.c"      // per-arch struct-stat layout os/linux fills
-// Byte size of the guest `struct stat` fill_stat.c writes -- the shared stat syscalls (os/linux/syscall/
+#include "../../core/options.c"
+#include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
+#include "../../translator/guest/x86_64/stat.c"     // per-arch struct-stat layout os/linux fills
+// Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
 #define GUEST_LINUX_STAT_BYTES 144
 
-#include "../os/linux/container/state.c"     // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
-#include "../translate/x86_64/engine_glue.c" // x86-only engine globals (trace/diag) the shared cache.c omits
+#include "../../linux_abi/container/state.c" // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
+#include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
 #include "../engine/cache.c"                 // SHARED engine: code cache + block map (hash via G_GPC_HASH_SHIFT)
-#include "../translate/x86_64/emit.c"        // x86 engine: arm64 emitters + SSE + x87
-#include "../translate/x86_64/decode.c"      // x86-64 decoder
-#include "../translate/x86_64/translate.c"   // x86-64 translate_block + trampolines
-#include "../translate/x86_64/pcache.c"      // persistent translated-code cache (HL_PCACHE=1)
+#include "../../translator/guest/x86_64/emit.c"      // x86 engine: arm64 emitters + SSE + x87
+#include "../../translator/guest/x86_64/decode.c"    // x86-64 decoder
+#include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
+#include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../os/linux/thread.c"              // SHARED: clone->pthread, per-thread cpu, futex
 #include "../os/linux/signal.c"              // SHARED: signal delivery driver + translation
-#include "../translate/x86_64/sigframe.c"    // x86-64 rt_sigframe build/restore (uses signal.c state)
-#include "../translate/x86_64/legacy.c"      // x86 legacy-syscall -> *at normalization (G_NORMALIZE)
-#include "../os/linux/container/vfs.c"       // SHARED: rootfs jail, overlay, /proc synth, stat
-#include "../os/linux/container/netns.c"     // SHARED: sockets, loopback netns, termios
+#include "../../translator/guest/x86_64/signal.c" // x86-64 rt_sigframe build/restore
+#include "../../translator/guest/x86_64/legacy.c" // x86 legacy-syscall -> *at normalization
+#include "../../linux_abi/container/vfs.c"   // SHARED: rootfs jail, overlay, /proc synth, stat
+#include "../../linux_abi/container/netns.c" // SHARED: sockets, loopback netns, termios
 #include "../os/linux/fscache.c"             // SHARED: fd/path cache
 #include "../../linux_abi/syscall/dispatch.c" // SHARED: the canonical syscall layer
 #include "../os/linux/sentry.c"              // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
-#include "../translate/x86_64/x86_ops.c"     // x86 cpuid + x87 m80 block-exit helpers
-#include "../translate/x86_64/avx.c"         // AVX/AVX2/AVX-512 (VEX/EVEX) emulation (R_AVX block-exit)
-#include "../engine/dispatch.c"              // SHARED engine: run_guest loop (x86 drives it via dispatch_hooks.h;
+#include "../../translator/guest/x86_64/ops.c" // x86 cpuid + x87 m80 block-exit helpers
+#include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
+#include "../engine/dispatch.c"              // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
                                              // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
-#include "../translate/x86_64/elf.c"         // x86 ELF loader + stack + fault handlers (per-arch: machine/platform)
-#include "../os/launch_config.c"             // serialized HL config-file launch bridge
+#include "../../translator/guest/x86_64/elf.c" // x86 ELF loader + stack + fault handlers
+#include "../../core/launch.c"                // serialized HL config-file launch bridge
 
 // ---- entry + main ----
 // ---------------- entry ----------------

@@ -359,7 +359,7 @@ static int mach_async_fault_signal(struct cpu *c, int hostsig, siginfo_t *si) {
     return 1;
 }
 
-// build_signal_frame + do_sigreturn are per-arch (the sigframe register layout) -> frontend/<arch>/sigframe.c
+// build_signal_frame + do_sigreturn are per-arch -> translator/guest/<arch>/signal.c
 static void build_signal_frame(struct cpu *c, int sig);
 static void do_sigreturn(struct cpu *c);
 // per-arch (the host<->guest register model differs): on a synchronous fault inside translated code,

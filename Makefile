@@ -21,7 +21,9 @@ PRIVATE_HEADERS := src/translator/host/aarch64/aarch64_codegen.h src/translator/
 # a generated list or a clean build.
 rwildcard = $(foreach entry,$(wildcard $1*),$(call rwildcard,$(entry)/,$2) $(filter $(subst *,%,$2),$(entry)))
 PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/production/,*.c) \
-	$(call rwildcard,src/production/,*.h) $(call rwildcard,include/hl/,*.h))
+	$(call rwildcard,src/production/,*.h) $(call rwildcard,src/translator/guest/,*.c) \
+	$(call rwildcard,src/translator/guest/,*.h) $(call rwildcard,src/translator/host/,*.c) \
+	$(call rwildcard,src/translator/host/,*.h) $(call rwildcard,include/hl/,*.h))
 
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
 IR_SOURCES := src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
@@ -241,7 +243,7 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/ta
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \
-		src/production/os/lifecycle_adapter.c \
+		src/core/lifecycle.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -265,7 +267,7 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/tar
 		src/translator/digest.c \
 		src/translator/identity.c \
 		src/translator/window.c \
-		src/production/os/lifecycle_adapter.c \
+		src/core/lifecycle.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 

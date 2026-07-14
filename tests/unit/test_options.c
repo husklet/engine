@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../src/production/engine/options.c"
+#include "../../src/core/options.c"
 
 int main(void) {
     char mutable[] = "original";

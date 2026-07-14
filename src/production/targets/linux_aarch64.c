@@ -37,35 +37,35 @@
 #include "hl/engine.h"
 
 #include "../include/cpu_aarch64.h"
-#include "../engine/options.c"
-#include "../translate/aarch64/abi.h"       // the cpu interface os/linux/ is written against
-#include "../translate/aarch64/fill_stat.c" // the per-arch struct-stat layout os/linux/ fills
-// Byte size of the guest `struct stat` fill_stat.c writes -- the shared stat syscalls (os/linux/syscall/
+#include "../../core/options.c"
+#include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
+#include "../../translator/guest/aarch64/stat.c" // the per-arch struct-stat layout os/linux/ fills
+// Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
 #define GUEST_LINUX_STAT_BYTES 128
 
 // container/ns config state + parsers (early globals)
-#include "../os/linux/container/state.c"
+#include "../../linux_abi/container/state.c"
 // code cache + block map + chaining
 #include "../engine/cache.c"
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
-#include "../host/arm64/asm.c"
+#include "../../translator/host/aarch64/asm.c"
 // persistent cross-process translated-code cache (recorded emitters used by stubs.c/translate.c;
 // load/save/relocate). MUST precede stubs.c + translate.c (they call the recorded emitters).
-#include "../translate/aarch64/pcache.c"
+#include "../../translator/guest/aarch64/cache.c"
 // engine block-ABI stubs: prologue/spill + IBTC/IC + exit/chain trampolines (built on the assembler above)
 #include "../engine/stubs.c"
 // transliterate + mangle + §B + LSE + depth-gate
-#include "../translate/aarch64/translate.c"
+#include "../../translator/guest/aarch64/translate.c"
 // clone/futex/threads (declares run_guest)
 #include "../os/linux/thread.c"
 // signal delivery
 #include "../os/linux/signal.c"
-#include "../translate/aarch64/sigframe.c" // per-arch rt_sigframe build/restore (uses signal.c state)
+#include "../../translator/guest/aarch64/signal.c" // per-arch rt_sigframe build/restore (uses signal.c state)
 // path jail + overlay + /proc synth
-#include "../os/linux/container/vfs.c"
+#include "../../linux_abi/container/vfs.c"
 // termios + NET-ns loopback
-#include "../os/linux/container/netns.c"
+#include "../../linux_abi/container/netns.c"
 // ELF fwd-decls + FS-metadata cache
 #include "../os/linux/fscache.c"
 // the syscall layer (service())
@@ -87,7 +87,7 @@ static int engine_global_init(void);
 // native checkpoint/restore (multi-process tree): dump/restore guest RAM + cpu + path-backed fds + pty
 #include "../os/linux/checkpoint.c"
 // Final-product bridge: read the serialized HL config file and enter this target's Linux guest.
-#include "../os/launch_config.c"
+#include "../../core/launch.c"
 
 // ---- library entry (Rust binding) + main() ----
 // ---------------- library entry (Rust bindings call this) ----------------

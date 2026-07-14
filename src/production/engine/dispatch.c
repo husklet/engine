@@ -45,10 +45,10 @@ __attribute__((naked)) static void block_return(void) {
 #endif // G_OWN_TRAMPOLINES
 
 // ---------------- dispatch seam defaults ----------------
-// Hooks the aarch64 frontend does NOT define in frontend/aarch64/dispatch_hooks.h (the seams added for
+// Hooks the aarch64 guest does NOT define in translator/guest/aarch64/dispatch.h (the seams added for
 // engine-dedup PR3/PR4 + opts committed after the design). Their #ifndef defaults below reproduce the
 // EXACT aarch64-inline behavior, so the aarch64 engine stays bit-identical; the x86 frontend overrides
-// each in frontend/x86_64/dispatch_hooks.h. (The four PR2 seams -- G_DISPATCH_DEBUG / G_SHADOW_CLEAR /
+// each in translator/guest/x86_64/dispatch.h. (The four PR2 seams -- G_DISPATCH_DEBUG / G_SHADOW_CLEAR /
 // G_IBTC_FILL / G_DISPATCH_REASON -- are defined by BOTH frontends, so they need no default here.)
 
 // One-time per-thread setup before the loop. aarch64 has none.
