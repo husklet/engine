@@ -445,6 +445,36 @@ static hl_host_result hl_linux_file_write(void *context, hl_host_handle file, ui
     return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_read_sequential(void *context, hl_host_handle file, void *output,
+                                                    uint64_t output_size) {
+    hl_host_linux *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((output_size != 0 && output == NULL) || output_size > SIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = read(descriptor, output, (size_t)output_size);
+    return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_write_sequential(void *context, hl_host_handle file, const void *input,
+                                                     uint64_t input_size) {
+    hl_host_linux *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((input_size != 0 && input == NULL) || input_size > SIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = write(descriptor, input, (size_t)input_size);
+    return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
     hl_host_linux *host = context;
     uint32_t low = (uint32_t)file;
@@ -947,9 +977,16 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_linux_monotonic,
                                                  hl_linux_realtime};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
-    static const hl_host_file_services file = {
-        HL_HOST_FILE_ABI,    sizeof(file),         hl_linux_file_open,         hl_linux_file_read,
-        hl_linux_file_write, hl_linux_file_append, hl_linux_file_metadata_get, hl_linux_close_descriptor};
+    static const hl_host_file_services file = {HL_HOST_FILE_ABI,
+                                               sizeof(file),
+                                               hl_linux_file_open,
+                                               hl_linux_file_read,
+                                               hl_linux_file_write,
+                                               hl_linux_file_append,
+                                               hl_linux_file_metadata_get,
+                                               hl_linux_close_descriptor,
+                                               hl_linux_file_read_sequential,
+                                               hl_linux_file_write_sequential};
     static const hl_host_event_services event = {HL_HOST_EVENT_ABI,        sizeof(event),       hl_linux_event_create,
                                                  hl_linux_event_control,   hl_linux_event_wait, hl_linux_event_wake,
                                                  hl_linux_close_descriptor};

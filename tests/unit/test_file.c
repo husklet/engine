@@ -38,8 +38,7 @@ static hl_host_result file_close(void *context, hl_host_handle file) {
 
 int main(void) {
     static const hl_host_file_services file = {
-        HL_HOST_FILE_ABI, sizeof(file), file_open, NULL, NULL, NULL, NULL, file_close,
-    };
+        .abi = HL_HOST_FILE_ABI, .size = sizeof(file), .open_relative = file_open, .close = file_close};
     file_test test = {0};
     hl_host_services services = {
         .abi = HL_HOST_SERVICES_ABI,

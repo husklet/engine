@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 1u
 #define HL_HOST_CLOCK_ABI 1u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 3u
+#define HL_HOST_FILE_ABI 4u
 #define HL_HOST_PROCESS_ABI 2u
 #define HL_HOST_EVENT_ABI 1u
 #define HL_HOST_NETWORK_ABI 1u
@@ -159,6 +159,9 @@ typedef struct hl_host_file_services {
     hl_host_result (*append)(void *context, hl_host_handle file, hl_host_const_bytes input);
     hl_host_result (*metadata)(void *context, hl_host_handle file, hl_host_file_metadata *output);
     hl_host_result (*close)(void *context, hl_host_handle file);
+    /* Sequential operations for streams and other non-seekable descriptors. */
+    hl_host_result (*read)(void *context, hl_host_handle file, void *output, uint64_t output_size);
+    hl_host_result (*write)(void *context, hl_host_handle file, const void *input, uint64_t input_size);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

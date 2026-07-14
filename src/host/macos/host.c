@@ -454,6 +454,26 @@ static hl_host_result hl_macos_file_write(void *context, hl_host_handle file, ui
     return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
 }
 
+static hl_host_result hl_macos_file_read_sequential(void *context, hl_host_handle file, void *output,
+                                                    uint64_t output_size) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    ssize_t count;
+    if ((output_size != 0 && output == NULL) || output_size > SIZE_MAX || descriptor < 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = read(descriptor, output, (size_t)output_size);
+    return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
+static hl_host_result hl_macos_file_write_sequential(void *context, hl_host_handle file, const void *input,
+                                                     uint64_t input_size) {
+    int descriptor = hl_macos_file_descriptor(context, file, 0);
+    ssize_t count;
+    if ((input_size != 0 && input == NULL) || input_size > SIZE_MAX || descriptor < 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = write(descriptor, input, (size_t)input_size);
+    return count < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0);
+}
+
 static hl_host_result hl_macos_file_append(void *context, hl_host_handle file, hl_host_const_bytes input) {
     int descriptor = hl_macos_file_descriptor(context, file, 1);
     ssize_t count;
@@ -710,9 +730,16 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI, sizeof(clock), hl_macos_monotonic,
                                                  hl_macos_realtime};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
-    static const hl_host_file_services file = {HL_HOST_FILE_ABI,           sizeof(file),        hl_macos_file_open,
-                                               hl_macos_file_read,         hl_macos_file_write, hl_macos_file_append,
-                                               hl_macos_file_metadata_get, hl_macos_file_close};
+    static const hl_host_file_services file = {HL_HOST_FILE_ABI,
+                                               sizeof(file),
+                                               hl_macos_file_open,
+                                               hl_macos_file_read,
+                                               hl_macos_file_write,
+                                               hl_macos_file_append,
+                                               hl_macos_file_metadata_get,
+                                               hl_macos_file_close,
+                                               hl_macos_file_read_sequential,
+                                               hl_macos_file_write_sequential};
     static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
                                                      hl_macos_process_spawn,     hl_macos_process_wait,
                                                      hl_macos_process_terminate, hl_macos_process_close};
