@@ -48,6 +48,10 @@ typedef struct hl_host_process_fd {
     uint32_t kind;
 } hl_host_process_fd;
 
+typedef struct hl_host_process_peer {
+    int64_t identity;
+} hl_host_process_peer;
+
 /* Snapshot host-wide values and up to core_capacity per-core counters. */
 int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, size_t core_capacity);
 
@@ -60,5 +64,11 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
 /* Query one open descriptor and, for files, copy its native absolute path without a trailing NUL. */
 int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd *entry, char *path,
                             size_t path_capacity, size_t *path_size);
+
+/* Enumerate other instances of this executable in the current process session. count includes truncation. */
+int hl_host_process_peers(hl_host_process_peer *entries, size_t capacity, size_t *count);
+
+/* Interrupt one enumerated peer so it can reach an engine safepoint. */
+int hl_host_process_interrupt(hl_host_process_peer peer);
 
 #endif

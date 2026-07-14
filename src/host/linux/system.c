@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -175,4 +176,44 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     closedir(directory);
     *count = total;
     return 1;
+}
+
+int hl_host_process_peers(hl_host_process_peer *entries, size_t capacity, size_t *count) {
+    char self_path[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+    char link[64];
+    DIR *directory;
+    struct dirent *item;
+    hl_host_process_info self_info;
+    ssize_t self_length;
+    size_t total = 0;
+    if (count == NULL || (capacity != 0 && entries == NULL) || !hl_host_process_read(getpid(), &self_info)) return 0;
+    self_length = readlink("/proc/self/exe", self_path, PATH_MAX);
+    if (self_length <= 0) return 0;
+    self_path[self_length] = '\0';
+    directory = opendir("/proc");
+    if (directory == NULL) return 0;
+    while ((item = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long long value;
+        hl_host_process_info info;
+        ssize_t length;
+        errno = 0;
+        value = strtoll(item->d_name, &end, 10);
+        if (errno != 0 || end == item->d_name || *end != '\0' || value <= 0 || value == getpid() ||
+            !hl_host_process_read(value, &info) || info.session != self_info.session)
+            continue;
+        snprintf(link, sizeof link, "/proc/%lld/exe", value);
+        length = readlink(link, path, PATH_MAX);
+        if (length != self_length || memcmp(path, self_path, (size_t)self_length) != 0) continue;
+        if (total < capacity) entries[total].identity = value;
+        total++;
+    }
+    closedir(directory);
+    *count = total;
+    return 1;
+}
+
+int hl_host_process_interrupt(hl_host_process_peer peer) {
+    return peer.identity > 0 && peer.identity <= INT32_MAX && kill((pid_t)peer.identity, SIGURG) == 0;
 }

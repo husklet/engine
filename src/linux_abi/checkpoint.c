@@ -18,7 +18,7 @@
 // fork/clone is a real host fork(), proc.c). CHECKPOINT is triggered by advancing a SHARED-MEMORY generation
 // counter (a MAP_SHARED "<dir>.trigger" every engine process maps) -- NOT a signal, because a guest's own
 // rt_sigaction silently remaps every guest-reachable host signal (bash SIG_IGNs SIGUSR1). ckpt_poll reads the
-// generation at each safepoint; the engine's guest-clobber-proof THREAD_INT_SIG (SIGINFO) is reused only to
+// generation at each safepoint; the host's guest-clobber-proof engine interrupt is reused only to
 // KICK a process out of a blocking host syscall (EINTR) or a chained in-cache loop (thread_int_handler sets
 // cpu->irq when armed) to its next safepoint. The container init (guest pid 1) is the coordinator: it
 // enumerates the tree (every ENGINE process in its session -- robust vs the lossy pid registry), kicks each
@@ -47,11 +47,10 @@
 // Restore: HL_RESTORE_DIR=<dir> (or `--restore <dir>`) calls the restore path.
 // The embedding runtime layers checkpoint(dir)/restore(dir) on this explicit lifecycle operation.
 
-#include <libproc.h>    // proc_pidpath: filter session members to engine processes
-#include <sys/sysctl.h> // KERN_PROC_SESSION: enumerate the container's whole process tree
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
 
 #include "../host/file.h"
+#include "../host/system.h"
 
 #define CKPT_MAGIC 0x325450434b444444ull          // "DDDKCPT2" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC 0x324e414d504b4444ull // "DDKPMAN2" (LE) -- workspace manifest
@@ -108,11 +107,9 @@ struct ckpt_fd {
 // never touches it). Every engine process maps it (inherited across fork, remapped after exec). ckpt_poll
 // reads it each safepoint (a cheap memory load) and checkpoints when the generation advances past the one it
 // last saw. Signals are unusable as the trigger because a guest's own rt_sigaction remaps every guest-
-// reachable host signal (bash sets SIG_IGN on SIGUSR1, silently swallowing it); the ONLY guest-clobber-proof
-// signals (macOS SIGEMT/SIGINFO, which sig_l2m never targets) are already taken by STW / THREAD_INT. So the
-// generation carries the INTENT and the engine's existing guest-proof THREAD_INT_SIG (SIGINFO) is reused
-// only to KICK a blocked/spinning process out to its safepoint (thread_int_handler sets cpu->irq when armed).
-#define CKPT_KICK_SIG SIGINFO
+// reachable host signal (bash sets SIG_IGN on SIGUSR1, silently swallowing it). The generation carries the
+// INTENT; the host process contract selects the reserved engine interrupt used only to kick a blocked or
+// spinning process out to its safepoint (thread_int_handler sets cpu->irq when armed).
 static char g_ckpt_dir[1024];
 // g_ckpt_trigger / g_ckpt_seen_gen live in container/state.c (early include) so signal.c's blocking-syscall
 // restart decision (ckpt_pending) can consult them too.
@@ -323,6 +320,7 @@ static int ckpt_dump_pages(FILE *f, size_t pagesz, uint64_t *out_n) {
 // container init's real host pid/group/session all read back as 1). getppid()==g_init_hostpid means "child
 // of init"; a host pgid/sid equal to g_init_hostpid is the container's own group/session (guest 1).
 static void ckpt_self_identity(struct ckpt_meta *m) {
+    hl_host_process_info process;
     int self = container_pid();
     m->self_gpid = self;
     if (self == 1) {
@@ -333,7 +331,7 @@ static void ckpt_self_identity(struct ckpt_meta *m) {
     }
     int pg = getpgid(0);
     m->pgid_gpid = (g_init_hostpid && pg == g_init_hostpid) ? 1 : pg;
-    int sd = getsid(0);
+    int sd = hl_host_process_read(getpid(), &process) ? (int)process.session : getsid(0);
     m->sid_gpid = (g_init_hostpid && sd == g_init_hostpid) ? 1 : sd;
 }
 
@@ -433,35 +431,8 @@ done:
 // (even a fork-without-exec bash subshell, even one orphaned to launchd after its parent exited) keeps the
 // init's session id. The pid registry is unreliable here (a short-lived fork child inherits + unlinks the
 // parent's registry entry on exit), so we scan the session table directly and filter to processes running
-// OUR OWN executable -- excluding the launcher and any unrelated session member. Fills `pids` (peers only,
-// self excluded), returns the count.
-static int ckpt_enum_tree(int *pids, int cap) {
-    char selfpath[PROC_PIDPATHINFO_MAXSIZE];
-    if (proc_pidpath(getpid(), selfpath, sizeof selfpath) <= 0) return 0;
-    int mysid = getsid(0);
-    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
-    size_t len = 0;
-    if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || len == 0) return 0;
-    len += 16 * sizeof(struct kinfo_proc); // slack for processes spawned between the sizing and fetch calls
-    struct kinfo_proc *kp = (struct kinfo_proc *)malloc(len);
-    if (!kp) return 0;
-    int n = 0;
-    if (sysctl(mib, 3, kp, &len, NULL, 0) == 0) {
-        int cnt = (int)(len / sizeof(struct kinfo_proc));
-        for (int i = 0; i < cnt && n < cap; i++) {
-            int pid = kp[i].kp_proc.p_pid;
-            if (pid <= 0 || pid == (int)getpid()) continue;
-            if (getsid(pid) != mysid) continue; // scope to OUR container's session (survives orphaning)
-            char pp[PROC_PIDPATHINFO_MAXSIZE];
-            if (proc_pidpath(pid, pp, sizeof pp) <= 0) continue;
-            if (strcmp(pp, selfpath) != 0) continue; // only our own engine processes are container peers
-            pids[n++] = pid;
-        }
-    }
-    free(kp);
-    return n;
-}
-
+// OUR OWN executable -- excluding the launcher and any unrelated session member. The host contract returns
+// peers only; native process-table details stay in the backend.
 // The container INIT (guest pid 1) coordinates a whole-tree checkpoint at its safepoint: freeze + dump every
 // peer, then itself, then publish the MANIFEST. Never returns (_exit frees init's RAM).
 static void ckpt_coordinate_and_exit(struct cpu *c) {
@@ -472,18 +443,20 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // peer may already have dumped into it. Just ensure it exists (idempotent) and proceed.
     mkdir(base, 0700);
 
-    static int foll[512];
-    int nfoll = ckpt_enum_tree(foll, 512);
+    static hl_host_process_peer foll[512];
+    size_t observed = 0;
+    (void)hl_host_process_peers(foll, 512, &observed);
+    int nfoll = observed > 512 ? 512 : (int)observed;
     fprintf(stderr, "[ckpt] coordinator pid=%d found %d peer(s)\n", getpid(), nfoll);
 
     // Freeze + dump every peer: the shared trigger generation is already advanced (the requester bumped it),
     // so KICK each peer with the guest-proof THREAD_INT_SIG to bounce it out of a blocked syscall / chained
     // in-cache loop to its safepoint, where ckpt_poll sees the new generation and dumps proc.<gpid> + _exit()s.
     for (int i = 0; i < nfoll; i++)
-        kill(foll[i], CKPT_KICK_SIG);
+        (void)hl_host_process_interrupt(foll[i]);
     for (int i = 0; i < nfoll; i++) {
         char pd[1200];
-        snprintf(pd, sizeof pd, "%s/proc.%d", base, foll[i]);
+        snprintf(pd, sizeof pd, "%s/proc.%lld", base, (long long)foll[i].identity);
         int done = 0;
         for (int t = 0; t < 500 && !done; t++) { // up to ~5s per peer
             if (access(pd, F_OK) == 0) {
@@ -494,7 +467,8 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
             while (waitpid(-1, &st, WNOHANG) > 0) {} // reap so a peer zombie doesn't linger
             usleep(10000);
         }
-        if (!done) fprintf(stderr, "[ckpt] warning: peer %d did not checkpoint in time\n", foll[i]);
+        if (!done)
+            fprintf(stderr, "[ckpt] warning: peer %lld did not checkpoint in time\n", (long long)foll[i].identity);
     }
 
     // Dump ourselves (the init) last.

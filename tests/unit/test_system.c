@@ -81,6 +81,21 @@ int main(void) {
     HL_CHECK(descriptor.kind == HL_HOST_FD_FILE && target_size > 0);
     HL_CHECK(hl_host_process_fd_read(child, pipes[1], &descriptor, NULL, 0, &target_size));
     HL_CHECK(descriptor.kind == HL_HOST_FD_PIPE);
+    {
+        size_t peer_count = 0;
+        int found = 0;
+        HL_CHECK(hl_host_process_peers(NULL, 0, &peer_count) && peer_count > 0);
+        hl_host_process_peer *peers = malloc(peer_count * sizeof *peers);
+        HL_CHECK(peers != NULL && hl_host_process_peers(peers, peer_count, &peer_count));
+        for (size_t index = 0; index < peer_count; ++index)
+            if (peers[index].identity == child) {
+                found = 1;
+                break;
+            }
+        free(peers);
+        HL_CHECK(found);
+        HL_CHECK(!hl_host_process_interrupt((hl_host_process_peer){-1}));
+    }
     HL_CHECK(kill(child, SIGKILL) == 0);
     HL_CHECK(waitpid(child, NULL, 0) == child);
     HL_CHECK(!hl_host_process_read(child, &process));

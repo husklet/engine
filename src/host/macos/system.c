@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/proc_info.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -183,4 +184,41 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
     entry->kind = kind;
     *path_size = 0;
     return 1;
+}
+
+int hl_host_process_peers(hl_host_process_peer *entries, size_t capacity, size_t *count) {
+    char self_path[PROC_PIDPATHINFO_MAXSIZE];
+    struct kinfo_proc *processes;
+    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    pid_t self = getpid();
+    pid_t session = getsid(0);
+    size_t bytes = 0;
+    size_t total = 0;
+    if (count == NULL || (capacity != 0 && entries == NULL) || proc_pidpath(self, self_path, sizeof self_path) <= 0 ||
+        session < 0)
+        return 0;
+    if (sysctl(mib, 3, NULL, &bytes, NULL, 0) != 0 || bytes == 0) return 0;
+    bytes += 16 * sizeof *processes;
+    processes = malloc(bytes);
+    if (processes == NULL) return 0;
+    if (sysctl(mib, 3, processes, &bytes, NULL, 0) != 0) {
+        free(processes);
+        return 0;
+    }
+    for (size_t index = 0; index < bytes / sizeof *processes; ++index) {
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        pid_t pid = processes[index].kp_proc.p_pid;
+        if (pid <= 0 || pid == self || getsid(pid) != session || proc_pidpath(pid, path, sizeof path) <= 0 ||
+            strcmp(path, self_path) != 0)
+            continue;
+        if (total < capacity) entries[total].identity = pid;
+        total++;
+    }
+    free(processes);
+    *count = total;
+    return 1;
+}
+
+int hl_host_process_interrupt(hl_host_process_peer peer) {
+    return peer.identity > 0 && peer.identity <= INT32_MAX && kill((pid_t)peer.identity, SIGINFO) == 0;
 }
