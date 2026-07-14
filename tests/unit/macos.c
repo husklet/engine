@@ -59,6 +59,25 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS |
                                                       HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     {
+        static const char message[] = {'h', 'o', 's', 't', '\0', 'l', 'o', 'g'};
+        char received[sizeof(message)] = {0};
+        int descriptors[2];
+        int saved_stderr;
+        ssize_t count;
+        HL_CHECK(pipe(descriptors) == 0);
+        saved_stderr = dup(STDERR_FILENO);
+        HL_CHECK(saved_stderr >= 0);
+        HL_CHECK(dup2(descriptors[1], STDERR_FILENO) == STDERR_FILENO);
+        HL_CHECK(close(descriptors[1]) == 0);
+        services.log->emit(services.context, 0x8badf00du, message, sizeof(message));
+        HL_CHECK(dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+        HL_CHECK(close(saved_stderr) == 0);
+        count = read(descriptors[0], received, sizeof(received));
+        HL_CHECK(count == (ssize_t)sizeof(received));
+        HL_CHECK(memcmp(received, message, sizeof(message)) == 0);
+        HL_CHECK(close(descriptors[0]) == 0);
+    }
+    {
         const uint32_t count = 65536;
         hl_host_handle *mutexes = calloc(count, sizeof(*mutexes));
         uint32_t index;
@@ -104,6 +123,14 @@ int main(void) {
              process_exit.value == 37);
     HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
     HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_INVALID_ARGUMENT);
+
+    HL_CHECK(services.sync->fork_prepare(services.context).status == HL_STATUS_OK);
+    process = services.process->spawn_prepared(services.context, child_exit_37, (void *)(uintptr_t)37);
+    HL_CHECK(process.status == HL_STATUS_OK && process.value != HL_HOST_HANDLE_INVALID);
+    process_exit = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_exit.status == HL_STATUS_OK && process_exit.detail == HL_HOST_PROCESS_EXIT_CODE &&
+             process_exit.value == 37);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
 
     process = services.process->spawn_cloned(services.context, child_sleep, (void *)(intptr_t)150000000);
     HL_CHECK(process.status == HL_STATUS_OK);
@@ -185,6 +212,26 @@ int main(void) {
         HL_CHECK(services.file->seek(services.context, clone.value, 0, SEEK_SET).value == 0);
         HL_CHECK(services.file->readv(services.context, clone.value, vectors, 2).value == 3);
         HL_CHECK(memcmp(vector_contents, "xbc", 3) == 0);
+        HL_CHECK(services.file->append(services.context, file.value, (hl_host_const_bytes){"d", 1}).value == 1);
+        {
+            hl_host_result sequential = services.file->open_relative(
+                services.context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
+            char positioned_contents[4] = {0};
+            const hl_host_iovec written[] = {{(uint64_t)(uintptr_t)"z", 1}, {(uint64_t)(uintptr_t)"w", 1}};
+            hl_host_iovec positioned[] = {{(uint64_t)(uintptr_t)&positioned_contents[0], 2},
+                                          {(uint64_t)(uintptr_t)&positioned_contents[2], 2}};
+            HL_CHECK(sequential.status == HL_STATUS_OK);
+            HL_CHECK(services.file->seek(services.context, sequential.value, 0, SEEK_SET).value == 0);
+            HL_CHECK(services.file->write(services.context, sequential.value, "y", 1).value == 1);
+            HL_CHECK(services.file->writev(services.context, sequential.value, written, 2).value == 2);
+            HL_CHECK(services.file->readv_at(services.context, sequential.value, positioned, 2, 0).value == 4);
+            HL_CHECK(memcmp(positioned_contents, "yzwd", 4) == 0);
+            HL_CHECK(
+                services.file->write_at(services.context, sequential.value, 0, (hl_host_const_bytes){"xbc", 3}).value ==
+                3);
+            HL_CHECK(services.file->truncate(services.context, sequential.value, 3).status == HL_STATUS_OK);
+            HL_CHECK(services.file->close(services.context, sequential.value).status == HL_STATUS_OK);
+        }
         HL_CHECK(services.file->sync(services.context, clone.value).status == HL_STATUS_OK);
         HL_CHECK(services.file->data_sync(services.context, clone.value).status == HL_STATUS_OK);
         HL_CHECK(services.file->truncate(services.context, clone.value, 2).status == HL_STATUS_OK);
