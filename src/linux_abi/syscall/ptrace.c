@@ -357,7 +357,10 @@ static void ptrace_apply_regs(struct cpu *c, struct pt_link *L) {
 static void ptrace_service_mem(struct pt_link *L) {
     unsigned s = __atomic_load_n(&L->mem_seq, __ATOMIC_ACQUIRE);
     if (s == L->mem_ack) return;
-    uint64_t addr = L->mem_addr, len = L->mem_len;
+    // Register images expose guest virtual addresses. A static ET_EXEC image is mapped at a private high
+    // bias by the engine, so translate an address in its low link-time image range before this tracee
+    // process dereferences its own memory. Stack/heap/PIE addresses remain unchanged.
+    uint64_t addr = nonpie_p(L->mem_addr), len = L->mem_len;
     if (len > PT_MEMBUF) len = PT_MEMBUF;
     int err = 0;
     if (L->mem_dir == 1) { // read: tracee copies its own guest memory into the shared buffer

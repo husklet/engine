@@ -138,9 +138,17 @@ SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
 	$(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/x86_64/%)
+PROCESS_CASE_SOURCES := $(sort $(wildcard tests/compat/process/*.c))
+PROCESS_CASE_NAMES := $(basename $(notdir $(PROCESS_CASE_SOURCES)))
+PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
+	$(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/x86_64/%)
+TIME_CASE_SOURCES := $(sort $(wildcard tests/compat/time/*.c))
+TIME_CASE_NAMES := $(basename $(notdir $(TIME_CASE_SOURCES)))
+TIME_CASE_BINS := $(TIME_CASE_NAMES:%=$(BUILD)/compat/time/aarch64/%) \
+	$(TIME_CASE_NAMES:%=$(BUILD)/compat/time/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-signals compat-syscall $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-syscall compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -376,6 +384,30 @@ $(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
+$(BUILD)/compat/process/aarch64/%: tests/compat/process/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/process/aarch64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/process/x86_64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/time/aarch64/%: tests/compat/time/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(BUILD)/compat/time/x86_64/%: tests/compat/time/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -526,7 +558,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-procfs compat-signals compat-syscall $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-syscall compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -635,6 +667,16 @@ compat-signals: compat-engines $(BUILD)/tools/matrix-runner $(SIGNALS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/signals/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/signals/x86_64) $(abspath tests/compat/signals)
+
+compat-process: compat-engines $(BUILD)/tools/matrix-runner $(PROCESS_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/process/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/process/x86_64) $(abspath tests/compat/process)
+
+compat-time: compat-engines $(BUILD)/tools/matrix-runner $(TIME_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/time/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/time/x86_64) $(abspath tests/compat/time)
 
 compat-procfs: compat-engines $(BUILD)/tools/matrix-runner $(PROCFS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \

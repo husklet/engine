@@ -929,6 +929,20 @@ static void emit_fast_syscall(uint64_t next) {
         e_subi_s(16, 0, 14, 1); // subs x16, x0, #14
         uint32_t *spm_miss = (uint32_t *)g_cp;
         e_bcond(1, 0); // b.ne -> sched_yield
+        // Preserve the Linux ABI validation performed by the shared slow path: kernel sigset size is
+        // exactly 8, and a non-NULL set accepts only BLOCK/UNBLOCK/SETMASK (0..2). Invalid calls must not
+        // mutate the mask or report inline success.
+        e_subi_s(20, 10, 8, 1); // r10 == sigsetsize == 8?
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(1, 0);          // b.ne -> slow (-EINVAL)
+        e_subi_s(20, 6, 0, 1); // set == NULL skips how validation
+        uint32_t *valid_no_set = (uint32_t *)g_cp;
+        e_bcond(0, 0);          // b.eq -> validated
+        e_subi_s(20, 7, 2, 1); // how > SIG_SETMASK?
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(8, 0); // b.hi -> slow (-EINVAL), unsigned also rejects negative values
+        *valid_no_set = (*valid_no_set & 0xFF00001Fu) |
+                        ((uint32_t)(((uint32_t *)g_cp - valid_no_set) & 0x7FFFF) << 5);
         // Pending-signal fallback: if g_pending != 0 take the UNCHANGED slow exit, so the
         // dispatcher's maybe_deliver_signal runs with the post-update mask at the SAME block
         // boundary, against the SAME mask, as the unmodified engine. When nothing is pending the
@@ -971,6 +985,9 @@ static void emit_fast_syscall(uint64_t next) {
         *d1 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d1) & 0x3FFFFFF);
         *d2 = 0x14000000u | (uint32_t)(((uint32_t *)g_cp - d2) & 0x3FFFFFF);
         *no_set = (*no_set & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_set) & 0x7FFFF) << 5);
+        // SIGKILL(9) and SIGSTOP(19) are unmaskable: Linux silently removes them from every new mask.
+        e_movconst(20, ~((1ull << (9 - 1)) | (1ull << (19 - 1))));
+        e_rrr(A_AND, 19, 19, 20, 1, 0);
         e_str(19, 28, OFF_SM); // c->sigmask = x19
         emit_host_ptr(20, (uint64_t)&g_sig_inline_count, PRELOC_HOSTGLOBAL);
         e_ldr(21, 20, 0);

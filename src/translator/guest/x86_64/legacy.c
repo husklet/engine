@@ -17,8 +17,6 @@ static const uint64_t ATFD = (uint64_t)-100; // Linux AT_FDCWD
 // g_nonpie_lo/g_nonpie_bias are the (tentative) globals engine_glue.c declares above; g_nonpie_hi is defined
 // later by container/vfs.c -- forward it tentatively here (all three tentative defs merge to one object, the
 // exact pattern engine_glue.c documents). Inert identity for PIE/static-PIE (g_nonpie_lo == 0).
-static uint64_t g_nonpie_hi;
-
 static inline uint64_t x86_nonpie(uint64_t a) {
     return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
 }

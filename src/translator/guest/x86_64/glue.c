@@ -128,7 +128,7 @@ static int noeaopt(void) { return 0; }
 // (< 4GiB; stack/heap/mmap/libs are all >= the engine's 4GiB __PAGEZERO). g_nonpie_lo/g_nonpie_bias are
 // forward-declared here (tentative; merge with the real defs set by load_elf in elf.c / translate.c). 0
 // for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
-static uint64_t g_nonpie_lo, g_nonpie_bias;
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 
 static int guestfold_on(void) { return g_nonpie_lo != 0; }
 

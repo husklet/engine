@@ -386,7 +386,14 @@ static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
         e_ldr(16, 28, I->seg == 1 ? OFF_FS : OFF_GS);
         e_rrr(A_ADD, 17, 17, 16, 1, 0);
     }
-    if (do_bias) ea_bias17(); // non-PIE: x17 = host address (+bias for a low image EA); no-op for PIE / lea
+    // A base-less absolute address is known at translation time. Bias it only when it actually names the
+    // ET_EXEC image; in particular, address zero must remain zero and fault as Linux requires. The generic
+    // runtime fold remains for register-derived image pointers.
+    int absolute = !I->rip_rel && !I->m_hasbase && !I->m_hasindex && !I->seg;
+    uint64_t absolute_addr = (uint64_t)I->disp;
+    if (do_bias && !(absolute && guestfold_on() &&
+                     (absolute_addr < g_nonpie_lo || absolute_addr >= g_nonpie_hi)))
+        ea_bias17(); // non-PIE: x17 = host address (+bias for a low image EA); no-op for PIE / lea
 }
 
 // Decide whether a [base+disp] (no index/seg/rip) memory operand can be folded directly
