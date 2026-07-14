@@ -16,7 +16,7 @@ add_library(hl-translator STATIC
     src/translator/ir/ir.c)
 target_include_directories(hl-translator PUBLIC include)
 
-add_library(hl-linux-abi STATIC src/linux_abi/linux_abi.c)
+add_library(hl-linux-abi STATIC src/linux_abi/linux_abi.c src/linux_abi/stat.c)
 target_include_directories(hl-linux-abi PUBLIC include)
 
 add_library(hl-engine STATIC src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c)
@@ -28,6 +28,11 @@ add_library(hl-production-xattr-cache OBJECT src/production/os/linux/container/x
 target_include_directories(hl-production-xattr-cache PRIVATE src/production/os/linux/container)
 target_compile_options(hl-production-xattr-cache PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                          -Wstrict-prototypes -Wmissing-prototypes)
+
+add_library(hl-production-readonly OBJECT src/production/os/linux/container/readonly/table.c)
+target_include_directories(hl-production-readonly PRIVATE src/production/os/linux/container/readonly)
+target_compile_options(hl-production-readonly PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+                                                     -Wstrict-prototypes -Wmissing-prototypes)
 
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
@@ -60,12 +65,18 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name config host_services ir linux_abi engine log options)
+    foreach(test_name codegen config host_services ir linux_abi stat engine log options)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)
+        if(test_name STREQUAL "linux_abi" OR test_name STREQUAL "stat")
+            target_link_libraries(test-${test_name} PRIVATE hl-linux-abi)
+        endif()
         add_test(NAME ${test_name} COMMAND test-${test_name})
     endforeach()
+    add_executable(test-readonly tests/unit/test_readonly.c $<TARGET_OBJECTS:hl-production-readonly>)
+    target_include_directories(test-readonly PRIVATE include tests/unit)
+    add_test(NAME readonly COMMAND test-readonly)
     if(TARGET hl-host-linux)
         add_executable(test-host_linux tests/unit/linux.c)
         target_include_directories(test-host_linux PRIVATE include tests/unit)

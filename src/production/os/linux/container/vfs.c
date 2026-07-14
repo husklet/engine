@@ -4579,9 +4579,9 @@ static const char *dev_node_hostpath(const char *gp) {
 }
 
 // ================= dd GPU rung 2: host-IOSurface-backed guest buffer =================
-// See include/dd_gpu.h. Entirely gated behind DD_GPU_IOSURFACE (gpu_iosurface_on()); the code compiles
+// See include/gpu.h. Entirely gated behind HL_GPU_IOSURFACE (gpu_iosurface_on()); the code compiles
 // always (the engine is always a macOS binary) but never runs for existing workloads / the gate.
-#include "../../../include/dd_gpu.h"
+#include "../../../include/gpu.h"
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
@@ -4765,7 +4765,7 @@ static void dd_gpu_free_handle(uint32_t handle) {
 }
 #endif
 
-// Core IOSurface allocator shared by DD_IOCTL_GPU_ALLOC (glmark2/EGL shim path) and the DRM
+// Core IOSurface allocator shared by HL_IOCTL_GPU_ALLOC (glmark2/EGL shim path) and the DRM
 // CREATE_DUMB ioctl (chromium/Mesa kms_swrast path). Reuse-or-create a host IOSurface for
 // (owner_fd,w,h), announce it to dd-display over mach, register it under owner_fd, and hand back its
 // id/stride/base. `reuse` selects redraw-in-place (glmark2) vs a fresh distinct surface per call
@@ -4896,11 +4896,11 @@ static int dd_gpu_surface(int owner_fd, uint32_t w, uint32_t h, int reuse, uint3
     return 0;
 }
 
-// Service DD_IOCTL_GPU_ALLOC: host-allocate (or reuse) an IOSurface, return its base pointer
+// Service HL_IOCTL_GPU_ALLOC: host-allocate (or reuse) an IOSurface, return its base pointer
 // (guest==host VA), its global id, stride, and a throwaway dmabuf fd. `owner_fd` is the render node so
 // the surface's lifetime is tied to it. Returns 0 on success, a negative errno otherwise.
-static int64_t dd_gpu_alloc(int owner_fd, void *arg) {
-    struct dd_gpu_alloc *r = (struct dd_gpu_alloc *)arg;
+static int64_t hl_gpu_alloc(int owner_fd, void *arg) {
+    struct hl_gpu_alloc *r = (struct hl_gpu_alloc *)arg;
     if (!r) return -EFAULT;
     uint32_t id = 0, stride = 0, gen = 0;
     void *base = NULL;
@@ -4936,7 +4936,7 @@ static int64_t dd_gpu_alloc(int owner_fd, void *arg) {
 //
 // Why this is needed: the bridge's CoreFoundation/IOSurface/mach calls (CFDictionary/CFNumber build,
 // IOSurfaceCreate, IOSurfaceCreateMachPort, bootstrap_look_up) lazily run one-time ObjC class
-// +initialize's the FIRST time the guest allocates a surface (DD_IOCTL_GPU_ALLOC / DRM CREATE_DUMB). That
+// +initialize's the FIRST time the guest allocates a surface (HL_IOCTL_GPU_ALLOC / DRM CREATE_DUMB). That
 // first alloc is serviced on whatever host thread runs the guest ioctl, and can land WHILE another host
 // thread is mid guest-fork() (libc fork() in os/linux/syscall/proc.c, which runs libobjc's pthread_atfork
 // handlers). If an ObjC +initialize is in progress at fork() — e.g. +[NSPlaceholderString initialize],

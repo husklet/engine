@@ -1,6 +1,7 @@
 // dd/runtime/os/linux/container -- container config state (UTS/cgroup/USER-ns/port-map) + parsers.
 #include "../../container_parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 #include "xattr_cache.h"
+#include "readonly/table.h"
 #include <sys/sysctl.h>            // sysctlbyname("hw.activecpu") -- true host core count (see container_online_cpus)
 
 // DD_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
@@ -27,29 +28,9 @@ static int g_rootfs_ro = 0;
 // read resolution / overlay merge at all. Append-only, count published LAST so a concurrent path
 // resolve sees either the old count or a fully-written entry; entries are never removed (a container
 // never downgrades a subtree remount,ro back to rw in practice).
-static char g_ro_subpath[16][256];
-static int g_nro_subpath = 0;
+static hl_readonly_table g_ro_subpaths;
 // 1 if `abs` falls under a runtime remount,ro subtree.
-static int ro_subpath_denies(const char *abs) {
-    int n = __atomic_load_n(&g_nro_subpath, __ATOMIC_ACQUIRE);
-    if (n <= 0 || !abs || abs[0] != '/') return 0;
-    for (int i = 0; i < n; i++) {
-        size_t L = strlen(g_ro_subpath[i]);
-        if (!strncmp(abs, g_ro_subpath[i], L) && (abs[L] == 0 || abs[L] == '/')) return 1;
-    }
-    return 0;
-}
 // Register a subtree as read-only (runtime remount,ro). Dedupes; 0 on success, -1 if the table is full.
-static int ro_subpath_add(const char *abs) {
-    if (!abs || abs[0] != '/') return -1;
-    for (int i = 0; i < g_nro_subpath; i++)
-        if (!strcmp(g_ro_subpath[i], abs)) return 0;
-    if (g_nro_subpath >= 16) return -1;
-    int i = g_nro_subpath;
-    snprintf(g_ro_subpath[i], sizeof g_ro_subpath[i], "%s", abs);
-    __atomic_store_n(&g_nro_subpath, i + 1, __ATOMIC_RELEASE);
-    return 0;
-}
 // docker --ulimit overrides, indexed by Linux RLIMIT_* resource number; .set gates the override.
 #define DD_RLIM_MAX 16
 

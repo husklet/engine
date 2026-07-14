@@ -122,6 +122,8 @@ typedef struct hl_linux_file_status {
     uint32_t mode;
 } hl_linux_file_status;
 
+enum { HL_LINUX_STAT_AARCH64_SIZE = 128, HL_LINUX_STAT_X86_64_SIZE = 144 };
+
 typedef struct hl_linux_abi {
     HL_ABI_HEADER;
     const hl_host_services *host;
@@ -187,6 +189,10 @@ HL_API int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t c
 /* lseek changes the shared OFD offset. SEEK_END and fstat use normalized host metadata. */
 HL_API int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, int32_t whence);
 HL_API int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_status *output);
+
+/* Encode host-neutral metadata into exact little-endian Linux stat records; unavailable fields are zero. */
+HL_API int64_t hl_linux_stat_aarch64(const hl_linux_file_status *status, void *output, size_t output_size);
+HL_API int64_t hl_linux_stat_x86_64(const hl_linux_file_status *status, void *output, size_t output_size);
 
 HL_EXTERN_C_END
 

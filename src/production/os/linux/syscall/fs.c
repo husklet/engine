@@ -394,7 +394,7 @@ static int64_t svc_mount(struct cpu *c, uint64_t a_src, uint64_t a_tgt, uint64_t
                 g_vols[vi].ro = 1;
                 return 0;
             }
-            return ro_subpath_add(tgt) == 0 ? 0 : -ENOMEM;
+            return hl_readonly_table_add(&g_ro_subpaths, tgt) == 0 ? 0 : -ENOMEM;
         }
         // remount,rw (relax where cleanly possible; a path-based RO subtree can't be un-listed race-free).
         if (!strcmp(tgt, "/"))
@@ -621,10 +621,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // it worked there). This makes both forms match, fixing musl tmux/script/openpty and any high-bit ioctl.
         unsigned long rq = (uint32_t)a1;
         void *arg = (void *)a2;
-        // GPU rung 2 (opt-in): the dd render node services DD_IOCTL_GPU_ALLOC (host-IOSurface buffer).
+        // GPU rung 2 (opt-in): the render node services HL_IOCTL_GPU_ALLOC (host-IOSurface buffer).
         // Gated on the per-fd render-node tag, so no other fd/ioctl is affected.
-        if (gpu_iosurface_on() && fd >= 0 && fd < DD_NFD && g_devdri[fd] && rq == DD_IOCTL_GPU_ALLOC) {
-            G_RET(c) = (uint64_t)dd_gpu_alloc(fd, arg);
+        if (gpu_iosurface_on() && fd >= 0 && fd < DD_NFD && g_devdri[fd] && rq == HL_IOCTL_GPU_ALLOC) {
+            G_RET(c) = (uint64_t)hl_gpu_alloc(fd, arg);
             break;
         }
         // DRM ioctls chromium/Mesa(kms_swrast) issue on the render node once it opens the discovered node:
@@ -2259,7 +2259,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (rp && gpu_iosurface_on()) {
                 int drm_minor = -1;
                 // synthesize /dev/dri/{renderD128,card0} as a placeholder fd tagged as a render node; its
-                // DD_IOCTL_GPU_ALLOC / DRM ioctls (fs.c case 29) service the IOSurface + version/cap probes.
+                // HL_IOCTL_GPU_ALLOC / DRM ioctls (fs.c case 29) service the IOSurface + version/cap probes.
                 if (!strncmp(rp, "/dev/dri/", 9) && drm_dev_minor(rp + 9, &drm_minor)) {
                     int d = open("/dev/null", O_RDWR); // backing is irrelevant; the ioctl carries the payload
                     if (d >= 0 && d < DD_NFD) g_devdri[d] = (uint8_t)(drm_minor + 1); // minor+1 (fstat fixup)

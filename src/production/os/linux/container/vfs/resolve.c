@@ -14,7 +14,7 @@ static int jail_ro(const char *abs) {
     // Routes to the rootfs/overlay jail: docker --read-only makes it EROFS, except the still-writable
     // pseudo-mounts (/proc /dev /sys /tmp /run) -- exactly as runc leaves those mounted rw over a ro root.
     // A runtime `mount -o remount,ro <subpath>` additionally enforces RO on that subtree (path-based).
-    return rootfs_ro_denies(abs) || ro_subpath_denies(abs);
+    return rootfs_ro_denies(abs) || hl_readonly_table_denies(&g_ro_subpaths, abs);
 }
 
 // 1 if the absolute guest path falls under ANY bind-mount volume (rw or ro). A volume is its OWN jail
@@ -32,7 +32,7 @@ static int jail_is_vol(const char *abs) {
 
 // Convenience: resolve a (dirfd, raw) target to its guest abs path (same as abs_guest) and test RO.
 static int jail_ro_at(int dirfd, const char *raw) {
-    if (g_nvols == 0 && !g_rootfs_ro && g_nro_subpath == 0)
+    if (g_nvols == 0 && !g_rootfs_ro && hl_readonly_table_empty(&g_ro_subpaths))
         return 0; // no RO surface at all -> skip work; behavior identical to before
     char abs[8192];
     abs_guest(dirfd, raw, abs, sizeof abs);

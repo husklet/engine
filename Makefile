@@ -26,7 +26,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/production/,*.c) \
 CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
 IR_SOURCES := src/translator/codegen.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c
+LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c src/linux_abi/stat.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
@@ -42,7 +42,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := codegen config host_services ir linux_abi engine log options xattr_cache
+UNIT_NAMES := codegen config host_services ir linux_abi stat engine log options readonly xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -100,6 +100,10 @@ $(BUILD)/tests/test_xattr_cache: tests/unit/test_xattr_cache.c src/production/os
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) $^ -o $@
 
+$(BUILD)/tests/test_readonly: tests/unit/test_readonly.c src/production/os/linux/container/readonly/table.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/fixtures/%: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
 	$(CC) -O2 -g -std=gnu11 -Wall -Wextra $< -pthread -o $@
@@ -134,6 +138,7 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/production/targets/linux_aarch6
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/linux/container/readonly/table.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -143,6 +148,7 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/production/targets/linux_x86_64.
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/linux/container/readonly/table.c \
 		src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
@@ -156,6 +162,7 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/production/ta
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
 		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_aarch64.c src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/linux/container/readonly/table.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
@@ -168,6 +175,7 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/production/tar
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
 		-o $@ tools/lifecycle_e2e_runner.c src/production/targets/linux_x86_64.c src/core/config.c \
 		src/production/os/linux/container/xattr_cache.c \
+		src/production/os/linux/container/readonly/table.c \
 		src/production/os/lifecycle_adapter.c \
 		src/core/engine.c src/core/host_services.c src/core/log.c src/host/macos/host.c
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
