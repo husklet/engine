@@ -234,7 +234,6 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000000000L;
         }
-        sleep_precise_begin(); // uncoalesced (precise) wakeup for this sleep; restored below
         int r = 0;
         for (;;) {
             struct timespec d;
@@ -270,7 +269,6 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
             break;
         }
-        sleep_precise_end(); // drop back to normal timeshare scheduling
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
     }
@@ -417,8 +415,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // realities are corrected: (1) hl's internal block-preemption interrupts the sleep with a
         // signal invisible to the guest -- re-sleep only the TRUE remainder, never restart the duration
         // (the old `nanosleep(req,rem)` retry restarted the full sleep when rem was NULL, +1 period each
-        // preemption); (2) macOS coalesces timer wakeups by ~1-2.5ms, blowing LTP nanosleep01's 450us
-        // threshold, so a scoped real-time policy makes the wakeup precise. (LTP nanosleep01/nanosleep02.)
+        // preemption). Host-specific wakeup precision belongs to the clock service. (LTP nanosleep01/02.)
         struct timespec now, deadline;
         engine_clock_gettime(CLOCK_MONOTONIC, &deadline);
         deadline.tv_sec += req->tv_sec;
@@ -427,7 +424,6 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000000000L;
         }
-        sleep_precise_begin();
         int rr = 0;
         for (;;) {
             struct timespec d;
@@ -462,7 +458,6 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
             break;
         }
-        sleep_precise_end();
         G_RET(c) = rr < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
     }

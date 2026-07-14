@@ -8,7 +8,9 @@
 #include <libkern/OSCacheControl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <mach/thread_policy.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -397,6 +399,26 @@ static hl_host_result hl_macos_thread_cpu(void *context) {
     return hl_macos_clock(CLOCK_THREAD_CPUTIME_ID);
 }
 
+static void hl_macos_precise_sleep_begin(void) {
+    mach_timebase_info_data_t timebase;
+    thread_time_constraint_policy_data_t policy;
+    double nanoseconds_to_ticks;
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) return;
+    nanoseconds_to_ticks = (double)timebase.denom / (double)timebase.numer;
+    policy.period = (uint32_t)(500000.0 * nanoseconds_to_ticks);
+    policy.computation = (uint32_t)(100000.0 * nanoseconds_to_ticks);
+    policy.constraint = (uint32_t)(500000.0 * nanoseconds_to_ticks);
+    policy.preemptible = 1;
+    (void)thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&policy,
+                            THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+static void hl_macos_precise_sleep_end(void) {
+    thread_standard_policy_data_t policy = {0};
+    (void)thread_policy_set(mach_thread_self(), THREAD_STANDARD_POLICY, (thread_policy_t)&policy,
+                            THREAD_STANDARD_POLICY_COUNT);
+}
+
 static hl_host_result hl_macos_clock_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
     clockid_t clock_id;
     struct timespec now, delay;
@@ -414,7 +436,14 @@ static hl_host_result hl_macos_clock_sleep_until(void *context, uint32_t clock_k
     remaining = deadline_ns - now_ns;
     delay.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
     delay.tv_nsec = (long)(remaining % UINT64_C(1000000000));
-    if (nanosleep(&delay, NULL) != 0) return hl_macos_errno();
+    /* Match Linux high-resolution timer wakeups without leaking a Darwin scheduler policy into linux_abi. */
+    hl_macos_precise_sleep_begin();
+    if (nanosleep(&delay, NULL) != 0) {
+        hl_host_result result = hl_macos_errno();
+        hl_macos_precise_sleep_end();
+        return result;
+    }
+    hl_macos_precise_sleep_end();
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 

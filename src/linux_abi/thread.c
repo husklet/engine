@@ -1,38 +1,6 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_time.h>     // mach_timebase_info: ns<->mach-abs for the precise-sleep RT window
-#include <mach/thread_policy.h> // THREAD_TIME_CONSTRAINT_POLICY: precise (uncoalesced) timer wakeups
-#endif
 #include "../host/range.h"
-
-// macOS coalesces ordinary timer wakeups by ~1-2.5ms to save power (nanosleep/mach_wait_until alike),
-// which blows LTP nanosleep01's 450us threshold -- Linux hrtimers are exact. A THREAD_TIME_CONSTRAINT
-// (soft real-time) policy makes THIS thread's next wakeup precise (~10us). We apply it only for the
-// duration of a guest sleep and drop back to the standard timeshare policy after, so the thread's normal
-// scheduling is unchanged outside the sleep and no thread is left permanently real-time.
-static void sleep_precise_begin(void) {
-#if defined(__APPLE__)
-    mach_timebase_info_data_t tb;
-    if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0) return;
-    double ns2abs = (double)tb.denom / (double)tb.numer; // nanoseconds -> mach abs ticks
-    thread_time_constraint_policy_data_t p;
-    p.period = (uint32_t)(500000.0 * ns2abs);      // 0.5ms nominal cadence
-    p.computation = (uint32_t)(100000.0 * ns2abs); // 0.1ms of "work" (we only need a timely wake)
-    p.constraint = (uint32_t)(500000.0 * ns2abs);  // wake within 0.5ms of the deadline
-    p.preemptible = 1;                             // fully preemptible: never starves other threads
-    thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p,
-                      THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-#endif
-}
-
-static void sleep_precise_end(void) {
-#if defined(__APPLE__)
-    thread_standard_policy_data_t sp = {0}; // back to the default timeshare scheduling
-    thread_policy_set(mach_thread_self(), THREAD_STANDARD_POLICY, (thread_policy_t)&sp, THREAD_STANDARD_POLICY_COUNT);
-#endif
-}
 
 // ---------------- syscalls ----------------
 // ---------------- threads & futex ----------------
