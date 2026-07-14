@@ -61,7 +61,7 @@ LINUX_ABI_OBJECTS := $(LINUX_ABI_SOURCES:%.c=$(BUILD)/%.o)
 FAKE_HOST_OBJECTS := $(FAKE_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
 LINUX_HOST_SOURCES := src/host/linux/directory.c src/host/linux/host.c src/host/linux/process.c src/host/linux/range.c \
-	src/host/linux/system.c \
+	src/host/linux/system.c src/host/clock.c src/host/file.c \
 	$(COMMON_HOST_SOURCES)
 LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 
@@ -816,7 +816,17 @@ $(BUILD)/linux-production/hl-engine-linux-x86_64: $(BUILD)/linux-production/targ
 	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
-	$(CC) -o $@ $^ -pthread
+	$(CC) -o $@ $^ -pthread -lm
+
+$(BUILD)/linux-production/linux-production-smoke: tools/linux_production_smoke.c
+	@mkdir -p $(@D)
+	$(CC) -O2 -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: run-linux-production-smoke
+run-linux-production-smoke: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/compat/core/abi/x86_64/hello
+	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+		$(BUILD)/compat/core/abi/x86_64/hello
 
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
 	$(BUILD)/production/hl-remote-supervisor

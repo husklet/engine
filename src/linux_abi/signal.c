@@ -1,4 +1,5 @@
 // hl/linux_abi -- signal delivery (Linux<->macOS signal-number translation; sigframe build).
+#include "../host/native_context.h"
 
 // ptrace signal-delivery/group stops. Defined later in the TU (os/linux/syscall/ptrace.c, pulled in
 // via dispatch.c). ptrace_intercept_signal: this process is traced and a signal is about to be delivered
@@ -638,7 +639,7 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
     return;
     ucontext_t *u = (ucontext_t *)ucv;
 #if defined(__aarch64__)
-    uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
+    uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
 #elif defined(__x86_64__)
     uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__rip : 0;
 #else

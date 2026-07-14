@@ -771,7 +771,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         char pb[4200];
         // confined (realpath gate)
         const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
-        int wfd = open(p, O_EVTONLY);
+        int wfd = hl_native_open_watch(p);
         if (wfd < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;

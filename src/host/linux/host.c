@@ -437,6 +437,29 @@ static hl_host_result hl_linux_memory_code_write(void *context) {
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static void *hl_linux_map_aligned(int descriptor, uint64_t size, uint64_t alignment, int protection, int flags) {
+    size_t reserve_size;
+    void *reservation;
+    uintptr_t base;
+    uintptr_t aligned;
+    if (alignment <= (uint64_t)sysconf(_SC_PAGESIZE))
+        return mmap(NULL, (size_t)size, protection, flags, descriptor, 0);
+    if (size > SIZE_MAX - alignment) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    reserve_size = (size_t)(size + alignment);
+    reservation = mmap(NULL, reserve_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) return MAP_FAILED;
+    base = (uintptr_t)reservation;
+    aligned = (base + (uintptr_t)alignment - 1) & ~((uintptr_t)alignment - 1);
+    if (aligned != base) (void)munmap((void *)base, (size_t)(aligned - base));
+    if (base + reserve_size != aligned + size)
+        (void)munmap((void *)(aligned + size), (size_t)(base + reserve_size - aligned - size));
+    reservation = mmap((void *)aligned, (size_t)size, protection, flags | MAP_FIXED, descriptor, 0);
+    return reservation;
+}
+
 static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
                                                    hl_host_code_mapping *output) {
     hl_host_linux *host = context;
@@ -445,11 +468,13 @@ static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size,
     void *writable;
     void *executable;
     hl_host_result handle;
-    if (output == NULL || size == 0 || size > SIZE_MAX || size > INT64_MAX || page <= 0 || alignment > (uint64_t)page)
+    if (output == NULL || size == 0 || size > SIZE_MAX || size > INT64_MAX || page <= 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || alignment < (uint64_t)page)
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     memset(output, 0, sizeof(*output));
     if ((flags & HL_HOST_CODE_DUAL_ALIAS) == 0) {
-        writable = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        writable = hl_linux_map_aligned(-1, size, alignment, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                        MAP_PRIVATE | MAP_ANONYMOUS);
         if (writable == MAP_FAILED) return hl_linux_errno_result();
         handle = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, writable, writable, size, -1);
         if (handle.status != HL_STATUS_OK) {
@@ -470,12 +495,12 @@ static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size,
         close(descriptor);
         return hl_linux_errno_result();
     }
-    writable = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
+    writable = hl_linux_map_aligned(descriptor, size, alignment, PROT_READ | PROT_WRITE, MAP_SHARED);
     if (writable == MAP_FAILED) {
         close(descriptor);
         return hl_linux_errno_result();
     }
-    executable = mmap(NULL, (size_t)size, PROT_READ | PROT_EXEC, MAP_SHARED, descriptor, 0);
+    executable = hl_linux_map_aligned(descriptor, size, alignment, PROT_READ | PROT_EXEC, MAP_SHARED);
     if (executable == MAP_FAILED) {
         munmap(writable, (size_t)size);
         close(descriptor);
@@ -2913,8 +2938,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
-    static const hl_host_file_services file = {HL_HOST_FILE_ABI,
-                                               sizeof(file),
+    static const hl_host_file_services file = {HL_HOST_FILE_ABI_13,
+                                               offsetof(hl_host_file_services, allocate_range),
                                                hl_linux_file_open,
                                                hl_linux_file_read,
                                                hl_linux_file_write,

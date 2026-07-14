@@ -1159,7 +1159,7 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
             int fd = openat(dfd, final, O_RDONLY);
             close(dfd);
             if (fd >= 0) {
-                if (fcntl(fd, F_GETPATH, buf) == 0) {
+                if (hl_native_fd_path(fd, buf, n) == 0) {
                     close(fd);
                     return buf;
                 }
@@ -1888,7 +1888,7 @@ static int proc_fd_dir_open(void) {
         if (eventfd_hidden_peer_fd(fd)) continue;
         if (fcntl(fd, F_GETFD) == -1) continue; // not open
         char tgt[4200];
-        if (fcntl(fd, F_GETPATH, tgt) == 0 && tgt[0]) {
+        if (hl_native_fd_path(fd, tgt, sizeof tgt) == 0 && tgt[0]) {
             if (g_rootfs && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len)) {
                 const char *g = tgt + g_rootfs_canon_len;
                 if (!g[0]) g = "/";

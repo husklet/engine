@@ -241,10 +241,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // socket -- write(2), writev(2), send(2) without MSG_NOSIGNAL -- returns -1/EPIPE instead
             // of raising SIGPIPE. Benign on healthy sockets; only sockets get it, so real pipes/FIFOs
             // keep Linux's default SIGPIPE-on-write semantics.
-            {
-                int on = 1;
-                setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-            }
+            (void)hl_native_set_no_sigpipe(r);
             if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
             if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
             if (r < HL_NFD) {
@@ -288,9 +285,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r == 0) {
             // SO_NOSIGPIPE on both ends so a write/send to a peer-closed pair returns EPIPE, never a
             // fatal SIGPIPE (matches Linux EPIPE-to-guest behaviour). See case 198 for the rationale.
-            int on = 1;
-            setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-            setsockopt(sv[1], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            (void)hl_native_set_no_sigpipe(sv[0]);
+            (void)hl_native_set_no_sigpipe(sv[1]);
             if ((int)a1 & 0x80000) { // SOCK_CLOEXEC
                 fcntl(sv[0], F_SETFD, FD_CLOEXEC);
                 fcntl(sv[1], F_SETFD, FD_CLOEXEC);
@@ -568,10 +564,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r >= 0) {
             // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
-            {
-                int on = 1;
-                setsockopt(r, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-            }
+            (void)hl_native_set_no_sigpipe(r);
             if (r >= 0 && r < HL_NFD) {
                 g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
@@ -926,8 +919,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
         // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
         if ((int)a3 & 0x4000) {
-            int on = 1;
-            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            (void)hl_native_set_no_sigpipe((int)a0);
         }
         // AF_UNIX pathname/abstract dest -> overlay/abstract-route it (syslog `logger` -> /dev/log).
         if (a4 && (socklen_t)a5 >= 2 && *(const uint16_t *)a4 == AF_UNIX) {
@@ -1103,8 +1095,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (lvl == 1 && opt == 17) {
             if (a3 && a4 && *(socklen_t *)a4 >= 12) {
                 pid_t ppid = 0;
+#if defined(__APPLE__)
                 socklen_t pl = sizeof ppid;
                 if (getsockopt((int)a0, SOL_LOCAL, LOCAL_PEERPID, &ppid, &pl) < 0 || ppid <= 0 || ppid == getpid()) {
+#else
+                struct ucred peer = {0};
+                socklen_t pl = sizeof peer;
+                if (getsockopt((int)a0, SOL_SOCKET, SO_PEERCRED, &peer, &pl) == 0) ppid = peer.pid;
+                if (ppid <= 0 || ppid == getpid()) {
+#endif
                     // macOS reports the socketpair CREATOR's pid on both ends -> a fork parent
                     // reads its OWN pid here for every child. Report the end's peer pid we resolved (the REAL
                     // guest pid of the process holding the OTHER end, stamped across fork/close -- see
@@ -1290,8 +1289,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE (macOS has no per-call flag); EPIPE instead of SIGPIPE.
         if (nr == 211 && ((int)a2 & 0x4000)) {
-            int on = 1;
-            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            (void)hl_native_set_no_sigpipe((int)a0);
         }
         // Zero-length address-peek idiom (recvmsg): if the guest wants the sender but supplies no receive
         // room, macOS returns 0 at once without filling msg_name (see dgram_addr_peek). Receive into a
@@ -1342,8 +1340,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             size_t ln = 0;
             if (passcred_active) {
                 int ppid = 0;
+#if defined(__APPLE__)
                 socklen_t pl = sizeof ppid;
                 if (getsockopt((int)a0, SOL_LOCAL, LOCAL_PEERPID, &ppid, &pl) < 0 || ppid <= 0 || ppid == getpid()) {
+#else
+                struct ucred peer = {0};
+                socklen_t pl = sizeof peer;
+                if (getsockopt((int)a0, SOL_SOCKET, SO_PEERCRED, &peer, &pl) == 0) ppid = peer.pid;
+                if (ppid <= 0 || ppid == getpid()) {
+#endif
                     // macOS reports the socketpair CREATOR's pid on both ends (never updated on fork), so the
                     // fork parent reads its OWN pid here for every child -> container_pid() collapsed all of
                     // them to guest 1, colliding peer node identities. Prefer the end's distinct synthetic
@@ -1421,8 +1426,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int done = 0, err = 0;
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE once before the fan-out (macOS has no per-call flag).
         if (nr == 269 && ((int)a3 & 0x4000)) {
-            int on = 1;
-            setsockopt((int)a0, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+            (void)hl_native_set_no_sigpipe((int)a0);
         }
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;

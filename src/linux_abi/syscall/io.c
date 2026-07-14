@@ -1084,12 +1084,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_proc_text_ro[(int)a0]) lf = 0;
             char fgetpath_buf[4096] = {0};
             int have_fgetpath = 0;
-#ifdef F_GETPATH
-            if ((lf & 0x3) && fcntl((int)a0, F_GETPATH, fgetpath_buf) == 0) {
+            if ((lf & 0x3) && hl_native_fd_path((int)a0, fgetpath_buf, sizeof fgetpath_buf) == 0) {
                 have_fgetpath = 1;
                 if (proc_text_host_path(fgetpath_buf)) lf &= ~0x3;
             }
-#endif
             if (r & 0x8) lf |= 0x400;
             if (r & 0x4) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
@@ -1106,7 +1104,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (have_fgetpath) {
                     snprintf(p, sizeof p, "%s", fgetpath_buf);
                 } else {
-                    (void)fcntl((int)a0, F_GETPATH, p);
+                    (void)hl_native_fd_path((int)a0, p, sizeof p);
                 }
                 fprintf(stderr, "[HLFCNTL] pid=%d cpid=%d fd=%d mflags=0x%x lflags=0x%x path=%s\n", getpid(),
                         container_pid(), (int)a0, r, lf, p);

@@ -3975,6 +3975,32 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
 }
 
 // ---------------- host entry trampolines (adapted from jit.c, x86 reg set) ----------------
+#if defined(__GNUC__) && !defined(__clang__)
+/* GCC ignores naked on AArch64 functions.  Define the two ABI trampolines as
+   assembler functions so no compiler-generated prologue can corrupt SP or the
+   callee-saved register image. */
+static void run_block(struct cpu *cpu, void *code);
+static void block_return(void);
+__asm__(
+    ".type run_block, %function\n"
+    "run_block:\n"
+    "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
+    "str x23,[x0,#208]\n str x24,[x0,#216]\n str x25,[x0,#224]\n str x26,[x0,#232]\n"
+    "str x27,[x0,#240]\n str x28,[x0,#248]\n str x29,[x0,#256]\n str x30,[x0,#264]\n"
+    "str q8,[x0,#272]\n str q9,[x0,#288]\n str q10,[x0,#304]\n str q11,[x0,#320]\n"
+    "str q12,[x0,#336]\n str q13,[x0,#352]\n str q14,[x0,#368]\n str q15,[x0,#384]\n"
+    "mov x9,sp\n str x9,[x0,#168]\n br x1\n"
+    ".size run_block, .-run_block\n"
+    ".type block_return, %function\n"
+    "block_return:\n"
+    "ldr x19,[x28,#176]\n ldr x20,[x28,#184]\n ldr x21,[x28,#192]\n ldr x22,[x28,#200]\n"
+    "ldr x23,[x28,#208]\n ldr x24,[x28,#216]\n ldr x25,[x28,#224]\n ldr x26,[x28,#232]\n"
+    "ldr x27,[x28,#240]\n ldr x29,[x28,#256]\n ldr x30,[x28,#264]\n"
+    "ldr q8,[x28,#272]\n ldr q9,[x28,#288]\n ldr q10,[x28,#304]\n ldr q11,[x28,#320]\n"
+    "ldr q12,[x28,#336]\n ldr q13,[x28,#352]\n ldr q14,[x28,#368]\n ldr q15,[x28,#384]\n"
+    "ldr x9,[x28,#168]\n mov sp,x9\n ldr x28,[x28,#248]\n ret\n"
+    ".size block_return, .-block_return\n");
+#else
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     __asm__ volatile( // x0=cpu, x1=code
         "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
@@ -3997,3 +4023,4 @@ __attribute__((naked)) static void block_return(void) {
         "ldr x28,[x28,#248]\n"             // restore host x28 LAST (was using it as base)
         "ret\n");
 }
+#endif

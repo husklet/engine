@@ -49,8 +49,10 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <sys/times.h>
+#include <sys/wait.h>
 #include <poll.h>
-#include <sys/event.h> // kqueue: backs epoll/timerfd/inotify on macOS
+#include "../../host/native_compat.h"
+#include "../../host/native_context.h"
 #include <dirent.h>
 #include <signal.h>
 #include <termios.h>

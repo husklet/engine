@@ -121,20 +121,22 @@ static void do_sigreturn(struct cpu *c) {
 // (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
 static int sigframe_capture_fault(struct cpu *c, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    uint64_t hpc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+    uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
     uint64_t lo = (uint64_t)g_cache + g_rw2rx, hi = lo + CACHE_SZ;
     if (hpc < lo || hpc >= hi) return 0; // host PC outside the code cache -> a genuine engine fault
-    uint64_t *X = uc->uc_mcontext->__ss.__x;
+    uint64_t *X = HL_HOST_UC_REGS(uc);
+    __uint128_t *V = HL_HOST_UC_VREGS(uc);
+    if (V == NULL) return 0;
     for (int i = 0; i < 16; i++)
         c->r[i] = X[i];                                   // rax..r15 == host x0..x15
-    memcpy(c->v, uc->uc_mcontext->__ns.__v, sizeof c->v); // xmm0..15 == host v0..v15
+    memcpy(c->v, V, sizeof c->v); // xmm0..15 == host v0..v15
     return 1;
 }
 
 static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    uc->uc_mcontext->__ss.__x[28] = (uint64_t)c; // block_return reads &cpu from x28 (pinned through the block)
-    uc->uc_mcontext->__ss.__pc = (uint64_t)block_return;
+    HL_HOST_UC_REGS(uc)[28] = (uint64_t)c; // block_return reads &cpu from x28 (pinned through the block)
+    HL_HOST_UC_PC(uc) = (uint64_t)block_return;
 }
 
 // recover a fast-clock GUARDED store fault (emit_fast_syscall's clock_gettime/gettimeofday inline
@@ -156,8 +158,8 @@ static int fastclk_fault_fixup(siginfo_t *si, void *ucv) {
     // va < fastclk_ptr, which underflows to a huge number) is >= 16. Correct for both bounds and wrap.
     if ((uint64_t)(va - c->fastclk_ptr) >= 16) return 0; // fault outside the guarded 16B window
     ucontext_t *uc = (ucontext_t *)ucv;
-    uc->uc_mcontext->__ss.__x[0] = (uint64_t)(int64_t)(-EFAULT); // guest rax = -EFAULT
-    uc->uc_mcontext->__ss.__pc = c->fastclk_resume;              // resume at the in-block EFAULT tail
+    HL_HOST_UC_REGS(uc)[0] = (uint64_t)(int64_t)(-EFAULT); // guest rax = -EFAULT
+    HL_HOST_UC_PC(uc) = c->fastclk_resume;                  // resume at the in-block EFAULT tail
     c->fastclk_resume = 0;                                       // window closed
     return 1;
 }

@@ -563,7 +563,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char host[4300];
         int e;
         if (nr == 7)
-            e = fcntl((int)a0, F_GETPATH, host) == 0 ? 0 : -EBADF;
+            e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
             e = xattr_hostpath((const char *)a0, nr == 6, 1, host, sizeof host);
         if (e < 0) {
@@ -581,7 +581,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char host[4300];
         int e;
         if (nr == 10)
-            e = fcntl((int)a0, F_GETPATH, host) == 0 ? 0 : -EBADF;
+            e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
             e = xattr_hostpath((const char *)a0, nr == 9, 0, host, sizeof host);
         if (e < 0) {
@@ -599,7 +599,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char host[4300];
         int e;
         if (nr == 13)
-            e = fcntl((int)a0, F_GETPATH, host) == 0 ? 0 : -EBADF;
+            e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
             e = xattr_hostpath((const char *)a0, nr == 12, 0, host, sizeof host);
         if (e < 0) {
@@ -616,7 +616,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char host[4300];
         int e;
         if (nr == 16)
-            e = fcntl((int)a0, F_GETPATH, host) == 0 ? 0 : -EBADF;
+            e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
             e = xattr_hostpath((const char *)a0, nr == 15, 1, host, sizeof host);
         if (e < 0) {
@@ -948,7 +948,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             int r = mknodat(pfd, fin, (mode_t)a2, (dev_t)a3), e = errno;
             char dp[4200];
-            if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
@@ -1002,7 +1002,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             int r = mkdirat(pfd, fin, (mode_t)a2), e = errno;
             char dp[4200];
-            if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
@@ -1160,7 +1160,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // AT_REMOVEDIR: linux 0x200
             int r = unlinkat(pfd, fin, (a2 & 0x200) ? AT_REMOVEDIR : 0), e = errno;
             char dp[4200];
-            if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
@@ -1397,7 +1397,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             char dp[4200];
-            if (fcntl(opfd, F_GETPATH, dp) == 0) {
+            if (hl_native_fd_path(opfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, ofin);
                 mc_evict(hp);
@@ -1944,7 +1944,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             int r = fchmodat(pfd, fin, (mode_t)a2, 0), e = errno;
             char dp[4200];
-            if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);
@@ -1987,7 +1987,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // the host chown is a rootless no-op; persist the guest-set owner as an xattr on
             // the backing file so a later stat reports it (not the cuid/cgid default). -1 = keep.
             char dp[4200];
-            if (fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 chown_xattr_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
@@ -2346,11 +2346,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 memf_materialize(pfn); // reopen-by-fd would expose the real file -> flush RAM cache first
                 char gp[4200];
                 int r = -1;
-                if (fcntl(pfn, F_GETPATH, gp) == 0 && gp[0]) r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
+                if (hl_native_fd_path(pfn, gp, sizeof gp) == 0 && gp[0]) r = open(gp, mf & ~(O_EXCL | O_CREAT), (mode_t)a3);
                 if (r < 0) r = dup(pfn); // anonymous/pipe/socket fd -> share the description
                 if (r >= 0) {
                     char tp[4200];
-                    if (fcntl(r, F_GETPATH, tp) == 0) fd_setpath(r, tp);
+                    if (hl_native_fd_path(r, tp, sizeof tp) == 0) fd_setpath(r, tp);
                 }
                 G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
                 break;
@@ -2389,7 +2389,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 int a = ctty_anchor();
                 if (a >= 0) {
                     char hp[4200];
-                    int s = (fcntl(a, F_GETPATH, hp) == 0) ? open(hp, mf) : dup(a);
+                    int s = (hl_native_fd_path(a, hp, sizeof hp) == 0) ? open(hp, mf) : dup(a);
                     G_RET(c) = s < 0 ? (uint64_t)(-errno) : (uint64_t)s;
                     break;
                 }
@@ -2443,7 +2443,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
             if (r >= 0) {
                 char gpa[4200];
-                int have_canon = fcntl(r, F_GETPATH, gpa) == 0;
+                int have_canon = hl_native_fd_path(r, gpa, sizeof gpa) == 0;
                 if (have_canon) {
                     fd_setpath(r, gpa);
                     if (isw) {
@@ -2571,7 +2571,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r >= 0) {
                 char gp[4200];
                 // canonical host path for tracking
-                if (fcntl(r, F_GETPATH, gp) == 0) {
+                if (hl_native_fd_path(r, gp, sizeof gp) == 0) {
                     fd_setpath(r, gp);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         mc_evict(gp);
@@ -2724,7 +2724,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // AT_FDCWD is excluded: an empty path there is a genuine ENOENT, handled by the normal path below.)
         if (p && !p[0] && (int)a0 >= 0) {
             char fp[4200];
-            if (fcntl((int)a0, F_GETPATH, fp) == 0) {
+            if (hl_native_fd_path((int)a0, fp, sizeof fp) == 0) {
                 ssize_t r = readlink(fp, buf, bs);
                 G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             } else {
@@ -2797,7 +2797,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             char gp[4200];
-            if (fcntl(pfn, F_GETPATH, gp) != 0) {
+            if (hl_native_fd_path(pfn, gp, sizeof gp) != 0) {
                 // A pathless fd (pipe/socket/eventfd/timerfd/anon inode): Linux still resolves
                 // /proc/self/fd/N to a synthetic "pipe:[ino]" / "socket:[ino]" / "anon_inode:[...]" name --
                 // never EBADF for an OPEN fd. Reproduce that so `ls -l /proc/self/fd`, lsof, and Go's
@@ -3176,7 +3176,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             int r = utimensat(pfd, fin, ts, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0), e = errno;
             char dp[4200];
-            if (r >= 0 && fcntl(pfd, F_GETPATH, dp) == 0) {
+            if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 snprintf(hp, sizeof hp, "%s/%s", dp, fin);
                 mc_evict(hp);

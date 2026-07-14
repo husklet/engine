@@ -154,6 +154,9 @@ static void termios_m2l(const struct termios *M, uint8_t *L) {
 
 // Linux MSG_* -> macOS MSG_* (they differ for TRUNC/DONTWAIT/EOR/WAITALL).
 static int msgflags_l2m(int lf) {
+#if defined(__linux__)
+    return lf;
+#else
     // OOB/PEEK/DONTROUTE identical
     int mf = lf & (0x1 | 0x2 | 0x4);
     // MSG_TRUNC
@@ -165,12 +168,16 @@ static int msgflags_l2m(int lf) {
     // MSG_WAITALL
     if (lf & 0x100) mf |= 0x40;
     return mf;
+#endif
 }
 
 // macOS MSG_* -> Linux MSG_* (inverse of msgflags_l2m; used for recvmsg msg_flags writeback). The
 // returned-flags set differs: notably MSG_CTRUNC is macOS 0x20 / Linux 0x8, MSG_TRUNC macOS 0x10 /
 // Linux 0x20, MSG_EOR macOS 0x8 / Linux 0x80. OOB/DONTROUTE map straight through.
 static int msgflags_m2l(int mf) {
+#if defined(__linux__)
+    return mf;
+#else
     // MSG_OOB(0x1)/MSG_DONTROUTE(0x4) identical; MSG_PEEK isn't a returned flag but is harmless
     int lf = mf & (0x1 | 0x2 | 0x4);
     // MSG_TRUNC: macOS 0x10 -> Linux 0x20
@@ -180,6 +187,7 @@ static int msgflags_m2l(int mf) {
     // MSG_EOR: macOS 0x8 -> Linux 0x80
     if (mf & 0x8) lf |= 0x80;
     return lf;
+#endif
 }
 
 // ---- SCM ancillary data: Linux<->macOS cmsg framing translation (SOL_SOCKET/SCM_RIGHTS fd passing).
@@ -1515,7 +1523,9 @@ static socklen_t sa_l2m(const uint8_t *g, socklen_t glen, struct sockaddr_storag
     if (fam == LX_AF_INET && glen >= 8) {
         struct sockaddr_in *m = (struct sockaddr_in *)out;
         memset(m, 0, sizeof *m);
+#if defined(__APPLE__)
         m->sin_len = sizeof *m;
+#endif
         m->sin_family = AF_INET;
         memcpy(&m->sin_port, g + 2, 2); // port (BE), same offset
         memcpy(&m->sin_addr, g + 4, 4); // addr (BE), same offset
@@ -1524,7 +1534,9 @@ static socklen_t sa_l2m(const uint8_t *g, socklen_t glen, struct sockaddr_storag
     if (fam == LX_AF_INET6 && glen >= 24) {
         struct sockaddr_in6 *m = (struct sockaddr_in6 *)out;
         memset(m, 0, sizeof *m);
+#if defined(__APPLE__)
         m->sin6_len = sizeof *m;
+#endif
         m->sin6_family = AF_INET6;
         memcpy(&m->sin6_port, g + 2, 2);
         memcpy(&m->sin6_flowinfo, g + 4, 4);
@@ -1687,7 +1699,9 @@ static int egress_connect(int fd, const struct sockaddr *m, socklen_t mlen) {
     }
     struct sockaddr_in px;
     memset(&px, 0, sizeof px);
+#if defined(__APPLE__)
     px.sin_len = sizeof px;
+#endif
     px.sin_family = AF_INET;
     px.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &px.sin_addr) != 1) {

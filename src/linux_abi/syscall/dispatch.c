@@ -33,12 +33,11 @@ int g_rwx_guest;
 
 // Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
 #define ATFD(value) (((int)(value) == -100) ? AT_FDCWD : (int)(value))
-// macOS renamex_np/renameatx_np flags (Linux renameat2 flags map onto these)
 #ifndef RENAME_SWAP
-#define RENAME_SWAP 0x00000002 // atomic swap  <- Linux RENAME_EXCHANGE(2)
+#define RENAME_SWAP 0x00000002
 #endif
 #ifndef RENAME_EXCL
-#define RENAME_EXCL 0x00000004 // fail if dst exists <- Linux RENAME_NOREPLACE(1)
+#define RENAME_EXCL 0x00000004
 #endif
 // ================= ptrace(2) — in-hl tracer/tracee coordination ========================
 // hl runs each guest PROCESS as its own host process (fork(2) is a real host fork; see proc.c case 220),
@@ -464,7 +463,7 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
                 snprintf(j, sizeof j, "%s/%s", g_fdpath[dirfd], raw); // bare: guest view == host view
         } else {
             char db[4200];
-            if (fcntl(dirfd, F_GETPATH, db) == 0) {
+            if (hl_native_fd_path(dirfd, db, sizeof db) == 0) {
                 if (g_rootfs) {
                     char gd[4200];
                     guest_from_host_raw(db, gd, sizeof gd);

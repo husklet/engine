@@ -11,6 +11,7 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 }
 
 #include <sys/ucontext.h>
+#include "../../../host/native_context.h"
 
 #include "../../../host/range.h"
 #include "../../../linux_abi/page.h"
@@ -689,9 +690,10 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     uint64_t va = (uint64_t)si->si_addr;
     if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
     ucontext_t *uc = (ucontext_t *)ucv;
-    uint32_t insn = *(uint32_t *)(uc->uc_mcontext->__ss.__pc);
+    uint32_t insn = *(uint32_t *)(HL_HOST_UC_PC(uc));
     uint64_t real = va + g_nonpie_bias;      // the actual mapped location of the datum
-    uint64_t *X = uc->uc_mcontext->__ss.__x; // __x[0..28]; 29=fp 30=lr 31=zr/sp
+    uint64_t *X = HL_HOST_UC_REGS(uc); // x[0..30]
+    __uint128_t *V = HL_HOST_UC_VREGS(uc);
     int v = (insn >> 26) & 1;                // SIMD&FP?
     int rt = insn & 0x1F;
     // Load/store-register IMMEDIATE family: bits[29:27]==111, and either the scaled unsigned-imm form
@@ -704,17 +706,18 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 
     // ---- SIMD&FP Q/D/S/H/B load/store (V==1). width = 1<<((opc[1]<<2)|size): B1 H2 S4 D8 Q16. ----
     if (v && ls_imm) {
+        if (V == NULL) return 0;
         int size = insn >> 30, opc = (insn >> 22) & 3;
         int bytes = 1 << (((opc >> 1) << 2) | size);
         if (opc & 1) { // load -> write Vt, zeroing the upper lanes (arm64 FP-load semantics)
             __uint128_t z = 0;
             memcpy(&z, (void *)real, (size_t)bytes);
-            uc->uc_mcontext->__ns.__v[rt] = z;
+            V[rt] = z;
         } else { // store -> low `bytes` of Vt to memory
-            __uint128_t s = uc->uc_mcontext->__ns.__v[rt];
+            __uint128_t s = V[rt];
             memcpy((void *)real, &s, (size_t)bytes);
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -731,7 +734,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             return 0; // signed/unsigned min/max (never emitted by the x86 backend) -> clean abort
         }
         if (rt != 31) X[rt] = nonpie_zext(old, size); // Rt receives the old value
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -741,7 +744,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         uint64_t expected = (rs == 31) ? 0 : X[rs], newv = (rt == 31) ? 0 : X[rt];
         uint64_t old = nonpie_cas((void *)real, size, expected, newv);
         if (rs != 31) X[rs] = nonpie_zext(old, size); // Rs receives the old value
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -776,7 +779,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         }
         if (rt != 31) X[rt] = val;
     }
-    uc->uc_mcontext->__ss.__pc += 4; // skip the faulting load/store
+    HL_HOST_UC_PC(uc) += 4; // skip the faulting load/store
     return 1;
 }
 
