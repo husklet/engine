@@ -18,7 +18,10 @@ static void eventfd_peer_vacate(int fd) {
     if (owner < 0) return;
     int hi = fcntl(fd, F_DUPFD, 1 << 20);
     if (hi < 0) hi = fcntl(fd, F_DUPFD, 64);
-    if (hi >= 0 && hi != fd) { g_eventfd_peer[owner] = hi + 1; }
+    if (hi >= 0 && hi != fd) {
+        g_eventfd_peer[owner] = hi + 1;
+        close(fd);
+    }
 }
 
 // Carry hl's virtual-fd emulation state from oldfd to newfd on dup/dup2/dup3/F_DUPFD. Linux duplicated
@@ -130,7 +133,10 @@ static void engine_fd_reloc(int *slot, int newfd) {
     // guest's active low fds, and the modest fallback keeps the relocation working under a small RLIMIT_NOFILE.
     int hi = fcntl(newfd, F_DUPFD, 1 << 20);
     if (hi < 0) hi = fcntl(newfd, F_DUPFD, 64);
-    if (hi >= 0) *slot = hi;
+    if (hi >= 0) {
+        *slot = hi;
+        close(newfd);
+    }
 }
 
 // ---- F_SETLEASE lease registry + F_NOTIFY (dnotify) directory-change monitor --------------------
