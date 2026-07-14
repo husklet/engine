@@ -36,6 +36,7 @@
 #include <stdatomic.h>
 
 #include "hl/engine.h"
+#include "hl/linux_abi.h"
 #include "../launch.h"
 #include "../options.h"
 #include "../cli.h"
@@ -784,6 +785,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         if (now.status != HL_STATUS_OK) return 70;
         g_host_launch_monotonic_ns = now.value;
     }
+    if (bound_shadow_activate() != 0) return 70;
     // Resume a previously checkpointed workspace instead of launching a program (the embedding host sets this on
     // window reopen; the container config/env is otherwise identical to the original launch).
     const char *rdir = hl_option_get("HL_RESTORE_DIR");
@@ -796,6 +798,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     container_init(rootfs);
     int irc = engine_global_init();
     if (irc) return irc;
+    if (box != NULL && g_untrusted) return 70;
     const char *prog = argv[0];
     static char gb[1024];
     prog = find_in_path(prog, gb, sizeof gb); // bare "sh" (docker) -> "/bin/sh" via the container PATH

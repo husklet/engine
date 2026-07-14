@@ -127,6 +127,18 @@ static int exec_fd_is_engine(int fd) {
     return 0;
 }
 
+static int exec_close_bound_cloexec(int fd) {
+    hl_linux_fd_snapshot snapshot;
+    if (g_linux_box == NULL || fd < 0 ||
+        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &snapshot) != HL_STATUS_OK)
+        return 0;
+    if ((snapshot.descriptor_flags & HL_LINUX_FD_CLOEXEC) != 0) {
+        (void)hl_linux_close(g_linux_box, (hl_linux_fd)fd);
+        close(fd);
+    }
+    return 1;
+}
+
 // Close the CLOEXEC guest fds among a bounded [0,maxfd) range (proc_pidinfo fallback path only).
 // The caller passes the REAL descriptor-table size (getdtablesize() = the current soft RLIMIT_NOFILE),
 // so do NOT clamp it DOWN -- that would leave CLOEXEC fds above the cap open across exec. The ceiling
@@ -134,6 +146,7 @@ static int exec_fd_is_engine(int fd) {
 static void exec_close_cloexec_scan(int maxfd) {
     if (maxfd < 0 || maxfd > (1 << 20)) maxfd = 4096;
     for (int fd = 0; fd < maxfd; fd++) {
+        if (exec_close_bound_cloexec(fd)) continue;
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {
@@ -175,6 +188,7 @@ static void exec_close_cloexec(void) {
     int n = got / (int)sizeof(struct proc_fdinfo);
     for (int i = 0; i < n; i++) {
         int fd = fds[i].proc_fd;
+        if (exec_close_bound_cloexec(fd)) continue;
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {
@@ -230,6 +244,38 @@ static void fork_child_hooks(struct cpu *c) {
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
     mlk_reset();                 // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
+}
+
+typedef struct bound_fork_state {
+    hl_linux_fork_plan plan;
+} bound_fork_state;
+
+static int bound_fork_prepare(bound_fork_state *state) {
+    hl_status status;
+    memset(state, 0, sizeof(*state));
+    if (g_linux_box == NULL) return 0;
+    state->plan.abi = HL_LINUX_ABI_VERSION;
+    state->plan.size = sizeof(state->plan);
+    state->plan.capacity = g_linux_box->ofd_capacity;
+    state->plan.records = calloc(state->plan.capacity, sizeof(*state->plan.records));
+    if (state->plan.records == NULL) return -ENOMEM;
+    status = hl_linux_abi_fork_prepare(g_linux_box, &state->plan);
+    if (status != HL_STATUS_OK) {
+        free(state->plan.records);
+        state->plan.records = NULL;
+        return status == HL_STATUS_BUSY ? -EAGAIN : status == HL_STATUS_OUT_OF_MEMORY ? -ENOMEM : -EIO;
+    }
+    return 0;
+}
+
+static int bound_fork_complete(bound_fork_state *state, int child) {
+    hl_status status;
+    if (g_linux_box == NULL) return 0;
+    status = child ? hl_linux_abi_fork_child(g_linux_box, &state->plan)
+                   : hl_linux_abi_fork_parent(g_linux_box, &state->plan);
+    free(state->plan.records);
+    state->plan.records = NULL;
+    return status == HL_STATUS_OK ? 0 : -EIO;
 }
 
 // ---- runtime credential overlay (USER ns) -------------------------------------------------------
@@ -1352,7 +1398,26 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         memf_materialize_all();
         sigexit_init(); // create the shared guest-signal-death relay in the PARENT before forking, so
                         // this child (and its descendants) inherit the same MAP_SHARED page it may die into.
+        bound_fork_state bound_fork;
+        int bound_status = bound_fork_prepare(&bound_fork);
+        if (bound_status != 0) {
+            G_RET(c) = (uint64_t)(int64_t)bound_status;
+            break;
+        }
         pid_t pid = fork();
+        int fork_error = errno;
+        bound_status = bound_fork_complete(&bound_fork, pid == 0);
+        if (bound_status != 0) {
+            if (pid == 0) _exit(127);
+            if (pid > 0) {
+                int failed_status;
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &failed_status, 0) < 0 && errno == EINTR) {}
+            }
+            G_RET(c) = (uint64_t)(int64_t)bound_status;
+            break;
+        }
+        errno = fork_error;
         if (pid == 0) {
             // clone(CLONE_VM, child_stack): glibc posix_spawn/popen/vfork pass a separate child stack in a1
             // and seed the clone trampoline (fn ptr + args) at its top. We fork() (COW) instead of sharing
@@ -1883,7 +1948,26 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         sigexit_init(); // shared signal-death relay must exist in the parent before fork (see case 220)
+        bound_fork_state bound_fork;
+        int bound_status = bound_fork_prepare(&bound_fork);
+        if (bound_status != 0) {
+            G_RET(c) = (uint64_t)(int64_t)bound_status;
+            break;
+        }
         pid_t pid = fork();
+        int fork_error = errno;
+        bound_status = bound_fork_complete(&bound_fork, pid == 0);
+        if (bound_status != 0) {
+            if (pid == 0) _exit(127);
+            if (pid > 0) {
+                int failed_status;
+                kill(pid, SIGKILL);
+                while (waitpid(pid, &failed_status, 0) < 0 && errno == EINTR) {}
+            }
+            G_RET(c) = (uint64_t)(int64_t)bound_status;
+            break;
+        }
+        errno = fork_error;
         // child: the same shared engine reset as the clone/fork site above (cache re-alias / §B shadow /
         // path caches / kqueues / fork-unsafe locks). clone3 historically lacked the W^X re-assert and the
         // DIR*-cache drop the clone site had; the shared helper closes that drift.

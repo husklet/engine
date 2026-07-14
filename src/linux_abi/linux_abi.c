@@ -865,6 +865,11 @@ int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command,
         argument = 0;
         break;
     case HL_LINUX_F_GETFL: argument = ofd_entry->status_flags; break;
+    case HL_LINUX_F_SETFL:
+        linux_abi->ofds[fd_entry->ofd].status_flags =
+            (ofd_entry->status_flags & HL_LINUX_O_ACCMODE) | ((uint32_t)argument & HL_LINUX_O_APPEND);
+        argument = 0;
+        break;
     default: hl_linux_unlock(linux_abi); return -HL_LINUX_EINVAL;
     }
     hl_linux_unlock(linux_abi);

@@ -63,7 +63,7 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     memcpy(&engine->host, host, sizeof(*host));
     if (config->fd_binding_count != 0) {
         uint32_t index;
-        uint32_t fd_capacity = 16;
+        uint32_t fd_capacity = HL_LINUX_FD_LIMIT;
         status = hl_host_services_validate(host, HL_HOST_CAP_FILE | HL_HOST_CAP_SYNC);
         if (status != HL_STATUS_OK) goto fail;
         for (index = 0; index < config->fd_binding_count; ++index) {
@@ -71,6 +71,7 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
             uint32_t previous;
             if (binding->abi != HL_ENGINE_ABI || binding->size < sizeof(*binding) ||
                 binding->host_handle == HL_HOST_HANDLE_INVALID || binding->guest_fd >= HL_LINUX_FD_LIMIT ||
+                binding->guest_fd < 3 ||
                 (binding->ownership != HL_ENGINE_FD_TRANSFER && binding->ownership != HL_ENGINE_FD_BORROW)) {
                 status = HL_STATUS_INVALID_ARGUMENT;
                 goto fail;
@@ -81,7 +82,6 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
                     goto fail;
                 }
             }
-            if (binding->guest_fd >= fd_capacity) fd_capacity = binding->guest_fd + 1u;
         }
         engine->box_fds = calloc(fd_capacity, sizeof(*engine->box_fds));
         engine->box_ofds = calloc(config->fd_binding_count + 2u, sizeof(*engine->box_ofds));

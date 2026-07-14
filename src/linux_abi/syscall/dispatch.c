@@ -500,6 +500,7 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
 #include "proc.c"
 #include "rare.c"
 #include "ptrace.c" // bug real ptrace tracer/tracee coordination (uses helpers above + G_* macros)
+#include "binding.c"
 
 static void service(struct cpu *c) {
     // Mark this thread as "in a host syscall" for the whole service window (incl. any blocking wait such
@@ -921,6 +922,7 @@ static void service_local(struct cpu *c) {
         default: break;
         }
     }
+    if (bound_route(c, nr, a0, a1, a2, a3)) return;
     // daemon-write coherence: notice a daemon-side write into this container's fs (docker cp /
     // exec-spawn /etc rewrites) and drop the path/metadata caches BEFORE any handler below can consult
     // them -- one shared-page atomic load per syscall (see fscache.c fsgen_poll).

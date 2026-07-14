@@ -56,6 +56,7 @@ enum {
     HL_LINUX_F_GETFD = 1,
     HL_LINUX_F_SETFD = 2,
     HL_LINUX_F_GETFL = 3,
+    HL_LINUX_F_SETFL = 4,
     HL_LINUX_F_DUPFD_CLOEXEC = 1030
 };
 

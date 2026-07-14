@@ -59,6 +59,7 @@
 #include <libkern/OSCacheControl.h>
 
 #include "hl/engine.h"
+#include "hl/linux_abi.h"
 #include "../launch.h"
 #include "../options.h"
 #include "../cli.h"
@@ -364,6 +365,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         if (now.status != HL_STATUS_OK) return 70;
         g_host_launch_monotonic_ns = now.value;
     }
+    if (bound_shadow_activate() != 0) return 70;
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
@@ -371,6 +373,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     container_init(rootfs);
     int rc = engine_global_init();
     if (rc) return rc;
+    if (box != NULL && g_untrusted) return 70;
     // Initial-exec shebang handling -- mirror of linux_aarch64.c (and execve case 221) via the shared
     // resolve_shebang_chain(). The container entry may itself be a "#!" script (redis/postgres'
     // docker-entrypoint.sh), and that script's interpreter may ITSELF be a "#!" script (nested, Linux

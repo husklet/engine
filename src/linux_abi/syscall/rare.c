@@ -155,6 +155,17 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (last >= (unsigned)maxfd) last = (unsigned)maxfd - 1;
         if (!(flags & 4)) engine_fd_vacate_range(first, last); // relocate engine fds out of the actual-close range
         for (unsigned fd = first; fd <= last; fd++) {
+            hl_linux_fd_snapshot bound;
+            if (g_linux_box != NULL && hl_linux_fd_snapshot_get(g_linux_box, fd, &bound) == HL_STATUS_OK) {
+                if (flags & 4) {
+                    (void)hl_linux_fcntl(g_linux_box, fd, HL_LINUX_F_SETFD, HL_LINUX_FD_CLOEXEC);
+                    (void)fcntl((int)fd, F_SETFD, FD_CLOEXEC);
+                } else {
+                    (void)hl_linux_close(g_linux_box, fd);
+                    close((int)fd);
+                }
+                continue;
+            }
             if (flags & 4) { // CLOSE_RANGE_CLOEXEC
                 int fl = fcntl((int)fd, F_GETFD);
                 if (fl >= 0) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);

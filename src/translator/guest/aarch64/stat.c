@@ -28,3 +28,20 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpa
         (uint64_t)s->st_ctimespec.tv_nsec, s->st_mode, uid, gid};
     (void)hl_linux_stat_encode_aarch64(&record, d, 128);
 }
+
+static void fill_linux_bound_stat(uint8_t *destination, const hl_linux_file_status *status) {
+    hl_linux_stat_record record = {0};
+    record.device = status->device;
+    record.object = status->object;
+    record.links = 1;
+    record.size = status->size;
+    record.blocks_512 = status->blocks_512;
+    record.modified_seconds = (int64_t)(status->modified_ns / UINT64_C(1000000000));
+    record.modified_nanoseconds = status->modified_ns % UINT64_C(1000000000);
+    record.changed_seconds = record.modified_seconds;
+    record.changed_nanoseconds = record.modified_nanoseconds;
+    record.mode = status->mode;
+    record.user = (uint32_t)cuid();
+    record.group = (uint32_t)cgid();
+    (void)hl_linux_stat_encode_aarch64(&record, destination, 128);
+}
