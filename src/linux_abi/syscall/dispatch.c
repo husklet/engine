@@ -652,6 +652,7 @@ static void service_local(struct cpu *c) {
             a1 = nonpie_p(a1);
             a4 = nonpie_p(a4);
             break;                          // sendto(fd, BUF, len, fl, SOCKADDR, alen)
+        case 199: a3 = nonpie_p(a3); break; // socketpair(domain, type, protocol, SV[2])
         case 211:                           // sendmsg(fd, MSGHDR, flags) -- top only
         case 212: a1 = nonpie_p(a1); break; // recvmsg(fd, MSGHDR, flags) -- top only
         case 221:
