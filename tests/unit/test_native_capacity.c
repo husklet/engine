@@ -18,6 +18,7 @@ enum {
     EVENT_COUNT = 129,
     DIRECTORY_COUNT = 129,
     COUNTER_COUNT = 129,
+    SUBSCRIPTION_COUNT = 129,
     TRANSFER_PAIR_COUNT = 33,
     TIMER_COUNT = 257,
     PROCESS_COUNT = 1025,
@@ -26,6 +27,11 @@ enum {
     FILE_COUNT = 1025
 };
 
+static void capacity_notify(void *observer, uint64_t token) {
+    (void)observer;
+    (void)token;
+}
+
 int main(void) {
     hl_native_host *host = NULL;
     hl_host_services services = {0};
@@ -33,6 +39,7 @@ int main(void) {
     hl_host_handle events[EVENT_COUNT] = {0};
     hl_host_handle directories[DIRECTORY_COUNT] = {0};
     hl_host_handle counters[COUNTER_COUNT] = {0};
+    hl_host_handle subscriptions[SUBSCRIPTION_COUNT] = {0};
     hl_host_handle transfers[TRANSFER_PAIR_COUNT * 2] = {0};
     hl_host_handle *mappings = NULL;
     hl_host_handle *files = NULL;
@@ -79,6 +86,13 @@ int main(void) {
         HL_CHECK(created.status == HL_STATUS_OK);
         counters[index] = created.value;
     }
+    for (size_t index = 0; index < SUBSCRIPTION_COUNT; ++index) {
+        hl_host_result subscribed =
+            services.counter->subscribe(services.context, counters[0], capacity_notify, NULL, index + 1u);
+        HL_CHECK(subscribed.status == HL_STATUS_OK);
+        subscriptions[index] = subscribed.value;
+    }
+    HL_CHECK(services.counter->unsubscribe(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
     for (size_t index = 0; index < TRANSFER_PAIR_COUNT; ++index) {
         hl_host_result pair = services.transfer->channel_pair(services.context);
         HL_CHECK(pair.status == HL_STATUS_OK);
@@ -144,6 +158,9 @@ int main(void) {
     for (size_t index = TRANSFER_PAIR_COUNT * 2; index != 0; --index)
         HL_CHECK(services.transfer->close(services.context, transfers[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.transfer->close(services.context, transfers[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    for (size_t index = SUBSCRIPTION_COUNT; index != 0; --index)
+        HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[index - 1]).status == HL_STATUS_OK);
+    HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[0]).status == HL_STATUS_INVALID_ARGUMENT);
     for (size_t index = COUNTER_COUNT; index != 0; --index)
         HL_CHECK(services.counter->close(services.context, counters[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.counter->get_flags(services.context, counters[0]).status == HL_STATUS_INVALID_ARGUMENT);
