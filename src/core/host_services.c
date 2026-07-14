@@ -90,5 +90,11 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->counter->get_flags == NULL || services->counter->set_flags == NULL ||
          services->counter->duplicate == NULL || services->counter->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_TRANSFER) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, transfer), sizeof(services->transfer)) ||
+         !hl_valid_group(services->transfer, HL_HOST_TRANSFER_ABI, sizeof(*services->transfer)) ||
+         services->transfer->channel_pair == NULL || services->transfer->send == NULL ||
+         services->transfer->receive == NULL || services->transfer->close == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     return HL_STATUS_OK;
 }

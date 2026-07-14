@@ -36,15 +36,22 @@ int main(void) {
     hl_host_result other_mutex;
     hl_host_result counter;
     hl_host_result duplicate;
+    hl_host_result channels;
+    hl_host_result transfer_result;
+    hl_host_transfer_attachment sent_attachment;
+    hl_host_transfer_attachment received_attachment;
+    char received_data[8] = {0};
     hl_host_clock_services malformed_clock;
     hl_host_sync_services malformed_sync;
     hl_host_memory_services malformed_memory;
+    hl_host_transfer_services malformed_transfer;
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_PROCESS) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);
@@ -78,6 +85,11 @@ int main(void) {
     truncated = services;
     truncated.sync = &malformed_sync;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+    malformed_transfer = *services.transfer;
+    malformed_transfer.receive = NULL;
+    truncated = services;
+    truncated.transfer = &malformed_transfer;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TRANSFER) == HL_STATUS_ABI_MISMATCH);
 
     truncated = services;
     truncated.size = 8;
@@ -139,6 +151,65 @@ int main(void) {
     HL_CHECK(services.counter->read(services.context, counter.value).status == HL_STATUS_WOULD_BLOCK);
     HL_CHECK(services.counter->set_flags(services.context, counter.value, 0).status == HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK);
+
+    counter = services.counter->create(services.context, 7, 0);
+    HL_CHECK(counter.status == HL_STATUS_OK);
+    channels = services.transfer->channel_pair(services.context);
+    HL_CHECK(channels.status == HL_STATUS_OK && channels.value != 0 && channels.detail != 0 &&
+             fake.live_transfer_channels == 2);
+    sent_attachment = (hl_host_transfer_attachment){counter.value, HL_HOST_TRANSFER_KIND_COUNTER,
+                                                    HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WAIT};
+    transfer_result = services.transfer->send(services.context, channels.value, (hl_host_const_bytes){"hello", 5},
+                                              &sent_attachment, 1);
+    HL_CHECK(transfer_result.status == HL_STATUS_OK && transfer_result.value == 5 && transfer_result.detail == 1);
+    HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK &&
+             fake.live_counters == 1);
+    transfer_result = services.transfer->receive(services.context, channels.detail, (hl_host_bytes){received_data, 4},
+                                                 &received_attachment, 1);
+    HL_CHECK(transfer_result.status == HL_STATUS_RESOURCE_LIMIT);
+    transfer_result =
+        services.transfer->receive(services.context, channels.detail,
+                                   (hl_host_bytes){received_data, sizeof(received_data)}, &received_attachment, 0);
+    HL_CHECK(transfer_result.status == HL_STATUS_RESOURCE_LIMIT);
+    transfer_result =
+        services.transfer->receive(services.context, channels.detail,
+                                   (hl_host_bytes){received_data, sizeof(received_data)}, &received_attachment, 1);
+    HL_CHECK(transfer_result.status == HL_STATUS_OK && transfer_result.value == 5 && transfer_result.detail == 1 &&
+             memcmp(received_data, "hello", 5) == 0);
+    HL_CHECK(received_attachment.kind == HL_HOST_TRANSFER_KIND_COUNTER &&
+             received_attachment.rights == (HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WAIT));
+    HL_CHECK(services.counter->read(services.context, received_attachment.object).value == 7);
+    HL_CHECK(services.counter->write(services.context, received_attachment.object, 1).status ==
+             HL_STATUS_PERMISSION_DENIED);
+    HL_CHECK(services.counter->get_flags(services.context, received_attachment.object).status ==
+             HL_STATUS_PERMISSION_DENIED);
+    HL_CHECK(services.counter->close(services.context, received_attachment.object).status == HL_STATUS_OK &&
+             fake.live_counters == 0);
+    HL_CHECK(services.transfer->close(services.context, channels.value).status == HL_STATUS_OK);
+    HL_CHECK(services.transfer->close(services.context, channels.detail).status == HL_STATUS_OK &&
+             fake.live_transfer_channels == 0);
+
+    counter = services.counter->create(services.context, 1, 0);
+    channels = services.transfer->channel_pair(services.context);
+    sent_attachment =
+        (hl_host_transfer_attachment){counter.value, HL_HOST_TRANSFER_KIND_COUNTER, HL_HOST_TRANSFER_READ};
+    HL_CHECK(services.transfer
+                 ->send(services.context, channels.value, (hl_host_const_bytes){NULL, 0}, &sent_attachment,
+                        HL_HOST_TRANSFER_MAX_ATTACHMENTS + 1)
+                 .status == HL_STATUS_INVALID_ARGUMENT);
+    sent_attachment.rights = UINT32_MAX;
+    HL_CHECK(
+        services.transfer->send(services.context, channels.value, (hl_host_const_bytes){NULL, 0}, &sent_attachment, 1)
+            .status == HL_STATUS_PERMISSION_DENIED);
+    sent_attachment.rights = HL_HOST_TRANSFER_READ;
+    HL_CHECK(
+        services.transfer->send(services.context, channels.value, (hl_host_const_bytes){NULL, 0}, &sent_attachment, 1)
+            .status == HL_STATUS_OK);
+    HL_CHECK(services.counter->close(services.context, counter.value).status == HL_STATUS_OK &&
+             fake.live_counters == 1);
+    HL_CHECK(services.transfer->close(services.context, channels.detail).status == HL_STATUS_OK &&
+             fake.live_counters == 0);
+    HL_CHECK(services.transfer->close(services.context, channels.value).status == HL_STATUS_OK);
 
     hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);
     HL_CHECK(services.memory->reserve(services.context, 4096, 4096, 0).status == HL_STATUS_OUT_OF_MEMORY);

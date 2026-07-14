@@ -16,6 +16,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_COUNTER_ABI 1u
 #define HL_HOST_SYNC_ABI 2u
+#define HL_HOST_TRANSFER_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -33,7 +34,8 @@ enum {
     HL_HOST_CAP_CODE_MAPPING = UINT64_C(1) << 9,
     HL_HOST_CAP_SYNC = UINT64_C(1) << 10,
     HL_HOST_CAP_EVENT_TIMER = UINT64_C(1) << 11,
-    HL_HOST_CAP_COUNTER = UINT64_C(1) << 12
+    HL_HOST_CAP_COUNTER = UINT64_C(1) << 12,
+    HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13
 };
 
 enum {
@@ -294,6 +296,37 @@ typedef struct hl_host_counter_services {
     hl_host_result (*close)(void *context, hl_host_handle counter);
 } hl_host_counter_services;
 
+enum { HL_HOST_TRANSFER_MAX_DATA = 256, HL_HOST_TRANSFER_MAX_ATTACHMENTS = 4, HL_HOST_TRANSFER_KIND_COUNTER = 1 };
+
+enum {
+    HL_HOST_TRANSFER_READ = 1u << 0,
+    HL_HOST_TRANSFER_WRITE = 1u << 1,
+    HL_HOST_TRANSFER_WAIT = 1u << 2,
+    HL_HOST_TRANSFER_CONTROL = 1u << 3
+};
+
+typedef struct hl_host_transfer_attachment {
+    hl_host_handle object;
+    uint32_t kind;
+    uint32_t rights;
+} hl_host_transfer_attachment;
+
+/*
+ * Host-owned message channels transfer object identity, never native descriptor numbers.
+ * send retains each object until receive creates a receiver-local handle or the channel is closed.
+ */
+typedef struct hl_host_transfer_services {
+    HL_ABI_HEADER;
+    /* Returns the two independently closeable endpoints in value and detail. */
+    hl_host_result (*channel_pair)(void *context);
+    hl_host_result (*send)(void *context, hl_host_handle channel, hl_host_const_bytes data,
+                           const hl_host_transfer_attachment *attachments, uint32_t attachment_count);
+    /* value is byte count and detail is attachment count. A successful receive consumes one message. */
+    hl_host_result (*receive)(void *context, hl_host_handle channel, hl_host_bytes data,
+                              hl_host_transfer_attachment *attachments, uint32_t attachment_capacity);
+    hl_host_result (*close)(void *context, hl_host_handle channel);
+} hl_host_transfer_services;
+
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -320,6 +353,7 @@ typedef struct hl_host_services {
     const hl_host_shared_memory_services *shared_memory;
     const hl_host_sync_services *sync;
     const hl_host_counter_services *counter;
+    const hl_host_transfer_services *transfer;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

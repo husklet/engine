@@ -221,6 +221,8 @@ static hl_host_result hl_fake_counter_create(void *context, uint64_t initial, ui
     if (result.status == HL_STATUS_OK) {
         fake->counter_handles[handle_index] = result.value;
         fake->counter_objects[handle_index] = (uint8_t)object_index;
+        fake->counter_rights[handle_index] =
+            HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT | HL_HOST_TRANSFER_CONTROL;
         fake->counter_values[object_index] = initial;
         fake->counter_flags[object_index] = flags;
         fake->counter_references[object_index] = 1;
@@ -236,6 +238,8 @@ static hl_host_result hl_fake_counter_read(void *context, hl_host_handle handle)
     uint64_t value;
     hl_host_result result;
     if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_READ) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
     object = fake->counter_objects[index];
     value = fake->counter_values[object];
     if (value == 0) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
@@ -256,6 +260,8 @@ static hl_host_result hl_fake_counter_write(void *context, hl_host_handle handle
     uint32_t object;
     hl_host_result result;
     if (index < 0 || value == UINT64_MAX) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_WRITE) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
     object = fake->counter_objects[index];
     if (value > UINT64_MAX - 1 - fake->counter_values[object]) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
     result = hl_fake_result(fake, 0);
@@ -268,6 +274,8 @@ static hl_host_result hl_fake_counter_get_flags(void *context, hl_host_handle ha
     hl_fake_host *fake = context;
     int index = hl_fake_counter_handle_index(fake, handle);
     if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_CONTROL) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
     return hl_fake_result(fake, fake->counter_flags[fake->counter_objects[index]]);
 }
 
@@ -277,6 +285,8 @@ static hl_host_result hl_fake_counter_set_flags(void *context, hl_host_handle ha
     uint32_t object;
     if (index < 0 || (flags & ~(uint32_t)(HL_HOST_COUNTER_SEMAPHORE | HL_HOST_COUNTER_NONBLOCK)) != 0)
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((fake->counter_rights[index] & HL_HOST_TRANSFER_CONTROL) == 0)
+        return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
     object = fake->counter_objects[index];
     if ((flags & HL_HOST_COUNTER_SEMAPHORE) != (fake->counter_flags[object] & HL_HOST_COUNTER_SEMAPHORE))
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
@@ -298,6 +308,7 @@ static hl_host_result hl_fake_counter_duplicate(void *context, hl_host_handle ha
         object = fake->counter_objects[source];
         fake->counter_handles[index] = result.value;
         fake->counter_objects[index] = (uint8_t)object;
+        fake->counter_rights[index] = fake->counter_rights[source];
         fake->counter_references[object]++;
     }
     return result;
@@ -314,11 +325,144 @@ static hl_host_result hl_fake_counter_close(void *context, hl_host_handle handle
     object = fake->counter_objects[index];
     fake->counter_handles[index] = 0;
     fake->counter_objects[index] = 0;
+    fake->counter_rights[index] = 0;
     if (--fake->counter_references[object] == 0) {
         fake->counter_values[object] = 0;
         fake->counter_flags[object] = 0;
         fake->live_counters--;
     }
+    return result;
+}
+
+static int hl_fake_transfer_channel_index(const hl_fake_host *fake, hl_host_handle channel) {
+    uint32_t index;
+    for (index = 0; index < 64; ++index)
+        if (fake->transfer_channels[index] == channel) return (int)index;
+    return -1;
+}
+
+static void hl_fake_transfer_drop_message(hl_fake_host *fake, uint32_t index) {
+    uint32_t attachment;
+    for (attachment = 0; attachment < fake->transfer_attachment_counts[index]; ++attachment) {
+        uint32_t object = fake->transfer_objects[index][attachment];
+        if (--fake->counter_references[object] == 0) {
+            fake->counter_values[object] = 0;
+            fake->counter_flags[object] = 0;
+            fake->live_counters--;
+        }
+    }
+    fake->transfer_message_pending[index] = 0;
+    fake->transfer_data_sizes[index] = 0;
+    fake->transfer_attachment_counts[index] = 0;
+}
+
+static hl_host_result hl_fake_transfer_channel_pair(void *context) {
+    hl_fake_host *fake = context;
+    uint32_t first;
+    uint32_t second;
+    hl_host_result result;
+    for (first = 0; first < 64 && fake->transfer_channels[first] != 0; ++first) {}
+    for (second = first + 1; second < 64 && fake->transfer_channels[second] != 0; ++second) {}
+    if (first == 64 || second == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status != HL_STATUS_OK) return result;
+    fake->transfer_channels[first] = result.value;
+    result.detail = ++fake->next_handle;
+    fake->transfer_channels[second] = result.detail;
+    fake->transfer_peers[first] = (uint8_t)second;
+    fake->transfer_peers[second] = (uint8_t)first;
+    fake->live_transfer_channels += 2;
+    return result;
+}
+
+static hl_host_result hl_fake_transfer_send(void *context, hl_host_handle channel, hl_host_const_bytes data,
+                                            const hl_host_transfer_attachment *attachments, uint32_t attachment_count) {
+    hl_fake_host *fake = context;
+    int source = hl_fake_transfer_channel_index(fake, channel);
+    uint32_t destination;
+    uint32_t index;
+    hl_host_result result;
+    const uint32_t all_rights =
+        HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT | HL_HOST_TRANSFER_CONTROL;
+    if (source < 0 || data.size > HL_HOST_TRANSFER_MAX_DATA || (data.size != 0 && data.data == NULL) ||
+        attachment_count > HL_HOST_TRANSFER_MAX_ATTACHMENTS || (attachment_count != 0 && attachments == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    destination = fake->transfer_peers[source];
+    if (fake->transfer_channels[destination] == 0) return (hl_host_result){HL_STATUS_NOT_FOUND, 0, 0, 0};
+    if (fake->transfer_message_pending[destination]) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    for (index = 0; index < attachment_count; ++index) {
+        int handle = hl_fake_counter_handle_index(fake, attachments[index].object);
+        if (handle < 0 || attachments[index].kind != HL_HOST_TRANSFER_KIND_COUNTER || attachments[index].rights == 0 ||
+            (attachments[index].rights & ~all_rights) != 0 ||
+            (attachments[index].rights & ~fake->counter_rights[handle]) != 0)
+            return (hl_host_result){HL_STATUS_PERMISSION_DENIED, 0, 0, 0};
+    }
+    result = hl_fake_result(fake, data.size);
+    if (result.status != HL_STATUS_OK) return result;
+    if (data.size != 0) memcpy(fake->transfer_data[destination], data.data, data.size);
+    fake->transfer_data_sizes[destination] = (uint16_t)data.size;
+    fake->transfer_attachment_counts[destination] = (uint8_t)attachment_count;
+    for (index = 0; index < attachment_count; ++index) {
+        int handle = hl_fake_counter_handle_index(fake, attachments[index].object);
+        uint32_t object = fake->counter_objects[handle];
+        fake->transfer_objects[destination][index] = (uint8_t)object;
+        fake->transfer_rights[destination][index] = attachments[index].rights;
+        fake->counter_references[object]++;
+    }
+    fake->transfer_message_pending[destination] = 1;
+    result.detail = attachment_count;
+    return result;
+}
+
+static hl_host_result hl_fake_transfer_receive(void *context, hl_host_handle channel, hl_host_bytes data,
+                                               hl_host_transfer_attachment *attachments, uint32_t attachment_capacity) {
+    hl_fake_host *fake = context;
+    int channel_index = hl_fake_transfer_channel_index(fake, channel);
+    uint32_t count;
+    uint32_t slots[HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint32_t index;
+    hl_host_result result;
+    if (channel_index < 0 || (data.size != 0 && data.data == NULL) || (attachment_capacity != 0 && attachments == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (!fake->transfer_message_pending[channel_index]) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    count = fake->transfer_attachment_counts[channel_index];
+    if (data.size < fake->transfer_data_sizes[channel_index] || attachment_capacity < count)
+        return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, fake->transfer_data_sizes[channel_index], count};
+    for (index = 0; index < count; ++index) {
+        uint32_t slot;
+        for (slot = index == 0 ? 0 : slots[index - 1] + 1; slot < 64 && fake->counter_handles[slot] != 0; ++slot) {}
+        if (slot == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+        slots[index] = slot;
+    }
+    result = hl_fake_result(fake, fake->transfer_data_sizes[channel_index]);
+    if (result.status != HL_STATUS_OK) return result;
+    if (result.value != 0) memcpy(data.data, fake->transfer_data[channel_index], result.value);
+    for (index = 0; index < count; ++index) {
+        uint32_t slot = slots[index];
+        fake->counter_handles[slot] = ++fake->next_handle;
+        fake->counter_objects[slot] = fake->transfer_objects[channel_index][index];
+        fake->counter_rights[slot] = fake->transfer_rights[channel_index][index];
+        attachments[index].object = fake->counter_handles[slot];
+        attachments[index].kind = HL_HOST_TRANSFER_KIND_COUNTER;
+        attachments[index].rights = fake->counter_rights[slot];
+    }
+    fake->transfer_message_pending[channel_index] = 0;
+    fake->transfer_data_sizes[channel_index] = 0;
+    fake->transfer_attachment_counts[channel_index] = 0;
+    result.detail = count;
+    return result;
+}
+
+static hl_host_result hl_fake_transfer_close(void *context, hl_host_handle channel) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_transfer_channel_index(fake, channel);
+    hl_host_result result;
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    result = hl_fake_result(fake, 0);
+    if (result.status != HL_STATUS_OK) return result;
+    if (fake->transfer_message_pending[index]) hl_fake_transfer_drop_message(fake, (uint32_t)index);
+    fake->transfer_channels[index] = 0;
+    fake->live_transfer_channels--;
     return result;
 }
 
@@ -356,6 +500,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
         HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,
         hl_fake_counter_read,      hl_fake_counter_write,     hl_fake_counter_get_flags,
         hl_fake_counter_set_flags, hl_fake_counter_duplicate, hl_fake_counter_close};
+    static const hl_host_transfer_services transfer = {HL_HOST_TRANSFER_ABI,          sizeof(transfer),
+                                                       hl_fake_transfer_channel_pair, hl_fake_transfer_send,
+                                                       hl_fake_transfer_receive,      hl_fake_transfer_close};
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -366,14 +513,15 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_CODE;
     services->abi = HL_HOST_SERVICES_ABI;
     services->size = sizeof(*services);
-    services->capabilities =
-        HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER;
+    services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
+                             HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
     services->process = &process;
     services->sync = &sync;
     services->counter = &counter;
+    services->transfer = &transfer;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

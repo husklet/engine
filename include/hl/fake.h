@@ -27,7 +27,17 @@ typedef struct hl_fake_host {
     uint64_t counter_values[64];
     uint32_t counter_flags[64];
     uint32_t counter_references[64];
+    uint32_t counter_rights[64];
     uint32_t live_counters;
+    uint64_t transfer_channels[64];
+    uint8_t transfer_peers[64];
+    uint8_t transfer_message_pending[64];
+    uint16_t transfer_data_sizes[64];
+    uint8_t transfer_attachment_counts[64];
+    uint8_t transfer_data[64][HL_HOST_TRANSFER_MAX_DATA];
+    uint8_t transfer_objects[64][HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint32_t transfer_rights[64][HL_HOST_TRANSFER_MAX_ATTACHMENTS];
+    uint32_t live_transfer_channels;
     int32_t process_exit_value;
     hl_status next_failure;
 } hl_fake_host;
