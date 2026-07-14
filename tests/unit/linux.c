@@ -9,9 +9,11 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -84,6 +86,117 @@ static void *wait_for_process(void *opaque) {
     return NULL;
 }
 
+typedef struct code_publish_context {
+    const hl_host_services *services;
+    hl_host_code_mapping *mapping;
+    _Atomic int stop;
+    _Atomic uint64_t publishes;
+} code_publish_context;
+
+static void write_return_code(void *address, unsigned value) {
+#if defined(__aarch64__)
+    uint32_t code[2] = {UINT32_C(0x52800000) | ((value & UINT32_C(0xffff)) << 5), UINT32_C(0xd65f03c0)};
+    memcpy(address, code, sizeof(code));
+#elif defined(__x86_64__)
+    unsigned char code[6] = {0xb8, (unsigned char)value, 0, 0, 0, 0xc3};
+    memcpy(address, code, sizeof(code));
+#else
+#error unsupported Linux host ISA for executable code mapping test
+#endif
+}
+
+static int call_return_code(uint64_t address) {
+    int (*function)(void) = NULL;
+    memcpy(&function, &address, sizeof(function));
+    return function();
+}
+
+static void *publish_code_forever(void *opaque) {
+    code_publish_context *context = opaque;
+    while (!atomic_load_explicit(&context->stop, memory_order_acquire)) {
+        hl_host_result result = context->services->memory->publish_code(
+            context->services->context, context->mapping->handle, 0, context->mapping->mapped_size);
+        if (result.status != HL_STATUS_OK) break;
+        atomic_fetch_add_explicit(&context->publishes, 1, memory_order_release);
+    }
+    return NULL;
+}
+
+static int check_code_mapping_fork(const hl_host_services *services) {
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    hl_host_code_mapping code = {0};
+    hl_host_result result;
+    pid_t child;
+    int status;
+    pthread_t publisher;
+    code_publish_context context = {services, &code, 0, 0};
+    if (page == 0 || page > SIZE_MAX) return 1;
+    result = services->memory->reserve_code(services->context, page, page, HL_HOST_CODE_DUAL_ALIAS, &code);
+    if (result.status != HL_STATUS_OK || code.writable_address == code.executable_address) return 2;
+    write_return_code((void *)(uintptr_t)code.writable_address, 41);
+    if (services->memory->publish_code(services->context, code.handle, 0, page).status != HL_STATUS_OK ||
+        call_return_code(code.executable_address) != 41)
+        return 3;
+
+    child = fork();
+    if (child == 0) {
+        uint64_t writable = code.writable_address, executable = code.executable_address;
+        hl_host_handle handle = code.handle;
+        if (services->memory->repair_code_after_fork(services->context, &code, 1).status != HL_STATUS_OK ||
+            code.handle != handle || code.writable_address != writable || code.executable_address != executable ||
+            call_return_code(code.executable_address) != 41)
+            _exit(11);
+        write_return_code((void *)(uintptr_t)code.writable_address, 42);
+        if (services->memory->publish_code(services->context, code.handle, 0, page).status != HL_STATUS_OK ||
+            call_return_code(code.executable_address) != 42 ||
+            services->memory->release(services->context, code.handle).status != HL_STATUS_OK)
+            _exit(12);
+        _exit(0);
+    }
+    if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 4;
+    if (call_return_code(code.executable_address) != 41) return 5;
+
+    if (pthread_create(&publisher, NULL, publish_code_forever, &context) != 0) return 6;
+    while (atomic_load_explicit(&context.publishes, memory_order_acquire) == 0) sched_yield();
+    for (unsigned iteration = 0; iteration < 16; ++iteration) {
+        child = fork();
+        if (child == 0) {
+            uint64_t old_writable = code.writable_address, old_executable = code.executable_address;
+            hl_host_handle handle = code.handle;
+            uint32_t preserve = iteration & 1u;
+            if (services->memory->repair_code_after_fork(services->context, &code, preserve).status != HL_STATUS_OK ||
+                code.handle != handle || code.writable_address == code.executable_address ||
+                (preserve != 0 &&
+                 (code.writable_address != old_writable || code.executable_address != old_executable ||
+                  call_return_code(code.executable_address) != 41)) ||
+                (preserve == 0 &&
+                 (code.writable_address == old_writable || code.executable_address == old_executable)))
+                _exit(21);
+            write_return_code((void *)(uintptr_t)code.writable_address, 43);
+            if (services->memory->publish_code(services->context, code.handle, 0, page).status != HL_STATUS_OK ||
+                call_return_code(code.executable_address) != 43 ||
+                services->memory->release(services->context, handle).status != HL_STATUS_OK ||
+                services->memory->release(services->context, handle).status != HL_STATUS_INVALID_ARGUMENT)
+                _exit(22);
+            _exit(0);
+        }
+        if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            atomic_store_explicit(&context.stop, 1, memory_order_release);
+            pthread_join(publisher, NULL);
+            return 7;
+        }
+        if (call_return_code(code.executable_address) != 41) {
+            atomic_store_explicit(&context.stop, 1, memory_order_release);
+            pthread_join(publisher, NULL);
+            return 8;
+        }
+    }
+    atomic_store_explicit(&context.stop, 1, memory_order_release);
+    if (pthread_join(publisher, NULL) != 0 || atomic_load_explicit(&context.publishes, memory_order_relaxed) == 0)
+        return 9;
+    return services->memory->release(services->context, code.handle).status == HL_STATUS_OK ? 0 : 10;
+}
+
 static int32_t process_cleanup_probe(void *opaque) {
     cleanup_probe *probe = opaque;
     pid_t pid = getpid();
@@ -115,6 +228,7 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    HL_CHECK(check_code_mapping_fork(&services) == 0);
     {
         hl_host_result source = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);
         hl_host_result destination = services.stream->pipe_pair(services.context, HL_HOST_STREAM_NONBLOCK);

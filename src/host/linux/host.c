@@ -500,20 +500,96 @@ static hl_host_result hl_linux_memory_reserve_code(void *context, uint64_t size,
 static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
     hl_host_linux *host = context;
     hl_linux_handle_entry *entry;
-    (void)preserve;
+    hl_linux_handle_entry inherited;
+    int descriptor = -1;
+    void *writable = MAP_FAILED;
+    void *executable = MAP_FAILED;
     if (mapping == NULL || mapping->abi != 1 || mapping->size < sizeof(*mapping))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+
+    /* This entry point is called only in the fork child. A sibling may have
+       owned the process-private registry lock when fork cloned the caller, so
+       its inherited pthread state cannot be acquired or destroyed safely. */
+    {
+        pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+        memcpy(&host->lock, &fresh, sizeof(fresh));
+    }
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, mapping->handle, HL_LINUX_HANDLE_MAPPING);
     if (entry == NULL || entry->executable_address == NULL) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    mapping->writable_address = (uint64_t)(uintptr_t)entry->address;
-    mapping->executable_address = (uint64_t)(uintptr_t)entry->executable_address;
-    mapping->mapped_size = entry->size;
+    inherited = *entry;
     pthread_mutex_unlock(&host->lock);
+
+    if (inherited.executable_address != inherited.address) {
+        descriptor = memfd_create("hl-code", MFD_CLOEXEC);
+        if (descriptor < 0) return hl_linux_errno_result();
+        if (ftruncate(descriptor, (off_t)inherited.size) != 0) goto fresh_failed;
+        writable = mmap(NULL, (size_t)inherited.size, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
+        if (writable == MAP_FAILED) goto fresh_failed;
+        executable = mmap(NULL, (size_t)inherited.size, PROT_READ | PROT_EXEC, MAP_SHARED, descriptor, 0);
+        if (executable == MAP_FAILED) goto fresh_failed;
+
+        if (preserve != 0) {
+            /* Linux inherits MAP_SHARED memfd pages as genuinely process-shared
+               pages. Give the child a private backing object while retaining
+               the exact cache addresses and bytes expected by every map entry,
+               chain, and inline-cache pointer. */
+            memcpy(writable, inherited.address, (size_t)inherited.size);
+            if (mmap(inherited.address, (size_t)inherited.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                     descriptor, 0) == MAP_FAILED ||
+                mmap(inherited.executable_address, (size_t)inherited.size, PROT_READ | PROT_EXEC,
+                     MAP_SHARED | MAP_FIXED, descriptor, 0) == MAP_FAILED)
+                goto fresh_failed;
+            (void)munmap(executable, (size_t)inherited.size);
+            (void)munmap(writable, (size_t)inherited.size);
+            writable = inherited.address;
+            executable = inherited.executable_address;
+        }
+
+        /* Publish the replacement under the same opaque handle and generation.
+           The inherited VMAs remain mapped until publication is complete, so a
+           new alias can never be accidentally removed through a reused VA. */
+        hl_host_process_fd_private_add(descriptor);
+        pthread_mutex_lock(&host->lock);
+        entry = hl_linux_lookup_locked(host, mapping->handle, HL_LINUX_HANDLE_MAPPING);
+        if (entry == NULL || entry->descriptor != inherited.descriptor || entry->address != inherited.address ||
+            entry->executable_address != inherited.executable_address || entry->size != inherited.size) {
+            pthread_mutex_unlock(&host->lock);
+            hl_host_process_fd_private_remove(descriptor);
+            goto fresh_failed;
+        }
+        entry->descriptor = descriptor;
+        entry->address = writable;
+        entry->executable_address = executable;
+        pthread_mutex_unlock(&host->lock);
+
+        hl_host_process_fd_private_remove(inherited.descriptor);
+        if (preserve == 0) {
+            (void)munmap(inherited.executable_address, (size_t)inherited.size);
+            (void)munmap(inherited.address, (size_t)inherited.size);
+        }
+        if (inherited.descriptor >= 0) (void)close(inherited.descriptor);
+    } else {
+        writable = inherited.address;
+        executable = inherited.executable_address;
+    }
+
+    mapping->writable_address = (uint64_t)(uintptr_t)writable;
+    mapping->executable_address = (uint64_t)(uintptr_t)executable;
+    mapping->mapped_size = inherited.size;
     return hl_linux_result(HL_STATUS_OK, mapping->handle, 0);
+
+fresh_failed: {
+    int error = errno;
+    if (executable != MAP_FAILED) (void)munmap(executable, (size_t)inherited.size);
+    if (writable != MAP_FAILED) (void)munmap(writable, (size_t)inherited.size);
+    if (descriptor >= 0) (void)close(descriptor);
+    errno = error;
+    return hl_linux_errno_result();
+}
 }
 
 static hl_host_result hl_linux_clock(int clock_id) {
