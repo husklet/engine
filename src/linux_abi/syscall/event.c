@@ -72,17 +72,12 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
 #define EP_WAKE_IDENT ((uintptr_t)0x7fffffe0u) // EVFILT_USER ident, disjoint from any real fd number
 static uint8_t g_ep_wake_armed[DD_NFD];          // per epoll fd: EVFILT_USER wake knote installed on its kqueue
 static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
-// Wall 7 trace focus: sticky per-epoll flag set the first time an AF_UNIX/eventfd (a Mojo channel/wake
-// fd) is registered on this instance, so epoll_wait tracing is confined to the renderer's Mojo IO-pump
-// epoll and not the timer/signal epolls. Touched only under DD_WALL7_TRACE.
-static uint8_t g_ep_has_mojo[DD_NFD];
-
 // per-epoll-instance registered-fd membership (lazily allocated DD_NFD-bit bitmap indexed by the
 // watched fd -- the bitmap must span the SAME index range as the fd < DD_NFD guard on ep_mem_test/
 // ep_mem_set and the sibling [DD_NFD] interest tables; large event loops register hundreds of fds,
 // so the watched-fd number routinely exceeds 1024 and any narrower bitmap would be indexed out of
 // bounds -- a heap overflow whose corrupted/garbage membership bit spuriously returns EEXIST and drops
-// the real registration, stranding that fd's readiness (the load-dependent renderer node-connect stall).
+// the real registration, stranding that fd's readiness (a load-dependent node-connect stall).
 // watched fd). kqueue silently accepts an EV_ADD of an already-armed filter and an EV_DELETE of an
 // absent one, but Linux epoll_ctl returns EEXIST / ENOENT respectively, so track membership to serve
 // those (plus EINVAL for adding the epoll fd to itself and EPERM for a regular file / directory). Only
@@ -361,7 +356,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // Validate `flags` exactly as Linux (fs/eventfd.c): only EFD_SEMAPHORE(1) | EFD_NONBLOCK(O_NONBLOCK
         // 0x800) | EFD_CLOEXEC(O_CLOEXEC 0x80000) are defined; any other bit -> EINVAL. IPC runtimes
         // EventFDNotifier::KernelSupported() probes eventfd2(0, ~0) and PCHECKs it FAILS with EINVAL/ENOSYS/
-        // EPERM (channel_linux.cc); without this the probe SUCCEEDED and the browser aborted.
+        // EPERM; without this the probe succeeded and the caller aborted.
         if ((unsigned)a1 & ~(unsigned)(1u | 0x800u | 0x80000u)) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -508,12 +503,6 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 g_ep_events[fd] = ev;
                 g_ep_udata[fd] = data;
             }
-        }
-        if (w7_on() && fd >= 0 && fd < DD_NFD && (g_sock_fam[fd] == AF_UNIX || g_eventfd_peer[fd])) {
-            if (epfd >= 0 && epfd < DD_NFD && op != 2) g_ep_has_mojo[epfd] = 1;
-            w7_trace("epoll_ctl %s epfd=%d fd=%d ev=0x%x%s%s kind=%s", op == 1 ? "ADD" : op == 2 ? "DEL" : "MOD",
-                     epfd, fd, ev, (ev & 0x1) ? " IN" : "", (ev & 0x80000000u) ? " ET" : "",
-                     g_eventfd_peer[fd] ? "eventfd" : "unix");
         }
         // op: 1=ADD 2=DEL 3=MOD ; EPOLLET=0x80000000 -> EV_CLEAR ; EPOLLONESHOT=0x40000000 -> EV_ONESHOT
         uint16_t xf = (uint16_t)((ev & 0x80000000u ? EV_CLEAR : 0) | (ev & 0x40000000u ? EV_ONESHOT : 0));
@@ -669,28 +658,13 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             // epoll_wait is never restarted by a handler -- re-wait only on a SPURIOUS EINTR (nothing to
             // deliver); the moment a guest handler is runnable we return -EINTR and let the dispatcher run it.
             // kevent applies the changelist before blocking, so a retry re-waits only (changes consumed -> none).
-            if (w7_on() && ep >= 0 && ep < DD_NFD && g_ep_has_mojo[ep] && tp == NULL)
-                w7_trace("epoll_wait BLOCK epfd=%d tmo=inf nchg=%d", ep, nchg); // dormant if no matching WAKE follows
-            ts_wait_enter();                                                    // 'S' while blocked in epoll_wait/epoll_pwait
+            ts_wait_enter(); // 'S' while blocked in epoll_wait/epoll_pwait
             do {
                 r = kevent(ep, chg, nchg, kv, maxev, tp);
                 chg = NULL;
                 nchg = 0;
             } while (r < 0 && svc_poll_retry(c));
             ts_wait_leave();
-            if (w7_on() && ep >= 0 && ep < DD_NFD && g_ep_has_mojo[ep] && r > 0) {
-                char ids[240];
-                int p = 0;
-                for (int i = 0; i < r && p < (int)sizeof ids - 28; i++) {
-                    const char *fn = kv[i].filter == EVFILT_READ    ? "R"
-                                     : kv[i].filter == EVFILT_WRITE  ? "W"
-                                     : kv[i].filter == EVFILT_USER   ? "U"
-                                                                     : "?";
-                    p += snprintf(ids + p, sizeof ids - (size_t)p, " %d%s%s", (int)kv[i].ident, fn,
-                                  (kv[i].flags & EV_EOF) ? "!EOF" : "");
-                }
-                w7_trace("epoll_wait WAKE epfd=%d r=%d fds=%s", ep, r, ids);
-            }
             if (opt && !lk) g_ep_chgn[ep] = 0; // consumed (threaded flushed it under the lock already)
             if (r < 0) {
                 G_RET(c) = (uint64_t)(-errno);

@@ -12,6 +12,7 @@ CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
+DEPFLAGS := -MMD -MP
 PRIVATE_HEADERS := src/core/cli.h src/host/sync.h src/linux_abi/encode.h src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
@@ -58,6 +59,15 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-linux
 endif
 
+NATIVE_OBJECTS := $(CORE_OBJECTS) $(TRANSLATOR_OBJECTS) $(LINUX_ABI_OBJECTS) $(FAKE_HOST_OBJECTS) \
+	$(LINUX_HOST_OBJECTS)
+MAC_OBJECTS := $(MAC_CORE_OBJECTS) $(MAC_TRANSLATOR_OBJECTS) $(MAC_LINUX_ABI_OBJECTS) $(MAC_HOST_OBJECTS)
+MAC_AUX_OBJECTS := $(BUILD)/mac/target/aarch64.o $(BUILD)/mac/target/x86_64.o \
+	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/x86_64-target.o \
+	$(BUILD)/mac/lifecycle/aarch64-core.o $(BUILD)/mac/lifecycle/x86_64-core.o \
+	$(BUILD)/mac/lifecycle/aarch64-runner.o $(BUILD)/mac/lifecycle/x86_64-runner.o
+DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d)
+
 UNIT_NAMES := affinity arena cli clock codegen config device digest emit file host_services identity ir launch linux_abi stat engine errno limits log namespace number options parse profile readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
@@ -78,11 +88,11 @@ all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/li
 
 $(BUILD)/src/%.o: src/%.c
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/%.o: %.c
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lib/libhl-engine.a: $(MAC_CORE_OBJECTS)
 	@mkdir -p $(@D)
@@ -196,11 +206,11 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 
 $(BUILD)/mac/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -218,27 +228,27 @@ compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/
 
 $(BUILD)/mac/lifecycle/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lifecycle/x86_64-target.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lifecycle/aarch64-core.o: src/core/lifecycle.c
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lifecycle/x86_64-core.o: src/core/lifecycle.c
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lifecycle/aarch64-runner.o: tools/lifecycle_e2e_runner.c
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lifecycle/x86_64-runner.o: tools/lifecycle_e2e_runner.c
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tools/lifecycle-aarch64: $(BUILD)/mac/lifecycle/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
@@ -372,3 +382,7 @@ help:
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
 	@echo 'make format-check  enforce the repository clang-format policy'
+
+# Compiler-generated prerequisites keep standalone objects synchronized with public and private headers.
+# Missing .d files are expected on a clean tree; -MP leaves harmless stubs for headers removed later.
+-include $(DEPENDENCY_FILES)

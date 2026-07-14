@@ -13,15 +13,10 @@
 //                        fork/chroot-reset via rc_reset). overlay_lookup consults it so a fresh
 //                        container's metadata storm (tar/find/ld.so over a still-empty upper) skips
 //                        the per-entry upper realpath climb + whiteout + opaque probes entirely.
-static void res_bump(void);
-static int updirneg_lookup(const char *dir);
-static void updirneg_store(const char *dir);
 //   updirverdict_* -- the " merged-view directory VERDICT" memo (0 present / 1 hidden /
 //                        2 opaque-cut), epoch-gated, fork/chroot-reset via rc_reset. overlay_dir_verdict
 //                        fills it so a lower-only child under a whiteout-removed or opaque-recreated
 //                        parent is not surfaced as a stale positive by the per-layer resolve.
-static int updirverdict_lookup(const char *dir, int *verdict);
-static void updirverdict_store(const char *dir, int verdict);
 static const char *xresolve_exec(const char *p, char *buf,
                                  // fwd (defined below; overlay uses it for the upper)
                                  size_t n);

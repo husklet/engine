@@ -175,7 +175,7 @@ __attribute__((constructor)) static void futex_table_ctor(void) {
 // addresses, so the SAME physical futex word has a different VA in each. Linux keys such a word by the
 // SHARED object identity (inode + page offset), so a FUTEX_WAKE through one mapping reaches a FUTEX_WAIT
 // parked through another. dd's VA-only key put the two in different buckets and LOST the wake -- the
-// documented "Wall 7": the renderer's command-buffer flush never woke the GPU service, so page content was
+// observed failure: one process's command-buffer flush never woke its peer, so page content was
 // never rasterized. (A fork-inherited anon MAP_SHARED page keeps the VA key: same VA in both processes.)
 //
 // Fix: record every file-backed MAP_SHARED region {host VA range -> (st_dev, st_ino, file offset)} at mmap

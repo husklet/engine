@@ -321,7 +321,7 @@ static void cmsg_note_recv_sock_fd(int fd);
 
 // guest(Linux) control buf -> host(macOS) control buf. Returns host bytes written (<=cap), 0/none,
 // or -1 with *errp set. A partial ancillary conversion must never be sent: silently dropping SCM_RIGHTS
-// fds leaves higher-level protocols like Mojo with a successful data message but missing handles.
+// fds leaves higher-level protocols with a successful data message but missing handles.
 static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, int *errp) {
     if (errp) *errp = 0;
     cmsg_tmpfds_close();
@@ -567,25 +567,25 @@ static int g_sock_pair_peer[DD_NFD];
 // fd -> a DISTINCT synthetic peer pid stamped on both ends at socketpair() creation (0 = none). macOS
 // captures LOCAL_PEERPID at socketpair-creation time and reports the CREATOR's pid on BOTH ends, never
 // updating it on fork -- so the process that CREATED the pair (typically container init, guest
-// pid 1) reads its OWN pid as the peer credential for every forked child (renderer/GPU), which the
+// pid 1) reads its OWN pid as the peer credential for every forked child, which the
 // SCM_CREDENTIALS/SO_PEERCRED self-fallback then collapsed to container_pid() == guest 1 for ALL of them.
-// Mojo uses that peer pid as the ports node identity, so every child collided on node "1" and the ports
+// IPC uses that peer pid as a node identity, so every child collided on node "1" and the
 // node-merge never finalized (transport up, but OnChannelConnected never fired -> the child's IO thread
 // blocked in recvmsg -> the 15s EnsureConnected watchdog killed it, before any Wayland/xdg_surface/frame).
 // Stamping each end with a unique id (>= 1<<30, above Linux PID_MAX ~4M so it never aliases a real guest
-// pid Mojo also tracks) gives every child a distinct, non-self node identity whenever LOCAL_PEERPID
+// pid the protocol also tracks) gives every child a distinct, non-self node identity whenever LOCAL_PEERPID
 // degenerates to self. Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
 static int g_sock_peer_pid[DD_NFD];
 
 // fd -> 1 if THIS process has actually SENT on this SEQPACKET/O_DIRECT-pipe endpoint (0 = never used it).
 // The synthetic peer-EOF injected on close (seq_send_eof) may fire ONLY for an endpoint this process wrote
 // to -- never for one it merely inherited across fork and never used. Rationale:
-// when the browser forks a renderer/GPU child, that child inherits ALL the browser's open fds, including the
-// browser's SEND end of a Mojo channel meant for a DIFFERENT child. The bystander never sends on it, but on
+// when a parent forks a child, that child inherits ALL the parent's open fds, including the
+// parent's SEND end of an IPC channel meant for a DIFFERENT child. The bystander never sends on it, but on
 // startup it CLOSES the inherited copy -- and the old close-time EOF injection then delivered a spurious
 // zero-length "EOF" datagram into the peer end, which is the REAL target child's LIVE recv queue. That child
 // read the premature 0 as end-of-channel and gave up ("Terminating after 15 seconds with no connection"),
-// which in turn dropped its channel ref so the browser's next invitation send got ECONNRESET. A per-fd
+// which in turn dropped its channel ref so the parent's next invitation send got ECONNRESET. A per-fd
 // "did I ever write here" gate makes a never-used inherited end silent (correct: a bystander's close signals
 // nothing on Linux either), while a genuine writer's close still injects the EOF a blocked reader needs
 // (rustc/make jobserver, O_DIRECT pipe). RESET on fork (a child starts having-written nothing -- seq_wrote_
@@ -655,7 +655,7 @@ static void seq_send_eof(int fd) {
     if (!seq_is(fd)) return;
     // Only a genuine WRITER on this endpoint may synthesize the peer's EOF on close. An endpoint this process
     // merely inherited across fork and never wrote to belongs to another process's channel topology -- a
-    // bystander renderer/GPU child closing the browser's inherited Mojo channel-send end must NOT dump a
+    // bystander child closing the parent's inherited IPC channel-send end must NOT dump a
     // zero-length "EOF" into the real target child's live recv queue. On
     // Linux a bystander's close signals nothing to the peer either, so staying silent is Linux-exact; a real
     // writer's last close still injects the EOF a blocked reader needs (jobserver / O_DIRECT pipe). See

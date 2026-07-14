@@ -8,7 +8,7 @@
 // DD_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
 // A high-fd shared-memory channel can create a memfd whose fd is >=1024, and F_ADD_SEALS then returned
-// EINVAL (fd out of the tracked range) and the browser aborted (channel_linux.cc). 65536 covers a realistic
+// EINVAL (fd out of the tracked range) and the IPC runtime aborted. 65536 covers a realistic
 // RLIMIT_NOFILE; the tables are zero-init BSS so the cost is a few MB of never-resident address space.
 #define DD_NFD 65536
 

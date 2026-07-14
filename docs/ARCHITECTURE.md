@@ -14,7 +14,7 @@ axes. Host operating-system behavior enters only through `hl_host_services`.
 4. Engine state is opaque and instance-owned. New code cannot add mutable process globals.
 5. Public structures begin with `abi,size`, are append-only within an ABI, and use fixed-width types. No `pid_t`, native
    fd, compiler-sized enum or Rust layout leaks into the public boundary.
-6. Process-global signal handlers, fork behavior, and `_exit` belong to the production runner boundary. Library
+6. Process-global signal handlers, fork behavior, and `_exit` belong to the target runner boundary. Library
    interfaces must not acquire those responsibilities implicitly.
 7. Logging calls use portable tags and an instance-owned `hl_log_context`. They are compiled out unless
    `HL_ENABLE_LOGGING=1`; host backends are byte sinks and never implement tag policy.
@@ -25,6 +25,13 @@ IR is private and versioned. Operands refer only to earlier SSA-like values; blo
 validation occurs before lowering. Persistent cache identity will include guest ISA, host ISA, IR ABI, codegen ABI
 and every code-changing feature. Direct emitters and IR lowerers obey the same guest-state and cache-identity
 contracts.
+
+## Current target boundary
+
+`src/core/target/aarch64.c` and `src/core/target/x86_64.c` are the executable target roots. They still textually include
+parts of the translator and Linux ABI and therefore compile as unity objects. Independently compiled core, translator,
+Linux ABI, and host-service sources live in their corresponding archives. New shared behavior belongs in those
+archives; shrinking the two target roots must preserve both guest ISAs and the public lifecycle contract.
 
 ## Rebranding
 

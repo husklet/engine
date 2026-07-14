@@ -189,7 +189,7 @@ __attribute__((constructor)) static void eventfd_count_ctor(void) {
 // threads (work-scheduling writers versus an event-loop reader) interleave and strand the invariant
 // "pipe-readable IFF count>0": a byte left in the pipe with count==0 makes a level-triggered epoll_wait
 // report the fd endlessly ready while read() returns EAGAIN (the pump busy-spins), and an edge-triggered
-// watcher that saw no fresh edge never wakes at all (the "lost wakeup" park). Either way the browser main
+// watcher that saw no fresh edge never wakes at all (the "lost wakeup" park). Either way the event-loop
 // thread stops making progress. Serialize every counter+pipe mutation for a given eventfd under this lock
 // so the pair is atomic; the epoll/kqueue side then only ever observes a consistent pipe state. Process-
 // private (in-process multi-threading is the case that matters -- the counter's own MAP_SHARED cross-fork
@@ -928,8 +928,6 @@ static int jail_pick(const char *abs, const char **canon, size_t *clen, const ch
 // hard-reset on fork/chroot (rc_reset), volumes never cached, DD_NOPATHCACHE=1 kills it. See the full
 // correctness model at the impl. DC_KEYMAX bounds the fixed-size slots (longer paths bypass, safely).
 #define DC_KEYMAX 320
-static int dc_lookup(const char *key, char *canon, size_t n, int *nmiss);
-static void dc_store(const char *key, const char *canon, int nmiss);
 static int dc_jail_cacheable(const char *jcanon);
 
 // Core: confine `rel` within an explicit jail root (jcanon). Generalized from secure_resolve so the

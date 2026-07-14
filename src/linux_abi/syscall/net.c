@@ -317,31 +317,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // whereas a Linux SEQPACKET message is bounded only by SO_SNDBUF (~208KB default) and never
                 // hits a 2KB wall. Large SEQPACKET bootstrap messages require the Linux-sized buffer, and bring-up
                 // messages (the invitation carrying serialized handles, GPU/Viz init IPCs) routinely exceed
-                // 2KB: on the DGRAM backing those sends fail and the message is lost, so the browser<->child
+                // 2KB: on the DGRAM backing those sends fail and the message is lost, so the parent/child
                 // handshake wedges forever (the UI thread blocks on a readiness event the child can never
                 // signal -> no window is ever created). Raise SO_SNDBUF/SO_RCVBUF on BOTH ends (a per-socket
                 // buffer overrides the maxdgram default; verified: with 1MB buffers, 256KB datagrams send OK)
                 // so an emulated SEQPACKET carries the same large messages a real Linux SEQPACKET does. Both
                 // ends are bidirectional (each sends and receives), and the setting survives the fork/exec
                 // that hands one end to the child (it is a property of the kernel socket object).
-                int bufsz = 1 << 20; // 1 MiB: comfortably above any realistic Mojo channel message
+                int bufsz = 1 << 20; // 1 MiB: comfortably above a realistic IPC channel message
                 setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz);
                 setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz);
                 setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof bufsz);
                 setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof bufsz);
                 // Stamp each end with a DISTINCT synthetic peer node identity. macOS reports the socketpair
-                // CREATOR's pid via LOCAL_PEERPID on BOTH ends (never updated on fork), so once the browser
-                // forks a renderer the browser's cred/peercred query on its end degenerates to self; without a
-                // distinct id every forked child collided on guest pid 1 and Mojo's ports node-merge hung.
+                // CREATOR's pid via LOCAL_PEERPID on BOTH ends (never updated on fork), so once the parent
+                // forks a child its cred/peercred query degenerates to self; without a distinct id every
+                // forked child collides on guest pid 1 and peer-node merging hangs.
                 if (sv[0] >= 0 && sv[0] < DD_NFD) g_sock_seqpacket[sv[0]] = 1;
                 if (sv[1] >= 0 && sv[1] < DD_NFD) g_sock_seqpacket[sv[1]] = 1;
             }
         }
-        if (r == 0 && (int)a0 == AF_UNIX)
-            w7_trace("socketpair AF_UNIX ty=%s fds=[%d,%d] peer_pid=[%d,%d]",
-                     lty == SOCK_STREAM ? "STREAM" : lty == SOCK_SEQPACKET ? "SEQPACKET" : "DGRAM", sv[0], sv[1],
-                     (sv[0] >= 0 && sv[0] < DD_NFD) ? g_sock_peer_pid[sv[0]] : 0,
-                     (sv[1] >= 0 && sv[1] < DD_NFD) ? g_sock_peer_pid[sv[1]] : 0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -991,7 +986,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int lvl = (int)a1, opt = (int)a2;
         // SO_PASSCRED (Linux SOL_SOCKET/16): macOS has no equivalent. Record it per-fd so recvmsg(212)
         // synthesizes the SCM_CREDENTIALS ancillary record the Linux kernel would auto-attach (credential-aware
-        // Mojo bootstrap requires it). Never fail the guest.
+        // credential-aware IPC bootstrap requires it). Never fail the guest.
         if (lvl == 1 && opt == 16) {
             // Validate the fd like the real kernel before recording state: a closed fd is EBADF, a non-socket
             // is ENOTSOCK. SO_TYPE succeeds for any socket and reproduces both errnos on the host.
@@ -1087,7 +1082,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 pid_t ppid = 0;
                 socklen_t pl = sizeof ppid;
                 if (getsockopt((int)a0, SOL_LOCAL, LOCAL_PEERPID, &ppid, &pl) < 0 || ppid <= 0 || ppid == getpid()) {
-                    // macOS reports the socketpair CREATOR's pid on both ends -> a fork parent (the browser)
+                    // macOS reports the socketpair CREATOR's pid on both ends -> a fork parent
                     // reads its OWN pid here for every child. Report the end's peer pid we resolved (the REAL
                     // guest pid of the process holding the OTHER end, stamped across fork/close -- see
                     // g_sock_peer_pid / seq_reassign_peer); else this guest's own pid.
@@ -1289,10 +1284,6 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (nr == 211) cmsg_tmpfds_close();
         if (nr == 211 && r >= 0) seq_mark_wrote((int)a0); // genuine writer: may inject peer-EOF on its close
-        if (nr == 211 && w7_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_fam[(int)a0] == AF_UNIX)
-            w7_trace("sendmsg fd=%d ret=%ld ctl_l=%u%s%s peer_pid=%d", (int)a0, (long)r, (unsigned)(gc ? gcl : 0),
-                     (gc && gcl) ? " SCM" : "", (r < 0) ? " ERR" : "",
-                     ((int)a0 < DD_NFD) ? g_sock_peer_pid[(int)a0] : 0);
         if (r > 0 && peekaddr) r = 0; // guest supplied no data room; only the source address was wanted
         // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
@@ -1322,7 +1313,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (getsockopt((int)a0, SOL_LOCAL, LOCAL_PEERPID, &ppid, &pl) < 0 || ppid <= 0 || ppid == getpid()) {
                     // macOS reports the socketpair CREATOR's pid on both ends (never updated on fork), so the
                     // fork parent reads its OWN pid here for every child -> container_pid() collapsed all of
-                    // them to guest 1, colliding Mojo's ports node identity. Prefer the end's distinct synthetic
+                    // them to guest 1, colliding peer node identities. Prefer the end's distinct synthetic
                     // peer node id stamped at socketpair(); fall back to this guest's own pid only if unstamped.
                     int sp = ((int)a0 >= 0 && (int)a0 < DD_NFD) ? g_sock_peer_pid[(int)a0] : 0;
                     ppid = sp ? sp : container_pid();
@@ -1343,14 +1334,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (((int)a2 & 0x40000000) && gc && ln) cmsg_lx_set_cloexec_fds(gc, ln); // MSG_CMSG_CLOEXEC
             *(uint64_t *)(g + 40) = ln;
             *(uint32_t *)(g + 48) = (uint32_t)mfl;
-            if (w7_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_fam[(int)a0] == AF_UNIX)
-                w7_trace("recvmsg fd=%d ret=%ld ctl_l=%zu%s%s%s peer_pid=%d", (int)a0, (long)r, ln,
-                         passcred_active ? " CRED" : "", (mfl & 0x8) ? " CTRUNC" : "",
-                         (mh.msg_controllen > 0) ? " HOSTSCM" : "", g_sock_peer_pid[(int)a0]);
         }
-        if (nr == 212 && r <= 0 && w7_on() && (int)a0 >= 0 && (int)a0 < DD_NFD && g_sock_fam[(int)a0] == AF_UNIX)
-            w7_trace("recvmsg fd=%d ret=%ld%s (no-data)", (int)a0, (long)r,
-                     (r < 0) ? (errno == EAGAIN ? " EAGAIN" : " ERR") : " EOF");
         if (hctl != hstack) free(hctl);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
