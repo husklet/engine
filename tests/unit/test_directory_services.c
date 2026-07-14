@@ -66,6 +66,21 @@ int main(void) {
     }
     HL_CHECK(hl_test_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT) == HL_STATUS_OK);
+    {
+        hl_host_file_metadata metadata;
+        hl_host_result root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                                           HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY, 0, 0);
+        HL_CHECK(root.status == HL_STATUS_OK);
+        HL_CHECK(services.file->make_fifo(services.context, root.value, "probe-fifo", 10, 0600).status == HL_STATUS_OK);
+        hl_host_result fifo = services.file->open_relative(services.context, root.value, "probe-fifo", 10,
+                                                           HL_HOST_FILE_PATH_ONLY, 0, 0);
+        HL_CHECK(fifo.status == HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, fifo.value, &metadata).status == HL_STATUS_OK);
+        HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_FIFO);
+        HL_CHECK(services.file->close(services.context, fifo.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->unlink_relative(services.context, root.value, "probe-fifo", 10).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, root.value).status == HL_STATUS_OK);
+    }
     for (count = 0; count < 3; ++count) {
         directory_files[count] = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD,
                                                               watched_paths[count], strlen(watched_paths[count]),

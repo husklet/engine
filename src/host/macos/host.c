@@ -973,9 +973,9 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
     }
     if ((access & HL_HOST_FILE_PATH_ONLY) != 0)
 #ifdef O_SYMLINK
-        flags = (access & HL_HOST_FILE_NOFOLLOW) != 0 ? O_SYMLINK : O_RDONLY;
+        flags = (access & HL_HOST_FILE_NOFOLLOW) != 0 ? O_SYMLINK : O_RDONLY | O_NONBLOCK;
 #else
-        flags = O_RDONLY;
+        flags = O_RDONLY | O_NONBLOCK;
 #endif
     else if ((access & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)) == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE))
         flags = O_RDWR;
