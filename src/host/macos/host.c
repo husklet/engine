@@ -1078,6 +1078,29 @@ static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, 
     return descriptor;
 }
 
+static hl_host_result hl_macos_attachment_borrow_file(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    int descriptor = -1;
+    int found;
+    pthread_mutex_lock(&host->lock);
+    hl_macos_file *file = hl_macos_file_lookup(host, handle);
+    found = file != NULL;
+    if (found) descriptor = fcntl(file->descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return found ? hl_macos_errno() : hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    hl_host_process_fd_private_add(descriptor);
+    return hl_macos_result(HL_STATUS_OK, (uint64_t)(unsigned)descriptor, 0);
+}
+
+static hl_host_result hl_macos_attachment_release(void *context, uint64_t borrowed_descriptor) {
+    (void)context;
+    if (borrowed_descriptor > INT_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int descriptor = (int)borrowed_descriptor;
+    hl_host_process_fd_private_remove(descriptor);
+    return close(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
 static hl_host_result hl_macos_file_read(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {
     int descriptor = hl_macos_file_descriptor(context, file, 0);
     ssize_t count;
@@ -3808,6 +3831,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_STREAM_ABI, sizeof(stream), hl_macos_stream_pipe_pair, hl_macos_stream_read,
         hl_macos_stream_write, hl_macos_stream_duplicate, hl_macos_stream_close,
         hl_macos_stream_set_status_flags, hl_macos_stream_readiness, hl_macos_stream_move};
+    static const hl_host_posix_attachment_services posix_attachment = {
+        HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_macos_attachment_borrow_file,
+        hl_macos_attachment_release};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;
@@ -3902,7 +3928,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_PROCESS | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
                                  HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC | HL_HOST_CAP_EVENT | HL_HOST_CAP_COUNTER |
-                                 HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM;
+                                 HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM |
+                                 HL_HOST_CAP_POSIX_ATTACHMENT;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -3917,6 +3944,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->directory = &directory;
     out_services->watch = &watch;
     out_services->stream = &stream;
+    out_services->posix_attachment = &posix_attachment;
     *out_host = host;
     return HL_STATUS_OK;
 }

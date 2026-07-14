@@ -1266,6 +1266,40 @@ static int bound_rights_reference(uint64_t message_address) {
     return 0;
 }
 
+/* Return 1 with a scoped native alias for a typed file, 0 for an already-native fd, or -errno. */
+static int bound_attachment_borrow(int guest_fd, int *native_fd) {
+    hl_linux_fd_snapshot snapshot;
+    const hl_host_posix_attachment_services *attachments;
+    hl_host_result borrowed;
+    if (native_fd == NULL || guest_fd < 0) return -EBADF;
+    if (!bound_snapshot((uint64_t)(uint32_t)guest_fd, &snapshot)) {
+        if (fcntl(guest_fd, F_GETFD) < 0) return -EBADF;
+        *native_fd = guest_fd;
+        return 0;
+    }
+    attachments = g_host_services == NULL ? NULL : g_host_services->posix_attachment;
+    if (attachments == NULL || attachments->abi != HL_HOST_POSIX_ATTACHMENT_ABI ||
+        attachments->size < sizeof(*attachments) || attachments->borrow_file == NULL)
+        return -EOPNOTSUPP;
+    borrowed = attachments->borrow_file(g_host_services->context, snapshot.host_handle);
+    if (borrowed.status != HL_STATUS_OK) return bound_host_error(borrowed.status);
+    if (borrowed.value > INT_MAX) {
+        if (attachments->release != NULL) (void)attachments->release(g_host_services->context, borrowed.value);
+        return -EIO;
+    }
+    *native_fd = (int)borrowed.value;
+    return 1;
+}
+
+static void bound_attachment_release(int native_fd) {
+    const hl_host_posix_attachment_services *attachments =
+        g_host_services == NULL ? NULL : g_host_services->posix_attachment;
+    if (attachments != NULL && attachments->release != NULL)
+        (void)attachments->release(g_host_services->context, (uint64_t)(unsigned)native_fd);
+    else
+        close(native_fd);
+}
+
 static int64_t bound_stream_read(const hl_linux_fd_snapshot *file, int native_fd, void *buffer, size_t size,
                                  off_t *offset) {
     if (file != NULL)
@@ -1404,10 +1438,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (nr == 72 && bound_fdsets_reference(a0, a1, a2, a3)) {
         G_RET(c) = (uint64_t)bound_pselect(c, a0, a1, a2, a3);
-        return 1;
-    }
-    if (nr == 211 && bound_rights_reference(a1)) {
-        G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
         return 1;
     }
     if (nr == 222 && (a3 & 0x20u) == 0) {

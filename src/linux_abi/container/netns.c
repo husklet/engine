@@ -208,11 +208,27 @@ struct hl_cmsg_eventfd_meta {
 };
 
 static __thread int g_cmsg_tmpfds[1024];
+static __thread uint8_t g_cmsg_tmpfd_borrowed[1024];
 static __thread int g_cmsg_ntmpfds;
+static int bound_attachment_borrow(int guest_fd, int *native_fd);
+static void bound_attachment_release(int native_fd);
+
+static int cmsg_tmpfd_track(int fd, int borrowed) {
+    if (fd < 0 || g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    g_cmsg_tmpfds[g_cmsg_ntmpfds] = fd;
+    g_cmsg_tmpfd_borrowed[g_cmsg_ntmpfds] = (uint8_t)(borrowed != 0);
+    g_cmsg_ntmpfds++;
+    return 0;
+}
 
 static void cmsg_tmpfds_close(void) {
     for (int i = 0; i < g_cmsg_ntmpfds; i++)
-        if (g_cmsg_tmpfds[i] >= 0) close(g_cmsg_tmpfds[i]);
+        if (g_cmsg_tmpfds[i] >= 0) {
+            if (g_cmsg_tmpfd_borrowed[i])
+                bound_attachment_release(g_cmsg_tmpfds[i]);
+            else
+                close(g_cmsg_tmpfds[i]);
+        }
     g_cmsg_ntmpfds = 0;
 }
 
@@ -236,7 +252,10 @@ static int cmsg_eventfd_marker(const struct hl_cmsg_eventfd_meta *m) {
     }
     lseek(fd, 0, SEEK_SET);
     fcntl(fd, F_SETFD, FD_CLOEXEC);
-    g_cmsg_tmpfds[g_cmsg_ntmpfds++] = fd;
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -359,7 +378,15 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 return -1;
             }
             for (int i = 0; i < nfds; i++) {
-                combo[combo_n++] = fds[i];
+                int native = fds[i];
+                int borrowed = bound_attachment_borrow(fds[i], &native);
+                if (borrowed < 0 || (borrowed > 0 && cmsg_tmpfd_track(native, 1) != 0)) {
+                    if (borrowed > 0) bound_attachment_release(native);
+                    free(combo);
+                    if (errp) *errp = borrowed < 0 ? -borrowed : EMFILE;
+                    return -1;
+                }
+                combo[combo_n++] = native;
             }
             for (int i = 0; i < nfds; i++) {
                 int fd = fds[i];

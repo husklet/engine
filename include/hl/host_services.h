@@ -5,7 +5,7 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_HOST_SERVICES_ABI 3u
+#define HL_HOST_SERVICES_ABI 4u
 #define HL_HOST_MEMORY_ABI 3u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
@@ -26,6 +26,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_DIRECTORY_ABI 1u
 #define HL_HOST_WATCH_ABI 1u
 #define HL_HOST_STREAM_ABI 1u
+#define HL_HOST_POSIX_ATTACHMENT_ABI 1u
 
 typedef uint64_t hl_host_handle;
 
@@ -47,7 +48,8 @@ enum {
     HL_HOST_CAP_TRANSFER = UINT64_C(1) << 13,
     HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14,
     HL_HOST_CAP_WATCH = UINT64_C(1) << 15,
-    HL_HOST_CAP_STREAM = UINT64_C(1) << 16
+    HL_HOST_CAP_STREAM = UINT64_C(1) << 16,
+    HL_HOST_CAP_POSIX_ATTACHMENT = UINT64_C(1) << 17
 };
 
 enum {
@@ -582,6 +584,14 @@ typedef struct hl_host_stream_services {
                            hl_host_handle destination, uint64_t destination_offset, uint64_t size, uint32_t flags);
 } hl_host_stream_services;
 
+/* Optional POSIX-host adapter for native ancillary descriptor transport. A borrow aliases the same
+ * open-file description, is CLOEXEC, and must be released on every path. */
+typedef struct hl_host_posix_attachment_services {
+    HL_ABI_HEADER;
+    hl_host_result (*borrow_file)(void *context, hl_host_handle file);
+    hl_host_result (*release)(void *context, uint64_t borrowed_descriptor);
+} hl_host_posix_attachment_services;
+
 typedef struct hl_host_services {
     HL_ABI_HEADER;
     uint64_t capabilities;
@@ -600,6 +610,7 @@ typedef struct hl_host_services {
     const hl_host_directory_services *directory;
     const hl_host_watch_services *watch;
     const hl_host_stream_services *stream;
+    const hl_host_posix_attachment_services *posix_attachment;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

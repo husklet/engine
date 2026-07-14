@@ -1089,6 +1089,28 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_attachment_borrow_file(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    int descriptor;
+    int borrowed;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    borrowed = descriptor < 0 ? -1 : fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (borrowed < 0)
+        return descriptor < 0 ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0) : hl_linux_errno_result();
+    hl_host_process_fd_private_add(borrowed);
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)(unsigned)borrowed, 0);
+}
+
+static hl_host_result hl_linux_attachment_release(void *context, uint64_t borrowed_descriptor) {
+    (void)context;
+    if (borrowed_descriptor > INT_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int descriptor = (int)borrowed_descriptor;
+    hl_host_process_fd_private_remove(descriptor);
+    return close(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_set_times(void *context, hl_host_handle file, const hl_host_file_time times[2]) {
     hl_host_linux *host = context;
     struct timespec native[2];
@@ -3211,6 +3233,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         HL_HOST_STREAM_ABI, sizeof(stream), hl_linux_stream_pipe_pair, hl_linux_stream_read,
         hl_linux_stream_write, hl_linux_stream_duplicate, hl_linux_stream_close,
         hl_linux_stream_set_status_flags, hl_linux_stream_readiness, hl_linux_stream_move};
+    static const hl_host_posix_attachment_services posix_attachment = {
+        HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_linux_attachment_borrow_file,
+        hl_linux_attachment_release};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
@@ -3276,7 +3301,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_NETWORK |
                                  HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING |
                                  HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY |
-                                 HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM;
+                                 HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_POSIX_ATTACHMENT;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -3292,6 +3317,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->directory = &directory;
     out_services->watch = &watch;
     out_services->stream = &stream;
+    out_services->posix_attachment = &posix_attachment;
     *out_host = host;
     return HL_STATUS_OK;
 }

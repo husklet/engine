@@ -53,6 +53,11 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_LOG) != 0 &&
         (!hl_valid_group(services->log, HL_HOST_LOG_ABI, sizeof(*services->log)) || services->log->emit == NULL))
         return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_POSIX_ATTACHMENT) != 0 &&
+        (!hl_valid_group(services->posix_attachment, HL_HOST_POSIX_ATTACHMENT_ABI,
+                         sizeof(*services->posix_attachment)) ||
+         services->posix_attachment->borrow_file == NULL || services->posix_attachment->release == NULL))
+        return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
         (!hl_valid_file_group(services->file) ||
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||

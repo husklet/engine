@@ -1276,6 +1276,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int cerr = 0;
             ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
             if (hn < 0) {
+                cmsg_tmpfds_close();
                 if (hctl != hstack) free(hctl);
                 G_RET(c) = (uint64_t)(-(cerr ? cerr : EINVAL));
                 break;
@@ -1492,6 +1493,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 int cerr = 0;
                 ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
                 if (hn < 0) {
+                    cmsg_tmpfds_close();
                     if (hctl != hstack) free(hctl);
                     err = cerr ? cerr : EINVAL;
                     break;
