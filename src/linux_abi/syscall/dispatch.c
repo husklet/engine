@@ -820,6 +820,9 @@ static void service_local(struct cpu *c) {
             a0 = nonpie_p(a0);
             a1 = nonpie_p(a1);
             break;
+        case 167: // prctl: only pointer-bearing option arguments are rebased
+            if (a0 == 2 || a0 == 15 || a0 == 16 || a0 == 37) a1 = nonpie_p(a1);
+            break;
         case 148: // getresuid(RUID, EUID, SUID) -- all three written directly
         case 150: // getresgid(RGID, EGID, SGID)
             a0 = nonpie_p(a0);
