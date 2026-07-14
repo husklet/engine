@@ -920,6 +920,19 @@ static hl_host_result hl_macos_file_sync(void *context, hl_host_handle file) {
     return fsync(descriptor) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_file_sync_range(void *context, hl_host_handle file, uint64_t offset, uint64_t size,
+                                               uint32_t flags) {
+    if ((flags & ~7u) != 0 || offset > INT64_MAX || size > INT64_MAX || offset > INT64_MAX - size)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* macOS has no range durability primitive; fsync is stronger and truthful. */
+    return hl_macos_file_sync(context, file);
+}
+
+static hl_host_result hl_macos_file_sync_filesystem(void *context, hl_host_handle file) {
+    /* fsync the selected filesystem object; macOS exposes no syncfs equivalent. */
+    return hl_macos_file_sync(context, file);
+}
+
 static int hl_macos_file_directory(hl_host_macos *host, hl_host_handle directory) {
     int descriptor = AT_FDCWD;
     if (directory == HL_HOST_HANDLE_CWD) return descriptor;
@@ -2543,7 +2556,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_standard_stream,
                                                hl_macos_file_readlink,
                                                hl_macos_file_set_owner,
-                                               hl_macos_file_resolve_beneath};
+                                               hl_macos_file_resolve_beneath,
+                                               hl_macos_file_sync_range,
+                                               hl_macos_file_sync_filesystem};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

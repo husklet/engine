@@ -1429,6 +1429,55 @@ int64_t hl_linux_fdatasync(hl_linux_abi *linux_abi, hl_linux_fd fd) {
     return hl_linux_file_control(linux_abi, fd, 0, 2);
 }
 
+static int64_t hl_linux_extended_sync(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t offset, uint64_t size,
+                                      uint32_t flags, int filesystem) {
+    const hl_linux_fd_entry *fd_entry;
+    const hl_linux_ofd_entry *found;
+    const hl_host_file_services *files;
+    hl_linux_ofd_entry *ofd;
+    hl_host_result host_result;
+    hl_status status;
+    int64_t result;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, fd, &fd_entry, &found);
+    if (status != HL_STATUS_OK) {
+        hl_linux_unlock(linux_abi);
+        return status == HL_STATUS_NOT_FOUND ? -HL_LINUX_EBADF : hl_linux_error(status);
+    }
+    ofd = &linux_abi->ofds[fd_entry->ofd];
+    ofd->active_operations++;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_lock(linux_abi, ofd);
+    files = hl_linux_files(linux_abi);
+    if (files == NULL)
+        result = -HL_LINUX_ENOSYS;
+    else if (filesystem)
+        host_result = files->sync_filesystem == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                                                     : files->sync_filesystem(linux_abi->host->context,
+                                                                              ofd->host_handle),
+        result = host_result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)host_result.status);
+    else
+        host_result = files->sync_range == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                                                : files->sync_range(linux_abi->host->context, ofd->host_handle,
+                                                                    offset, size, flags),
+        result = host_result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)host_result.status);
+    hl_linux_lock(linux_abi);
+    ofd->active_operations--;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(linux_abi, ofd);
+    return result;
+}
+
+int64_t hl_linux_sync_range(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t offset, uint64_t size, uint32_t flags) {
+    if ((flags & ~7u) != 0) return -HL_LINUX_EINVAL;
+    return hl_linux_extended_sync(linux_abi, fd, offset, size, flags, 0);
+}
+
+int64_t hl_linux_sync_filesystem(hl_linux_abi *linux_abi, hl_linux_fd fd) {
+    return hl_linux_extended_sync(linux_abi, fd, 0, 0, 0, 1);
+}
+
 static int64_t hl_linux_openat_install(hl_linux_abi *linux_abi, const hl_linux_fd_reservation *reservation,
                                        int32_t directory_fd, hl_host_handle direct_directory, const char *path,
                                        size_t path_size, uint32_t flags, uint32_t mode) {

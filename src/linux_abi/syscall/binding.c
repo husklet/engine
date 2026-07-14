@@ -872,6 +872,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 46: result = hl_linux_ftruncate(g_linux_box, source.fd, a1); break;
     case 82: result = hl_linux_fsync(g_linux_box, source.fd); break;
     case 83: result = hl_linux_fdatasync(g_linux_box, source.fd); break;
+    case 84:
+        if ((G_A3(c) & ~(uint64_t)7u) != 0)
+            result = -EINVAL;
+        else
+            result = hl_linux_sync_range(g_linux_box, source.fd, a1, a2, (uint32_t)G_A3(c));
+        break;
+    case 267: result = hl_linux_sync_filesystem(g_linux_box, source.fd); break;
     case 80: {
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
@@ -969,7 +976,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 76:           /* splice */
     case 77:           /* tee */
     case 79:           /* newfstatat directory */
-    case 84:           /* sync_file_range */
     case 200:          /* bind */
     case 201:          /* listen */
     case 202:          /* accept */
@@ -984,7 +990,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 211:          /* sendmsg */
     case 212:          /* recvmsg */
     case 213:          /* readahead */
-    case 267:          /* syncfs */
     case 286:          /* preadv2 */
     case 287:          /* pwritev2 */
         /* A bound slot is never a native descriptor. Unsupported fd operations cannot touch its shadow. */

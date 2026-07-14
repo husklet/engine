@@ -339,6 +339,13 @@ int main(void) {
                                         HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,
                                         HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
     HL_CHECK(file.status == HL_STATUS_OK);
+    HL_CHECK(services.file
+                 ->sync_range(services.context, file.value, 0, 0,
+                              HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE | HL_HOST_FILE_SYNC_WAIT_AFTER)
+                 .status == HL_STATUS_OK);
+    HL_CHECK(services.file->sync_range(services.context, file.value, 0, 0, 8).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.file->sync_filesystem(services.context, file.value).status == HL_STATUS_OK);
     {
         char resolved[1024];
         char *expected = realpath(path, NULL);

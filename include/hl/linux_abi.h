@@ -260,6 +260,9 @@ HL_API int64_t hl_linux_pwritev(hl_linux_abi *linux_abi, hl_linux_fd fd, const h
                                 uint64_t offset);
 HL_API int64_t hl_linux_ftruncate(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t size);
 HL_API int64_t hl_linux_fsync(hl_linux_abi *linux_abi, hl_linux_fd fd);
+HL_API int64_t hl_linux_sync_range(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t offset, uint64_t size,
+                                   uint32_t flags);
+HL_API int64_t hl_linux_sync_filesystem(hl_linux_abi *linux_abi, hl_linux_fd fd);
 HL_API int64_t hl_linux_fdatasync(hl_linux_abi *linux_abi, hl_linux_fd fd);
 /* path is translated guest memory; mode is used only with O_CREAT. */
 HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, const char *path, size_t path_size,

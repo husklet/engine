@@ -25,6 +25,8 @@ typedef struct test_file_host {
     uint32_t truncates;
     uint32_t syncs;
     uint32_t data_syncs;
+    uint32_t range_syncs;
+    uint32_t filesystem_syncs;
     uint32_t opens;
     uint32_t last_access;
     uint32_t last_creation;
@@ -301,6 +303,22 @@ static hl_host_result test_data_sync(void *context, hl_host_handle file) {
     return file_result(HL_STATUS_OK, 0);
 }
 
+static hl_host_result test_sync_range(void *context, hl_host_handle file, uint64_t offset, uint64_t size,
+                                      uint32_t flags) {
+    test_file_host *host = context;
+    if ((file != 55 && file != 56) || offset != 2 || size != 0 || flags != HL_HOST_FILE_SYNC_WRITE)
+        return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    host->range_syncs++;
+    return file_result(HL_STATUS_OK, 0);
+}
+
+static hl_host_result test_sync_filesystem(void *context, hl_host_handle file) {
+    test_file_host *host = context;
+    if (file != 55 && file != 56) return file_result(HL_STATUS_INVALID_ARGUMENT, 0);
+    host->filesystem_syncs++;
+    return file_result(HL_STATUS_OK, 0);
+}
+
 static hl_host_result test_rename(void *context, hl_host_handle old_directory, const char *old_path,
                                   size_t old_path_size, hl_host_handle new_directory, const char *new_path,
                                   size_t new_path_size) {
@@ -395,6 +413,8 @@ int main(void) {
                                    .truncate = test_truncate,
                                    .sync = test_sync,
                                    .data_sync = test_data_sync,
+                                   .sync_range = test_sync_range,
+                                   .sync_filesystem = test_sync_filesystem,
                                    .rename_relative = test_rename,
                                    .unlink_relative = test_unlink};
     char buffer[8] = {0};
@@ -731,6 +751,10 @@ int main(void) {
         HL_CHECK(hl_linux_ftruncate(&linux_abi, original, 1) == 0 && file_host.truncates == 2);
         HL_CHECK(hl_linux_fsync(&linux_abi, original) == 0 && file_host.syncs == 1);
         HL_CHECK(hl_linux_fdatasync(&linux_abi, original) == 0 && file_host.data_syncs == 1);
+        HL_CHECK(hl_linux_sync_range(&linux_abi, original, 2, 0, HL_HOST_FILE_SYNC_WRITE) == 0 &&
+                 file_host.range_syncs == 1);
+        HL_CHECK(hl_linux_sync_range(&linux_abi, original, 2, 0, 8) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_sync_filesystem(&linux_abi, original) == 0 && file_host.filesystem_syncs == 1);
         file_host.next_status = HL_STATUS_IO;
         HL_CHECK(hl_linux_fsync(&linux_abi, original) == -HL_LINUX_EIO);
         HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK);

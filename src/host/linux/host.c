@@ -900,6 +900,35 @@ static hl_host_result hl_linux_file_sync(void *context, hl_host_handle file) {
     return fsync(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_sync_range(void *context, hl_host_handle file, uint64_t offset, uint64_t size,
+                                               uint32_t flags) {
+    hl_host_linux *host = context;
+    int descriptor;
+    unsigned int native = 0;
+    if ((flags & ~7u) != 0 || offset > INT64_MAX || size > INT64_MAX || offset > INT64_MAX - size)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (flags & HL_HOST_FILE_SYNC_WAIT_BEFORE) native |= SYNC_FILE_RANGE_WAIT_BEFORE;
+    if (flags & HL_HOST_FILE_SYNC_WRITE) native |= SYNC_FILE_RANGE_WRITE;
+    if (flags & HL_HOST_FILE_SYNC_WAIT_AFTER) native |= SYNC_FILE_RANGE_WAIT_AFTER;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return sync_file_range(descriptor, (off64_t)offset, (off64_t)size, native) == 0
+               ? hl_linux_result(HL_STATUS_OK, 0, 0)
+               : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_sync_filesystem(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return syncfs(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
 static hl_host_result hl_linux_file_data_sync(void *context, hl_host_handle file) {
     hl_host_linux *host = context;
     int descriptor;
@@ -2453,7 +2482,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_standard_stream,
                                                hl_linux_file_readlink,
                                                hl_linux_file_set_owner,
-                                               hl_linux_file_resolve_beneath};
+                                               hl_linux_file_resolve_beneath,
+                                               hl_linux_file_sync_range,
+                                               hl_linux_file_sync_filesystem};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

@@ -10,7 +10,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 11u
+#define HL_HOST_FILE_ABI 12u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -220,6 +220,11 @@ typedef struct hl_host_file_resolution {
 } hl_host_file_resolution;
 
 enum { HL_HOST_FILE_IOV_MAX = 1024 };
+enum {
+    HL_HOST_FILE_SYNC_WAIT_BEFORE = 1u << 0,
+    HL_HOST_FILE_SYNC_WRITE = 1u << 1,
+    HL_HOST_FILE_SYNC_WAIT_AFTER = 1u << 2
+};
 
 typedef struct hl_host_file_services {
     HL_ABI_HEADER;
@@ -266,6 +271,8 @@ typedef struct hl_host_file_services {
     /* Resolve beneath a pinned directory; returned handles are independently closeable. */
     hl_host_result (*resolve_beneath)(void *context, hl_host_handle root, const char *path, size_t path_size,
                                       uint32_t policy, hl_host_file_resolution *output);
+    hl_host_result (*sync_range)(void *context, hl_host_handle file, uint64_t offset, uint64_t size, uint32_t flags);
+    hl_host_result (*sync_filesystem)(void *context, hl_host_handle file);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

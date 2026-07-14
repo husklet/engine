@@ -116,6 +116,14 @@ int main(void) {
                                                    HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
         HL_CHECK(page > 0 && mapped_file.status == HL_STATUS_OK);
         HL_CHECK(services.file->truncate(services.context, mapped_file.value, (uint64_t)page).status == HL_STATUS_OK);
+        HL_CHECK(services.file
+                     ->sync_range(services.context, mapped_file.value, 0, (uint64_t)page,
+                                  HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE |
+                                      HL_HOST_FILE_SYNC_WAIT_AFTER)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.file->sync_range(services.context, mapped_file.value, 0, 1, 8).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->sync_filesystem(services.context, mapped_file.value).status == HL_STATUS_OK);
         HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page,
                                            HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_SHARED,
                                            &shared_map).status == HL_STATUS_OK);
