@@ -44,7 +44,8 @@ procfd	edge	edge_procfd.c	edge_procfd.c	aarch64,x86_64	-static-pie -O2 -pthread 
 proctask	edge	edge_proctask.c	edge_proctask.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_proctask.out	linux-libc,syscall	active	exact source; deterministic checked golden
 times	edge	edge_times.c	edge_times.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_times.out	linux-libc,syscall	active	exact source; deterministic checked golden
 utimes-family	edge	utimes_family.c	utimes_family.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/utimes_family.out	linux-libc,syscall	active	exact source; deterministic checked golden
-statfs	edge	edge_statfs.c	edge_statfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_statfs.out	linux-libc,syscall	excluded-known-gap	exact source; legacy engine xfail remains open
+statfs-dynamic	edge	edge_statfs.c	edge_statfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	-	linux-libc,syscall	excluded-replaced	exact source retained; output embeds host volume size and is replaced by stable geometry/coherence assertions
+statfs-contract	edge	statfs_contract.c	edge_statfs.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statfs_contract.out	linux-libc,syscall	active	deterministic C contract validates real geometry bounds and statfs/statvfs coherence
 statx-agree	edge	statx_agree.c	statx_agree.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/statx_agree.out	linux-libc,syscall	active	exact source; deterministic checked golden
 efault	edge	edge_efault.c	edge_efault.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/edge_efault.out	linux-libc,syscall	active	exact source; deterministic checked golden
 clockelapsed	edge	clockelapsed.c	clockelapsed.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockelapsed.out	linux-libc,syscall	active	exact source; deterministic checked golden
