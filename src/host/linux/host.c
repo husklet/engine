@@ -1237,7 +1237,7 @@ static hl_host_result hl_linux_file_seek(void *context, hl_host_handle file, int
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
     pthread_mutex_unlock(&host->lock);
-    if (descriptor < 0 || whence > UINT32_C(2)) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (descriptor < 0 || whence > HL_HOST_FILE_SEEK_HOLE) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = lseek(descriptor, (off_t)offset, (int)whence);
     return result < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, (uint64_t)result, 0);
 }

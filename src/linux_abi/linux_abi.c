@@ -1967,7 +1967,7 @@ int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, 
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_lock(linux_abi, ofd);
     files = hl_linux_files(linux_abi);
-    if (whence < HL_LINUX_SEEK_SET || whence > HL_LINUX_SEEK_END)
+    if (whence < HL_LINUX_SEEK_SET || whence > HL_LINUX_SEEK_HOLE)
         result = -HL_LINUX_EINVAL;
     else if (files == NULL || files->seek == NULL)
         result = -HL_LINUX_ENOSYS;

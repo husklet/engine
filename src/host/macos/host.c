@@ -1299,21 +1299,57 @@ static hl_host_result hl_macos_file_clone_for_fork(void *context, hl_host_handle
     }
 }
 
+/* Some virtual/shared macOS filesystems reject SEEK_DATA/SEEK_HOLE with ENOTTY even for regular files.
+ * Preserve the Linux contract there by discovering logical zero/data runs. Native APFS/HFS extents remain
+ * authoritative whenever the filesystem implements the operation. */
+static off_t hl_macos_sparse_seek_fallback(int descriptor, off_t offset, uint32_t whence) {
+    unsigned char bytes[16384];
+    struct stat metadata;
+    off_t cursor = offset;
+    int want_data = whence == HL_HOST_FILE_SEEK_DATA;
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstat(descriptor, &metadata) != 0) return -1;
+    if (offset >= metadata.st_size) {
+        errno = ENXIO;
+        return -1;
+    }
+    while (cursor < metadata.st_size) {
+        size_t amount =
+            (uint64_t)(metadata.st_size - cursor) < sizeof(bytes) ? (size_t)(metadata.st_size - cursor) : sizeof(bytes);
+        ssize_t count = pread(descriptor, bytes, amount, cursor);
+        if (count <= 0) {
+            if (count == 0) errno = ENXIO;
+            return -1;
+        }
+        for (ssize_t index = 0; index < count; ++index)
+            if ((bytes[index] != 0) == want_data) return cursor + index;
+        cursor += count;
+    }
+    if (!want_data) return metadata.st_size;
+    errno = ENXIO;
+    return -1;
+}
+
 static hl_host_result hl_macos_file_seek(void *context, hl_host_handle file, int64_t offset, uint32_t whence) {
     hl_host_macos *host = context;
     int descriptor = -1;
     off_t result;
-    if (whence > UINT32_C(2)) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (whence > HL_HOST_FILE_SEEK_HOLE) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     hl_macos_file *entry = hl_macos_file_lookup(host, file);
     if (entry != NULL) descriptor = entry->descriptor;
     if (entry != NULL && entry->directory_shared != NULL) {
         hl_macos_directory_shared *shared = entry->directory_shared;
         pthread_mutex_lock(&shared->lock);
-        if (whence == SEEK_SET) result = (off_t)offset;
+        if (whence == SEEK_SET)
+            result = (off_t)offset;
         else if (whence == SEEK_CUR && shared->position <= INT64_MAX)
             result = (off_t)shared->position + (off_t)offset;
-        else result = -1;
+        else
+            result = -1;
         if (result >= 0) {
             shared->position = (uint64_t)result;
             if (entry->directory != NULL) {
@@ -1329,7 +1365,17 @@ static hl_host_result hl_macos_file_seek(void *context, hl_host_handle file, int
     }
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    result = lseek(descriptor, (off_t)offset, (int)whence);
+    if (whence == HL_HOST_FILE_SEEK_DATA)
+        result = lseek(descriptor, (off_t)offset, SEEK_DATA);
+    else if (whence == HL_HOST_FILE_SEEK_HOLE)
+        result = lseek(descriptor, (off_t)offset, SEEK_HOLE);
+    else
+        result = lseek(descriptor, (off_t)offset, (int)whence);
+    if (result < 0 && (whence == HL_HOST_FILE_SEEK_DATA || whence == HL_HOST_FILE_SEEK_HOLE) && errno != EBADF &&
+        errno != ESPIPE) {
+        result = hl_macos_sparse_seek_fallback(descriptor, (off_t)offset, whence);
+        if (result >= 0 && lseek(descriptor, result, SEEK_SET) < 0) result = -1;
+    }
     return result < 0 ? hl_macos_errno() : hl_macos_result(HL_STATUS_OK, (uint64_t)result, 0);
 }
 

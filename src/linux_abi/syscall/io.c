@@ -79,6 +79,44 @@ static void fd_carry_virt(int newfd, int oldfd) {
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
 
+/* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
+ * available there by finding logical zero/data runs; native filesystem extents remain preferred. */
+static off_t sparse_seek_fallback(int fd, off_t offset, int guest_whence) {
+    unsigned char bytes[16384];
+    struct stat metadata;
+    off_t cursor = offset;
+    int want_data = guest_whence == 3;
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstat(fd, &metadata) != 0) return -1;
+    if (!S_ISREG(metadata.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (offset >= metadata.st_size) {
+        errno = ENXIO;
+        return -1;
+    }
+    while (cursor < metadata.st_size) {
+        size_t amount = (uint64_t)(metadata.st_size - cursor) < sizeof(bytes)
+                            ? (size_t)(metadata.st_size - cursor)
+                            : sizeof(bytes);
+        ssize_t count = pread(fd, bytes, amount, cursor);
+        if (count <= 0) {
+            if (count == 0) errno = ENXIO;
+            return -1;
+        }
+        for (ssize_t index = 0; index < count; ++index)
+            if ((bytes[index] != 0) == want_data) return cursor + index;
+        cursor += count;
+    }
+    if (!want_data) return metadata.st_size;
+    errno = ENXIO;
+    return -1;
+}
+
 // In hl's in-process exec model the guest shares the host descriptor table (fds are 1:1), and the engine
 // pins private host fds at LOW numbers (g_root_fd -- every path resolution openat()s off it -- plus the
 // signalfd pipe and each bind-mount volume fd). A guest dup2/dup3 onto one of those low
@@ -342,12 +380,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             memf_materialize((int)a0); // SEEK_DATA/HOLE: fall through to the now-materialized host fd
         }
+        int guest_whence = whence;
         if (whence == 3)
             whence = 4; // Linux SEEK_DATA -> macOS SEEK_DATA
         else if (whence == 4)
             whence = 3; // Linux SEEK_HOLE -> macOS SEEK_HOLE
         off_t r = lseek((int)a0, (off_t)a1, whence);
-        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        int seek_error = errno;
+        if (r < 0 && (guest_whence == 3 || guest_whence == 4) && errno != EBADF && errno != ESPIPE) {
+            r = sparse_seek_fallback((int)a0, (off_t)a1, guest_whence);
+            seek_error = errno;
+            /* The fallback's only regular-file miss is "no requested extent before EOF". Preserve the
+             * Linux ENXIO contract explicitly across the Darwin errno translation boundary. */
+            if (r < 0 && (off_t)a1 >= 0 && seek_error != EBADF) seek_error = ENXIO;
+            if (r >= 0 && lseek((int)a0, r, SEEK_SET) < 0) r = -1;
+        }
+        G_RET(c) = r < 0 ? (uint64_t)(-seek_error) : (uint64_t)r;
     lseek_out:
         break;
     }

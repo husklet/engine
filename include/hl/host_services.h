@@ -64,6 +64,15 @@ enum {
 
 enum { HL_HOST_STANDARD_INPUT = 0, HL_HOST_STANDARD_OUTPUT = 1, HL_HOST_STANDARD_ERROR = 2 };
 
+/* Linux-compatible logical seek modes; hosts translate these rather than exposing native ABI numbers. */
+enum {
+    HL_HOST_FILE_SEEK_SET = 0,
+    HL_HOST_FILE_SEEK_CUR = 1,
+    HL_HOST_FILE_SEEK_END = 2,
+    HL_HOST_FILE_SEEK_DATA = 3,
+    HL_HOST_FILE_SEEK_HOLE = 4
+};
+
 enum { HL_HOST_COUNTER_SEMAPHORE = 1u << 0, HL_HOST_COUNTER_NONBLOCK = 1u << 1 };
 
 enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
