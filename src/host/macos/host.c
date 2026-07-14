@@ -168,8 +168,10 @@ struct hl_host_macos {
     pthread_cond_t process_changed;
     uint32_t destroying;
     hl_host_sync_registry *sync;
-    hl_macos_mapping mappings[HL_MACOS_MAPPING_CAPACITY];
-    hl_macos_file files[HL_MACOS_FILE_CAPACITY];
+    hl_macos_mapping *mappings;
+    uint32_t mapping_capacity;
+    hl_macos_file *files;
+    uint32_t file_capacity;
     hl_macos_process processes[HL_MACOS_PROCESS_CAPACITY];
     hl_macos_event *events;
     uint32_t event_capacity;
@@ -314,7 +316,7 @@ static int hl_macos_handle_index(hl_host_handle handle, hl_macos_handle_kind kin
 
 static hl_macos_mapping *hl_macos_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_MAPPING, HL_MACOS_MAPPING_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_MAPPING, host->mapping_capacity, &index) ||
         !host->mappings[index].active ||
         host->mappings[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -325,7 +327,7 @@ static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, voi
     uint32_t index;
     hl_host_handle handle = 0;
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_MAPPING_CAPACITY; index++) {
+    for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) {
             mapping->generation++;
@@ -336,6 +338,28 @@ static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, voi
             mapping->size = size;
             handle = hl_macos_handle(HL_MACOS_HANDLE_MAPPING, index, mapping->generation);
             break;
+        }
+    }
+    if (handle == 0) {
+        uint32_t capacity = host->mapping_capacity > UINT32_C(0x0ffffffe) / 2u
+                                ? UINT32_C(0x0ffffffe)
+                                : host->mapping_capacity * 2u;
+        hl_macos_mapping *grown = capacity > host->mapping_capacity
+                                      ? realloc(host->mappings, (size_t)capacity * sizeof(*grown))
+                                      : NULL;
+        if (grown != NULL) {
+            memset(grown + host->mapping_capacity, 0,
+                   (size_t)(capacity - host->mapping_capacity) * sizeof(*grown));
+            index = host->mapping_capacity;
+            host->mappings = grown;
+            host->mapping_capacity = capacity;
+            hl_macos_mapping *mapping = &host->mappings[index];
+            mapping->generation = 1;
+            mapping->active = 1;
+            mapping->writable = writable;
+            mapping->executable = executable;
+            mapping->size = size;
+            handle = hl_macos_handle(HL_MACOS_HANDLE_MAPPING, index, mapping->generation);
         }
     }
     pthread_mutex_unlock(&host->lock);
@@ -524,7 +548,7 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         free(head_copy);
         if (address == MAP_FAILED) return hl_macos_errno();
         pthread_mutex_lock(&host->lock);
-        for (uint32_t index = 0; index < HL_MACOS_MAPPING_CAPACITY; ++index) {
+        for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
             uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
             if (old->active && low < old_high && old_low < low + total) {
@@ -576,7 +600,7 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
         pthread_mutex_lock(&host->lock);
-        for (uint32_t index = 0; index < HL_MACOS_MAPPING_CAPACITY; ++index) {
+        for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
             uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
             if (old->active && low < old_high && old_low < high) {
@@ -817,7 +841,7 @@ static hl_host_result hl_macos_clock_sleep_until(void *context, uint32_t clock_k
 
 static hl_macos_file *hl_macos_file_lookup(hl_host_macos *host, hl_host_handle handle) {
     uint32_t index;
-    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_FILE, HL_MACOS_FILE_CAPACITY, &index) ||
+    if (!hl_macos_handle_index(handle, HL_MACOS_HANDLE_FILE, host->file_capacity, &index) ||
         !host->files[index].active ||
         host->files[index].generation != (uint32_t)(handle >> 32))
         return NULL;
@@ -831,7 +855,7 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
     if (descriptor >= 0) hl_host_process_fd_private_add(descriptor);
     if (append_descriptor >= 0) hl_host_process_fd_private_add(append_descriptor);
     pthread_mutex_lock(&host->lock);
-    for (index = 0; index < HL_MACOS_FILE_CAPACITY; ++index) {
+    for (index = 0; index < host->file_capacity; ++index) {
         hl_macos_file *file = &host->files[index];
         if (!file->active) {
             file->generation++;
@@ -844,6 +868,27 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
             file->stream_endpoint = 0;
             handle = hl_macos_handle(HL_MACOS_HANDLE_FILE, index, file->generation);
             break;
+        }
+    }
+    if (handle == 0) {
+        uint32_t capacity = host->file_capacity > UINT32_C(0x0ffffffe) / 2u
+                                ? UINT32_C(0x0ffffffe)
+                                : host->file_capacity * 2u;
+        hl_macos_file *grown = capacity > host->file_capacity
+                                   ? realloc(host->files, (size_t)capacity * sizeof(*grown))
+                                   : NULL;
+        if (grown != NULL) {
+            memset(grown + host->file_capacity, 0, (size_t)(capacity - host->file_capacity) * sizeof(*grown));
+            index = host->file_capacity;
+            host->files = grown;
+            host->file_capacity = capacity;
+            hl_macos_file *file = &host->files[index];
+            file->generation = 1;
+            file->active = 1;
+            file->shared = shared;
+            file->descriptor = descriptor;
+            file->append_descriptor = append_descriptor;
+            handle = hl_macos_handle(HL_MACOS_HANDLE_FILE, index, file->generation);
         }
     }
     pthread_mutex_unlock(&host->lock);
@@ -3676,19 +3721,27 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     memset(out_services, 0, sizeof(*out_services));
     host = calloc(1, sizeof(*host));
     if (host == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    host->mappings = calloc(HL_MACOS_MAPPING_CAPACITY, sizeof(*host->mappings));
+    host->files = calloc(HL_MACOS_FILE_CAPACITY, sizeof(*host->files));
     host->events = calloc(HL_MACOS_EVENT_CAPACITY, sizeof(*host->events));
     host->watches = calloc(HL_MACOS_WATCH_CAPACITY, sizeof(*host->watches));
-    if (host->events == NULL || host->watches == NULL) {
+    if (host->mappings == NULL || host->files == NULL || host->events == NULL || host->watches == NULL) {
         free(host->watches);
         free(host->events);
+        free(host->files);
+        free(host->mappings);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
+    host->mapping_capacity = HL_MACOS_MAPPING_CAPACITY;
+    host->file_capacity = HL_MACOS_FILE_CAPACITY;
     host->event_capacity = HL_MACOS_EVENT_CAPACITY;
     host->watch_capacity = HL_MACOS_WATCH_CAPACITY;
     if (pthread_mutex_init(&host->lock, NULL) != 0) {
         free(host->watches);
         free(host->events);
+        free(host->files);
+        free(host->mappings);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3696,6 +3749,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         pthread_mutex_destroy(&host->lock);
         free(host->watches);
         free(host->events);
+        free(host->files);
+        free(host->mappings);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3704,6 +3759,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         pthread_mutex_destroy(&host->lock);
         free(host->watches);
         free(host->events);
+        free(host->files);
+        free(host->mappings);
         free(host);
         return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -3713,6 +3770,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         pthread_mutex_destroy(&host->lock);
         free(host->watches);
         free(host->events);
+        free(host->files);
+        free(host->mappings);
         free(host);
         return HL_STATUS_OUT_OF_MEMORY;
     }
@@ -3799,14 +3858,14 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         pthread_cond_wait(&host->process_changed, &host->lock);
     }
     pthread_mutex_unlock(&host->lock);
-    for (index = 0; index < HL_MACOS_MAPPING_CAPACITY; index++) {
+    for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) continue;
         munmap(mapping->writable, (size_t)mapping->size);
         if (mapping->executable != NULL && mapping->executable != mapping->writable)
             munmap(mapping->executable, (size_t)mapping->size);
     }
-    for (index = 0; index < HL_MACOS_FILE_CAPACITY; ++index) {
+    for (index = 0; index < host->file_capacity; ++index) {
         hl_macos_file *file = &host->files[index];
         if (!file->active) continue;
         close(file->descriptor);
@@ -3824,5 +3883,7 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_mutex_destroy(&host->lock);
     free(host->watches);
     free(host->events);
+    free(host->files);
+    free(host->mappings);
     free(host);
 }

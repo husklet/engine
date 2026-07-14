@@ -12,8 +12,8 @@
 enum {
     WATCH_COUNT = 257,
     EVENT_COUNT = 129,
-    LINUX_MAPPING_COUNT = 4000,
-    LINUX_FILE_COUNT = 64
+    MAPPING_COUNT = 4097,
+    FILE_COUNT = 1025
 };
 
 int main(void) {
@@ -57,17 +57,17 @@ int main(void) {
              HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.file->metadata(services.context, events[0], &(hl_host_file_metadata){0}).status ==
              HL_STATUS_INVALID_ARGUMENT);
-    if (strcmp(HL_NATIVE_HOST_NAME, "linux") == 0) {
-        mappings = calloc(LINUX_MAPPING_COUNT, sizeof(*mappings));
-        files = calloc(LINUX_FILE_COUNT, sizeof(*files));
+    {
+        mappings = calloc(MAPPING_COUNT, sizeof(*mappings));
+        files = calloc(FILE_COUNT, sizeof(*files));
         HL_CHECK(mappings != NULL && files != NULL);
-        for (size_t index = 0; index < LINUX_MAPPING_COUNT; ++index) {
+        for (size_t index = 0; index < MAPPING_COUNT; ++index) {
             hl_host_result reserved = services.memory->reserve(services.context, 4096, 4096,
                                                                HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
             HL_CHECK(reserved.status == HL_STATUS_OK);
             mappings[index] = reserved.value;
         }
-        for (size_t index = 0; index < LINUX_FILE_COUNT; ++index) {
+        for (size_t index = 0; index < FILE_COUNT; ++index) {
             hl_host_result opened = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path,
                                                                  strlen(path), HL_HOST_FILE_READ, 0, 0);
             HL_CHECK(opened.status == HL_STATUS_OK);
@@ -81,7 +81,7 @@ int main(void) {
             hl_host_watch_record inherited = {0};
             int valid = services.watch->query(services.context, watches[WATCH_COUNT - 1], &inherited).status ==
                             HL_STATUS_OK &&
-                        services.memory->protect(services.context, mappings[LINUX_MAPPING_COUNT - 1], 0, 4096,
+                        services.memory->protect(services.context, mappings[MAPPING_COUNT - 1], 0, 4096,
                                                  HL_HOST_MEMORY_READ)
                                 .status == HL_STATUS_OK;
             _exit(valid ? 0 : 41);
@@ -90,9 +90,9 @@ int main(void) {
         HL_CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
 
-    for (size_t index = LINUX_FILE_COUNT; files != NULL && index != 0; --index)
+    for (size_t index = FILE_COUNT; files != NULL && index != 0; --index)
         HL_CHECK(services.file->close(services.context, files[index - 1]).status == HL_STATUS_OK);
-    for (size_t index = LINUX_MAPPING_COUNT; mappings != NULL && index != 0; --index)
+    for (size_t index = MAPPING_COUNT; mappings != NULL && index != 0; --index)
         HL_CHECK(services.memory->release(services.context, mappings[index - 1]).status == HL_STATUS_OK);
     for (size_t index = EVENT_COUNT; index != 0; --index)
         HL_CHECK(services.event->close(services.context, events[index - 1]).status == HL_STATUS_OK);
