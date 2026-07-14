@@ -293,7 +293,8 @@ static int at_dirfd_check(int dirfd, const char *raw) {
 // the writable upper). Returns 0 (host filled) or -errno.
 static int xattr_hostpath(const char *path, int nofollow, int forwrite, char *host, size_t hn) {
     if (!g_rootfs) {
-        snprintf(host, hn, "%s", path ? path : "");
+        const char *resolved = nofollow ? xlate(path, host, hn) : xresolve(path, host, hn);
+        if (resolved != host) snprintf(host, hn, "%s", resolved ? resolved : "");
         return 0;
     }
     char gp[4200];
