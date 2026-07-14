@@ -3594,26 +3594,43 @@ void hl_host_macos_destroy(hl_host_macos *host) {
         hl_macos_process *process = &host->processes[index];
         if (process->active && !process->reaped) kill(process->pid, SIGKILL);
     }
+    pthread_mutex_unlock(&host->lock);
+    /* Subscription threads may call user code and own three descriptors each.
+     * Join them before releasing counters or any storage they can observe. */
+    for (index = 0; index < HL_MACOS_COUNTER_SUBSCRIPTIONS; ++index) {
+        hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->counter_subscriptions[index].active)
+            handle = hl_macos_handle(index, host->counter_subscriptions[index].generation);
+        pthread_mutex_unlock(&host->lock);
+        if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_unsubscribe(host, handle);
+    }
+    for (index = 0; index < HL_MACOS_TRANSFER_CAPACITY; ++index) {
+        hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->transfers[index].active) handle = hl_macos_handle(index, host->transfers[index].generation);
+        pthread_mutex_unlock(&host->lock);
+        if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_transfer_close(host, handle);
+    }
+    for (index = 0; index < HL_MACOS_DIRECTORY_CAPACITY; ++index) {
+        hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->directories[index].active) handle = hl_macos_handle(index, host->directories[index].generation);
+        pthread_mutex_unlock(&host->lock);
+        if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_directory_close(host, handle);
+    }
+    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
+        hl_host_handle handle = HL_HOST_HANDLE_INVALID;
+        pthread_mutex_lock(&host->lock);
+        if (host->counters[index].active) handle = hl_macos_handle(index, host->counters[index].generation);
+        pthread_mutex_unlock(&host->lock);
+        if (handle != HL_HOST_HANDLE_INVALID) (void)hl_macos_counter_close(host, handle);
+    }
+    pthread_mutex_lock(&host->lock);
     for (index = 0; index < HL_MACOS_EVENT_CAPACITY; ++index)
         if (host->events[index].active) close(host->events[index].descriptor);
     for (index = 0; index < HL_MACOS_WATCH_CAPACITY; ++index)
         if (host->watches[index].active) close(host->watches[index].descriptor);
-    for (index = 0; index < HL_MACOS_COUNTER_CAPACITY; ++index) {
-        hl_macos_counter *counter = &host->counters[index];
-        hl_macos_counter_object *object;
-        if (!counter->active) continue;
-        object = counter->object;
-        counter->active = 0;
-        counter->object = NULL;
-        if (--object->shared->references == 0) {
-            close(object->readable);
-            close(object->signal);
-            pthread_mutex_destroy(&object->shared->lock);
-            munmap(object->shared, sizeof(*object->shared));
-            close(object->backing);
-            free(object);
-        }
-    }
     hl_host_sync_registry_destroy(host->sync);
     for (;;) {
         uint32_t waiters = 0;

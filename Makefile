@@ -1208,6 +1208,15 @@ $(BUILD)/tests/macos: tests/unit/macos.c src/host/macos/host.c src/host/macos/sy
 	src/host/macos/host.c src/host/macos/system.c src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c \
 		src/host/file.c -o $@
 
+.PHONY: run-unit-macos-destroy
+run-unit-macos-destroy: $(BUILD)/tests/macos-destroy
+	$(MAC) $<
+
+$(BUILD)/tests/macos-destroy: tests/unit/test_macos_destroy.c src/host/macos/host.c src/host/macos/system.c \
+	src/host/sync.c src/host/resolve.c src/core/host_services.c src/core/log.c src/host/clock.c src/host/file.c
+	@mkdir -p $(@D)
+	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/tests/range-macos: tests/unit/test_range.c src/host/range.c src/host/macos/range.c
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
