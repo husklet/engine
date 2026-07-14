@@ -240,7 +240,9 @@ typedef struct hl_host_network_services {
 
 typedef struct hl_host_shared_memory_services {
     HL_ABI_HEADER;
+    /* create returns a reopen identity in detail; it remains valid while the source handle is live. */
     hl_host_result (*create)(void *context, uint64_t size, uint32_t flags);
+    /* open duplicates a live identity into an independently resizable and closeable handle. */
     hl_host_result (*open)(void *context, uint64_t identity, uint32_t flags);
     hl_host_result (*resize)(void *context, hl_host_handle object, uint64_t size);
     hl_host_result (*close)(void *context, hl_host_handle object);

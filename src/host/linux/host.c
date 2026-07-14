@@ -943,8 +943,7 @@ static hl_host_result hl_linux_network_receive(void *context, hl_host_handle soc
 static hl_host_result hl_linux_shared_create(void *context, uint64_t size, uint32_t flags) {
     hl_host_linux *host = context;
     int descriptor;
-    (void)flags;
-    if (size > INT64_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (size > INT64_MAX || flags != 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     descriptor = memfd_create("hl-engine", MFD_CLOEXEC);
     if (descriptor < 0) return hl_linux_errno_result();
     if (ftruncate(descriptor, (off_t)size) != 0) {
@@ -954,14 +953,33 @@ static hl_host_result hl_linux_shared_create(void *context, uint64_t size, uint3
     hl_host_result result =
         hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SHARED_MEMORY, descriptor, NULL, NULL, size, -1);
     if (result.status != HL_STATUS_OK) close(descriptor);
+    if (result.status == HL_STATUS_OK) result.detail = result.value;
     return result;
 }
 
 static hl_host_result hl_linux_shared_open(void *context, uint64_t identity, uint32_t flags) {
-    (void)context;
-    (void)identity;
-    (void)flags;
-    return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *source;
+    int descriptor;
+    uint64_t size;
+    hl_host_result result;
+    if (flags != 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    source = hl_linux_lookup_locked(host, identity, HL_LINUX_HANDLE_SHARED_MEMORY);
+    if (source == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    descriptor = fcntl(source->descriptor, F_DUPFD_CLOEXEC, 0);
+    size = source->size;
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_errno_result();
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SHARED_MEMORY, descriptor, NULL, NULL, size, -1);
+    if (result.status != HL_STATUS_OK)
+        close(descriptor);
+    else
+        result.detail = identity;
+    return result;
 }
 
 static hl_host_result hl_linux_shared_resize(void *context, hl_host_handle object, uint64_t size) {

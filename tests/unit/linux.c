@@ -67,7 +67,10 @@ int main(void) {
     hl_host_result mapping;
     hl_host_result file;
     hl_host_result pollset;
+    hl_host_result receiver;
+    hl_host_result sender;
     hl_host_result shared;
+    hl_host_result shared_copy;
     hl_host_code_mapping code;
     hl_host_event_record event;
     hl_host_file_metadata metadata;
@@ -78,6 +81,7 @@ int main(void) {
     char readback[sizeof(contents) + sizeof(suffix)] = {0};
     char path[128];
     char moved_path[160];
+    char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE |
@@ -172,22 +176,81 @@ int main(void) {
     unlink(path);
     unlink(moved_path);
 
-    pollset = services.event->create(services.context);
-    HL_CHECK(pollset.status == HL_STATUS_OK);
+    HL_CHECK(services.network->socket(services.context, 99, HL_HOST_NETWORK_DATAGRAM, 0).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    receiver = services.network->socket(services.context, HL_HOST_NETWORK_LOCAL, HL_HOST_NETWORK_DATAGRAM, 0);
+    sender = services.network->socket(services.context, HL_HOST_NETWORK_LOCAL, HL_HOST_NETWORK_DATAGRAM, 0);
+    HL_CHECK(receiver.status == HL_STATUS_OK && sender.status == HL_STATUS_OK);
+    snprintf(socket_path, sizeof(socket_path), "/tmp/hl-host-linux-socket-%ld", (long)getpid());
+    unlink(socket_path);
     {
+        hl_host_network_address address = {0};
+        const char datagram[] = "ready";
+        char received[sizeof(datagram)] = {0};
+        address.family = HL_HOST_NETWORK_LOCAL;
+        address.size = (uint16_t)strlen(socket_path);
+        memcpy(address.local_path, socket_path, address.size);
+        HL_CHECK(services.network->bind(services.context, receiver.value, &address).status == HL_STATUS_OK);
+        HL_CHECK(services.network->connect(services.context, sender.value, &address).status == HL_STATUS_OK);
+
+        pollset = services.event->create(services.context);
+        HL_CHECK(pollset.status == HL_STATUS_OK);
+        HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 0,
+                                         HL_HOST_READY_READ)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_ADD, receiver.value, 73,
+                                         HL_HOST_READY_READ)
+                     .status == HL_STATUS_OK);
         uint64_t start = services.clock->monotonic_ns(services.context).value;
         uint64_t deadline = start + UINT64_C(10000000);
         HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1, deadline).value == 0);
         HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline);
+
+        HL_CHECK(services.network->send(services.context, sender.value,
+                                        (hl_host_const_bytes){datagram, sizeof(datagram)}, 0)
+                     .value == sizeof(datagram));
+        deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+        {
+            hl_host_result ready = services.event->wait(services.context, pollset.value, &event, 1, deadline);
+            HL_CHECK(ready.status == HL_STATUS_OK && ready.value == 1 && event.token == 73 &&
+                     (event.readiness & HL_HOST_READY_READ) != 0);
+        }
+        HL_CHECK(services.network->receive(services.context, receiver.value,
+                                           (hl_host_bytes){received, sizeof(received)}, 0)
+                     .value == sizeof(received));
+        HL_CHECK(memcmp(received, datagram, sizeof(datagram)) == 0);
+        HL_CHECK(services.event->control(services.context, pollset.value, HL_HOST_EVENT_DELETE, receiver.value, 73, 0)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.event->control(services.context, pollset.value, 99, receiver.value, 73, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_OK);
+        HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1,
+                                      services.clock->monotonic_ns(services.context).value + UINT64_C(100000000))
+                     .value == 0);
+        HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+        HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_INVALID_ARGUMENT);
     }
-    HL_CHECK(services.event->wake(services.context, pollset.value).status == HL_STATUS_OK);
-    HL_CHECK(services.event->wait(services.context, pollset.value, &event, 1, 100000000).value == 0);
-    HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
+    HL_CHECK(services.network->close(services.context, receiver.value).status == HL_STATUS_OK);
+    HL_CHECK(services.network->receive(services.context, receiver.value, (hl_host_bytes){readback, 1}, 0).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.network->close(services.context, receiver.value).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.network->close(services.context, sender.value).status == HL_STATUS_OK);
+    unlink(socket_path);
 
     shared = services.shared_memory->create(services.context, 4096, 0);
-    HL_CHECK(shared.status == HL_STATUS_OK);
-    HL_CHECK(services.shared_memory->resize(services.context, shared.value, 8192).status == HL_STATUS_OK);
+    HL_CHECK(shared.status == HL_STATUS_OK && shared.detail == shared.value);
+    HL_CHECK(services.shared_memory->create(services.context, 4096, 1).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.shared_memory->open(services.context, shared.detail, 1).status == HL_STATUS_INVALID_ARGUMENT);
+    shared_copy = services.shared_memory->open(services.context, shared.detail, 0);
+    HL_CHECK(shared_copy.status == HL_STATUS_OK && shared_copy.value != shared.value &&
+             shared_copy.detail == shared.detail);
+    HL_CHECK(services.shared_memory->resize(services.context, shared_copy.value, 8192).status == HL_STATUS_OK);
+    HL_CHECK(services.file->metadata(services.context, shared.value, &metadata).status == HL_STATUS_OK &&
+             metadata.size == 8192);
     HL_CHECK(services.shared_memory->close(services.context, shared.value).status == HL_STATUS_OK);
+    HL_CHECK(services.shared_memory->open(services.context, shared.detail, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.shared_memory->resize(services.context, shared_copy.value, 12288).status == HL_STATUS_OK);
+    HL_CHECK(services.shared_memory->close(services.context, shared_copy.value).status == HL_STATUS_OK);
 
     process = services.process->spawn_cloned(services.context, process_exit, (void *)(intptr_t)37);
     HL_CHECK(process.status == HL_STATUS_OK);
