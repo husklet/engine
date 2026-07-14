@@ -147,6 +147,67 @@ int main(void) {
         HL_CHECK(unlink(map_path) == 0);
     }
     {
+        long page = sysconf(_SC_PAGESIZE);
+        char map_path[128];
+        hl_host_file_mapping first = {HL_HOST_FILE_MAPPING_ABI, sizeof(first), 0, 0, 0, 0};
+        hl_host_file_mapping fork_shared = {HL_HOST_FILE_MAPPING_ABI, sizeof(fork_shared), 0, 0, 0, 0};
+        hl_host_file_mapping replacement = {HL_HOST_FILE_MAPPING_ABI, sizeof(replacement), 0, 0, 0, 0};
+        hl_host_file_mapping collision = {HL_HOST_FILE_MAPPING_ABI, sizeof(collision), 0, 0, 0, 0};
+        hl_host_result mapped_file;
+        snprintf(map_path, sizeof(map_path), "/tmp/hl_file_fixed_linux_%ld", (long)getpid());
+        mapped_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, map_path, strlen(map_path),
+                                                   HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                                   HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
+        HL_CHECK(page > 0 && mapped_file.status == HL_STATUS_OK);
+        HL_CHECK(services.file->truncate(services.context, mapped_file.value, (uint64_t)page * 3).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page * 3,
+                                           HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                                           &first).status == HL_STATUS_OK);
+        memset((void *)(uintptr_t)first.address, 'A', (size_t)page * 3);
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page,
+                                           HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_SHARED,
+                                           &fork_shared).status == HL_STATUS_OK);
+        {
+            pid_t child = fork();
+            int child_status = 0;
+            HL_CHECK(child >= 0);
+            if (child == 0) {
+                ((char *)(uintptr_t)first.address)[0] = 'P';
+                ((char *)(uintptr_t)fork_shared.address)[0] = 'S';
+                _exit(0);
+            }
+            HL_CHECK(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+                     WEXITSTATUS(child_status) == 0);
+            HL_CHECK(((char *)(uintptr_t)first.address)[0] == 'A');
+            HL_CHECK(((char *)(uintptr_t)fork_shared.address)[0] == 'S');
+        }
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, first.address, (uint64_t)page,
+                                           (uint64_t)page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                           HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE,
+                                           &collision).status == HL_STATUS_ALREADY_EXISTS);
+        HL_CHECK(((char *)(uintptr_t)first.address)[0] == 'A');
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, first.address, (uint64_t)page,
+                                           (uint64_t)page * 3, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                           HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED,
+                                           &replacement).status == HL_STATUS_OK &&
+                 replacement.address == first.address);
+        HL_CHECK(services.memory->protect(services.context, replacement.handle, (uint64_t)page, (uint64_t)page,
+                                          HL_HOST_MEMORY_READ).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, replacement.handle, (uint64_t)page,
+                                              (uint64_t)page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->protect(services.context, replacement.handle, 0, (uint64_t)page,
+                                          HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, replacement.handle, 0, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, replacement.handle, (uint64_t)page * 2,
+                                              (uint64_t)page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, fork_shared.handle, 0, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, mapped_file.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(map_path) == 0);
+    }
+    {
         hl_host_result stream = services.file->standard_stream(services.context, HL_HOST_STANDARD_OUTPUT);
         HL_CHECK(stream.status == HL_STATUS_OK && (stream.detail & HL_HOST_FILE_WRITE) != 0);
         HL_CHECK(services.file->close(services.context, stream.value).status == HL_STATUS_OK);

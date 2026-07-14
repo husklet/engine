@@ -824,6 +824,10 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
 
     // drop the COW-inherited parent guest memory + registries, then load our own
+    /* The forked restorer inherited a COW copy of the parent's typed VMA ledger and
+     * host mapping ownership. Release those handles before forgetting the generic
+     * map registry, otherwise every restored child leaks its parent's mappings. */
+    bound_mapping_reset();
     gmap_reset_all();
     g_nanonmap = 0;
     g_ngna = 0;

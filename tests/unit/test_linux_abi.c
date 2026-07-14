@@ -416,6 +416,14 @@ int main(void) {
              HL_STATUS_OK);
     HL_CHECK(file_host.fake.live_mutexes == 0);
     {
+        hl_host_file_mapping output = {HL_HOST_FILE_MAPPING_ABI, sizeof(output), 0, 0, 0, 0};
+        uint32_t complete_size = linux_abi.size;
+        linux_abi.size = (uint32_t)offsetof(hl_linux_abi, vma_state);
+        HL_CHECK(hl_linux_map_file(&linux_abi, 0, 0, 0, 4096, HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE,
+                                   &output) == -HL_LINUX_EINVAL);
+        linux_abi.size = complete_size;
+    }
+    {
         hl_linux_fd_reservation reservation;
         hl_linux_fork_plan plan = {.abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan)};
         HL_CHECK(hl_linux_fd_reserve_at(&linux_abi, 6, &reservation) == HL_STATUS_OK);

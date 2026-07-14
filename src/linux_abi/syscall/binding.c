@@ -19,7 +19,11 @@ typedef struct bound_mapping {
     struct bound_mapping *next;
 } bound_mapping;
 
-static bound_mapping **bound_mapping_head(void) { return (bound_mapping **)&g_linux_box->vma_state; }
+static bound_mapping **bound_mapping_head(void) {
+    size_t required = offsetof(hl_linux_abi, vma_state) + sizeof(g_linux_box->vma_state);
+    if (g_linux_box == NULL || g_linux_box->abi != HL_LINUX_ABI_VERSION || g_linux_box->size < required) return NULL;
+    return (bound_mapping **)&g_linux_box->vma_state;
+}
 
 static int64_t bound_host_error(int32_t status) {
     switch ((hl_status)status) {
@@ -36,17 +40,21 @@ static int64_t bound_host_error(int32_t status) {
 }
 
 static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
+    bound_mapping **head = bound_mapping_head();
     bound_mapping *entry;
-    for (entry = *bound_mapping_head(); entry != NULL; entry = entry->next)
+    if (head == NULL || size == 0) return NULL;
+    for (entry = *head; entry != NULL; entry = entry->next)
         if (address >= entry->address && size <= entry->size && address - entry->address <= entry->size - size)
             return entry;
     return NULL;
 }
 
 static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
+    bound_mapping **head = bound_mapping_head();
     bound_mapping_object *object = entry->object;
+    if (head == NULL) return;
     if (previous != NULL) previous->next = entry->next;
-    else *bound_mapping_head() = entry->next;
+    else *head = entry->next;
     free(entry);
     if (--object->references == 0) {
         (void)g_host_services->memory->release(g_host_services->context, object->handle);
@@ -55,8 +63,12 @@ static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
 }
 
 static void bound_mapping_retire(uint64_t address, uint64_t size) {
-    uint64_t end = address + size;
-    bound_mapping *entry = *bound_mapping_head(), *previous = NULL;
+    bound_mapping **head = bound_mapping_head();
+    uint64_t end;
+    bound_mapping *entry, *previous = NULL;
+    if (head == NULL || size == 0 || address > UINT64_MAX - size) return;
+    end = address + size;
+    entry = *head;
     while (entry != NULL) {
         bound_mapping *next = entry->next;
         uint64_t base = entry->address, mapped_end = base + entry->size;
@@ -89,7 +101,9 @@ static void bound_mapping_retire(uint64_t address, uint64_t size) {
 }
 
 static void bound_mapping_reset(void) {
-    while (*bound_mapping_head() != NULL) bound_mapping_drop(*bound_mapping_head(), NULL);
+    bound_mapping **head = bound_mapping_head();
+    if (head == NULL) return;
+    while (*head != NULL) bound_mapping_drop(*head, NULL);
 }
 
 static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t address, uint64_t size, uint32_t protection,
@@ -98,8 +112,10 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     uint32_t flags = (linux_flags & 1u) ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE;
     bound_mapping_object *object;
     bound_mapping *entry;
+    bound_mapping **head = bound_mapping_head();
     int64_t result;
-    if (g_host_services == NULL || g_host_services->memory == NULL || g_host_services->memory->map_file == NULL)
+    if (head == NULL || g_host_services == NULL || g_host_services->memory == NULL ||
+        g_host_services->memory->map_file == NULL)
         return -ENOSYS;
     if (linux_flags & 0x10u) flags |= HL_HOST_MEMORY_FIXED;
     if (linux_flags & 0x100000u) flags = (flags & ~HL_HOST_MEMORY_FIXED) | HL_HOST_MEMORY_FIXED_NOREPLACE;
@@ -118,8 +134,8 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     }
     if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
     *object = (bound_mapping_object){mapped.handle, mapped.address, mapped.mapped_size, 1};
-    *entry = (bound_mapping){mapped.address, mapped.mapped_size, 0, object, *bound_mapping_head()};
-    *bound_mapping_head() = entry;
+    *entry = (bound_mapping){mapped.address, mapped.mapped_size, 0, object, *head};
+    *head = entry;
     if (mapped.address == 0 || mapped.mapped_size < size) {
         bound_mapping_drop(entry, NULL);
         return -EIO;
@@ -695,7 +711,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             return 1;
         }
     }
-    if (nr == 76 || nr == 285) {
+    if (nr == 76) {
         hl_linux_fd_snapshot second;
         if (bound_snapshot(a2, &second)) {
             G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
@@ -862,6 +878,39 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
         }
         break;
+    case 285: {
+        hl_linux_fd_snapshot output;
+        off_t *input_offset = (off_t *)(uintptr_t)a1;
+        off_t *output_offset = (off_t *)(uintptr_t)a3;
+        size_t done = 0;
+        char buffer[8192];
+        result = 0;
+        if (!bound_snapshot(a2, &output)) { result = -ENOSYS; break; }
+        if ((input_offset && !host_range_mapped((uintptr_t)input_offset, sizeof(*input_offset))) ||
+            (output_offset && !host_range_mapped((uintptr_t)output_offset, sizeof(*output_offset)))) {
+            result = -EFAULT;
+            break;
+        }
+        while (done < (size_t)G_A4(c)) {
+            size_t chunk = (size_t)G_A4(c) - done;
+            if (chunk > sizeof(buffer)) chunk = sizeof(buffer);
+            int64_t nr_read = input_offset
+                                  ? hl_linux_pread64(g_linux_box, source.fd, buffer, chunk, (uint64_t)*input_offset)
+                                  : hl_linux_read(g_linux_box, source.fd, buffer, chunk);
+            if (nr_read <= 0) { if (!done) result = nr_read; break; }
+            int64_t nr_written = output_offset
+                                     ? hl_linux_pwrite64(g_linux_box, output.fd, buffer, (size_t)nr_read,
+                                                         (uint64_t)*output_offset)
+                                     : hl_linux_write(g_linux_box, output.fd, buffer, (size_t)nr_read);
+            if (nr_written < 0) { if (!done) result = nr_written; break; }
+            done += (size_t)nr_written;
+            if (input_offset) *input_offset += (off_t)nr_written;
+            if (output_offset) *output_offset += (off_t)nr_written;
+            result = (int64_t)done;
+            if (nr_written < nr_read) break;
+        }
+        break;
+    }
     case 20: return 0; /* epoll_create1: a0 is flags, not an fd */
     case 21:           /* epoll_ctl */
     case 22:           /* epoll_pwait */
