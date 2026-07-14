@@ -33,6 +33,7 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/statfs.h>
@@ -84,6 +85,7 @@ typedef struct hl_native_kregistration {
     ino_t inode;
     int target;
     int wake;
+    int16_t filter;
     uint32_t read;
     uint32_t write;
     uint16_t flags;
@@ -158,17 +160,18 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         struct epoll_event event = {0};
         int operation;
         int target;
-        if (change->filter == EVFILT_VNODE || change->filter == EVFILT_TIMER) {
+        if (change->filter == EVFILT_VNODE) {
             pthread_mutex_unlock(&hl_native_klock);
             errno = ENOTSUP;
             return -1;
         }
-        if (change->filter != EVFILT_READ && change->filter != EVFILT_WRITE && change->filter != EVFILT_USER) {
+        if (change->filter != EVFILT_READ && change->filter != EVFILT_WRITE && change->filter != EVFILT_USER &&
+            change->filter != EVFILT_TIMER) {
             pthread_mutex_unlock(&hl_native_klock);
             errno = ENOTSUP;
             return -1;
         }
-        target = change->filter == EVFILT_USER ? -1 : (int)change->ident;
+        target = change->filter == EVFILT_USER ? -1 : change->filter == EVFILT_TIMER ? -2 : (int)change->ident;
         entry = hl_native_kfind(device, inode, target);
         if (change->filter == EVFILT_USER && (change->fflags & NOTE_TRIGGER) != 0) {
             uint64_t one = 1;
@@ -200,6 +203,7 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
                 entry->inode = inode;
                 entry->target = target;
                 entry->wake = -1;
+                entry->filter = change->filter;
                 entry->next = hl_native_kregistrations;
                 hl_native_kregistrations = entry;
             }
@@ -208,12 +212,32 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             if (change->filter == EVFILT_READ) entry->read = 1;
             else if (change->filter == EVFILT_WRITE) entry->write = 1;
             else {
-                if (entry->wake < 0) entry->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                if (entry->wake < 0)
+                    entry->wake = change->filter == EVFILT_TIMER
+                                      ? timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)
+                                      : eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
                 if (entry->wake < 0) {
                     pthread_mutex_unlock(&hl_native_klock);
                     return -1;
                 }
                 entry->read = 1;
+                if (change->filter == EVFILT_TIMER) {
+                    struct itimerspec setting = {0};
+                    int64_t nanoseconds = change->data;
+                    if ((change->fflags & NOTE_NSECONDS) == 0 || nanoseconds < 0) {
+                        pthread_mutex_unlock(&hl_native_klock);
+                        errno = ENOTSUP;
+                        return -1;
+                    }
+                    if (nanoseconds == 0) nanoseconds = 1;
+                    setting.it_value.tv_sec = (time_t)(nanoseconds / INT64_C(1000000000));
+                    setting.it_value.tv_nsec = (long)(nanoseconds % INT64_C(1000000000));
+                    if ((change->flags & EV_ONESHOT) == 0) setting.it_interval = setting.it_value;
+                    if (timerfd_settime(entry->wake, 0, &setting, NULL) != 0) {
+                        pthread_mutex_unlock(&hl_native_klock);
+                        return -1;
+                    }
+                }
             }
         } else {
             continue;
@@ -234,6 +258,10 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             pthread_mutex_unlock(&hl_native_klock);
             return -1;
         }
+        if (operation == EPOLL_CTL_DEL && entry->filter == EVFILT_TIMER && entry->wake >= 0) {
+            close(entry->wake);
+            entry->wake = -1;
+        }
     }
     pthread_mutex_unlock(&hl_native_klock);
     if (event_count == 0) return 0;
@@ -251,12 +279,18 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         for (index = 0; index < count; ++index) {
             hl_native_kregistration *entry = native_events[index].data.ptr;
             uint32_t ready = native_events[index].events;
-            int16_t filter = (ready & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0 ? EVFILT_READ : EVFILT_WRITE;
+            int16_t filter = entry->filter == EVFILT_TIMER
+                                 ? EVFILT_TIMER
+                                 : (ready & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0 ? EVFILT_READ : EVFILT_WRITE;
             events[index] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target), filter, 0, 0,
                                             0, entry->udata};
             if ((ready & (EPOLLHUP | EPOLLRDHUP)) != 0) events[index].flags |= EV_EOF;
             if ((ready & EPOLLERR) != 0) events[index].flags |= EV_ERROR;
-            if (entry->target < 0) {
+            if (entry->filter == EVFILT_TIMER) {
+                uint64_t expirations = 0;
+                if (read(entry->wake, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations))
+                    events[index].data = (intptr_t)expirations;
+            } else if (entry->target < 0) {
                 uint64_t value;
                 (void)read(entry->wake, &value, sizeof(value));
                 events[index].filter = EVFILT_USER;
