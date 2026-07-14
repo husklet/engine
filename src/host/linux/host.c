@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/vfs.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
@@ -1432,6 +1433,49 @@ static hl_host_result hl_linux_file_open_beneath(void *context, hl_host_handle r
         (void)hl_linux_close_descriptor(context, resolved.target);
     (void)hl_linux_close_descriptor(context, resolved.parent);
     return result;
+}
+
+static hl_host_result hl_linux_file_allocate_range(void *context, hl_host_handle file, uint32_t mode,
+                                                    uint64_t offset, uint64_t size) {
+    const uint32_t allowed = HL_HOST_FILE_ALLOC_KEEP_SIZE | HL_HOST_FILE_ALLOC_PUNCH_HOLE |
+                             HL_HOST_FILE_ALLOC_COLLAPSE_RANGE | HL_HOST_FILE_ALLOC_ZERO_RANGE |
+                             HL_HOST_FILE_ALLOC_INSERT_RANGE | HL_HOST_FILE_ALLOC_UNSHARE_RANGE;
+    hl_host_linux *host = context;
+    int descriptor;
+    if (size == 0 || offset > INT64_MAX || size > INT64_MAX || offset > INT64_MAX - size || (mode & ~allowed) != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (fallocate(descriptor, (int)mode, (off_t)offset, (off_t)size) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_file_filesystem_metadata(void *context, hl_host_handle file,
+                                                        hl_host_filesystem_metadata *output) {
+    hl_host_linux *host = context;
+    struct statfs status;
+    int descriptor;
+    if (output == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (fstatfs(descriptor, &status) != 0) return hl_linux_errno_result();
+    memset(output, 0, sizeof(*output));
+    output->blocks = status.f_blocks;
+    output->blocks_free = status.f_bfree;
+    output->blocks_available = status.f_bavail;
+    output->files = status.f_files;
+    output->files_free = status.f_ffree;
+    output->filesystem_id[0] = (uint32_t)status.f_fsid.__val[0];
+    output->filesystem_id[1] = (uint32_t)status.f_fsid.__val[1];
+    output->block_size = (uint64_t)status.f_bsize;
+    output->fragment_size = (uint64_t)status.f_bsize;
+    output->name_max = NAME_MAX;
+    output->flags = (uint64_t)status.f_flags;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
 static hl_host_result hl_linux_file_path(void *context, hl_host_handle file, hl_host_bytes output) {
@@ -2948,8 +2992,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
-    static const hl_host_file_services file = {HL_HOST_FILE_ABI_13,
-                                               offsetof(hl_host_file_services, allocate_range),
+    static const hl_host_file_services file = {HL_HOST_FILE_ABI,
+                                               sizeof(file),
                                                hl_linux_file_open,
                                                hl_linux_file_read,
                                                hl_linux_file_write,
@@ -2977,7 +3021,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_resolve_beneath,
                                                hl_linux_file_sync_range,
                                                hl_linux_file_sync_filesystem,
-                                               hl_linux_file_open_beneath};
+                                               hl_linux_file_open_beneath,
+                                               hl_linux_file_allocate_range,
+                                               hl_linux_file_filesystem_metadata};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

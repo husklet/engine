@@ -222,6 +222,28 @@ int main(void) {
     malformed_file.open_beneath = NULL;
     truncated.file = &malformed_file;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI_13;
+    malformed_file.size = (uint32_t)offsetof(hl_host_file_services, allocate_range);
+    malformed_file.allocate_range = NULL;
+    malformed_file.filesystem_metadata = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_OK);
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.allocate_range = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_file, 0xff, sizeof(malformed_file));
+    malformed_file.abi = HL_HOST_FILE_ABI;
+    malformed_file.size = sizeof(malformed_file);
+    malformed_file.filesystem_metadata = NULL;
+    truncated.file = &malformed_file;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_FILE) == HL_STATUS_ABI_MISMATCH);
 
     truncated = services;
     truncated.size = 8;

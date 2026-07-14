@@ -11,6 +11,13 @@ static int hl_valid_group(const void *group, uint32_t abi, size_t size) {
     return group != NULL && header[0] == abi && header[1] >= size;
 }
 
+static int hl_valid_file_group(const hl_host_file_services *file) {
+    const size_t abi13_size = offsetof(hl_host_file_services, allocate_range);
+    return file != NULL &&
+           ((file->abi == HL_HOST_FILE_ABI_13 && file->size >= abi13_size) ||
+            (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
+}
+
 hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities) {
     if (services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     if (services->abi != HL_HOST_SERVICES_ABI) return HL_STATUS_ABI_MISMATCH;
@@ -42,7 +49,7 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         (!hl_valid_group(services->log, HL_HOST_LOG_ABI, sizeof(*services->log)) || services->log->emit == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
-        (!hl_valid_group(services->file, HL_HOST_FILE_ABI, sizeof(*services->file)) ||
+        (!hl_valid_file_group(services->file) ||
          services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
          services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL ||
          services->file->read == NULL || services->file->write == NULL || services->file->clone_for_fork == NULL ||
@@ -51,7 +58,9 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->standard_stream == NULL || services->file->readlink == NULL ||
          services->file->set_owner == NULL || services->file->resolve_beneath == NULL ||
          services->file->sync_range == NULL || services->file->sync_filesystem == NULL ||
-         services->file->open_beneath == NULL))
+         services->file->open_beneath == NULL ||
+         (services->file->abi == HL_HOST_FILE_ABI &&
+          (services->file->allocate_range == NULL || services->file->filesystem_metadata == NULL))))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

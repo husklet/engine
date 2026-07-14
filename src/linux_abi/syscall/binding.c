@@ -376,6 +376,27 @@ static int64_t bound_host_error(int32_t status) {
     }
 }
 
+static int bound_file_abi14(void) {
+    const hl_host_file_services *file = g_host_services != NULL ? g_host_services->file : NULL;
+    return file != NULL && file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file);
+}
+
+static void bound_fill_statfs(uint8_t *output, const hl_host_filesystem_metadata *metadata) {
+    memset(output, 0, 120);
+    *(int64_t *)(output + 0) = INT64_C(0x01021994);
+    *(uint64_t *)(output + 8) = metadata->block_size;
+    *(uint64_t *)(output + 16) = metadata->blocks;
+    *(uint64_t *)(output + 24) = metadata->blocks_free;
+    *(uint64_t *)(output + 32) = metadata->blocks_available;
+    *(uint64_t *)(output + 40) = metadata->files;
+    *(uint64_t *)(output + 48) = metadata->files_free;
+    *(uint32_t *)(output + 56) = (uint32_t)metadata->filesystem_id[0];
+    *(uint32_t *)(output + 60) = (uint32_t)metadata->filesystem_id[1];
+    *(uint64_t *)(output + 64) = metadata->name_max;
+    *(uint64_t *)(output + 72) = metadata->fragment_size;
+    *(uint64_t *)(output + 80) = metadata->flags;
+}
+
 static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
     bound_mapping **head = bound_mapping_head();
     bound_mapping *entry;
@@ -1534,6 +1555,69 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (result == 0) fill_linux_bound_stat((uint8_t *)(uintptr_t)a1, &status);
         break;
     }
+    case 44: {
+        hl_host_filesystem_metadata metadata;
+        hl_host_result status;
+        if (!bound_file_abi14() || g_host_services->file->filesystem_metadata == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        status = g_host_services->file->filesystem_metadata(g_host_services->context, source.host_handle, &metadata);
+        if (status.status != HL_STATUS_OK) {
+            result = bound_host_error(status.status);
+            break;
+        }
+        if (!host_range_mapped((uintptr_t)a1, 120)) {
+            result = -EFAULT;
+            break;
+        }
+        bound_fill_statfs((uint8_t *)(uintptr_t)a1, &metadata);
+        result = 0;
+        break;
+    }
+    case 47: {
+        hl_host_file_metadata before = {0}, after = {0};
+        hl_host_result status;
+        uint32_t mode = (uint32_t)a1;
+        int prepared = 0;
+        if (a1 > UINT32_MAX || a2 > INT64_MAX || a3 == 0 || a3 > INT64_MAX) {
+            result = -EINVAL;
+            break;
+        }
+        if (a2 > INT64_MAX - a3) {
+            result = -EFBIG;
+            break;
+        }
+        if (!bound_file_abi14() || g_host_services->file->allocate_range == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        status = g_host_services->file->metadata(g_host_services->context, source.host_handle, &before);
+        if (status.status != HL_STATUS_OK) {
+            result = bound_host_error(status.status);
+            break;
+        }
+        if ((mode & HL_HOST_FILE_ALLOC_COLLAPSE_RANGE) != 0) {
+            gbus_prepare();
+            prepared = 1;
+        }
+        status = g_host_services->file->allocate_range(g_host_services->context, source.host_handle, mode, a2, a3);
+        result = bound_host_error(status.status);
+        if (status.status == HL_STATUS_OK &&
+            g_host_services->file->metadata(g_host_services->context, source.host_handle, &after).status ==
+                HL_STATUS_OK) {
+            bound_watch_publish_size(after.stable_device, after.stable_object, after.size);
+            pthread_mutex_lock(&g_bound_mapping_gate);
+            pthread_mutex_lock(&g_bound_mapping_lock);
+            if (before.size != after.size)
+                bound_mapping_file_size_changed(&source, &after, 1, before.size, after.size, NULL);
+            pthread_mutex_unlock(&g_bound_mapping_lock);
+            pthread_mutex_unlock(&g_bound_mapping_gate);
+            bound_mapping_file_data_changed(&source, after.stable_device, after.stable_object);
+        }
+        if (prepared) gbus_prepare_release();
+        break;
+    }
     case 23: result = bound_dup_at_least(source.fd, 0, 0); break;
     case 24: {
         uint32_t flags = (uint32_t)a2;
@@ -1672,7 +1756,6 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 22:           /* epoll_pwait */
     case 29:           /* ioctl */
     case 32:           /* flock */
-    case 44:           /* fstatfs */
     case 52:           /* fchmod */
     case 55:           /* fchown */
     case 61:           /* getdents64 */

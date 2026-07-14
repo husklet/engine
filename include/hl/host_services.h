@@ -10,7 +10,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
-#define HL_HOST_FILE_ABI 13u
+#define HL_HOST_FILE_ABI_13 13u
+#define HL_HOST_FILE_ABI 14u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -60,6 +61,15 @@ enum { HL_HOST_STANDARD_INPUT = 0, HL_HOST_STANDARD_OUTPUT = 1, HL_HOST_STANDARD
 enum { HL_HOST_COUNTER_SEMAPHORE = 1u << 0, HL_HOST_COUNTER_NONBLOCK = 1u << 1 };
 
 enum { HL_HOST_FILE_CREATE = 1u << 0, HL_HOST_FILE_EXCLUSIVE = 1u << 1, HL_HOST_FILE_TRUNCATE = 1u << 2 };
+
+enum {
+    HL_HOST_FILE_ALLOC_KEEP_SIZE = 1u << 0,
+    HL_HOST_FILE_ALLOC_PUNCH_HOLE = 1u << 1,
+    HL_HOST_FILE_ALLOC_COLLAPSE_RANGE = 1u << 3,
+    HL_HOST_FILE_ALLOC_ZERO_RANGE = 1u << 4,
+    HL_HOST_FILE_ALLOC_INSERT_RANGE = 1u << 5,
+    HL_HOST_FILE_ALLOC_UNSHARE_RANGE = 1u << 6
+};
 
 enum {
     HL_HOST_RESOLVE_NOFOLLOW_FINAL = 1u << 0,
@@ -209,6 +219,19 @@ typedef struct hl_host_file_metadata {
     uint32_t permissions;
 } hl_host_file_metadata;
 
+typedef struct hl_host_filesystem_metadata {
+    uint64_t blocks;
+    uint64_t blocks_free;
+    uint64_t blocks_available;
+    uint64_t files;
+    uint64_t files_free;
+    uint64_t filesystem_id[2];
+    uint64_t block_size;
+    uint64_t fragment_size;
+    uint64_t name_max;
+    uint64_t flags;
+} hl_host_filesystem_metadata;
+
 typedef struct hl_host_iovec {
     uint64_t address;
     uint64_t size;
@@ -285,6 +308,10 @@ typedef struct hl_host_file_services {
     hl_host_result (*open_beneath)(void *context, hl_host_handle root, const char *path, size_t path_size,
                                    uint32_t access, uint32_t creation, uint32_t permissions,
                                    uint32_t resolve_policy);
+    hl_host_result (*allocate_range)(void *context, hl_host_handle file, uint32_t mode, uint64_t offset,
+                                     uint64_t size);
+    hl_host_result (*filesystem_metadata)(void *context, hl_host_handle file,
+                                          hl_host_filesystem_metadata *output);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

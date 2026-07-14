@@ -132,6 +132,26 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     {
+        char range_path[128];
+        hl_host_filesystem_metadata filesystem;
+        hl_host_file_metadata range_metadata;
+        hl_host_result range_file;
+        snprintf(range_path, sizeof(range_path), "/tmp/hl_file_abi14_macos_%ld", (long)getpid());
+        range_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, range_path,
+                                                  strlen(range_path), HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                                  HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
+        HL_CHECK(range_file.status == HL_STATUS_OK && services.file->abi == HL_HOST_FILE_ABI);
+        HL_CHECK(services.file->allocate_range(services.context, range_file.value, 0, 0, 8192).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
+                 range_metadata.size == 8192);
+        HL_CHECK(services.file->filesystem_metadata(services.context, range_file.value, &filesystem).status ==
+                     HL_STATUS_OK && filesystem.block_size > 0 && filesystem.blocks > 0 &&
+                 filesystem.blocks_free <= filesystem.blocks);
+        HL_CHECK(services.file->close(services.context, range_file.value).status == HL_STATUS_OK &&
+                 unlink(range_path) == 0);
+    }
+    {
         hl_host_result stream = services.file->standard_stream(services.context, HL_HOST_STANDARD_OUTPUT);
         HL_CHECK(stream.status == HL_STATUS_OK && (stream.detail & HL_HOST_FILE_WRITE) != 0);
         HL_CHECK(services.file->close(services.context, stream.value).status == HL_STATUS_OK);
