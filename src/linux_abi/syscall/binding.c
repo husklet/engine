@@ -397,6 +397,50 @@ static void bound_fill_statfs(uint8_t *output, const hl_host_filesystem_metadata
     *(uint64_t *)(output + 80) = metadata->flags;
 }
 
+static void bound_fill_statx(uint8_t *output, const hl_linux_file_status *status) {
+    memset(output, 0, 256);
+    *(uint32_t *)(output + 0) = 0x7ffu | 0x800u;
+    *(uint32_t *)(output + 4) = 4096;
+    *(uint32_t *)(output + 16) = (uint32_t)status->link_count;
+    *(uint32_t *)(output + 20) = status->user;
+    *(uint32_t *)(output + 24) = status->group;
+    *(uint16_t *)(output + 28) = (uint16_t)status->mode;
+    *(uint64_t *)(output + 32) = status->object;
+    *(uint64_t *)(output + 40) = status->size;
+    *(uint64_t *)(output + 48) = status->blocks_512;
+    const uint64_t timestamps[4] = {status->accessed_ns, status->created_ns, status->changed_ns,
+                                    status->modified_ns};
+    for (size_t index = 0; index < 4; ++index) {
+        size_t offset = 64 + index * 16;
+        *(int64_t *)(output + offset) = (int64_t)(timestamps[index] / UINT64_C(1000000000));
+        *(uint32_t *)(output + offset + 8) = (uint32_t)(timestamps[index] % UINT64_C(1000000000));
+    }
+    *(uint32_t *)(output + 128) = hl_linux_device_major(status->special_device);
+    *(uint32_t *)(output + 132) = hl_linux_device_minor(status->special_device);
+    *(uint32_t *)(output + 136) = hl_linux_device_major(status->device);
+    *(uint32_t *)(output + 140) = hl_linux_device_minor(status->device);
+}
+
+static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_file_status *status) {
+    char path[HL_LINUX_PATH_MAX + 1];
+    hl_host_result named = g_host_services->file->path(
+        g_host_services->context, file->host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+    if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
+        int uid, gid;
+        struct stat native;
+        path[named.value] = 0;
+        uint64_t device = status->device, object = status->object;
+        if (stat(path, &native) == 0) {
+            device = (uint64_t)native.st_dev;
+            object = (uint64_t)native.st_ino;
+        }
+        if (chown_xattr_get(path, -1, device, object, &uid, &gid)) {
+            if (uid >= 0) status->user = (uint32_t)uid;
+            if (gid >= 0) status->group = (uint32_t)gid;
+        }
+    }
+}
+
 static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
     bound_mapping **head = bound_mapping_head();
     bound_mapping *entry;
@@ -1432,6 +1476,33 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = bound_snapshot(a0, &source);
+    if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0 &&
+        host_range_mapped((uintptr_t)a1, 1) && host_range_mapped((uintptr_t)a2, (size_t)a3)) {
+        int guest_fd = procfd_num((const char *)(uintptr_t)a1);
+        hl_linux_fd_snapshot target;
+        if (guest_fd >= 0 && bound_snapshot((uint64_t)(uint32_t)guest_fd, &target)) {
+            int native_fd;
+            int borrowed = bound_attachment_borrow(guest_fd, &native_fd);
+            if (borrowed < 0) {
+                G_RET(c) = (uint64_t)(int64_t)borrowed;
+                return 1;
+            }
+            char host_path[4200];
+            int path_status = hl_native_fd_path(native_fd, host_path, sizeof(host_path));
+            if (borrowed > 0) bound_attachment_release(native_fd);
+            if (path_status != 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+                return 1;
+            }
+            char guest_path[4200];
+            guest_from_host(host_path, guest_path, sizeof(guest_path));
+            size_t length = strlen(guest_path);
+            if (length > (size_t)a3) length = (size_t)a3;
+            memcpy((void *)(uintptr_t)a2, guest_path, length);
+            G_RET(c) = (uint64_t)length;
+            return 1;
+        }
+    }
     if (nr == 73 && bound_poll_references(a0, a1)) {
         G_RET(c) = (uint64_t)bound_ppoll(c, a0, a1, a2, a3);
         return 1;
@@ -1734,26 +1805,35 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
         if (result == 0 && !host_range_mapped((uintptr_t)a1, GUEST_LINUX_STAT_BYTES)) result = -EFAULT;
-        if (result == 0) {
-            char path[HL_LINUX_PATH_MAX + 1];
-            hl_host_result named = g_host_services->file->path(
-                g_host_services->context, source.host_handle, (hl_host_bytes){path, HL_LINUX_PATH_MAX});
-            if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
-                int uid, gid;
-                struct stat native;
-                path[named.value] = 0;
-                uint64_t dev = status.device, ino = status.object;
-                if (stat(path, &native) == 0) {
-                    dev = (uint64_t)native.st_dev;
-                    ino = (uint64_t)native.st_ino;
-                }
-                if (chown_xattr_get(path, -1, dev, ino, &uid, &gid)) {
-                    if (uid >= 0) status.user = (uint32_t)uid;
-                    if (gid >= 0) status.group = (uint32_t)gid;
-                }
-            }
-        }
+        if (result == 0) bound_virtualize_owner(&source, &status);
         if (result == 0) fill_linux_bound_stat((uint8_t *)(uintptr_t)a1, &status);
+        break;
+    }
+    case 291: {
+        const char *path = (const char *)(uintptr_t)a1;
+        uint64_t flags = a2;
+        uint64_t mask = a3;
+        uint64_t output = G_A4(c);
+        if ((flags & ~UINT64_C(0x7900)) != 0 || (flags & UINT64_C(0x6000)) == UINT64_C(0x6000) ||
+            (mask & UINT64_C(0x80000000)) != 0) {
+            result = -EINVAL;
+            break;
+        }
+        if (path == NULL || !host_range_mapped((uintptr_t)path, 1)) {
+            result = -EFAULT;
+            break;
+        }
+        if (path[0] != 0 || (flags & UINT64_C(0x1000)) == 0) return 0;
+        if (!host_range_mapped((uintptr_t)output, 256)) {
+            result = -EFAULT;
+            break;
+        }
+        hl_linux_file_status status;
+        result = hl_linux_fstat(g_linux_box, source.fd, &status);
+        if (result == 0) {
+            bound_virtualize_owner(&source, &status);
+            bound_fill_statx((uint8_t *)(uintptr_t)output, &status);
+        }
         break;
     }
     case 44: {
@@ -1855,28 +1935,44 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 88: {
         hl_host_file_time times[2];
         const struct timespec *guest = (const struct timespec *)(uintptr_t)a2;
-        if (a1 != 0) {
-            if (!host_range_mapped((uintptr_t)a1, 1)) {
-                result = -EFAULT;
-                break;
-            }
-            /* Absolute paths ignore dirfd. Relative paths require a directory, while typed handles
-             * currently represent ordinary files only. Let the common path route handle absolutes. */
-            if (*(const char *)(uintptr_t)a1 == '/') return 0;
-            result = -ENOTDIR;
-            break;
-        }
-        if (a3 != 0) {
+        char relative[HL_LINUX_PATH_MAX + 1];
+        size_t relative_size = 0;
+        hl_host_handle target = source.host_handle;
+        int close_target = 0;
+        if (a3 & ~UINT64_C(0x100)) {
             result = -EINVAL;
             break;
         }
+        if (a1 != 0) {
+            result = bound_path_copy(a1, relative, &relative_size);
+            if (result != 0) {
+                break;
+            }
+            /* Absolute paths ignore dirfd and remain on the common namespace route. Relative paths
+             * resolve beneath the opaque directory and update the independently opened target. */
+            if (relative[0] == '/') return 0;
+            if (g_host_services->file->open_relative == NULL) {
+                result = -ENOSYS;
+                break;
+            }
+            uint32_t access = HL_HOST_FILE_PATH_ONLY;
+            if (a3 & UINT64_C(0x100)) access |= HL_HOST_FILE_NOFOLLOW;
+            hl_host_result opened = g_host_services->file->open_relative(
+                g_host_services->context, source.host_handle, relative, relative_size, access, 0, 0);
+            if (opened.status != HL_STATUS_OK) {
+                result = bound_host_error(opened.status);
+                break;
+            }
+            target = opened.value;
+            close_target = 1;
+        }
         if (g_host_services->file->set_times == NULL) {
             result = -ENOSYS;
-            break;
+            goto bound_set_times_done;
         }
         if (guest != NULL && !host_range_mapped((uintptr_t)guest, sizeof(struct timespec) * 2)) {
             result = -EFAULT;
-            break;
+            goto bound_set_times_done;
         }
         for (int index = 0; index < 2; ++index) {
             int64_t nanoseconds = guest == NULL ? INT64_C(0x3fffffff) : (int64_t)guest[index].tv_nsec;
@@ -1894,9 +1990,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 goto bound_set_times_done;
             }
         }
-        result = bound_host_error(
-            g_host_services->file->set_times(g_host_services->context, source.host_handle, times).status);
+        result = bound_host_error(g_host_services->file->set_times(g_host_services->context, target, times).status);
     bound_set_times_done:
+        if (close_target) (void)g_host_services->file->close(g_host_services->context, target);
         break;
     }
     case 32: {

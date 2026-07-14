@@ -91,6 +91,16 @@ int main(void) {
     if (fd >= 0) {
         do_statx(fd, "", AT_EMPTY, &x); fstat(fd, &s);
         r_fstat = agree(&x, &s);
+        if (!r_fstat)
+            fprintf(stderr,
+                    "statx-fd uid=%u/%u gid=%u/%u mode=%o/%o links=%u/%lu size=%llu/%lld ino=%llu/%llu "
+                    "blocks=%llu/%lld rdev=%u:%u/%u:%u dev=%u:%u/%u:%u\n",
+                    x.uid, s.st_uid, x.gid, s.st_gid, x.mode, s.st_mode & 0xffff, x.nlink,
+                    (unsigned long)s.st_nlink,
+                    (unsigned long long)x.size, (long long)s.st_size, (unsigned long long)x.ino,
+                    (unsigned long long)s.st_ino, (unsigned long long)x.blocks, (long long)s.st_blocks,
+                    x.rdev_major, x.rdev_minor, major(s.st_rdev), minor(s.st_rdev), x.dev_major, x.dev_minor,
+                    major(s.st_dev), minor(s.st_dev));
         close(fd);
     }
 
