@@ -135,24 +135,23 @@ static int fbk_parked(struct futex_bucket *b, uintptr_t a) {
 // and both hash to the same bucket, while the underlying MAP_SHARED guest page is one physical page.
 // The table is created ONCE at engine startup (constructor, before any guest fork) so every forked
 // worker inherits the same physical buckets. The lock-free no-sleeper WAKE fast path is unchanged --
-// only the slow path (a real sleeper exists) touches the now-cross-process mutex/condvar. In-process
-// (multi-threaded) futexes still hit the same table, keyed by their shared virtual address, as before.
+// only the slow path (a real sleeper exists) touches the cross-process mutex/condvar. FUTEX_PRIVATE_FLAG
+// operations use a separate process-private table below; non-private operations retain this shared table.
 static struct futex_bucket *g_fbk;
+static struct futex_bucket *g_fbk_private;
+static __thread struct futex_bucket *g_fbk_active;
 
-static void futex_table_init(void) {
-    if (g_fbk) return;
+static struct futex_bucket *futex_table_alloc(int shared) {
     size_t sz = sizeof(struct futex_bucket) * FUTEX_NBUCKET;
-    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) // cross-process wakeups degrade, but in-process futexes still work
-        mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANON, -1, 0);
     if (mem == MAP_FAILED) abort();
     struct futex_bucket *t = (struct futex_bucket *)mem;
     pthread_mutexattr_t ma;
     pthread_condattr_t ca;
     pthread_mutexattr_init(&ma);
     pthread_condattr_init(&ca);
-    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
-    pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setpshared(&ma, shared ? PTHREAD_PROCESS_SHARED : PTHREAD_PROCESS_PRIVATE);
+    pthread_condattr_setpshared(&ca, shared ? PTHREAD_PROCESS_SHARED : PTHREAD_PROCESS_PRIVATE);
     for (int i = 0; i < FUTEX_NBUCKET; i++) {
         pthread_mutex_init(&t[i].m, &ma);
         pthread_cond_init(&t[i].c, &ca);
@@ -160,7 +159,29 @@ static void futex_table_init(void) {
     }
     pthread_mutexattr_destroy(&ma);
     pthread_condattr_destroy(&ca);
-    g_fbk = t;
+    return t;
+}
+
+static void futex_table_init(void) {
+    if (g_fbk) return;
+    g_fbk = futex_table_alloc(1);
+    g_fbk_private = futex_table_alloc(0);
+}
+
+// A fork child inherits the private table's bytes, including locks that may have been held by a vanished
+// peer thread. Rebuild only that table in place; the shared table must retain its cross-process waiters.
+static void futex_private_table_after_fork(void) {
+    for (int i = 0; i < FUTEX_NBUCKET; i++) {
+        struct futex_bucket *b = &g_fbk_private[i];
+        pthread_mutex_init(&b->m, NULL);
+        pthread_cond_init(&b->c, NULL);
+        atomic_store_explicit(&b->waiters, 0, memory_order_relaxed);
+        memset(b->saddr, 0, sizeof b->saddr);
+        memset(b->scnt, 0, sizeof b->scnt);
+        memset(b->sbits, 0, sizeof b->sbits);
+        b->imprecise = 0;
+    }
+    g_fbk_active = g_fbk_private;
 }
 
 __attribute__((constructor)) static void futex_table_ctor(void) {
@@ -283,7 +304,7 @@ static void futex_shared_unmap(uint64_t ustart, uint64_t uend) {
 
 static inline struct futex_bucket *fbk_of(const void *uaddr) {
     uint32_t h = (uint32_t)((futex_key(uaddr) >> 2) * 2654435761u) & (FUTEX_NBUCKET - 1);
-    return &g_fbk[h];
+    return &(g_fbk_active ? g_fbk_active : g_fbk)[h];
 }
 
 // legacy global queue (NOFUTEXQ=1)
@@ -764,8 +785,13 @@ static long futex_unlock_pi(struct cpu *c, int *uaddr) {
 // nr_wake2 is the raw 4th syscall arg (a3) reinterpreted as a count for FUTEX_WAKE_OP (WAIT ops use a3 as a
 // timespec instead -- the two never overlap because op selects one interpretation); uaddr2 (a4) + val3 (a5)
 // carry the WAKE_OP / REQUEUE second-address operands, and are ignored by the WAIT/plain-WAKE branches.
-static long futex_op(struct cpu *c, int *uaddr, int op, int val, const struct timespec *ts, int nr_wake2, int *uaddr2,
-                     uint32_t val3) {
+static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, const struct timespec *ts, int nr_wake2,
+                     int *uaddr2, uint32_t val3) {
+    // Linux FUTEX_PRIVATE_FLAG promises that no other process can participate. Keep those high-frequency
+    // pthread waits on process-private host mutexes/condvars; macOS process-shared pthread primitives are
+    // substantially heavier and eventually fault/livelock under sustained condvar churn. Non-private ops
+    // retain the MAP_SHARED table required by forked and independently-mapped shared futexes.
+    g_fbk_active = private ? g_fbk_private : g_fbk;
     // FUTEX_WAIT_BITSET(9)/WAKE_BITSET(10) require a non-empty bitset: Linux rejects val3==0 with EINVAL
     // (a zero mask can match no waiter). The old shared WAIT/WAKE path ignored val3 entirely and accepted it.
     if ((op == 9 || op == 10) && val3 == 0) return -EINVAL;
@@ -994,6 +1020,9 @@ static void futex_wake_addr(uint64_t uaddr) {
         pthread_mutex_unlock(&g_futex_m);
         return;
     }
+    // Linux's kernel-driven clear-child-tid wake uses shared futex semantics; glibc's lll_wait_tid joins on
+    // that same key class. Do not route it through whichever table this thread's last syscall selected.
+    g_fbk_active = g_fbk;
     // Always lock+broadcast (same reasoning as futex_op's WAKE): the joiner's FUTEX_WAIT re-checks
     // *ctid under this bucket's mutex, so the zero store above is ordered ahead of its check.
     struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
@@ -1027,13 +1056,14 @@ static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
 // the guest forked is inherited LOCKED with no owner to release it, so the single-threaded child deadlocks
 // the first time it takes that lock (the go/npm/cargo build hang). Reinitialise this module's
 // private locks to a clean unlocked state in the child (the calling thread never holds one across a guest
-// syscall, and no peer survives, so this is always safe). The g_fbk futex buckets are deliberately NOT reset
-// here: they live in a PROCESS_SHARED MAP_SHARED page so a cross-fork FUTEX_WAKE/WAIT still matches (glibc
-// process-shared semaphores), which is the opposite requirement. Called from the fork child path in proc.c.
+// syscall, and no peer survives, so this is always safe). Only the PRIVATE futex table is reset; g_fbk lives
+// in a PROCESS_SHARED MAP_SHARED page and must retain cross-fork FUTEX_WAKE/WAIT state (glibc process-shared
+// semaphores). Called from the fork child path in proc.c.
 static void thread_after_fork(void) {
     pthread_mutex_init(&g_threg_m, NULL); // thread registry (tkill/tgkill lookup, thread_register)
     pthread_mutex_init(&g_futex_m, NULL); // legacy global futex lock (NOFUTEXQ path)
     pthread_cond_init(&g_futex_c, NULL);
+    futex_private_table_after_fork();
     // Shared-futex-key registry lock: a private (process-shared? no -- plain) mutex that a dead peer could
     // have held across the guest fork; the child inherits the VA->object-identity entries (its mappings are
     // the parent's, at the same VAs) but must reset the lock, exactly as the futex/threg locks above.
@@ -1300,6 +1330,9 @@ static void robust_handle_death(uint64_t futex_addr, int mytid) {
 // Walk this thread's robust list (if any) and mark+wake each still-owned mutex. Clears c->robust_list so a
 // second call (thread exit then process exit) is a no-op. Every guest pointer is bounds-checked before deref.
 static void futex_robust_exit(struct cpu *c) {
+    // Like clear-child-tid, Linux's kernel-driven robust-list wake has no FUTEX_PRIVATE_FLAG and uses the
+    // shared key class. Keep it aligned with glibc's robust owner-death wait path.
+    g_fbk_active = g_fbk;
     uint64_t head = c->robust_list;
     c->robust_list = 0;
     if (!head || !host_range_mapped((uintptr_t)head, 24)) return;

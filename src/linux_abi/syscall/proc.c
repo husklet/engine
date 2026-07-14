@@ -568,8 +568,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // futex
     case 98: // futex(uaddr, op, val, timeout|nr_wake2=a3, uaddr2=a4, val3=a5); a3 is a timespec* for WAIT
         // ops and a wake count for WAKE_OP -- pass it both ways, the op selects the interpretation.
-        G_RET(c) = (uint64_t)futex_op(c, (int *)a0, (int)a1 & 0x7f, (int)a2, (struct timespec *)a3, (int)a3, (int *)a4,
-                                      (uint32_t)a5);
+        G_RET(c) = (uint64_t)futex_op(c, (int *)a0, (int)a1 & 0x7f, ((int)a1 & 0x80) != 0, (int)a2,
+                                      (struct timespec *)a3, (int)a3, (int *)a4, (uint32_t)a5);
         break;
     // set_robust_list(head, len): record the per-thread robust-list head (walked on exit to mark OWNER_DIED +
     // wake robust-mutex waiters). Linux rejects len != sizeof(struct robust_list_head) (24 on LP64).
