@@ -43,6 +43,26 @@ uint64_t jit_guest_bus_fault(uint64_t address, uint64_t size) {
 // G_OWN_TRAMPOLINES to suppress these aarch64 ones. (engine-dedup §B.1/§B.3: the register model is the
 // one irreducible divergence; the shared loop only CALLS run_block, never bakes its offsets.)
 #ifndef G_OWN_TRAMPOLINES
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+/* GCC has no AArch64 naked-function implementation.  Assembly symbols keep
+   the host boundary free of a compiler-generated frame. */
+void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
+void block_return(void) __attribute__((visibility("hidden")));
+__asm__(".pushsection .text\n.p2align 2\n.hidden run_block\n.type run_block,%function\nrun_block:\n"
+        "str x19,[x0,#288]\nstr x20,[x0,#296]\nstr x21,[x0,#304]\nstr x22,[x0,#312]\n"
+        "str x23,[x0,#320]\nstr x24,[x0,#328]\nstr x25,[x0,#336]\nstr x26,[x0,#344]\n"
+        "str x27,[x0,#352]\nstr x28,[x0,#360]\nstr x29,[x0,#368]\nstr x30,[x0,#376]\n"
+        "str q8,[x0,#896]\nstr q9,[x0,#912]\nstr q10,[x0,#928]\nstr q11,[x0,#944]\n"
+        "str q12,[x0,#960]\nstr q13,[x0,#976]\nstr q14,[x0,#992]\nstr q15,[x0,#1008]\n"
+        "mov x9,sp\nstr x9,[x0,#280]\nbr x1\n.size run_block,.-run_block\n"
+        ".p2align 2\n.hidden block_return\n.type block_return,%function\nblock_return:\n"
+        "ldr x19,[x0,#288]\nldr x20,[x0,#296]\nldr x21,[x0,#304]\nldr x22,[x0,#312]\n"
+        "ldr x23,[x0,#320]\nldr x24,[x0,#328]\nldr x25,[x0,#336]\nldr x26,[x0,#344]\n"
+        "ldr x27,[x0,#352]\nldr x28,[x0,#360]\nldr x29,[x0,#368]\nldr x30,[x0,#376]\n"
+        "ldr q8,[x0,#896]\nldr q9,[x0,#912]\nldr q10,[x0,#928]\nldr q11,[x0,#944]\n"
+        "ldr q12,[x0,#960]\nldr q13,[x0,#976]\nldr q14,[x0,#992]\nldr q15,[x0,#1008]\n"
+        "ldr x9,[x0,#280]\nmov sp,x9\nret\n.size block_return,.-block_return\n.popsection\n");
+#else
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     // x0=cpu, x1=code
     __asm__ volatile("str x19, [x0, #288]\n str x20, [x0, #296]\n"
@@ -73,6 +93,7 @@ __attribute__((naked)) static void block_return(void) {
                      "ldr x9, [x0, #280]\n mov sp, x9\n"
                      "ret\n");
 }
+#endif
 #endif // G_OWN_TRAMPOLINES
 
 // ---------------- dispatch seam defaults ----------------

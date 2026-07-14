@@ -157,10 +157,10 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     uint64_t va = (uint64_t)si->si_addr;
     if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
     ucontext_t *uc = (ucontext_t *)ucv;
-    uint32_t insn = *(uint32_t *)(uc->uc_mcontext->__ss.__pc);
+    uint32_t insn = *(uint32_t *)(HL_HOST_UC_PC(uc));
     uint64_t real = va + g_nonpie_bias;         // the datum's real (high) mapped location
-    uint64_t *X = uc->uc_mcontext->__ss.__x;    // __x[0..28] then fp/lr/sp contiguous -> X[29]=fp X[30]=lr X[31]=sp
-    __uint128_t *V = uc->uc_mcontext->__ns.__v; // SIMD/FP register file
+    uint64_t *X = HL_HOST_UC_REGS(uc);
+    __uint128_t *V = HL_HOST_UC_VREGS(uc);
     int rt = insn & 0x1F;
 
     // ---- DC ZVA (data-cache zero by VA): zero the DCZID_EL0-sized block containing the faulting addr.
@@ -172,7 +172,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
         uint64_t bs = 4ull << (dczid & 0xf);
         memset((void *)(real & ~(bs - 1)), 0, (size_t)bs);
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -218,7 +218,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             int64_t off = nonpie_sext((insn >> 15) & 0x7F, 7) * bytes;
             X[rn] = (op2 == 1) ? va + off : va;
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -237,7 +237,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         default: val = __atomic_load_n((uint64_t *)real, __ATOMIC_ACQUIRE); break;
         }
         if (rt != 31) X[rt] = nonpie_zext(val, size);
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -254,7 +254,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             return 0; // signed/unsigned min/max -> clean abort
         }
         if (rt != 31) X[rt] = nonpie_zext(old, size); // Rt receives the old value
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -265,7 +265,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         uint64_t expected = (rs == 31) ? 0 : X[rs], newv = (rt == 31) ? 0 : X[rt];
         uint64_t old = nonpie_cas((void *)real, size, expected, newv);
         if (rs != 31) X[rs] = nonpie_zext(old, size); // Rs receives the old value
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -302,7 +302,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             int ok = nonpie_sc(real, size, newv, &g_llsc.val);
             if (rs != 31) X[rs] = ok ? 0 : 1;
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -348,7 +348,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
                 if (rs != 31) X[rs] = ok ? 0 : 1;
             }
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -371,7 +371,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             if ((rs + 1) != 31) X[rs + 1] = (uint32_t)(exp >> 32);
         }
 #undef NP_XR
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -451,7 +451,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             int rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
             X[rn] = va + (rm == 31 ? (uint64_t)(regs * regbytes) : X[rm]);
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -511,7 +511,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
             int rn = (insn >> 5) & 0x1F, rm = (insn >> 16) & 0x1F;
             X[rn] = va + (rm == 31 ? (uint64_t)(selem * esize) : X[rm]);
         }
-        uc->uc_mcontext->__ss.__pc += 4;
+        HL_HOST_UC_PC(uc) += 4;
         return 1;
     }
 
@@ -555,7 +555,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         int64_t off = nonpie_sext((insn >> 12) & 0x1FF, 9);
         X[rn] = (mode == 1) ? va + off : va; // post -> Xn=va+imm, pre -> Xn=va
     }
-    uc->uc_mcontext->__ss.__pc += 4;
+    HL_HOST_UC_PC(uc) += 4;
     return 1;
 }
 
@@ -577,8 +577,8 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     if (0) {
         extern int jit_pc_in_cache(uint64_t pc, uint64_t *base);
         ucontext_t *u = (ucontext_t *)uc;
-        uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
-        uint64_t hsp = u ? (uint64_t)u->uc_mcontext->__ss.__sp : 0;
+        uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
+        uint64_t hsp = u ? (uint64_t)HL_HOST_UC_SP(u) : 0;
         uint64_t rxb = 0;
         int inc = jit_pc_in_cache(hpc, &rxb);
         char b[224];

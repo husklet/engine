@@ -816,6 +816,10 @@ $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD
 # First native-Linux production lane: AArch64 host executing an x86-64 Linux
 # guest through the production JIT. This target is smoke-scoped until the
 # remaining event/path personality seams have native Linux implementations.
+$(BUILD)/linux-production/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/linux-production/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
@@ -823,6 +827,16 @@ $(BUILD)/linux-production/target/x86_64.o: src/core/target/x86_64.c $(PRODUCTION
 $(BUILD)/linux-production/lifecycle/x86_64-core.o: src/core/lifecycle.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-production/lifecycle/aarch64-core.o: src/core/lifecycle.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-production/hl-engine-linux-aarch64: $(BUILD)/linux-production/target/aarch64.o \
+	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) -o $@ $^ -pthread -lm -ldl -latomic
 
 $(BUILD)/linux-production/hl-engine-linux-x86_64: $(BUILD)/linux-production/target/x86_64.o \
 	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(BUILD)/lib/libhl-engine.a \
@@ -839,6 +853,12 @@ run-linux-production-smoke: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/compat/core/abi/x86_64/hello
 	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/core/abi/x86_64/hello
+
+.PHONY: run-linux-production-aarch64-smoke
+run-linux-production-aarch64-smoke: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
+	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/compat/core/abi/aarch64/hello
+	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/linux-production/hl-engine-linux-aarch64 \
+		$(BUILD)/compat/core/abi/aarch64/hello
 
 LINUX_PRODUCTION_MATRIX_CASES := \
 	$(BUILD)/compat/core/abi/x86_64/files \

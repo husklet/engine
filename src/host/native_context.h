@@ -8,11 +8,15 @@
 #define HL_HOST_UC_PC(uc) ((uc)->uc_mcontext->__ss.__pc)
 #define HL_HOST_UC_REGS(uc) ((uc)->uc_mcontext->__ss.__x)
 #define HL_HOST_UC_VREGS(uc) ((uc)->uc_mcontext->__ns.__v)
+#define HL_HOST_UC_SP(uc) ((uc)->uc_mcontext->__ss.__sp)
+#define HL_HOST_UC_PSTATE(uc) ((uc)->uc_mcontext->__ss.__cpsr)
 #elif defined(__linux__) && defined(__aarch64__)
 #include <ucontext.h>
 #include <asm/sigcontext.h>
 #define HL_HOST_UC_PC(uc) ((uc)->uc_mcontext.pc)
 #define HL_HOST_UC_REGS(uc) ((uint64_t *)(void *)((uc)->uc_mcontext.regs))
+#define HL_HOST_UC_SP(uc) ((uc)->uc_mcontext.sp)
+#define HL_HOST_UC_PSTATE(uc) ((uc)->uc_mcontext.pstate)
 static inline __uint128_t *hl_host_uc_vregs(ucontext_t *context) {
     struct _aarch64_ctx *record = (struct _aarch64_ctx *)(void *)context->uc_mcontext.__reserved;
     unsigned char *end = context->uc_mcontext.__reserved + sizeof(context->uc_mcontext.__reserved);

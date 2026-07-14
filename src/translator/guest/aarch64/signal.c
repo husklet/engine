@@ -118,20 +118,21 @@ static void block_return(void);
 
 static int sigframe_capture_fault(struct cpu *c, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    uint64_t hpc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+    uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
     extern int jit_pc_in_retained_cache(uint64_t pc);
     if (!jit_pc_in_retained_cache(hpc)) return 0; // host PC outside all retained code caches -> engine fault
-    uint64_t *X = uc->uc_mcontext->__ss.__x; // __x[0..28], then fp=X[29] lr=X[30] sp=X[31]
+    uint64_t *X = HL_HOST_UC_REGS(uc);
     for (int r = 0; r <= 30; r++)
         if (!is_stolen(r)) c->x[r] = X[r];
-    c->sp = X[31];
-    c->nzcv = uc->uc_mcontext->__ss.__cpsr;
-    memcpy(c->v, uc->uc_mcontext->__ns.__v, sizeof c->v);
+    c->sp = HL_HOST_UC_SP(uc);
+    c->nzcv = HL_HOST_UC_PSTATE(uc);
+    __uint128_t *V = HL_HOST_UC_VREGS(uc);
+    if (V) memcpy(c->v, V, sizeof c->v);
     return 1;
 }
 
 static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    uc->uc_mcontext->__ss.__x[0] = (uint64_t)c; // block_return reads &cpu from x0
-    uc->uc_mcontext->__ss.__pc = (uint64_t)block_return;
+    HL_HOST_UC_REGS(uc)[0] = (uint64_t)c; // block_return reads &cpu from x0
+    HL_HOST_UC_PC(uc) = (uint64_t)block_return;
 }

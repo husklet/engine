@@ -27,14 +27,17 @@
 #include "../../host/native_context.h"
 #include <signal.h>
 #include <dirent.h>
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
-#include <dlfcn.h>
 #include <sys/event.h>
+#endif
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <stdatomic.h>
+#include <dlfcn.h>
 
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
@@ -158,14 +161,15 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     if (deliver_guest_fault(s, si, uc)) return;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     ucontext_t *u = (ucontext_t *)uc;
-    uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__pc : 0;
-    uint64_t hx0 = u ? (uint64_t)u->uc_mcontext->__ss.__x[0] : 0;
-    uint64_t hx1 = u ? (uint64_t)u->uc_mcontext->__ss.__x[1] : 0;
-    uint64_t hx9 = u ? (uint64_t)u->uc_mcontext->__ss.__x[9] : 0;
-    uint64_t hx10 = u ? (uint64_t)u->uc_mcontext->__ss.__x[10] : 0;
-    uint64_t hx16 = u ? (uint64_t)u->uc_mcontext->__ss.__x[16] : 0;
-    uint64_t hx17 = u ? (uint64_t)u->uc_mcontext->__ss.__x[17] : 0;
-    uint64_t hx30 = u ? (uint64_t)u->uc_mcontext->__ss.__x[30] : 0;
+    uint64_t *regs = u ? HL_HOST_UC_REGS(u) : NULL;
+    uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
+    uint64_t hx0 = regs ? regs[0] : 0;
+    uint64_t hx1 = regs ? regs[1] : 0;
+    uint64_t hx9 = regs ? regs[9] : 0;
+    uint64_t hx10 = regs ? regs[10] : 0;
+    uint64_t hx16 = regs ? regs[16] : 0;
+    uint64_t hx17 = regs ? regs[17] : 0;
+    uint64_t hx30 = regs ? regs[30] : 0;
     char b[1600];
     for (int i = 0; i < 1600; i++)
         b[i] = ' ';
@@ -209,11 +213,11 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     bp += 16;
     if (u) {
         for (int r = 2; r <= 8; r++)
-            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+            bp = diag_reg(b, bp, r, regs[r]);
         for (int r = 11; r <= 15; r++)
-            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+            bp = diag_reg(b, bp, r, regs[r]);
         for (int r = 18; r <= 27; r++)
-            bp = diag_reg(b, bp, r, (uint64_t)u->uc_mcontext->__ss.__x[r]);
+            bp = diag_reg(b, bp, r, regs[r]);
     }
     extern int jit_pc_in_retained_cache(uint64_t pc);
     memcpy(b + bp, " jit=0x", 7);
@@ -274,6 +278,7 @@ static void diag_hx8(char *b, uint32_t v) {
     }
 }
 
+#if defined(__APPLE__)
 static mach_port_t g_exc_port;
 // MiG lays exception messages out with 4-byte packing (see <mach/exc.h> `#pragma pack(push, 4)`),
 // so the 64-bit `code[]` array immediately follows `codeCnt` at a 4-byte-aligned offset with NO padding.
@@ -525,6 +530,7 @@ static void install_mach_exc(void) {
     pthread_t t;
     pthread_create(&t, NULL, exc_thread, NULL);
 }
+#endif
 
 // Fork-server seam: the original guest entry inlined (1)
 // container init, (2) engine init (signal handlers + pthread key + code-cache arena + env flags), and
