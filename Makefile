@@ -146,9 +146,21 @@ TIME_CASE_SOURCES := $(sort $(wildcard tests/compat/time/*.c))
 TIME_CASE_NAMES := $(basename $(notdir $(TIME_CASE_SOURCES)))
 TIME_CASE_BINS := $(TIME_CASE_NAMES:%=$(BUILD)/compat/time/aarch64/%) \
 	$(TIME_CASE_NAMES:%=$(BUILD)/compat/time/x86_64/%)
+ISOLATION_CASE_SOURCES := $(sort $(wildcard tests/compat/isolation/*.c))
+ISOLATION_CASE_NAMES := $(basename $(notdir $(ISOLATION_CASE_SOURCES)))
+ISOLATION_CASE_BINS := $(ISOLATION_CASE_NAMES:%=$(BUILD)/compat/isolation/aarch64/%) \
+	$(ISOLATION_CASE_NAMES:%=$(BUILD)/compat/isolation/x86_64/%)
+SYSCALL_EDGE_CASE_SOURCES := $(sort $(wildcard tests/compat/syscall_edges/*.c))
+SYSCALL_EDGE_CASE_NAMES := $(basename $(notdir $(SYSCALL_EDGE_CASE_SOURCES)))
+SYSCALL_EDGE_CASE_BINS := $(SYSCALL_EDGE_CASE_NAMES:%=$(BUILD)/compat/syscall_edges/aarch64/%) \
+	$(SYSCALL_EDGE_CASE_NAMES:%=$(BUILD)/compat/syscall_edges/x86_64/%)
+SOAK_CASE_SOURCES := $(sort $(wildcard tests/soak/*.c))
+SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
+SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
+	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-syscall compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
+	compat-abi compat-filesystem compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(E2E_CASE_RUNS) perf-compat check-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -408,6 +420,30 @@ $(BUILD)/compat/time/x86_64/%: tests/compat/time/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
+$(BUILD)/compat/isolation/aarch64/%: tests/compat/isolation/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/isolation/x86_64/%: tests/compat/isolation/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/syscall_edges/aarch64/%: tests/compat/syscall_edges/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(BUILD)/compat/syscall_edges/x86_64/%: tests/compat/syscall_edges/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(BUILD)/soak/aarch64/%: tests/soak/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
+
+$(BUILD)/soak/x86_64/%: tests/soak/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
+
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
@@ -558,7 +594,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-filesystem compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-syscall compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-filesystem compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -677,6 +713,21 @@ compat-time: compat-engines $(BUILD)/tools/matrix-runner $(TIME_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/time/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/time/x86_64) $(abspath tests/compat/time)
+
+compat-isolation: compat-engines $(BUILD)/tools/matrix-runner $(ISOLATION_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/isolation/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/isolation/x86_64) $(abspath tests/compat/isolation)
+
+compat-syscall-edges: compat-engines $(BUILD)/tools/matrix-runner $(SYSCALL_EDGE_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/syscall_edges/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/syscall_edges/x86_64) $(abspath tests/compat/syscall_edges)
+
+compat-soak: compat-engines $(BUILD)/tools/matrix-runner $(SOAK_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/soak/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/soak/x86_64) $(abspath tests/soak)
 
 compat-procfs: compat-engines $(BUILD)/tools/matrix-runner $(PROCFS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
