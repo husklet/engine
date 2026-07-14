@@ -836,6 +836,35 @@ run-linux-production-smoke: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 	$(BUILD)/linux-production/linux-production-smoke $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/core/abi/x86_64/hello
 
+LINUX_PRODUCTION_MATRIX_CASES := \
+	$(BUILD)/compat/core/abi/x86_64/files \
+	$(BUILD)/compat/core/abi/x86_64/statfile \
+	$(BUILD)/compat/core/abi/x86_64/mmapanon \
+	$(BUILD)/compat/core/abi/x86_64/pipe \
+	$(BUILD)/compat/posix/x86_64/pollpipe \
+	$(BUILD)/compat/posix/x86_64/waitstatus \
+	$(BUILD)/compat/signals/x86_64/signals_core \
+	$(BUILD)/compat/memory/x86_64/mprotect_enforce \
+	$(BUILD)/compat/posix/x86_64/mmapfile
+
+$(BUILD)/tools/linux-matrix: tools/linux_matrix.c
+	@mkdir -p $(@D)
+	$(CC) -O2 -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-linux-production-matrix
+test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/tools/linux-matrix $(LINUX_PRODUCTION_MATRIX_CASES)
+	$(BUILD)/tools/linux-matrix $(BUILD)/linux-production/hl-engine-linux-x86_64 \
+		$(BUILD)/compat/core/abi/x86_64/files tests/compat/core/abi/expected/files.out 0 \
+		$(BUILD)/compat/core/abi/x86_64/statfile tests/compat/core/abi/expected/statfile.out 0 \
+		$(BUILD)/compat/core/abi/x86_64/mmapanon tests/compat/core/abi/expected/mmapanon.out 0 \
+		$(BUILD)/compat/core/abi/x86_64/pipe tests/compat/core/abi/expected/pipe.out 0 \
+		$(BUILD)/compat/posix/x86_64/pollpipe tests/compat/posix/expected/pollpipe.out 0 \
+		$(BUILD)/compat/posix/x86_64/waitstatus tests/compat/posix/expected/waitstatus.out 0 \
+		$(BUILD)/compat/signals/x86_64/signals_core tests/compat/signals/expected/signals_core.out 0 \
+		$(BUILD)/compat/memory/x86_64/mprotect_enforce tests/compat/memory/expected/mprotect_enforce.out 0 \
+		$(BUILD)/compat/posix/x86_64/mmapfile tests/compat/posix/expected/mmapfile.out 0
+
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64 \
 	$(BUILD)/production/hl-remote-supervisor
 
