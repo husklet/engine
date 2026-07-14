@@ -14,6 +14,7 @@ static int jail_routed_at(int dirfd, const char *path) {
 }
 static int64_t bound_open_handle(hl_host_handle directory, const char *path, size_t path_size, uint32_t flags,
                                  uint32_t mode);
+static int64_t bound_relocate_lowest(int64_t opened);
 
 static uint32_t typed_open_flags(uint64_t guest) {
 #if G_O_DIRECTORY == 0x4000
@@ -2496,6 +2497,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 opened =
                     bound_open_handle(plan.directory, plan.path, plan.path_size, typed_open_flags(a2), (uint32_t)a3);
                 (void)g_host_services->file->close(g_host_services->context, plan.directory);
+                opened = bound_relocate_lowest(opened);
                 G_RET(c) = (uint64_t)opened;
                 break;
             }

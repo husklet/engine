@@ -151,13 +151,34 @@ static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot) {
 }
 
 static int bound_shadow_reserve(int minimum) {
-    int fd;
+    int candidate;
     if (g_bound_sentinel < 0 || minimum < 0) {
         errno = EBADF;
         return -1;
     }
-    fd = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, minimum);
-    return fd;
+    /* Allocate in the guest namespace, not by the host kernel's lowest native
+     * descriptor. Opaque and engine-private descriptors may occupy low host
+     * numbers but are not guest-visible. Relocate known engine descriptors,
+     * skip live native guest descriptors and typed reservations, then install
+     * the sentinel shadow at the exact lowest logical slot. */
+    for (candidate = minimum; candidate < guest_nofile_cur(); ++candidate) {
+        hl_linux_fd_snapshot snapshot;
+        int shadow;
+        if (bound_snapshot((uint64_t)(unsigned)candidate, &snapshot)) continue;
+        engine_fd_vacate(candidate);
+        if (fcntl(candidate, F_GETFD) >= 0 || errno != EBADF) continue;
+        shadow = dup2(g_bound_sentinel, candidate);
+        if (shadow < 0) return -1;
+        if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) {
+            int error = errno;
+            close(shadow);
+            errno = error;
+            return -1;
+        }
+        return shadow;
+    }
+    errno = EMFILE;
+    return -1;
 }
 
 static int bound_shadow_matches(int fd) {
@@ -276,6 +297,25 @@ static int64_t bound_open_handle(hl_host_handle directory, const char *path, siz
         close(shadow);
     }
     return result;
+}
+
+/* Resolution may temporarily occupy low native descriptors. Once its opaque
+ * handles are closed, republish the new typed OFD at the true lowest logical
+ * guest slot and retire the temporary shadow. */
+static int64_t bound_relocate_lowest(int64_t opened) {
+    int shadow;
+    int64_t duplicated;
+    if (opened < 0) return opened;
+    shadow = bound_shadow_reserve(0);
+    if (shadow < 0) return opened;
+    duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)opened, (hl_linux_fd)shadow, 0);
+    if (duplicated < 0) {
+        close(shadow);
+        return opened;
+    }
+    (void)hl_linux_close(g_linux_box, (hl_linux_fd)opened);
+    (void)close((int)opened);
+    return duplicated;
 }
 
 static int bound_path_copy(uint64_t address, char path[HL_LINUX_PATH_MAX + 1], size_t *path_size) {

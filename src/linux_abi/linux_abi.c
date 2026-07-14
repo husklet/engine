@@ -748,6 +748,23 @@ int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entri
             if (status == HL_STATUS_NOT_FOUND) {
                 entries[index].readiness = HL_LINUX_READY_ERROR;
                 count_ready++;
+            } else if (status == HL_STATUS_NOT_SUPPORTED) {
+                /* A NULL object adapter denotes an ordinary opaque host file. The
+                 * typed layer deliberately has no native descriptor to poll; Linux
+                 * regular files are immediately readable/writable, so readiness is
+                 * derived from the logical request rather than host fd numbering. */
+                hl_linux_fd_snapshot snapshot;
+                status = hl_linux_fd_snapshot_get(linux_abi, entries[index].fd, &snapshot);
+                if (status == HL_STATUS_NOT_FOUND) {
+                    entries[index].readiness = HL_LINUX_READY_ERROR;
+                    count_ready++;
+                } else if (status != HL_STATUS_OK) {
+                    return hl_linux_error(status);
+                } else {
+                    entries[index].readiness =
+                        entries[index].interests & (HL_LINUX_READY_READ | HL_LINUX_READY_WRITE);
+                    if (entries[index].readiness != 0) count_ready++;
+                }
             } else if (status != HL_STATUS_OK) {
                 return hl_linux_error(status);
             } else {
