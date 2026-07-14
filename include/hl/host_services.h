@@ -11,7 +11,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI_13 13u
-#define HL_HOST_FILE_ABI 14u
+#define HL_HOST_FILE_ABI_14 14u
+#define HL_HOST_FILE_ABI 15u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -215,8 +216,15 @@ typedef struct hl_host_file_metadata {
     uint64_t size;
     uint64_t allocated_size;
     uint64_t modified_ns;
+    uint64_t accessed_ns;
+    uint64_t changed_ns;
+    uint64_t created_ns;
+    uint64_t device;
+    uint64_t link_count;
     uint32_t type;
     uint32_t permissions;
+    uint32_t user;
+    uint32_t group;
 } hl_host_file_metadata;
 
 typedef struct hl_host_filesystem_metadata {

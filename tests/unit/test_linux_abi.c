@@ -193,6 +193,13 @@ static hl_host_result test_metadata(void *context, hl_host_handle file, hl_host_
     metadata->size = host->size;
     metadata->allocated_size = 512;
     metadata->modified_ns = 123456789;
+    metadata->accessed_ns = 123456700;
+    metadata->changed_ns = 123456800;
+    metadata->created_ns = 123456000;
+    metadata->device = 99;
+    metadata->link_count = 3;
+    metadata->user = 1000;
+    metadata->group = 1001;
     metadata->type = host->metadata_type == 0 ? HL_HOST_FILE_TYPE_REGULAR : host->metadata_type;
     metadata->permissions = 0640;
     return file_result(HL_STATUS_OK, 0);
@@ -681,7 +688,10 @@ int main(void) {
     {
         hl_linux_file_status file_status;
         HL_CHECK(hl_linux_fstat(&linux_abi, original, &file_status) == 0);
-        HL_CHECK(file_status.device == 7 && file_status.object == 11 && file_status.size == 6);
+        HL_CHECK(file_status.device == 7 && file_status.object == 11 && file_status.size == 6 &&
+                 file_status.special_device == 99 && file_status.link_count == 3 && file_status.user == 1000 &&
+                 file_status.group == 1001 && file_status.accessed_ns == 123456700 &&
+                 file_status.changed_ns == 123456800 && file_status.created_ns == 123456000);
         HL_CHECK(file_status.blocks_512 == 1 && file_status.modified_ns == 123456789);
         HL_CHECK(file_status.mode == (HL_LINUX_S_IFREG | 0640u));
     }

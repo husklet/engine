@@ -26,8 +26,12 @@ static int all_zero(const uint8_t *bytes, size_t begin, size_t end) {
 }
 
 int main(void) {
-    hl_linux_file_status status = {UINT64_C(0x1020304050607080), UINT64_C(0x1122334455667788), 123456789, 241,
-                                   UINT64_C(987654321012345678), HL_LINUX_S_IFREG | 0754u};
+    hl_linux_file_status status = {.device = UINT64_C(0x1020304050607080),
+                                   .object = UINT64_C(0x1122334455667788),
+                                   .size = 123456789,
+                                   .blocks_512 = 241,
+                                   .modified_ns = UINT64_C(987654321012345678),
+                                   .mode = HL_LINUX_S_IFREG | 0754u};
     uint8_t aarch64[HL_LINUX_STAT_AARCH64_SIZE];
     uint8_t x86_64[HL_LINUX_STAT_X86_64_SIZE];
     size_t index;

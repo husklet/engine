@@ -487,6 +487,11 @@ int main(void) {
         HL_CHECK(services.file->metadata(services.context, file.value, &metadata).status == HL_STATUS_OK);
         HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR && metadata.size == 3 &&
                  (metadata.permissions & 0600u) == 0600u);
+        HL_CHECK(metadata.link_count >= 1);
+        HL_CHECK(metadata.user == (uint32_t)getuid());
+        HL_CHECK(metadata.group == (uint32_t)getgid());
+        HL_CHECK(metadata.modified_ns != 0 && metadata.accessed_ns != 0 && metadata.changed_ns != 0 &&
+                 metadata.created_ns != 0);
         HL_CHECK(services.file->seek(services.context, file.value, 0, SEEK_SET).value == 0);
         clone = services.file->clone_for_fork(services.context, file.value);
         HL_CHECK(clone.status == HL_STATUS_OK && clone.value != file.value);

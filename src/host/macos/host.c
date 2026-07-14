@@ -1640,6 +1640,16 @@ static hl_host_result hl_macos_file_metadata_get(void *context, hl_host_handle f
     output->allocated_size = (uint64_t)status.st_blocks * 512u;
     output->modified_ns =
         (uint64_t)status.st_mtimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtimespec.tv_nsec;
+    output->accessed_ns =
+        (uint64_t)status.st_atimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_atimespec.tv_nsec;
+    output->changed_ns =
+        (uint64_t)status.st_ctimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_ctimespec.tv_nsec;
+    output->created_ns =
+        (uint64_t)status.st_birthtimespec.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_birthtimespec.tv_nsec;
+    output->device = (uint64_t)status.st_rdev;
+    output->link_count = (uint64_t)status.st_nlink;
+    output->user = (uint32_t)status.st_uid;
+    output->group = (uint32_t)status.st_gid;
     output->permissions = (uint32_t)status.st_mode & 07777u;
     if (S_ISREG(status.st_mode))
         output->type = HL_HOST_FILE_TYPE_REGULAR;

@@ -596,6 +596,9 @@ int main(void) {
     HL_CHECK(metadata.size == sizeof(readback));
     HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_REGULAR);
     HL_CHECK((metadata.permissions & 0777u) == 0600u);
+    HL_CHECK(metadata.link_count == 1 && metadata.user == (uint32_t)getuid() &&
+             metadata.group == (uint32_t)getgid());
+    HL_CHECK(metadata.modified_ns != 0 && metadata.accessed_ns != 0 && metadata.changed_ns != 0);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     {
         char replacement[11];

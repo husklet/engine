@@ -15,6 +15,7 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
     const size_t abi13_size = offsetof(hl_host_file_services, allocate_range);
     return file != NULL &&
            ((file->abi == HL_HOST_FILE_ABI_13 && file->size >= abi13_size) ||
+            (file->abi == HL_HOST_FILE_ABI_14 && file->size >= sizeof(*file)) ||
             (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
 }
 

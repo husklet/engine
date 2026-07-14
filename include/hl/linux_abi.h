@@ -151,7 +151,14 @@ typedef struct hl_linux_file_status {
     uint64_t size;
     uint64_t blocks_512;
     uint64_t modified_ns;
+    uint64_t accessed_ns;
+    uint64_t changed_ns;
+    uint64_t created_ns;
+    uint64_t special_device;
+    uint64_t link_count;
     uint32_t mode;
+    uint32_t user;
+    uint32_t group;
 } hl_linux_file_status;
 
 typedef struct hl_linux_fork_record {

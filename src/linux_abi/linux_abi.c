@@ -136,6 +136,7 @@ static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi
         host->file == NULL ||
         !((host->file->abi == HL_HOST_FILE_ABI_13 &&
            host->file->size >= offsetof(hl_host_file_services, allocate_range)) ||
+          (host->file->abi == HL_HOST_FILE_ABI_14 && host->file->size >= sizeof(*host->file)) ||
           (host->file->abi == HL_HOST_FILE_ABI && host->file->size >= sizeof(*host->file))))
         return NULL;
     return host->file;
@@ -1917,6 +1918,13 @@ int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_st
     output->size = metadata.size;
     output->blocks_512 = metadata.allocated_size / 512u;
     output->modified_ns = metadata.modified_ns;
+    output->accessed_ns = metadata.accessed_ns;
+    output->changed_ns = metadata.changed_ns;
+    output->created_ns = metadata.created_ns;
+    output->special_device = metadata.device;
+    output->link_count = metadata.link_count;
+    output->user = metadata.user;
+    output->group = metadata.group;
     output->mode = hl_linux_mode_type(metadata.type) | (metadata.permissions & 07777u);
     return 0;
 }
