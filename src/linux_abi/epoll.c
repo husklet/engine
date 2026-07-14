@@ -152,6 +152,10 @@ static hl_status epoll_subscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *wa
                 watch->subscribed = EPOLL_HOST;
             }
         }
+        if (status == HL_STATUS_NOT_SUPPORTED && target.ops->subscribe != NULL && target.ops->unsubscribe != NULL) {
+            status = target.ops->subscribe(target.context, epoll_notify, epoll, watch->token);
+            if (status == HL_STATUS_OK) watch->subscribed = EPOLL_CALLBACK;
+        }
     } else if (target.ops->subscribe == NULL || target.ops->unsubscribe == NULL)
         status = HL_STATUS_NOT_SUPPORTED;
     else {
