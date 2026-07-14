@@ -661,7 +661,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a0) *(unsigned *)a0 = affinity_first_cpu();
+        if (a0) *(unsigned *)a0 = hl_linux_affinity_first(&g_affinity, linux_online_cpus());
         if (a1) *(unsigned *)a1 = 0;
         G_RET(c) = 0;
         break;

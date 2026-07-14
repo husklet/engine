@@ -2,7 +2,7 @@
 
 #include "hl/macos.h"
 #include "../../src/production/host/clock.h"
-#include "../../src/production/host/file.h"
+#include "../../src/host/file.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -122,7 +122,10 @@ int main(void) {
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     {
         struct stat status;
-        HL_CHECK(hl_production_file_reset(&services, path, 0600) == 0);
+        errno = 0;
+        HL_CHECK(hl_host_file_exclusive(&services, path, 0600) == -1 && errno == EIO);
+        HL_CHECK(stat(path, &status) == 0 && status.st_size == 3);
+        HL_CHECK(hl_host_file_reset(&services, path, 0600) == 0);
         HL_CHECK(stat(path, &status) == 0 && status.st_size == 0);
     }
     unlink(path);

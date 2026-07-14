@@ -566,23 +566,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // set) so a later getaffinity reflects the pin; -EINVAL if it selects no online CPU, as on Linux.
     case 122: {
         size_t n = (size_t)a1;
-        if (n > sizeof g_affinity) n = sizeof g_affinity;
-        if (a2 && n) {
-            uint8_t online[sizeof g_affinity];
-            cpu_online_mask(online, sizeof online);
-            uint8_t want[sizeof g_affinity];
-            int any = 0;
-            for (size_t i = 0; i < n; i++) {
-                want[i] = ((const uint8_t *)a2)[i] & online[i];
-                if (want[i]) any = 1;
-            }
-            if (!any) {
-                G_RET(c) = (uint64_t)(-EINVAL);
-                break;
-            }
-            memset(g_affinity, 0, sizeof g_affinity);
-            memcpy(g_affinity, want, n);
-            g_affinity_set = 1;
+        if (!hl_linux_affinity_set(&g_affinity, (const uint8_t *)a2, n, linux_online_cpus())) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
         }
         G_RET(c) = 0;
         break;
@@ -594,7 +580,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // Linux validates the cpusetsize FIRST: it must be a multiple of sizeof(long) AND wide enough to
         // hold every online CPU, else -EINVAL (LTP sched_getaffinity01). The old handler skipped this and
         // always "succeeded", so a deliberately-tiny cpusetsize wrongly returned 0.
-        if ((n & (sizeof(unsigned long) - 1)) || n * 8 < (size_t)dd_online_cpus()) {
+        if ((n & (sizeof(unsigned long) - 1)) || n * 8 < (size_t)linux_online_cpus()) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -612,7 +598,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if (n > 128) n = 128;
-        if (a2 && n) memcpy((void *)a2, affinity_mask(), n);
+        if (a2 && n) memcpy((void *)a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), n);
         // Return the number of bytes the mask spans (glibc zeroes the remainder); 8 covers <=64 CPUs.
         G_RET(c) = n < 8 ? (uint64_t)n : 8;
         break;

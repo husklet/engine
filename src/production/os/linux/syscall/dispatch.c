@@ -399,46 +399,22 @@ static void mq_maybe_free(int qi) {
 // CPU topology: the number of CPUs to advertise to the guest (the host's online count, capped). glibc
 // and tcmalloc enumerate CPUs via sched_getaffinity and /sys/devices/system/cpu/{online,possible};
 // reporting only CPU 0 makes tcmalloc's NumPossibleCPUs() assert (`cpus.has_value()`) and mongod abort.
-static int dd_online_cpus(void) {
+static int linux_online_cpus(void) {
     // container_online_cpus() (state.c) applies the docker --cpus cap (ceil(NanoCpus/1e9)) on top of the
     // host online count, so sched_getaffinity / the cpu-topology sysfs advertise the container's allotment.
     return container_online_cpus();
 }
 
 // Build the "all online CPUs" bitmask into the caller's buffer (CPU i -> bit i, little-endian bytes).
-static void cpu_online_mask(uint8_t *m, size_t n) {
-    memset(m, 0, n);
-    int nc = dd_online_cpus();
-    for (int cpu = 0; cpu < nc; cpu++)
-        if ((size_t)(cpu / 8) < n) m[cpu / 8] |= (uint8_t)(1u << (cpu % 8));
-}
-
 // Current CPU-affinity mask (process-global; default = all online CPUs). sched_setaffinity records the
 // guest's chosen mask so sched_getaffinity round-trips it (pin-to-CPU0 then read back), while a fresh
 // process still advertises every online CPU so glibc/tcmalloc size their per-CPU tables correctly.
-static uint8_t g_affinity[128];
-static int g_affinity_set;
-
-static const uint8_t *affinity_mask(void) {
-    if (!g_affinity_set) {
-        cpu_online_mask(g_affinity, sizeof g_affinity);
-        g_affinity_set = 1;
-    }
-    return g_affinity;
-}
+#include "../../../../linux_abi/affinity.h"
+static struct hl_linux_affinity g_affinity;
 
 // Lowest CPU id in the current affinity mask. getcpu(2) must return a CPU the task is allowed to run
 // on; when the guest has pinned itself to a single CPU via sched_setaffinity, that is the exact value
 // LTP getcpu01 expects back. Falls back to CPU 0 for an (impossible) empty mask.
-static unsigned affinity_first_cpu(void) {
-    const uint8_t *m = affinity_mask();
-    for (size_t i = 0; i < sizeof g_affinity; i++)
-        if (m[i])
-            for (int b = 0; b < 8; b++)
-                if (m[i] & (1u << b)) return (unsigned)(i * 8 + b);
-    return 0;
-}
-
 // Back a short synthesized sysfs string with an anonymous temp fd (the same trick proc_open uses for
 // the macOS-has-no-/proc case). Returns a readable fd positioned at offset 0, or -1 on error.
 static int synth_str_fd(const char *s) {
@@ -455,11 +431,7 @@ static int synth_str_fd(const char *s) {
 // Render the kernel's CPU-range format ("0" for a single CPU, else "0-N\n") for the cpu/{online,
 // possible,present} sysfs files that glibc __get_nprocs / tcmalloc NumPossibleCPUs parse.
 static void cpu_range_str(char *buf, size_t n) {
-    int nc = dd_online_cpus();
-    if (nc <= 1)
-        snprintf(buf, n, "0\n");
-    else
-        snprintf(buf, n, "0-%d\n", nc - 1);
+    hl_linux_affinity_range(buf, n, linux_online_cpus());
 }
 
 // /proc/self/exe and /proc/<pid>/exe (where <pid> is the guest's own pid) are magic kernel symlinks

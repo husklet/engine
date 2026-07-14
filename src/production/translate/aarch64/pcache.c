@@ -78,6 +78,7 @@
 
 #include "../reloc.h"
 #include "../digest.h"
+#include "../../../translator/identity.h"
 #include "../window.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
@@ -204,17 +205,13 @@ static uint64_t pcache_engine_id(void) {
 // with varying flags -- e.g. go's `compile -o pkgN.a -p pkgN ...` -- keeps ONE cache reused across all
 // its invocations (the go-build fork-storm win).
 static uint64_t pcache_argv0_id(const char *argv0) {
-    if (!argv0) return 0x1357ull;
-    const char *base = argv0;
-    for (const char *p = argv0; *p; p++)
-        if (*p == '/') base = p + 1;
-    return hl_digest_bytes(HL_DIGEST_SEED, base, strlen(base));
+    return hl_identity_name(argv0);
 }
 
 static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, const char *argv0) {
     uint64_t a = pcache_id_of(prog_host);
     uint64_t b = interp_host ? pcache_id_of(interp_host) : 0xABCDEFull;
-    return (a ^ (b * 1099511628211ull)) ^ pcache_engine_id() ^ (pcache_argv0_id(argv0) * 0x100000001B3ull);
+    return hl_identity_mix(a, b, pcache_engine_id(), pcache_argv0_id(argv0));
 }
 
 static void pcache_file(char *out, size_t n) {

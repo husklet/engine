@@ -12,6 +12,7 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 add_library(hl-translator STATIC
     src/translator/codegen.c
+    src/translator/identity.c
     src/translator/host/aarch64/codegen.c
     src/translator/host/x86_64/codegen.c
     src/translator/ir/interpreter.c
@@ -58,9 +59,13 @@ add_library(hl-production-device OBJECT src/production/os/linux/syscall/device.c
 target_include_directories(hl-production-device PRIVATE src/production/os/linux/syscall)
 target_compile_options(hl-production-device PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                    -Wstrict-prototypes -Wmissing-prototypes)
+add_library(hl-linux-affinity OBJECT src/linux_abi/affinity.c)
+target_include_directories(hl-linux-affinity PRIVATE src/linux_abi)
+target_compile_options(hl-linux-affinity PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                                 -Wmissing-prototypes)
 
 add_library(hl-production-clock OBJECT src/production/host/clock.c)
-add_library(hl-production-file OBJECT src/production/host/file.c)
+add_library(hl-host-file OBJECT src/host/file.c)
 
 add_library(hl-production-errno OBJECT src/production/os/linux/syscall/errno.c)
 target_include_directories(hl-production-errno PRIVATE src/production/os/linux/syscall)
@@ -73,9 +78,9 @@ target_compile_options(hl-production-number PRIVATE -Wall -Wextra -Wpedantic -Wc
 target_include_directories(hl-production-clock PRIVATE include src/production/host)
 target_compile_options(hl-production-clock PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
                                                   -Wstrict-prototypes -Wmissing-prototypes)
-target_include_directories(hl-production-file PRIVATE include src/production/host)
-target_compile_options(hl-production-file PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-                                                 -Wstrict-prototypes -Wmissing-prototypes)
+target_include_directories(hl-host-file PRIVATE include src/host)
+target_compile_options(hl-host-file PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
+                                            -Wmissing-prototypes)
 
 foreach(target_name hl-translator hl-linux-abi hl-engine)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes
@@ -107,7 +112,7 @@ target_link_libraries(hl-engine-runner PRIVATE hl-engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name codegen config host_services ir linux_abi stat engine log options)
+    foreach(test_name codegen config host_services identity ir linux_abi stat engine log options)
         add_executable(test-${test_name} tests/unit/test_${test_name}.c)
         target_include_directories(test-${test_name} PRIVATE include tests/unit)
         target_link_libraries(test-${test_name} PRIVATE hl-engine hl-host-fake)
@@ -135,6 +140,9 @@ if(BUILD_TESTING)
     add_executable(test-device tests/unit/test_device.c $<TARGET_OBJECTS:hl-production-device>)
     target_include_directories(test-device PRIVATE include tests/unit)
     add_test(NAME device COMMAND test-device)
+    add_executable(test-affinity tests/unit/test_affinity.c $<TARGET_OBJECTS:hl-linux-affinity>)
+    target_include_directories(test-affinity PRIVATE include tests/unit)
+    add_test(NAME affinity COMMAND test-affinity)
     add_executable(test-errno tests/unit/test_errno.c $<TARGET_OBJECTS:hl-production-errno>)
     target_include_directories(test-errno PRIVATE include tests/unit)
     add_test(NAME errno COMMAND test-errno)
@@ -145,7 +153,7 @@ if(BUILD_TESTING)
     target_include_directories(test-clock PRIVATE include tests/unit)
     target_link_libraries(test-clock PRIVATE hl-host-fake)
     add_test(NAME clock COMMAND test-clock)
-    add_executable(test-file tests/unit/test_file.c $<TARGET_OBJECTS:hl-production-file>)
+    add_executable(test-file tests/unit/test_file.c $<TARGET_OBJECTS:hl-host-file>)
     target_include_directories(test-file PRIVATE include tests/unit)
     add_test(NAME file COMMAND test-file)
     if(TARGET hl-host-linux)

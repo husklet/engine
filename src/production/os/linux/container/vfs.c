@@ -2611,8 +2611,8 @@ static void proc_reg_mark_child(int hostpid) {
     proc_reg_key(dir, sizeof dir);
     mkdir(dir, 0777);
     snprintf(path, sizeof path, "%s/%d", dir, hostpid);
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644); // EXCL: never clobber the child's real record
-    if (fd >= 0) close(fd);
+    // EXCL: never clobber the child's real record.
+    (void)hl_host_file_exclusive(&g_jit_services, path, 0644);
 }
 
 // Drop a reaped child's registry records from the PARENT at wait4/waitid time. A child that exits cleanly
@@ -4471,8 +4471,7 @@ static void pts_publish(int n) {
     if (!g_rootfs_canon[0] || n < 0 || n >= DEVPTS_MAX) return;
     char p[4200];
     pts_node_path(n, p, sizeof p);
-    int fd = open(p, O_CREAT | O_WRONLY, 0620);
-    if (fd >= 0) close(fd);
+    (void)hl_host_file_create(&g_jit_services, p, 0620);
 }
 
 static void pts_unpublish(int n) {
@@ -5344,8 +5343,7 @@ static int drm_dir_open(const char *rp) {
     for (int i = 0; ent[i]; i++) {
         char p[96];
         snprintf(p, sizeof p, "%s/%s", tmpl, ent[i]);
-        int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
-        if (f >= 0) close(f);
+        (void)hl_host_file_reset(&g_jit_services, p, 0444);
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (fd < 0) { procfd_dir_rm(tmpl); return -1; }
