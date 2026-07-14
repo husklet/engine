@@ -49,9 +49,15 @@ extern int g_rwx_guest;
 static uint64_t g_smc_pg[SMC_MAX];
 static int g_smc_n;
 static uint64_t g_smc_flushes; // PROF: number of SMC re-translate events
+static uint64_t smc_page_size(void) {
+    static uint64_t size;
+    if (size == 0) size = (uint64_t)getpagesize();
+    return size;
+}
 static void smc_protect(uint64_t pc) {
     if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
-    uint64_t pg = pc & ~0x3FFFull; // 16KB macOS hardware page
+    uint64_t size = smc_page_size();
+    uint64_t pg = pc & ~(size - 1);
     for (int i = 0; i < g_smc_n; i++)
         if (g_smc_pg[i] == pg) return; // already protected
     // Capacity check BEFORE the mprotect. If the table is full, leave the page WRITABLE: a protected-but-
@@ -59,7 +65,7 @@ static void smc_protect(uint64_t pc) {
     // fault falls through as a real SIGSEGV / hangs on the un-handled write. Not protecting past SMC_MAX only
     // loses SMC coherence for the overflow pages (the separate "SMC capacity cliff" -> stale code, not a hang).
     if (g_smc_n >= SMC_MAX) return;
-    if (mprotect((void *)pg, 0x4000, PROT_READ) != 0) return; // code page -> read-only; writes trap
+    if (mprotect((void *)pg, (size_t)size, PROT_READ) != 0) return; // code page -> read-only; writes trap
     g_smc_pg[g_smc_n++] = pg;
 }
 
@@ -67,10 +73,11 @@ static void smc_protect(uint64_t pc) {
 // Re-protected the next time the page is translated. Called from jit86_lazyguard (elf.c).
 static int smc_on_write(uint64_t a) {
     if (!g_rwx_guest) return 0;
-    uint64_t pg = a & ~0x3FFFull;
+    uint64_t size = smc_page_size();
+    uint64_t pg = a & ~(size - 1);
     for (int i = 0; i < g_smc_n; i++)
         if (g_smc_pg[i] == pg) {
-            mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE); // let the guest's write through
+            mprotect((void *)pg, (size_t)size, PROT_READ | PROT_WRITE); // let the guest's write through
             g_smc_pg[i] = g_smc_pg[--g_smc_n];                    // re-protected on next translate
             g_smc_flushes++;
             return 1;

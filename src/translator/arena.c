@@ -22,6 +22,7 @@ void hl_arena_bind(hl_emit_state *state, const hl_host_code_mapping *mapping) {
 
 int hl_arena_repair(const hl_host_services *services, hl_emit_state *state, int preserve) {
     int dual_alias = state->dual_alias;
+    state->mapping.content_size = (uint64_t)(state->cursor - state->base);
     if (services->memory->repair_code_after_fork(services->context, &state->mapping, (uint32_t)preserve).status !=
         HL_STATUS_OK)
         return -1;

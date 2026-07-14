@@ -8,6 +8,7 @@ typedef struct fake_arena {
     hl_host_handle released;
     uint64_t size;
     uint64_t alignment;
+    uint64_t content_size;
 } fake_arena;
 
 static hl_host_result reserve_code(void *context, uint64_t size, uint64_t alignment, uint32_t flags,
@@ -26,6 +27,7 @@ static hl_host_result reserve_code(void *context, uint64_t size, uint64_t alignm
 static hl_host_result repair(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
     fake_arena *fake = context;
     fake->preserve = preserve;
+    fake->content_size = mapping->content_size;
     if (!preserve) {
         mapping->writable_address = 0x5000;
         mapping->executable_address = 0x5000;
@@ -61,8 +63,11 @@ int main(void) {
     HL_CHECK(state.rx_delta == 0x2000);
     HL_CHECK(state.dual_alias == 1);
 
+    state.cursor += 127;
+
     HL_CHECK(hl_arena_repair(&services, &state, 0) == 0);
     HL_CHECK(fake.preserve == 0);
+    HL_CHECK(fake.content_size == 127);
     HL_CHECK(state.base == (uint8_t *)(uintptr_t)0x5000);
     HL_CHECK(state.rx_delta == 0);
     HL_CHECK(state.dual_alias == 1);

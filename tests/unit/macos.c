@@ -845,6 +845,7 @@ int main(void) {
              HL_STATUS_OK);
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     memcpy((void *)(uintptr_t)code.writable_address, "code", 5);
+    code.content_size = 5;
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 5).status == HL_STATUS_OK);
     HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "code", 5) == 0);

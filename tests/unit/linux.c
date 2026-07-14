@@ -134,6 +134,7 @@ static int check_code_mapping_fork(const hl_host_services *services) {
     result = services->memory->reserve_code(services->context, page, page, HL_HOST_CODE_DUAL_ALIAS, &code);
     if (result.status != HL_STATUS_OK || code.writable_address == code.executable_address) return 2;
     write_return_code((void *)(uintptr_t)code.writable_address, 41);
+    code.content_size = page;
     if (services->memory->publish_code(services->context, code.handle, 0, page).status != HL_STATUS_OK ||
         call_return_code(code.executable_address) != 41)
         return 3;
@@ -549,6 +550,7 @@ int main(void) {
              HL_STATUS_OK);
     HL_CHECK(code.handle != 0 && code.writable_address != 0 && code.executable_address != 0);
     memcpy((void *)(uintptr_t)code.writable_address, "jit", 4);
+    code.content_size = 4;
     HL_CHECK(services.memory->publish_code(services.context, code.handle, 0, 4).status == HL_STATUS_OK);
     HL_CHECK(memcmp((const void *)(uintptr_t)code.executable_address, "jit", 4) == 0);
     HL_CHECK(services.memory->repair_code_after_fork(services.context, &code, 1).status == HL_STATUS_OK);

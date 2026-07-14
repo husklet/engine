@@ -170,7 +170,7 @@ typedef struct hl_host_code_mapping {
     uint64_t writable_address;
     uint64_t executable_address;
     uint64_t mapped_size;
-    uint64_t reserved;
+    uint64_t content_size;
 } hl_host_code_mapping;
 
 typedef struct hl_host_file_mapping {

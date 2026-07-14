@@ -593,6 +593,8 @@ static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_ma
     }
     inherited = *entry;
     pthread_mutex_unlock(&host->lock);
+    if (mapping->content_size > inherited.size)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
 
     if (inherited.executable_address != inherited.address) {
         descriptor = memfd_create("hl-code", MFD_CLOEXEC);
@@ -608,7 +610,7 @@ static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_ma
                pages. Give the child a private backing object while retaining
                the exact cache addresses and bytes expected by every map entry,
                chain, and inline-cache pointer. */
-            memcpy(writable, inherited.address, (size_t)inherited.size);
+            memcpy(writable, inherited.address, (size_t)mapping->content_size);
             if (mmap(inherited.address, (size_t)inherited.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
                      descriptor, 0) == MAP_FAILED ||
                 mmap(inherited.executable_address, (size_t)inherited.size, PROT_READ | PROT_EXEC,

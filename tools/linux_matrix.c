@@ -190,14 +190,23 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             continue;
         }
         source_size = strlen(fields[2]);
-        if (source_size < 3 || strcmp(fields[2] + source_size - 2, ".c") != 0 || source_size - 2 >= sizeof(binary)) {
+        if (source_size >= 3 && strcmp(fields[2] + source_size - 2, ".c") == 0) {
+            if (source_size - 2 >= sizeof(binary)) {
+                fprintf(stderr, "linux-matrix: source path too long %s\n", fields[2]);
+                free(line);
+                fclose(file);
+                return 1;
+            }
+            memcpy(binary, fields[2], source_size - 2);
+            binary[source_size - 2] = 0;
+        } else if (strncmp(fields[5], "prebuilt:", 9) == 0 && source_size != 0 && source_size < sizeof(binary)) {
+            memcpy(binary, fields[2], source_size + 1);
+        } else {
             fprintf(stderr, "linux-matrix: invalid source %s\n", fields[2]);
             free(line);
             fclose(file);
             return 1;
         }
-        memcpy(binary, fields[2], source_size - 2);
-        binary[source_size - 2] = 0;
         if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
             snprintf(golden, sizeof(golden), "%s/%s", suite_root, fields[9]) >= (int)sizeof(golden)) {
             fprintf(stderr, "linux-matrix: path too long for %s\n", fields[0]);

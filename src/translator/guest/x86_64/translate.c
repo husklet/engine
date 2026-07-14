@@ -960,7 +960,8 @@ static void emit_x87_round_st0(void) {
 // nothing. Inert unless a JIT guest is present (g_rwx_guest) -> the normal (non-JIT) matrix is byte-exact.
 static void jit86_drop_range_translations(uint64_t lo, uint64_t hi) {
     if (!g_rwx_guest || g_smc_n == 0 || hi <= lo) return;
-    uint64_t plo = lo & ~0x3FFFull, phi = (hi + 0x3FFFull) & ~0x3FFFull;
+    uint64_t page_size = smc_page_size();
+    uint64_t plo = lo & ~(page_size - 1), phi = (hi + page_size - 1) & ~(page_size - 1);
     int hit = 0;
     for (int i = 0; i < g_smc_n;) {
         if (g_smc_pg[i] >= plo && g_smc_pg[i] < phi) { // a translated code page lived in the range
