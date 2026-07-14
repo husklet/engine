@@ -18,29 +18,32 @@
 
 #define N 200
 
-static void lock_whole(int fd, int type) {
+static int lock_whole(int fd, int type) {
     struct flock fl = {.l_type = (short)type, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
-    while (fcntl(fd, F_SETLKW, &fl) < 0 && errno == EINTR) {
-    }
+    int result;
+    do result = fcntl(fd, F_SETLKW, &fl); while (result < 0 && errno == EINTR);
+    return result;
 }
 
 static void worker(const char *path) {
     int fd = open(path, O_RDWR); // a fresh open in this process -> distinct fd, same (dev,ino) lock domain
+    if (fd < 0) _exit(10);
     for (int i = 0; i < N; i++) {
-        lock_whole(fd, F_WRLCK); // exclusive: only one worker inside the critical section at a time
+        if (lock_whole(fd, F_WRLCK) != 0) _exit(11);
         char buf[32];
-        lseek(fd, 0, SEEK_SET);
+        if (lseek(fd, 0, SEEK_SET) != 0) _exit(12);
         int n = (int)read(fd, buf, sizeof buf - 1);
-        buf[n > 0 ? n : 0] = 0;
+        if (n <= 0) _exit(13);
+        buf[n] = 0;
         long v = atol(buf) + 1;
         char out[32];
         int len = snprintf(out, sizeof out, "%ld", v);
-        lseek(fd, 0, SEEK_SET);
-        if (ftruncate(fd, 0) != 0) { /* ignore */ }
-        if (write(fd, out, (size_t)len) != len) { /* ignore */ }
-        lock_whole(fd, F_UNLCK);
+        if (lseek(fd, 0, SEEK_SET) != 0) _exit(14);
+        if (ftruncate(fd, 0) != 0) _exit(15);
+        if (write(fd, out, (size_t)len) != len) _exit(16);
+        if (lock_whole(fd, F_UNLCK) != 0) _exit(17);
     }
-    close(fd);
+    if (close(fd) != 0) _exit(18);
     _exit(0);
 }
 
@@ -89,8 +92,13 @@ int main(void) {
     if (a == 0) worker(path);
     pid_t b = fork();
     if (b == 0) worker(path);
-    waitpid(a, 0, 0);
-    waitpid(b, 0, 0);
+    int ast = 0, bst = 0;
+    if (waitpid(a, &ast, 0) != a || waitpid(b, &bst, 0) != b || !WIFEXITED(ast) || WEXITSTATUS(ast) != 0 ||
+        !WIFEXITED(bst) || WEXITSTATUS(bst) != 0) {
+        fprintf(stderr, "poslk workers a=0x%x b=0x%x\n", ast, bst);
+        unlink(path);
+        return 2;
+    }
 
     int rf = open(path, O_RDONLY);
     char buf[32];
