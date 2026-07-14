@@ -32,3 +32,39 @@ int hl_host_file_exclusive(const hl_host_services *services, const char *path, u
 int hl_host_file_reset(const hl_host_services *services, const char *path, uint32_t permissions) {
     return hl_host_file_marker(services, path, permissions, HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE);
 }
+
+int hl_host_file_store(const hl_host_services *services, const char *path, uint32_t permissions, const void *data,
+                       size_t size) {
+    hl_host_result opened;
+    size_t offset = 0;
+    int failed = 0;
+    if (services == NULL || services->file == NULL || services->file->open_relative == NULL ||
+        services->file->write == NULL || services->file->close == NULL || path == NULL || path[0] == '\0' ||
+        (size != 0 && data == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    opened =
+        services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_FILE_WRITE,
+                                      HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE, permissions);
+    if (opened.status != HL_STATUS_OK) {
+        errno = EIO;
+        return -1;
+    }
+    while (offset < size) {
+        const unsigned char *bytes = data;
+        hl_host_result written =
+            services->file->write(services->context, opened.value, bytes + offset, (uint64_t)(size - offset));
+        if (written.status != HL_STATUS_OK || written.value == 0 || written.value > size - offset) {
+            failed = 1;
+            break;
+        }
+        offset += (size_t)written.value;
+    }
+    hl_host_result closed = services->file->close(services->context, opened.value);
+    if (failed || closed.status != HL_STATUS_OK) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}

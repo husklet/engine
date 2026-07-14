@@ -2076,10 +2076,7 @@ static void proc_reg_unlink(void) {
 static void proc_reg_write_files(const char *dir, const char *buf, int len, const char *exe) {
     char tmp[144];
     snprintf(tmp, sizeof tmp, "%s/.t%d", dir, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-    if (write(fd, buf, (size_t)len) < 0) {}
-    close(fd);
+    if (hl_host_file_store(&g_jit_services, tmp, 0644, buf, (size_t)len) != 0) return;
     char final[128];
     snprintf(final, sizeof final, "%s/%d", dir, (int)getpid());
     if (rename(tmp, final) == 0)
@@ -2093,10 +2090,7 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
         char xtmp[152], xfin[144];
         snprintf(xtmp, sizeof xtmp, "%s/.xt%d", dir, (int)getpid());
         snprintf(xfin, sizeof xfin, "%s/x%d", dir, (int)getpid());
-        int xfd = open(xtmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (xfd >= 0) {
-            if (write(xfd, exe, strlen(exe)) < 0) {}
-            close(xfd);
+        if (hl_host_file_store(&g_jit_services, xtmp, 0644, exe, strlen(exe)) == 0) {
             if (rename(xtmp, xfin) == 0)
                 snprintf(g_reg_exe_file, sizeof g_reg_exe_file, "%s", xfin);
             else

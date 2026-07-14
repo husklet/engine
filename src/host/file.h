@@ -6,5 +6,7 @@
 int hl_host_file_create(const hl_host_services *services, const char *path, uint32_t permissions);
 int hl_host_file_exclusive(const hl_host_services *services, const char *path, uint32_t permissions);
 int hl_host_file_reset(const hl_host_services *services, const char *path, uint32_t permissions);
+int hl_host_file_store(const hl_host_services *services, const char *path, uint32_t permissions, const void *data,
+                       size_t size);
 
 #endif
