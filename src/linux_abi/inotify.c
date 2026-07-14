@@ -1,0 +1,397 @@
+#include "inotify.h"
+
+#include "object.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+enum { HL_LINUX_OBJECT_INOTIFY = 0x696e6f74u };
+
+#define INOTIFY_EVENT_MASK UINT32_C(0x00000fff)
+#define INOTIFY_OPTION_MASK                                                                                            \
+    (HL_LINUX_IN_ONLYDIR | HL_LINUX_IN_DONT_FOLLOW | HL_LINUX_IN_EXCL_UNLINK | HL_LINUX_IN_MASK_CREATE |               \
+     HL_LINUX_IN_MASK_ADD | HL_LINUX_IN_ONESHOT)
+
+typedef struct inotify_watch {
+    int32_t wd;
+    uint32_t mask;
+    uint64_t token;
+    char *path;
+    size_t path_size;
+} inotify_watch;
+
+typedef struct inotify_object {
+    const hl_linux_inotify_provider_ops *provider;
+    void *provider_context;
+    inotify_watch *watches;
+    uint32_t watch_count;
+    uint32_t watch_capacity;
+    unsigned char *queue;
+    size_t queue_size;
+    size_t queue_capacity;
+    int32_t next_wd;
+    uint32_t nonblocking;
+} inotify_object;
+
+static int64_t inotify_error(hl_status status) {
+    switch (status) {
+    case HL_STATUS_OK: return 0;
+    case HL_STATUS_NOT_FOUND: return -HL_LINUX_EINVAL;
+    case HL_STATUS_ALREADY_EXISTS: return -HL_LINUX_EEXIST;
+    case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
+    case HL_STATUS_INTERRUPTED: return -HL_LINUX_EINTR;
+    case HL_STATUS_WOULD_BLOCK: return -HL_LINUX_EAGAIN;
+    case HL_STATUS_NOT_SUPPORTED: return -HL_LINUX_ENOSYS;
+    default: return -HL_LINUX_EINVAL;
+    }
+}
+
+static inotify_watch *watch_token(inotify_object *object, uint64_t token) {
+    uint32_t index;
+    for (index = 0; index < object->watch_count; ++index)
+        if (object->watches[index].token == token) return &object->watches[index];
+    return NULL;
+}
+
+static inotify_watch *watch_id(inotify_object *object, int32_t wd) {
+    uint32_t index;
+    for (index = 0; index < object->watch_count; ++index)
+        if (object->watches[index].wd == wd) return &object->watches[index];
+    return NULL;
+}
+
+static hl_status queue_event(inotify_object *object, int32_t wd, uint32_t mask, uint32_t cookie, const char *name,
+                             size_t name_size) {
+    size_t padded = name_size == 0 ? 0 : (name_size + 1u + 3u) & ~(size_t)3u;
+    size_t needed = 16u + padded;
+    unsigned char *grown;
+    if (needed > SIZE_MAX - object->queue_size) return HL_STATUS_OUT_OF_MEMORY;
+    if (object->queue_size + needed > object->queue_capacity) {
+        size_t capacity = object->queue_capacity == 0 ? 256u : object->queue_capacity;
+        while (capacity < object->queue_size + needed) {
+            if (capacity > SIZE_MAX / 2u) return HL_STATUS_OUT_OF_MEMORY;
+            capacity *= 2u;
+        }
+        grown = realloc(object->queue, capacity);
+        if (grown == NULL) return HL_STATUS_OUT_OF_MEMORY;
+        object->queue = grown;
+        object->queue_capacity = capacity;
+    }
+    memcpy(object->queue + object->queue_size, &wd, 4);
+    memcpy(object->queue + object->queue_size + 4, &mask, 4);
+    memcpy(object->queue + object->queue_size + 8, &cookie, 4);
+    {
+        uint32_t length = (uint32_t)padded;
+        memcpy(object->queue + object->queue_size + 12, &length, 4);
+    }
+    if (padded != 0) {
+        memcpy(object->queue + object->queue_size + 16, name, name_size);
+        memset(object->queue + object->queue_size + 16 + name_size, 0, padded - name_size);
+    }
+    object->queue_size += needed;
+    return HL_STATUS_OK;
+}
+
+static hl_status inotify_pump(inotify_object *object) {
+    hl_linux_inotify_provider_event events[32];
+    uint32_t count = 0;
+    uint32_t index;
+    hl_status status = object->provider->drain(object->provider_context, events, 32, &count);
+    if (status == HL_STATUS_WOULD_BLOCK) return HL_STATUS_OK;
+    if (status != HL_STATUS_OK) return status;
+    for (index = 0; index < count; ++index) {
+        inotify_watch *watch = watch_token(object, events[index].token);
+        uint32_t mask;
+        if (watch == NULL && (events[index].mask & HL_LINUX_IN_Q_OVERFLOW) == 0) continue;
+        mask = events[index].mask;
+        if (watch != NULL && (mask & (INOTIFY_EVENT_MASK | HL_LINUX_IN_ISDIR)) != 0 &&
+            (mask & (watch->mask & INOTIFY_EVENT_MASK)) == 0)
+            continue;
+        status = queue_event(object, watch == NULL ? -1 : watch->wd, mask, events[index].cookie, events[index].name,
+                             events[index].name_size);
+        if (status != HL_STATUS_OK) return status;
+        if (watch != NULL && ((watch->mask & HL_LINUX_IN_ONESHOT) != 0 || (mask & HL_LINUX_IN_IGNORED) != 0)) {
+            int32_t wd = watch->wd;
+            uint64_t token = watch->token;
+            uint32_t position = (uint32_t)(watch - object->watches);
+            if ((mask & HL_LINUX_IN_IGNORED) == 0) {
+                (void)object->provider->remove(object->provider_context, token);
+                status = queue_event(object, wd, HL_LINUX_IN_IGNORED, 0, NULL, 0);
+                if (status != HL_STATUS_OK) return status;
+            }
+            free(watch->path);
+            object->watches[position] = object->watches[--object->watch_count];
+        }
+    }
+    return HL_STATUS_OK;
+}
+
+static int64_t inotify_read(void *opaque, void *buffer, size_t size) {
+    inotify_object *object = opaque;
+    size_t offset = 0;
+    hl_status status = inotify_pump(object);
+    if (status != HL_STATUS_OK) return inotify_error(status);
+    while (object->queue_size == 0 && object->nonblocking == 0) {
+        status = object->provider->wait(object->provider_context);
+        if (status != HL_STATUS_OK) return inotify_error(status);
+        status = inotify_pump(object);
+        if (status != HL_STATUS_OK) return inotify_error(status);
+    }
+    if (object->queue_size == 0) return -HL_LINUX_EAGAIN;
+    if (size < 16) return -HL_LINUX_EINVAL;
+    while (offset + 16 <= object->queue_size) {
+        uint32_t length;
+        size_t record;
+        memcpy(&length, object->queue + offset + 12, 4);
+        record = 16u + length;
+        if (record > size - offset) break;
+        offset += record;
+    }
+    if (offset == 0) return -HL_LINUX_EINVAL;
+    memcpy(buffer, object->queue, offset);
+    object->queue_size -= offset;
+    if (object->queue_size != 0) memmove(object->queue, object->queue + offset, object->queue_size);
+    return (int64_t)offset;
+}
+
+static uint32_t inotify_ready(void *opaque, uint32_t interests) {
+    inotify_object *object = opaque;
+    if ((interests & HL_LINUX_READY_READ) == 0) return 0;
+    if (object->queue_size == 0) (void)inotify_pump(object);
+    return object->queue_size != 0 || object->provider->readiness(object->provider_context) != 0 ? HL_LINUX_READY_READ
+                                                                                                 : 0;
+}
+
+static hl_host_result inotify_wait_handle(void *opaque) {
+    inotify_object *object = opaque;
+    return object->provider->wait_handle(object->provider_context);
+}
+
+static hl_status inotify_subscribe(void *opaque, void (*notify)(void *, uint64_t), void *observer, uint64_t token) {
+    inotify_object *object = opaque;
+    if (object->provider->subscribe == NULL) return HL_STATUS_NOT_SUPPORTED;
+    return object->provider->subscribe(object->provider_context, notify, observer, token);
+}
+
+static void inotify_unsubscribe(void *opaque, void *observer, uint64_t token) {
+    inotify_object *object = opaque;
+    if (object->provider->unsubscribe != NULL) object->provider->unsubscribe(object->provider_context, observer, token);
+}
+
+static hl_status inotify_clone(void *opaque, void **out_context) {
+    inotify_object *source = opaque;
+    inotify_object *copy = calloc(1, sizeof(*copy));
+    uint32_t index;
+    hl_status status;
+    if (copy == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    copy->provider = source->provider;
+    copy->next_wd = source->next_wd;
+    copy->nonblocking = source->nonblocking;
+    status = source->provider->clone(source->provider_context, &copy->provider_context);
+    if (status != HL_STATUS_OK) {
+        free(copy);
+        return status;
+    }
+    if (source->watch_capacity != 0) {
+        copy->watches = calloc(source->watch_capacity, sizeof(*copy->watches));
+        if (copy->watches == NULL) goto no_memory;
+        copy->watch_capacity = source->watch_capacity;
+        copy->watch_count = source->watch_count;
+        for (index = 0; index < source->watch_count; ++index) {
+            copy->watches[index] = source->watches[index];
+            copy->watches[index].path = malloc(source->watches[index].path_size + 1u);
+            if (copy->watches[index].path == NULL) goto no_memory;
+            memcpy(copy->watches[index].path, source->watches[index].path, source->watches[index].path_size + 1u);
+        }
+    }
+    if (source->queue_size != 0) {
+        copy->queue = malloc(source->queue_size);
+        if (copy->queue == NULL) goto no_memory;
+        memcpy(copy->queue, source->queue, source->queue_size);
+        copy->queue_size = copy->queue_capacity = source->queue_size;
+    }
+    *out_context = copy;
+    return HL_STATUS_OK;
+no_memory:
+    for (index = 0; index < copy->watch_count; ++index)
+        free(copy->watches[index].path);
+    free(copy->watches);
+    (void)copy->provider->close(copy->provider_context);
+    free(copy);
+    return HL_STATUS_OUT_OF_MEMORY;
+}
+
+static hl_status inotify_close(void *opaque) {
+    inotify_object *object = opaque;
+    uint32_t index;
+    hl_status status;
+    for (index = 0; index < object->watch_count; ++index)
+        free(object->watches[index].path);
+    free(object->watches);
+    free(object->queue);
+    status = object->provider->close(object->provider_context);
+    free(object);
+    return status;
+}
+
+static const hl_linux_object_ops inotify_ops = {.read = inotify_read,
+                                                .readiness = inotify_ready,
+                                                .wait_handle = inotify_wait_handle,
+                                                .subscribe = inotify_subscribe,
+                                                .unsubscribe = inotify_unsubscribe,
+                                                .clone = inotify_clone,
+                                                .close = inotify_close};
+
+int64_t hl_linux_inotify_create(hl_linux_abi *linux_abi, const hl_linux_inotify_provider_ops *provider,
+                                void *provider_context, uint32_t descriptor_flags, uint32_t status_flags) {
+    inotify_object *object;
+    hl_linux_fd fd;
+    hl_status status;
+    if (linux_abi == NULL || provider == NULL || provider->add == NULL || provider->modify == NULL ||
+        provider->remove == NULL || provider->drain == NULL || provider->wait == NULL ||
+        provider->wait_handle == NULL || provider->readiness == NULL || provider->clone == NULL ||
+        provider->close == NULL)
+        return -HL_LINUX_EINVAL;
+    object = calloc(1, sizeof(*object));
+    if (object == NULL) return -HL_LINUX_ENOMEM;
+    object->provider = provider;
+    object->provider_context = provider_context;
+    object->next_wd = 1;
+    object->nonblocking = (status_flags & 00004000u) != 0;
+    status = hl_linux_object_install(linux_abi, &inotify_ops, object, HL_LINUX_OBJECT_INOTIFY, status_flags,
+                                     descriptor_flags, &fd);
+    if (status != HL_STATUS_OK) {
+        (void)provider->close(provider_context);
+        free(object);
+        return inotify_error(status);
+    }
+    return (int64_t)fd;
+}
+
+int64_t hl_linux_inotify_create_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
+                                   const hl_linux_inotify_provider_ops *provider, void *provider_context,
+                                   uint32_t descriptor_flags, uint32_t status_flags) {
+    inotify_object *object;
+    hl_status status;
+    if (linux_abi == NULL || provider == NULL || provider->add == NULL || provider->modify == NULL ||
+        provider->remove == NULL || provider->drain == NULL || provider->wait == NULL ||
+        provider->wait_handle == NULL || provider->readiness == NULL || provider->clone == NULL ||
+        provider->close == NULL)
+        return -HL_LINUX_EINVAL;
+    object = calloc(1, sizeof(*object));
+    if (object == NULL) return -HL_LINUX_ENOMEM;
+    object->provider = provider;
+    object->provider_context = provider_context;
+    object->next_wd = 1;
+    object->nonblocking = (status_flags & 00004000u) != 0;
+    status = hl_linux_object_install_at(linux_abi, requested, &inotify_ops, object, HL_LINUX_OBJECT_INOTIFY,
+                                        status_flags, descriptor_flags);
+    if (status != HL_STATUS_OK) {
+        (void)provider->close(provider_context);
+        free(object);
+        return inotify_error(status);
+    }
+    return (int64_t)requested;
+}
+
+int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char *path, size_t path_size,
+                             uint32_t mask) {
+    hl_linux_object_pin pin;
+    inotify_object *object;
+    inotify_watch *watch = NULL;
+    uint32_t index;
+    uint32_t events = mask & INOTIFY_EVENT_MASK;
+    hl_status status;
+    if (path == NULL || path_size == 0 || events == 0 || (mask & ~(INOTIFY_EVENT_MASK | INOTIFY_OPTION_MASK)) != 0)
+        return -HL_LINUX_EINVAL;
+    status = hl_linux_object_pin_fd(linux_abi, fd, &pin);
+    if (status != HL_STATUS_OK) return -HL_LINUX_EBADF;
+    if (pin.ops != &inotify_ops) {
+        hl_linux_object_unpin(&pin);
+        return -HL_LINUX_EINVAL;
+    }
+    object = pin.context;
+    for (index = 0; index < object->watch_count; ++index)
+        if (object->watches[index].path_size == path_size && !memcmp(object->watches[index].path, path, path_size)) {
+            watch = &object->watches[index];
+            break;
+        }
+    if (watch != NULL) {
+        uint32_t previous;
+        if ((mask & HL_LINUX_IN_MASK_CREATE) != 0) {
+            hl_linux_object_unpin(&pin);
+            return -HL_LINUX_EEXIST;
+        }
+        previous = watch->mask;
+        watch->mask = (mask & HL_LINUX_IN_MASK_ADD) != 0 ? watch->mask | (mask & ~UINT32_C(0x20000000))
+                                                         : mask & ~UINT32_C(0x10000000);
+        status = object->provider->modify(object->provider_context, watch->token, watch->mask);
+        if (status != HL_STATUS_OK) watch->mask = previous;
+        index = (uint32_t)watch->wd;
+    } else {
+        char *saved;
+        inotify_watch *grown;
+        if (object->watch_count == object->watch_capacity) {
+            uint32_t capacity = object->watch_capacity == 0 ? 8u : object->watch_capacity * 2u;
+            grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
+            if (grown == NULL) {
+                hl_linux_object_unpin(&pin);
+                return -HL_LINUX_ENOMEM;
+            }
+            object->watches = grown;
+            object->watch_capacity = capacity;
+        }
+        saved = malloc(path_size + 1u);
+        if (saved == NULL) {
+            hl_linux_object_unpin(&pin);
+            return -HL_LINUX_ENOMEM;
+        }
+        memcpy(saved, path, path_size);
+        saved[path_size] = 0;
+        if (object->next_wd <= 0 || object->next_wd == INT32_MAX) {
+            free(saved);
+            hl_linux_object_unpin(&pin);
+            return -HL_LINUX_ENOSYS;
+        }
+        watch = &object->watches[object->watch_count];
+        *watch = (inotify_watch){object->next_wd++, mask & ~UINT32_C(0x10000000),
+                                 (uint64_t)(uint32_t)object->next_wd - 1u, saved, path_size};
+        status = object->provider->add(object->provider_context, path, path_size, watch->token, watch->mask);
+        index = (uint32_t)watch->wd;
+        if (status == HL_STATUS_OK)
+            object->watch_count++;
+        else
+            free(saved);
+    }
+    hl_linux_object_unpin(&pin);
+    return status == HL_STATUS_OK ? (int64_t)index : inotify_error(status);
+}
+
+int64_t hl_linux_inotify_remove(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t wd) {
+    hl_linux_object_pin pin;
+    inotify_object *object;
+    inotify_watch *watch;
+    uint32_t index;
+    hl_status status = hl_linux_object_pin_fd(linux_abi, fd, &pin);
+    if (status != HL_STATUS_OK) return -HL_LINUX_EBADF;
+    if (pin.ops != &inotify_ops) {
+        hl_linux_object_unpin(&pin);
+        return -HL_LINUX_EINVAL;
+    }
+    object = pin.context;
+    watch = watch_id(object, wd);
+    if (watch == NULL) {
+        hl_linux_object_unpin(&pin);
+        return -HL_LINUX_EINVAL;
+    }
+    status = object->provider->remove(object->provider_context, watch->token);
+    if (status == HL_STATUS_OK || status == HL_STATUS_NOT_FOUND) {
+        (void)queue_event(object, wd, HL_LINUX_IN_IGNORED, 0, NULL, 0);
+        index = (uint32_t)(watch - object->watches);
+        free(watch->path);
+        object->watches[index] = object->watches[--object->watch_count];
+        status = HL_STATUS_OK;
+    }
+    hl_linux_object_unpin(&pin);
+    return inotify_error(status);
+}
