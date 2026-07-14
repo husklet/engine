@@ -273,9 +273,11 @@ static void poslk_lock(void) {
             return;
         if ((spin & 1023) == 1023) {
             int32_t owner = atomic_load_explicit(&g_poslk->lockword, memory_order_relaxed);
-            if (owner && !poslk_alive(owner)) // holder crashed mid-update -> steal the spinlock
-                atomic_compare_exchange_strong_explicit(&g_poslk->lockword, &owner, me, memory_order_acquire,
-                                                        memory_order_relaxed);
+            if (owner && !poslk_alive(owner)) { // holder crashed mid-update -> steal the spinlock
+                if (atomic_compare_exchange_strong_explicit(&g_poslk->lockword, &owner, me, memory_order_acquire,
+                                                            memory_order_relaxed))
+                    return;
+            }
             sched_yield();
         }
     }
