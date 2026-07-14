@@ -853,6 +853,14 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     }
     case 57: /* close */
+        if (g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_file_metadata metadata;
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            if (status.status == HL_STATUS_OK && metadata.type == HL_HOST_FILE_TYPE_REGULAR)
+                poslk_on_close_identity(metadata.stable_device, metadata.stable_object);
+        }
         result = hl_linux_close(g_linux_box, source.fd);
         (void)close((int)source.fd);
         break;
@@ -954,6 +962,63 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             else
                 result = bound_dup_at_least(source.fd, (int)a2,
                                             (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
+        } else if (a1 == 5 || a1 == 6 || a1 == 7) {
+            uint8_t *lock = (uint8_t *)(uintptr_t)a2;
+            hl_host_file_metadata metadata;
+            hl_host_result status;
+            int64_t current = 0;
+            int lock_result = 0;
+            if (!host_range_mapped((uintptr_t)lock, 32)) {
+                result = -EFAULT;
+                break;
+            }
+            short whence = *(short *)(lock + 2);
+            if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) {
+                result = -EINVAL;
+                break;
+            }
+            if (g_host_services == NULL || g_host_services->file == NULL ||
+                g_host_services->file->metadata == NULL) {
+                result = -ENOSYS;
+                break;
+            }
+            status = g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            if (status.status != HL_STATUS_OK) {
+                result = bound_host_error(status.status);
+                break;
+            }
+            if (metadata.type != HL_HOST_FILE_TYPE_REGULAR) {
+                result = -EBADF;
+                break;
+            }
+            if (whence == SEEK_CUR) {
+                current = hl_linux_lseek(g_linux_box, source.fd, 0, SEEK_CUR);
+                if (current < 0) {
+                    result = current;
+                    break;
+                }
+            }
+            for (;;) {
+                (void)poslk_op_identity(metadata.stable_device, metadata.stable_object, current, metadata.size,
+                                        (int)a1, lock, &lock_result);
+                if (a1 != 7 || lock_result != -EAGAIN) break;
+                uint64_t pending = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) |
+                                   __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+                int interrupted = 0;
+                for (int signal_number = 1; signal_number < 64; ++signal_number)
+                    if ((pending & (UINT64_C(1) << signal_number)) &&
+                        !(c->sigmask & (UINT64_C(1) << (signal_number - 1)))) {
+                        interrupted = 1;
+                        break;
+                    }
+                if (interrupted) {
+                    lock_result = -EINTR;
+                    break;
+                }
+                struct timespec delay = {0, 1000000};
+                nanosleep(&delay, NULL);
+            }
+            result = lock_result;
         } else {
             result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
         }

@@ -160,8 +160,8 @@ static void flock_on_close(int fd) {
 #define POSLK_MAX 8192
 
 struct poslk_rec {
-    dev_t dev;
-    ino_t ino;
+    uint64_t device;
+    uint64_t object;
     int64_t lo, hi; // absolute byte range [lo,hi); hi==INT64_MAX => to-EOF (Linux l_len 0)
     int32_t type;   // F_RDLCK / F_WRLCK (F_UNLCK is never stored)
     int32_t owner;  // owning process = host pid (0 == free slot)
@@ -254,11 +254,11 @@ static inline int poslk_conflict(const struct poslk_rec *r, int64_t lo, int64_t 
 // Remove owner `own`'s locks over [lo,hi) on (dev,ino), SPLITTING any record that straddles a boundary so the
 // non-overlapping fragments survive with their original type (POSIX unlock / replace-on-set). Held under the
 // spinlock. New fragments land in reused slots and, being disjoint from [lo,hi), are skipped by this scan.
-static void poslk_clear_own(dev_t dev, ino_t ino, int32_t own, int64_t lo, int64_t hi) {
+static void poslk_clear_own(uint64_t device, uint64_t object, int32_t own, int64_t lo, int64_t hi) {
     int n = g_poslk->hi;
     for (int i = 0; i < n; i++) {
         struct poslk_rec *r = &g_poslk->rec[i];
-        if (r->owner != own || r->dev != dev || r->ino != ino) continue;
+        if (r->owner != own || r->device != device || r->object != object) continue;
         if (r->hi <= lo || hi <= r->lo) continue; // disjoint -> keep
         int64_t olo = r->lo, ohi = r->hi;
         int32_t ot = r->type;
@@ -266,8 +266,8 @@ static void poslk_clear_own(dev_t dev, ino_t ino, int32_t own, int64_t lo, int64
         if (olo < lo) {
             struct poslk_rec *f = poslk_slot();
             if (f) {
-                f->dev = dev;
-                f->ino = ino;
+                f->device = device;
+                f->object = object;
                 f->lo = olo;
                 f->hi = lo;
                 f->type = ot;
@@ -277,8 +277,8 @@ static void poslk_clear_own(dev_t dev, ino_t ino, int32_t own, int64_t lo, int64
         if (ohi > hi) {
             struct poslk_rec *f = poslk_slot();
             if (f) {
-                f->dev = dev;
-                f->ino = ino;
+                f->device = device;
+                f->object = object;
                 f->lo = hi;
                 f->hi = ohi;
                 f->type = ot;
@@ -349,25 +349,15 @@ static int poslk_resolve(int fd, const uint8_t *lf, dev_t *dev, ino_t *ino, int6
 // (*out = the value to return to the guest: 0 / -EAGAIN / -EBADF / -EINVAL / -ENOLCK) or 0 when the fd is not
 // a regular file (the caller must fall back to a real host fcntl). F_SETLKW is a single non-blocking attempt
 // here (returns -EAGAIN on conflict); io.c wraps it in a signal-aware poll-retry loop.
-static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
-    if (!g_poslk) return 0; // shared table unavailable -> host path
-    dev_t dev;
-    ino_t ino;
-    int64_t lo, hi;
-    int type;
-    int rr = poslk_resolve(fd, lf, &dev, &ino, &lo, &hi, &type);
-    if (rr == -2) return 0;
-    if (rr < 0) {
-        *out = -(errno ? errno : EINVAL);
-        return 1;
-    }
+static int poslk_apply(uint64_t device, uint64_t object, int lcmd, uint8_t *lf, int64_t lo, int64_t hi,
+                       int type, int *out) {
     int32_t me = poslk_mypid();
     poslk_lock();
     if (lcmd == 5) { // F_GETLK: report the first conflicting lock held by ANOTHER process, else F_UNLCK
         struct poslk_rec *hit = NULL;
         for (int i = 0; i < g_poslk->hi; i++) {
             struct poslk_rec *r = &g_poslk->rec[i];
-            if (!r->owner || r->owner == me || r->dev != dev || r->ino != ino) continue;
+            if (!r->owner || r->owner == me || r->device != device || r->object != object) continue;
             if (!poslk_conflict(r, lo, hi, type)) continue;
             if (!poslk_alive(r->owner)) {
                 r->owner = 0;
@@ -391,14 +381,14 @@ static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
         return 1;
     }
     if (type == F_UNLCK) { // F_SETLK/W unlock: drop this process's locks over the range (with splitting)
-        poslk_clear_own(dev, ino, me, lo, hi);
+        poslk_clear_own(device, object, me, lo, hi);
         *out = 0;
         poslk_unlock();
         return 1;
     }
     for (int i = 0; i < g_poslk->hi; i++) { // conflict scan vs OTHER owners
         struct poslk_rec *r = &g_poslk->rec[i];
-        if (!r->owner || r->owner == me || r->dev != dev || r->ino != ino) continue;
+        if (!r->owner || r->owner == me || r->device != device || r->object != object) continue;
         if (!poslk_conflict(r, lo, hi, type)) continue;
         if (!poslk_alive(r->owner)) {
             r->owner = 0;
@@ -408,7 +398,7 @@ static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
         poslk_unlock();
         return 1;
     }
-    poslk_clear_own(dev, ino, me, lo, hi); // replace/upgrade/downgrade: drop own overlap, then insert
+    poslk_clear_own(device, object, me, lo, hi); // replace/upgrade/downgrade: drop own overlap, then insert
     struct poslk_rec *slot = poslk_slot();
     if (!slot) { // table full -> reclaim dead owners and retry once
         poslk_sweep_dead();
@@ -419,8 +409,8 @@ static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
         poslk_unlock();
         return 1;
     }
-    slot->dev = dev;
-    slot->ino = ino;
+    slot->device = device;
+    slot->object = object;
     slot->lo = lo;
     slot->hi = hi;
     slot->type = type;
@@ -429,6 +419,84 @@ static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
     *out = 0;
     poslk_unlock();
     return 1;
+}
+
+static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
+    if (!g_poslk) return 0; // shared table unavailable -> host path
+    dev_t dev;
+    ino_t ino;
+    int64_t lo, hi;
+    int type;
+    int rr = poslk_resolve(fd, lf, &dev, &ino, &lo, &hi, &type);
+    if (rr == -2) return 0;
+    if (rr < 0) {
+        *out = -(errno ? errno : EINVAL);
+        return 1;
+    }
+    return poslk_apply((uint64_t)dev, (uint64_t)ino, lcmd, lf, lo, hi, type, out);
+}
+
+/* Host-neutral typed-file entry: the caller resolves stable identity, current
+   offset, and size through host services, never by treating an opaque handle
+   as a native descriptor. */
+static int poslk_op_identity(uint64_t device, uint64_t object, int64_t current, uint64_t size,
+                             int lcmd, uint8_t *lf, int *out) {
+    short linux_type = *(const short *)(lf + 0);
+    short whence = *(const short *)(lf + 2);
+    int64_t start = *(const int64_t *)(lf + 8);
+    int64_t length = *(const int64_t *)(lf + 16);
+    int type = linux_type == 0 ? F_RDLCK : linux_type == 1 ? F_WRLCK : F_UNLCK;
+    int64_t base;
+    if (!g_poslk) {
+        *out = -ENOLCK;
+        return 1;
+    }
+    if (linux_type < 0 || linux_type > 2) {
+        *out = -EINVAL;
+        return 1;
+    }
+    if (whence == SEEK_SET)
+        base = 0;
+    else if (whence == SEEK_CUR)
+        base = current;
+    else if (whence == SEEK_END) {
+        if (size > INT64_MAX) {
+            *out = -EOVERFLOW;
+            return 1;
+        }
+        base = (int64_t)size;
+    } else {
+        *out = -EINVAL;
+        return 1;
+    }
+    int64_t begin;
+    if (__builtin_add_overflow(base, start, &begin) || begin < 0) {
+        *out = -EINVAL;
+        return 1;
+    }
+    int64_t end;
+    if (length == 0)
+        end = INT64_MAX;
+    else if (length > 0) {
+        if (__builtin_add_overflow(begin, length, &end)) {
+            *out = -EOVERFLOW;
+            return 1;
+        }
+    } else {
+        end = begin;
+        if (__builtin_add_overflow(begin, length, &begin) || begin < 0) {
+            *out = -EINVAL;
+            return 1;
+        }
+    }
+    return poslk_apply(device, object, lcmd, lf, begin, end, type, out);
+}
+
+static void poslk_on_close_identity(uint64_t device, uint64_t object) {
+    if (!g_poslk || !g_i_locked) return;
+    poslk_lock();
+    poslk_clear_own(device, object, poslk_mypid(), 0, INT64_MAX);
+    poslk_unlock();
 }
 
 // close() hook: POSIX releases ALL a process's locks on a file when ANY fd for it is closed. Called from

@@ -3,6 +3,7 @@ pollselect	posix	pollselect.c	pollselect.c	aarch64,x86_64	-static-pie -O2 -pthre
 pollselect-ext	posix	pollselect_ext.c	pollselect_ext.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/pollselect_ext.out	linux-libc,syscall	active	exact source; deterministic checked golden
 mmapshared	posix	mmapshared.c	mmapshared.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/mmapshared.out	linux-libc,syscall	active	exact source; deterministic checked golden
 filelock	posix	filelock.c	filelock.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/filelock.out	linux-libc,syscall	active	exact source; deterministic checked golden
+typed-filelock	posix	typed_lock.c	focused-production-regression	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/typed_lock.out	linux-libc,syscall,filesystem,fork/wait	active	stable identity across reopen; SEEK_CUR/END; close releases process locks; invalid whence
 clock	posix	clockmono.c	clockmono.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/clockmono.out	linux-libc,syscall	active	exact source; deterministic checked golden
 realpath	posix	realpath.c	realpath.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/realpath.out	linux-libc,syscall	active	exact source; deterministic checked golden
 getdents	posix	getdents.c	getdents.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/getdents.out	linux-libc,syscall	active	exact source; deterministic checked golden
