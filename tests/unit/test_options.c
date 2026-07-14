@@ -12,7 +12,10 @@ int main(void) {
 
     hl_option_reset();
     HL_CHECK(setenv("HL_CWD", "/ambient", 1) == 0);
+    HL_CHECK(setenv("MAPDUMP", "/tmp/legacy-mapdump", 1) == 0);
     HL_CHECK(hl_option_get("HL_CWD") == NULL);
+    HL_CHECK(hl_option_get("MAPDUMP") == NULL);
+    HL_CHECK(hl_option_set("MAPDUMP", "value", 1) == -1);
     HL_CHECK(hl_option_set("HL_CWD", mutable, 1) == 0);
     mutable[0] = 'X';
     HL_CHECK(strcmp(hl_option_get("HL_CWD"), "original") == 0);
@@ -26,5 +29,6 @@ int main(void) {
     hl_option_reset();
     HL_CHECK(hl_option_get("HL_CWD") == NULL);
     unsetenv("HL_CWD");
+    unsetenv("MAPDUMP");
     return EXIT_SUCCESS;
 }

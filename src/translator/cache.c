@@ -429,31 +429,6 @@ static uint64_t g_prof_bl_shadow, g_prof_bl_leaf;
 // per-site-IC skip at recognized interpreter-dispatch `br`s) for A/B.
 static int g_noibslim; // NOIBSLIM=1
 
-// MAPDUMP=<prefix> (profiling-only, this worktree): at exit_group, dump the translation map + the raw
-// code cache so an offline tool can attribute sampled host PCs to guest blocks/instructions.
-// <prefix>.map is text: "CACHE <rw> <rx> <cp>" then one "MAP <gpc> <host> <body>" per live block.
-// <prefix>.bin is the raw [g_cache, g_cp) bytes. Zero cost unless the env is set.
-static void md_dump_to(const char *pfx) {
-    if (!pfx || !g_cache) return;
-    char p[1024];
-    snprintf(p, sizeof p, "%s.map", pfx);
-    FILE *f = fopen(p, "w");
-    if (!f) return;
-    fprintf(f, "CACHE %p %p %p\n", (void *)g_cache, J_RX(g_cache), (void *)g_cp);
-    for (uint32_t i = 0; i < JIT_MAP_N; i++)
-        if (g_map[i].host)
-            fprintf(f, "MAP %llx %p %p\n", (unsigned long long)g_map[i].gpc, g_map[i].host, g_map[i].body);
-    fclose(f);
-    snprintf(p, sizeof p, "%s.bin", pfx);
-    f = fopen(p, "wb");
-    if (!f) return;
-    fwrite(g_cache, 1, (size_t)(g_cp - g_cache), f);
-    fclose(f);
-}
-
-static void md_dump(void) {
-}
-
 // ARM-B1: recognize a clang jump-table switch dispatch at a guest `br xN`. The compiler emits
 //   ldrh wM,[xB,wI,uxtw #1] ; adr xA,. ; add xN,xA,wM,sxth #2 ; br xN
 // (an indexed 16-bit offset table). Bit-exact opcode match on the 3 predecessors + Rd==br.Rn.
@@ -780,80 +755,6 @@ static int stw_peers_live(void) {
             n++;
     pthread_mutex_unlock(&g_stw_reg_lock);
     return n;
-}
-
-// ---- #186 diagnostic: dump md_dump on a LIVE (hung) process via a trigger file ----
-// MAPDUMP only fires at exit_group, but a hung JVM never exits -- and a POSIX signal can't be used
-// because the engine forwards host signals to the guest (HotSpot itself claims SIGUSR2). Instead, when
-// MAPDUMP is set we spawn ONE detached watcher thread that polls for the trigger file "<prefix>.trig".
-// When it appears, the watcher (a) snapshots every registered guest thread's host PC via Mach
-// thread_get_state (so the SPINNING thread's in-cache PC can be attributed to a region head), writing
-// them to "<prefix>.pc", then (b) calls md_dump() for the stitched host map + raw code cache. Purely a
-// reader of engine state; gated entirely by MAPDUMP -> not even spawned otherwise.
-#include <mach/arm/thread_status.h>
-#include <mach/thread_act.h>
-
-static void md_snapshot_pcs(const char *pfx) {
-    char p[1088];
-    snprintf(p, sizeof p, "%s.pc", pfx);
-    FILE *f = fopen(p, "w");
-    if (!f) return;
-    fprintf(f, "CACHE rw=%p rx=%p cp=%p gen=%llu\n", (void *)g_cache, J_RX(g_cache), (void *)g_cp,
-            (unsigned long long)g_cache_gen);
-    for (int i = 0; i < STW_MAXTHREAD; i++) {
-        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
-        pthread_t th = g_stw_threads[i].th;
-        mach_port_t mp = pthread_mach_thread_np(th);
-        if (!mp) continue;
-        arm_thread_state64_t st;
-        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-        if (thread_suspend(mp) != KERN_SUCCESS) continue;
-        kern_return_t kr = thread_get_state(mp, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt);
-        thread_resume(mp);
-        if (kr != KERN_SUCCESS) continue;
-        uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(st);
-        uint64_t x28 = (uint64_t)st.__x[28];
-        // is the PC inside the RX code cache?
-        uint64_t rx = (uint64_t)(uintptr_t)J_RX(g_cache), rxe = rx + (uint64_t)(g_cp - g_cache);
-        fprintf(f, "TH slot=%d pc=%llx x28=%llx incache=%d\n", i, (unsigned long long)pc, (unsigned long long)x28,
-                (pc >= rx && pc < rxe));
-    }
-    fclose(f);
-}
-
-static void *md_watcher(void *arg) {
-    const char *pfx = (const char *)arg;
-    char trig[1088];
-    snprintf(trig, sizeof trig, "%s.trig", pfx);
-    time_t seen_sec = 0;
-    long seen_nsec = 0;
-    for (;;) {
-        struct stat sb;
-        if (stat(trig, &sb) == 0) {
-            time_t sec = sb.st_mtimespec.tv_sec;
-            long nsec = sb.st_mtimespec.tv_nsec;
-            if (sec == seen_sec && nsec == seen_nsec) {
-                struct timespec ts = {0, 100000000}; // 100ms
-                nanosleep(&ts, NULL);
-                continue;
-            }
-            seen_sec = sec;
-            seen_nsec = nsec;
-            char ppfx[1088];
-            snprintf(ppfx, sizeof ppfx, "%s.%d", pfx, getpid());
-            md_snapshot_pcs(ppfx);
-            md_dump_to(ppfx);
-            char done[1088];
-            snprintf(done, sizeof done, "%s.%d.done", pfx, getpid());
-            (void)hl_host_file_reset(&g_jit_services, done, 0644);
-        }
-        struct timespec ts = {0, 100000000}; // 100ms
-        nanosleep(&ts, NULL);
-    }
-    return NULL;
-}
-
-static void md_sig_install(void) {
 }
 
 // Unmap a retired cache's mapping(s): the RW base, plus the RX alias when dual-mapped (delta != 0).
