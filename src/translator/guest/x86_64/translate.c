@@ -3489,53 +3489,11 @@ static void *translate_block(uint64_t gpc) {
                     gpc = next;
                     continue;
                 }
-                if ((sub == 0 || sub == 1) && I.is_mem) { // fxsave / fxrstor: FCW@0, MXCSR@24, XMM0-15@160
+                if ((sub == 0 || sub == 1) && I.is_mem) { // fxsave / fxrstor
                     emit_ea(&I, next);                    // x17 = base of the 512-byte FXSAVE area
-                    for (int i = 0; i < 16; i++) {
-                        if (sub == 0)
-                            g_str_q(i, 17, 160 + i * 16);
-                        else
-                            g_ldr_q(i, 17, 160 + i * 16);
-                    }
-                    if (sub == 0) { // fxsave: also save MXCSR (from FPCR.RMode, mirrors stmxcsr) + FCW
-                        emit32(0xD53B4400u | 19);       // mrs x19, fpcr
-                        e_lsr_i(19, 19, 22, 0);         // x19 = FPCR >> 22
-                        e_movconst(20, 3);
-                        e_rrr(A_AND, 19, 19, 20, 0, 0); // x19 = ARM RMode
-                        e_movconst(20, 1);
-                        e_rrr(A_AND, 21, 19, 20, 0, 0);
-                        e_lsr_i(22, 19, 1, 0);
-                        e_rrr(A_ORR, 19, 22, 21, 0, 1);                    // x19 = x86 RC (swap the two bits back)
-                        e_movconst(16, 0x1f80);                            // default MXCSR (all masks set, RC=00)
-                        e_rrr(A_ORR, 16, 16, 19, 0, 13);                   // MXCSR |= RC << 13
-                        emit_fpsr_to_mxcsr(16);                            // + live sticky exception flags
-                        emit32(0xB9000000u | (6u << 10) | (17 << 5) | 16); // str  w16, [x17,#24]  (MXCSR)
-                        e_ldr(16, 28, OFF_FPCW);
-                        emit32(0x79000000u | (0u << 10) | (17 << 5) | 16); // strh w16, [x17,#0]   (FCW)
-                    } else {                                               // fxrstor: restore MXCSR.RC -> FPCR + FCW
-                        emit32(0xB9400000u | (6u << 10) | (17 << 5) | 23); // ldr  w23, [x17,#24]  (MXCSR, full)
-                        emit_mxcsr_to_fpsr(23);                            // restore sticky exception flags -> FPSR
-                        e_lsr_i(16, 23, 13, 0);                            // x16 = MXCSR >> 13
-                        e_movconst(19, 3);
-                        e_rrr(A_AND, 16, 16, 19, 0, 0); // x16 = RC (0..3)
-                        e_movconst(19, 1);
-                        e_rrr(A_AND, 20, 16, 19, 0, 0);
-                        e_lsr_i(21, 16, 1, 0);
-                        e_rrr(A_ORR, 20, 21, 20, 0, 1);  // x20 = ARM RMode (swap the two RC bits)
-                        emit32(0xD53B4400u | 19);        // mrs x19, fpcr
-                        e_movconst(21, 3u << 22);
-                        e_rrr(A_BIC, 19, 19, 21, 1, 0);  // clear RMode
-                        e_rrr(A_ORR, 19, 19, 20, 1, 22); // FPCR.RMode = ARM RMode
-                        emit32(0xD51B4400u | 19);        // msr fpcr, x19
-                        emit32(0x79400000u | (0u << 10) | (17 << 5) | 16); // ldrh w16, [x17,#0]   (FCW)
-                        e_str(16, 28, OFF_FPCW);                           // cpu->fpcw = FCW
-                    }
-                    // The XMM/MXCSR/FCW area is done inline above; the x87-register DATA (ST0-7 @32, 80-bit)
-                    // and FSW (@2) need the modeled x87 stack (c->st[]/fptop/fpsw), so finish in C. Spill the
-                    // x87 shadow + any pending flags, stash the area base, and exit to do_fxsave/do_fxrstor.
+                    e_str(17, 28, OFF_X87EA);             // preserve EA across BUS guards and scratch lowering
                     if (g_fl_pending) flags_materialize();
                     if (g_fp_known) fp_drop();
-                    e_str(17, 28, OFF_X87EA);
                     emit_exit_const(next, sub == 0 ? R_FXSAVE : R_FXRSTOR);
                     break;
                 }

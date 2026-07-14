@@ -447,21 +447,54 @@ static double x87_m80_to_double(const uint8_t *ea) {
 // state is not modeled, so all 8 are reported present -- exact for the common save-all-then-restore round trip).
 static void do_fxsave(struct cpu *c) {
     uint8_t *p = (uint8_t *)c->x87_ea;
+    uint32_t mxcsr = 0x1f80;
+#if defined(__aarch64__)
+    uint64_t fpcr, fpsr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+    uint32_t arm_rc = (uint32_t)((fpcr >> 22) & 3u);
+    uint32_t x86_rc = ((arm_rc & 1u) << 1) | ((arm_rc >> 1) & 1u);
+    static const unsigned fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
+    mxcsr |= x86_rc << 13;
+    for (unsigned bit = 0; bit < 6; ++bit) mxcsr |= (uint32_t)((fpsr >> fpsr_bit[bit]) & 1u) << bit;
+#endif
+    memcpy(p, &c->fpcw, 2);
     uint16_t fsw = (uint16_t)((c->fpsw & 0x4700) | ((c->fptop & 7) << 11));
     memcpy(p + 2, &fsw, 2); // FSW: C0-C3 (bits 8/9/10/14) + TOP (bits 11-13)
     p[4] = 0xff;            // abridged FTW: all registers reported valid (see note above)
     p[5] = 0;
     for (int j = 0; j < 8; j++)
         x87_double_to_m80(c->st[j], p + 32 + j * 16);
+    memcpy(p + 24, &mxcsr, sizeof(mxcsr));
+    memcpy(p + 160, c->v, 16 * 16);
 }
 static void do_fxrstor(struct cpu *c) {
     const uint8_t *p = (const uint8_t *)c->x87_ea;
     uint16_t fsw;
+    uint16_t fcw;
+    uint32_t mxcsr;
+    memcpy(&fcw, p, sizeof(fcw));
     memcpy(&fsw, p + 2, 2);
+    memcpy(&mxcsr, p + 24, sizeof(mxcsr));
+    c->fpcw = fcw;
     c->fpsw = fsw & 0x4700;    // restore C0-C3
     c->fptop = (fsw >> 11) & 7; // restore TOP
     for (int j = 0; j < 8; j++)
         c->st[j] = x87_m80_to_double(p + 32 + j * 16);
+    memcpy(c->v, p + 160, 16 * 16);
+#if defined(__aarch64__)
+    uint64_t fpcr, fpsr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+    uint32_t x86_rc = (mxcsr >> 13) & 3u;
+    uint32_t arm_rc = ((x86_rc & 1u) << 1) | ((x86_rc >> 1) & 1u);
+    fpcr = (fpcr & ~(UINT64_C(3) << 22)) | (uint64_t)arm_rc << 22;
+    static const unsigned fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
+    fpsr &= ~UINT64_C(0x9f);
+    for (unsigned bit = 0; bit < 6; ++bit) fpsr |= (uint64_t)((mxcsr >> bit) & 1u) << fpsr_bit[bit];
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+    __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
+#endif
 }
 
 // x87 transcendentals (R_X87FUNC): the D9 F0-FF subset has no ARM/SSE counterpart, so it is computed
