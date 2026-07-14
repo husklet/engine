@@ -1,5 +1,5 @@
-// Emulated fd state must keep working above fd 1024. Chromium routinely runs
-// with high-numbered eventfd/timerfd/memfd descriptors during Mojo startup.
+// Emulated fd state must keep working above fd 1024. multi-process application routinely runs
+// with high-numbered eventfd/timerfd/memfd descriptors during IPC startup.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

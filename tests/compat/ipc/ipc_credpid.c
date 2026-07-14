@@ -1,4 +1,4 @@
-// SCM_CREDENTIALS peer-pid IDENTITY guard for the Chromium Mojo ports bootstrap. The Mojo NodeChannel uses
+// SCM_CREDENTIALS peer-pid IDENTITY guard for the multi-process application IPC ports bootstrap. The IPC NodeChannel uses
 // the SCM_CREDENTIALS ucred.pid the kernel attaches on recv as the peer's ports-node identity, so two
 // distinct children must present two DISTINCT pids, and neither may equal the RECEIVER's own pid (a peer
 // that reports the receiver's own pid looks like a self/loopback node and the ports node-merge never
@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 // Fork a child over a fresh SEQPACKET socketpair; the parent enables SO_PASSCRED and recvmsg's the child's
-// one-byte record, returning the peer's ucred.pid (0 if none delivered). Mirrors Chromium's NodeChannel.
+// one-byte record, returning the peer's ucred.pid (0 if none delivered). Mirrors multi-process application's NodeChannel.
 static int recv_peer_pid(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) return 0;

@@ -1,5 +1,5 @@
 // SCM_RIGHTS-RECEIVED socket armed on the CHILD's own epoll, woken by a cross-process write to the
-// parent's RETAINED peer end -- the exact Mojo AcceptBrokerClient/AcceptInvitee step. A node-channel
+// parent's RETAINED peer end -- the exact IPC AcceptBrokerClient/AcceptInvitee step. A node-channel
 // control message carries an out-of-band platform SOCKET handle; the child recvmsg's that fd and
 // installs the RECEIVED fd (a fresh guest/host fd number) on its kqueue/epoll, then parks in
 // epoll_wait until the peer writes.
@@ -15,9 +15,9 @@
 // into a deterministic nonzero exit (never a hang). ROUNDS repeats the drain->re-block cycle so a
 // readiness edge lost specifically on RE-ARM of a received socket is also caught.
 //
-// Layout (Chrome-faithful): parent = browser; child = fork+execve renderer.
+// Layout (multi-process application-faithful): parent = coordinator; child = fork+execve worker.
 //   node[2]  : primordial node channel (SEQPACKET). child end dup2'd to fd 3 at launch (inherited).
-//   broker[2]: the out-of-band peer/broker channel (SOCK_STREAM, like Chrome's ty=1 node channel).
+//   broker[2]: the out-of-band peer/broker channel (SOCK_STREAM, like multi-process application's ty=1 node channel).
 //   parent sends broker[1] to the child over the NODE channel via SCM_RIGHTS; retains broker[0].
 //   child recvmsg's broker[1] off fd 3, epoll_ctl(ADD, EPOLLIN) the RECEIVED fd, and epoll_waits.
 //   each round: parent writes to broker[0]; child must wake+read, then ACK over the node channel.

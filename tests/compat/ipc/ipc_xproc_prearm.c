@@ -1,7 +1,7 @@
 // EDGE-TRIGGERED pre-armed inbound: the parent writes the socket message + signals the eventfd BEFORE
 // the child registers its epoll. The child then registers EPOLLIN|EPOLLET and epoll_waits with a SHORT
-// timeout. On Linux the EPOLLET registration edge reports an already-readable fd (this is how Chrome's
-// child learns of a bootstrap message the browser sent before the child's message loop started). The
+// timeout. On Linux the EPOLLET registration edge reports an already-readable fd (this is how multi-process application's
+// child learns of a bootstrap message the coordinator sent before the child's message loop started). The
 // engine emulates that with a per-process g_ep_prime probe (poll() at registration) -- this test proves
 // whether that prime fires CROSS-PROCESS for data another process buffered. A short timeout means a lost
 // prime shows as a clean FAIL (timeout), never a hang.

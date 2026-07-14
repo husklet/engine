@@ -1,11 +1,11 @@
-// SEQPACKET fidelity guard for the Mojo-IPC path (Chromium NodeChannel). Exercises three DGRAM-backed
-// SOCK_SEQPACKET emulation properties that all broke chromium before the os/linux net.c fixes, all
+// SEQPACKET fidelity guard for the IPC-IPC path (multi-process application NodeChannel). Exercises three DGRAM-backed
+// SOCK_SEQPACKET emulation properties that all broke multi-process application before the os/linux net.c fixes, all
 // oracle-diffed vs native Linux (booleans/lengths only, so host vs guest credentials/pids don't diverge):
 //   1. NO premature EOF when the parent closes the child's fork-inherited socketpair end while keeping its
 //      own: a later recvmsg on the retained end must still deliver the child's real record (the bug injected
 //      a zero-length "EOF" datagram into the parent's own end -> recv returned 0 -> "did not receive ping").
 //   2. SCM_RIGHTS fd passing over SEQPACKET (not just STREAM): the received fd reads back the sent bytes.
-//   3. SO_PASSCRED -> a synthesized SCM_CREDENTIALS record on recvmsg whose ucred.uid == getuid() (chromium
+//   3. SO_PASSCRED -> a synthesized SCM_CREDENTIALS record on recvmsg whose ucred.uid == getuid() (multi-process application
 //      aborts "missing credentials" without it). Record boundary: a 5-byte send arrives as one 5-byte read.
 #define _GNU_SOURCE
 #include <stdio.h>

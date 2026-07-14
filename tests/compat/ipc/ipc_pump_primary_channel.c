@@ -1,12 +1,11 @@
-// Renderer Mojo PRIMARY-CHANNEL bring-up under MessagePumpEpoll, faithfully modeled + maximally loaded.
+// Worker IPC PRIMARY-CHANNEL bring-up under MessagePumpEpoll, faithfully modeled + maximally loaded.
 //
-// WHY THIS GATE EXISTS. Multi-process Chrome content is white because the RENDERER never rasters: its
-// primordial Mojo channel / IO-thread pump never completes bring-up, so it sits dormant (parked in
-// epoll_wait + FUTEX_WAIT) — see docs/rendering/{README.md §3.2, CHROME-TILE-B1-B2-RESOLVED.md,
-// WL_SHM-MULTIPROC-CONTENT-FINDINGS.md}. Every EXISTING cross-process micro-gate PASSES
+// This gate detects a worker whose initial IPC channel or IO-thread pump never completes bring-up and
+// remains parked in epoll_wait or FUTEX_WAIT under a loaded multi-process guest. Every narrower
+// cross-process micro-gate passes independently
 // (scm-recv-epoll, exec-fd-epoll, xproc-inbound, zygote-inbound, scm-futex, pump-worker-dispatch,
 // pump-xproc-et/oneshot, epoll-shared-xthread, pump-epollout-rearm), and a live trace once saw the
-// renderer connect + pump hundreds of messages — so the wall is a LOAD-SENSITIVE / timing race, not a
+// worker connect + pump hundreds of messages — so the wall is a LOAD-SENSITIVE / timing race, not a
 // missing primitive. This gate reproduces the exact permutation those gates DON'T combine.
 //
 // WHAT NO OTHER GATE COMBINES (each existing gate isolates ONE leg):
@@ -17,26 +16,26 @@
 //                      no exec, no two-pump handoff.
 //   * pump-worker-dispatch: EPOLLET IO pump + eventfd ScheduleWork + FUTEX handoff, but in-process
 //                      (socketpair, no exec, no SCM_RIGHTS-received channel), ONE watched socket.
-// Here ALL of it is one process shape, matching base::MessagePumpEpoll's renderer IO thread:
-//   (a) the Mojo PRIMARY channel is an SCM_RIGHTS-RECEIVED SOCK_STREAM the child recvmsg's AFTER execve
+// Here ALL of it is one process shape, matching base::MessagePumpEpoll's worker IO thread:
+//   (a) the IPC PRIMARY channel is an SCM_RIGHTS-RECEIVED SOCK_STREAM the child recvmsg's AFTER execve
 //       (state reset by exec, fd is a fresh number installed via the recvmsg SCM_RIGHTS path, net.c
 //       cmsg_m2l) and installs on its OWN epoll;
 //   (b) a LEVEL-triggered epoll pump (EPOLLIN, NOT EPOLLET) watches the primary channel + a ScheduleWork
 //       eventfd, reading ONE message per readiness (MessagePumpEpoll processes one FdWatcher event then
 //       relies on the kernel's LEVEL re-report for the rest — so every extra byte needs a fresh level
 //       report, the path EPOLLET gates never touch);
-//   (c) a HIGH-FD regime: >=1024 idle watched fds on the SAME epoll (real renderers watch hundreds–
+//   (c) a HIGH-FD regime: >=1024 idle watched fds on the SAME epoll (real workers watch hundreds–
 //       thousands of fds) so the kqueue interest set / changelist is large;
 //   (d) a CHURN thread hammers concurrent epoll_ctl ADD/DEL on that same epoll while the pump is blocked
 //       in epoll_wait — cross-thread changelist pressure on the live instance;
 //   (e) the IO thread hands each decoded message to the MAIN thread via a cross-thread WaitableEvent
 //       (eventfd), and the main thread runs its OWN MessagePumpEpoll (second epoll) — the IO->main
 //       ScheduleWork wakeup none of the single-pump gates model;
-//   (f) the browser writes each message after a VARIABLE delay (jittered), so messages land both while
+//   (f) the coordinator writes each message after a VARIABLE delay (jittered), so messages land both while
 //       the pump is fully parked AND inside the drain/re-block window.
-// Assert: every message the browser sends is woken + recv'd on the IO pump AND dispatched + processed on
+// Assert: every message the coordinator sends is woken + recv'd on the IO pump AND dispatched + processed on
 // the main pump within a bound. A lost readiness edge / lost cross-thread wake on ANY leg parks a pump
-// with work pending = the dormant renderer; a watchdog turns that into a deterministic nonzero exit
+// with work pending = the dormant worker; a watchdog turns that into a deterministic nonzero exit
 // (exit 7), never a hang. If this reproduces the stall, localize in hl-jit-darwin
 // (src/runtime/os/linux/syscall/event.c: kqueue readiness-prime / level re-report for an SCM_RIGHTS-
 // received socket under concurrent epoll_ctl + high-fd load, or the eventfd cross-thread wake).
@@ -58,15 +57,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CH_NODE 3      // primordial node channel — child end, placed by the parent at a fixed fd (Mojo launch)
-#define ROUNDS  12000  // messages the browser streams over the primary channel
+#define CH_NODE 3      // primordial node channel — child end, placed by the parent at a fixed fd (IPC launch)
+#define ROUNDS  12000  // messages the coordinator streams over the primary channel
 #define NFILLER 3000   // idle watched fds on the SAME epoll — the high-fd regime (>=1024)
 #define CHURN   96     // fds each churn thread cycles ADD/DEL on the live epoll
 #define NCHURN  2      // concurrent churn threads (more changelist pressure on the live instance)
 #define REARM   37     // every Nth message, StopWatch->Watch the primary (DEL+ADD) racing pending data
 #define MSGSZ   8      // one primary-channel message = an 8-byte sequence number
 
-static int g_primary;                 // SCM_RIGHTS-received SOCK_STREAM (the Mojo primary channel)
+static int g_primary;                 // SCM_RIGHTS-received SOCK_STREAM (the IPC primary channel)
 static int g_io_ep, g_main_ep;        // the IO-thread pump epoll + the main-thread pump epoll
 static int g_schedwork_io;            // eventfd: ScheduleWork for the IO pump (posted work / self-wake)
 static int g_waitable;                // eventfd: cross-thread WaitableEvent, IO thread -> main thread
@@ -103,7 +102,7 @@ static int send_fd(int sock, int fd) {
 
 // MAIN-thread MessagePumpEpoll: parks on its own epoll watching the cross-thread WaitableEvent (eventfd).
 // The IO thread signals it per decoded message; here we "run the task": count it, and every 256 ACK the
-// browser over the node channel for coarse backpressure. A lost IO->main wake parks this pump = dormant.
+// coordinator over the node channel for coarse backpressure. A lost IO->main wake parks this pump = dormant.
 static void *main_pump(void *arg) {
     (void)arg;
     struct epoll_event out[8];
@@ -116,7 +115,7 @@ static void *main_pump(void *arg) {
             uint64_t v = 0;
             if (read(g_waitable, &v, 8) == 8 && v > 0) {
                 long done = atomic_fetch_add(&g_processed, (long)v) + (long)v;
-                // coarse cross-process backpressure ACK so the browser bounds outstanding messages
+                // coarse cross-process backpressure ACK so the coordinator bounds outstanding messages
                 while (done - acked >= 256) {
                     char a = 'A';
                     if (write(CH_NODE, &a, 1) != 1) return NULL;
@@ -163,10 +162,10 @@ static void *watchdog(void *arg) {
         long p = atomic_load(&g_processed);
         if (p >= ROUNDS || atomic_load(&g_done)) return NULL;
         if (p == last) {
-            fprintf(stderr, "STALL processed=%ld recvd=%ld/%d (renderer pump parked with work pending)\n",
+            fprintf(stderr, "STALL processed=%ld recvd=%ld/%d (worker pump parked with work pending)\n",
                     p, atomic_load(&g_recvd), ROUNDS);
             fflush(stderr);
-            _exit(7); // lost wake: a pump is dormant with a message pending — the renderer-dormancy shape
+            _exit(7); // lost wake: a pump is dormant with a message pending — the worker-dormancy shape
         }
         last = p;
     }
@@ -174,7 +173,7 @@ static void *watchdog(void *arg) {
 
 static int child_main(void) {
     int node = CH_NODE;
-    // AcceptInvitee/AcceptBrokerClient: pull the Mojo PRIMARY channel (SOCK_STREAM) off the node channel.
+    // AcceptInvitee/AcceptBrokerClient: pull the IPC PRIMARY channel (SOCK_STREAM) off the node channel.
     g_primary = recv_fd(node);
     if (g_primary < 0) { printf("child recv primary failed: %s\n", strerror(errno)); return 20; }
     fcntl(g_primary, F_SETFL, fcntl(g_primary, F_GETFL) | O_NONBLOCK);
@@ -215,13 +214,13 @@ static int child_main(void) {
     for (int i = 0; i < NCHURN; i++) pthread_create(&ch[i], NULL, churn_thread, NULL);
     pthread_create(&wd, NULL, watchdog, NULL);
 
-    // Tell the browser the primary channel is received + armed and both pumps are up.
+    // Tell the coordinator the primary channel is received + armed and both pumps are up.
     char rdy = 'R';
     if (write(node, &rdy, 1) != 1) return 25;
 
     // IO-thread MessagePumpEpoll: park on epoll_wait; on the primary channel's LEVEL readiness read ONE
     // message and rely on the kernel's level re-report for the rest, handing each to the main thread via
-    // the WaitableEvent eventfd. This is the renderer's IO thread.
+    // the WaitableEvent eventfd. This is the worker's IO thread.
     char buf[MSGSZ * 8];
     while (!atomic_load(&g_done)) {
         struct epoll_event out[16];
@@ -230,7 +229,7 @@ static int child_main(void) {
         if (n == 0) {
             if (atomic_load(&g_recvd) >= ROUNDS || atomic_load(&g_done)) break;
             fprintf(stderr, "IO pump epoll_wait timeout recvd=%ld/%d\n", atomic_load(&g_recvd), ROUNDS);
-            return 27; // parked 4s with no readiness though the browser is streaming = lost wake
+            return 27; // parked 4s with no readiness though the coordinator is streaming = lost wake
         }
         for (int i = 0; i < n; i++) {
             if (out[i].data.fd == g_schedwork_io) {
@@ -248,7 +247,7 @@ static int child_main(void) {
                 if (add && write(g_waitable, &add, 8) != 8) return 29;
                 // base::MessagePumpEpoll StopWatch -> Watch: periodically DE-register then RE-register the
                 // RECEIVED primary channel. Because we read only ONE syscall's worth per wake (level pump)
-                // and the browser bursts, the socket buffer is often NON-EMPTY at this point — so the re-ADD
+                // and the coordinator bursts, the socket buffer is often NON-EMPTY at this point — so the re-ADD
                 // of an already-readable SCM_RIGHTS-received socket MUST re-prime level readiness (the exact
                 // "readiness never re-armed after the handle lands" hypothesis, now on RE-registration under
                 // the high-fd + concurrent-ctl load). A lost prime parks the pump with data pending.
@@ -272,7 +271,7 @@ static int child_main(void) {
 }
 
 int main(int argc, char **argv) {
-    signal(SIGPIPE, SIG_IGN); // a stalled-child write must return EPIPE, not kill the browser
+    signal(SIGPIPE, SIG_IGN); // a stalled-child write must return EPIPE, not kill the coordinator
     if (argc > 1 && !strcmp(argv[1], "child")) return child_main();
 
     int node[2];
@@ -304,7 +303,7 @@ int main(int argc, char **argv) {
     char r;
     if (read(node[0], &r, 1) != 1) { printf("parent ready-read: %s\n", strerror(errno)); return 3; }
 
-    // Browser: stream ROUNDS messages, each after a VARIABLE (jittered) delay so messages land both while
+    // Coordinator: stream ROUNDS messages, each after a VARIABLE (jittered) delay so messages land both while
     // the pump is fully parked and inside its drain/re-block window. Bounded outstanding via the child's
     // periodic ACK bytes (read non-blocking on the node channel).
     fcntl(node[0], F_SETFL, fcntl(node[0], F_GETFL) | O_NONBLOCK);

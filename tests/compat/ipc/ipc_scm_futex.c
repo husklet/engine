@@ -1,6 +1,6 @@
 // Cross-process FUTEX on a shared-memory object passed by SCM_RIGHTS (NOT fork-inherited) — the exact
-// Chrome renderer<->GPU-service command-buffer wakeup: the GPU service creates a shm/memfd, sends the
-// handle over Mojo (SCM_RIGHTS), and the peer mmaps it and FUTEX_WAITs on a word inside; the other side
+// multi-process application worker<->service-peer command-buffer wakeup: the service peer creates a shm/memfd, sends the
+// handle over IPC (SCM_RIGHTS), and the peer mmaps it and FUTEX_WAITs on a word inside; the other side
 // stores + FUTEX_WAKEs through its OWN independent mapping. The existing futex-shared-key gate only covers
 // a FORK-INHERITED memfd (same fd number, same VA lineage); this covers an SCM_RIGHTS-delivered memfd that
 // lands at a different fd number in an unrelated process, mmap'd at an independent VA. A lost wake surfaces
@@ -50,7 +50,7 @@ static int recv_fd(int sock) {
 int main(void) {
     int zc[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, zc) != 0) { perror("zc"); return 1; }
-    // control pipe: renderer -> browser "parked"
+    // control pipe: worker -> coordinator "parked"
     int rp[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, rp) != 0) { perror("rp"); return 1; }
 
@@ -60,13 +60,13 @@ int main(void) {
         close(zc[0]); close(rp[0]);
         int shm = recv_fd(zc[1]);              // memfd via SCM_RIGHTS
         if (shm < 0) _exit(50);
-        pid_t r = fork();                       // zygote forks the "renderer"
+        pid_t r = fork();                       // zygote forks the "worker"
         if (r == 0) {
-            // shift the allocator so the shared page lands at a different VA than the browser's
+            // shift the allocator so the shared page lands at a different VA than the coordinator's
             (void)mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             int *C = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0);
             if (C == MAP_FAILED) _exit(3);
-            char b = 'R'; (void)!write(rp[1], &b, 1); // tell browser we are about to park
+            char b = 'R'; (void)!write(rp[1], &b, 1); // tell coordinator we are about to park
             struct timespec to = {3, 0};
             int woke = 0;
             for (;;) {
@@ -90,11 +90,11 @@ int main(void) {
     if (send_fd(zc[0], shm) != 0) { perror("send_fd"); return 1; }
 
     char rb = 0;
-    (void)!read(rp[0], &rb, 1);                 // wait until the renderer has mapped + is parking
+    (void)!read(rp[0], &rb, 1);                 // wait until the worker has mapped + is parking
     struct timespec nap = {0, 250 * 1000 * 1000};
     nanosleep(&nap, NULL);                        // let it actually park in FUTEX_WAIT
     atomic_store((_Atomic int *)&P[0], 1);
-    fwake(&P[0], INT_MAX);                         // wake through the browser's independent VA
+    fwake(&P[0], INT_MAX);                         // wake through the coordinator's independent VA
 
     int zst = 0;
     waitpid(zyg, &zst, 0);

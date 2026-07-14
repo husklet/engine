@@ -1,23 +1,23 @@
-// Chrome child-process Mojo BOOTSTRAP shape end-to-end: the browser hands a freshly launched child its
+// multi-process application child-process IPC BOOTSTRAP shape end-to-end: the coordinator hands a freshly launched child its
 // initial platform channel + a shared-memory command buffer at LAUNCH time by (a) placing each fd at a
-// FIXED number and (b) passing that number as a command-line STRING (Chrome's --mojo-platform-channel-
+// FIXED number and (b) passing that number as a command-line STRING (multi-process application's --mojo-platform-channel-
 // handle=N / GlobalDescriptors convention). The child, after fork + in-place execve, must find each fd
 // alive AT THE NUMBER THE ARGV NAMED and be able to use it. The existing xproc-inbound/zygote/scm-futex
 // gates prove the cross-process TRANSPORT (socketpair/eventfd/epoll/SCM_RIGHTS/futex) delivers, but none
 // carries a memfd across hl's fork+in-place-execve, mmaps it in the NEW image, and wakes it by futex --
 // nor validates that the cmdline fd NUMBER and the surviving fd agree. This closes that bootstrap gap.
 //
-// What it asserts (browser == parent, child == exec'd renderer/GPU/utility process):
-//   1. chan   : the SEQPACKET Mojo channel dup2'd to fd 7 (non-CLOEXEC) survives the in-place execve and
-//               the child receives the browser's INBOUND message on it (the EstablishGpuChannel direction).
+// What it asserts (coordinator == parent, child == exec'd worker/service/utility process):
+//   1. chan   : the SEQPACKET IPC channel dup2'd to fd 7 (non-CLOEXEC) survives the in-place execve and
+//               the child receives the coordinator's INBOUND message on it (the EstablishPeerChannel direction).
 //   2. shmem  : a memfd command buffer dup2'd to fd 8 (non-CLOEXEC) survives the execve and is MAP_SHARED-
-//               mmap'able in the new image, coherent with the browser's own independent mapping.
-//   3. futex  : a FUTEX_WAKE issued through the browser's mapping releases the child parked in FUTEX_WAIT
-//               on a word inside that shared page (the renderer<->GPU command-buffer wakeup).
+//               mmap'able in the new image, coherent with the coordinator's own independent mapping.
+//   3. futex  : a FUTEX_WAKE issued through the coordinator's mapping releases the child parked in FUTEX_WAIT
+//               on a word inside that shared page (the worker<->service command-buffer wakeup).
 //   4. decoy  : a sibling fd left FD_CLOEXEC is GONE after the execve -- proving the close-on-exec sweep
 //               actually ran, so (1)/(2) survive because hl honours the CLEARED cloexec flag, not because
-//               the sweep is a no-op that would also leak a fd Chrome meant to drop.
-// A dropped/renumbered bootstrap fd (the multi-process dormant-renderer hypothesis) fails deterministically
+//               the sweep is a no-op that would also leak a fd multi-process application meant to drop.
+// A dropped/renumbered bootstrap fd (the multi-process dormant-worker hypothesis) fails deterministically
 // (chan/shmem/futex=0) inside a timed wait -- never a hang.
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,7 +37,7 @@
 #include <time.h>
 #include <unistd.h>
 
-// Fixed child fd numbers the browser assigns and names on the command line (mirrors Chrome's fd remap +
+// Fixed child fd numbers the coordinator assigns and names on the command line (mirrors multi-process application's fd remap +
 // base::GlobalDescriptors kBaseDescriptor offset -- deliberately above stdio, not 3/4).
 #define CH_CHAN  7
 #define CH_MEMFD 8
@@ -66,7 +66,7 @@ static int child_main(int argc, char **argv) {
     int *C = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
     if (C != MAP_FAILED) shmem_ok = 1;
 
-    // (1) park an epoll on the channel exactly as a renderer's IO thread would.
+    // (1) park an epoll on the channel exactly as a worker's IO thread would.
     int ep = epoll_create1(EPOLL_CLOEXEC);
     struct epoll_event ce = {.events = EPOLLIN, .data.fd = chan};
     if (epoll_ctl(ep, EPOLL_CTL_ADD, chan, &ce) != 0) {
@@ -84,13 +84,13 @@ static int child_main(int argc, char **argv) {
         if (r > 0) {
             msg[r] = 0;
             chan_ok = 1;
-            msg_ok = !strcmp(msg, "EstablishGpu");
+            msg_ok = !strcmp(msg, "EstablishPeer");
         }
     }
     char parked = 'P';
-    (void)!write(chan, &parked, 1); // tell the browser we consumed the channel msg and are about to futex
+    (void)!write(chan, &parked, 1); // tell the coordinator we consumed the channel msg and are about to futex
 
-    // (3) block on the command-buffer word until the browser stores + FUTEX_WAKEs through its own mapping.
+    // (3) block on the command-buffer word until the coordinator stores + FUTEX_WAKEs through its own mapping.
     int futex_ok = 0;
     if (shmem_ok) {
         struct timespec to = {3, 0};
@@ -103,7 +103,7 @@ static int child_main(int argc, char **argv) {
     }
 
     printf("child bootstrap chan=%d msg=%s shmem=%d futex=%d decoy_swept=%d\n",
-           chan_ok, msg_ok ? "EstablishGpu" : "?", shmem_ok, futex_ok, decoy_swept);
+           chan_ok, msg_ok ? "EstablishPeer" : "?", shmem_ok, futex_ok, decoy_swept);
     fflush(stdout);
     return (chan_ok && msg_ok && shmem_ok && futex_ok && decoy_swept) ? 0 : 25;
 }
@@ -111,7 +111,7 @@ static int child_main(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "child")) return child_main(argc, argv);
 
-    // Browser side: create the Mojo channel + the shared command buffer.
+    // Coordinator side: create the IPC channel + the shared command buffer.
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) { perror("socketpair"); return 1; }
     int shm = (int)syscall(SYS_memfd_create, "cmdbuf", 0u);
@@ -152,11 +152,11 @@ int main(int argc, char **argv) {
     if (read(sv[0], &r, 1) != 1 || r != 'R') { printf("parent ready-read r=%d\n", r); return 2; }
     struct timespec settle = {0, 50 * 1000 * 1000};
     nanosleep(&settle, NULL);
-    const char *m = "EstablishGpu";
+    const char *m = "EstablishPeer";
     if (write(sv[0], m, strlen(m)) < 0) { perror("write chan"); return 3; }
 
     // Wait for the child's "parked" datagram (channel msg consumed, about to FUTEX_WAIT), then wake it
-    // through the browser's OWN independent mapping of the shared page.
+    // through the coordinator's OWN independent mapping of the shared page.
     char pk = 0;
     if (read(sv[0], &pk, 1) != 1 || pk != 'P') { printf("parent park-read pk=%d\n", pk); return 4; }
     nanosleep(&settle, NULL);

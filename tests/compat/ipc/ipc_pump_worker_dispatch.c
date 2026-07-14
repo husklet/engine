@@ -1,6 +1,6 @@
-// In-process renderer-shaped model: an IO epoll pump (SEQPACKET channel + ScheduleWork eventfd, EPOLLET)
+// In-process worker-shaped model: an IO epoll pump (SEQPACKET channel + ScheduleWork eventfd, EPOLLET)
 // that, per inbound message, dispatches work to one of N worker threads parked on a condvar (glibc
-// condvar => FUTEX_WAIT under hl). Mirrors the observed dormant Chrome-renderer park state -- several
+// condvar => FUTEX_WAIT under hl). Mirrors the observed dormant multi-process application-worker park state -- several
 // threads in FUTEX_WAIT plus the epoll pump -- and exercises the pump->worker handoff that couples the
 // epoll-readiness wakeup to a futex wakeup (no existing gate combines the two). A missed wakeup anywhere
 // (eventfd edge, socket edge, or the FUTEX handoff) stalls the pipeline; a watchdog turns any stall into
@@ -140,6 +140,6 @@ int main(void) {
     uint64_t one = 1; if (write(wake_fd, &one, 8) != 8) {}
     pthread_join(io, NULL);
     long d = atomic_load(&g_done_rounds);
-    printf("renderer rounds=%d done=%ld ok=%d\n", ROUNDS, d, d == ROUNDS);
+    printf("worker rounds=%d done=%ld ok=%d\n", ROUNDS, d, d == ROUNDS);
     return d == ROUNDS ? 0 : 5;
 }

@@ -1,14 +1,14 @@
-// Synthetic repro for the Chrome "lost cross-thread wakeup" stall (hl aarch64 engine, eventfd/epoll).
+// Synthetic repro for the multi-process application "lost cross-thread wakeup" stall (hl aarch64 engine, eventfd/epoll).
 //
-// Chrome's browser main thread runs an idle message-pump loop: a MessagePumpEpoll blocks in epoll_pwait
+// multi-process application's coordinator main thread runs an idle message-pump loop: a MessagePumpEpoll blocks in epoll_pwait
 // on an eventfd that peer threads write() to wake it (ScheduleWork), and a futex-backed mutex
 // (base::Lock, FUTEX_WAIT val=2 = locked-with-waiters) guards the task queue. Under heavy multi-threaded
-// startup the browser stops making progress -> no first paint. Root cause: hl emulated an eventfd as a
+// startup the coordinator stops making progress -> no first paint. Root cause: hl emulated an eventfd as a
 // {counter, readiness-pipe} pair mutated WITHOUT synchronization, so concurrent write()/read() interleave
 // and strand the invariant "pipe-readable IFF counter>0" -- a byte left in the pipe with counter 0 makes a
 // level-triggered epoll_wait report the fd endlessly ready while read() drains nothing (the pump busy-
 // spins), and an edge-triggered watcher that saw no fresh edge never wakes (the "lost wakeup" park). Both
-// also corrupt the accumulated counter. This program reproduces that mechanism WITHOUT chromium.
+// also corrupt the accumulated counter. This program reproduces that mechanism WITHOUT multi-process application.
 //
 // Structure: ONE consumer ("main/pump") thread runs a LEVEL-triggered epoll_pwait loop on an eventfd; N
 // producer threads each push M tasks (lock the futex mutex, enqueue, unlock) and write() the eventfd to
@@ -81,7 +81,7 @@ static void *producer(void *arg) {
     return NULL;
 }
 
-// Watchdog: no pump progress for ~8s => a wake was dropped (a real bug would hang forever, like chromium).
+// Watchdog: no pump progress for ~8s => a wake was dropped (a real bug would hang forever, like multi-process application).
 static void *watchdog(void *arg) {
     (void)arg;
     long last = -1, stall = 0;
@@ -109,7 +109,7 @@ int main(void) {
     if (g_efd < 0) { perror("eventfd"); return 2; }
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epfd < 0) { perror("epoll_create1"); return 2; }
-    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 42}; // level-triggered wake fd (as Chrome)
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 42}; // level-triggered wake fd (as multi-process application)
     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_efd, &ev) < 0) { perror("epoll_ctl"); return 2; }
 
     pthread_t wtd, prod[NWORKERS];

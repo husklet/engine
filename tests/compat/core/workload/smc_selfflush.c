@@ -1,11 +1,11 @@
-// SMC self-flush LIVELOCK repro (the chromium/V8 startup wall). A code-generating guest (V8) issues
+// SMC self-flush LIVELOCK repro (the multi-process application/V8 startup wall). A code-generating guest (V8) issues
 // `ic ivau` (icache invalidate) constantly at startup -- and crucially it re-flushes ALREADY-TRANSLATED,
 // UNCHANGED code lines (a builtin/trampoline flushed as part of a range every call, or a block flushing
 // its OWN currently-executing source line). hl's SMC hook responded to EVERY such line-hit with a
 // WHOLESALE drop of the entire translation map + IBTC, forcing the whole working set to re-translate --
 // so a hot loop that re-flushes one unchanged line pays O(working-set) re-translations PER ITERATION.
 // With a large working set that is `translate_block` spinning at 100% CPU forever (RSS flat, no guest
-// progress of consequence): the observed `chromium --version` hang.
+// progress of consequence): the observed `multi-process application --version` hang.
 //
 // This reproduces it without V8: an RWX arena holds (a) a self-flushing function `sf` whose body issues
 // `ic ivau` on its OWN executing line (dc cvau; dsb; ic ivau; dsb; isb; ret -- the __clear_cache dance,

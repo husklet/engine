@@ -1,5 +1,5 @@
-// Cross-process INBOUND event delivery to a CHILD parked in epoll_wait -- the exact Chrome
-// renderer/GPU Mojo scenario (child blocks on its transport fds; the parent/browser writes).
+// Cross-process INBOUND event delivery to a CHILD parked in epoll_wait -- the exact multi-process application
+// worker/service IPC scenario (child blocks on its transport fds; the parent/coordinator writes).
 // The existing scm-eventfd gate tests the OPPOSITE direction (parent epolls, child writes), so this
 // isolates whether a parent's socketpair write / eventfd signal wakes a child's epoll cross-process.
 //
@@ -20,7 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-// fixed child fd numbers (mirrors Chrome's base::LaunchOptions fd remapping)
+// fixed child fd numbers (mirrors multi-process application's base::LaunchOptions fd remapping)
 #define CH_SOCK 3
 #define CH_EFD  4
 
@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     // brief settle so the child is inside epoll_wait
     struct timespec ts = {0, 50 * 1000 * 1000};
     nanosleep(&ts, NULL);
-    // INBOUND: socketpair message + eventfd signal, browser->renderer direction
+    // INBOUND: socketpair message + eventfd signal, coordinator->worker direction
     const char *m = "BeginFrame";
     if (write(sv[0], m, strlen(m)) < 0) { perror("parent write sock"); return 3; }
     uint64_t v = 7;

@@ -1,11 +1,11 @@
-// exec-fd-inheritance + epoll: the EXACT Chrome renderer-launch bootstrap that Wall 7 blocks on.
+// exec-fd-inheritance + epoll: the EXACT multi-process application worker-launch bootstrap that Wall 7 blocks on.
 //
-// Chrome's PlatformChannel: the browser creates a socketpair, dup2()s one end to a known fd number,
-// clears FD_CLOEXEC, and execve()s the renderer, passing that fd number on the command line
-// (--mojo-platform-channel-handle=<fd>). The renderer then arms epoll (EPOLLIN) on THAT
-// exec-inherited fd and blocks in epoll_wait for the "invitation" the browser writes later.
+// multi-process application's PlatformChannel: the coordinator creates a socketpair, dup2()s one end to a known fd number,
+// clears FD_CLOEXEC, and execve()s the worker, passing that fd number on the command line
+// (--mojo-platform-channel-handle=<fd>). The worker then arms epoll (EPOLLIN) on THAT
+// exec-inherited fd and blocks in epoll_wait for the "invitation" the coordinator writes later.
 //
-// This gate reproduces that permutation OFFLINE with no live Chrome. The distinguishing feature vs the
+// This gate reproduces that permutation OFFLINE with no live multi-process application. The distinguishing feature vs the
 // existing zygote-inbound (fork-inherit) / scm-recv-epoll (SCM_RIGHTS) gates is EXECVE: exec resets
 // process state, so the socket fd must survive across exec at its specific number (FD_CLOEXEC clear),
 // and an epoll arm on that exec-inherited fd must deliver a CROSS-PROCESS wake when the parent writes.
@@ -34,7 +34,7 @@
 
 extern char **environ;
 
-#define CHILD_FD 42       // Chrome passes the platform-channel fd at a fixed number; mirror that here
+#define CHILD_FD 42       // multi-process application passes the platform-channel fd at a fixed number; mirror that here
 #define WAIT_MS 2500      // per-round epoll_wait budget (comfortably > the parent's arm delay)
 
 static void die_alarm(int sig) { (void)sig; _exit(7); } // watchdog: any hang -> hard exit, never block
@@ -75,7 +75,7 @@ static int child_main(int fd, int et) {
     if (write(fd, "R", 1) != 1) return 13; // tell the parent we are armed
 
     // Two invitation rounds over the SAME persistent epoll registration (round 2 proves the arm
-    // survives / re-fires — the renderer reads more than one message off its primary channel).
+    // survives / re-fires — the worker reads more than one message off its primary channel).
     const char *want[2] = {"GO1", "GO2"};
     for (int round = 0; round < 2; round++) {
         struct epoll_event out[4];

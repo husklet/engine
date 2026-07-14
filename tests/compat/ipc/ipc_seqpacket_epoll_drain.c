@@ -30,7 +30,7 @@ static int fd_cloexec(int fd) {
 }
 
 static int send_bootstrap(int sock, int fd) {
-    char payload[] = "renderer-bootstrap";
+    char payload[] = "worker-bootstrap";
     struct iovec iov = {.iov_base = payload, .iov_len = sizeof(payload) - 1};
     char ctl[CMSG_SPACE(sizeof(int))];
     memset(ctl, 0, sizeof ctl);
@@ -69,7 +69,7 @@ static void child_main(int sock, int ready_wr, int out_wr) {
                     .msg_controllen = sizeof ctl,
                 };
                 ssize_t n = recvmsg(sock, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
-                r.got_msg = n == 18 && memcmp(buf, "renderer-bootstrap", 18) == 0;
+                r.got_msg = n == 18 && memcmp(buf, "worker-bootstrap", 18) == 0;
                 int recvfd = -1;
                 for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
                     if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)

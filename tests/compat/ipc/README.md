@@ -7,8 +7,8 @@ production engine, compared byte-for-byte with `expected/shared`, and compared
 across engines.
 
 `manifest.tsv` is the authoritative contract. The suite is Linux-only, uses
-checked-in expectations rather than a native oracle, and has no GUI, browser,
-GPU, or compositor dependency. The two former `untrusted` registrations map
+checked-in expectations rather than a native oracle, and has no graphics, coordinator,
+service, or display service dependency. The two former `untrusted` registrations map
 to the same generic engine configuration because sandbox policy is no longer
 an engine mode; they remain explicit active variants so registration coverage
 is not lost.

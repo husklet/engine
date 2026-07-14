@@ -1,6 +1,6 @@
-// SEQPACKET bystander-EOF guard (the Chromium Mojo child-bootstrap wall). When the browser forks a
-// renderer/GPU child, that child inherits ALL the browser's open fds -- including the browser's SEND end of
-// a Mojo channel meant for a DIFFERENT child. The bystander never uses it, but closes the inherited copy on
+// SEQPACKET bystander-EOF guard (the multi-process application IPC child-bootstrap wall). When the coordinator forks a
+// worker/service child, that child inherits ALL the coordinator's open fds -- including the coordinator's SEND end of
+// a IPC channel meant for a DIFFERENT child. The bystander never uses it, but closes the inherited copy on
 // startup. The DGRAM-backed SEQPACKET emulation must NOT synthesize a peer-EOF for an endpoint a process
 // merely inherited and never wrote to: the old code injected a zero-length "EOF" datagram into the peer end
 // -- the LIVE channel's recv queue -- so the real receiver read a premature 0 and gave up ("Terminating

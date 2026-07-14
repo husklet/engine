@@ -1,11 +1,11 @@
-// Faithful Chrome renderer-launch repro: a fd is passed via SCM_RIGHTS to a pre-existing ZYGOTE
-// process, which then FORKS the renderer child that inherits it. The ORIGINAL creator (browser)
-// writes inbound. This is the exact path renderers take (browser -> zygote SCM_RIGHTS -> fork child),
-// which differs from a plain fork-inherit (the GPU process path, already known to work).
+// Faithful multi-process application worker-launch repro: a fd is passed via SCM_RIGHTS to a pre-existing ZYGOTE
+// process, which then FORKS the worker child that inherits it. The ORIGINAL creator (coordinator)
+// writes inbound. This is the exact path workers take (coordinator -> zygote SCM_RIGHTS -> fork child),
+// which differs from a plain fork-inherit (the service process path, already known to work).
 //
-// browser: creates channel socketpair(sv) + an eventfd(efd); sends sv[1]+efd to the zygote via
-//   SCM_RIGHTS; then writes "BeginFrame" to sv[0] and signals efd. Reads the renderer's verdict off sv[0].
-// zygote:  recvmsg's the two fds, forks a renderer that epoll_waits on both and reports.
+// coordinator: creates channel socketpair(sv) + an eventfd(efd); sends sv[1]+efd to the zygote via
+//   SCM_RIGHTS; then writes "BeginFrame" to sv[0] and signals efd. Reads the worker's verdict off sv[0].
+// zygote:  recvmsg's the two fds, forks a worker that epoll_waits on both and reports.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -50,15 +50,15 @@ static int recv_two_fds(int sock, int *a, int *b) {
     return 0;
 }
 
-// renderer: epoll on the inherited channel + eventfd, report verdict on the channel.
-static void renderer_main(int chan, int efd) {
+// worker: epoll on the inherited channel + eventfd, report verdict on the channel.
+static void worker_main(int chan, int efd) {
     int ep = epoll_create1(EPOLL_CLOEXEC);
     struct epoll_event ce = {.events = EPOLLIN, .data.fd = chan};
     struct epoll_event ee = {.events = EPOLLIN, .data.fd = efd};
     epoll_ctl(ep, EPOLL_CTL_ADD, chan, &ce);
     epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ee);
     char rdy = 'R';
-    if (write(chan, &rdy, 1) != 1) _exit(40); // tell browser we are parked
+    if (write(chan, &rdy, 1) != 1) _exit(40); // tell coordinator we are parked
     int gs = 0, ge = 0;
     char msg[64] = {0};
     uint64_t v = 0;
@@ -82,7 +82,7 @@ static void renderer_main(int chan, int efd) {
 }
 
 int main(void) {
-    // control channel browser<->zygote
+    // control channel coordinator<->zygote
     int zc[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, zc) != 0) { perror("zc"); return 1; }
     pid_t zyg = fork();
@@ -91,9 +91,9 @@ int main(void) {
         close(zc[0]);
         int chan = -1, efd = -1;
         if (recv_two_fds(zc[1], &chan, &efd) != 0) _exit(50);
-        pid_t r = fork(); // zygote forks the renderer
-        if (r == 0) { close(zc[1]); renderer_main(chan, efd); }
-        // zygote: reap renderer, then exit
+        pid_t r = fork(); // zygote forks the worker
+        if (r == 0) { close(zc[1]); worker_main(chan, efd); }
+        // zygote: reap worker, then exit
         int st;
         waitpid(r, &st, 0);
         _exit(0);
@@ -107,9 +107,9 @@ int main(void) {
     if (send_two_fds(zc[0], sv[1], efd) != 0) { perror("send_two_fds"); return 1; }
     close(sv[1]);
 
-    // wait for the renderer's readiness byte (it is a grandchild; the channel is our only link)
+    // wait for the worker's readiness byte (it is a grandchild; the channel is our only link)
     char r;
-    if (read(sv[0], &r, 1) != 1) { printf("browser ready-read: %s\n", strerror(errno)); return 2; }
+    if (read(sv[0], &r, 1) != 1) { printf("coordinator ready-read: %s\n", strerror(errno)); return 2; }
     struct timespec ts = {0, 50 * 1000 * 1000};
     nanosleep(&ts, NULL);
     const char *m = "BeginFrame";
@@ -122,6 +122,6 @@ int main(void) {
     if (vn > 0) verdict[vn] = 0;
     int zst = 0;
     waitpid(zyg, &zst, 0);
-    printf("browser got %s\n", vn > 0 ? verdict : "(no verdict)");
+    printf("coordinator got %s\n", vn > 0 ? verdict : "(no verdict)");
     return 0;
 }

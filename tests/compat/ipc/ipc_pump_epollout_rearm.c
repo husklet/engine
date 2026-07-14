@@ -1,10 +1,10 @@
 // EPOLLOUT (write-readiness) EDGE re-arm on a SOCK_STREAM socketpair -- the "message written but never
-// flushed" wall. Chrome's Mojo PlatformChannel is SOCK_STREAM; when a channel write would block, the
+// flushed" wall. multi-process application's IPC PlatformChannel is SOCK_STREAM; when a channel write would block, the
 // Channel arms EPOLLOUT|EPOLLET, waits for the writable edge, flushes the rest, then disarms. Every
 // existing pump gate only exercises EPOLLIN readiness; none covers the WRITE side's drain->re-arm edge,
 // which is a distinct kqueue path (EVFILT_WRITE + EV_CLEAR) that can drop the writable transition
 // between the reader draining the peer's recv buffer and the writer re-blocking. A lost writable edge
-// leaves the sender parked with a half-written message forever -- the browser->renderer node-channel
+// leaves the sender parked with a half-written message forever -- the coordinator->worker node-channel
 // write that never lands. Two threads: a writer that fills the socket then EPOLLOUT-waits for room, and
 // a reader thread that drains slowly; a watchdog turns any stall into a deterministic nonzero exit.
 #define _GNU_SOURCE
@@ -91,7 +91,7 @@ int main(void) {
             continue;
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // would block: arm EPOLLOUT|EPOLLET and wait for the writable edge (Chrome's channel write watch)
+            // would block: arm EPOLLOUT|EPOLLET and wait for the writable edge (multi-process application's channel write watch)
             if (!armed) {
                 if (epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &we) != 0) return 2;
                 armed = 1;

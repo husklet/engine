@@ -1,1 +1,1 @@
-renderer rounds=30000 done=30000 ok=1
+worker rounds=30000 done=30000 ok=1

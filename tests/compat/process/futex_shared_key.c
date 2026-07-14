@@ -1,5 +1,5 @@
-// Cross-mapping futex on a MAP_SHARED page reached at TWO DIFFERENT virtual addresses (the Chrome
-// renderer<->GPU-service command-buffer pattern: one shared-memory object, mmap'd independently in each
+// Cross-mapping futex on a MAP_SHARED page reached at TWO DIFFERENT virtual addresses (the multi-process application
+// worker<->service-peer command-buffer pattern: one shared-memory object, mmap'd independently in each
 // peer, so the SAME futex word lives at a DIFFERENT address in each). On Linux a FUTEX_WAIT and a
 // FUTEX_WAKE on a MAP_SHARED page rendezvous by the shared key (inode+offset), NOT by virtual address,
 // so a wake through mapping B must release a waiter parked through mapping A. hl hashed the futex bucket
@@ -8,7 +8,7 @@
 //   T (same-process, two mappings of one memfd): thread FUTEX_WAITs via map A; main stores + FUTEX_WAKEs
 //     via map B. Different VAs, same physical word -> the wake must cross.
 //   X (cross-process): child mmaps the shared fd (its own VA) and FUTEX_WAITs; parent stores + FUTEX_WAKEs
-//     via the parent's independent VA. Exactly the renderer/GPU-service split.
+//     via the parent's independent VA. Exactly the worker/service-peer split.
 //
 // Waits are TIMED (3s) so a LOST wake surfaces as woke=0 (a deterministic failure), never a harness hang.
 // Linux-only raw futex(2) -> oracle-diffed (native prints woke=1 for both).

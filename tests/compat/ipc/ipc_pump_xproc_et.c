@@ -1,7 +1,7 @@
 // Cross-process EDGE-TRIGGERED (EPOLLET) SEQPACKET streaming with each message planted in the child's
 // drain->re-arm window -- the exact "readiness edge lost between drain and re-block" pattern, sustained
-// (the existing xproc-inbound/xproc-prearm gates cover only a single-shot delivery). Models Chrome's
-// renderer IO pump: the child epolls its Mojo channel (SEQPACKET, EPOLLET) + a ScheduleWork wakeup
+// (the existing xproc-inbound/xproc-prearm gates cover only a single-shot delivery). Models multi-process application's
+// worker IO pump: the child epolls its IPC channel (SEQPACKET, EPOLLET) + a ScheduleWork wakeup
 // eventfd, drains to EAGAIN, then signals the parent "drained" over a control fd; the parent immediately
 // sends the NEXT large (>2KB, invitation-sized) message so it lands right after the drain, at re-arm.
 // A lost edge => the child parks forever => the watchdog turns the stall into a deterministic nonzero
@@ -22,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CH_SOCK 3 // Mojo channel (SEQPACKET) — child end
+#define CH_SOCK 3 // IPC channel (SEQPACKET) — child end
 #define CH_EFD  4 // ScheduleWork wakeup eventfd
 #define CH_CTL  5 // control back-channel: child -> parent "drained" tokens
 #define ROUNDS  4000

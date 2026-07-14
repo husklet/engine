@@ -172,7 +172,7 @@ int main(void) {
     int nrecv = 0, status_ok = 0, statm_ok = 0, maps_ok = 0;
     sscanf(reply, "%d %d %d %d", &nrecv, &status_ok, &statm_ok, &maps_ok);
     int child_ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-    printf("chrome_procfd open=%d send=%d recv=%d status=%d statm=%d maps=%d child=%d\n",
+    printf("procfd_bundle open=%d send=%d recv=%d status=%d statm=%d maps=%d child=%d\n",
            open_ok, send_ok, nrecv, status_ok, statm_ok, maps_ok, child_ok);
     return open_ok && send_ok && nrecv == 3 && status_ok && statm_ok && maps_ok && child_ok ? 0 : 1;
 }

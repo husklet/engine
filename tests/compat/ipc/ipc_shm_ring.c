@@ -1,14 +1,14 @@
-// Chrome OOP-raster GPU command-buffer transport, faithfully modeled at Chrome's regime — the Wall-7
+// multi-process application out-of-process service command-buffer transport, faithfully modeled at multi-process application's regime — the Wall-7
 // "multi-proc content white" reproducer.
 //
-// WHY THIS GATE EXISTS. Multi-process Chrome content is white because the renderer's rasterized GL
-// command stream never executes in the gpu-process RasterDecoder (executor trace: 1913/1913 frames bind
-// ONLY the present surface, off_draws=0 — the gpu-process composites but never rasters content). The
-// renderer→gpu OOP-raster command buffer is a SHARED-MEMORY ring: the renderer writes GL commands into a
+// WHY THIS GATE EXISTS. Multi-process multi-process application content is white because the worker's queued
+// command stream never executes in the service process RasterDecoder (executor trace: 1913/1913 frames bind
+// ONLY the present surface, off_draws=0 — the service process composites but never processes content). The
+// worker→service out-of-process command buffer is a SHARED-MEMORY ring: the worker writes GL commands into a
 // memfd "transfer buffer", advances a "put" offset in a small memfd "shared state" region, and signals an
-// eventfd (AsyncFlush over the Mojo GpuChannel); the gpu-process reads [get..put] from the ring, executes
+// eventfd (AsyncFlush over the IPC PeerChannel); the service process reads [get..put] from the ring, executes
 // it, and advances "get". EVERY existing cross-process micro-gate passes (scm-recv-epoll, scm-futex,
-// pump-*, xproc-*, zygote-inbound, epoll-shared-xthread), and SharedImage ALLOCATION (a pure Mojo message)
+// pump-*, xproc-*, zygote-inbound, epoll-shared-xthread), and SharedImage ALLOCATION (a pure IPC message)
 // works — so the wall is NOT a missing primitive. What NO prior gate tests is the exact command-buffer
 // COMBINATION: a memfd created by one process, transferred by SCM_RIGHTS, mapped MAP_SHARED by BOTH, then
 // used as a producer/consumer RING with a separate tiny partial-host-page STATE region, under ring-wrap
@@ -23,8 +23,8 @@
 //                           offsets). Emitted with (seen_put, real commands pending).
 //   * exit 7 (watchdog)   — the producer advanced put + signaled, but the consumer never woke (a lost
 //                           cross-process eventfd wakeup = command-channel pump dormancy).
-//   * "cmdbuf_ring ok"    — all N commands crossed coherently and every flush woke the consumer: the
-//                           engine's command-buffer transport is correct; the live wall is Chromium-internal
+//   * "shm_ring ok"    — all N commands crossed coherently and every flush woke the consumer: the
+//                           engine's command-buffer transport is correct; the live wall is multi-process application-internal
 //                           command-buffer scheduling, not a hl primitive.
 //
 // FIX LOCUS if it reproduces: hl-jit-darwin/src/runtime/os/linux/syscall/mem.c (MAP_SHARED memfd host
@@ -59,7 +59,7 @@ static int memfd_create_(const char *name, unsigned flags) {
 #define RING_BYTES 65536u          // small ring -> wraps ~N*CMD_SIZE/RING_BYTES times (forces wrap)
 #define RING_SLOTS (RING_BYTES / CMD_SIZE)
 #define N_CMDS 200000u             // ~390 ring wraps; thousands of flush/wake cycles
-#define IDLE_FDS 1500              // >1024: Chrome's high-fd interest-set regime
+#define IDLE_FDS 1500              // >1024: multi-process application's high-fd interest-set regime
 
 // The command-buffer SHARED STATE: put/get offsets in COMMAND units (not bytes). Deliberately tiny so the
 // memfd is far smaller than one 16 KB host page — the partial-page coherence case.
@@ -85,13 +85,13 @@ static void *watchdog(void *arg) {
         last = now;
     }
     (void)stuck;
-    // A pump parked with work pending = the dormant renderer. Sub-classify by whether wakes were still
+    // A pump parked with work pending = the dormant worker. Sub-classify by whether wakes were still
     // arriving: wakes received but progress stuck => the producer's `put` advance in the STATE memfd is
     // not visible (partial-page STATE incoherence); no wakes => the eventfd AsyncFlush wake was lost.
     char b[160];
     uint32_t w = atomic_load(&g_wakes), n = atomic_load(&g_next);
     const char *kind = (w > n + 4) ? "state-incoherence (put advance not visible)" : "lost-wakeup (pump dormancy)";
-    int k = snprintf(b, sizeof b, "cmdbuf_ring WATCHDOG stall: consumed=%u wakes=%u -> %s\n", n, w, kind);
+    int k = snprintf(b, sizeof b, "shm_ring WATCHDOG stall: consumed=%u wakes=%u -> %s\n", n, w, kind);
     write(2, b, (size_t)k);
     _exit(7);
 }
@@ -131,7 +131,7 @@ static int recv_fds(int sock, int fds[3]) {
     return 0;
 }
 
-// The RENDERER (child, producer): write commands into the ring, advance put in the shared state, signal
+// The WORKER (child, producer): write commands into the ring, advance put in the shared state, signal
 // the flush eventfd. Backpressure on the ring capacity (respect RING_SLOTS-1 so we never overwrite an
 // unconsumed slot — the correctness this reproducer's earlier draft got wrong).
 static int run_producer(struct cbstate *st, uint32_t *ring, int flush_efd) {
@@ -151,14 +151,14 @@ static int run_producer(struct cbstate *st, uint32_t *ring, int flush_efd) {
         rec[1] = seq;                        // seq
         rec[0] = CMD_MAGIC;                  // magic (header)
         atomic_store_explicit(&st->put, seq + 1, memory_order_release); // publish (put advance)
-        // AsyncFlush: signal the gpu-process. Coalescing is fine (eventfd counter), like Mojo.
+        // AsyncFlush: signal the service process. Coalescing is fine (eventfd counter), like IPC.
         uint64_t one = 1;
         if (write(flush_efd, &one, sizeof one) != sizeof one && errno != EAGAIN) return 2;
     }
     return 0;
 }
 
-// The GPU PROCESS (parent, consumer): block on the flush eventfd, then drain [get..put], verifying each
+// The SERVICE PROCESS (parent, consumer): block on the flush eventfd, then drain [get..put], verifying each
 // command's magic+seq is COHERENT (i.e. the producer's cross-process writes are visible), advancing get.
 static int run_consumer(struct cbstate *st, uint32_t *ring, int flush_efd, char *err, size_t errsz) {
     uint32_t next = 0; // expected seq
@@ -174,7 +174,7 @@ static int run_consumer(struct cbstate *st, uint32_t *ring, int flush_efd, char 
                 nanosleep(&ts, NULL);
                 continue;
             }
-            snprintf(err, errsz, "cmdbuf_ring FAIL: eventfd read errno=%d\n", errno);
+            snprintf(err, errsz, "shm_ring FAIL: eventfd read errno=%d\n", errno);
             return 3;
         }
         atomic_fetch_add(&g_wakes, 1u); // an AsyncFlush wake was delivered (distinguishes lost-wake vs stale-put)
@@ -189,14 +189,14 @@ static int run_consumer(struct cbstate *st, uint32_t *ring, int flush_efd, char 
                 uint32_t magic = rec[0], gotseq = rec[1];
                 if (magic != CMD_MAGIC || gotseq != next) {
                     snprintf(err, errsz,
-                             "cmdbuf_ring FAIL ring-incoherence: at seq=%u slot=%u got magic=0x%x seq=%u "
+                             "shm_ring FAIL ring-incoherence: at seq=%u slot=%u got magic=0x%x seq=%u "
                              "(TRANSFER-BUFFER memfd not coherent cross-process)\n",
                              next, slot, magic, gotseq);
                     return 5;
                 }
                 // Verify a payload word too (catches a torn / partial-page write mid-record).
                 if (rec[CMD_WORDS - 1] != next * 2654435761u + (CMD_WORDS - 1)) {
-                    snprintf(err, errsz, "cmdbuf_ring FAIL ring-incoherence: torn payload at seq=%u\n", next);
+                    snprintf(err, errsz, "shm_ring FAIL ring-incoherence: torn payload at seq=%u\n", next);
                     return 5;
                 }
                 next++;
@@ -209,41 +209,41 @@ static int run_consumer(struct cbstate *st, uint32_t *ring, int flush_efd, char 
 }
 
 int main(void) {
-    // Chrome's regime: a large fd interest set. Burn >1024 fds so any fd-count-sensitive path is exercised.
+    // multi-process application's regime: a large fd interest set. Burn >1024 fds so any fd-count-sensitive path is exercised.
     for (int i = 0; i < IDLE_FDS; i++)
         if (dup(2) < 0) break;
 
-    // Create the two shared regions as memfds (exactly like Chrome's base::UnsafeSharedMemoryRegion).
+    // Create the two shared regions as memfds (exactly like multi-process application's base::UnsafeSharedMemoryRegion).
     int state_fd = memfd_create_("cbstate", 0);
     int ring_fd = memfd_create_("cbring", 0);
     if (state_fd < 0 || ring_fd < 0) {
-        printf("cmdbuf_ring FAIL: memfd_create errno=%d\n", errno);
+        printf("shm_ring FAIL: memfd_create errno=%d\n", errno);
         return 1;
     }
     if (ftruncate(state_fd, sizeof(struct cbstate)) != 0 || ftruncate(ring_fd, RING_BYTES) != 0) {
-        printf("cmdbuf_ring FAIL: ftruncate errno=%d\n", errno);
+        printf("shm_ring FAIL: ftruncate errno=%d\n", errno);
         return 1;
     }
     int flush_efd = eventfd(0, 0); // blocking eventfd = the AsyncFlush signal
     if (flush_efd < 0) {
-        printf("cmdbuf_ring FAIL: eventfd errno=%d\n", errno);
+        printf("shm_ring FAIL: eventfd errno=%d\n", errno);
         return 1;
     }
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        printf("cmdbuf_ring FAIL: socketpair\n");
+        printf("shm_ring FAIL: socketpair\n");
         return 1;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
-        printf("cmdbuf_ring FAIL: fork\n");
+        printf("shm_ring FAIL: fork\n");
         return 1;
     }
     if (pid == 0) {
-        // Child = RENDERER (producer). Receives the fds over SCM_RIGHTS (Chrome transfers the memfds via
-        // Mojo/SCM_RIGHTS; the child maps the RECEIVED fds, not the fork-inherited ones — the faithful path).
+        // Child = WORKER (producer). Receives the fds over SCM_RIGHTS (multi-process application transfers the memfds via
+        // IPC/SCM_RIGHTS; the child maps the RECEIVED fds, not the fork-inherited ones — the faithful path).
         close(sv[0]);
         int fds[3];
         if (recv_fds(sv[1], fds) != 0) _exit(11);
@@ -255,17 +255,17 @@ int main(void) {
         _exit(rc);
     }
 
-    // Parent = GPU PROCESS (consumer). Send the fds, then map + drain.
+    // Parent = SERVICE PROCESS (consumer). Send the fds, then map + drain.
     close(sv[1]);
     int fds[3] = {state_fd, ring_fd, flush_efd};
     if (send_fds(sv[0], fds) != 0) {
-        printf("cmdbuf_ring FAIL: send_fds\n");
+        printf("shm_ring FAIL: send_fds\n");
         return 1;
     }
     struct cbstate *st = mmap(NULL, sizeof(struct cbstate), PROT_READ | PROT_WRITE, MAP_SHARED, state_fd, 0);
     uint32_t *ring = mmap(NULL, RING_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, 0);
     if (st == MAP_FAILED || ring == MAP_FAILED) {
-        printf("cmdbuf_ring FAIL: parent mmap\n");
+        printf("shm_ring FAIL: parent mmap\n");
         return 1;
     }
 
@@ -286,10 +286,10 @@ int main(void) {
         return rc;
     }
     if (cexit != 0) {
-        printf("cmdbuf_ring FAIL: producer exit=%d\n", cexit);
+        printf("shm_ring FAIL: producer exit=%d\n", cexit);
         return 6;
     }
-    printf("cmdbuf_ring ok cmds=%u wraps=%u child_exit=0 spurious_eagain=%u\n", N_CMDS, N_CMDS / RING_SLOTS,
+    printf("shm_ring ok cmds=%u wraps=%u child_exit=0 spurious_eagain=%u\n", N_CMDS, N_CMDS / RING_SLOTS,
            atomic_load(&g_spurious_eagain));
     return 0;
 }

@@ -1,4 +1,4 @@
-// Cross-process EPOLLONESHOT re-arm race. The child registers its SEQPACKET Mojo channel + wakeup
+// Cross-process EPOLLONESHOT re-arm race. The child registers its SEQPACKET IPC channel + wakeup
 // eventfd with EPOLLIN|EPOLLONESHOT; on each event the kernel auto-disarms the fd, the child drains it,
 // then re-arms via EPOLL_CTL_MOD. If a message arrives in the window between the oneshot firing (disarm)
 // and the MOD re-arm, Linux re-reports it on re-arm (the fd is still readable) -- a lost re-arm edge
