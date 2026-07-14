@@ -76,6 +76,9 @@ static void thread_kill(struct cpu *c, int tid, int sig) {
 
 static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                       uint64_t a5) {
+    if ((nr >= 129 && nr <= 139) || nr == (UINT64_C(0x10000) | 34))
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL, "nr=%llu target=%lld signal=%lld", (unsigned long long)nr,
+                (long long)a0, (long long)a1);
     switch (nr) {
     // ===================== Signals — Linux signal numbers -> macOS; kill/sigaction/sigreturn =====================
     // kill(pid,sig)

@@ -156,6 +156,8 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
 
 static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                    uint64_t a5) {
+    if ((nr >= 198 && nr <= 212) || nr == 242 || nr == 243 || nr == 269)
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "nr=%llu fd=%lld", (unsigned long long)nr, (long long)a0);
     // AF_NETLINK/NETLINK_ROUTE: a guest netlink socket is a socketpair we RTNETLINK-respond on
     // (see netns.c). bind/getsockname/send/recv are handled here; everything else (setsockopt/getsockopt/
     // close) falls through to the generic paths, which work on the underlying AF_UNIX socket.

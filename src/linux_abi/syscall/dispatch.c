@@ -545,6 +545,8 @@ static void service_local(struct cpu *c) {
     // A handler that then parks in a blocking host wait stamps 'S' for its duration and 'R' again on wake.
     ts_running();
     uint64_t nr = G_NR(c), a0 = G_A0(c), a1 = G_A1(c), a2 = G_A2(c), a3 = G_A3(c), a4 = G_A4(c), a5 = G_A5(c);
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_SYSCALL, "nr=%llu a0=%#llx a1=%#llx a2=%#llx", (unsigned long long)nr,
+            (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     if (g_trace || g_systrace)
         fprintf(stderr, "[sys pid=%d] %llu (%llx,%llx,%llx,%llx,%llx,%llx)\n", (int)getpid(), (unsigned long long)nr,
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,

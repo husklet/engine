@@ -1111,6 +1111,7 @@ static void emit_irq_check(uint64_t rip) {
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
     uint64_t start = gpc;
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=x86_64 guest_pc=%#llx", (unsigned long long)gpc);
     void *host = g_cp;
     emit_prologue();
     void *body = g_cp;

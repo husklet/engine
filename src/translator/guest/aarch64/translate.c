@@ -1284,6 +1284,7 @@ static int insn_touches_vreg(uint32_t in) {
 }
 
 static void *translate_block(uint64_t gpc) {
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 guest_pc=%#llx", (unsigned long long)gpc);
     // W4E tier-2: read NOTIER2 / TIER2_THRESHOLD once (idempotent) before any self-loop detection.
     tier2_env_init();
     // gpc is mutated by the decode loop; key the cache by START
