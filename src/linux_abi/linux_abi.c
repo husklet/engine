@@ -564,6 +564,9 @@ hl_status hl_linux_object_install_at(hl_linux_abi *linux_abi, hl_linux_fd fd, co
                                           &installed);
 }
 
+static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd_entry,
+                                       hl_host_handle *last_host_handle);
+
 hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_object_pin *pin) {
     const hl_linux_fd_entry *descriptor;
     const hl_linux_ofd_entry *found;
@@ -584,16 +587,32 @@ hl_status hl_linux_object_pin_fd(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_lin
         pin->context = ofd->object_context;
     }
     hl_linux_unlock(linux_abi);
+    if (status == HL_STATUS_OK) {
+        hl_host_result locked = hl_linux_sync(linux_abi)->mutex_lock(linux_abi->host->context, ofd->io_mutex);
+        if (locked.status != HL_STATUS_OK) {
+            hl_linux_lock(linux_abi);
+            ofd->active_operations--;
+            hl_linux_unlock(linux_abi);
+            memset(pin, 0, sizeof(*pin));
+            return (hl_status)locked.status;
+        }
+    }
     return status;
 }
 
 void hl_linux_object_unpin(hl_linux_object_pin *pin) {
     hl_linux_ofd_entry *ofd;
+    int finalize = 0;
     if (pin == NULL || pin->linux_abi == NULL) return;
     hl_linux_lock(pin->linux_abi);
     ofd = &pin->linux_abi->ofds[pin->ofd];
-    if (ofd->generation == pin->generation && ofd->active_operations != 0) ofd->active_operations--;
+    if (ofd->generation == pin->generation && ofd->active_operations != 0) {
+        ofd->active_operations--;
+        finalize = ofd->active_operations == 0 && ofd->references == 0 && ofd->closing != 0;
+    }
     hl_linux_unlock(pin->linux_abi);
+    (void)hl_linux_sync(pin->linux_abi)->mutex_unlock(pin->linux_abi->host->context, ofd->io_mutex);
+    if (finalize) (void)hl_linux_ofd_finalize(pin->linux_abi, ofd, NULL);
     memset(pin, 0, sizeof(*pin));
 }
 
@@ -746,12 +765,21 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     hl_host_result result;
     /* Wait only for this OFD. Operations drop their pin before releasing io_lock. */
     result = sync->mutex_lock(linux_abi->host->context, mutex);
-    if (result.status != HL_STATUS_OK) return (hl_status)result.status;
+    if (result.status != HL_STATUS_OK) close_status = (hl_status)result.status;
+retry_active:
     hl_linux_lock(linux_abi);
-    if (ofd_entry->references != 0 || ofd_entry->active_operations != 0 || ofd_entry->closing == 0) {
+    if (ofd_entry->references != 0 || ofd_entry->closing == 0) {
         hl_linux_unlock(linux_abi);
-        (void)sync->mutex_unlock(linux_abi->host->context, mutex);
+        if (result.status == HL_STATUS_OK) (void)sync->mutex_unlock(linux_abi->host->context, mutex);
         return HL_STATUS_CORRUPT;
+    }
+    if (ofd_entry->active_operations != 0) {
+        hl_linux_unlock(linux_abi);
+        if (result.status != HL_STATUS_OK) return close_status;
+        (void)sync->mutex_unlock(linux_abi->host->context, mutex);
+        result = sync->mutex_lock(linux_abi->host->context, mutex);
+        if (result.status != HL_STATUS_OK) return (hl_status)result.status;
+        goto retry_active;
     }
     host_handle = ofd_entry->host_handle;
     object_ops = ofd_entry->object_ops;
@@ -764,8 +792,10 @@ static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     ofd_entry->object_context = NULL;
     hl_linux_unlock(linux_abi);
     if (object_ops != NULL) close_status = object_ops->close(object_context);
-    result = sync->mutex_unlock(linux_abi->host->context, mutex);
-    if (result.status != HL_STATUS_OK && close_status == HL_STATUS_OK) close_status = (hl_status)result.status;
+    if (result.status == HL_STATUS_OK) {
+        result = sync->mutex_unlock(linux_abi->host->context, mutex);
+        if (result.status != HL_STATUS_OK && close_status == HL_STATUS_OK) close_status = (hl_status)result.status;
+    }
     result = sync->mutex_close(linux_abi->host->context, mutex);
     if (result.status != HL_STATUS_OK && close_status == HL_STATUS_OK) close_status = (hl_status)result.status;
     hl_linux_lock(linux_abi);
@@ -786,6 +816,7 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     hl_linux_ofd ofd;
     hl_linux_ofd_entry *ofd_entry;
     int final_reference;
+    int defer_finalization;
     if (last_host_handle != NULL) *last_host_handle = HL_HOST_HANDLE_INVALID;
     if (linux_abi == NULL) return HL_STATUS_NOT_FOUND;
     hl_linux_lock(linux_abi);
@@ -809,8 +840,10 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     ofd_entry->references--;
     final_reference = ofd_entry->references == 0;
     if (final_reference) ofd_entry->closing = 1;
+    defer_finalization = final_reference && ofd_entry->active_operations != 0;
     hl_linux_unlock(linux_abi);
-    return final_reference ? hl_linux_ofd_finalize(linux_abi, ofd_entry, last_host_handle) : HL_STATUS_OK;
+    return final_reference && !defer_finalization ? hl_linux_ofd_finalize(linux_abi, ofd_entry, last_host_handle)
+                                                  : HL_STATUS_OK;
 }
 
 hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *out_closed) {
@@ -831,8 +864,8 @@ hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *ou
     }
     hl_linux_unlock(linux_abi);
     status = hl_linux_fd_close(linux_abi, fd, &handle);
-    if (status != HL_STATUS_OK) return status;
     *out_closed = 1;
+    if (status != HL_STATUS_OK) return status;
     if (handle == HL_HOST_HANDLE_INVALID) return HL_STATUS_OK;
     files = hl_linux_files(linux_abi);
     if (files == NULL || files->close == NULL) return HL_STATUS_NOT_SUPPORTED;
@@ -1360,10 +1393,10 @@ static int64_t hl_linux_fd_replace(hl_linux_abi *linux_abi, hl_linux_fd source, 
     if (displaced != NULL) {
         const hl_host_file_services *files;
         status = hl_linux_ofd_finalize(linux_abi, displaced, &displaced_handle);
-        if (status != HL_STATUS_OK) return hl_linux_error(status);
         files = hl_linux_files(linux_abi);
         /* Linux dup2/dup3 intentionally discard errors from closing target. */
         if (files != NULL && files->close != NULL) (void)files->close(linux_abi->host->context, displaced_handle);
+        (void)status;
     }
     return (int64_t)target;
 }

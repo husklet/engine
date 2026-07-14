@@ -824,6 +824,20 @@ int main(void) {
         HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, typed, &snapshot) == HL_STATUS_OK &&
                  snapshot.descriptor_generation != old_generation);
         HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 3);
+        HL_CHECK(hl_linux_object_install(&linux_abi, &object_ops, &object, 77, HL_LINUX_O_RDWR, 0, &typed) ==
+                 HL_STATUS_OK);
+        HL_CHECK(hl_linux_object_pin_fd(&linux_abi, typed, &pin) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_close(&linux_abi, typed) == 0 && object.closes == 3);
+        hl_linux_object_unpin(&pin);
+        HL_CHECK(object.closes == 4 && hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_object_install(&linux_abi, &object_ops, &object, 77, HL_LINUX_O_RDWR, HL_LINUX_FD_CLOEXEC,
+                                         &typed) == HL_STATUS_OK);
+        object.close_status = HL_STATUS_IO;
+        {
+            uint32_t removed = 0;
+            HL_CHECK(hl_linux_fd_exec(&linux_abi, typed, &removed) == HL_STATUS_IO && removed == 1);
+        }
+        object.close_status = HL_STATUS_OK;
     }
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
     HL_CHECK(file_host.fake.live_mutexes == 0);
