@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../../src/core/options.c"
+#include "../../src/core/options.h"
 
 int main(void) {
     char mutable[] = "original";
@@ -24,7 +24,7 @@ int main(void) {
     HL_CHECK(hl_option_set("HL_NOT_REGISTERED", "value", 1) == -1);
     HL_CHECK(hl_option_unset("HL_NOT_REGISTERED") == -1);
     hl_option_reset();
-    HL_CHECK(hl_option_get("HL_CWD") == NULL && hl_option_store_size == 0);
+    HL_CHECK(hl_option_get("HL_CWD") == NULL);
     unsetenv("HL_CWD");
     return EXIT_SUCCESS;
 }

@@ -10,54 +10,19 @@
 // Keep this parser guest-OS-neutral even though Linux is now the only supported guest ABI.
 #ifndef HL_LINUX_PARSE_H
 #define HL_LINUX_PARSE_H
-#include <errno.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stddef.h>
 
 // Parse a base-10 unsigned integer in [lo, hi]. Rejects empty / non-numeric / trailing garbage /
 // negative / overflow. On ANY violation: print "hl: invalid <name>..." to stderr and exit nonzero.
-static unsigned long long hl_parse_u64(const char *name, const char *s, unsigned long long lo, unsigned long long hi) {
-    if (!s || !*s || *s == '-') {
-        fprintf(stderr, "hl: invalid %s=%s: not a number\n", name, s ? s : "");
-        exit(2);
-    }
-    errno = 0;
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0') {
-        fprintf(stderr, "hl: invalid %s=%s: not a number\n", name, s);
-        exit(2);
-    }
-    if (v < lo || v > hi) {
-        fprintf(stderr, "hl: invalid %s=%s: out of range %llu..%llu\n", name, s, lo, hi);
-        exit(2);
-    }
-    return v;
-}
+unsigned long long hl_parse_u64(const char *name, const char *value, unsigned long long low, unsigned long long high);
 
 // Container uid/gid: a valid id (0..INT_MAX). Garbage MUST error -- never fall back to 0 (= root).
-static int hl_parse_id(const char *name, const char *s) {
-    return (int)hl_parse_u64(name, s, 0, INT_MAX);
-}
+int hl_parse_id(const char *name, const char *value);
 
 // A TCP/UDP port: 1..65535. Rejects 0 and >65535 (which atoi would wrap into a wrong u16).
-static unsigned hl_parse_port(const char *name, const char *s) {
-    return (unsigned)hl_parse_u64(name, s, 1, 65535);
-}
+unsigned hl_parse_port(const char *name, const char *value);
 
 // Parse a port from the field s[0..end) -- 'end' points just past the last char (e.g. at ':'/','),
 // or NULL for "to end of string". Used by the HOST:CONTAINER publish parsers (delimited tokens).
-static unsigned hl_parse_port_field(const char *name, const char *s, const char *end) {
-    char buf[16];
-    size_t n = end ? (size_t)(end - s) : strlen(s);
-    if (n == 0 || n >= sizeof buf) {
-        fprintf(stderr, "hl: invalid %s: bad port field\n", name);
-        exit(2);
-    }
-    memcpy(buf, s, n);
-    buf[n] = '\0';
-    return hl_parse_port(name, buf);
-}
+unsigned hl_parse_port_field(const char *name, const char *value, const char *end);
 #endif

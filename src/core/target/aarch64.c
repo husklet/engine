@@ -35,9 +35,9 @@
 #include <stdatomic.h>
 
 #include "hl/engine.h"
+#include "../options.h"
 
 #include "../../translator/guest/aarch64/cpu.h"
-#include "../options.c"
 #include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
 #include "../../translator/guest/aarch64/stat.c" // the per-arch struct-stat layout os/linux/ fills
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/

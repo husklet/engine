@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../../include/hl/config.h"
+#include "options.h"
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
 int hl_run_linux_guest(const char *rootfs, int argc, char *const argv[]);

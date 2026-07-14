@@ -1,5 +1,11 @@
 // Authoritative engine option registry.
 //
+#include "options.h"
+
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
 typedef struct hl_option_definition {
     const char *name;
     const char *purpose;
@@ -59,7 +65,7 @@ static hl_option_definition *hl_option_find(const char *name) {
     return NULL;
 }
 
-static const char *hl_option_get(const char *name) {
+const char *hl_option_get(const char *name) {
     hl_option_definition *definition = hl_option_find(name);
     if (definition == NULL) return NULL;
     return definition->value;
@@ -72,7 +78,7 @@ static size_t hl_option_value_size(const char *value) {
     return 0;
 }
 
-static int hl_option_set(const char *name, const char *value, int overwrite) {
+int hl_option_set(const char *name, const char *value, int overwrite) {
     hl_option_definition *definition = hl_option_find(name);
     size_t value_size;
     char *copy;
@@ -91,7 +97,7 @@ static int hl_option_set(const char *name, const char *value, int overwrite) {
     return 0;
 }
 
-static int hl_option_unset(const char *name) {
+int hl_option_unset(const char *name) {
     hl_option_definition *definition = hl_option_find(name);
     if (definition == NULL) return -1;
     free(definition->value);
@@ -101,7 +107,7 @@ static int hl_option_unset(const char *name) {
     return 0;
 }
 
-static void hl_option_reset(void) {
+void hl_option_reset(void) {
     size_t index;
     for (index = 0; index < sizeof hl_option_definitions / sizeof hl_option_definitions[0]; index++) {
         free(hl_option_definitions[index].value);

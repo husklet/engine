@@ -26,11 +26,11 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
 	$(call rwildcard,include/hl/,*.h))
 
-CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c
+CORE_SOURCES := src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c src/core/options.c
 IR_SOURCES := src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/reloc.c \
 	src/translator/window.c src/translator/host/aarch64/codegen.c src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c src/linux_abi/stat.c
+LINUX_ABI_SOURCES := src/linux_abi/linux_abi.c src/linux_abi/parse.c src/linux_abi/stat.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/host.c
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES)
@@ -46,7 +46,7 @@ LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-host_linux
 endif
 
-UNIT_NAMES := affinity clock codegen config device digest file host_services identity ir linux_abi stat engine errno limits log number options readonly reloc window xattr_cache
+UNIT_NAMES := affinity clock codegen config device digest file host_services identity ir linux_abi stat engine errno limits log number options parse readonly reloc window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -144,6 +144,10 @@ $(BUILD)/tests/test_number: tests/unit/test_number.c src/linux_abi/number.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
+$(BUILD)/tests/test_parse: tests/unit/test_parse.c src/linux_abi/parse.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
 $(BUILD)/tests/test_clock: tests/unit/test_clock.c src/host/clock.c src/host/fake/host.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
@@ -181,10 +185,10 @@ $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
+	src/core/config.c src/core/host_services.c src/core/log.c src/core/options.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c src/core/options.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \
@@ -192,6 +196,7 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCT
 		src/linux_abi/device.c \
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
+		src/linux_abi/parse.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
@@ -202,10 +207,10 @@ $(BUILD)/production/hl-engine-linux-aarch64: src/core/target/aarch64.c $(PRODUCT
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS) \
-	src/core/config.c src/core/host_services.c src/core/log.c src/host/macos/host.c \
+	src/core/config.c src/core/host_services.c src/core/log.c src/core/options.c src/host/macos/host.c \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
-	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c \
+	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -O2 -framework IOSurface -framework CoreFoundation -o $@ $< src/core/config.c src/core/options.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \
@@ -213,6 +218,7 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTIO
 		src/linux_abi/device.c \
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
+		src/linux_abi/parse.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
@@ -225,12 +231,12 @@ $(BUILD)/production/hl-engine-linux-x86_64: src/core/target/x86_64.c $(PRODUCTIO
 compat-engines: $(BUILD)/production/hl-engine-linux-aarch64 $(BUILD)/production/hl-engine-linux-x86_64
 
 $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/aarch64.c \
-	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
+	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c src/core/options.c \
 	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/core/target/aarch64.c src/core/config.c \
+		-o $@ tools/lifecycle_e2e_runner.c src/core/target/aarch64.c src/core/config.c src/core/options.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \
@@ -238,6 +244,7 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/a
 		src/linux_abi/device.c \
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
+		src/linux_abi/parse.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \
@@ -249,12 +256,12 @@ $(BUILD)/tools/lifecycle-aarch64: tools/lifecycle_e2e_runner.c src/core/target/a
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/core/target/x86_64.c \
-	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c \
+	$(PRODUCTION_UNITY_DEPS) src/core/config.c src/core/engine.c src/core/host_services.c src/core/log.c src/core/options.c \
 	src/host/macos/host.c packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG) -DHL_ENGINE_NO_MAIN=1 \
 		-DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 -framework IOSurface -framework CoreFoundation \
-		-o $@ tools/lifecycle_e2e_runner.c src/core/target/x86_64.c src/core/config.c \
+		-o $@ tools/lifecycle_e2e_runner.c src/core/target/x86_64.c src/core/config.c src/core/options.c \
 		src/linux_abi/xattr.c \
 		src/linux_abi/readonly.c \
 		src/linux_abi/limits.c \
@@ -262,6 +269,7 @@ $(BUILD)/tools/lifecycle-x86_64: tools/lifecycle_e2e_runner.c src/core/target/x8
 		src/linux_abi/device.c \
 		src/linux_abi/errno.c \
 		src/linux_abi/number.c \
+		src/linux_abi/parse.c \
 		src/host/clock.c \
 		src/host/file.c \
 		src/translator/reloc.c \

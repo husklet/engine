@@ -57,9 +57,9 @@
 #include <libkern/OSCacheControl.h>
 
 #include "hl/engine.h"
+#include "../options.h"
 
 #include "../../translator/guest/x86_64/cpu.h"
-#include "../options.c"
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
 #include "../../translator/guest/x86_64/stat.c"     // per-arch struct-stat layout os/linux fills
