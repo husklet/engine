@@ -23,6 +23,8 @@
 #include <arpa/inet.h>
 #include <sys/un.h>
 #include <poll.h>
+#include "../../host/native_compat.h"
+#include "../../host/native_context.h"
 #include <signal.h>
 #include <dirent.h>
 #include <mach/mach.h>
