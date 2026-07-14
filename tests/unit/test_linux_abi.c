@@ -68,6 +68,11 @@ static hl_host_result test_close(void *context, hl_host_handle file) {
         return file_result(HL_STATUS_PLATFORM_FAILURE, 0);
     }
     host->closes++;
+    if (host->next_status != HL_STATUS_OK) {
+        hl_status status = host->next_status;
+        host->next_status = HL_STATUS_OK;
+        return file_result(status, 0);
+    }
     return file_result(HL_STATUS_OK, 0);
 }
 
@@ -267,6 +272,38 @@ int main(void) {
     }
     HL_CHECK(hl_linux_fcntl(&linux_abi, original, 999, 0) == -HL_LINUX_EINVAL);
     HL_CHECK(hl_linux_fcntl(&linux_abi, original, HL_LINUX_F_DUPFD, HL_ARRAY_COUNT(fds)) == -HL_LINUX_EINVAL);
+
+    /* dup2/dup3 replace target atomically and discard a displaced close error. */
+    {
+        hl_linux_fd target;
+        uint32_t closes_before = file_host.closes;
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_LINUX_O_RDONLY, HL_LINUX_FD_CLOEXEC, &target) == HL_STATUS_OK);
+        HL_CHECK(target == 2);
+        file_host.next_status = HL_STATUS_IO;
+        HL_CHECK(hl_linux_dup3(&linux_abi, original, target, HL_LINUX_O_CLOEXEC) == target);
+        HL_CHECK(file_host.closes == closes_before + 1);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, target, &snapshot) == HL_STATUS_OK);
+        HL_CHECK(snapshot.host_handle == 55 && snapshot.ofd == fds[original].ofd);
+        HL_CHECK(snapshot.descriptor_flags == HL_LINUX_FD_CLOEXEC);
+        HL_CHECK(hl_linux_dup2(&linux_abi, original, original) == original);
+        HL_CHECK(hl_linux_dup3(&linux_abi, original, original, 0) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_dup3(&linux_abi, original, target, HL_LINUX_O_APPEND) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_dup2(&linux_abi, original, HL_ARRAY_COUNT(fds)) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_close(&linux_abi, target) == 0);
+
+        /* Replacing another descriptor for the same OFD has a net-zero reference change. */
+        closes_before = file_host.closes;
+        HL_CHECK(hl_linux_dup2(&linux_abi, original, duplicate) == duplicate);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_OK);
+        HL_CHECK(snapshot.descriptor_references == 2 && snapshot.descriptor_flags == 0);
+        HL_CHECK(file_host.closes == closes_before);
+
+        /* Source validation precedes target replacement, so errors leave target untouched. */
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_LINUX_O_RDONLY, 0, &target) == HL_STATUS_OK);
+        HL_CHECK(hl_linux_dup2(&linux_abi, 7, target) == -HL_LINUX_EBADF);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, target, &snapshot) == HL_STATUS_OK && snapshot.host_handle == 56);
+        HL_CHECK(hl_linux_close(&linux_abi, target) == 0);
+    }
     {
         hl_linux_file_status file_status;
         HL_CHECK(hl_linux_fstat(&linux_abi, original, &file_status) == 0);

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <sys/un.h>
 #include <time.h>
@@ -28,7 +30,8 @@ typedef enum hl_linux_handle_kind {
     HL_LINUX_HANDLE_FILE = 2,
     HL_LINUX_HANDLE_SOCKET = 3,
     HL_LINUX_HANDLE_POLLSET = 4,
-    HL_LINUX_HANDLE_SHARED_MEMORY = 5
+    HL_LINUX_HANDLE_SHARED_MEMORY = 5,
+    HL_LINUX_HANDLE_PROCESS = 6
 } hl_linux_handle_kind;
 
 typedef struct hl_linux_handle_entry {
@@ -40,6 +43,7 @@ typedef struct hl_linux_handle_entry {
     void *executable_address;
     uint64_t size;
     int wake_descriptor;
+    uint32_t process_reaped;
 } hl_linux_handle_entry;
 
 struct hl_host_linux {
@@ -749,6 +753,88 @@ static hl_host_result hl_linux_shared_resize(void *context, hl_host_handle objec
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_process_spawn(void *context, hl_host_process_entry entry, void *entry_context) {
+    hl_host_linux *host = context;
+    hl_host_result result;
+    pid_t pid;
+    if (entry == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pid = fork();
+    if (pid < 0) return hl_linux_errno_result();
+    if (pid == 0) _exit(entry(entry_context) & 255);
+    result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_PROCESS, pid, NULL, NULL, 0, -1);
+    if (result.status != HL_STATUS_OK) {
+        int status;
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
+    return result;
+}
+
+static hl_host_result hl_linux_process_wait(void *context, hl_host_handle handle, uint64_t deadline_ns) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    pid_t pid;
+    pid_t waited;
+    int status;
+    int options;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
+    pid = entry != NULL && !entry->process_reaped ? entry->descriptor : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (deadline_ns != 0 && deadline_ns != HL_HOST_DEADLINE_INFINITE)
+        return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    options = deadline_ns == 0 ? WNOHANG : 0;
+    do {
+        waited = waitpid(pid, &status, options);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == 0) return hl_linux_result(HL_STATUS_WOULD_BLOCK, 0, 0);
+    if (waited < 0) return hl_linux_errno_result();
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
+    if (entry != NULL) entry->process_reaped = 1;
+    pthread_mutex_unlock(&host->lock);
+    if (WIFEXITED(status))
+        return hl_linux_result(HL_STATUS_OK, (uint64_t)WEXITSTATUS(status), HL_HOST_PROCESS_EXIT_CODE);
+    if (WIFSIGNALED(status))
+        return hl_linux_result(HL_STATUS_OK, (uint64_t)WTERMSIG(status), HL_HOST_PROCESS_EXIT_SIGNAL);
+    return hl_linux_result(HL_STATUS_CORRUPT, 0, (uint64_t)(uint32_t)status);
+}
+
+static hl_host_result hl_linux_process_terminate(void *context, hl_host_handle handle, uint32_t reason) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    pid_t pid;
+    if (reason != HL_HOST_PROCESS_TERMINATE_FORCE) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
+    pid = entry != NULL && !entry->process_reaped ? entry->descriptor : -1;
+    pthread_mutex_unlock(&host->lock);
+    if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (kill(pid, SIGKILL) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_process_close(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_PROCESS);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if (!entry->process_reaped) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_BUSY, 0, 0);
+    }
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    entry->descriptor = -1;
+    entry->process_reaped = 0;
+    pthread_mutex_unlock(&host->lock);
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,      sizeof(memory),          hl_linux_memory_reserve,      hl_linux_memory_protect,
@@ -768,6 +854,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_linux_shared_create,    hl_linux_shared_open,
                                                                  hl_linux_shared_resize,    hl_linux_close_descriptor};
+    static const hl_host_process_services process = {HL_HOST_PROCESS_ABI,        sizeof(process),
+                                                     hl_linux_process_spawn,     hl_linux_process_wait,
+                                                     hl_linux_process_terminate, hl_linux_process_close};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
@@ -787,7 +876,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_FILE |
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_NETWORK | HL_HOST_CAP_SHARED_MEMORY |
-                                 HL_HOST_CAP_CODE_MAPPING;
+                                 HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -796,6 +885,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->event = &event;
     out_services->network = &network;
     out_services->shared_memory = &shared_memory;
+    out_services->process = &process;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -810,6 +900,11 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             if (entry->executable_address != NULL && entry->executable_address != entry->address)
                 munmap(entry->executable_address, (size_t)entry->size);
             if (entry->descriptor >= 0) close(entry->descriptor);
+        } else if (entry->kind == HL_LINUX_HANDLE_PROCESS) {
+            int status;
+            if (entry->process_reaped) continue;
+            kill(entry->descriptor, SIGKILL);
+            while (waitpid(entry->descriptor, &status, 0) < 0 && errno == EINTR) {}
         } else if (entry->kind != HL_LINUX_HANDLE_NONE) {
             if (entry->descriptor >= 0) close(entry->descriptor);
             if (entry->wake_descriptor >= 0) close(entry->wake_descriptor);

@@ -2,9 +2,48 @@
 
 #include "hl/host_linux.h"
 
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+static int32_t process_exit(void *context) {
+    return (int32_t)(intptr_t)context;
+}
+
+static int32_t process_signal(void *context) {
+    (void)context;
+    raise(SIGTERM);
+    return 99;
+}
+
+static int32_t process_sleep(void *context) {
+    struct timespec duration = {0, (long)(intptr_t)context};
+    while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
+    return 9;
+}
+
+static int32_t process_pause(void *context) {
+    (void)context;
+    for (;;)
+        pause();
+    return 0;
+}
+
+typedef struct cleanup_probe {
+    int descriptor;
+} cleanup_probe;
+
+static int32_t process_cleanup_probe(void *opaque) {
+    cleanup_probe *probe = opaque;
+    pid_t pid = getpid();
+    if (write(probe->descriptor, &pid, sizeof(pid)) != (ssize_t)sizeof(pid)) return 98;
+    for (;;)
+        pause();
+}
 
 int main(void) {
     hl_host_linux *linux_host;
@@ -16,6 +55,8 @@ int main(void) {
     hl_host_code_mapping code;
     hl_host_event_record event;
     hl_host_file_metadata metadata;
+    hl_host_result process;
+    hl_host_result process_result;
     const char contents[] = "portable-host";
     const char suffix[] = "append";
     char readback[sizeof(contents) + sizeof(suffix)] = {0};
@@ -24,8 +65,8 @@ int main(void) {
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_FILE |
                                                       HL_HOST_CAP_EVENT | HL_HOST_CAP_NETWORK |
-                                                      HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_CODE_MAPPING) ==
-             HL_STATUS_OK);
+                                                      HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS |
+                                                      HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
     HL_CHECK(services.clock->monotonic_ns(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.clock->realtime_ns(services.context).status == HL_STATUS_OK);
 
@@ -79,6 +120,59 @@ int main(void) {
     HL_CHECK(services.shared_memory->resize(services.context, shared.value, 8192).status == HL_STATUS_OK);
     HL_CHECK(services.shared_memory->close(services.context, shared.value).status == HL_STATUS_OK);
 
-    hl_host_linux_destroy(linux_host);
+    process = services.process->spawn_cloned(services.context, process_exit, (void *)(intptr_t)37);
+    HL_CHECK(process.status == HL_STATUS_OK);
+    process_result = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_result.status == HL_STATUS_OK && process_result.detail == HL_HOST_PROCESS_EXIT_CODE &&
+             process_result.value == 37);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.process->wait(services.context, process.value, 0).status == HL_STATUS_INVALID_ARGUMENT);
+
+    process = services.process->spawn_cloned(services.context, process_signal, NULL);
+    HL_CHECK(process.status == HL_STATUS_OK);
+    process_result = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_result.status == HL_STATUS_OK && process_result.detail == HL_HOST_PROCESS_EXIT_SIGNAL &&
+             process_result.value == SIGTERM);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+
+    process = services.process->spawn_cloned(services.context, process_sleep, (void *)(intptr_t)200000000);
+    HL_CHECK(process.status == HL_STATUS_OK);
+    HL_CHECK(services.process->wait(services.context, process.value, 0).status == HL_STATUS_WOULD_BLOCK);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_BUSY);
+    process_result = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_result.status == HL_STATUS_OK && process_result.detail == HL_HOST_PROCESS_EXIT_CODE &&
+             process_result.value == 9);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+
+    process = services.process->spawn_cloned(services.context, process_pause, NULL);
+    HL_CHECK(process.status == HL_STATUS_OK);
+    HL_CHECK(services.process->terminate(services.context, process.value, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.process->terminate(services.context, process.value, HL_HOST_PROCESS_TERMINATE_FORCE).status ==
+             HL_STATUS_OK);
+    process_result = services.process->wait(services.context, process.value, HL_HOST_DEADLINE_INFINITE);
+    HL_CHECK(process_result.status == HL_STATUS_OK && process_result.detail == HL_HOST_PROCESS_EXIT_SIGNAL &&
+             process_result.value == SIGKILL);
+    HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_OK);
+    HL_CHECK(services.process->terminate(services.context, process.value, HL_HOST_PROCESS_TERMINATE_FORCE).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+
+    {
+        int descriptors[2];
+        cleanup_probe probe;
+        pid_t child;
+        int status;
+        HL_CHECK(pipe(descriptors) == 0);
+        probe.descriptor = descriptors[1];
+        process = services.process->spawn_cloned(services.context, process_cleanup_probe, &probe);
+        HL_CHECK(process.status == HL_STATUS_OK);
+        close(descriptors[1]);
+        HL_CHECK(read(descriptors[0], &child, sizeof(child)) == (ssize_t)sizeof(child));
+        close(descriptors[0]);
+        hl_host_linux_destroy(linux_host);
+        errno = 0;
+        HL_CHECK(waitpid(child, &status, WNOHANG) == -1 && errno == ECHILD);
+    }
+
     return EXIT_SUCCESS;
 }

@@ -228,6 +228,29 @@ static int64_t hl_linux_fd_dup_at_least(hl_linux_abi *linux_abi, hl_linux_fd sou
     return status == HL_STATUS_OK ? (int64_t)fd : -HL_LINUX_EMFILE;
 }
 
+/* Complete a final reference removal which already marked the OFD closing. */
+static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd_entry,
+                                       hl_host_handle *last_host_handle) {
+    /* Wait only for this OFD. Operations drop their pin before releasing io_lock. */
+    hl_linux_ofd_lock(ofd_entry);
+    hl_linux_lock(linux_abi);
+    if (ofd_entry->references != 0 || ofd_entry->active_operations != 0 || ofd_entry->closing == 0) {
+        hl_linux_unlock(linux_abi);
+        hl_linux_ofd_unlock(ofd_entry);
+        return HL_STATUS_CORRUPT;
+    }
+    if (last_host_handle != NULL) *last_host_handle = ofd_entry->host_handle;
+    ofd_entry->host_handle = HL_HOST_HANDLE_INVALID;
+    ofd_entry->offset = 0;
+    ofd_entry->status_flags = 0;
+    ofd_entry->closing = 0;
+    ofd_entry->generation++;
+    ofd_entry->kind = 0;
+    hl_linux_unlock(linux_abi);
+    hl_linux_ofd_unlock(ofd_entry);
+    return HL_STATUS_OK;
+}
+
 hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_handle *last_host_handle) {
     hl_linux_ofd ofd;
     hl_linux_ofd_entry *ofd_entry;
@@ -254,26 +277,7 @@ hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_host_han
     final_reference = ofd_entry->references == 0;
     if (final_reference) ofd_entry->closing = 1;
     hl_linux_unlock(linux_abi);
-    if (!final_reference) return HL_STATUS_OK;
-
-    /* Wait only for this OFD. Operations drop their pin before releasing io_lock. */
-    hl_linux_ofd_lock(ofd_entry);
-    hl_linux_lock(linux_abi);
-    if (ofd_entry->references != 0 || ofd_entry->active_operations != 0 || ofd_entry->closing == 0) {
-        hl_linux_unlock(linux_abi);
-        hl_linux_ofd_unlock(ofd_entry);
-        return HL_STATUS_CORRUPT;
-    }
-    if (last_host_handle != NULL) *last_host_handle = ofd_entry->host_handle;
-    ofd_entry->host_handle = HL_HOST_HANDLE_INVALID;
-    ofd_entry->offset = 0;
-    ofd_entry->status_flags = 0;
-    ofd_entry->closing = 0;
-    ofd_entry->generation++;
-    ofd_entry->kind = 0;
-    hl_linux_unlock(linux_abi);
-    hl_linux_ofd_unlock(ofd_entry);
-    return HL_STATUS_OK;
+    return final_reference ? hl_linux_ofd_finalize(linux_abi, ofd_entry, last_host_handle) : HL_STATUS_OK;
 }
 
 static int64_t hl_linux_pread64_owned(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd, void *buffer, size_t size,
@@ -526,6 +530,69 @@ int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd) {
 
 int64_t hl_linux_dup(hl_linux_abi *linux_abi, hl_linux_fd fd) {
     return hl_linux_fd_dup_at_least(linux_abi, fd, 0, 0);
+}
+
+/*
+ * Publish target's new OFD while holding table ownership. If target displaced
+ * the final reference to another OFD, drain that OFD only after publication.
+ */
+static int64_t hl_linux_fd_replace(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd target,
+                                   uint32_t descriptor_flags, int reject_same) {
+    const hl_linux_fd_entry *source_entry;
+    hl_linux_ofd_entry *displaced = NULL;
+    hl_linux_ofd source_ofd;
+    hl_linux_ofd target_ofd;
+    hl_host_handle displaced_handle = HL_HOST_HANDLE_INVALID;
+    hl_status status;
+    if (linux_abi == NULL) return -HL_LINUX_EBADF;
+    if (source == target && reject_same) return -HL_LINUX_EINVAL;
+    hl_linux_lock(linux_abi);
+    status = hl_linux_fd_get_unlocked(linux_abi, source, &source_entry, NULL);
+    if (status != HL_STATUS_OK || target >= linux_abi->fd_capacity) {
+        hl_linux_unlock(linux_abi);
+        return -HL_LINUX_EBADF;
+    }
+    if (source == target) {
+        hl_linux_unlock(linux_abi);
+        return (int64_t)target;
+    }
+    source_ofd = source_entry->ofd;
+    target_ofd = linux_abi->fds[target].ofd;
+    if (target_ofd != 0) {
+        if (target_ofd >= linux_abi->ofd_capacity || linux_abi->ofds[target_ofd].references == 0) {
+            hl_linux_unlock(linux_abi);
+            return -HL_LINUX_EIO;
+        }
+        displaced = &linux_abi->ofds[target_ofd];
+        displaced->references--;
+        if (displaced->references == 0) displaced->closing = 1;
+    }
+    linux_abi->fds[target].ofd = source_ofd;
+    linux_abi->fds[target].descriptor_flags = descriptor_flags;
+    linux_abi->fds[target].generation++;
+    linux_abi->ofds[source_ofd].references++;
+    if (displaced != NULL && displaced->references != 0) displaced = NULL;
+    hl_linux_unlock(linux_abi);
+
+    if (displaced != NULL) {
+        const hl_host_file_services *files;
+        status = hl_linux_ofd_finalize(linux_abi, displaced, &displaced_handle);
+        if (status != HL_STATUS_OK) return hl_linux_error(status);
+        files = hl_linux_files(linux_abi);
+        /* Linux dup2/dup3 intentionally discard errors from closing target. */
+        if (files != NULL && files->close != NULL) (void)files->close(linux_abi->host->context, displaced_handle);
+    }
+    return (int64_t)target;
+}
+
+int64_t hl_linux_dup2(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd target) {
+    return hl_linux_fd_replace(linux_abi, source, target, 0, 0);
+}
+
+int64_t hl_linux_dup3(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd target, uint32_t flags) {
+    if ((flags & ~(uint32_t)HL_LINUX_O_CLOEXEC) != 0) return -HL_LINUX_EINVAL;
+    return hl_linux_fd_replace(linux_abi, source, target, (flags & HL_LINUX_O_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0,
+                               1);
 }
 
 int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command, uint64_t argument) {

@@ -82,6 +82,53 @@ static int check_native_exit(uint16_t opcode, uint32_t expected_kind) {
     return EXIT_SUCCESS;
 }
 
+static int check_register_spills(void) {
+    hl_ir_instruction instructions[24];
+    hl_ir_instruction current;
+    hl_ir_block block;
+    hl_ir_value values[20];
+    hl_ir_value sum;
+    uint8_t storage[1024];
+    hl_code_buffer code;
+    hl_ir_exit native_exit;
+    uint32_t index;
+    uint32_t host_isa;
+
+    HL_CHECK(hl_ir_block_init(&block, UINT64_C(0x600000), instructions, HL_ARRAY_COUNT(instructions)) == HL_STATUS_OK);
+    for (index = 0; index < HL_ARRAY_COUNT(values); ++index) {
+        current = instruction(HL_IR_OP_CONSTANT, HL_IR_TYPE_I64);
+        current.immediate = UINT64_C(1000) + index;
+        HL_CHECK(hl_ir_append(&block, &current, &values[index]) == HL_STATUS_OK);
+    }
+    current = instruction(HL_IR_OP_ADD, HL_IR_TYPE_I64);
+    current.operand_count = 2;
+    current.operands[0] = values[18];
+    current.operands[1] = values[19];
+    HL_CHECK(hl_ir_append(&block, &current, &sum) == HL_STATUS_OK);
+    current = instruction(HL_IR_OP_GUEST_RETURN, HL_IR_TYPE_NONE);
+    current.operand_count = 1;
+    current.operands[0] = sum;
+    HL_CHECK(hl_ir_append(&block, &current, NULL) == HL_STATUS_OK);
+
+    for (host_isa = HL_HOST_ISA_AARCH64; host_isa <= HL_HOST_ISA_X86_64; ++host_isa) {
+        HL_CHECK(hl_code_buffer_init(&code, storage, sizeof(storage)) == HL_STATUS_OK);
+        HL_CHECK(hl_codegen_block(host_isa, &block, &code) == HL_STATUS_OK);
+#if defined(__aarch64__)
+        if (host_isa == HL_HOST_ISA_AARCH64) {
+#elif defined(__x86_64__)
+        if (host_isa == HL_HOST_ISA_X86_64) {
+#else
+        if (0) {
+#endif
+            memset(&native_exit, 0xa5, sizeof(native_exit));
+            HL_CHECK(execute_native(storage, code.code_size, &native_exit) == HL_STATUS_OK);
+            HL_CHECK(native_exit.kind == HL_IR_EXIT_RETURN && native_exit.reserved == 0 && native_exit.value == 2037 &&
+                     native_exit.detail == 0);
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
 int main(void) {
     hl_ir_instruction instructions[8];
     hl_ir_block block;
@@ -135,5 +182,6 @@ int main(void) {
 #endif
     HL_CHECK(check_native_exit(HL_IR_OP_SYSCALL_EXIT, HL_IR_EXIT_SYSCALL) == EXIT_SUCCESS);
     HL_CHECK(check_native_exit(HL_IR_OP_FAULT_EXIT, HL_IR_EXIT_FAULT) == EXIT_SUCCESS);
+    HL_CHECK(check_register_spills() == EXIT_SUCCESS);
     return EXIT_SUCCESS;
 }

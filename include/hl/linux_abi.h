@@ -180,6 +180,9 @@ HL_API int64_t hl_linux_openat(hl_linux_abi *linux_abi, int32_t directory_fd, co
 HL_API int64_t hl_linux_close(hl_linux_abi *linux_abi, hl_linux_fd fd);
 /* dup and supported fcntl commands operate only on the guest fd/OFD tables. */
 HL_API int64_t hl_linux_dup(hl_linux_abi *linux_abi, hl_linux_fd fd);
+HL_API int64_t hl_linux_dup2(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd target);
+/* flags accepts only Linux O_CLOEXEC; source == target is EINVAL as on Linux. */
+HL_API int64_t hl_linux_dup3(hl_linux_abi *linux_abi, hl_linux_fd source, hl_linux_fd target, uint32_t flags);
 HL_API int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command, uint64_t argument);
 /* lseek changes the shared OFD offset. SEEK_END and fstat use normalized host metadata. */
 HL_API int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, int32_t whence);
