@@ -277,14 +277,14 @@ static int smc_on_write(uint64_t a) {
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
         if (d == 0) {                                                                                                  \
-            if (raise_guest_de(c)) continue; /* #DE -> guest SIGFPE handler (queued; delivered at loop top) */         \
+            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
             fprintf(stderr, "[dd] #DE divide-by-zero\n");                                                              \
             (c)->exited = 1;                                                                                           \
             (c)->exit_code = 136;                                                                                      \
             break;                                                                                                     \
         }                                                                                                              \
         if ((c)->r[RDX] >= d) { /* quotient overflow (high half >= divisor): x86 #DE, same as /0 */                    \
-            if (raise_guest_de(c)) continue;                                                                           \
+            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
             fprintf(stderr, "[dd] #DE divide overflow\n");                                                             \
             (c)->exited = 1;                                                                                           \
             (c)->exit_code = 136;                                                                                      \
@@ -298,7 +298,7 @@ static int smc_on_write(uint64_t a) {
     if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                              \
         int64_t d = (int64_t)(c)->divop;                                                                               \
         if (d == 0) {                                                                                                  \
-            if (raise_guest_de(c)) continue; /* #DE -> guest SIGFPE handler (queued; delivered at loop top) */         \
+            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
             fprintf(stderr, "[dd] #DE divide-by-zero\n");                                                              \
             (c)->exited = 1;                                                                                           \
             (c)->exit_code = 136;                                                                                      \
@@ -307,7 +307,7 @@ static int smc_on_write(uint64_t a) {
         __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
         __int128 q = num / d;                                                                                          \
         if ((__int128)(int64_t)q != q) { /* quotient doesn't fit int64 (incl. INT_MIN/-1): x86 #DE */                  \
-            if (raise_guest_de(c)) continue;                                                                           \
+            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
             fprintf(stderr, "[dd] #DE divide overflow\n");                                                             \
             (c)->exited = 1;                                                                                           \
             (c)->exit_code = 136;                                                                                      \
@@ -318,7 +318,7 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_TRAP) { /* int3 -> SIGTRAP, UD2 -> SIGILL: deliver from C (cpu->divop = signo|code<<8) */    \
-        if (raise_guest_trap(c)) continue; /* queued -> maybe_deliver_signal runs the guest handler at loop top */    \
+        if (raise_guest_trap(c)) { maybe_deliver_signal(c); continue; }                                                \
         (c)->exited = 1;                   /* no guest handler: default action terminates with the signal */          \
         (c)->exit_code = 128 + ((int)((c)->divop & 0xff));                                                             \
         break;                                                                                                         \
