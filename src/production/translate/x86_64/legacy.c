@@ -8,7 +8,7 @@
 // place and return 0 to fall through to the shared service.
 //
 // x86-64 ABI reg map: rax=r[0], rdi=r[7], rsi=r[6], rdx=r[2], r10=r[10], r8=r[8], r9=r[9].
-#define ATFD ((uint64_t)-100) // AT_FDCWD
+static const uint64_t ATFD = (uint64_t)-100; // Linux AT_FDCWD
 
 // A legacy TIME syscall (utime/utimes/futimesat) hands us a `struct utimbuf` / `struct timeval[2]` POINTER
 // that we must dereference HERE to convert it to a `struct timespec[2]` for utimensat -- and we run BEFORE

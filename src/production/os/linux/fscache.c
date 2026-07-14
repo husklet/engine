@@ -4,7 +4,7 @@ static void load_elf(const char *path, struct loaded *out);
 static int elf_interp(const char *path, char *out, size_t n);
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
 
-// Linux AT_FDCWD(-100) -> macOS AT_FDCWD; real dir-fds pass through unchanged.
+// Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
 #define ATFD(a) (((int)(a) == -100) ? AT_FDCWD : (int)(a))
 // ---- S2 path-resolution cache (forward decls; impl after mc_hash, which it reuses) ----
 // Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
