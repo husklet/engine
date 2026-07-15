@@ -2023,7 +2023,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
-        int chown_result = fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
+        /* atpath() resolves a confined relative guest path to an absolute host path.  Linux ignores
+           dirfd for an absolute pathname; Darwin's fchownat validates it first, so use AT_FDCWD once
+           resolution is absolute to preserve the Linux contract on every host. */
+        int host_dirfd = p != NULL && p[0] == '/' ? AT_FDCWD : ATFD(a0);
+        int chown_result = fchownat(host_dirfd, p, (uid_t)a2, (gid_t)a3, 0);
         if (chown_result < 0 && errno != EPERM && errno != EACCES) {
             G_RET(c) = (uint64_t)(int64_t)(-errno);
             break;

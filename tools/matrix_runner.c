@@ -353,6 +353,11 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     wire.config.abi = HL_CONFIG_ABI;
     wire.config.uid = -1;
     wire.config.gid = -1;
+    {
+        const char *debug_log = getenv("HL_LOG");
+        if (debug_log != NULL && *debug_log != 0 && pool_string(&wire, debug_log, &wire.config.debug_log_offset) != 0)
+            return 1;
+    }
     if (rootfs != NULL && pool_string(&wire, rootfs, &wire.config.rootfs_offset) != 0) return 1;
     if (*encoded != 0) {
         memcpy(copy, encoded, strlen(encoded) + 1);
@@ -647,7 +652,7 @@ static void diagnostic(const suite_case *item, const char *isa, const char *reas
         if (shown < result->output_size) fputs("...", stderr);
     }
     if (result != NULL && result->error_size != 0) {
-        size_t shown = result->error_size > 240 ? 240 : result->error_size;
+        size_t shown = result->error_size > 4096 ? 4096 : result->error_size;
         fprintf(stderr, " stderr=");
         (void)fwrite(result->error, 1, shown, stderr);
     }

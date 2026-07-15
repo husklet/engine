@@ -28,6 +28,20 @@ static const char *shm_backing_path(const char *guest, char *buf, size_t n) {
     return buf;
 }
 
+static int logical_fd_path(int descriptor, char *path, size_t capacity) {
+    hl_linux_fd_snapshot snapshot;
+    hl_host_result result;
+    if (path == NULL || capacity < 2 || g_linux_box == NULL || g_linux_box->host == NULL ||
+        g_linux_box->host->file == NULL || g_linux_box->host->file->path == NULL || descriptor < 0 ||
+        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)descriptor, &snapshot) != HL_STATUS_OK)
+        return -1;
+    result = g_linux_box->host->file->path(g_linux_box->host->context, snapshot.host_handle,
+                                           (hl_host_bytes){path, capacity - 1});
+    if (result.status != HL_STATUS_OK || result.value >= capacity) return -1;
+    path[result.value] = 0;
+    return 0;
+}
+
 // Rewrite ABSOLUTE guest paths into the rootfs; relative paths pass through (resolved
 // against the dir-fd by the *at syscall, e.g. ls stat-ing entries relative to a dir).
 // nofollow=1 leaves the FINAL component unresolved (lstat/AT_SYMLINK_NOFOLLOW unlink), so a
@@ -65,7 +79,23 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
         }
         return nofollow ? xlate(raw, buf, n) : xresolve_exec(raw, buf, n);
     }
-    if (!g_rootfs) return raw;
+    if (!g_rootfs) {
+        /* Embedded engines keep a logical guest descriptor table; its number need not be the native
+           descriptor number because the host transport owns descriptors too.  Resolve a tracked relative
+           directory path through the recorded backing path so every *at syscall remains independent of
+           transport descriptor allocation.  Untracked descriptors retain the native direct-mode path. */
+        if (dirfd >= 0) {
+            char directory[4200];
+            const char *base = NULL;
+            if (logical_fd_path(dirfd, directory, sizeof directory) == 0)
+                base = directory;
+            else if (dirfd < 1024 && g_fdpath[dirfd][0])
+                base = g_fdpath[dirfd];
+            if (base != NULL && path_join(buf, n, base, raw) != 0) return NULL;
+            if (base != NULL) return buf;
+        }
+        return raw;
+    }
     // relative via a real dir-fd
     if (dirfd >= 0) {
         // untracked dir-fd (dup/inherited/high): FAIL CLOSED
