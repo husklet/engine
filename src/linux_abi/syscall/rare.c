@@ -600,7 +600,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     case 231:
         mlk_unwire_all(); // drop the real host wiring before clearing the tracked state
-        mlk_reset();
+        hl_gmap_lock_reset();
         G_RET(c) = 0;
         break;
     // NUMA memory-policy syscalls (mbind/{set,get}_mempolicy/migrate_pages/move_pages). The host is a

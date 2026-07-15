@@ -257,7 +257,7 @@ static void fork_child_hooks(struct cpu *c) {
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
-    mlk_reset();                 // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
+    hl_gmap_lock_reset();        // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
 }
 
 typedef struct bound_fork_state {
@@ -1769,7 +1769,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         bound_mapping_reset();
         hl_gmap_reset();
         gna_reset();                   // the old image's PROT_NONE ranges are gone with its address space
-        mlk_reset();                   // ... and so are its mlock'd ranges (VmLck resets across execve)
+        hl_gmap_lock_reset();          // ... and so are its mlock'd ranges (VmLck resets across execve)
         g_nonpie_lo = g_nonpie_hi = 0; // reset; load_elf re-sets it iff the new main image is non-PIE
 #ifdef R_REPSTR // g_nonpie_blob_code lives in the x86-only frontend (translate/x86_64/translate.c); guard so this
                 // shared execve path still compiles into the aarch64 unity (R_REPSTR is x86 cpu.h-only)
