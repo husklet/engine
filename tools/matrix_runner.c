@@ -653,8 +653,9 @@ static void diagnostic(const suite_case *item, const char *isa, const char *reas
     }
     if (result != NULL && result->error_size != 0) {
         size_t shown = result->error_size > 4096 ? 4096 : result->error_size;
-        fprintf(stderr, " stderr=");
-        (void)fwrite(result->error, 1, shown, stderr);
+        size_t offset = result->error_size - shown;
+        fprintf(stderr, result->error_size > shown ? " stderr_tail=" : " stderr=");
+        (void)fwrite(result->error + offset, 1, shown, stderr);
     }
     fputc('\n', stderr);
 }
