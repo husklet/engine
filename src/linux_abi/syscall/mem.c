@@ -73,6 +73,14 @@ static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
 // PLACE over EXACTLY the requested bytes (memset 0 for anon, pread for file) so the neighbour survives.
 // The caller gates this on the range being contained in a writable private-anon region, so the edge host
 // pages are guaranteed mapped+writable. Returns 0 on success, -1 if the interior remap failed.
+static ssize_t pread_retry(int fd, void *buffer, size_t length, off_t offset) {
+    ssize_t result;
+    do {
+        result = pread(fd, buffer, length, offset);
+    } while (result < 0 && errno == EINTR);
+    return result;
+}
+
 static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int fd, off_t off) {
     size_t hp = (size_t)getpagesize();
     uint64_t lo = a0, hi = a0 + a1;
@@ -82,21 +90,22 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
         if (mmap((void *)ilo, (size_t)(ihi - ilo), prot | PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE,
                  -1, 0) == MAP_FAILED)
             return -1;
-        if (!anon && fd >= 0) pread(fd, (void *)ilo, (size_t)(ihi - ilo), off + (off_t)(ilo - lo));
+        if (!anon && fd >= 0 && pread_retry(fd, (void *)ilo, (size_t)(ihi - ilo), off + (off_t)(ilo - lo)) < 0)
+            return -1;
     }
     uint64_t he = ilo < hi ? ilo : hi; // partial head edge [lo, he)
     if (lo < he) {
         if (anon || fd < 0)
             memset((void *)lo, 0, (size_t)(he - lo));
         else
-            pread(fd, (void *)lo, (size_t)(he - lo), off);
+            if (pread_retry(fd, (void *)lo, (size_t)(he - lo), off) < 0) return -1;
     }
     uint64_t tl = he > ihi ? he : ihi; // partial tail edge [tl, hi) (never re-covers the head)
     if (tl < hi) {
         if (anon || fd < 0)
             memset((void *)tl, 0, (size_t)(hi - tl));
         else
-            pread(fd, (void *)tl, (size_t)(hi - tl), off + (off_t)(tl - lo));
+            if (pread_retry(fd, (void *)tl, (size_t)(hi - tl), off + (off_t)(tl - lo)) < 0) return -1;
     }
     return 0;
 }
@@ -518,9 +527,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && ((off_t)a5 & (off_t)(hp - 1))) {
             void *ar = mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ar != MAP_FAILED) {
-                pread((int)a4, ar, (size_t)a1, (off_t)a5); // short read => trailing bytes stay anon-zero
-                r = ar;
-                off_emul = 1;
+                if (pread_retry((int)a4, ar, (size_t)a1, (off_t)a5) < 0) {
+                    munmap(ar, (size_t)a1);
+                } else {
+                    r = ar;
+                    off_emul = 1;
+                }
             }
         }
         // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
@@ -574,9 +586,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 mmap((void *)lo, (size_t)a1 + head, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ar != MAP_FAILED) {
                 if (hsave) memcpy((void *)lo, hsave, head);            // restore the previous seg's tail
-                if (!(a3 & 0x20) && (int)a4 >= 0)                      // file-backed: load the file bytes;
-                    pread((int)a4, (void *)a0, (size_t)a1, (off_t)a5); //   short read => trailing BSS zeros
-                r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
+                if (!(a3 & 0x20) && (int)a4 >= 0 &&
+                    pread_retry((int)a4, (void *)a0, (size_t)a1, (off_t)a5) < 0) {
+                    munmap(ar, (size_t)a1 + head);
+                    ar = MAP_FAILED;
+                }
+                if (ar != MAP_FAILED)
+                    r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
             }
             free(hsave);
         }

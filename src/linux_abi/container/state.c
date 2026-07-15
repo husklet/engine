@@ -478,12 +478,23 @@ static void owner_sidecar_set(uint64_t dev, uint64_t ino, uint64_t birth_ns, int
     struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
     while (fcntl(fd, F_SETLKW, &lock) < 0 && errno == EINTR) {}
     hl_owner_record record = {0x484c4f57u, -1, -1, birth_ns};
-    (void)pread(fd, &record, sizeof(record), 0);
+    ssize_t loaded;
+    do {
+        loaded = pread(fd, &record, sizeof(record), 0);
+    } while (loaded < 0 && errno == EINTR);
+    if (loaded != (ssize_t)sizeof(record)) record = (hl_owner_record){0x484c4f57u, -1, -1, birth_ns};
     if (record.magic != 0x484c4f57u || record.birth_ns != birth_ns)
         record = (hl_owner_record){0x484c4f57u, -1, -1, birth_ns};
     if (uid >= 0) record.uid = uid;
     if (gid >= 0) record.gid = gid;
-    (void)pwrite(fd, &record, sizeof(record), 0);
+    ssize_t stored;
+    do {
+        stored = pwrite(fd, &record, sizeof(record), 0);
+    } while (stored < 0 && errno == EINTR);
+    if (stored != (ssize_t)sizeof(record) && ftruncate(fd, 0) != 0) {
+        // The sidecar is advisory metadata.  Leaving an unreadable record is safe: get validates its
+        // exact size/magic/birth generation and falls back to the container owner.
+    }
     lock.l_type = F_UNLCK;
     (void)fcntl(fd, F_SETLK, &lock);
     close(fd);

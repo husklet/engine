@@ -553,9 +553,16 @@ static void filemap_written_identity(uint64_t device, uint64_t inode, int source
         uint64_t lo = offset > map_lo ? offset : map_lo;
         uint64_t hi = end < map_hi ? end : map_hi;
         int fd = source_fd >= 0 ? source_fd : filemap_source_fd(mapping);
-        if (hi > lo && fd >= 0)
-            (void)pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo),
-                        (off_t)lo);
+        if (hi > lo && fd >= 0) {
+            ssize_t loaded;
+            do {
+                loaded = pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo),
+                               (off_t)lo);
+            } while (loaded < 0 && errno == EINTR);
+            // A short read intentionally leaves the anonymous-zero tail intact; an error leaves the
+            // prior MAP_PRIVATE snapshot intact, matching a failed external refresh.
+            if (loaded < 0) continue;
+        }
     }
     pthread_mutex_unlock(&g_filemap_lock);
 }
@@ -580,7 +587,9 @@ static void filemap_replay(void) {
            exhausting this internal journal as a fatal engine resource error,
            before any guest instruction can observe corrupt data. */
         static const char message[] = "[hl-engine] fatal: file mapping mutation journal exhausted\n";
-        (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+        ssize_t written = write(STDERR_FILENO, message, sizeof(message) - 1);
+        if (written < 0 && errno == EINTR) written = write(STDERR_FILENO, message, sizeof(message) - 1);
+        if (written < 0) errno = 0; // diagnostics cannot change the unconditional fatal outcome below
         _exit(125);
     }
     while (g_filemap_cursor < end) {

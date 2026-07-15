@@ -1998,7 +1998,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             int nofollow = (a4 & 0x100) ? 1 : 0;
-            fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+            int chown_result = fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+            if (chown_result < 0 && errno != EPERM && errno != EACCES) {
+                int error = errno;
+                close(pfd);
+                G_RET(c) = (uint64_t)(int64_t)(-error);
+                break;
+            }
             // the host chown is a rootless no-op; persist the guest-set owner as an xattr on
             // the backing file so a later stat reports it (not the cuid/cgid default). -1 = keep.
             char dp[4200];
@@ -2014,7 +2020,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
-        fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
+        int chown_result = fchownat(ATFD(a0), p, (uid_t)a2, (gid_t)a3, 0);
+        if (chown_result < 0 && errno != EPERM && errno != EACCES) {
+            G_RET(c) = (uint64_t)(int64_t)(-errno);
+            break;
+        }
         chown_xattr_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, 0);
         G_RET(c) = 0;
         break;

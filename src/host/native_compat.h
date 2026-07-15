@@ -306,7 +306,11 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
                     events[index].data = (intptr_t)expirations;
             } else if (entry->target < 0) {
                 uint64_t value;
-                (void)read(entry->wake, &value, sizeof(value));
+                ssize_t consumed = read(entry->wake, &value, sizeof(value));
+                if (consumed < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    events[index].flags |= EV_ERROR;
+                    events[index].data = errno;
+                }
                 events[index].filter = EVFILT_USER;
             }
         }

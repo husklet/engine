@@ -637,6 +637,20 @@ static int sig_diag_put_hex(char *b, int n, const char *k, uint64_t v) {
     return n + 16;
 }
 
+static void sig_diag_write(const char *buffer, size_t length) {
+    while (length != 0) {
+        ssize_t written = write(STDERR_FILENO, buffer, length);
+        if (written > 0) {
+            buffer += written;
+            length -= (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
 static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c) {
     return;
     char b[384];
@@ -656,7 +670,7 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
 #endif
     n = sig_diag_put_hex(b, n, " si_addr=", si ? (uint64_t)si->si_addr : 0);
     b[n++] = '\n';
-    (void)write(2, b, (size_t)n);
+    sig_diag_write(b, (size_t)n);
 }
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
@@ -695,7 +709,7 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
         n = sig_diag_put_hex(b, n, " hinsn=", (uint64_t)hinsn);
     }
     b[n++] = '\n';
-    (void)write(2, b, (size_t)n);
+    sig_diag_write(b, (size_t)n);
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
@@ -715,7 +729,7 @@ static void sig_diag_raise_default(struct cpu *c, int sig) {
     n = sig_diag_put_hex(b, n, " handler=", (sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0);
     n = sig_diag_put_hex(b, n, " mask=", c ? c->sigmask : 0);
     b[n++] = '\n';
-    (void)write(2, b, (size_t)n);
+    sig_diag_write(b, (size_t)n);
 }
 
 // a GENUINE synchronous CPU fault (SIGSEGV/SIGBUS/...) taken in translated code for which the guest

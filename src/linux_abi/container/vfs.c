@@ -53,6 +53,11 @@ static int path_join(char *out, size_t capacity, const char *directory, const ch
     return 0;
 }
 
+static int symlink_idempotent(const char *target, const char *path) {
+    if (symlink(target, path) == 0 || errno == EEXIST) return 0;
+    return -1;
+}
+
 // ---- rootfs path rewriting (ported from mac_elf.c) ----
 static const char *g_rootfs = NULL;
 // guest CWD (within the rootfs) -- AT_FDCWD resolution + getcwd
@@ -3474,7 +3479,10 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
     for (int i = 0; links[i]; i++) {
         char p[64];
         snprintf(p, sizeof p, "%s/%s", tmpl, links[i]);
-        symlink(".", p);
+        if (symlink_idempotent(".", p) != 0) {
+            procfd_dir_rm(tmpl);
+            return -1;
+        }
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
@@ -3788,8 +3796,12 @@ static int synth_names_dir_open(const char *guestpath, const char *const *names,
         snprintf(p, sizeof p, "%s/%s", tmpl, names[i]);
         if (kind == 2)
             mkdir(p, 0555);
-        else if (kind == 1)
-            symlink(".", p); // inert target; readlink of the guest path is intercepted separately
+        else if (kind == 1) {
+            if (symlink_idempotent(".", p) != 0) {
+                procfd_dir_rm(tmpl);
+                return -1;
+            }
+        }
         else {
             int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
             if (f >= 0) close(f);
@@ -5236,10 +5248,11 @@ static void container_populate_dev(void) {
 #define DEVP2(d, leaf) (snprintf(base + bl, sizeof base - bl, "/%s/%s", (d), (leaf)), base)
     // /dev/fd + the std stream aliases: the standard Linux symlinks into /proc/self/fd (which the engine
     // already synthesizes). readlink/ls see the symlink; open("/dev/fd/N") is caught by procfd_num().
-    symlink("/proc/self/fd", DEVP("fd"));
-    symlink("/proc/self/fd/0", DEVP("stdin"));
-    symlink("/proc/self/fd/1", DEVP("stdout"));
-    symlink("/proc/self/fd/2", DEVP("stderr"));
+    if (symlink_idempotent("/proc/self/fd", DEVP("fd")) != 0 ||
+        symlink_idempotent("/proc/self/fd/0", DEVP("stdin")) != 0 ||
+        symlink_idempotent("/proc/self/fd/1", DEVP("stdout")) != 0 ||
+        symlink_idempotent("/proc/self/fd/2", DEVP("stderr")) != 0)
+        return;
     // char-device placeholders so they list in /dev; open()/stat() are intercepted by the fs.c synth
     // (dev_node_hostpath), so the empty file is never actually read/written.
     static const char *const chr[] = {"null", "zero", "full", "random", "urandom", "tty", "console", "ptmx"};
