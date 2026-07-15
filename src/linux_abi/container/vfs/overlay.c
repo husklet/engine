@@ -220,7 +220,7 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
     // would live under that missing upper dir -- cannot exist either, so the three upper probes below are
     // provably ENOENT and we go straight to the lowers. A later mkdir/copy-up in the upper bumps
     // g_res_epoch (dispatch.c res_bump + the copy-up bumps in this file), instantly invalidating the memo.
-    if (!(have_par && updirneg_lookup(par))) {
+    if (!(have_par && hl_fdcache_upper_negative_lookup(par))) {
         int upmiss = 0, isvol = 0;
         int injail = secure_resolve_probe(guest, up, sizeof up, 1, &upmiss, &isvol); // upper (or volume)
         if (upmiss == 0) { // parent chain exists in the upper (or a volume): full probe, as before

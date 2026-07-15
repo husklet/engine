@@ -399,7 +399,7 @@ void res_bump(void) {
 //     so another engine process (docker exec) creating upper dirs invalidates this process's memo too.
 //   * fork/chroot hard reset via rc_reset() below.
 //   * volume paths are never stored (host-mutable backing; enforced at the overlay_lookup call site).
-int updirneg_lookup(const char *d) {
+int hl_fdcache_upper_negative_lookup(const char *d) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
