@@ -69,7 +69,7 @@ uint32_t hl_engine_abi(void) {
 }
 
 const char *hl_engine_version(void) {
-    return "0.1.0";
+    return "0.1.1";
 }
 
 enum { HL_ENGINE_STRING_LIMIT = 64 * 1024 * 1024 };
