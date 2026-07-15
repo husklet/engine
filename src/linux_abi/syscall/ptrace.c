@@ -36,6 +36,7 @@
 //       threaded tracees are tracked at process (not per-tid) granularity for now.
 
 #include <limits.h>
+#include "../shared.h"
 
 // ---- ptrace request numbers (identical on x86-64 and aarch64 Linux) ----
 enum {
@@ -151,14 +152,13 @@ static void pt_unlock(void) {
 
 // mmap the shared arena ONCE, before any guest fork (called from engine_global_init in each target).
 static void ptrace_arena_init(void) {
+    void *arena = NULL;
     if (g_pt) return;
-    void *p = mmap(NULL, sizeof(struct pt_arena), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) {
+    if (hl_linux_shared_create(effective_host_services(), sizeof(struct pt_arena), &arena) != HL_STATUS_OK) {
         g_pt = NULL;
         return;
     } // ptrace unavailable -> requests EPERM/ESRCH, never crash
-    memset(p, 0, sizeof(struct pt_arena));
-    g_pt = (struct pt_arena *)p;
+    g_pt = arena;
 }
 
 // ---- per-process cached self-link lookup (re-scans only when the arena generation or our pid changes) ----
