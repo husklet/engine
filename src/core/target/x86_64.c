@@ -1,3 +1,5 @@
+#include "namespace.h"
+
 // hl/core/target -- x86-64 Linux guest target composition.
 //
 // This unity translation unit wires the x86-64 translator frontend to the shared Linux ABI,

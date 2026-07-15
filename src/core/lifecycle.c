@@ -1,3 +1,4 @@
+#include "target/namespace.h"
 #include "engine_backend.h"
 #include "engine_result.h"
 #include "options.h"

@@ -1,3 +1,5 @@
+#include "namespace.h"
+
 // HL engine: the aarch64 Linux-guest JIT runner (unity translation unit).
 //
 // A same-ISA aarch64->aarch64 JIT services the guest's Linux syscalls in userspace (no VM). This TU
