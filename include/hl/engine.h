@@ -7,7 +7,8 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_ENGINE_ABI 4u
-#define HL_ENGINE_BOX_ABI 1u
+#define HL_ENGINE_BOX_ABI 2u
+#define HL_ENGINE_BOX_ABI_1 1u
 
 typedef struct hl_engine hl_engine;
 
@@ -45,7 +46,11 @@ typedef struct hl_engine_fd_binding {
 enum {
     HL_ENGINE_BOX_ROOTFS_READ_ONLY = 1u << 0,
     HL_ENGINE_BOX_SANDBOX = 1u << 1,
-    HL_ENGINE_BOX_NETWORK_ISOLATED = 1u << 2
+    HL_ENGINE_BOX_NETWORK_ISOLATED = 1u << 2,
+    HL_ENGINE_BOX_PUBLISH_EXTERNAL = 1u << 3,
+    HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED = 1u << 4,
+    /* Route authority operations through the sentry without host worker confinement. */
+    HL_ENGINE_BOX_SENTRY_ONLY = 1u << 5
 };
 
 /*
@@ -63,6 +68,19 @@ typedef struct hl_engine_box_config {
     const char *hostname;
     /* Newline-separated [A-Za-z_][A-Za-z0-9_]*=VALUE records; NULL selects engine defaults. */
     const char *environment;
+    /* ABI 2: owned launcher settings. NULL means unspecified; non-NULL strings must be nonempty. */
+    const char *lower_layers;
+    const char *publish;
+    const char *volumes;
+    const char *limits;
+    const char *network_namespace;
+    const char *translation_cache;
+    const char *network_bridge;
+    const char *ip;
+    const char *filesystem_generation;
+    const char *egress_proxy;
+    const char *checkpoint_directory;
+    const char *restore_directory;
 } hl_engine_box_config;
 
 typedef struct hl_engine_config {

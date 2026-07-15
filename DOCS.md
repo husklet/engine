@@ -87,21 +87,22 @@ native file descriptor, a compiler-sized enum, a platform context structure, or 
 `hl_engine_config` is authoritative. Unknown flags and nonzero reserved fields are invalid. Limits are applied before
 guest startup. A field that cannot be honored is rejected; it is never accepted as a no-op.
 
-`hl_engine_box_config` is the reusable, ABI-versioned Linux-box configuration surface. Its current slice owns Linux
-identity (`uid`/`gid`), initial working directory, hostname, guest environment, read-only-root policy, host sandboxing,
-and external-network isolation. `hl_engine_create` validates the complete structure and deep-copies its strings before
-returning, so two engines never share mutable launch state and callers need not retain configuration storage. Applying
-these values to the instance option store is transactional: validation or allocation failure destroys the candidate
-instance without starting a process or changing another engine.
+`hl_engine_box_config` is the reusable, ABI-versioned Linux-box configuration surface. It owns Linux identity,
+working directory, hostname, guest environment, root policy, sandbox mode, network isolation and publication, overlay
+layers, volumes, resource-limit records, namespace and bridge identity, virtual IP, translation-cache policy,
+filesystem generation, egress proxy, and checkpoint/restore directories. `hl_engine_create` validates the complete
+structure and deep-copies every string before returning, so two engines never share mutable launch state and callers
+need not retain configuration storage. Applying these values to the instance option store is transactional: validation
+or allocation failure destroys the candidate instance without starting a process or changing another engine.
 
-The serialized `hl_launch_config` remains the launcher wire format, not the preferred embedding API. Its
-`lower_layers`, `publish`, `volumes`, `limits`, `network_namespace`, `translation_cache`, `network_bridge`, `ip`,
-`filesystem_generation`, `egress_proxy`, `checkpoint_directory`, and `restore_directory` strings; its
-`publish_external` and `translation_cache_disabled` booleans; and its sentry-only `HL_CONFIG_UNTRUSTED_ONLY` sandbox
-mode do not yet have typed public engine fields. The wire's rootfs and scalar memory/pid/CPU limits are already exposed
-by `hl_engine_config`; arguments are supplied to `hl_engine_run`; debug logging is deliberately a debug-build concern,
-not box configuration. Remaining settings must be added append-only to `hl_engine_box_config`, with validation and
-ownership rules; public callers must not be given raw access to the internal `HL_*` option registry.
+ABI 1 is the exact prefix ending at `environment`; ABI 2 appends the remaining settings. Cache enable and disable are
+mutually exclusive, checkpoint and restore cannot be selected together, an IP requires a bridge, external publication
+requires publication rules, and isolated networking rejects publication, bridge, IP, and egress settings. Full host
+sandboxing and sentry-only routing are distinct mutually exclusive modes. Cache, filesystem-generation, checkpoint,
+and restore locations are absolute paths. A non-NULL string is always nonempty. The serialized `hl_launch_config`
+remains the launcher wire format, not the preferred embedding API; public callers never receive raw access to the
+internal `HL_*` option registry. Rootfs and scalar memory/pid/CPU limits live in `hl_engine_config`, arguments are
+supplied to `hl_engine_run`, and debug logging is deliberately a debug-build concern rather than box configuration.
 
 ### 3.2 Engine core (`src/core`)
 
