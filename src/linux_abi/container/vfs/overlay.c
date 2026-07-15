@@ -147,7 +147,7 @@ static int dir_is_opaque(const char *jc, size_t jcl, const char *guestdir) {
 static int overlay_dir_verdict(const char *dir) {
     if (!g_nlower || !dir || dir[0] != '/' || !dir[1]) return 0; // "/" and non-overlay: always present
     int v;
-    if (updirverdict_lookup(dir, &v)) return v;
+    if (hl_fdcache_upper_verdict_lookup(dir, &v)) return v;
     // Resolve the parent's verdict first (memoized recursion). A hidden parent hides this dir outright; an
     // opaque-cut parent means this dir may come only from the upper (lowers already hidden above it).
     char par[4200];

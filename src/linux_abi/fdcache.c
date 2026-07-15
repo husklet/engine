@@ -437,7 +437,7 @@ void hl_fdcache_upper_negative_store(const char *d) {
 // entries. Correctness model is identical to the updirneg memo above: epoch-gated on the
 // container-shared g_res_epoch (every unlink/rmdir/rename/mkdir/whiteout/opaque bumps it, so a removal
 // instantly invalidates the memo), with a fork/chroot hard reset via rc_reset().
-int updirverdict_lookup(const char *d, int *verdict) {
+int hl_fdcache_upper_verdict_lookup(const char *d, int *verdict) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
     CLK;
     int hit = 0;
