@@ -2,6 +2,7 @@
 #include "../parse.h" // strict numeric parsing (the config trust boundary; see LAUNCH.md)
 #include "../xattr.h"
 #include "../readonly.h"
+#include "../shared.h"
 #include "../limits.h"
 #include "../../host/system.h"
 #include "key.h"
@@ -127,10 +128,12 @@ static void acct_claim_self(void) {
 
 // (Re)create the shared accounting table for a NEW container init and claim this process's slot. Called
 // from container_init (normal launch + cold forkserver) and the forkserver warm re-anchor point.
-static void acct_container_reset(void) {
+static void acct_container_reset(const hl_host_services *host) {
     size_t sz = sizeof(struct hl_acct_slot) * HL_ACCT_SLOTS;
-    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    g_acct = (m == MAP_FAILED) ? NULL : (struct hl_acct_slot *)m; // kernel zero-fills -> all slots free
+    void *arena = NULL;
+    g_acct = hl_linux_shared_create(host, sz, &arena) == HL_STATUS_OK
+                 ? (struct hl_acct_slot *)arena
+                 : NULL;
     g_acct_self = NULL;
     acct_claim_self();
     static int reg = 0; // free our slot on a normal exit (fork children inherit this atexit registration)

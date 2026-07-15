@@ -631,7 +631,7 @@ static int container_init(const char *rootfs) {
     if (rootfs) g_init_hostpid = getpid();
     // cross-engine-process cgroup accounting: a FRESH shared slot table for THIS container init, inherited
     // by every guest fork (see state.c). Per-container so sibling forkserver workers never share a total.
-    if (rootfs) acct_container_reset();
+    if (rootfs) acct_container_reset(effective_host_services());
     {
         const char *h = hl_option_get("HL_HOSTNAME");
         // hl-engine -> jit config

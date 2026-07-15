@@ -243,7 +243,7 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
         if (g_srv_rootfs[0]) g_init_hostpid = getpid();
         // Re-anchor cross-process cgroup accounting to a FRESH slot table for THIS warm container: the
         // worker inherited the SERVER's table on fork, but each launch is its own container (state.c).
-        if (g_srv_rootfs[0]) acct_container_reset();
+        if (g_srv_rootfs[0]) acct_container_reset(effective_host_services());
         FSRV_WARM_CHDIR_ROOTFS();
         const char *icwd = hl_option_get("HL_CWD"); // docker -w from the CLIENT's env
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);

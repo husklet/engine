@@ -352,7 +352,7 @@ static int container_init(const char *rootfs) {
     if (rootfs) g_init_hostpid = getpid();
     // cross-engine-process cgroup accounting: a FRESH shared slot table for THIS container init, inherited
     // by every guest fork (see state.c). Per-container so sibling forkserver workers never share a total.
-    if (rootfs) acct_container_reset();
+    if (rootfs) acct_container_reset(effective_host_services());
     container_read_resource_env(); // Docker CPU, read-only-root, and ulimit values from centralized HL options.
     // The final typed launch hands the container model to the engine as HL options, not as the
     // --hostname/--mem-max/--pids-max CLI flags. aarch64's container_init() already reads these options;
