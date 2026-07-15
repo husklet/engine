@@ -1871,7 +1871,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/core/workload/x86_64/busyloop \
 	$(BUILD)/compat/syscall/aarch64/gettid $(BUILD)/compat/syscall/x86_64/gettid \
 	$(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
-	$(BUILD)/compat/process/aarch64/forkstorm $(BUILD)/compat/process/x86_64/forkstorm
+	$(BUILD)/compat/process/aarch64/forkstorm $(BUILD)/compat/process/x86_64/forkstorm \
+	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64)
 	$(call HL_PERF_LINUX,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
 	$(call HL_PERF_LINUX,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
 	$(call HL_PERF_LINUX,compute,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
@@ -1882,6 +1883,18 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(call HL_PERF_LINUX,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
 	$(call HL_PERF_LINUX,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
 	$(call HL_PERF_LINUX,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
+	$(call HL_PERF_LINUX,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
+	$(call HL_PERF_LINUX,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
+	$(call HL_PERF_LINUX,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
+	$(call HL_PERF_LINUX,event,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-aarch64,0)
+	$(call HL_PERF_LINUX,ipc-latency,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-aarch64,0)
+	$(call HL_PERF_LINUX,ipc-throughput,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
+	$(call HL_PERF_LINUX,mmap,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-x86_64,0)
+	$(call HL_PERF_LINUX,file,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-x86_64,0)
+	$(call HL_PERF_LINUX,pipe,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-x86_64,0)
+	$(call HL_PERF_LINUX,event,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-x86_64,0)
+	$(call HL_PERF_LINUX,ipc-latency,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-x86_64,0)
+	$(call HL_PERF_LINUX,ipc-throughput,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-x86_64,0)
 
 # Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
 perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
