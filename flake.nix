@@ -109,8 +109,13 @@
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
-            ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [ linuxArm.stdenv.cc linuxX86.stdenv.cc ]
-              ++ pkgs.lib.optionals (system == "aarch64-linux") [ pkgs.gcc linuxX86.stdenv.cc ];
+            ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [
+              linuxArm.stdenv.cc linuxArm.glibc.static
+              linuxX86.stdenv.cc linuxX86.glibc.static
+            ] ++ pkgs.lib.optionals (system == "aarch64-linux") [
+              pkgs.gcc pkgs.glibc.static
+              linuxX86.stdenv.cc linuxX86.glibc.static
+            ];
           } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
             CC = "${pkgs.stdenv.cc}/bin/cc";
             AARCH64_LINUX_CC = linuxArmCompiler;
