@@ -4,6 +4,7 @@
 #include "../readonly.h"
 #include "../limits.h"
 #include "../../host/system.h"
+#include "key.h"
 
 // HL_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
@@ -55,15 +56,7 @@ static int g_init_hostpid = 0;
 static char g_namespace_key[40];
 
 static void namespace_key_set(const char *key) {
-    // Hash the externally supplied namespace key into a path-safe, fixed-size identity. Equal keys must
-    // deliberately meet; different keys must not alias, and path punctuation must never escape /tmp.
-    uint64_t hash = UINT64_C(14695981039346656037);
-    const unsigned char *cursor = (const unsigned char *)key;
-    while (*cursor) {
-        hash ^= *cursor++;
-        hash *= UINT64_C(1099511628211);
-    }
-    snprintf(g_namespace_key, sizeof g_namespace_key, "%016llx", (unsigned long long)hash);
+    if (hl_linux_container_key(key, g_namespace_key, sizeof g_namespace_key) != 0) g_namespace_key[0] = 0;
 }
 
 // ===================== cross-engine-process cgroup accounting (pids + memory) =====================
