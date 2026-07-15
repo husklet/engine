@@ -1,5 +1,6 @@
 // hl/linux_abi -- signal delivery (Linux<->macOS signal-number translation; sigframe build).
 #include "../host/native_context.h"
+#include "shared.h"
 
 // ptrace signal-delivery/group stops. Defined later in the TU (os/linux/syscall/ptrace.c, pulled in
 // via dispatch.c). ptrace_intercept_signal: this process is traced and a signal is about to be delivered
@@ -171,10 +172,11 @@ struct sigexit_ent {
 static struct sigexit_ent *g_sigexit;
 
 static void sigexit_init(void) {
+    void *arena = NULL;
     if (g_sigexit) return;
-    void *m =
-        mmap(NULL, sizeof(struct sigexit_ent) * SIGEXIT_SLOTS, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (m != MAP_FAILED) g_sigexit = (struct sigexit_ent *)m;
+    if (hl_linux_shared_create(effective_host_services(), sizeof(struct sigexit_ent) * SIGEXIT_SLOTS, &arena) ==
+        HL_STATUS_OK)
+        g_sigexit = (struct sigexit_ent *)arena;
 }
 
 // Dying child: publish (signo, core) for its own pid. Claim a free slot (0 -> -1), fill the payload, then
