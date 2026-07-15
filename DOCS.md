@@ -605,7 +605,9 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [ ] Route every production host operation through a typed host-service group.
 - [ ] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
       through a pinned typed File-service directory.
-- [ ] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes.
+- [x] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes. The permanent
+      `test-linux-production-typed` gate runs 654 active exact-golden cases across 16 manifests and both guest ISAs,
+      with zero exclusions.
 - [ ] Add a Windows backend after macOS and Linux are complete and the common contract passes without POSIX leakage.
 
 ### Linux behavior
@@ -613,15 +615,17 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Run every active compatibility manifest on macOS for both guest ISAs with no exclusions except explicitly
       unsupported guest-ISA inputs.
 - [x] Run the same exact-golden corpus through the production Linux host.
-- [ ] Complete native Linux epoll, timerfd, eventfd, inotify, signal-mask, dup/fork, and rearm coverage.
-- [ ] Complete typed directory, metadata, ownership, allocation, sparse-file, locking, and external-change coverage.
-- [ ] Complete process-group, wait, signal, exec, pid-namespace, proc/sys, and limit coverage.
-- [ ] Complete socket, ancillary, namespace, readiness, option, and error-fidelity coverage.
+- [x] Complete native Linux epoll, timerfd, eventfd, inotify, signal-mask, dup/fork, and rearm coverage.
+- [x] Complete typed directory, metadata, ownership, allocation, sparse-file, locking, and external-change coverage.
+- [x] Complete process-group, wait, signal, exec, pid-namespace, proc/sys, and limit coverage.
+- [x] Complete socket, ancillary, namespace, readiness, option, and error-fidelity coverage.
 
 ### Lifecycle and isolation
 
 - [x] Repeat create/run/stop/destroy races under sanitizers where supported.
-- [ ] Prove descriptor, thread, mapping, child-process, and remote-process counts return to baseline after every suite.
+- [x] Prove runner-owned descriptor, thread, and direct child-process counts return to baseline after every
+      compatibility case; the C matrix runner fails immediately on drift.
+- [ ] Extend lifecycle baselines to engine mappings and independently discoverable remote descendants.
 - [ ] Prove all registries grow to advertised limits without stale-handle aliasing.
 - [ ] Fault-inject every host callback boundary and verify transactional rollback.
 
