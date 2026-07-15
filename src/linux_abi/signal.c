@@ -606,6 +606,12 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
 static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) {
         if (container_pid() != 1) {
+#if defined(__linux__)
+            // This dispatcher-side EOF fault is a real guest SIGBUS. Linux can carry that termination
+            // status without translation, so let the kernel produce the parent's wait status directly.
+            signal(SIGBUS, SIG_DFL);
+            raise(SIGBUS);
+#endif
             int core = sig_coredumps(7) && svc_core_rlimit_cur() > 0;
             sigexit_record(7, core);
         }
@@ -770,6 +776,17 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     // the container init just exits 128+signo (what `docker run` reports for a crash). This is hl's standard
     // fatal-signal relay -- the same mechanism as a fatal-default signal in maybe_deliver_signal.
     if (container_pid() != 1) {
+#if defined(__linux__)
+        // On a Linux host, preserve the kernel's native WIFSIGNALED status. The synchronous signal is
+        // blocked while this handler runs, so restore its default disposition and unblock it before
+        // re-sending it to this process. If delivery unexpectedly returns, retain the relay fallback.
+        signal(hostsig, SIG_DFL);
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, hostsig);
+        sigprocmask(SIG_UNBLOCK, &unblocked, NULL);
+        kill(getpid(), hostsig);
+#endif
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
     }
