@@ -1822,6 +1822,11 @@ define HL_PERF_NATIVE
 		$(abspath $(4))
 endef
 
+define HL_PERF_LINUX
+	$(BUILD)/tools/perf-runner --label linux-$(1)-$(2) --warmups $(3) --samples $(4) --expect $(6) -- \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-$(2)) $(abspath $(5))
+endef
+
 # Keep the correctness gate explicit: standalone performance runs remain quick, while this target
 # proves the measured binaries still pass the complete compatibility matrix first.
 perf-compat: e2e-compat perf-macos
@@ -1858,6 +1863,13 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(call HL_PERF_ENGINE,ipc-throughput,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-x86_64,0)
 	$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) $(abspath $(BUILD)/perf/resource-aarch64)
 	$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/perf/resource-x86_64)
+
+.PHONY: perf-linux
+perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
+	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/tools/perf-runner \
+	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64
+	$(call HL_PERF_LINUX,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
+	$(call HL_PERF_LINUX,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
 
 # Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
 perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
