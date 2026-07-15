@@ -3,6 +3,7 @@
 #include "rotate.h"
 #include "x87math.h"
 #include "operand.h"
+#include "flags.h"
 
 // translator/guest/x86_64/dispatch.h -- the x86-64 guest's definitions of the shared run_guest()
 // dispatch seam (engine-dedup PR3/PR4). Mirror of guest/aarch64/dispatch.h: the shared

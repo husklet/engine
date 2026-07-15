@@ -10,19 +10,6 @@
 // the generic per-element loop.
 // width-w (a-b) flags -> ARM NZCV, in the engine's borrow convention (stored C = NOT x86 CF),
 // byte-identical to what do_alu()/SUBS produces for a normal cmp of the same width.
-static uint64_t repstr_nzcv(uint64_t a, uint64_t b, int w) {
-    int bits = 8 * w;
-    uint64_t mask = (w == 8) ? ~0ull : ((1ull << bits) - 1);
-    uint64_t ua = a & mask, ub = b & mask, r = (ua - ub) & mask;
-    uint64_t N = r >> (bits - 1);
-    uint64_t Z = (r == 0);
-    uint64_t C = (ua >= ub); // ARM carry = NO borrow
-    // signed overflow of (a-b): sign(a)!=sign(b) AND sign(r)!=sign(a). Bitwise -> works at all widths
-    // incl. 64-bit (a naive INT64 negation form was the one bug the qemu oracle caught -- see W4-C md §5).
-    uint64_t V = (((ua ^ ub) & (ua ^ r)) >> (bits - 1)) & 1;
-    return (N << 31) | (Z << 30) | (C << 29) | (V << 28);
-}
-
 static void do_repstr(struct cpu *c) {
     uint64_t d = c->divop;
     int w = (int)(d & 0xff);
@@ -127,7 +114,7 @@ static void do_repstr(struct cpu *c) {
     if (isrep) c->r[RCX] = n - k;
     if (!isscas) c->r[RSI] = gsi + k * (uint64_t)step; // advance the GUEST pointers (not the host-biased ones)
     c->r[RDI] = gdi + k * (uint64_t)step;
-    c->nzcv = repstr_nzcv(av, bv, w);
+    c->nzcv = hl_x86_sub_nzcv(av, bv, w);
     g_repstr_n++;
     g_repstr_elems += k;
 }
