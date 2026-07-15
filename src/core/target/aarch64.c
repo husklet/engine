@@ -877,6 +877,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     argc = (int)argument_count;
     hl_target_services_inject(&g_target_services, host);
     hl_gmap_bind_host(host);
+    seq_ref_arena_init(host);
     eventfd_count_init(host);
     fdvis_init(host);
     ts_init(host);

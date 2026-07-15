@@ -2,6 +2,8 @@
 
 #include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
+#include "../shared.h"
+
 // Build a pathname AF_UNIX address without ever accepting the silent truncation performed by snprintf.
 // Callers must do this before replacing a guest socket so ENAMETOOLONG leaves the original fd untouched.
 static int unix_addr_set(struct sockaddr_un *address, const char *path) {
@@ -730,19 +732,15 @@ static uint8_t g_sock_seqpacket[HL_NFD];
 // neither EOF nor a wakeup. Keep endpoint ownership in shared memory so fork/dup/close/exec reproduce the
 // Linux last-open-file-description rule. The arena is inherited by every guest descendant; dead pairs are
 // recycled only after both endpoint reference counts reach zero.
-static int seq_ref_arena(void) {
-    if (__atomic_load_n(&g_seq_refs, __ATOMIC_ACQUIRE)) return 0;
-    void *p = mmap(NULL, sizeof(struct seq_ref) * SEQ_REF_N, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) return -1;
-    struct seq_ref *expected = NULL;
-    if (!__atomic_compare_exchange_n(&g_seq_refs, &expected, p, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
-        munmap(p, sizeof(struct seq_ref) * SEQ_REF_N);
-    return 0;
+static void seq_ref_arena_init(const hl_host_services *host) {
+    void *arena = NULL;
+    if (g_seq_refs != NULL) return;
+    if (hl_linux_shared_create(host, sizeof(struct seq_ref) * SEQ_REF_N, &arena) == HL_STATUS_OK)
+        g_seq_refs = (struct seq_ref *)arena;
 }
 
 static int seq_ref_pair(int first, int second) {
-    if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD || seq_ref_arena() != 0) return -1;
+    if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD || g_seq_refs == NULL) return -1;
     for (uint32_t i = 0; i < SEQ_REF_N; i++) {
         if (!__sync_bool_compare_and_swap(&g_seq_refs[i].used, 0, 1)) continue;
         __atomic_store_n(&g_seq_refs[i].refs[0], 1, __ATOMIC_RELAXED);
@@ -784,7 +782,7 @@ static void seq_ref_drop(int fd) {
 // Reserve the references the child will inherit before fork. A failed fork rolls them back; a successful
 // fork consumes the reservation, requiring no allocation or lock in the post-fork child.
 static void seq_ref_fork_prepare(void) {
-    if (seq_ref_arena() != 0) return;
+    if (g_seq_refs == NULL) return;
     for (int fd = 0; fd < HL_NFD; fd++) {
         if (!g_seq_ref[fd]) continue;
         uint32_t slot = g_seq_ref[fd] - 1;
