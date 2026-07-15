@@ -44,12 +44,13 @@ static int test_refcounts_and_reuse(void) {
     uint64_t start = process_start((pid_t)pid);
     if (start == 0 || hl_host_process_fd_private_add(TEST_FD) != 0 || hl_host_process_fd_private_add(TEST_FD) != 0)
         return -1;
-    if (!hl_host_process_fd_private_is(pid, start, TEST_FD) || hl_host_process_fd_private_is(pid, start, OTHER_FD))
+    if (!hl_host_process_fd_private_is(pid, start, TEST_FD) || !hl_host_process_fd_private_current(TEST_FD) ||
+        hl_host_process_fd_private_is(pid, start, OTHER_FD) || hl_host_process_fd_private_current(OTHER_FD))
         return -1;
     hl_host_process_fd_private_remove(TEST_FD);
     if (!hl_host_process_fd_private_is(pid, start, TEST_FD)) return -1;
     hl_host_process_fd_private_remove(TEST_FD);
-    if (hl_host_process_fd_private_is(pid, start, TEST_FD)) return -1;
+    if (hl_host_process_fd_private_is(pid, start, TEST_FD) || hl_host_process_fd_private_current(TEST_FD)) return -1;
 
     /* Reusing the same numeric descriptor for a guest-visible object must not inherit privacy. */
     int source = open("/dev/null", O_RDONLY);

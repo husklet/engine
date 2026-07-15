@@ -119,6 +119,7 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
 // numbers the new guest could reuse, corrupting timer/signal delivery and path confinement.
 static int exec_fd_is_engine(int fd) {
     if (fd < 0) return 1;
+    if (hl_host_process_fd_private_current(fd)) return 1;
     if (eventfd_peer_is_engine_fd(fd)) return 1;
     if (sfd_wr_is(fd)) return 1; // signalfd write ends are engine-private (read ends are ordinary guest fds)
     if (fd == g_root_fd) return 1;

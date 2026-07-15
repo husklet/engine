@@ -71,6 +71,7 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
 int hl_host_process_fd_private_add(int descriptor);
 void hl_host_process_fd_private_remove(int descriptor);
 int hl_host_process_fd_private_is(int64_t pid, uint64_t start_ns, int descriptor);
+int hl_host_process_fd_private_current(int descriptor);
 int hl_host_process_fd_private_fork_prepare(void);
 int hl_host_process_fd_private_fork_complete(int child);
 void hl_host_process_fd_private_cleanup(void);

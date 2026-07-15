@@ -263,6 +263,11 @@ int hl_host_process_fd_private_is(int64_t pid, uint64_t start_ns, int fd) {
     return 0;
 }
 
+int hl_host_process_fd_private_current(int fd) {
+    int64_t pid = (int64_t)getpid();
+    return hl_host_process_fd_private_is(pid, hl_private_process_start(pid), fd);
+}
+
 int hl_host_process_fd_private_fork_prepare(void) {
     int64_t pid = (int64_t)getpid();
     uint64_t start = hl_private_process_start(pid);
