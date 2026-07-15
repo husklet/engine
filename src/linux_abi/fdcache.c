@@ -504,7 +504,7 @@ int hl_fdcache_dentry_cacheable(const char *jcanon) {
     return 0; // anything else (bind-mount volumes, unknown roots): host-mutable -> never cache
 }
 
-int dc_lookup(const char *key, char *canon, size_t n, int *nmiss) {
+int hl_fdcache_dentry_lookup(const char *key, char *canon, size_t n, int *nmiss) {
     if (!key || !key[0] || strlen(key) >= DC_KEYMAX) return 0;
     CLK;
     int hit = 0;

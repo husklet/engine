@@ -145,7 +145,8 @@ restart:;
             int kl = snprintf(dkey, sizeof dkey, "%s%s", g_rootfs_canon, dnorm);
             char dcanon[DC_KEYMAX];
             int dk;
-            if (kl > 0 && (size_t)kl < sizeof dkey && dc_lookup(dkey, dcanon, sizeof dcanon, &dk) && dk == 0 &&
+            if (kl > 0 && (size_t)kl < sizeof dkey &&
+                hl_fdcache_dentry_lookup(dkey, dcanon, sizeof dcanon, &dk) && dk == 0 &&
                 !strcmp(dcanon, dkey)) {
                 int d = open(dcanon, O_RDONLY | O_DIRECTORY);
                 if (d >= 0) {

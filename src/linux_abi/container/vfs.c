@@ -1514,7 +1514,7 @@ static int confine_in_m(const char *jcanon, size_t jclen, const char *rel, char 
     if (dcok) {
         char dcanon[DC_KEYMAX];
         int k;
-        if (dc_lookup(hkey, dcanon, sizeof dcanon, &k)) {
+        if (hl_fdcache_dentry_lookup(hkey, dcanon, sizeof dcanon, &k)) {
             const char *p = hkey + strlen(hkey); // start of the k popped components ("" when k == 0)
             for (int i = 0; i < k; i++) {
                 p--;

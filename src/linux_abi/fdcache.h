@@ -64,7 +64,6 @@ void hl_fdcache_evict_path(const char *host_path);
 #define rc_reset hl_fdcache_reset
 #define rc_lookup hl_fdcache_resolution_lookup
 #define rc_store hl_fdcache_resolution_store
-#define dc_lookup hl_fdcache_dentry_lookup
 #define dc_store hl_fdcache_dentry_store
 #define oc_lookup hl_fdcache_open_lookup
 #define oc_store hl_fdcache_open_store
