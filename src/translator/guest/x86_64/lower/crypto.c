@@ -68,6 +68,22 @@ static void e_ins_h(int vd, int di, int vn, int si) {
     emit32(0x6E000400u | ((unsigned)(((di << 2) | 2)) << 16) | ((unsigned)(si << 1) << 11) | (vn << 5) | vd);
 }
 
+// INS Vd.<T>[i], Rn (general): imm5 selects lane size+index. nb = element bytes (1/2/4/8).
+static void crypto_ins_g(int vd, int i, int rn, int nb) {
+    unsigned imm5 = (nb == 1)   ? ((unsigned)i << 1) | 1u
+                    : (nb == 2) ? ((unsigned)i << 2) | 2u
+                    : (nb == 4) ? ((unsigned)i << 3) | 4u
+                                : ((unsigned)i << 4) | 8u;
+    emit32(0x4E001C00u | (imm5 << 16) | ((unsigned)rn << 5) | (unsigned)vd);
+}
+
+static void crypto_vconst16(int vd, uint64_t lo, uint64_t hi) {
+    e_movconst(16, lo);
+    e_fmov_to_d(vd, 16);
+    e_movconst(16, hi);
+    crypto_ins_g(vd, 1, 16, 8);
+}
+
 // sized FP/SIMD loads from [x17] (byte / halfword) -- for pmov narrow memory operands (avoid 16B over-read)
 static void e_ldr_h(int t, int rn) {
     emit32(0x7D400000u | (rn << 5) | t);
@@ -191,6 +207,26 @@ static int g_v26z, g_v27m;
 static int translate_crypto(struct insn *I, uint64_t next) {
     uint8_t op = I->op;
     int D = I->reg; // dst xmm == src1 (destructive) for AES/PCLMUL
+
+    if (I->map3 == 3 && op == 0xDF) { // AESKEYGENASSIST xmm, xmm/m128, imm8
+        if (hl_x86_x87_known()) hl_x86_x87_drop();
+        int s = crypto_rm_vec(I, next);
+        if (!g_v26z || nosseopt()) e_v3(A_EOR16, 26, 26, 26);
+        g_v26z = 1;
+        e_vmov(17, s);
+        emit32(A_AESE | (26 << 5) | 17);
+        crypto_vconst16(16, UINT64_C(0x040B0E010B0E0104), UINT64_C(0x0C0306090306090C));
+        emit32(A_TBL | (16 << 16) | (17 << 5) | 17);
+        e_v3(A_EOR16, 16, 16, 16);
+        uint32_t rcon = (uint32_t)((uint64_t)I->imm & UINT64_C(0xff));
+        if (rcon) {
+            e_movz(16, rcon, 0);
+            crypto_ins_g(16, 1, 16, 4);
+            crypto_ins_g(16, 3, 16, 4);
+        }
+        e_v3(A_EOR16, D, 17, 16);
+        return TX_NEXT;
+    }
 
     if (I->map3 == 2) { // 0F38
         switch (op) {

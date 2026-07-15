@@ -479,6 +479,8 @@ static void g_ldr_s(int t, int rn) {
     e_dmb_ishld();
 }
 
+void hl_x86_emit_load_scalar32(int destination, int address) { g_ldr_s(destination, address); }
+
 static void g_str_s(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(4, 0);
     e_dmb_ish();
@@ -515,6 +517,10 @@ static void e_ins_d(int vd, int ld, int vn, int ls) { // ins vd.d[ld], vn.d[ls]
 
 static void e_ins_s(int vd, int ls_lane, int vn, int sl) { // ins vd.s[ls_lane], vn.s[sl]
     emit32(0x6E000400u | ((unsigned)((ls_lane << 3) | 4) << 16) | ((unsigned)(sl << 2) << 11) | (vn << 5) | vd);
+}
+
+void hl_x86_emit_insert_scalar32(int destination, int destination_lane, int source, int source_lane) {
+    e_ins_s(destination, destination_lane, source, source_lane);
 }
 
 // ---- x87 FPU stack helpers (ST(i) emulated at double precision in cpu->st[]) ----
@@ -601,6 +607,10 @@ static void e_ext(int vd, int vn, int vm, int idx) {
 static void e_v3(uint32_t base, int vd, int vn, int vm) {
     emit32(base | (vm << 16) | (vn << 5) | vd);
 } // NEON 3-same .16b/.Ns
+
+void hl_x86_emit_vector3(uint32_t base, int destination, int left, int right) {
+    e_v3(base, destination, left, right);
+}
 
 // LSE atomics (AL ordering). sz: 1/2/4/8 bytes.
 static void e_lse(uint32_t base, int sz, int rs, int rt, int rn) {

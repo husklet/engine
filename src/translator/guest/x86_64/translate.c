@@ -819,7 +819,7 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/crypto.c"
 
-#include "lower/sse4x.c"
+#include "lower/sse4x.h"
 
 // SSE2 variable-count packed shift (PSLLW/D/Q, PSRLW/D/Q, PSRAW/D by xmm/m): shift every
 // `esize`-bit lane of `vn` by the SCALAR count held in the low 64 bits of `vs`, result -> `vd`.
@@ -1183,9 +1183,10 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
-            // perf wave 2: MOVBE/CRC32 + PINSR/PEXTR/INSERTPS + AESKEYGENASSIST lowered inline
-            // (translate/sse4x.c) -- the residual per-block exits in openssl's stitched CTR loop.
-            if (translate_sse4x(&I, next) == TX_NEXT) {
+            // perf wave 2: MOVBE/CRC32 + PINSR/PEXTR/INSERTPS lowered inline -- the residual
+            // per-block exits in openssl's stitched CTR loop. AESKEYGENASSIST is handled by crypto.c.
+            const hl_x86_sse4x_state sse4x_state = {.optimize = !nosseopt()};
+            if (hl_x86_lower_sse4x(&I, next, &sse4x_state) == TX_NEXT) {
                 gpc = next;
                 continue;
             }

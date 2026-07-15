@@ -70,5 +70,8 @@ void e_fp_ld(int destination, int index);
 void e_fp_st(int source, int index);
 void e_fp_push(int source);
 void e_fcom_setfpsw(int left, int right);
+void hl_x86_emit_load_scalar32(int destination, int address);
+void hl_x86_emit_insert_scalar32(int destination, int destination_lane, int source, int source_lane);
+void hl_x86_emit_vector3(uint32_t base, int destination, int left, int right);
 
 #endif
