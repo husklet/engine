@@ -85,6 +85,27 @@
           package = self.packages.${system}.default;
         } // pkgs.lib.optionalAttrs (system == "aarch64-darwin" || system == "aarch64-linux") {
           rust = self.packages.${system}.rust;
+        } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
+          linux-typed =
+            let
+              cross = pkgs.pkgsCross.gnu64;
+              crossCompiler = "${cross.stdenv.cc}/bin/${cross.stdenv.cc.targetPrefix}cc";
+            in pkgs.runCommand "hl-engine-linux-typed" {
+              src = pkgs.lib.cleanSource self;
+              nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config pkgs.stdenv.cc cross.stdenv.cc ];
+            } ''
+              cp -R "$src" source
+              chmod -R u+w source
+              cd source
+              make -j$NIX_BUILD_CORES test-linux-production-typed \
+                AARCH64_LINUX_CC=cc \
+                X86_64_LINUX_CC=${crossCompiler} \
+                AARCH64_DYNAMIC_LOADER=${pkgs.glibc}/lib/ld-linux-aarch64.so.1 \
+                AARCH64_DYNAMIC_LIBC=${pkgs.glibc}/lib/libc.so.6 \
+                X86_64_DYNAMIC_LOADER=${cross.glibc}/lib/ld-linux-x86-64.so.2 \
+                X86_64_DYNAMIC_LIBC=${cross.glibc}/lib/libc.so.6
+              touch "$out"
+            '';
         });
 
       devShells = forAllSystems (pkgs: {
