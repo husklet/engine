@@ -1184,14 +1184,12 @@ static void fill_inet_br(uint8_t *sa, socklen_t *l, uint32_t ip_be, uint16_t por
 // guest's AF_UNIX switch socket and relay bytes both ways. The guest's own accept() returns the relayed
 // connection exactly as if a peer container had connected, so container<->container, egress, the switch
 // and --network none/host are completely untouched -- this purely ADDS the host->container path.
-// (Uses g_portmap/pm_host from state.c, included before this file in the same TU.) TCP only for now;
+// (Uses the container's explicit port-map state from state.c.) TCP only for now;
 // published UDP is a follow-up (the guest's UDP path isn't switch-redirected today).
 
 // Is `cport` a published container port? (pm_host() returns cport on a miss, so it can't answer this.)
 static int pm_published(uint16_t cport) {
-    for (int i = 0; i < g_nportmap; i++)
-        if (g_portmap[i].cport == cport) return 1;
-    return 0;
+    return hl_linux_ports_contains(&g_ports, cport);
 }
 
 // Host ports we've already spun up a TCP / UDP forwarder for (idempotent across re-listen()/re-bind under

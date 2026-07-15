@@ -642,7 +642,7 @@ static int container_init(const char *rootfs) {
         if (p && !g_pids_max) g_pids_max = hl_parse_id("HL_PIDS_MAX", p);
         container_read_resource_env(); // Docker CPU, read-only-root, and ulimit values from centralized HL options.
         const char *pub = hl_option_get("HL_PUBLISH");
-        if (pub && !g_nportmap) parse_publish(pub);
+        if (pub && hl_linux_ports_count(&g_ports) == 0) parse_publish(pub);
         const char *low = hl_option_get("HL_LOWER");
         if (low && !g_nlower) {
             char tb[8192];

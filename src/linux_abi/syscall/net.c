@@ -515,7 +515,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
-        if (g_nportmap && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
+        if (hl_linux_ports_count(&g_ports) != 0 && sa && a2 >= 8 && *(uint16_t *)(sa + 0) == AF_INET) {
             uint16_t cp = ntohs(*(uint16_t *)(sa + 2)), hp = pm_host(cp);
             // remember for getsockname
             if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_fd_cport[(int)a0] = cp;
@@ -867,7 +867,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (a2) *(socklen_t *)a2 = hsl;
             } else {
                 if (a2) *(socklen_t *)a2 = (socklen_t)ll;
-                if (g_nportmap && fd >= 0 && fd < HL_NFD && g_fd_cport[fd] && gcap >= 4)
+                if (hl_linux_ports_count(&g_ports) != 0 && fd >= 0 && fd < HL_NFD && g_fd_cport[fd] && gcap >= 4)
                     // app sees the port it asked for (port @2)
                     *(uint16_t *)((uint8_t *)a1 + 2) = htons(g_fd_cport[fd]);
             }

@@ -414,7 +414,7 @@ static int container_init(const char *rootfs) {
     }
     {
         const char *pub = hl_option_get("HL_PUBLISH");
-        if (pub && pub[0] && !g_nportmap) parse_publish(pub);
+        if (pub && pub[0] && hl_linux_ports_count(&g_ports) == 0) parse_publish(pub);
     } // docker -p (inherit across exec)
     {
         const char *ls = hl_option_get("HL_LOWER"); // overlay lower layers (inherit across exec)

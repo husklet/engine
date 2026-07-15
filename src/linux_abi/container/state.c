@@ -5,6 +5,7 @@
 #include "../limits.h"
 #include "../../host/system.h"
 #include "key.h"
+#include "ports.h"
 
 // HL_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
@@ -770,25 +771,17 @@ static void newfile_stamp_path(const char *hostpath, int nofollow) {
 
 // ---- NET ns Phase 1: port-map (docker run -p H:C). bind(:C) actually binds the host port :H;
 // getsockname reports :C back so the guest sees the port it asked for. {cport->hport} table.
-static struct {
-    uint16_t cport, hport;
-} g_portmap[32];
-
-static int g_nportmap = 0;
+static hl_linux_ports g_ports;
 // fd -> the container port it bound (for getsockname)
 static uint16_t g_fd_cport[HL_NFD];
 
-static uint16_t pm_host(uint16_t c) {
-    for (int i = 0; i < g_nportmap; i++)
-        if (g_portmap[i].cport == c) return g_portmap[i].hport;
-    return c;
-}
+static uint16_t pm_host(uint16_t c) { return hl_linux_ports_host(&g_ports, c); }
 
 // "H:C,H:C,..." (docker -p order: host:container). Ports are strictly validated (1..65535);
 // a bad field or more than the cap of entries is an error, not a silent drop.
 static void parse_publish(const char *s) {
     while (s && *s) {
-        if (g_nportmap >= 32) {
+        if (hl_linux_ports_count(&g_ports) >= HL_LINUX_PORT_CAPACITY) {
             fprintf(stderr, "hl-engine: too many HL_PUBLISH entries (max 32)\n");
             exit(2);
         }
@@ -800,9 +793,7 @@ static void parse_publish(const char *s) {
         }
         unsigned h = hl_parse_port_field("HL_PUBLISH host port", s, colon);
         unsigned cc = hl_parse_port_field("HL_PUBLISH container port", colon + 1, comma);
-        g_portmap[g_nportmap].cport = (uint16_t)cc;
-        g_portmap[g_nportmap].hport = (uint16_t)h;
-        g_nportmap++;
+        if (hl_linux_ports_add(&g_ports, (uint16_t)h, (uint16_t)cc) != 0) exit(2);
         if (!comma) break;
         s = comma + 1;
     }
