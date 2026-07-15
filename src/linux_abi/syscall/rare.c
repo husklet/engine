@@ -574,7 +574,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // mlockall/munlockall. macOS has no mlockall(2), but it DOES have mlock(2), so we wire the pages for real
     // over the guest's tracked mappings instead of only tracking state: MCL_CURRENT host-mlocks every current
-    // guest range (mlk_wire_current); MCL_FUTURE arms the registry so each fresh mmap (mem.c case 222) is
+    // guest range (hl_gmap_lock_wire_current); MCL_FUTURE arms the registry so each fresh mmap (mem.c case 222) is
     // wired on creation. The lock STATE stays reported via /proc VmLck:/smaps Locked: (LTP
     // munlockall01). `flags` is validated exactly as Linux (mm/mlock.c): flags==0, any unknown bit, or
     // MCL_ONFAULT without MCL_CURRENT|MCL_FUTURE -> EINVAL. (MCL_CURRENT=1 MCL_FUTURE=2 MCL_ONFAULT=4.)
@@ -593,7 +593,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;
         }
-        if (f & 1u) mlk_wire_current(); // MCL_CURRENT: wire every existing mapping resident now
+        if (f & 1u) hl_gmap_lock_wire_current(); // MCL_CURRENT: wire every existing mapping resident now
         hl_gmap_lock_all((f & 2u) != 0);
         G_RET(c) = 0;
         break;
