@@ -353,7 +353,7 @@ void hl_fdcache_access_store(const char *p, int rc) {
     CUL;
 }
 
-void ac_evict(const char *p) {
+void hl_fdcache_access_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -763,7 +763,7 @@ void hl_fdcache_fd_clear(int fd) {
 // idiom of a dir-fd + final component (resolved to its host path via F_GETPATH).
 void hl_fdcache_evict_path(const char *hp) {
     mc_evict(hp);
-    ac_evict(hp);
+    hl_fdcache_access_evict(hp);
     hl_fdcache_readlink_evict(hp);
 }
 

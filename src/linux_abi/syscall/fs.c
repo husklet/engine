@@ -961,7 +961,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
                     mc_evict(hp);
-                    ac_evict(hp);
+                    hl_fdcache_access_evict(hp);
                     if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
                 }
             }
@@ -974,7 +974,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int r = mknodat(ATFD(a0), p, (mode_t)a2, (dev_t)a3);
         if (r >= 0) {
             mc_evict(p);
-            ac_evict(p);
+            hl_fdcache_access_evict(p);
             if (newfile_stamp_wanted()) newfile_stamp_path(p, 1);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -1016,7 +1016,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
                     mc_evict(hp);
-                    ac_evict(hp);
+                    hl_fdcache_access_evict(hp);
                     if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
                 }
             }
@@ -1030,7 +1030,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int r = mkdirat(ATFD(a0), p, (mode_t)a2);
         mc_evict(p);
         // namespace change -> evict
-        ac_evict(p);
+        hl_fdcache_access_evict(p);
         if (r >= 0 && newfile_stamp_wanted()) newfile_stamp_path(p, 1);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -1143,7 +1143,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // (mirrors the non-overlay branch below). Without this a removed upper entry kept reporting as
             // present via a stale mc_ hit even though it no longer appears in a readdir.
             mc_evict(host);
-            ac_evict(host);
+            hl_fdcache_access_evict(host);
             hl_fdcache_readlink_evict(host);
             // hardlink coherence: removing one link drops the sibling links' nlink -- evict their cached
             // stats by inode (lst was captured before the removal, so nlink>=2 means aliases still exist).
@@ -1175,7 +1175,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
                     mc_evict(hp);
-                    ac_evict(hp);
+                    hl_fdcache_access_evict(hp);
                     hl_fdcache_readlink_evict(hp);
                 }
             }
@@ -1199,7 +1199,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         int r = unlinkat(ATFD(a0), p, (a2 & 0x200) ? AT_REMOVEDIR : 0);
         mc_evict(p);
-        ac_evict(p);
+        hl_fdcache_access_evict(p);
         hl_fdcache_readlink_evict(p);
         if (r >= 0 && aino) memf_try_adopt(adev, aino);
         if (r >= 0 && nlink >= 2) hl_fdcache_metadata_evict_inode((dev_t)ps.st_dev, (ino_t)ps.st_ino);
@@ -1415,7 +1415,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, ofin) == 0) {
                     mc_evict(hp);
-                    ac_evict(hp);
+                    hl_fdcache_access_evict(hp);
                 }
             }
             int r = renameatx_np(opfd, ofin, npfd, nfin, rxflags), e = errno;
@@ -2498,7 +2498,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if (isw) {
                         mc_evict(gpa);
                         hl_fdcache_readlink_evict(gpa);
-                        ac_evict(gpa);
+                        hl_fdcache_access_evict(gpa);
                     }
                 }
                 // Remember the guest dir for merged getdents. Derive it from the fd's CANONICAL host path
@@ -2557,7 +2557,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if (lf & 3) { // write-open: keep the metadata caches coherent (same as the walk path)
                         mc_evict(hostc);
                         hl_fdcache_readlink_evict(hostc);
-                        ac_evict(hostc);
+                        hl_fdcache_access_evict(hostc);
                     }
                 }
                 G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
@@ -2627,7 +2627,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         mc_evict(gp);
                         hl_fdcache_readlink_evict(gp);
-                        ac_evict(gp);
+                        hl_fdcache_access_evict(gp);
                     }
                     // W4D: memoize this walk's result (gp = F_GETPATH = canonical in-jail host path) so the
                     // next open of the same guest path is a single open(). hl_fdcache_open_store re-checks
@@ -2653,7 +2653,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                 mc_evict(p);
                 hl_fdcache_readlink_evict(p);
-                ac_evict(p);
+                hl_fdcache_access_evict(p);
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
