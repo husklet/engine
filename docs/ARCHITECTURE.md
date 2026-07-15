@@ -38,8 +38,9 @@ archives; shrinking the two target roots must preserve both guest ISAs and the p
 macOS and Linux AArch64 are production hosts. Their packaged activation archives contain both Linux guest ISAs and are
 executed end to end by the C and Rust behavioral gates. The unity roots still reach host mechanisms directly,
 including Mach fault and process inspection, `kqueue`/`epoll`, JIT write protection, instruction-cache maintenance,
-and parts of fork and signal handling. The translator cache also constructs a concrete host backend instead of
-receiving the engine's selected services. Those paths are implementation debt, not exceptions to the boundary rules.
+and parts of fork and signal handling. The translator cache receives the engine's bound services and routes code
+mapping, publication, clocks, and persistence through their typed groups. Remaining direct host paths are
+implementation debt, not exceptions to the boundary rules.
 
 ## Rebranding
 
