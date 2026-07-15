@@ -338,9 +338,8 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
 
-# Truthful Linux-host compile/link gate. This covers every currently portable engine, translator,
-# Linux ABI, common-host, and Linux-host unit. The production unity JIT remains macOS-only and is
-# deliberately excluded until its remaining Mach, libkern, and kqueue dependencies are extracted.
+# Linux-host compile/link gate for the independently compiled libraries, Linux provider, and runner.
+# Full production runtime behavior is covered separately by test-linux-production-typed.
 linux-compile: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(BUILD)/lib/libhl-host-linux.a $(BUILD)/bin/hl-engine-runner \
 	$(BUILD)/tests/linux
@@ -2204,7 +2203,7 @@ clean:
 
 help:
 	@echo 'make all           build pure-C static libraries and runner'
-	@echo 'make linux-compile compile/link every portable unit and Linux host (not the macOS-only unity JIT)'
+	@echo 'make linux-compile compile/link the independent libraries, Linux provider, and runner'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
 	@echo 'make sanitize      run the complete C unit graph under ASan and UBSan'
 	@echo 'make compat-build  compile every Linux behavior fixture'

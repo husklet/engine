@@ -33,6 +33,14 @@ jobs:
       - name: Test engine
         run: nix flake check --print-build-logs
 
+      - name: Test Linux compatibility
+        if: runner.os == 'Linux'
+        run: nix develop --command make -s -j2 test-linux-production-typed
+
+      - name: Test macOS compatibility
+        if: runner.os == 'macOS'
+        run: nix develop --command make -s -j2 e2e-compat
+
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
 
