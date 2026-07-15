@@ -56,8 +56,8 @@ void jit_guest_bus_transition_end(void *opaque) {
 #if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
 /* GCC has no AArch64 naked-function implementation.  Assembly symbols keep
    the host boundary free of a compiler-generated frame. */
-void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
-void block_return(void) __attribute__((visibility("hidden")));
+extern void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
+extern void block_return(void) __attribute__((visibility("hidden")));
 __asm__(".pushsection .text\n.p2align 2\n.hidden run_block\n.type run_block,%function\nrun_block:\n"
         "str x19,[x0,#288]\nstr x20,[x0,#296]\nstr x21,[x0,#304]\nstr x22,[x0,#312]\n"
         "str x23,[x0,#320]\nstr x24,[x0,#328]\nstr x25,[x0,#336]\nstr x26,[x0,#344]\n"

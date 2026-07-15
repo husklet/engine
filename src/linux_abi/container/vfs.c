@@ -2266,22 +2266,38 @@ static struct {
     char path[32];
 } g_procfd_dirs[64];
 
-static void procfd_dir_rm(const char *path) {
-    DIR *d = opendir(path);
-    if (d) {
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
-            char p[160];
-            snprintf(p, sizeof p, "%s/%s", path, e->d_name);
-            if (e->d_type == DT_DIR)
-                procfd_dir_rm(p); // per-pid dirs nest a task/<tid>/ subtree
-            else
-                unlink(p);
-        }
-        closedir(d);
+static void procfd_dir_empty(int fd) {
+    int scan = dup(fd);
+    if (scan < 0) return;
+    DIR *d = fdopendir(scan);
+    if (!d) {
+        close(scan);
+        return;
     }
-    rmdir(path);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]))) continue;
+        if (e->d_type == DT_DIR || e->d_type == DT_UNKNOWN) {
+            int child = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child >= 0) {
+                procfd_dir_empty(child); // per-pid dirs nest a task/<tid>/ subtree
+                close(child);
+                (void)unlinkat(fd, e->d_name, AT_REMOVEDIR);
+                continue;
+            }
+        }
+        (void)unlinkat(fd, e->d_name, 0);
+    }
+    closedir(d);
+}
+
+static void procfd_dir_rm(const char *path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+        procfd_dir_empty(fd);
+        close(fd);
+    }
+    (void)rmdir(path);
 }
 
 static void procfd_dirs_reap(int force) {
@@ -3872,6 +3888,11 @@ static int synth_misc_dir_open(const char *gp) {
 // bits, most-significant group first, comma-separated. `all` -> every online CPU set; else just bit `bit`.
 // `ndig` is the low-group width the kernel pads to for this machine (DIV_ROUND_UP(nc,4)); e.g. nc=18 -> 5.
 static void cpumask_hex(char *out, size_t n, int nc, int all, int bit, int ndig) {
+    if (!out || n == 0) return;
+    if (nc < 1) nc = 1;
+    if (nc > 64) nc = 64;
+    if (ndig < 1) ndig = 1;
+    if (ndig > 8) ndig = 8;
     unsigned long long v = all ? (nc >= 64 ? ~0ULL : ((1ULL << nc) - 1ULL)) : (1ULL << (bit & 63));
     if (nc <= 32) {
         snprintf(out, n, "%0*llx", ndig, v & 0xffffffffULL);

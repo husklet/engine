@@ -671,7 +671,7 @@ static struct {
 
 static uint64_t g_nfreed_total;
 
-static void cache_oom_abort(void);
+static _Noreturn void cache_oom_abort(void);
 static void jit_flush_to_fresh(void);
 
 int jit_pc_in_retained_cache(uint64_t pc) {
@@ -980,9 +980,10 @@ static void retire_current(void) {
 // A fresh cache could not be allocated and the peers are quiesced IN / parked ON the current cache, so
 // reusing it in place would corrupt them on resume. Reclamation has already freed everything safe to free,
 // so we cannot proceed -- abort cleanly rather than corrupt guest state.
-static void cache_oom_abort(void) {
+static _Noreturn void cache_oom_abort(void) {
     static const char msg[] = "hl-engine: JIT code cache exhausted (out of VA for a fresh cache under threads)\n";
-    write(2, msg, sizeof msg - 1);
+    ssize_t ignored = write(STDERR_FILENO, msg, sizeof msg - 1);
+    (void)ignored;
     _exit(70);
 }
 

@@ -2,7 +2,11 @@
 // IC, exit trampolines, block chaining. The engine's emission semantics, built on the host ARM64 assembler
 // (host/arm64/asm.c, #included before this file). Split out of the former engine/emit_arm64.c (C7).
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+extern void block_return(void) __attribute__((visibility("hidden")));
+#else
 static void block_return(void);
+#endif
 // No host register is permanently reserved, so ALL 31 guest GPRs (incl. x28) live
 // in the real registers during a block. The cpu pointer is recovered from this
 // global only at block boundaries (set by the dispatcher before each run_block).

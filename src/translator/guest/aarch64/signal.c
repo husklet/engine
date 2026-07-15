@@ -114,7 +114,11 @@ static void do_sigreturn(struct cpu *c) {
 // cpu, leaving the stolen regs untouched. block_return (jit/dispatch.c, included later) unwinds a block back
 // to the dispatcher: it restores the host callee-saved state run_block saved at block entry and returns to
 // the run_guest loop, which then sees cpu->pc == handler and runs it.
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+extern void block_return(void) __attribute__((visibility("hidden")));
+#else
 static void block_return(void);
+#endif
 
 static int sigframe_capture_fault(struct cpu *c, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;

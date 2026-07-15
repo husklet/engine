@@ -104,7 +104,11 @@ static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 #define g_reloc (g_reloc_table.records)
 #define g_nreloc (g_reloc_table.count)
 
-static void block_return(void); // engine trampoline (also forward-declared in stubs.c)
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+extern void block_return(void) __attribute__((visibility("hidden")));
+#else
+static void block_return(void);
+#endif
 
 static void pc_reloc_add(uint32_t off, uint8_t kind, uint8_t rd, uint16_t slot) {
     if (!hl_reloc_add(&g_reloc_table, off, (uint32_t)kind | ((uint32_t)rd << 8) | ((uint32_t)slot << 16))) {

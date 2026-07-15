@@ -3938,9 +3938,10 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
 /* GCC ignores naked on AArch64 functions.  Define the two ABI trampolines as
    assembler functions so no compiler-generated prologue can corrupt SP or the
    callee-saved register image. */
-static void run_block(struct cpu *cpu, void *code);
-static void block_return(void);
+extern void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
+extern void block_return(void) __attribute__((visibility("hidden")));
 __asm__(
+    ".hidden run_block\n"
     ".type run_block, %function\n"
     "run_block:\n"
     "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
@@ -3950,6 +3951,7 @@ __asm__(
     "str q12,[x0,#336]\n str q13,[x0,#352]\n str q14,[x0,#368]\n str q15,[x0,#384]\n"
     "mov x9,sp\n str x9,[x0,#168]\n br x1\n"
     ".size run_block, .-run_block\n"
+    ".hidden block_return\n"
     ".type block_return, %function\n"
     "block_return:\n"
     "ldr x19,[x28,#176]\n ldr x20,[x28,#184]\n ldr x21,[x28,#192]\n ldr x22,[x28,#200]\n"

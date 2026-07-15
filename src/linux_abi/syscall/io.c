@@ -166,7 +166,9 @@ static void engine_fd_reloc(int *slot, int newfd) {
 //     same async delivery path POSIX timers/timerfd use (g_pending + the signalfd wake). One-shot by
 //     default; re-armed each event only when DN_MULTISHOT is set.
 #define DN_SIG_DEFAULT 29 // Linux SIGIO
+#ifndef DN_MULTISHOT
 #define DN_MULTISHOT 0x80000000u
+#endif
 #define DN_VALID (1u | 2u | 4u | 8u | 16u | 32u | DN_MULTISHOT) // ACCESS/MODIFY/CREATE/DELETE/RENAME/ATTRIB
 
 static int8_t g_lease[HL_NFD];     // 0 = no lease; else lease type + 1 (F_RDLCK 0->1, F_WRLCK 1->2, F_UNLCK 2->3)

@@ -643,7 +643,11 @@ static int64_t sext(uint64_t v, int bits) {
     return (int64_t)((v ^ m) - m);
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+extern void block_return(void) __attribute__((visibility("hidden")));
+#else
 static void block_return(void);
+#endif
 
 // ---------------- prologue / spill / exits ----------------
 // Prologue: entered x0 = &cpu. Pin cpu in x28, restore flags + 16 guest GPRs (x0 last).

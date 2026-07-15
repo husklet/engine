@@ -52,7 +52,10 @@ static int unix_sock_at(int fd, const char *host, int connecting) {
     if (fchdir(pfd) == 0) {
         rc = connecting ? connect(fd, (struct sockaddr *)&un, sizeof un) : bind(fd, (struct sockaddr *)&un, sizeof un);
         e = errno;
-        fchdir(cwd);
+        if (fchdir(cwd) != 0) {
+            rc = -1;
+            e = errno;
+        }
     } else {
         e = errno;
     }
@@ -100,7 +103,10 @@ static int64_t unix_dgram_sendmsg_at(int fd, const char *host, struct msghdr *mh
         mh->msg_namelen = sizeof un;
         rc = sendmsg(fd, mh, flags);
         e = errno;
-        fchdir(cwd);
+        if (fchdir(cwd) != 0) {
+            rc = -1;
+            e = errno;
+        }
     } else {
         e = errno;
     }
@@ -677,7 +683,9 @@ static int tcp_opt_l2m(int o) {
 // so each container's localhost is isolated from the host + other containers. 0.0.0.0/external stay
 // host-passthrough (so `-p` publishing still works). Off when g_netns[0]==0.
 // host dir for this container's loopback unix sockets ("" = no isolation)
-static char g_netns[200];
+// Both names are generated internally from a fixed prefix plus at most 40 identifier bytes.  Keeping
+// the declared bound honest proves every derived AF_UNIX rendezvous name fits sun_path.
+static char g_netns[64];
 // fd -> the loopback port it's bound/connected to (0 = not a private-lo socket)
 static uint16_t g_lo_port[HL_NFD];
 // fd -> 1 if this private-lo socket is AF_INET6 (so getsockname/getpeername/accept report a sockaddr_in6
@@ -979,7 +987,7 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // is keyed by <netid> (mode 0700, the guest is path-jailed) so other networks never share sockets. The
 // 127/8 loopback path (g_netns / lo_*) is untouched and stays per-container; only non-127 in-subnet
 // AF_INET is bridged. Off when g_netbr[0]==0 || g_myip==0.
-static char g_netbr[200];          // shared per-network rendezvous dir ("" = bridge off)
+static char g_netbr[64];           // shared per-network rendezvous dir ("" = bridge off)
 static uint32_t g_myip;            // this endpoint's IP, network byte order (0 = unset)
 static uint16_t g_br_port[HL_NFD]; // fd -> virtual port of a bridge socket (0 = not a bridge socket)
 static uint32_t g_br_ip[HL_NFD];   // fd -> virtual IP (network order) reported via getsockname/getpeername
@@ -1329,7 +1337,12 @@ static int switch_dial(const char *path) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof un.sun_path, "%s", path);
+    size_t path_len = strlen(path);
+    if (path_len >= sizeof un.sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(un.sun_path, path, path_len + 1);
     for (int attempt = 0; attempt < 60; attempt++) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return -1;
@@ -1488,7 +1501,15 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
     struct sockaddr_un gu;
     memset(&gu, 0, sizeof gu);
     gu.sun_family = AF_UNIX;
-    snprintf(gu.sun_path, sizeof gu.sun_path, "%s", f->upath);
+    size_t upath_len = strlen(f->upath);
+    if (upath_len >= sizeof gu.sun_path) {
+        close(gs);
+        unlink(un.sun_path);
+        if (!appended) f->npeers--;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(gu.sun_path, f->upath, upath_len + 1);
     if (connect(gs, (struct sockaddr *)&gu, sizeof gu) < 0) {
         close(gs);
         unlink(un.sun_path);
@@ -1633,6 +1654,11 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
     } else {
         return 0;
     }
+    size_t up_len = strlen(up);
+    if (up_len >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        *out = -ENAMETOOLONG;
+        return 1;
+    }
     if (udp_swap(fd) < 0) {
         *out = -errno;
         return 1;
@@ -1641,7 +1667,7 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
     struct sockaddr_un un;
     memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+    memcpy(un.sun_path, up, up_len + 1);
     int r = bind(fd, (struct sockaddr *)&un, sizeof un);
     if (r == 0) {
         if (myip) {
