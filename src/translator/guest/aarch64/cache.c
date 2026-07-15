@@ -208,7 +208,12 @@ static uint64_t pcache_id_of(const char *path) {
 // transparently (old files just go unreferenced; harmless cruft in the cache dir).
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
-    return hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
+    uint64_t build = hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
+    uint64_t modes = (uint64_t)(g_guestfold != 0) | ((uint64_t)(g_steal1617 != 0) << 1) |
+                     ((uint64_t)(g_noibslim != 0) << 2) | ((uint64_t)(g_mtibtc != 0) << 3) |
+                     ((uint64_t)(g_futexq != 0) << 4) | ((uint64_t)(g_no_stw_reclaim != 0) << 5) |
+                     ((uint64_t)(g_prof != 0) << 6) | ((uint64_t)(uint32_t)g_fwdskip << 32);
+    return hl_identity_configuration(build, 1, 1, modes);
 }
 
 // Hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs DIFFERENT code

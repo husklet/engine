@@ -53,6 +53,13 @@ int main(void) {
     HL_CHECK(hl_identity_name("/usr/local/bin/busybox") == busybox);
     HL_CHECK(hl_identity_name("/bin/sh") != busybox);
     HL_CHECK(hl_identity_mix(1, 2, 3, 4) == ((1ull ^ (2ull * 1099511628211ull)) ^ 3ull ^ (4ull * 0x100000001B3ull)));
+    {
+        uint64_t configuration = hl_identity_configuration(11, 1, 1, 0);
+        HL_CHECK(hl_identity_configuration(12, 1, 1, 0) != configuration);
+        HL_CHECK(hl_identity_configuration(11, 2, 1, 0) != configuration);
+        HL_CHECK(hl_identity_configuration(11, 1, 2, 0) != configuration);
+        HL_CHECK(hl_identity_configuration(11, 1, 1, 1) != configuration);
+    }
     for (size_t index = 0; index < HL_ARRAY_COUNT(fields); ++index) {
         expected ^= fields[index];
         expected *= UINT64_C(1099511628211);

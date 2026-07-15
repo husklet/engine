@@ -852,6 +852,8 @@ static void s1_calibrate(void) {
     uint64_t freq;
     hl_host_result effective_frequency;
     const hl_host_services *host = effective_host_services();
+    g_fastsys = 1;
+    g_fastclk = 1;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     if (!freq) {
         g_fastsys = 0; // no readable counter frequency -> safe fallback

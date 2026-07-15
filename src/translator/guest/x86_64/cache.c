@@ -141,11 +141,14 @@ static uint64_t pcache_id_of(const char *path) {
 // stale files become unreferenced automatically when the engine build changes.
 static uint64_t pcache_engine_id(void) {
     uint64_t h = 1469598103934665603ull;
+    uint64_t modes;
     for (const char *p = __DATE__ " " __TIME__; *p; p++) {
         h ^= (uint8_t)*p;
         h *= 1099511628211ull;
     }
-    return h;
+    modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) |
+            ((uint64_t)(g_siginline != 0) << 2) | ((uint64_t)(slimsys_on() != 0) << 3);
+    return hl_identity_configuration(h, 2, 1, modes);
 }
 
 // hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs a DIFFERENT

@@ -354,8 +354,6 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     c.r[RDX] = 0;                                             // rtld_fini = 0
     c.rip = jump;
 
-    s1_calibrate(); // S1: anchor CNTVCT vs host REALTIME/MONOTONIC for the inline time fast path
-                    // (also honors HL_NOFASTSYS=1 for the conservative syscall path)
     proc_reg_publish(g_exe_path, argc, argv); // publish this process into the /proc table
     if (g_untrusted) sentry_init();           // fork the host-authority sentry + (optionally) confine the worker
     run_guest(&c);
@@ -428,6 +426,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     struct loaded lm, li;
     uint64_t jump, at_base;
     int have_interp;
+    /* Calibration selects emitted code, so it must precede cache identity
+       construction and lookup. */
+    s1_calibrate();
     load_program(argv[0], &lm, &li, &jump, &at_base, &have_interp); // (sets g_pc_binid + fixed bases when g_pcache)
     if (g_pcache) {
         g_pc_entry = jump;

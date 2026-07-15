@@ -66,3 +66,14 @@ uint64_t hl_identity_source(const hl_host_services *services, const char *path) 
 uint64_t hl_identity_mix(uint64_t program, uint64_t interpreter, uint64_t engine, uint64_t name) {
     return (program ^ (interpreter * HL_IDENTITY_PRIME)) ^ engine ^ (name * HL_IDENTITY_PRIME);
 }
+
+uint64_t hl_identity_configuration(uint64_t build, uint32_t guest_isa, uint32_t host_isa, uint64_t modes) {
+    uint64_t value = HL_IDENTITY_SEED;
+    const uint64_t fields[] = {build, guest_isa, host_isa, modes};
+    size_t index;
+    for (index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index) {
+        value ^= fields[index];
+        value *= HL_IDENTITY_PRIME;
+    }
+    return value;
+}
