@@ -667,6 +667,16 @@ int main(void) {
     HL_CHECK(metadata.modified_ns != 0 && metadata.accessed_ns != 0 && metadata.changed_ns != 0);
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     {
+        hl_host_result path_handle =
+            services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, moved_path, strlen(moved_path),
+                                         HL_HOST_FILE_PATH_ONLY, 0, 0);
+        HL_CHECK(path_handle.status == HL_STATUS_OK);
+        HL_CHECK(services.file->set_permissions(services.context, path_handle.value, 0640).status == HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, path_handle.value, &metadata).status == HL_STATUS_OK &&
+                 (metadata.permissions & 0777u) == 0640u);
+        HL_CHECK(services.file->close(services.context, path_handle.value).status == HL_STATUS_OK);
+    }
+    {
         char replacement[11];
         int descriptor = open(path, O_RDONLY);
         HL_CHECK(descriptor >= 0 &&

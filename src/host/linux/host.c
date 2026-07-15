@@ -1301,8 +1301,11 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* File-service path handles are deliberately opened with O_PATH. fchmod(2) rejects those descriptors;
+       operate on the pinned object through the empty relative path instead, preserving the handle identity
+       without resolving the caller's original pathname again. */
     do
-        status = fchmod(descriptor, (mode_t)permissions);
+        status = fchmodat(descriptor, "", (mode_t)permissions, AT_EMPTY_PATH);
     while (status != 0 && errno == EINTR);
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
