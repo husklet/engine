@@ -708,16 +708,20 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
-    size_t count, excluded, index;
-    if (argc != 7) {
+    size_t count, excluded, index, selected = 0;
+    const char *only = argc == 8 ? argv[7] : NULL;
+    if (argc != 7 && argc != 8) {
         fprintf(
             stderr,
-            "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT\n");
+            "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT "
+            "[CASE]\n");
         return 2;
     }
     if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
     for (index = 0; index < count; ++index) {
         capture a = {0}, x = {0};
+        if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
+        selected++;
         if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
             run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {
             capture_free(&a);
@@ -739,6 +743,10 @@ int main(int argc, char **argv) {
         capture_free(&a);
         capture_free(&x);
     }
-    printf("matrix-runner: %zu active cases passed; %zu manifest cases excluded\n", count, excluded);
+    if (only != NULL && selected == 0) {
+        fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
+        return 2;
+    }
+    printf("matrix-runner: %zu active cases passed; %zu manifest cases excluded\n", selected, excluded);
     return 0;
 }
