@@ -84,7 +84,7 @@ static void e_mul_oc_narrow(int prod, int k, int w) {
 // count OF is undefined and left unchanged. `res` holds the rotated value in its low `width` bits. We
 // rewrite only stored-C (bit29 = NOT CF, the borrow convention) and V (bit28 = OF), preserving N/Z and the
 // PF/AF lanes. `cnt` is the (already masked, nonzero) immediate count -> OF written iff cnt==1. Scratch x18..x23.
-static void e_rot_flags_const(int res, int k, int width, int cnt) {
+void e_rot_flags_const(int res, int k, int width, int cnt) {
     int wsf = width == 64;
     e_ldr(18, 28, OFF_NZCV);
     e_lsr_i(20, res, k == 1 ? width - 1 : 0, wsf);
@@ -116,7 +116,7 @@ static void e_rot_flags_const(int res, int k, int width, int cnt) {
 // ROL/ROR by CL: like e_rot_flags_const but the count is runtime (n = CL & (width-1)). When n==0 x86
 // changes NO flags, so keep the old NZCV; otherwise set CF (and OF via the 1-bit formula -- for n>1 OF is
 // x86-undefined, so emitting that legal value is fine). Reads CL (RCX); scratch x18..x25.
-static void e_rot_flags_cl(int res, int k, int width) {
+void e_rot_flags_cl(int res, int k, int width) {
     int wsf = width == 64;
     // "flags affected?" is decided by the 5-bit (0x1f) / 6-bit (0x3f, REX.W) masked count -- NOT the
     // rotate amount (count MOD width). For 8/16-bit rotates these differ: e.g. `rolb %cl` with CL=8 rotates
@@ -155,7 +155,7 @@ static void e_rot_flags_cl(int res, int k, int width) {
 
 // Set x86 OF (= ARM V, bit28) of the stored NZCV to the 0/1 in `ofreg` (read-modify-write; the prior flag
 // save left V=0). Used by the 1-bit SHL/SHR paths where OF is x86-defined. `ofreg` must not be x20/x23.
-static void e_nzcv_set_of(int ofreg) {
+void e_nzcv_set_of(int ofreg) {
     e_ldr(20, 28, OFF_NZCV);
     e_movconst(23, 1u << 28);
     e_rrr(A_BIC, 20, 20, 23, 1, 0);     // clear V
@@ -289,7 +289,7 @@ void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17
 // affected, with SF/ZF/PF preserved. Carry-in is taken from cpu->nzcv (stored ARM C = NOT x86 CF; the
 // lazy-flag pre-pass has already materialized any pending producer), the result and the new CF/OF are
 // emitted with compile-time-constant shifts, and CF/OF are written back to cpu->nzcv. Scratch x19..x24.
-static void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_raw) {
+void emit_rcl_rcr(struct insn *I, uint64_t next, int w, int rcr, int cnt_raw) {
     int ssf = (w >= 4) ? (w == 8) : 1; // operate 64-bit for byte/word (operand is zero-extended)
     int W = 8 * w, bw = ssf ? 64 : 32;
     int ec = (w < 4) ? (cnt_raw % (W + 1)) : cnt_raw; // effective rotate through the (W+1)-bit value
@@ -567,7 +567,7 @@ static void e_nzcv_C_op(uint32_t alu_base) {
 
 // Stash the x86 PF source: the low byte of an integer op's result (the consumer computes even-parity).
 // A non-flag str -> leaves the live ARM NZCV untouched (safe to interleave with the lazy-flag path).
-static void e_pf_save(int reg) {
+void e_pf_save(int reg) {
     if (g_pfaf_dead) return; // PF dead (next insn overwrites it) -- skip the store entirely
     e_str(reg, 28, OFF_PF);
 }

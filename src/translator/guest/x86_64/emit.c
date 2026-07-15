@@ -1,18 +1,19 @@
 // translator/guest/x86_64 -- arm64 host emitters + NEON/SSE encoders (xmm->v0..15) + x87 FPU stack
 // (ST(i) at double precision) + prologue/spill/exits.
 // ---------------- ARM64 instruction emitters ----------------
+#include "encoding.h"
 // (the same-ISA-independent half: these emit HOST code, copied from jit.c +
 //  a few width-typed loads/stores the x86 front-end needs.)
-static void emit32(uint32_t in) {
+void emit32(uint32_t in) {
     *(uint32_t *)g_cp = in;
     g_cp += 4;
 }
 
-static void e_str(int rt, int rn, int off) {
+void e_str(int rt, int rn, int off) {
     emit32(0xF9000000u | (((unsigned)off / 8) << 10) | (rn << 5) | rt);
 } // str x
 
-static void e_ldr(int rt, int rn, int off) {
+void e_ldr(int rt, int rn, int off) {
     emit32(0xF9400000u | (((unsigned)off / 8) << 10) | (rn << 5) | rt);
 } // ldr x
 
@@ -152,29 +153,18 @@ static void e_addi_s(int rd, int rn, unsigned imm12, int sf) { // adds rd, rn, #
     emit32((sf ? 0xB1000000u : 0x31000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
-static void e_subi_s(int rd, int rn, unsigned imm12, int sf) { // subs rd, rn, #imm (sets flags)
+void e_subi_s(int rd, int rn, unsigned imm12, int sf) { // subs rd, rn, #imm (sets flags)
     emit32((sf ? 0xF1000000u : 0x71000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
 // shifted-register 3-operand (LSL #amt) for add/sub/and/orr/eor and their S-forms.
-static void e_rrr(uint32_t base, int rd, int rn, int rm, int sf, int lsl) {
+void e_rrr(uint32_t base, int rd, int rn, int rm, int sf, int lsl) {
     emit32(base | (sf ? 0x80000000u : 0) | (rm << 16) | ((lsl & 0x3F) << 10) | (rn << 5) | rd);
 }
 
-#define A_ADD 0x0B000000u
-#define A_ADDS 0x2B000000u
-#define A_SUB 0x4B000000u
-#define A_SUBS 0x6B000000u
-#define A_AND 0x0A000000u
-#define A_ANDS 0x6A000000u
-#define A_ORR 0x2A000000u
-#define A_EOR 0x4A000000u
-#define A_ORN 0x2A200000u // orn (for mvn)
-#define A_BIC 0x0A200000u // bic (and-not)
-
 // nzcv scratch is x20 (a free callee-saved host reg, saved/restored by the trampoline),
 // NOT x16/x17 -- so x16(value)/x17(EA) stay usable across flag-setting mem-dest ops.
-static void e_nzcv_save(void) {
+void e_nzcv_save(void) {
     emit32(0xD53B4200u | 20);
     e_str(20, 28, OFF_NZCV);
 } // mrs x20,nzcv; str
@@ -233,7 +223,7 @@ static void e_nzcv_fix_c1(void) { // deferred logical op: x86 CF=0,OF=0 in the b
     emit32(0xD51B4200u | 20);       // msr nzcv, x20 (no membank store)
 }
 
-static void e_nzcv_save_setcf(int cfreg) { // save N/Z (from ARM nzcv), set stored C = NOT x86CF (cfreg holds 0/1)
+void e_nzcv_save_setcf(int cfreg) { // save N/Z (from ARM nzcv), set stored C = NOT x86CF (cfreg holds 0/1)
     // Capture NOT cf into x23 FIRST -- the mrs/movconst below clobber x20 and x22, so reading cfreg up
     // front lets the carry-VALUE live in x20 (the narrow_adcsbb caller passes cfreg==20).
     e_movconst(23, 1);
@@ -269,7 +259,7 @@ static void e_nzcv_save_keepC(void) { // inc/dec: take new N/Z/V, KEEP stored C 
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
 }
 
-static void e_lsr_i(int rd, int rn, int sh, int sf); // defined below; used by the PF helpers here
+void e_lsr_i(int rd, int rn, int sh, int sf); // defined below; used by the PF helpers here
 
 // COMISD/UCOMISD: x86 sets ZF=PF=CF=1 on unordered and SF=OF=0 always, but ARM FCMP encodes unordered
 // as N=0,Z=0,C=1,V=1. Our substrate maps x86 ZF->Z, x86 CF->NOT stored-C (borrow), x86 PF->V. So on
@@ -318,11 +308,11 @@ static void e_cset(int rd, int cond, int sf) { // cset rd, cond
     emit32((sf ? 0x9A9F07E0u : 0x1A9F07E0u) | (((cond ^ 1) & 0xF) << 12) | rd);
 }
 
-static void e_csel(int rd, int rn_t, int rm_f, int cond, int sf) {
+void e_csel(int rd, int rn_t, int rm_f, int cond, int sf) {
     emit32((sf ? 0x9A800000u : 0x1A800000u) | (rm_f << 16) | ((cond & 0xF) << 12) | (rn_t << 5) | rd);
 }
 
-static void e_uxt(int rd, int rn, int w) { // uxtb/uxth/uxtw (zero-extend reg)
+void e_uxt(int rd, int rn, int w) { // uxtb/uxth/uxtw (zero-extend reg)
     // w==1 -> uxtb, w==2 -> uxth, w>=4 -> uxtw (ubfm xd,xn,#0,#31). The uxtw case is needed by the
     // 32-bit unsigned DIV path (e_uxt(.., rmv, 4)): a bare uxth truncated the divisor to 16 bits.
     uint32_t b = w == 1 ? 0x12001C00u : w == 2 ? 0x12003C00u : 0xD3407C00u;
@@ -355,17 +345,17 @@ static void e_ldrs_w(int w, int rt, int rn, int to_x) {
 }
 
 // shift by immediate (UBFM/SBFM). sh in [0,31] (32-bit) or [0,63] (64-bit).
-static void e_lsl_i(int rd, int rn, int sh, int sf) {
+void e_lsl_i(int rd, int rn, int sh, int sf) {
     int w = sf ? 64 : 32, immr = (w - sh) & (w - 1), imms = w - 1 - sh;
     emit32((sf ? 0xD3400000u : 0x53000000u) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
 }
 
-static void e_lsr_i(int rd, int rn, int sh, int sf) {
+void e_lsr_i(int rd, int rn, int sh, int sf) {
     int imms = sf ? 63 : 31;
     emit32((sf ? 0xD3400000u : 0x53000000u) | (sh << 16) | (imms << 10) | (rn << 5) | rd);
 }
 
-static void e_asr_i(int rd, int rn, int sh, int sf) { // asr = SBFM rd,rn,#sh,#(w-1)
+void e_asr_i(int rd, int rn, int sh, int sf) { // asr = SBFM rd,rn,#sh,#(w-1)
     int imms = sf ? 63 : 31;
     emit32((sf ? 0x93400000u : 0x13000000u) | (sh << 16) | (imms << 10) | (rn << 5) | rd);
 }
@@ -376,14 +366,9 @@ void e_bfi(int rd, int rn, int lsb, int width, int sf) { // bfi rd,rn,#lsb,#widt
 }
 
 // variable shift (LSLV/LSRV/ASRV/RORV), count in rm (low bits used)
-static void e_shv(uint32_t base32, int rd, int rn, int rm, int sf) {
+void e_shv(uint32_t base32, int rd, int rn, int rm, int sf) {
     emit32(base32 | (sf ? 0x80000000u : 0) | (rm << 16) | (rn << 5) | rd);
 }
-
-#define S_LSLV 0x1AC02000u
-#define S_LSRV 0x1AC02400u
-#define S_ASRV 0x1AC02800u
-#define S_RORV 0x1AC02C00u
 
 static void e_mul(int rd, int rn, int rm, int sf) {
     emit32((sf ? 0x9B007C00u : 0x1B007C00u) | (rm << 16) | (rn << 5) | rd);
@@ -409,7 +394,7 @@ static void e_msub(int rd, int rn, int rm, int ra, int sf) {
     emit32((sf ? 0x9B008000u : 0x1B008000u) | (rm << 16) | (ra << 10) | (rn << 5) | rd);
 }
 
-static void e_ror_i(int rd, int rn, int sh, int sf) { // ror rd,rn,#sh  (EXTR rd,rn,rn,#sh)
+void e_ror_i(int rd, int rn, int sh, int sf) { // ror rd,rn,#sh  (EXTR rd,rn,rn,#sh)
     emit32((sf ? 0x93C00000u : 0x13800000u) | (rn << 16) | ((sh & (sf ? 63 : 31)) << 10) | (rn << 5) | rd);
 }
 
@@ -417,7 +402,7 @@ static void e_extr(int rd, int rn, int rm, int lsb, int sf) { // EXTR rd, rn, rm
     emit32((sf ? 0x93C00000u : 0x13800000u) | (rm << 16) | ((lsb & (sf ? 63 : 31)) << 10) | (rn << 5) | rd);
 }
 
-static void e_tst(int rn, int sf) {
+void e_tst(int rn, int sf) {
     emit32((sf ? 0xEA00001Fu : 0x6A00001Fu) | (rn << 16) | (rn << 5));
 } // ands xzr,rn,rn
 
@@ -792,7 +777,7 @@ static void emit_bus_guard_mem17(uint64_t size, int offset) {
         e_addi(17, 16, (unsigned)-offset, 1);
 }
 
-static void emit_exit_const(uint64_t rip, uint64_t reason) {
+void emit_exit_const(uint64_t rip, uint64_t reason) {
     // a plain R_SYSCALL exit skips the xmm spill WHEN cpu->V is current (cpu->vdirty==0); else
     // full. Runtime check (blocks chain without spilling). x16 is engine scratch here (guest is x0..x15).
     if (reason == R_SYSCALL && slimsys_on()) {

@@ -20,6 +20,8 @@ int xaludirect_on(void);
 void do_alu(int kind, int destination, int left, int right, int width);
 void narrow_adcsbb(int adc, int destination, int left, int right, int width);
 int lock_rmw(int kind, int width, int source);
+void emit_rcl_rcr(struct insn *insn, uint64_t next, int width, int rotate_right, int count);
+void emit_exit_const(uint64_t rip, uint64_t reason);
 
 void emit_ea(struct insn *insn, uint64_t next);
 void emit_ea_core(struct insn *insn, uint64_t next, int bias);
@@ -39,5 +41,24 @@ void e_mov_rr(int destination, int source, int sixty_four_bit);
 void e_sxt(int destination, int source, int width);
 void e_addi(int destination, int source, unsigned immediate, int sixty_four_bit);
 void e_subi(int destination, int source, unsigned immediate, int sixty_four_bit);
+void emit32(uint32_t instruction);
+void e_str(int source, int base, int offset);
+void e_ldr(int destination, int base, int offset);
+void e_uxt(int destination, int source, int width);
+void e_rrr(uint32_t instruction, int destination, int left, int right, int sixty_four_bit, int shift);
+void e_shv(uint32_t instruction, int destination, int source, int count, int sixty_four_bit);
+void e_ror_i(int destination, int source, int shift, int sixty_four_bit);
+void e_rot_flags_cl(int result, int kind, int width);
+void e_rot_flags_const(int result, int kind, int width, int count);
+void e_asr_i(int destination, int source, int shift, int sixty_four_bit);
+void e_lsl_i(int destination, int source, int shift, int sixty_four_bit);
+void e_lsr_i(int destination, int source, int shift, int sixty_four_bit);
+void e_tst(int source, int sixty_four_bit);
+void e_nzcv_save(void);
+void e_nzcv_save_setcf(int carry);
+void e_nzcv_set_of(int overflow);
+void e_pf_save(int source);
+void e_csel(int destination, int when_true, int when_false, int condition, int sixty_four_bit);
+void e_subi_s(int destination, int source, unsigned immediate, int sixty_four_bit);
 
 #endif
