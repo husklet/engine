@@ -2196,13 +2196,23 @@ static hl_host_result hl_linux_directory_read(void *context, hl_host_handle inst
             hl_linux_directory_watch *watch = hl_linux_directory_watch_for_id(object, event->wd);
             uint64_t token = watch == NULL ? 0 : watch->token;
             uint32_t changes = hl_linux_directory_changes(event->mask);
-            if (watch != NULL)
+            int oneshot = 0;
+            if (watch != NULL) {
                 changes = (changes & watch->interests) | (changes & HL_HOST_DIRECTORY_IGNORED);
+                oneshot = (watch->interests & HL_HOST_DIRECTORY_ONESHOT) != 0 &&
+                          (changes & ~(uint32_t)HL_HOST_DIRECTORY_IGNORED) != 0;
+                if (oneshot) changes |= HL_HOST_DIRECTORY_IGNORED;
+            } else {
+                changes = 0;
+            }
             if (changes != 0 && hl_linux_directory_append(object, (hl_host_directory_record){token, changes, 0}) != 0) {
                 pthread_mutex_unlock(&host->lock);
                 return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
             }
-            if ((event->mask & IN_IGNORED) != 0 && watch != NULL) {
+            if (oneshot) {
+                (void)inotify_rm_watch(entry->descriptor, watch->watch);
+                *watch = (hl_linux_directory_watch){-1, 0, 0, 0};
+            } else if ((event->mask & IN_IGNORED) != 0 && watch != NULL) {
                 *watch = (hl_linux_directory_watch){-1, 0, 0, 0};
             }
             offset += sizeof(*event) + event->len;
