@@ -16,7 +16,8 @@
 #include <unistd.h>
 
 #include "../host/child.h"
-#include "fork_wire.h"
+#include "fork_codec.h"
+#include "../host/fork_wire.h"
 //
 // WHY: per-launch wall is dominated by the irreducible per-process posix_spawn + dyld +
 // codesign-validation floor of the engine ITSELF (opt8 measured ~2 ms of a ~3-5 ms launch), paid on

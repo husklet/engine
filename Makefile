@@ -112,13 +112,13 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
 	src/linux_abi/fdcache.c \
-	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_wire.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
+	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_codec.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/shared.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
 	src/linux_abi/syscall/misc.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c \
 	src/host/macos/system.c
-COMMON_HOST_SOURCES := src/host/child.c src/host/private.c src/host/range.c src/host/resolve.c src/host/sync.c
+COMMON_HOST_SOURCES := src/host/child.c src/host/fork_wire.c src/host/private.c src/host/range.c src/host/resolve.c src/host/sync.c
 MAC_LINUX_ABI_SOURCES := $(LINUX_ABI_SOURCES)
 MAC_HOST_SOURCES := $(MACOS_HOST_SOURCES) $(COMMON_HOST_SOURCES) src/host/clock.c src/host/file.c
 MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
@@ -568,9 +568,11 @@ $(BUILD)/tests/test_seccomp_vm: tests/unit/test_seccomp_vm.c $(BUILD)/lib/libhl-
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -o $@
 
-$(BUILD)/tests/test_fork_wire: tests/unit/test_fork_wire.c $(BUILD)/lib/libhl-linux-abi.a
+$(BUILD)/tests/test_fork_wire: tests/unit/test_fork_wire.c $(BUILD)/lib/libhl-linux-abi.a \
+	$(PACKAGE_HOST_LIBRARY)
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -o $@
+	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Isrc/host -Itests/unit $(ENGINE_CFLAGS) $< \
+		$(BUILD)/lib/libhl-linux-abi.a $(PACKAGE_HOST_LIBRARY) -pthread -o $@
 
 $(BUILD)/tests/test_limits: tests/unit/test_limits.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)

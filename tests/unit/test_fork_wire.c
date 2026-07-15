@@ -1,5 +1,6 @@
 #include "test.h"
 
+#include "fork_codec.h"
 #include "fork_wire.h"
 
 #include <stdint.h>
