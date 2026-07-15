@@ -13,6 +13,8 @@
         let
           system = pkgs.stdenv.hostPlatform.system;
           runtimeHost = system == "aarch64-darwin" || system == "aarch64-linux";
+          linuxX86 = pkgs.pkgsCross.gnu64;
+          linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "hl-engine";
@@ -20,7 +22,9 @@
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
-              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools ];
+              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools ]
+              ++ pkgs.lib.optionals (system == "aarch64-linux") [ linuxX86.stdenv.cc ];
+            X86_64_LINUX_CC = if system == "aarch64-linux" then linuxX86Compiler else "x86_64-linux-gnu-gcc";
             enableParallelBuilding = true;
 
             buildPhase = ''
