@@ -579,6 +579,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     argc = (int)argument_count;
     hl_target_services_inject(&g_target_services, host);
     hl_gmap_bind_host(host);
+    futex_table_init(host);
     seq_ref_arena_init(host);
     eventfd_count_init(host);
     fdvis_init(host);
@@ -675,7 +676,6 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 #include "../../linux_abi/fork.c"
 
 void hl_target_runtime_init(void) {
-    futex_table_init();
     jit86_install_sync_fault_guards();
     poslk_init();
     ipc_init();

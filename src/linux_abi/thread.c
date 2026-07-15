@@ -117,10 +117,12 @@ static struct futex_bucket *g_fbk;
 static struct futex_bucket *g_fbk_private;
 static __thread struct futex_bucket *g_fbk_active;
 
-static struct futex_bucket *futex_table_alloc(int shared) {
+static struct futex_bucket *futex_table_alloc(const hl_host_services *host, int shared) {
     size_t sz = sizeof(struct futex_bucket) * FUTEX_NBUCKET;
-    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) abort();
+    void *mem = NULL;
+    if (hl_linux_memory_create(host, sz, shared ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE, &mem) !=
+        HL_STATUS_OK)
+        abort();
     struct futex_bucket *t = (struct futex_bucket *)mem;
     pthread_mutexattr_t ma;
     pthread_condattr_t ca;
@@ -138,10 +140,10 @@ static struct futex_bucket *futex_table_alloc(int shared) {
     return t;
 }
 
-static void futex_table_init(void) {
+static void futex_table_init(const hl_host_services *host) {
     if (g_fbk) return;
-    g_fbk = futex_table_alloc(1);
-    g_fbk_private = futex_table_alloc(0);
+    g_fbk = futex_table_alloc(host, 1);
+    g_fbk_private = futex_table_alloc(host, 0);
 }
 
 // A fork child inherits the private table's bytes, including locks that may have been held by a vanished
@@ -159,12 +161,6 @@ static void futex_private_table_after_fork(void) {
     }
     g_fbk_active = g_fbk_private;
 }
-
-#ifndef HL_EMBEDDED_BUILD
-__attribute__((constructor)) static void futex_table_ctor(void) {
-    futex_table_init();
-}
-#endif
 
 // ===================== shared-memory futex key (Linux "shared" futex semantics) =================
 // hl hashes a futex bucket by the WORD's host virtual address. That is exactly Linux's PRIVATE futex key

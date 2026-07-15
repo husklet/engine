@@ -25,6 +25,7 @@ typedef struct shared_host {
     uint32_t map_calls;
     uint32_t discard_calls;
     uint32_t release_calls;
+    uint32_t expected_flags;
     int owned;
 } shared_host;
 
@@ -35,7 +36,7 @@ static hl_host_result map_shared(void *opaque, uint64_t requested, uint64_t size
     assert(requested == 0);
     assert(size == 4096);
     assert(protection == (HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE));
-    assert(flags == HL_HOST_MEMORY_SHARED);
+    assert(flags == host->expected_flags);
     assert(output != NULL && output->abi == HL_HOST_MEMORY_MAPPING_ABI && output->size >= sizeof(*output));
     if (host->fault == FAULT_MAP) return (hl_host_result){HL_STATUS_OUT_OF_MEMORY, 0, 0, 0};
     if (host->fault == FAULT_NO_HANDLE) return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
@@ -84,6 +85,7 @@ static int run_fault(hl_host_services *services, shared_host *host, enum fault f
     void *output = (void *)(uintptr_t)1;
     memset(host, 0, sizeof(*host));
     host->fault = fault;
+    host->expected_flags = HL_HOST_MEMORY_SHARED;
     HL_CHECK(hl_linux_shared_create(services, 4096, &output) != HL_STATUS_OK);
     HL_CHECK(output == NULL && host->map_calls == 1 && host->discard_calls == (fault >= FAULT_DISCARD ? 1u : 0u));
     HL_CHECK(host->release_calls == releases);
@@ -110,11 +112,18 @@ int main(void) {
                                  .memory = &memory};
     void *output = NULL;
 
+    host.expected_flags = HL_HOST_MEMORY_SHARED;
     HL_CHECK(hl_linux_shared_create(&services, 4096, &output) == HL_STATUS_OK);
     HL_CHECK(output == host.address && !host.owned && host.discard_calls == 1 && host.release_calls == 0);
     for (size_t index = 0; index < 4096; ++index) HL_CHECK(((unsigned char *)output)[index] == 0);
     ((unsigned char *)output)[0] = 42;
     HL_CHECK(((unsigned char *)host.address)[0] == 42);
+    force_cleanup(&host);
+
+    memset(&host, 0, sizeof(host));
+    host.expected_flags = HL_HOST_MEMORY_PRIVATE;
+    HL_CHECK(hl_linux_memory_create(&services, 4096, HL_HOST_MEMORY_PRIVATE, &output) == HL_STATUS_OK);
+    HL_CHECK(output == host.address && !host.owned && host.discard_calls == 1);
     force_cleanup(&host);
 
     HL_CHECK(run_fault(&services, &host, FAULT_MAP, 0) == EXIT_SUCCESS);
@@ -129,5 +138,6 @@ int main(void) {
     HL_CHECK(hl_linux_shared_create(NULL, 4096, &output) == HL_STATUS_INVALID_ARGUMENT && output == NULL);
     HL_CHECK(hl_linux_shared_create(&services, 0, &output) == HL_STATUS_INVALID_ARGUMENT && output == NULL);
     HL_CHECK(hl_linux_shared_create(&services, 4096, NULL) == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(hl_linux_memory_create(&services, 4096, 0, &output) == HL_STATUS_INVALID_ARGUMENT);
     return EXIT_SUCCESS;
 }
