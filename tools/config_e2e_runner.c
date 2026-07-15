@@ -43,13 +43,14 @@ static int read_full(int fd, void *buffer, size_t size) {
     return 0;
 }
 
-static int make_config(const char *path, const char *guest, const char *result_path) {
+static int make_config(const char *path, const char *guest, const char *result_path, const char *cache_path) {
     static const char volume[] = "/tmp:/tmp";
     hl_launch_config config;
     size_t guest_size = strlen(guest) + 1;
     size_t volume_size = sizeof volume;
     size_t result_size = strlen(result_path) + 1;
-    size_t pool_size = 1 + guest_size + 1 + volume_size + result_size;
+    size_t cache_size = cache_path == NULL ? 0 : strlen(cache_path) + 1;
+    size_t pool_size = 1 + guest_size + 1 + volume_size + result_size + cache_size;
     char *pool = calloc(pool_size, 1);
     int fd;
     int result = -1;
@@ -67,6 +68,10 @@ static int make_config(const char *path, const char *guest, const char *result_p
     memcpy(pool + config.volumes_offset, volume, volume_size);
     config.result_path_offset = config.volumes_offset + (uint32_t)volume_size;
     memcpy(pool + config.result_path_offset, result_path, result_size);
+    if (cache_path != NULL) {
+        config.translation_cache_offset = config.result_path_offset + (uint32_t)result_size;
+        memcpy(pool + config.translation_cache_offset, cache_path, cache_size);
+    }
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) goto done;
     if (write_full(fd, &config, sizeof config) == 0 && write_full(fd, pool, pool_size) == 0) result = 0;
@@ -145,9 +150,10 @@ int main(int argc, char **argv) {
     char directory[1200];
     char path[1200];
     char result_path[1200];
+    const char *cache_path = NULL;
     int expected_exit, repetitions = 1;
-    if (argc != 5 && argc != 6) {
-        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [REPETITIONS]\n");
+    if (argc < 5 || argc > 7) {
+        fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [REPETITIONS [CACHE]]\n");
         return 2;
     }
     expected_exit = atoi(argv[4]);
@@ -158,6 +164,19 @@ int main(int argc, char **argv) {
         parsed = strtol(argv[5], &end, 10);
         if (errno != 0 || end == argv[5] || *end != 0 || parsed < 1 || parsed > 10000) return 2;
         repetitions = (int)parsed;
+    }
+    if (argc == 7) {
+        char *end = NULL;
+        long parsed;
+        errno = 0;
+        parsed = strtol(argv[5], &end, 10);
+        if (errno != 0 || end == argv[5] || *end != 0 || parsed < 1 || parsed > 10000) return 2;
+        repetitions = (int)parsed;
+        cache_path = argv[6];
+        if (mkdir(cache_path, 0700) != 0 && errno != EEXIST) {
+            perror("cache directory");
+            return 1;
+        }
     }
     if (getcwd(working_directory, sizeof working_directory) == NULL ||
         snprintf(directory, sizeof directory, "%s/.hl-config-e2e-XXXXXX", working_directory) >= (int)sizeof directory ||
@@ -177,7 +196,7 @@ int main(int argc, char **argv) {
             perror("make result");
             return 1;
         }
-        if (make_config(path, argv[3], result_path) != 0) {
+        if (make_config(path, argv[3], result_path, cache_path) != 0) {
             perror("make config");
             unlink(path);
             return 1;
