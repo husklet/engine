@@ -2215,7 +2215,8 @@ static int proc_status_text(char *b, size_t n) {
     unsigned long rss = (unsigned long)(self_rss_bytes() / 1024);
     unsigned long vsz = g_mem_max ? (unsigned long)(g_mem_max / 1024) : rss + 4096;
     if (vsz < rss) vsz = rss;
-    unsigned long vmlck = (unsigned long)(mlk_total_locked() / 1024); // mlock/mlockall'd bytes (LTP munlockall01)
+    unsigned long vmlck =
+        (unsigned long)(hl_gmap_lock_total_bytes() / 1024); // mlock/mlockall'd bytes (LTP munlockall01)
     char groups[512]; // image-derived supplementary set (runc additionalGids), == getgroups(2)
     groups_status_str(groups, sizeof groups);
     char cpumask[40], cpulist[24];
