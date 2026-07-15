@@ -630,7 +630,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
             }
         }
         ckpt_place_bump_past(reg.addr + reg.len); // keep the high-arena cursor above every restored region
-        gmap_add(reg.addr, reg.len);
+        hl_gmap_add(reg.addr, reg.len);
         gmap_set_glen(reg.addr, reg.glen);
         if (reg.is_gna)
             gna_add(reg.addr & ~(uint64_t)0xfff, (reg.addr + reg.glen + 0xfff) & ~(uint64_t)0xfff);

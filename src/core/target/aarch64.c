@@ -767,7 +767,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     // checkpoint/restore: place the brk heap in the deterministic high arena (0 hint => normal NULL placement)
     uint8_t *heap =
         mmap((void *)ckpt_place_hint(256u << 20), 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    gmap_add((uint64_t)heap, 256u << 20); // track so a later execve() can reclaim the inherited heap
+    hl_gmap_add((uint64_t)heap, 256u << 20); // track so a later execve() can reclaim the inherited heap
     brk_lo = brk_cur = (uint64_t)heap;
     brk_hi = brk_lo + (256u << 20);
 

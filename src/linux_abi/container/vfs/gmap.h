@@ -43,7 +43,6 @@ int hl_gmap_lock_future(void);
 void hl_gmap_lock_all(int future);
 
 /* Temporary call-site aliases while the surrounding unity roots are decomposed. */
-#define gmap_add hl_gmap_add
 #define gmap_set_glen hl_gmap_set_guest_length
 #define gmap_del hl_gmap_remove
 #define gmap_find_len hl_gmap_find_length

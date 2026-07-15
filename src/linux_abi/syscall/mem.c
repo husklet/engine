@@ -325,7 +325,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         mlk_del(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
                     }
-                    gmap_add(a4, (uint64_t)a2 + guard);
+                    hl_gmap_add(a4, (uint64_t)a2 + guard);
                     gmap_set_glen(a4, (uint64_t)a2);
                     anon_track(a4, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
                     gna_clear(a4 & ~(uint64_t)0xfff, (nhi + 0xfff) & ~(uint64_t)0xfff);
@@ -354,7 +354,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 mmap((void *)end, (size_t)(a0 + want - end), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ext == (void *)end) {
                 gmap_del(a0);
-                gmap_add(a0, want);              // track the grown extent (incl. fresh guard) for execve() teardown
+                hl_gmap_add(a0, want);           // track the grown extent (incl. fresh guard) for execve() teardown
                 gmap_set_glen(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
                 G_RET(c) = a0;
@@ -382,7 +382,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             gmap_del(a0);
             anon_untrack(a0, (size_t)phys);
         }
-        gmap_add((uint64_t)r, (uint64_t)a2 + guard);                           // track for execve() teardown
+        hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);                        // track for execve() teardown
         gmap_set_glen((uint64_t)r, (uint64_t)a2);                              // /proc maps: guest length (sans guard)
         anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
@@ -635,7 +635,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r != MAP_FAILED) {
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
-            gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+            hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             gmap_set_glen((uint64_t)r, (uint64_t)a1);    // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
                 filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);

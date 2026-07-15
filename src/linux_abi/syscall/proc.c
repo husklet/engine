@@ -1835,7 +1835,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 g_sigact[s].mask = 0;
             }
         uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        gmap_add((uint64_t)heap, 256u << 20);
+        hl_gmap_add((uint64_t)heap, 256u << 20);
         brk_lo = brk_cur = (uint64_t)heap;
         brk_hi = brk_lo + (256u << 20);
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
