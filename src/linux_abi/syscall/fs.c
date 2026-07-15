@@ -1147,7 +1147,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             rl_evict(host);
             // hardlink coherence: removing one link drops the sibling links' nlink -- evict their cached
             // stats by inode (lst was captured before the removal, so nlink>=2 means aliases still exist).
-            if (S_ISREG(lst.st_mode) && lst.st_nlink >= 2) mc_evict_ino(lst.st_dev, lst.st_ino);
+            if (S_ISREG(lst.st_mode) && lst.st_nlink >= 2) hl_fdcache_metadata_evict_inode(lst.st_dev, lst.st_ino);
             break;
         }
         if (jail_routed_at((int)a0, (const char *)a1)) {
@@ -1181,7 +1181,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             close(pfd);
             if (r >= 0 && aino) memf_try_adopt(adev, aino);
-            if (r >= 0 && nlink >= 2) mc_evict_ino((dev_t)ps.st_dev, (ino_t)ps.st_ino);
+            if (r >= 0 && nlink >= 2) hl_fdcache_metadata_evict_inode((dev_t)ps.st_dev, (ino_t)ps.st_ino);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
             break;
         }
@@ -1202,7 +1202,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         ac_evict(p);
         rl_evict(p);
         if (r >= 0 && aino) memf_try_adopt(adev, aino);
-        if (r >= 0 && nlink >= 2) mc_evict_ino((dev_t)ps.st_dev, (ino_t)ps.st_ino);
+        if (r >= 0 && nlink >= 2) hl_fdcache_metadata_evict_inode((dev_t)ps.st_dev, (ino_t)ps.st_ino);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -1324,7 +1324,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // the new link bumped the shared inode's nlink -> the source path's cached stat is now stale.
             if (r == 0) {
                 struct stat ls;
-                if (fstatat(npfd, nfin, &ls, AT_SYMLINK_NOFOLLOW) == 0) mc_evict_ino(ls.st_dev, ls.st_ino);
+                if (fstatat(npfd, nfin, &ls, AT_SYMLINK_NOFOLLOW) == 0)
+                    hl_fdcache_metadata_evict_inode(ls.st_dev, ls.st_ino);
             }
             close(opfd);
             close(npfd);
@@ -1337,7 +1338,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int r = linkat(ATFD(a0), op, ATFD(a2), np, fl);
         if (r == 0) {
             struct stat ls;
-            if (fstatat(ATFD(a2), np, &ls, AT_SYMLINK_NOFOLLOW) == 0) mc_evict_ino(ls.st_dev, ls.st_ino);
+            if (fstatat(ATFD(a2), np, &ls, AT_SYMLINK_NOFOLLOW) == 0)
+                hl_fdcache_metadata_evict_inode(ls.st_dev, ls.st_ino);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;

@@ -269,7 +269,7 @@ void mc_evict(const char *p) {
 // nlink. link()/unlink() of a multiply-linked inode call this to drop every POSITIVE cached stat for that
 // (dev,ino), so the next stat of any alias re-reads the true link count. Rare op (only when nlink>=2), so
 // the full-table scan is acceptable; negative entries carry no inode and are left alone.
-void mc_evict_ino(dev_t dev, ino_t ino) {
+void hl_fdcache_metadata_evict_inode(dev_t dev, ino_t ino) {
     if (!ino) return;
     CLK;
     for (int i = 0; i < MCACHE_N; i++) {

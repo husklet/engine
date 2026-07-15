@@ -58,7 +58,6 @@ void hl_fdcache_evict_path(const char *host_path);
 
 /* Temporary call-site aliases while the surrounding unity roots are decomposed. */
 #define mc_evict hl_fdcache_metadata_evict
-#define mc_evict_ino hl_fdcache_metadata_evict_inode
 #define rl_lookup hl_fdcache_readlink_lookup
 #define rl_store hl_fdcache_readlink_store
 #define rl_evict hl_fdcache_readlink_evict
