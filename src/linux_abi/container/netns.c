@@ -2623,7 +2623,7 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 // nameserver, the same address Docker uses. glibc/musl in the guest then send DNS as UDP (default) or TCP
 // (fallback) to 127.0.0.11:53. We intercept those sends here, parse the query, resolve it via the macOS
 // host resolver (getaddrinfo / getnameinfo -- which honor the host's system DNS, INCLUDING a corporate
-// VPN's split-DNS, exactly like the ddcli-mac container), synthesize a wire-format DNS response, and make
+// VPN's split-DNS, synthesize a wire-format DNS response, and make
 // it readable on the guest socket. The guest fd is swapped to one end of an AF_UNIX socketpair; the
 // response is written into the engine-held peer end, so poll/select/epoll + recv/read all see a real fd
 // with real buffered data (no polling/timeout hacks). recvfrom/recvmsg report the source as 127.0.0.11:53

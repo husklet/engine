@@ -169,10 +169,10 @@ struct sembuf_guest {
 #define HL_IPC_SEMMNI 512             // semaphore SETS
 #define HL_IPC_SEMMSL 256             // semaphores per set (inline values)
 #define HL_IPC_MSGMNI 512             // message queues (metadata; data in a per-queue object)
-#define DDMSG_SLOTS 512              // messages a single queue can hold
-#define DDMSG_MAXSZ 8192             // == MSGMAX: largest single message body
-#define HL_IPC_CTRL_MAGIC 0x44494943u // "DIIC"
-#define DDMSG_MAGIC 0x44494d51u      // "DIMQ"
+#define HL_MSG_SLOTS 512                    // messages a single queue can hold
+#define HL_MSG_MAX_SIZE 8192                // == MSGMAX: largest single message body
+#define HL_IPC_CTRL_MAGIC UINT32_C(0x43494c48) // "HLIC" (LE)
+#define HL_MSG_MAGIC UINT32_C(0x514d4c48)      // "HLMQ" (LE)
 
 // A cross-process robust spinlock: 0 == free, else == holder host pid. A holder that dies with the lock
 // held is detected (kill(pid,0)==ESRCH) and its lock stolen -- macOS has no PTHREAD_MUTEX_ROBUST, and the
@@ -187,7 +187,7 @@ struct hl_ipc_perm {
     uint32_t uid, gid, cuid, cgid, mode, seq;
 };
 
-struct ddshm {
+struct hl_shm_entry {
     uint32_t inuse, removed;
     struct hl_ipc_perm perm;
     uint64_t segsz; // caller-requested size (reported by IPC_STAT, Linux-faithful)
@@ -196,7 +196,7 @@ struct ddshm {
     uint32_t nattch; // authoritative attach count across all processes
 };
 
-struct ddsem {
+struct hl_sem_entry {
     uint32_t inuse;
     struct hl_ipc_perm perm;
     uint32_t nsems;
@@ -207,7 +207,7 @@ struct ddsem {
     int32_t zcnt[HL_IPC_SEMMSL]; // processes waiting for the sem to reach 0 (GETZCNT)
 };
 
-struct ddmsgq {
+struct hl_msg_queue {
     uint32_t inuse, removed;
     struct hl_ipc_perm perm;
     int64_t stime, rtime, ctime;
@@ -218,9 +218,9 @@ struct ddmsgq {
 struct hl_ipc_ctrl {
     atomic_uint magic;
     struct hl_ipc_lock lock;
-    struct ddshm shm[HL_IPC_SHMMNI];
-    struct ddsem sem[HL_IPC_SEMMNI];
-    struct ddmsgq msg[HL_IPC_MSGMNI];
+    struct hl_shm_entry shm[HL_IPC_SHMMNI];
+    struct hl_sem_entry sem[HL_IPC_SEMMNI];
+    struct hl_msg_queue msg[HL_IPC_MSGMNI];
 };
 
 // A message queue's backing object: a slot ring + free list. head/tail are the FIFO order; msgrcv may
@@ -229,13 +229,13 @@ struct hl_ipc_msg_slot {
     long mtype;
     uint32_t size;
     int32_t next;
-    uint8_t data[DDMSG_MAXSZ];
+    uint8_t data[HL_MSG_MAX_SIZE];
 };
 
 struct hl_ipc_msg_store {
     atomic_uint magic;
     int32_t head, tail, freehead;
-    struct hl_ipc_msg_slot slots[DDMSG_SLOTS];
+    struct hl_ipc_msg_slot slots[HL_MSG_SLOTS];
 };
 
 // ---- in-process (COW-inherited across fork) state ------------------------------------------------
@@ -312,15 +312,15 @@ static uint32_t ipc_ns(void) {
 }
 
 static void hl_ipc_control_name(char *out, size_t n) {
-    snprintf(out, n, "/di%08xC", ipc_ns());
+    snprintf(out, n, "/hl%08xC", ipc_ns());
 }
 
 static void hl_ipc_shm_name(char *out, size_t n, uint32_t idx) {
-    snprintf(out, n, "/di%08xs%x", ipc_ns(), idx);
+    snprintf(out, n, "/hl%08xs%x", ipc_ns(), idx);
 }
 
 static void hl_ipc_message_name(char *out, size_t n, uint32_t idx) {
-    snprintf(out, n, "/di%08xm%x", ipc_ns(), idx);
+    snprintf(out, n, "/hl%08xm%x", ipc_ns(), idx);
 }
 
 // ---- robust spinlock -----------------------------------------------------------------------------
@@ -380,6 +380,10 @@ static struct hl_ipc_ctrl *hl_ipc_ctrl(void) {
             struct timespec ts = {0, 20000};
             nanosleep(&ts, NULL);
         }
+        if (atomic_load(&c->magic) != HL_IPC_CTRL_MAGIC) {
+            munmap(c, sizeof *c);
+            return NULL;
+        }
     }
     g_ctrl = c;
     if (!g_ipc_atexit_armed) {
@@ -422,16 +426,20 @@ static struct hl_ipc_msg_store *hl_ipc_msg_store(uint32_t idx, uint32_t seq, int
     close(fd);
     if (p == MAP_FAILED) return NULL;
     struct hl_ipc_msg_store *s = (struct hl_ipc_msg_store *)p;
-    if (create && atomic_load(&s->magic) != DDMSG_MAGIC) {
+    if (create && atomic_load(&s->magic) != HL_MSG_MAGIC) {
         s->head = s->tail = -1;
-        for (int i = 0; i < DDMSG_SLOTS; i++)
-            s->slots[i].next = (i + 1 < DDMSG_SLOTS) ? i + 1 : -1;
+        for (int i = 0; i < HL_MSG_SLOTS; i++)
+            s->slots[i].next = (i + 1 < HL_MSG_SLOTS) ? i + 1 : -1;
         s->freehead = 0;
-        atomic_store(&s->magic, DDMSG_MAGIC);
+        atomic_store(&s->magic, HL_MSG_MAGIC);
     } else {
-        for (int i = 0; i < 200000 && atomic_load(&s->magic) != DDMSG_MAGIC; i++) {
+        for (int i = 0; i < 200000 && atomic_load(&s->magic) != HL_MSG_MAGIC; i++) {
             struct timespec ts = {0, 20000};
             nanosleep(&ts, NULL);
+        }
+        if (atomic_load(&s->magic) != HL_MSG_MAGIC) {
+            munmap(s, sizeof *s);
+            return NULL;
         }
     }
     pthread_mutex_lock(&g_ipc_local_m);
@@ -477,7 +485,7 @@ static int hl_ipc_owner(const struct hl_ipc_perm *p) {
     return ((uint32_t)cred_euid() == p->uid || (uint32_t)cred_euid() == p->cuid) ? 0 : -EPERM;
 }
 
-static void ddperm_to_guest(struct ipc64_perm_guest *g, const struct hl_ipc_perm *p) {
+static void hl_perm_to_guest(struct ipc64_perm_guest *g, const struct hl_ipc_perm *p) {
     g->key = p->key;
     g->uid = p->uid;
     g->gid = p->gid;
@@ -489,7 +497,7 @@ static void ddperm_to_guest(struct ipc64_perm_guest *g, const struct hl_ipc_perm
     g->unused1 = g->unused2 = 0;
 }
 
-static void ddperm_init(struct hl_ipc_perm *p, int32_t key, int flag) {
+static void hl_perm_init(struct hl_ipc_perm *p, int32_t key, int flag) {
     p->key = key;
     p->uid = p->cuid = (uint32_t)cuid();
     p->gid = p->cgid = (uint32_t)cgid();
@@ -505,15 +513,15 @@ static uint64_t hl_ipc_id(int mni, uint32_t idx, uint32_t seq) {
 // ============================================================================================
 //  SHARED MEMORY
 // ============================================================================================
-static struct ddshm *shm_by_id(struct hl_ipc_ctrl *C, int id) {
+static struct hl_shm_entry *shm_by_id(struct hl_ipc_ctrl *C, int id) {
     if (id < 0) return NULL;
     uint32_t idx = (uint32_t)id % HL_IPC_SHMMNI, seq = (uint32_t)id / HL_IPC_SHMMNI;
-    struct ddshm *s = &C->shm[idx];
+    struct hl_shm_entry *s = &C->shm[idx];
     if (!s->inuse || s->removed || s->perm.seq != seq) return NULL;
     return s;
 }
 
-static uint32_t shm_idx_of(struct hl_ipc_ctrl *C, const struct ddshm *s) {
+static uint32_t shm_idx_of(struct hl_ipc_ctrl *C, const struct hl_shm_entry *s) {
     return (uint32_t)(s - C->shm);
 }
 
@@ -529,10 +537,10 @@ static void shm_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 // Marshal descriptor idx -> the guest shmid64_ds at gbuf (already access-checked). Returns 0 or -errno.
 static uint64_t shm_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
     if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct shmid64_ds_guest))) return (uint64_t)(-EFAULT);
-    struct ddshm *s = &C->shm[idx];
+    struct hl_shm_entry *s = &C->shm[idx];
     struct shmid64_ds_guest *g = (struct shmid64_ds_guest *)gbuf;
     memset(g, 0, sizeof *g);
-    ddperm_to_guest(&g->shm_perm, &s->perm);
+    hl_perm_to_guest(&g->shm_perm, &s->perm);
     g->shm_segsz = s->segsz;
     g->shm_atime = s->atime;
     g->shm_dtime = s->dtime;
@@ -546,15 +554,15 @@ static uint64_t shm_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t 
 // ============================================================================================
 //  SEMAPHORES
 // ============================================================================================
-static struct ddsem *sem_by_id(struct hl_ipc_ctrl *C, int id) {
+static struct hl_sem_entry *sem_by_id(struct hl_ipc_ctrl *C, int id) {
     if (id < 0) return NULL;
     uint32_t idx = (uint32_t)id % HL_IPC_SEMMNI, seq = (uint32_t)id / HL_IPC_SEMMNI;
-    struct ddsem *s = &C->sem[idx];
+    struct hl_sem_entry *s = &C->sem[idx];
     if (!s->inuse || s->perm.seq != seq) return NULL;
     return s;
 }
 
-static uint32_t sem_idx_of(struct hl_ipc_ctrl *C, const struct ddsem *s) {
+static uint32_t sem_idx_of(struct hl_ipc_ctrl *C, const struct hl_sem_entry *s) {
     return (uint32_t)(s - C->sem);
 }
 
@@ -566,10 +574,10 @@ static void sem_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 
 static uint64_t sem_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
     if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct semid64_ds_guest))) return (uint64_t)(-EFAULT);
-    struct ddsem *s = &C->sem[idx];
+    struct hl_sem_entry *s = &C->sem[idx];
     struct semid64_ds_guest *g = (struct semid64_ds_guest *)gbuf;
     memset(g, 0, sizeof *g);
-    ddperm_to_guest(&g->sem_perm, &s->perm);
+    hl_perm_to_guest(&g->sem_perm, &s->perm);
     g->sem_otime = s->otime;
     g->sem_ctime = s->ctime;
     g->sem_nsems = s->nsems;
@@ -605,15 +613,15 @@ static void sem_undo_add(uint32_t idx, uint32_t seq, uint16_t semnum, int adj) {
 // ============================================================================================
 //  MESSAGE QUEUES
 // ============================================================================================
-static struct ddmsgq *msg_by_id(struct hl_ipc_ctrl *C, int id) {
+static struct hl_msg_queue *msg_by_id(struct hl_ipc_ctrl *C, int id) {
     if (id < 0) return NULL;
     uint32_t idx = (uint32_t)id % HL_IPC_MSGMNI, seq = (uint32_t)id / HL_IPC_MSGMNI;
-    struct ddmsgq *q = &C->msg[idx];
+    struct hl_msg_queue *q = &C->msg[idx];
     if (!q->inuse || q->removed || q->perm.seq != seq) return NULL;
     return q;
 }
 
-static uint32_t msg_idx_of(struct hl_ipc_ctrl *C, const struct ddmsgq *q) {
+static uint32_t msg_idx_of(struct hl_ipc_ctrl *C, const struct hl_msg_queue *q) {
     return (uint32_t)(q - C->msg);
 }
 
@@ -629,10 +637,10 @@ static void msg_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 
 static uint64_t msg_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
     if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct msqid64_ds_guest))) return (uint64_t)(-EFAULT);
-    struct ddmsgq *q = &C->msg[idx];
+    struct hl_msg_queue *q = &C->msg[idx];
     struct msqid64_ds_guest *g = (struct msqid64_ds_guest *)gbuf;
     memset(g, 0, sizeof *g);
-    ddperm_to_guest(&g->msg_perm, &q->perm);
+    hl_perm_to_guest(&g->msg_perm, &q->perm);
     g->msg_stime = q->stime;
     g->msg_rtime = q->rtime;
     g->msg_ctime = q->ctime;
@@ -700,7 +708,7 @@ static void sysv_after_fork(void) {
         hl_ipc_lock(&g_ctrl->lock);
         for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (g_shmat[i].used) {
-                struct ddshm *s = &g_ctrl->shm[g_shmat[i].idx];
+                struct hl_shm_entry *s = &g_ctrl->shm[g_shmat[i].idx];
                 if (s->inuse) s->nattch++;
             }
         hl_ipc_unlock(&g_ctrl->lock);
@@ -722,7 +730,7 @@ static void sysv_after_exec(void) {
         hl_ipc_lock(&C->lock);
         for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (g_shmat[i].used) {
-                struct ddshm *s = &C->shm[g_shmat[i].idx];
+                struct hl_shm_entry *s = &C->shm[g_shmat[i].idx];
                 munmap(g_shmat[i].addr, g_shmat[i].len);
                 if (s->inuse) {
                     if (s->nattch) s->nattch--;
@@ -747,7 +755,7 @@ static void sysv_on_exit(void) {
     // already marked for deletion is destroyed once nattch hits 0).
     for (int i = 0; i < HL_SHMAT_MAX; i++)
         if (g_shmat[i].used) {
-            struct ddshm *s = &C->shm[g_shmat[i].idx];
+            struct hl_shm_entry *s = &C->shm[g_shmat[i].idx];
             if (s->inuse) {
                 if (s->nattch) s->nattch--;
                 if (s->removed && s->nattch == 0) shm_free(C, g_shmat[i].idx);
@@ -805,7 +813,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddshm *found = NULL;
+        struct hl_shm_entry *found = NULL;
         if (key != L_IPC_PRIVATE)
             for (int i = 0; i < HL_IPC_SHMMNI; i++)
                 if (C->shm[i].inuse && !C->shm[i].removed && C->shm[i].perm.key == key) {
@@ -872,11 +880,11 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         close(fd);
-        struct ddshm *s = &C->shm[idx];
+        struct hl_shm_entry *s = &C->shm[idx];
         uint32_t seq = s->perm.seq;
         memset(s, 0, sizeof *s);
         s->perm.seq = seq;
-        ddperm_init(&s->perm, key, flag);
+        hl_perm_init(&s->perm, key, flag);
         s->segsz = size;
         s->cpid = container_pid();
         s->ctime = hl_ipc_now();
@@ -895,7 +903,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddshm *s = shm_by_id(C, id);
+        struct hl_shm_entry *s = shm_by_id(C, id);
         if (!s) { // a removed-but-attached id resolves nowhere new; report EIDRM if it exists-but-removed
             uint32_t idx = (uint32_t)id % HL_IPC_SHMMNI;
             int eid = (id >= 0 && C->shm[idx].inuse && C->shm[idx].removed &&
@@ -986,7 +994,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         munmap(addr, len);
         if (C) {
             hl_ipc_lock(&C->lock);
-            struct ddshm *s = &C->shm[idx];
+            struct hl_shm_entry *s = &C->shm[idx];
             if (s->inuse) {
                 if (s->nattch) s->nattch--;
                 s->lpid = container_pid();
@@ -1056,7 +1064,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddshm *s = shm_by_id(C, id);
+        struct hl_shm_entry *s = shm_by_id(C, id);
         if (!s) {
             hl_ipc_unlock(&C->lock);
             G_RET(c) = (uint64_t)(-EINVAL);
@@ -1121,7 +1129,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddsem *found = NULL;
+        struct hl_sem_entry *found = NULL;
         if (key != L_IPC_PRIVATE)
             for (int i = 0; i < HL_IPC_SEMMNI; i++)
                 if (C->sem[i].inuse && C->sem[i].perm.key == key) {
@@ -1171,11 +1179,11 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-ENOSPC);
             break;
         }
-        struct ddsem *s = &C->sem[idx];
+        struct hl_sem_entry *s = &C->sem[idx];
         uint32_t seq = s->perm.seq;
         memset(s, 0, sizeof *s);
         s->perm.seq = seq;
-        ddperm_init(&s->perm, key, flag);
+        hl_perm_init(&s->perm, key, flag);
         s->nsems = (uint32_t)nsems;
         s->ctime = hl_ipc_now();
         s->inuse = 1;
@@ -1227,7 +1235,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int did_wait = 0, waited_marked = 0;
         for (;;) {
             hl_ipc_lock(&C->lock);
-            struct ddsem *s = sem_by_id(C, id);
+            struct hl_sem_entry *s = sem_by_id(C, id);
             if (!s) {
                 if (waited_marked) waited_marked = 0; // set gone while blocking -> EIDRM
                 hl_ipc_unlock(&C->lock);
@@ -1314,7 +1322,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 if (now.tv_sec > deadline.tv_sec ||
                     (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
                     hl_ipc_lock(&C->lock);
-                    struct ddsem *s2 = sem_by_id(C, id);
+                    struct hl_sem_entry *s2 = sem_by_id(C, id);
                     if (s2)
                         for (size_t i = 0; i < nsops; i++) {
                             if (sops[i].sem_op < 0 && s2->ncnt[sops[i].sem_num] > 0)
@@ -1330,7 +1338,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             struct timespec ts = {0, 200000}; // 200us poll
             if (nanosleep(&ts, NULL) < 0 && errno == EINTR) {
                 hl_ipc_lock(&C->lock);
-                struct ddsem *s2 = sem_by_id(C, id);
+                struct hl_sem_entry *s2 = sem_by_id(C, id);
                 if (s2)
                     for (size_t i = 0; i < nsops; i++) {
                         if (sops[i].sem_op < 0 && s2->ncnt[sops[i].sem_num] > 0)
@@ -1401,7 +1409,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddsem *s = sem_by_id(C, id);
+        struct hl_sem_entry *s = sem_by_id(C, id);
         if (!s) {
             hl_ipc_unlock(&C->lock);
             G_RET(c) = (uint64_t)(-EINVAL);
@@ -1564,7 +1572,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddmsgq *found = NULL;
+        struct hl_msg_queue *found = NULL;
         if (key != L_IPC_PRIVATE)
             for (int i = 0; i < HL_IPC_MSGMNI; i++)
                 if (C->msg[i].inuse && !C->msg[i].removed && C->msg[i].perm.key == key) {
@@ -1604,11 +1612,11 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-ENOSPC);
             break;
         }
-        struct ddmsgq *q = &C->msg[idx];
+        struct hl_msg_queue *q = &C->msg[idx];
         uint32_t seq = q->perm.seq;
         memset(q, 0, sizeof *q);
         q->perm.seq = seq;
-        ddperm_init(&q->perm, key, flag);
+        hl_perm_init(&q->perm, key, flag);
         q->qbytes = HL_IPC_MSGMNB;
         q->ctime = hl_ipc_now();
         q->inuse = 1;
@@ -1633,7 +1641,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (msgsz > DDMSG_MAXSZ) {
+        if (msgsz > HL_MSG_MAX_SIZE) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -1650,7 +1658,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int did_wait = 0;
         for (;;) {
             hl_ipc_lock(&C->lock);
-            struct ddmsgq *q = msg_by_id(C, id);
+            struct hl_msg_queue *q = msg_by_id(C, id);
             if (!q) {
                 hl_ipc_unlock(&C->lock);
                 G_RET(c) = (uint64_t)(did_wait ? -EIDRM : -EINVAL);
@@ -1664,7 +1672,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)perr;
                 break;
             }
-            int full = (q->cbytes + msgsz > q->qbytes) || (q->qnum >= DDMSG_SLOTS);
+            int full = (q->cbytes + msgsz > q->qbytes) || (q->qnum >= HL_MSG_SLOTS);
             if (full) {
                 if (flag & L_IPC_NOWAIT) {
                     hl_ipc_unlock(&C->lock);
@@ -1734,7 +1742,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int did_wait = 0;
         for (;;) {
             hl_ipc_lock(&C->lock);
-            struct ddmsgq *q = msg_by_id(C, id);
+            struct hl_msg_queue *q = msg_by_id(C, id);
             if (!q) {
                 hl_ipc_unlock(&C->lock);
                 G_RET(c) = (uint64_t)(did_wait ? -EIDRM : -EINVAL);
@@ -1873,7 +1881,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         hl_ipc_lock(&C->lock);
-        struct ddmsgq *q = msg_by_id(C, id);
+        struct hl_msg_queue *q = msg_by_id(C, id);
         if (!q) {
             hl_ipc_unlock(&C->lock);
             G_RET(c) = (uint64_t)(-EINVAL);

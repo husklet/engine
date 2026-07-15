@@ -101,7 +101,7 @@ struct pc_warm {
     uint64_t magic, arena_used, restored, waste; // waste = restored blocks that never became usable
 };
 
-#define PC_WARM_MAGIC 0x314d525750434444ull // "DDCPWRM1"
+#define PC_WARM_MAGIC UINT64_C(0x324d525743504c48) // "HLPCWRM2" (LE)
 
 static int g_pcache_forked;          // set in a fork child (fresh arena, inherited bookkeeping) -> never save
 static int g_pcache_skip;            // this run intentionally skipped a dead-weight restore -> don't churn-resave

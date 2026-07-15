@@ -1,9 +1,9 @@
-// hl/runtime -- ddjit_aarch64: the aarch64-Linux-guest JIT runner (unity translation unit).
+// HL engine: the aarch64 Linux-guest JIT runner (unity translation unit).
 //
 // A same-ISA aarch64->aarch64 JIT services the guest's Linux syscalls in userspace (no VM). This TU
 // pulls in the engine (jit/), the aarch64 guest frontend (frontend/aarch64/), the Linux personality +
 // container layer (os/linux/), and defines hl_run_linux_guest() plus main(). The x86-64
-// guest reuses os/linux/ + jit/ with frontend/x86_64/ (see ddjit_x86_64.c).
+// The guest reuses the Linux ABI and translator layers with the selected frontend.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

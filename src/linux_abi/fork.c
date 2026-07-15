@@ -30,7 +30,7 @@
 //
 // PROTOCOL v2 (AF_UNIX SOCK_STREAM; v2 extends the W3D research protocol with env/cwd + signal
 // propagation so a forkserver launch is INDISTINGUISHABLE from a cold spawn):
-//   client -> server:  [u32 magic 'DDF2'][u32 body_len] body, where body =
+//   client -> server:  [u32 magic 'HLF3'][u32 body_len] body, where body =
 //                      [i32 argc][argc*(i32 len+bytes)][i32 envc][envc*(i32 len+bytes)][i32 cwdlen+bytes]
 //                      (all strings NUL-terminated, lengths include the NUL), plus the client's
 //                      {stdin,stdout,stderr} as 3 fds in an SCM_RIGHTS cmsg on the FIRST sendmsg.
@@ -207,7 +207,7 @@ static int recv_full(int sock, void *buf, size_t n) {
     return 0;
 }
 
-#define FSRV_MAGIC 0x32464444u // "DDF2" LE
+#define FSRV_MAGIC UINT32_C(0x33464c48) // "HLF3" (LE)
 #define FSRV_BUFSZ (256 * 1024)
 #define FSRV_MAXARG 256
 #define FSRV_MAXENV 1024

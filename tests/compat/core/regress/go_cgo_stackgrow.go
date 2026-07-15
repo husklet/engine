@@ -13,7 +13,7 @@
 // Build (on linux/arm64, no cross-compile):
 //   CGO_ENABLED=1 go build -trimpath -ldflags='-linkmode external -extldflags -static' \
 //     -o go_cgo_stackgrow_arm go_cgo_stackgrow.go
-// Install at <poc>/guests/arm/go_cgo_stackgrow_arm (see dd-tests/src/harness/provision/mod.rs resolve()).
+// The compatibility build installs this fixture for the AArch64 guest matrix.
 package main
 
 /*

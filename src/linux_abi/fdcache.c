@@ -688,7 +688,7 @@ static void oc_reset(void) {
 // cache). On a change it drops ALL its caches via rc_reset() -- the same conservative fork-grade full
 // flush -- so a daemon write is visible no later than the guest's NEXT syscall, exactly like the
 // kernel-coherent dcache on real Linux. Hot-path cost: ONE shared-page atomic load per syscall. Without
-// the env (bench/tests/direct `ddjit` runs) the pointer stays on a local counter that never moves, so
+// the environment (tests/direct engine runs) the pointer stays on a local counter that never moves, so
 // the poll is a single always-equal load and behaviour is byte-identical. Same 32-bit width and atomics
 // discipline as g_res_epoch (daemon side increments with release; the poll loads with acquire so the
 // flush is ordered after the daemon's completed file writes).

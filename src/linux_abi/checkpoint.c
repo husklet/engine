@@ -52,9 +52,9 @@
 #include "../host/file.h"
 #include "../host/system.h"
 
-#define CKPT_MAGIC 0x325450434b444444ull          // "DDDKCPT2" (LE) -- per-process meta
-#define CKPT_MANIFEST_MAGIC 0x324e414d504b4444ull // "DDKPMAN2" (LE) -- workspace manifest
-#define CKPT_VERSION 4 // v4: meta carries the guest signal-disposition table (sig_*), re-installed on restore
+#define CKPT_MAGIC UINT64_C(0x353054504b434c48)          // "HLCKPT05" (LE) -- per-process meta
+#define CKPT_MANIFEST_MAGIC UINT64_C(0x3530304e414d4c48) // "HLMAN005" (LE) -- workspace manifest
+#define CKPT_VERSION 5 // v5: HL identity; v4 and legacy-branded artifacts are intentionally rejected
 #define CKPT_ARCH_AARCH64 2
 
 #define CKF_TTY 1  // controlling terminal / any tty -- inherited down the restore fork from the launcher pty

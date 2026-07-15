@@ -1271,7 +1271,7 @@ static void vol_handle_bind(struct vol *volume, const char *directory) {
 // in no layer. Creating /x (and /x/y) in the upper lets the merged readdir list `/x` -> `y`; the mount
 // itself still wins in jail_pick(), so `/x/y` shows the host files, not the empty placeholder. The rootfs
 // is the per-container overlay upper (daemon) or the plain rootfs (manual) -- both writable & private.
-// No-op until the rootfs is known (the bridge sets DDVOL after container_init resolves g_rootfs_canon).
+// No-op until the rootfs is known (the bridge supplies HL_VOLUMES after container_init resolves g_rootfs_canon).
 // A file mount's leaf is created as an empty placeholder FILE (not a dir) so a parent `ls` shows it as a
 // file, exactly as Docker materializes a single-file bind target inside the rootfs.
 static void vol_mkmountpoint(const char *guest, int isfile) {
