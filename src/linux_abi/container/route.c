@@ -48,7 +48,7 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
         // S2: serve the memoized host path (only when a rootfs is configured -- without one the
         // resolvers below return `raw` untouched and leave `buf` garbage, so there's nothing to cache).
         // Follow-path only: the rc_* cache memoizes followed results, so a nofollow lookup must bypass it.
-        if (!nofollow && g_rootfs && rc_lookup(raw, buf, n)) return buf;
+        if (!nofollow && g_rootfs && hl_fdcache_resolution_lookup(raw, buf, n)) return buf;
         if (g_nlower) {
             overlay_resolve(raw, buf, n, nofollow);
             if (!nofollow && g_rootfs) rc_store(raw, buf);

@@ -149,7 +149,7 @@ static void fdcache_unlock(void) {
 // runs on the result, so existence/contents are never cached). A global epoch -- bumped by
 // service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
 // it in the fork child so a child never serves the parent's stale mappings.
-int rc_lookup(const char *g, char *out, size_t n);
+int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n);
 void rc_store(const char *g, const char *host);
 void res_bump(void);
 void rc_reset(void);
@@ -574,7 +574,7 @@ void rc_reset(void) {
     CUL;
 }
 
-int rc_lookup(const char *g, char *out, size_t n) {
+int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n) {
     if (!g || g[0] != '/' || strlen(g) >= sizeof(((struct rcent *)0)->guest)) return 0;
     CLK;
     int hit = 0;
