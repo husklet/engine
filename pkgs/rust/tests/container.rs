@@ -10,8 +10,8 @@ fn container_accepts_closures_and_reusable_functions() {
     let engine = Engine::new();
     let command = engine
         .command(Guest::Aarch64, "/missing")
-        .container(standard_paths)
-        .container(|container| {
+        .apply(standard_paths)
+        .apply(|container| {
             container.env("MODE", "test");
         })
         .mount(Mount::read_only("/tmp", "/host-tmp"));

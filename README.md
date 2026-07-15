@@ -23,10 +23,10 @@ let output = Engine::new()
             .env("TERM", "xterm-256color"),
     )
     .args(["-c", "printf 'hello from Linux'"])
-    .container(accelerator)
+    .apply(accelerator)
     .output()?;
 assert!(output.exit.success());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Container closures contribute only mounts and environment edits; the engine remains device-neutral.
+Applied container closures contribute only mounts and environment edits; the engine remains device-neutral.

@@ -70,7 +70,7 @@ impl Command {
         self
     }
     #[must_use]
-    pub fn container(mut self, edit: impl FnOnce(&mut Container)) -> Self {
+    pub fn apply(mut self, edit: impl FnOnce(&mut Container)) -> Self {
         edit(&mut self.container);
         self
     }
