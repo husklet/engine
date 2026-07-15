@@ -492,6 +492,14 @@ $(BUILD)/e2e/guest-exit-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/guest-exit70-aarch64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-exit70-x86_64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
 $(BUILD)/e2e/guest-spin-aarch64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@

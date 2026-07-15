@@ -28,6 +28,8 @@ static const hl_host_memory_services *native_memory;
 static uint32_t fatal_events;
 static uint32_t fatal_tag;
 static char fatal_message[96];
+static const hl_host_stream_services *native_stream;
+static int result_fault;
 
 static hl_host_result fail_publish(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
     (void)context;
@@ -44,6 +46,25 @@ static void capture_fatal(void *context, uint32_t tag, const char *message, size
     fatal_tag = tag;
     memcpy(fatal_message, message, copy);
     fatal_message[copy] = 0;
+}
+
+static hl_host_result result_write(void *context, hl_host_handle stream, hl_host_const_bytes input) {
+    if (result_fault == 1) return (hl_host_result){HL_STATUS_OK, 0, input.size, 0};
+    if (result_fault == 2) {
+        size_t half = input.size / 2u;
+        hl_host_result written = native_stream->write(context, stream, (hl_host_const_bytes){input.data, half});
+        return written.status == HL_STATUS_OK && written.value == half
+                   ? (hl_host_result){HL_STATUS_OK, 0, input.size, 0}
+                   : written;
+    }
+    if (result_fault == 3 && input.size != 0) {
+        unsigned char copy[64];
+        size_t size = input.size < sizeof(copy) ? input.size : sizeof(copy);
+        memcpy(copy, input.data, size);
+        copy[0] ^= 0xffu;
+        return native_stream->write(context, stream, (hl_host_const_bytes){copy, size});
+    }
+    return native_stream->write(context, stream, input);
 }
 
 static hl_host_result spy_monotonic_ns(void *context) {
@@ -69,15 +90,17 @@ int main(int argc, char **argv) {
     hl_host_clock_services clock;
     hl_host_memory_services memory;
     hl_host_log_services log;
+    hl_host_stream_services stream;
     hl_engine_config config;
     hl_engine_exit result;
     hl_engine *engine = NULL;
     hl_status status;
     int force_stop = argc > 1 && strcmp(argv[1], "--force-stop") == 0;
     int fail_code_publish = argc > 1 && strcmp(argv[1], "--fail-publish") == 0;
+    int bad_result = argc > 1 && strncmp(argv[1], "--result-", 9) == 0;
     int guest_index = 1;
     injected_clock = argc > 1 && strcmp(argv[1], "--clock-spy") == 0;
-    if (injected_clock || fail_code_publish) guest_index = 2;
+    if (injected_clock || fail_code_publish || bad_result) guest_index = 2;
     if (argc < 2) {
         fprintf(stderr, "usage: lifecycle-e2e-runner GUEST [args...]\n");
         return 64;
@@ -92,6 +115,17 @@ int main(int argc, char **argv) {
     clock.monotonic_ns = spy_monotonic_ns;
     clock.realtime_ns = spy_realtime_ns;
     services.clock = &clock;
+    if (bad_result) {
+        result_fault = strcmp(argv[1], "--result-missing") == 0     ? 1
+                       : strcmp(argv[1], "--result-truncated") == 0 ? 2
+                       : strcmp(argv[1], "--result-malformed") == 0 ? 3
+                                                                    : 0;
+        if (result_fault == 0) return 80;
+        native_stream = services.stream;
+        stream = *native_stream;
+        stream.write = result_write;
+        services.stream = &stream;
+    }
     if (fail_code_publish) {
         native_memory = services.memory;
         memory = *native_memory;
@@ -131,15 +165,25 @@ int main(int argc, char **argv) {
     hl_engine_destroy(engine);
     hl_host_macos_destroy(host);
     if (fail_code_publish)
-        return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 70 &&
+        return status == HL_STATUS_PLATFORM_FAILURE && result.kind == HL_ENGINE_EXIT_ENGINE_ERROR &&
+                       result.guest_status == HL_STATUS_PLATFORM_FAILURE && result.detail == 0 &&
                        fatal_events == 0
                    ? 0
                    : 79;
+    if (bad_result)
+        return status == HL_STATUS_CORRUPT && result.kind == HL_ENGINE_EXIT_ENGINE_ERROR &&
+                       result.guest_status == HL_STATUS_CORRUPT
+                   ? 0
+                   : 81;
     if (!force_stop && __atomic_load_n(clock_calls, __ATOMIC_RELAXED) == 0) return 77;
     if (injected_clock && __atomic_load_n(realtime_calls, __ATOMIC_RELAXED) == 0) return 78;
     (void)munmap(clock_calls, 2 * sizeof(*clock_calls));
     if (force_stop)
         return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == 9 ? 0 : 75;
-    if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE) return 72;
+    if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE) {
+        fprintf(stderr, "lifecycle: status=%d kind=%u guest=%d detail=%llu\n", status, result.kind,
+                result.guest_status, (unsigned long long)result.detail);
+        return 72;
+    }
     return result.guest_status;
 }

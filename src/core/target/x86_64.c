@@ -70,7 +70,10 @@
 static const hl_host_services *g_host_services;
 static hl_native_host *g_native_host;
 static hl_host_services g_jit_services;
+static hl_status g_engine_result_status;
 static hl_linux_abi *g_linux_box;
+
+hl_status hl_run_linux_guest_status(void) { return g_engine_result_status; }
 static uint64_t g_host_launch_monotonic_ns;
 
 #include "../../translator/guest/x86_64/cpu.h"
@@ -244,6 +247,7 @@ static int engine_global_init(void) {
     // macOS host services own code mappings and post-fork alias repair. NODUALMAP keeps the single-MAP_JIT
     // compatibility mode; the default remains a stable dual RW/RX mapping.
     if (jit_cache_init() != 0) {
+        g_engine_result_status = hl_fatal_status(&g_jit_fatal);
         return 70;
     }
     {
@@ -365,6 +369,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argument_count,
                        char *const argv[]) {
     int argc;
+    g_engine_result_status = HL_STATUS_OK;
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
     g_host_services = host;
@@ -427,6 +432,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         int hit = pcache_load(jump); // graceful MISS on any stale/corrupt/truncated cache -> translate fresh
         if (g_coldprof) fprintf(stderr, "[pcache] %s reloc=%d\n", hit ? "HIT (translation skipped)" : "MISS", g_nreloc);
         if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+            g_engine_result_status = hl_fatal_status(&g_jit_fatal);
             pcache_directory_close();
             return 70;
         }
@@ -434,7 +440,10 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     int ec = run_loaded(argc, argv, &lm, jump, at_base);
     if (hl_fatal_status(&g_jit_fatal) == HL_STATUS_OK)
         pcache_save(); // exit via syscall 93 returns here; syscall 94 saves before _exit (idempotent atomic rename)
-    if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) ec = 70;
+    if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+        g_engine_result_status = hl_fatal_status(&g_jit_fatal);
+        ec = 70;
+    }
     pcache_directory_close();
     return ec;
 }

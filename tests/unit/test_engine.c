@@ -49,7 +49,8 @@ static int option_matches_u64(const hl_options *options, const char *name, uint6
 
 static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
                             const hl_engine_config *config,
-                            uint32_t argc, const char *const argv[], hl_host_handle *process) {
+                            uint32_t argc, const char *const argv[], hl_host_handle *process,
+                            hl_host_handle *result_stream) {
     hl_host_result spawned;
     (void)argc;
     (void)argv;
@@ -83,10 +84,11 @@ static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_
     spawned = host->process->spawn_cloned(host->context, fake_entry, NULL);
     if (spawned.status != HL_STATUS_OK) return (hl_status)spawned.status;
     *process = spawned.value;
+    *result_stream = HL_HOST_HANDLE_INVALID;
     return HL_STATUS_OK;
 }
 
-static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start};
+static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start, NULL};
 
 typedef struct run_context {
     hl_engine *engine;

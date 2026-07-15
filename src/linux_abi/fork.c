@@ -1,5 +1,7 @@
 // linux_abi/fork.c -- W3D: resident engine server fork-server, SHARED by both Linux engines.
 
+#include "../core/engine_result.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -186,6 +188,7 @@ static int hl_forkserver_guest_environment(char *const envv[]) {
 }
 
 static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **argv, char **envv, const char *cwd) {
+    hl_engine_child_result_after_fork();
     // Shed every server-side fd so nothing leaks into the guest's fd table: the listener, the child-wake
     // pipe, every concurrently live
     // launch's control conn, and our OWN control conn (the server reports pid/status, not us).

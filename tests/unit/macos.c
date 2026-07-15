@@ -30,6 +30,19 @@ static int32_t child_exit_37(void *context) {
     return 37;
 }
 
+typedef struct stream_fork_close_context {
+    const hl_host_services *services;
+    hl_host_handle input;
+    hl_host_handle output;
+} stream_fork_close_context;
+
+static int32_t child_close_inherited_stream(void *context) {
+    stream_fork_close_context *stream = context;
+    if (stream->services->stream->close(stream->services->context, stream->input).status != HL_STATUS_OK) return 91;
+    if (stream->services->stream->close(stream->services->context, stream->output).status != HL_STATUS_OK) return 92;
+    return 0;
+}
+
 typedef struct signal_repair_probe {
     const hl_host_services *services;
     uint64_t address;
@@ -793,6 +806,21 @@ int main(void) {
         HL_CHECK(services.file->read(services.context, clone.value, &byte, 1).value == 1 && byte == 'd');
         HL_CHECK(services.file->close(services.context, clone.value).status == HL_STATUS_OK);
         HL_CHECK(services.file->close(services.context, pipe.detail).status == HL_STATUS_OK);
+    }
+    {
+        hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
+        stream_fork_close_context child = {&services, pipe.value, pipe.detail};
+        hl_host_result spawned;
+        hl_host_result waited;
+        HL_CHECK(pipe.status == HL_STATUS_OK);
+        HL_CHECK(services.sync->fork_prepare(services.context).status == HL_STATUS_OK);
+        spawned = services.process->spawn_prepared(services.context, child_close_inherited_stream, &child);
+        HL_CHECK(spawned.status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, pipe.detail).status == HL_STATUS_OK);
+        waited = services.process->wait(services.context, spawned.value, HL_HOST_DEADLINE_INFINITE);
+        HL_CHECK(waited.status == HL_STATUS_OK && waited.detail == HL_HOST_PROCESS_EXIT_CODE && waited.value == 0);
+        HL_CHECK(services.process->close(services.context, spawned.value).status == HL_STATUS_OK);
+        HL_CHECK(services.stream->close(services.context, pipe.value).status == HL_STATUS_OK);
     }
     {
         hl_host_result pipe = services.stream->pipe_pair(services.context, 0);

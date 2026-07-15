@@ -4175,9 +4175,16 @@ static hl_host_result hl_macos_fork_prepare(void *context) {
         /* clone_for_fork has created one additional handle per OFD.  fork duplicates both the
            parent and child handles into the other process, so reserve one reference for every
            inherited handle before either side closes its unwanted half. */
-        for (index = 0; index < host->file_capacity; ++index)
+        for (index = 0; index < host->file_capacity; ++index) {
             if (host->files[index].active && host->files[index].directory_shared != NULL)
                 (void)__atomic_add_fetch(&host->files[index].directory_shared->references, 1u, __ATOMIC_ACQ_REL);
+            /* Every live stream handle is duplicated by fork. Reserve the
+             * child's reference before either process can close an endpoint;
+             * otherwise one process may unmap the shared stream bookkeeping
+             * while the other still owns its inherited handle. */
+            if (host->files[index].active && host->files[index].stream != NULL)
+                (void)__atomic_add_fetch(&host->files[index].stream->references, 1u, __ATOMIC_ACQ_REL);
+        }
         for (index = 0; index < host->counter_capacity; ++index) {
             hl_macos_counter_object *object;
             uint32_t previous;

@@ -202,11 +202,14 @@ static void exec_close_cloexec(void) {
     free(fds);
 }
 
+#include "../../core/engine_result.h"
+
 // ---- fork child-side engine hooks (shared by clone/case-220 and clone3/case-435) -----------------
 // Everything the CHILD must reset before it re-enters guest code. Factored so the two fork sites can
 // never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop).
 
 static void fork_child_hooks(struct cpu *c) {
+    hl_engine_child_result_after_fork();
     atomic_flag_clear_explicit(&g_bus_lock, memory_order_release);
     // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
     // so the child's first run_block can instruction-abort fetching from the (non-executable) code
@@ -643,6 +646,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         hl_host_process_fd_private_cleanup(); // retire provider-private descriptors for this process identity
         poslk_on_exit();                      // release this process's in-engine fcntl advisory locks
         sysv_on_exit();                       // apply SEM_UNDO + GC this container's SysV objects (_exit skips atexit)
+        hl_engine_child_result_publish((int32_t)a0, HL_STATUS_OK, 0);
         _exit((int)a0);
     case 96:
         // set_tid_address(tidptr): store tidptr as this thread's clear_child_tid so thread exit zeroes it and
