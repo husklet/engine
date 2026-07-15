@@ -625,14 +625,17 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Repeat create/run/stop/destroy races under sanitizers where supported.
 - [x] Prove runner-owned descriptor, thread, and direct child-process counts return to baseline after every
       compatibility case; the C matrix runner fails immediately on drift.
-- [ ] Extend lifecycle baselines to engine mappings and independently discoverable remote descendants.
+- [x] Reap independently discoverable remote descendants after both normal completion and transport cancellation;
+      the C supervisor integration gate proves a child that outlives its engine cannot survive the launch group.
+- [ ] Extend lifecycle baselines to engine mappings.
 - [ ] Prove all registries grow to advertised limits without stale-handle aliasing.
 - [ ] Fault-inject every host callback boundary and verify transactional rollback.
 
 ### Translation and cache
 
 - [x] Run the complete instruction, SMC, code-cache, fork, thread-churn, and persistent-cache corpus on every host.
-- [ ] Verify cache identity rejects every incompatible code-changing configuration.
+- [x] Verify cache identity rejects incompatible builds, guest ISAs, host ISAs, and effective code-generation modes;
+      x86 host-counter calibration runs before lookup, and the C identity gate mutates every key field.
 - [ ] Prove no translator path performs ambient host I/O.
 
 ### Performance and release
