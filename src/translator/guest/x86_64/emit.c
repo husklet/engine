@@ -36,7 +36,7 @@ static void e_br(int rn) {
     emit32(0xD61F0000u | (rn << 5));
 }
 
-static void e_movconst(int rd, uint64_t v) {
+void e_movconst(int rd, uint64_t v) {
     e_movz(rd, v & 0xffff, 0);
     if ((v >> 16) & 0xffff) e_movk(rd, (v >> 16) & 0xffff, 1);
     if ((v >> 32) & 0xffff) e_movk(rd, (v >> 32) & 0xffff, 2);
@@ -370,7 +370,7 @@ static void e_asr_i(int rd, int rn, int sh, int sf) { // asr = SBFM rd,rn,#sh,#(
     emit32((sf ? 0x93400000u : 0x13000000u) | (sh << 16) | (imms << 10) | (rn << 5) | rd);
 }
 
-static void e_bfi(int rd, int rn, int lsb, int width, int sf) { // bfi rd,rn,#lsb,#width
+void e_bfi(int rd, int rn, int lsb, int width, int sf) { // bfi rd,rn,#lsb,#width
     int w = sf ? 64 : 32, immr = (w - lsb) & (w - 1), imms = width - 1;
     emit32((sf ? 0xB3400000u : 0x33000000u) | (immr << 16) | (imms << 10) | (rn << 5) | rd);
 }

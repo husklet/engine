@@ -1,6 +1,8 @@
 // translator/guest/x86_64 -- the x86-64 -> arm64 translator (flag synthesis, SSE/x87 lowering, the
 // big translate_block) + host entry trampolines.
 
+#include "lower/primitives.h"
+
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
 
@@ -161,7 +163,7 @@ static void e_nzcv_set_of(int ofreg) {
 
 // ALU operation selector from the primary opcode group (00..3D) or group1 /digit.
 // returns: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP, or -1.
-static int alu_kind_primary(uint8_t op) {
+int alu_kind_primary(uint8_t op) {
     int k = (op >> 3) & 7;
     return ((op & 7) <= 5) ? k : -1;
 }
@@ -192,7 +194,7 @@ static int is_hi8(struct insn *I, int regnum) {
 
 // value of an 8-bit register operand, in the LOW 8 bits of the returned reg (rest is
 // don't-care -- do_alu's <<24 trick keeps only the low byte). hi8 -> extract via >>8.
-static int byte_val(struct insn *I, int regnum, int scratch) {
+int byte_val(struct insn *I, int regnum, int scratch) {
     if (is_hi8(I, regnum)) {
         e_lsr_i(scratch, regnum - 4, 8, 1);
         return scratch;
@@ -201,7 +203,7 @@ static int byte_val(struct insn *I, int regnum, int scratch) {
 }
 
 // write the low byte of `val` into an 8-bit register operand (preserving other bits).
-static void byte_wb(struct insn *I, int regnum, int val) {
+void byte_wb(struct insn *I, int regnum, int val) {
     if (is_hi8(I, regnum))
         e_bfi(regnum - 4, val, 8, 8, 1);
     else
@@ -243,7 +245,7 @@ static void emit_ea(struct insn *I, uint64_t next_rip);
 // helpers in translate/<class>.c (#included above translate_block) can defer a rare unhandled form.
 static void report_unimpl(uint64_t pc, struct insn *I);
 
-static int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
+int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
     if (I->is_mem) {
         emit_ea(I, next);
         emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
@@ -256,7 +258,7 @@ static int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
     return I->rm_reg;
 }
 
-static void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17 if mem)
+void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17 if mem)
     if (I->is_mem) {
         if (val == 16) {
             e_mov_rr(19, 16, 1); /* host-call guard clobbers x16 */
@@ -417,7 +419,7 @@ static int lazyflags_on(void) { return 1; }
 // as the dst==reg forms do) and computes PF/AF from the pristine a,b BEFORE overwriting `out`, so
 // out==a is byte-identical to out==x16 + rm_store — one fewer instruction on the dependent chain.
 // Gate NOXALUDIRECT=1 for A/B (elide-on default). Independent of the flag levers.
-static int xaludirect_on(void) { return 1; }
+int xaludirect_on(void) { return 1; }
 
 // Direct-write SHIFT dst (follow-on to the ALU residency above): when an IMMEDIATE/by-1
 // SHL/SHR/SAR's r/m operand is a REGISTER at width>=4, shift straight into the guest reg's host home
@@ -587,7 +589,7 @@ static void e_af_addsub(int a, int b, int res, int tmp) {
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
 // x86 byte/word flags exactly, then merge the low w bytes back (preserving upper bits).
-static void do_alu(int kind, int dst, int a, int b, int w) {
+void do_alu(int kind, int dst, int a, int b, int w) {
     int sf = w == 8, out = dst < 0 ? 31 : dst;
     int ak = kind == 7 ? 5 : kind; // cmp == sub(discard); test == and(discard)
     if (kind == 7) ak = 5;
@@ -704,7 +706,7 @@ static void do_alu(int kind, int dst, int a, int b, int w) {
 // x86 CF/OF/SF/ZF explicitly, then store the borrow-convention NZCV via e_nzcv_save_setcf. `dst`>=0 gets
 // the low w bytes merged (bfi); a/b are value regs. Scratch x19..x27 (callee-saved host regs the
 // trampoline preserves; never a guest x0..x15, the value x16, or the EA x17 -- so a mem dest still works).
-static void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
+void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
     int bits = 8 * w;
     e_uxt(21, a, w); // x21 = a & mask  (read operands FIRST -- a/b may alias scratch like x19/x16)
     e_uxt(22, b, w); // x22 = b & mask
@@ -757,7 +759,7 @@ static void narrow_adcsbb(int adc, int dst, int a, int b, int w) {
 // computed). `rs` is the operand value register. `k` is the alu kind (0 add, 1 or, 4 and, 5 sub, 6 xor).
 // x86 flags are set from (old OP operand); x19/x20 are scratch. Returns 1 if it emitted an atomic, 0 if
 // `k` has no atomic form here (caller falls back to the non-atomic load-op-store).
-static int lock_rmw(int k, int w, int rs) {
+int lock_rmw(int k, int w, int rs) {
     int sf = (w == 8);
     uint32_t lse;
     int rsu = rs;

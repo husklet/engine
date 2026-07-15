@@ -171,10 +171,6 @@ static void emit_rep_string(int movs, int w, int shift, int df_static) {
     g_vmark_done = 0;
 }
 
-// translate_block control code: a per-class translate helper cannot continue/break the caller's for(;;)
-// translate loop, so it returns how the caller should steer it. (Shared by the instruction-class splits.)
-enum { TX_FALL = 0, TX_NEXT = 1, TX_BREAK = 2 };
-
 // ---- string ops dispatch: stos/movs/lods (AA/AB/A4/A5/AC/AD), cmps/scas (A6/A7/AE/AF), cld/std (FC/FD).
 // Lifted VERBATIM out of translate_block's one-byte switch (behavior-preserving move). DF assumed 0 (fwd)
 // for stos/movs/lods unless std set g_df. Returns TX_FALL if `op` is not a string op (caller falls through
