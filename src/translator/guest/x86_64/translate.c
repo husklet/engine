@@ -3,6 +3,7 @@
 
 #include "lower/primitives.h"
 #include "lower/alu.h"
+#include "lower/mov.h"
 
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -816,8 +817,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/x87.c"
 
-#include "lower/mov.c"
-
 #include "lower/shift.c"
 
 #include "lower/crypto.c"
@@ -1269,7 +1268,11 @@ static void *translate_block(uint64_t gpc) {
             // ---- data-move class (mov B0-BF/C6/C7/88-8B, lea 8D, push/pop 50-5F, movsxd 63) ----
             // Lowered in translate/mov.c translate_mov(); no EFLAGS interaction.
             {
-                int s = translate_mov(&I, next);
+                const hl_x86_move_image image = {
+                    g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_nonpie_types_hi,
+                    g_nonpie_blob_code,
+                };
+                int s = hl_x86_lower_mov(&I, next, &image);
                 if (s == TX_NEXT) {
                     gpc = next;
                     continue;

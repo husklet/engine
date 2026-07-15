@@ -4,7 +4,10 @@
 // there is no lazy-flag interaction. Every handler advances past the insn -> the helper returns TX_FALL
 // (not a move -> caller falls through) or TX_NEXT (caller: gpc = next; continue). #included after the
 // other class files; uses EA helpers from decode.c + e_* from emit.c + byte_val/byte_wb (all defined above).
-static int translate_mov(struct insn *I, uint64_t next) {
+#include "mov.h"
+#include "primitives.h"
+
+int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *image) {
     uint8_t op = I->op;
     int sf = I->opsize == 8;
     // ---- mov r8, imm8 (B0+r) ----
@@ -22,7 +25,7 @@ static int translate_mov(struct insn *I, uint64_t next) {
         // (v8_Default_embedded_blob_code_) to the high mapping so V8's InnerPointerToCodeCache range
         // matches where the builtins actually execute (return addresses stay HIGH). Exact-value match
         // on the symbol recorded at load -> inert for every other constant / PIE / non-V8 image.
-        if (g_nonpie_blob_code && v == g_nonpie_blob_code) v += g_nonpie_bias;
+        if (image->blob_code && v == image->blob_code) v += image->bias;
         e_movconst(rd, v);
         return TX_NEXT;
     }
@@ -38,7 +41,7 @@ static int translate_mov(struct insn *I, uint64_t next) {
             uint64_t v = sf ? (uint64_t)I->imm : (uint64_t)(uint32_t)I->imm;
             // the C7 /0 `mov r,imm` form of the V8 embedded-blob code-base load (see the B8-BF
             // note above). Same exact-value rebase; C6 is byte-imm (never a code address) so op==0xC7.
-            if (op == 0xC7 && g_nonpie_blob_code && v == g_nonpie_blob_code) v += g_nonpie_bias;
+            if (op == 0xC7 && image->blob_code && v == image->blob_code) v += image->bias;
             e_movconst(I->rm_reg, v);
         }
         return TX_NEXT;
@@ -134,13 +137,13 @@ static int translate_mov(struct insn *I, uint64_t next) {
         // ea_bias17 / the rep-string helpers (repstr_g2h) / nonpie_fixup; an indirect call/jmp through
         // it is redirected by the dispatcher (run_guest). Only the 64-bit form (sf); inert for
         // PIE/static-PIE (g_nonpie_lo == 0). NOGUESTFOLD leaves lea biased for A/B bisection.
-        if (sf && I->rip_rel && g_nonpie_lo && guestfold_on()) {
-            uint64_t lo = (next - g_nonpie_bias) + (uint64_t)I->disp; // low link target
+        if (sf && I->rip_rel && image->low) {
+            uint64_t lo = (next - image->bias) + (uint64_t)I->disp; // low link target
             // EXPERIMENT(diagnosis): for a Go image restrict the low-rewrite to the type
             // section only (the pre-v0.9.40 behavior). Whole-image low-rewrite wrongly caught
             // code-address leas (LEAQ asyncPreempt(SB)) that findfunc needs HIGH -> crash.
-            uint64_t rlo = g_nonpie_types_lo ? g_nonpie_types_lo : g_nonpie_lo;
-            uint64_t rhi = g_nonpie_types_lo ? g_nonpie_types_hi : g_nonpie_hi;
+            uint64_t rlo = image->types_low ? image->types_low : image->low;
+            uint64_t rhi = image->types_low ? image->types_high : image->high;
             if (lo >= rlo && lo < rhi) {
                 e_movconst(I->reg, lo);
                 return TX_NEXT;
@@ -179,14 +182,14 @@ static int translate_mov(struct insn *I, uint64_t next) {
     // ---- push/pop r (50-5F) ----
     if (op >= 0x50 && op <= 0x57) {
         int r = (op - 0x50) | (I->rexB << 3);
-        e_subi(RSP, RSP, 8, 1);
-        e_store(8, r, RSP);
+        e_subi(4, 4, 8, 1);
+        e_store(8, r, 4);
         return TX_NEXT;
     } // push (64-bit)
     if (op >= 0x58 && op <= 0x5F) {
         int r = (op - 0x58) | (I->rexB << 3);
-        e_load(8, r, RSP);
-        e_addi(RSP, RSP, 8, 1);
+        e_load(8, r, 4);
+        e_addi(4, 4, 8, 1);
         return TX_NEXT;
     } // pop
     // ---- movsxd (0x63): operand-size governed. REX.W -> sign-extend r/m32 to r64; no REX.W ->
