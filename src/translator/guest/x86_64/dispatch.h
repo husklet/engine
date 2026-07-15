@@ -251,11 +251,11 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     } /* rip already = next */                                                                                         \
     if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
-        do_avx(c);                                                                                                     \
+        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C; rip = the insn, do_sse3b advances it */      \
-        do_sse3b(c);                                                                                                   \
+        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_REPSTR) {                                                                                     \

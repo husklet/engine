@@ -1,4 +1,11 @@
+#include "avx.h"
+#include "cpu.h"
+#include "decoder.h"
+
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // translator/guest/x86_64/avx.c -- AVX/AVX2/AVX-512 (VEX/EVEX) emulation.
 //
@@ -51,7 +58,7 @@ static void xs_note(int vex, int map, int op, uint64_t rip) {
     }
 }
 
-static void xs_dump(void) { // called from G_PROF_EXTRA at exit_group (destructors are bypassed by _exit)
+void hl_x86_avx_dump(void) { // called from G_PROF_EXTRA at exit_group (destructors are bypassed by _exit)
     if (g_xs_on != 1) return;
     fprintf(stderr, "[exitstat] per-insn C-emulation exits:\n");
     for (int m = 0; m < 4; m++)
@@ -108,7 +115,15 @@ static void avx_put(struct cpu *c, int r, const uint8_t in[64], int wbytes) {
 // rip-relative and base+index forms are covered regardless of whether the guest rip is kept low or high:
 // a resolved HIGH address (>= g_nonpie_hi) is never in the low link range, so it is left untouched.
 // Inert for PIE / static-PIE / non-ET_EXEC (g_nonpie_lo == 0 -> the range test is always false).
-static uint64_t avx_ea(struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes) {
+uint64_t hl_x86_avx_address(const hl_x86_avx_state *state, uint64_t address) {
+    uint64_t low = state != NULL && state->nonpie_low != NULL ? *state->nonpie_low : 0;
+    uint64_t high = state != NULL && state->nonpie_high != NULL ? *state->nonpie_high : 0;
+    uint64_t bias = state != NULL && state->nonpie_bias != NULL ? *state->nonpie_bias : 0;
+    return low != 0 && address >= low && address < high ? address + bias : address;
+}
+
+static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
+                       int wbytes) {
     uint64_t a;
     if (I->rip_rel) {
         a = rip_after + (uint64_t)I->disp;
@@ -124,15 +139,15 @@ static uint64_t avx_ea(struct cpu *c, struct insn *I, uint64_t rip_after, int wb
         else if (I->seg == 2)
             a += c->gs_base;
     }
-    if (a >= g_nonpie_lo && a < g_nonpie_hi) a += g_nonpie_bias; // non-PIE: low image ptr -> high mapping
-    return a;
+    return hl_x86_avx_address(state, a);
 }
 
 // Read the r/m operand (register or memory) into buf as `wbytes` bytes.
-static void avx_get_rm(struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes, uint8_t buf[64]) {
+static void avx_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
+                       int wbytes, uint8_t buf[64]) {
     memset(buf, 0, 64);
     if (I->is_mem) {
-        uint64_t a = avx_ea(c, I, rip_after, wbytes);
+        uint64_t a = avx_ea(state, c, I, rip_after, wbytes);
         memcpy(buf, (void *)a, wbytes);
     } else {
         uint8_t t[64];
@@ -141,9 +156,10 @@ static void avx_get_rm(struct cpu *c, struct insn *I, uint64_t rip_after, int wb
     }
 }
 
-static void avx_put_rm(struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes, const uint8_t buf[64]) {
+static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
+                       int wbytes, const uint8_t buf[64]) {
     if (I->is_mem) {
-        uint64_t a = avx_ea(c, I, rip_after, wbytes);
+        uint64_t a = avx_ea(state, c, I, rip_after, wbytes);
         memcpy((void *)a, buf, wbytes);
     } else {
         avx_put(c, I->rm_reg, buf, wbytes);
@@ -231,7 +247,7 @@ static float avx_f16_to_f32(uint16_t bits) {
     return (float)h;
 }
 
-static void do_avx(struct cpu *c) {
+void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + I.len;
@@ -250,7 +266,7 @@ static void do_avx(struct cpu *c) {
         uint64_t M = I.vex_w ? ~0ull : 0xffffffffull;
         uint64_t rm;
         if (I.is_mem) {
-            uint64_t ea = avx_ea(c, &I, next, I.vex_w ? 8 : 4);
+            uint64_t ea = avx_ea(state, c, &I, next, I.vex_w ? 8 : 4);
             rm = 0;
             memcpy(&rm, (void *)ea, I.vex_w ? 8 : 4);
         } else
@@ -343,7 +359,7 @@ static void do_avx(struct cpu *c) {
                 memcpy(d, t, es);
                 avx_put(c, rd, d, 16); // 128-bit result, upper 128/256 lanes zeroed
             } else {
-                avx_get_rm(c, &I, next, (op == 0x10 && (pp == 2 || pp == 3)) ? (pp == 2 ? 4 : 8) : W, d);
+                avx_get_rm(state, c, &I, next, (op == 0x10 && (pp == 2 || pp == 3)) ? (pp == 2 ? 4 : 8) : W, d);
                 // scalar ss/sd mem-load: only the low element loads, VEX zeroes the rest.
                 avx_put(c, rd, d, W);
             }
@@ -362,25 +378,25 @@ static void do_avx(struct cpu *c) {
                 avx_put(c, I.rm_reg, d, 16);
             } else {
                 avx_get(c, rd, d);
-                avx_put_rm(c, &I, next, (op == 0x11 && (pp == 2 || pp == 3)) ? (pp == 2 ? 4 : 8) : W, d);
+                avx_put_rm(state, c, &I, next, (op == 0x11 && (pp == 2 || pp == 3)) ? (pp == 2 ? 4 : 8) : W, d);
             }
             goto done;
         }
         case 0x6F: { // vmovdqa(66)/vmovdqu(F3) reg <- rm
-            avx_get_rm(c, &I, next, W, d);
+            avx_get_rm(state, c, &I, next, W, d);
             avx_put(c, rd, d, W);
             goto done;
         }
         case 0x7F: { // vmovdqa/u rm <- reg
             avx_get(c, rd, d);
-            avx_put_rm(c, &I, next, W, d);
+            avx_put_rm(state, c, &I, next, W, d);
             goto done;
         }
         case 0x6E: { // vmovd/vmovq gpr/mem -> xmm (zero-extend)
             int wb = I.vex_w ? 8 : 4;
             memset(d, 0, 64);
             if (I.is_mem) {
-                uint64_t addr = avx_ea(c, &I, next, wb);
+                uint64_t addr = avx_ea(state, c, &I, next, wb);
                 memcpy(d, (void *)addr, wb);
             } else
                 memcpy(d, &c->r[I.rm_reg], wb);
@@ -389,13 +405,13 @@ static void do_avx(struct cpu *c) {
         }
         case 0x7E: {       // F3: vmovq xmm<-xmm/mem (zext); 66: vmovd/q xmm->gpr/mem
             if (pp == 2) { // F3 vmovq: reg <- rm (low 64), zero-extend
-                avx_get_rm(c, &I, next, 8, d);
+                avx_get_rm(state, c, &I, next, 8, d);
                 avx_put(c, rd, d, 16);
             } else { // 66 vmovd/q: rm <- reg low
                 int wb = I.vex_w ? 8 : 4;
                 avx_get(c, rd, d);
                 if (I.is_mem) {
-                    uint64_t addr = avx_ea(c, &I, next, wb);
+                    uint64_t addr = avx_ea(state, c, &I, next, wb);
                     memcpy((void *)addr, d, wb);
                 } else {
                     uint64_t v = 0;
@@ -407,14 +423,14 @@ static void do_avx(struct cpu *c) {
         }
         case 0xD6: { // vmovq rm <- reg (low 64)
             avx_get(c, rd, d);
-            avx_put_rm(c, &I, next, 8, d);
+            avx_put_rm(state, c, &I, next, 8, d);
             goto done;
         }
         case 0x12: {             // F2: vmovddup (dup low 64 per 128-lane); F3: vmovsldup (dup even dwords)
             if (pp == 3) {       // vmovddup
                 uint8_t src[64]; // 128-bit reads m64; 256-bit reads m256
                 if (I.is_mem) {
-                    uint64_t ea = avx_ea(c, &I, next, L == 0 ? 8 : W);
+                    uint64_t ea = avx_ea(state, c, &I, next, L == 0 ? 8 : W);
                     memcpy(src, (void *)ea, L == 0 ? 8 : W);
                 } else
                     avx_get(c, I.rm_reg, src);
@@ -426,7 +442,7 @@ static void do_avx(struct cpu *c) {
                 avx_put(c, rd, d, W);
                 goto done;
             } else if (pp == 2) { // vmovsldup
-                avx_get_rm(c, &I, next, W, b);
+                avx_get_rm(state, c, &I, next, W, b);
                 for (int i = 0; i < W; i += 8) {
                     memcpy(d + i, b + i, 4);
                     memcpy(d + i + 4, b + i, 4);
@@ -438,7 +454,7 @@ static void do_avx(struct cpu *c) {
         }
         case 0x16: { // F3: vmovshdup (dup odd dwords)
             if (pp == 2) {
-                avx_get_rm(c, &I, next, W, b);
+                avx_get_rm(state, c, &I, next, W, b);
                 for (int i = 0; i < W; i += 8) {
                     memcpy(d + i, b + i + 4, 4);
                     memcpy(d + i + 4, b + i + 4, 4);
@@ -453,7 +469,7 @@ static void do_avx(struct cpu *c) {
             avx_get(c, vv, a);
             int64_t iv;
             if (I.is_mem) {
-                uint64_t ea = avx_ea(c, &I, next, wi);
+                uint64_t ea = avx_ea(state, c, &I, next, wi);
                 iv = 0;
                 memcpy(&iv, (void *)ea, wi);
                 if (!I.vex_w) iv = (int32_t)iv;
@@ -474,7 +490,7 @@ static void do_avx(struct cpu *c) {
         case 0x2D: // vcvtss2si/sd2si (round)    -> GPR
         {
             int dbl = (pp == 3), es = dbl ? 8 : 4, trunc = (op == 0x2C), w64 = I.vex_w;
-            avx_get_rm(c, &I, next, es, b);
+            avx_get_rm(state, c, &I, next, es, b);
             // x86 float->int yields the "integer indefinite" (INT_MIN bit pattern) on NaN, infinity, or an
             // out-of-range value; a raw C cast is undefined there (the legacy SSE path applies the same fixup,
             // translate.c 0x2C/0x2D). Round in the float domain (0x2D honors MXCSR via the host FPCR rounding
@@ -505,7 +521,7 @@ static void do_avx(struct cpu *c) {
         case 0x5A: {       // vcvtss2sd/sd2ss (scalar) or vcvtps2pd/pd2ps (packed) per pp
             if (pp == 2) { // F3: ss->sd scalar, rest of low-128 from src1
                 avx_get(c, vv, a);
-                avx_get_rm(c, &I, next, 4, b);
+                avx_get_rm(state, c, &I, next, 4, b);
                 memcpy(d, a, 16);
                 float x;
                 memcpy(&x, b, 4);
@@ -514,7 +530,7 @@ static void do_avx(struct cpu *c) {
                 avx_put(c, rd, d, 16);
             } else if (pp == 3) { // F2: sd->ss scalar
                 avx_get(c, vv, a);
-                avx_get_rm(c, &I, next, 8, b);
+                avx_get_rm(state, c, &I, next, 8, b);
                 memcpy(d, a, 16);
                 double x;
                 memcpy(&x, b, 8);
@@ -522,7 +538,7 @@ static void do_avx(struct cpu *c) {
                 memcpy(d, &y, 4);
                 avx_put(c, rd, d, 16);
             } else if (pp == 0) { // np: ps->pd, src is W/2 bytes of floats -> W bytes doubles
-                avx_get_rm(c, &I, next, W / 2, b);
+                avx_get_rm(state, c, &I, next, W / 2, b);
                 int n = W / 8;
                 for (int i = 0; i < n; i++) {
                     float x;
@@ -532,7 +548,7 @@ static void do_avx(struct cpu *c) {
                 }
                 avx_put(c, rd, d, W);
             } else { // 66: pd->ps, src W bytes doubles -> W/2 bytes floats
-                avx_get_rm(c, &I, next, W, b);
+                avx_get_rm(state, c, &I, next, W, b);
                 int n = W / 8;
                 for (int i = 0; i < n; i++) {
                     double x;
@@ -555,7 +571,7 @@ static void do_avx(struct cpu *c) {
             int dbl = (pp == 1 || pp == 3), scalar = (pp == 2 || pp == 3);
             int es = dbl ? 8 : 4;
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, scalar ? es : W, b);
+            avx_get_rm(state, c, &I, next, scalar ? es : W, b);
             if (scalar) { // low element computed, rest of low-128 from src1
                 memcpy(d, a, 16);
                 if (dbl) {
@@ -603,7 +619,7 @@ static void do_avx(struct cpu *c) {
         case 0x55: // vandnps/pd
         {
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i++) {
                 uint8_t x = a[i], y = b[i];
                 d[i] = (op == 0xEF || op == 0x57)   ? (x ^ y)
@@ -630,7 +646,7 @@ static void do_avx(struct cpu *c) {
                                                   : 8;
             int sub = (op >= 0xF8);
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += es) {
                 uint64_t x = 0, y = 0;
                 memcpy(&x, a + i, es);
@@ -652,7 +668,7 @@ static void do_avx(struct cpu *c) {
             int es = (op == 0x74 || op == 0x64) ? 1 : (op == 0x75 || op == 0x65) ? 2 : 4;
             int gt = (op >= 0x64 && op <= 0x66);
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += es) {
                 int64_t x = 0, y = 0;
                 memcpy(&x, a + i, es);
@@ -670,7 +686,7 @@ static void do_avx(struct cpu *c) {
             goto done;
         }
         case 0xD7: { // vpmovmskb: gpr <- sign bits of each byte of rm (per 128-bit lane, packed)
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             uint64_t m = 0;
             for (int i = 0; i < W; i++)
                 if (b[i] & 0x80) m |= (1ull << i);
@@ -678,7 +694,7 @@ static void do_avx(struct cpu *c) {
             goto done;
         }
         case 0x70: { // vpshufd(66)/vpshuflw(F2)/vpshufhw(F3) reg <- rm, imm8 (per 128-bit lane)
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             uint8_t imm = (uint8_t)I.imm;
             for (int lane = 0; lane < W; lane += 16) {
                 if (pp == 1) { // vpshufd: 4 dwords
@@ -751,7 +767,7 @@ static void do_avx(struct cpu *c) {
         switch (op) {
         case 0x00: { // vpshufb: per-128-lane byte shuffle (src1=vvvv, control=rm)
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int lane = 0; lane < W; lane += 16)
                 for (int i = 0; i < 16; i++) {
                     uint8_t ctl = b[lane + i];
@@ -765,7 +781,7 @@ static void do_avx(struct cpu *c) {
         case 0x58:
         case 0x59: { // vpbroadcastb/w/d/q: broadcast low element of rm across W
             int es = (op == 0x78) ? 1 : (op == 0x79) ? 2 : (op == 0x58) ? 4 : 8;
-            avx_get_rm(c, &I, next, es, b);
+            avx_get_rm(state, c, &I, next, es, b);
             for (int i = 0; i < W; i += es)
                 memcpy(d + i, b, es);
             avx_put(c, rd, d, W);
@@ -774,7 +790,7 @@ static void do_avx(struct cpu *c) {
         case 0x18:
         case 0x19: { // vbroadcastss(4)/sd(8)
             int es = (op == 0x18) ? 4 : 8;
-            avx_get_rm(c, &I, next, es, b);
+            avx_get_rm(state, c, &I, next, es, b);
             for (int i = 0; i < W; i += es)
                 memcpy(d + i, b, es);
             avx_put(c, rd, d, W);
@@ -798,7 +814,7 @@ static void do_avx(struct cpu *c) {
             static const int k_dst_es[6] = {2, 4, 8, 4, 8, 8};
             int src_es = k_src_es[idx], dst_es = k_dst_es[idx];
             int n = W / dst_es;
-            avx_get_rm(c, &I, next, n * src_es, b);
+            avx_get_rm(state, c, &I, next, n * src_es, b);
             for (int i = 0; i < n; i++) {
                 int64_t v = 0;
                 memcpy(&v, b + i * src_es, src_es);
@@ -813,7 +829,7 @@ static void do_avx(struct cpu *c) {
         }
         case 0x13: { // vcvtph2ps: rm holds W/2 bytes of packed fp16 -> W/4 fp32 in dst
             int nf = W / 4;
-            avx_get_rm(c, &I, next, W / 2, b);
+            avx_get_rm(state, c, &I, next, W / 2, b);
             for (int i = 0; i < nf; i++) {
                 uint16_t h;
                 memcpy(&h, b + 2 * i, 2);
@@ -825,7 +841,7 @@ static void do_avx(struct cpu *c) {
         }
         case 0x36: {           // vpermd: dst.dword[i] = rm.dword[ vvvv.dword[i] & 7 ] (across full 256)
             avx_get(c, vv, a); // control indices
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += 4) {
                 uint32_t idx;
                 memcpy(&idx, a + i, 4);
@@ -836,7 +852,7 @@ static void do_avx(struct cpu *c) {
         }
         case 0x40: { // vpmulld: 32-bit low product, dst = src1(vvvv) * rm
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += 4) {
                 int32_t x, y;
                 memcpy(&x, a + i, 4);
@@ -853,7 +869,7 @@ static void do_avx(struct cpu *c) {
         {
             int es = I.vex_w ? 8 : 4; // W selects dword(0) / qword(1); 0x46 is dword-only
             avx_get(c, vv, a);        // values to shift
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += es) {
                 uint64_t v = 0, cnt = 0;
                 memcpy(&v, a + i, es);
@@ -909,7 +925,7 @@ static void do_avx(struct cpu *c) {
             uint8_t dst[64];
             avx_get(c, rd, dst);
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             // per form pick (mul1, mul2, add) from {dst, vvvv=a, rm=b}
             uint8_t *m1 = (form == 0) ? dst : a;
             uint8_t *m2 = (form == 0) ? b : (form == 1) ? dst : b;
@@ -944,7 +960,7 @@ static void do_avx(struct cpu *c) {
         case 0x18:   // vinsertf128 (same as vinserti128)
         case 0x38: { // vinserti128: dst = src1; dst[imm&1 *16] = rm(128)
             avx_get(c, vv, d);
-            avx_get_rm(c, &I, next, 16, b);
+            avx_get_rm(state, c, &I, next, 16, b);
             memcpy(d + ((I.imm & 1) ? 16 : 0), b, 16);
             avx_put(c, rd, d, 32);
             goto done;
@@ -953,12 +969,12 @@ static void do_avx(struct cpu *c) {
         case 0x39: { // vextracti128: rm(128) = src.reg[imm&1]
             avx_get(c, rd, a);
             memcpy(d, a + ((I.imm & 1) ? 16 : 0), 16);
-            avx_put_rm(c, &I, next, 16, d);
+            avx_put_rm(state, c, &I, next, 16, d);
             goto done;
         }
         case 0x06: { // vperm2f128: select a 128-bit lane into each half (imm[3]/[7] zero the lane)
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, 32, b);
+            avx_get_rm(state, c, &I, next, 32, b);
             uint8_t src[64];
             memcpy(src, a, 32);      // [0:16)=a.lo, [16:32)=a.hi
             memcpy(src + 32, b, 32); // [32:48)=b.lo, [48:64)=b.hi
@@ -981,12 +997,12 @@ static void do_avx(struct cpu *c) {
                 uint16_t h = avx_f32_to_f16(f, I.imm);
                 memcpy(d + 2 * i, &h, 2);
             }
-            avx_put_rm(c, &I, next, W / 2, d);
+            avx_put_rm(state, c, &I, next, W / 2, d);
             goto done;
         }
         case 0x0F: { // vpalignr imm8: per-128-lane byte concat(src1:src2) >> imm
             avx_get(c, vv, a);
-            avx_get_rm(c, &I, next, W, b);
+            avx_get_rm(state, c, &I, next, W, b);
             int sh = (uint8_t)I.imm;
             for (int lane = 0; lane < W; lane += 16) {
                 uint8_t t[32];
@@ -1149,9 +1165,10 @@ static inline int sat_u16(int v) {
 }
 
 // Read the 16-byte r/m operand (xmm register or m128) of a legacy SSE insn.
-static void sse_get_rm(struct cpu *c, struct insn *I, uint64_t next, uint8_t buf[16]) {
+static void sse_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t next,
+                       uint8_t buf[16]) {
     if (I->is_mem)
-        memcpy(buf, (void *)avx_ea(c, I, next, 16), 16);
+        memcpy(buf, (void *)avx_ea(state, c, I, next, 16), 16);
     else
         memcpy(buf, &c->v[2 * I->rm_reg], 16);
 }
@@ -1276,7 +1293,7 @@ static void sse42_mask(struct cpu *c, int res, int imm, int n) {
     memcpy(&c->v[0], out, 16); // XMM0 == c->v[0..1]; legacy SSE leaves the upper YMM bits intact
 }
 
-static void do_sse3b(struct cpu *c) {
+void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + I.len;
@@ -1291,7 +1308,7 @@ static void do_sse3b(struct cpu *c) {
             int nb = (op == 0xF0) ? 1 : I.opsize;
             uint64_t v;
             if (I.is_mem) {
-                uint64_t a = avx_ea(c, &I, next, nb);
+                uint64_t a = avx_ea(state, c, &I, next, nb);
                 v = 0;
                 memcpy(&v, (void *)a, nb);
             } else {
@@ -1302,7 +1319,7 @@ static void do_sse3b(struct cpu *c) {
             c->r[I.reg] = crc; // zero-extends into the 64-bit GPR (incl. the REX.W form)
         } else {               // MOVBE: byte-swapping load (F0) / store (F1) of a memory operand
             int nb = I.opsize;
-            uint64_t a = avx_ea(c, &I, next, nb);
+            uint64_t a = avx_ea(state, c, &I, next, nb);
             if (op == 0xF0) { // MOVBE r, m  -> reg = bswap(load)
                 uint64_t v = 0;
                 memcpy(&v, (void *)a, nb);
@@ -1347,7 +1364,7 @@ static void do_sse3b(struct cpu *c) {
             val = w;
         }
         if (I.is_mem) {
-            uint64_t a = avx_ea(c, &I, next, nb);
+            uint64_t a = avx_ea(state, c, &I, next, nb);
             memcpy((void *)a, &val, nb);
         } else if (nb == 8) {
             c->r[I.rm_reg] = val;
@@ -1362,20 +1379,20 @@ static void do_sse3b(struct cpu *c) {
     if (map == 3 && (op == 0x20 || op == 0x21 || op == 0x22)) {
         int imm = (int)I.imm;
         if (op == 0x20) { // pinsrb: r/m8 -> byte lane imm[3:0]
-            uint8_t v = I.is_mem ? *(uint8_t *)avx_ea(c, &I, next, 1) : (uint8_t)c->r[I.rm_reg];
+            uint8_t v = I.is_mem ? *(uint8_t *)avx_ea(state, c, &I, next, 1) : (uint8_t)c->r[I.rm_reg];
             D[imm & 15] = v;
         } else if (op == 0x22) { // pinsrd/q: r/m32/64 -> dword/qword lane
             if (I.rexW) {
-                uint64_t v = I.is_mem ? *(uint64_t *)avx_ea(c, &I, next, 8) : c->r[I.rm_reg];
+                uint64_t v = I.is_mem ? *(uint64_t *)avx_ea(state, c, &I, next, 8) : c->r[I.rm_reg];
                 memcpy(D + 8 * (imm & 1), &v, 8);
             } else {
-                uint32_t v = I.is_mem ? *(uint32_t *)avx_ea(c, &I, next, 4) : (uint32_t)c->r[I.rm_reg];
+                uint32_t v = I.is_mem ? *(uint32_t *)avx_ea(state, c, &I, next, 4) : (uint32_t)c->r[I.rm_reg];
                 memcpy(D + 4 * (imm & 3), &v, 4);
             }
         } else { // 0x21 insertps: select src dword, insert at dst lane, then zero per imm[3:0]
             uint32_t src;
             if (I.is_mem)
-                src = *(uint32_t *)avx_ea(c, &I, next, 4); // memory source: element 0
+                src = *(uint32_t *)avx_ea(state, c, &I, next, 4); // memory source: element 0
             else
                 memcpy(&src, (uint8_t *)&c->v[2 * I.rm_reg] + 4 * ((imm >> 6) & 3), 4); // src dword via imm[7:6]
             int dlane = (imm >> 4) & 3;
@@ -1391,7 +1408,7 @@ static void do_sse3b(struct cpu *c) {
     // 60=PCMPESTRM (explicit len -> mask in xmm0), 61=PCMPESTRI (explicit len -> index in ECX),
     // 62=PCMPISTRM (implicit len -> mask in xmm0), 63=PCMPISTRI (implicit len -> index in ECX).
     if (map == 3 && (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x63)) {
-        sse_get_rm(c, &I, next, s); // s = operand2 (r/m), D = operand1 (reg/xmm1)
+        sse_get_rm(state, c, &I, next, s); // s = operand2 (r/m), D = operand1 (reg/xmm1)
         int imm = (int)I.imm;
         int wordsz = (imm & 1) ? 2 : 1;
         int n = 16 / wordsz;
@@ -1416,7 +1433,7 @@ static void do_sse3b(struct cpu *c) {
     // ---- PTEST (66 0F38 17, SSE4.1): read-only flag-setter. ZF=(D & s)==0, CF=(s & ~D)==0, OF/SF/AF/PF=0.
     // D = operand1 (reg/xmm1), s = operand2 (r/m). node/V8 startup branches on these. Substrate: x86 CF=NOT stored-C.
     if (map == 2 && op == 0x17) {
-        sse_get_rm(c, &I, next, s);
+        sse_get_rm(state, c, &I, next, s);
         uint64_t d0, d1, s0, s1;
         memcpy(&d0, D, 8);
         memcpy(&d1, D + 8, 8);
@@ -1432,7 +1449,7 @@ static void do_sse3b(struct cpu *c) {
     }
 
     // ---- the remaining ops are xmm-destructive: load the r/m source, compute into r, write to D -----
-    sse_get_rm(c, &I, next, s);
+    sse_get_rm(state, c, &I, next, s);
     memcpy(r, D, 16);
 
     if (map == 2) {

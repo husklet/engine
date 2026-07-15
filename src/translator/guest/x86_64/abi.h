@@ -69,7 +69,6 @@
 
 // W5B tier-2: extra PROF line at exit_group (x86 engine only; aarch64 leaves G_PROF_EXTRA undefined).
 // g_prof_t2 lives in the shared cache, while g_prof_t2fold lives in the independently compiled x86 glue state.
-static void xs_dump(void); // EXITSTAT diagnostic histogram (defined in avx.c; no-op unless EXITSTAT set)
 #define G_PROF_EXTRA                                                                                                   \
     do {                                                                                                               \
     } while (0)

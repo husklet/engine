@@ -104,6 +104,8 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+#include "../../translator/guest/x86_64/avx.h"
+static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonpie_bias};
 #include "../../translator/guest/x86_64/glue.h" // independently compiled x86 target state
 #include "../../translator/cache.c"             // SHARED translator: code cache + block map
 
@@ -332,7 +334,6 @@ static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining
 
 #include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
-#include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 #include "../../linux_abi/x86.c" // Linux x86-64 ELF loader + stack + fault handlers
