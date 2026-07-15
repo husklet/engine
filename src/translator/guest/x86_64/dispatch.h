@@ -1,7 +1,9 @@
 #include "cpuid.h"
 #include "cmpxchg.h"
 #include "rotate.h"
+#include "rep.h"
 #include "x87math.h"
+#include "x87state.h"
 #include "operand.h"
 #include "flags.h"
 
@@ -257,7 +259,7 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_REPSTR) {                                                                                     \
-        do_repstr(c);                                                                                                  \
+        hl_x86_rep_compare(c, g_nonpie_lo, g_nonpie_hi, g_nonpie_bias);                                                \
         continue;                                                                                                      \
     } /* W4-C rep cmps/scas idiom (rip already = next) */                                                              \
     if ((c)->reason == R_X87FLD) {                                                                                     \

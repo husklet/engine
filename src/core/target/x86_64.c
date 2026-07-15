@@ -124,7 +124,6 @@ static int elf_interp(const char *path, char *out, size_t n);
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
 #include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
-#include "../../translator/guest/x86_64/ops.c" // x86 cpuid + x87 m80 block-exit helpers
 #include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
