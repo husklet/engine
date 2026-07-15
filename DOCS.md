@@ -10,13 +10,13 @@ The final system has three independent axes:
 
 - **Guest operating system:** Linux.
 - **Guest instruction set:** initially AArch64 and x86-64.
-- **Host platform:** macOS first, Linux second, and Windows last, all behind the same service contract.
+- **Host platform:** macOS and Linux behind the same service contract.
 
 This ordering is an implementation priority, not an architectural dependency. The current production effort ports and
 finishes the known-working macOS-hosted Linux engine. Every behavior is separated into translator, Linux ABI, and
 host-service ownership as it is transferred. Once the macOS compatibility and performance gates are complete, the
-same portable layers are used to finish Linux. Windows is an explicit final host target after both POSIX hosts have
-proved the contract; it must not be anticipated by leaking Windows policy into the Linux front or translator.
+same portable layers are used to finish Linux. Other hosts are outside the current product scope and do not affect
+the definition of done.
 
 The engine is deliberately product-neutral. It does not know about windows, browsers, compositors, GPU APIs, display
 servers, application brands, or application-specific command-line modes. A caller may build any of those systems on
@@ -61,12 +61,11 @@ runner / embedding application
          \      /
           v    v
              host-service contract
-          /             |             \
- host-macos        host-linux       host-windows
-   current             next            last
+          /             \
+ host-macos        host-linux
 ```
 
-Only arrows shown above are allowed. `host-windows` is the final planned provider, not current implementation work.
+Only arrows shown above are allowed.
 Host backends do not call into guest translation, and the translator does not reach around the service contract to
 native APIs.
 
@@ -593,8 +592,6 @@ Work is completed in this order:
    every active dual-ISA compatibility, stress, lifecycle, and performance gate on the real mac host.
 2. **Linux production completion.** Reuse the already-separated translator, Linux ABI, and host-service contract;
    finish the Linux backend and pass the same exact-golden corpus without changing guest semantics.
-3. **Windows production implementation.** Implement Windows only after macOS and Linux prove that the portable
-   contract is complete. Windows is a required eventual host, but it is deliberately the final host milestone.
 
 macOS work must not create macOS exceptions in portable code. Each transferred behavior is placed in its final owning
 layer immediately so completing macOS reduces, rather than increases, the later Linux work.
@@ -608,7 +605,6 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes. The permanent
       `test-linux-production-typed` gate runs 655 active exact-golden cases across 16 manifests and both guest ISAs,
       with zero exclusions.
-- [ ] Add a Windows backend after macOS and Linux are complete and the common contract passes without POSIX leakage.
 
 ### Linux behavior
 

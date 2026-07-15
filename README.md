@@ -7,7 +7,6 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 | macOS AArch64 | Supported | AArch64, x86-64 |
 | Linux AArch64 | Supported | AArch64, x86-64 |
 | Linux x86-64 | In progress | AArch64, x86-64 |
-| Windows x86-64 | In progress | AArch64, x86-64 |
 
 ```sh
 cargo add hl-engine
