@@ -189,7 +189,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // neighbour (a partial unmap, full == a1, leaves the tail alone). Guard-less mappings (file/fixed,
         // full == a1) and untracked mappings (full == 0) keep the plain a1 unmap unchanged.
         size_t len = (size_t)a1;
-        uint64_t full = gmap_find_len(a0);
+        uint64_t full = hl_gmap_find_length(a0);
         // Page-size mismatch: guest pages are 4 KB (AT_PAGESZ) but the macOS host uses 16 KB pages, and
         // macOS munmap rounds the LENGTH up to a whole host page. macOS also gives every distinct mmap
         // its own host-page-aligned base + host-page-rounded extent, so two SEPARATE guest mappings never
@@ -224,7 +224,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // Update the registries against the range actually unmapped. A full-cover unmap drops the
             // entry; a partial unmap (guest trimming the head/middle of a larger mapping, e.g. ZendMM
             // freeing an aligned over-allocation) SPLITS it so the surviving sub-region(s) stay tracked --
-            // reclaimed at execve() teardown and still findable by gmap_find_len (the mremap grow path).
+            // reclaimed at execve() teardown and still findable by hl_gmap_find_length (the mremap grow path).
             // (PROT_NONE coverage was already dropped above via gna_clear over the guest-logical range.)
             gmap_split_unmap(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
@@ -278,7 +278,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         const uint64_t guard = 0x10000;
-        uint64_t tracked = gmap_find_len(a0);             // full mapped extent at a0 (incl. guard), 0 if untracked
+        uint64_t tracked = hl_gmap_find_length(a0);       // full mapped extent at a0 (incl. guard), 0 if untracked
         uint64_t phys = tracked ? tracked : (uint64_t)a1; // bytes we can assume are mapped at a0
         // MREMAP_FIXED(2): relocate the mapping to EXACTLY new_addr (a4), the way mremap(MREMAP_FIXED) does.
         // Linux (mm/mremap.c) requires MREMAP_MAYMOVE to also be set, a page-aligned new_addr, and that the
@@ -752,7 +752,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // PROT_EXEC is intentionally omitted: translated guest bytes are data to the host, not executed.
             {
                 size_t hp = (size_t)getpagesize();
-                uint64_t tracked = gmap_find_len(physical_a0);
+                uint64_t tracked = hl_gmap_find_length(physical_a0);
                 uint64_t host_len = (a1 + hp - 1) & ~((uint64_t)hp - 1);
                 // A Linux 4 KiB subpage may start inside one 16 KiB macOS VM page. In that case physical
                 // mprotect would be EINVAL (or, after rounding down, alter adjacent guest subpages), so the
