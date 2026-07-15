@@ -905,7 +905,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;
         }
-        mlk_add(a0, (uint64_t)a1);
+        hl_gmap_lock_add(a0, (uint64_t)a1);
         G_RET(c) = 0;
         break;
     }

@@ -650,13 +650,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 futex_shared_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5);
             // mlockall(MCL_FUTURE): a mapping created while future-locking is armed must be wired resident on
             // creation (Linux mm/mlock.c). Best-effort (a RLIMIT_MEMLOCK refusal leaves it pageable); the
-            // mlk_add records it so /proc Locked:/VmLck: reports the range under whole-map locking too.
+            // hl_gmap_lock_add records it so /proc Locked:/VmLck: reports the range under whole-map locking too.
             // MCL_FUTURE accounting: only wire+count the new mapping while it stays within RLIMIT_MEMLOCK.
             // A mapping that would push the locked total over the guest's limit is left pageable/uncounted
             // (the mmap still succeeds) so the tracked locked bytes never exceed the limit.
             if (hl_gmap_lock_future() && mlk_rlimit_gate((uint64_t)r, (uint64_t)a1) == 0) {
                 mlock(r, (size_t)a1 + guard);
-                mlk_add((uint64_t)r, (uint64_t)a1);
+                hl_gmap_lock_add((uint64_t)r, (uint64_t)a1);
             }
             // DONTNEED anon registry: record PRIVATE-ANON ranges (incl. the guard tail); for any other
             // (file-backed/shared) mapping, forget overlapping anon coverage -- a MAP_FIXED file map may
@@ -814,7 +814,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        mlk_add(a0, (uint64_t)a1);
+        hl_gmap_lock_add(a0, (uint64_t)a1);
         G_RET(c) = 0;
         break;
     }
