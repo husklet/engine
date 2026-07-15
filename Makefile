@@ -1481,7 +1481,7 @@ $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 .PHONY: test-linux-production-typed
 test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/linux-production/hl-remote-supervisor \
-	$(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS)
 	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/filesystem/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
@@ -1490,6 +1490,10 @@ test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 		$(abspath $(BUILD)/compat/isolation/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/isolation/x86_64) $(abspath tests/compat/isolation)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/network/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network)
 
 $(BUILD)/tools/remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
