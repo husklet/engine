@@ -3532,7 +3532,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // F_OK existence check: cacheable
         if (a2 == 0 && p) {
             int rc;
-            if (!ac_lookup(p, &rc)) {
+            if (!hl_fdcache_access_lookup(p, &rc)) {
                 int r = faccessat(ATFD(a0), p, 0, 0);
                 rc = r < 0 ? -errno : 0;
                 ac_store(p, rc);

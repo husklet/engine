@@ -324,7 +324,7 @@ void rl_evict(const char *p) {
 }
 
 // access(F_OK) existence cache (ld.so probes every library candidate)
-int ac_lookup(const char *p, int *rc) {
+int hl_fdcache_access_lookup(const char *p, int *rc) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;
