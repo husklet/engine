@@ -2,6 +2,7 @@
 // (lower/upper + copy-up + whiteout + merged readdir), and /proc + /sys synthesis.
 
 #include "../open_plan.h"
+#include "../../host/file.h"
 
 static int path_copy(char *out, size_t capacity, const char *value) {
     size_t length;
