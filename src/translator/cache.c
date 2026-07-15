@@ -724,7 +724,7 @@ static void stw_install(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = stw_park_handler;
-    sa.sa_flags = SA_RESTART | SA_SIGINFO; // auto-restart interrupted host syscalls
+    sa.sa_flags = SA_RESTART | SA_SIGINFO | SA_ONSTACK; // never place a host frame on the live guest stack
     sigemptyset(&sa.sa_mask);
     sigaction(STW_SIG, &sa, NULL);
 }

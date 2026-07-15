@@ -84,6 +84,10 @@ struct cpu {
     uint64_t bus_filter;
     uint64_t bus_force;
     uint64_t bus_scratch[3];
+    // Published while this thread is inside service(). A directed signal
+    // needs a host interrupt only in that window; translated code observes
+    // irq itself and dispatcher code is already at a delivery boundary.
+    volatile uint64_t in_service;
 };
 
 #define OFF_VDIRTY ((int)offsetof(struct cpu, vdirty))

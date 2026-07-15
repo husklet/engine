@@ -716,6 +716,7 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
         // POSIX handler only ever sees an EXTERNAL kill, and the async signals forward to the host here.
         if (s == 7 || s == 11) continue;
         int ms = sig_l2m(s);
+        if (sig_host_is_engine_control(ms)) continue;
         if (h == 0) {
             signal(ms, SIG_DFL);
         } else if (h == 1) {
@@ -724,7 +725,7 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
             struct sigaction sa;
             memset(&sa, 0, sizeof sa);
             sa.sa_sigaction = (s == 4 || s == 5 || s == 8) ? host_sigh_sync : host_sigh_si;
-            sa.sa_flags = SA_SIGINFO;
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
             sigfillset(&sa.sa_mask);
             sigaction(ms, &sa, NULL);
         }

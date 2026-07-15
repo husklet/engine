@@ -1572,7 +1572,10 @@ static void thread_int_install(void) {
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = thread_int_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; // NO SA_RESTART: the interrupted syscall must return EINTR so its retry loop can bail on exited
+    // Host AArch64 executes with the guest SP live.  Keep this engine-only
+    // interrupt frame off that stack; NO SA_RESTART still makes a blocking
+    // syscall return EINTR so its retry loop can bail on exited.
+    sa.sa_flags = SA_ONSTACK;
     sigaction(THREAD_INT_SIG, &sa, NULL);
 }
 
@@ -1655,7 +1658,8 @@ static int thread_target_signal(int tid, int sig) {
                     pthread_mutex_lock(m); // serialize with the target's pre-wait window; broadcast can't be lost
                     pthread_cond_broadcast(cnd);
                     pthread_mutex_unlock(m);
-                } else if (!pthread_equal(g_threg[i].th, pthread_self())) {
+                } else if (!pthread_equal(g_threg[i].th, pthread_self()) &&
+                           __atomic_load_n(&g_threg[i].c->in_service, __ATOMIC_SEQ_CST)) {
                     // No published futex wait: the target is either running translated code (cpu->irq already
                     // bounces it to a dispatcher boundary) or PARKED IN A BLOCKING HOST SYSCALL (read/accept/
                     // recv/poll/nanosleep/...), which reaches no boundary on its own. Poke it with

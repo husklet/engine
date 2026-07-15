@@ -78,6 +78,14 @@ static int sig_is_sync(int s) {
     // ILL TRAP BUS FPE SEGV (Linux nums)
 }
 
+// Native Linux has no signal numbers outside the Linux guest ABI. The two
+// host signals selected for engine control therefore remain virtual for the
+// guest: guest dispositions live in g_sigact and must never replace these
+// process-wide host handlers.
+static int sig_host_is_engine_control(int hostsig) {
+    return hostsig == STW_SIG || hostsig == THREAD_INT_SIG;
+}
+
 #if defined(__linux__)
 #define HOST_SIGNAL_HAS_FAULT_ADDRESS(si) ((si) != NULL && (si)->si_code > 0)
 #else
@@ -436,7 +444,9 @@ static void maybe_deliver_signal(struct cpu *c) {
             // (LTP-style signal()-with-caller-reset semantics; glibc's legacy signal() sets SA_RESETHAND).
             if (flags & 0x80000000ull) {
                 g_sigact[sig].handler = 0;
-                if (sig != 9 && sig != 19 && !sig_is_sync(sig)) signal(sig_l2m(sig), SIG_DFL);
+                if (sig != 9 && sig != 19 && !sig_is_sync(sig) &&
+                    !sig_host_is_engine_control(sig_l2m(sig)))
+                    signal(sig_l2m(sig), SIG_DFL);
             }
             return;
         }

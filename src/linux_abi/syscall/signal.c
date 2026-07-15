@@ -350,7 +350,9 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         struct sigaction saved[65];
         uint64_t installed = 0;
         for (int s = 1; s <= 64; s++) {
-            if (!(set & (1ull << (s - 1))) || s == 9 || s == 19 || sig_is_sync(s)) continue;
+            if (!(set & (1ull << (s - 1))) || s == 9 || s == 19 || sig_is_sync(s) ||
+                sig_host_is_engine_control(sig_l2m(s)))
+                continue;
             if (g_sigact[s].handler > 1) continue;
             struct sigaction sa;
             memset(&sa, 0, sizeof sa);
@@ -455,7 +457,12 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             if (sig != 9 && sig != 19 && !sig_is_sync(sig)) {
                 // host(macOS) signo to install on
                 int ms = sig_l2m(sig);
-                if (h == 0)
+                // STW_SIG and THREAD_INT_SIG are engine control channels on
+                // native Linux. Guest dispositions remain virtual in
+                // g_sigact; never replace their host handlers.
+                if (sig_host_is_engine_control(ms)) {
+                    // no host disposition change
+                } else if (h == 0)
                     signal(ms, SIG_DFL);
                 else if (h == 1)
                     // honor SIG_IGN (e.g. SIGPIPE)
@@ -466,7 +473,7 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                     struct sigaction sa;
                     memset(&sa, 0, sizeof sa);
                     sa.sa_sigaction = host_sigh_si;
-                    sa.sa_flags = SA_SIGINFO;
+                    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
                     // SIGCHLD: honor SA_NOCLDSTOP by forwarding it to the host SIGCHLD action (Linux flag bit
                     // NOCLDSTOP=0x1 differs from macOS's value, so translate) -- the host then suppresses the
                     // child-stop SIGCHLD. SA_NOCLDWAIT is NOT forwarded: macOS SA_NOCLDWAIT also SUPPRESSES the
@@ -495,7 +502,7 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                     struct sigaction sa;
                     memset(&sa, 0, sizeof sa);
                     sa.sa_sigaction = host_sigh_sync;
-                    sa.sa_flags = SA_SIGINFO;
+                    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
                     sigfillset(&sa.sa_mask);
                     sigaction(ms, &sa, NULL);
                 }

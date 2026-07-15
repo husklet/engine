@@ -1101,10 +1101,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         g_sfd[sslot].mask = pm;
         for (int s = 1; s < 64; s++)
             // make sure the host delivers them
-            if ((pm & (1ull << s)) && !sig_is_sync(s)) {
+            if ((pm & (1ull << s)) && !sig_is_sync(s) && !sig_host_is_engine_control(sig_l2m(s))) {
                 struct sigaction sa;
                 memset(&sa, 0, sizeof sa);
                 sa.sa_handler = host_sigh;
+                sa.sa_flags = SA_ONSTACK;
                 sigaction(sig_l2m(s), &sa, NULL);
             }
         int srd = g_sfd[sslot].rd;

@@ -500,6 +500,19 @@ static void service(struct cpu *c) {
     // SIGSEGV/ILL/FPE/... from a genuine engine fault (see g_in_service in os/linux/signal.c). Cleared on
     // EVERY exit path below, so the ptrace/untrusted routes must not early-return past the clear.
     g_in_service = 1;
+    __atomic_store_n(&c->in_service, 1, __ATOMIC_SEQ_CST);
+    // Close the signal-vs-syscall-entry race. The signaler publishes tpending
+    // before reading in_service; after publishing in_service, recheck it here
+    // before entering a potentially blocking host call.
+    if (cpu_has_actionable_tsig(c)) {
+        // Do not execute or advance past the syscall. The dispatcher delivers
+        // the pending handler, and sigreturn resumes at this SVC exactly as a
+        // Linux signal noticed before syscall entry would.
+        c->redirect = 1;
+        __atomic_store_n(&c->in_service, 0, __ATOMIC_SEQ_CST);
+        g_in_service = 0;
+        return;
+    }
     uint64_t _rnr = g_systrace ? G_NR(c) : 0; // JTS: capture nr to pair the return log below
     // seccomp gate: run the guest's installed cBPF filter(s) / STRICT policy against this syscall BEFORE it
     // is routed anywhere. On an intercepted syscall (ERRNO/TRAP/TRACE/KILL/strict-violation) the result is
@@ -510,6 +523,7 @@ static void service(struct cpu *c) {
         if (g_systrace)
             fprintf(stderr, "[ret pid=%d] %llu -> %lld (seccomp)\n", (int)getpid(), (unsigned long long)_rnr,
                     (long long)(int64_t)G_RET(c));
+        __atomic_store_n(&c->in_service, 0, __ATOMIC_SEQ_CST);
         g_in_service = 0;
         return;
     }
@@ -525,6 +539,7 @@ static void service(struct cpu *c) {
     if (g_systrace)
         fprintf(stderr, "[ret pid=%d] %llu -> %lld\n", (int)getpid(), (unsigned long long)_rnr,
                 (long long)(int64_t)G_RET(c));
+    __atomic_store_n(&c->in_service, 0, __ATOMIC_SEQ_CST);
     g_in_service = 0;
 }
 

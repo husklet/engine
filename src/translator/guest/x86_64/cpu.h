@@ -96,6 +96,7 @@ struct cpu {
     uint64_t bus_filter;
     uint64_t bus_force;
     uint64_t bus_scratch[3];
+    volatile uint64_t in_service;
 };
 
 #define OFF_FCPTR ((int)__builtin_offsetof(struct cpu, fastclk_ptr))
