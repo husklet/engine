@@ -1,4 +1,5 @@
 badfd failed=1 ebadf=1
+mmap_badoff failed=1 einval=1 fd_live=1
 mmap_len0 failed=1 einval=1
 munmap_len0 einval=1
 munmap_misalign einval=1

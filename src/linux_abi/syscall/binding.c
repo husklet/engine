@@ -595,8 +595,6 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     result = hl_linux_map_file(g_linux_box, file->fd, address, offset, size, protection & 7u, flags, &mapped);
     if (result < 0) {
         if (bus_prepared) gbus_prepare_release();
-        free(object);
-        free(entry);
         pthread_mutex_unlock(&g_bound_mapping_gate);
         return result;
     }

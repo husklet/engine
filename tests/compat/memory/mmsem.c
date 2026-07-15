@@ -42,6 +42,29 @@ static void t_badfd(void) {
     unlink(tmpl);
 }
 
+// A valid file descriptor with a non-page-aligned offset reaches the host mapping operation and must
+// fail transactionally with EINVAL.  In particular, failure must not disturb the live descriptor or
+// attempt to release mapping state that was never created.
+static void t_bad_offset(void) {
+    char tmpl[] = "/tmp/mmoffXXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0 || ftruncate(fd, PS) != 0) {
+        printf("mmap_badoff failed=0 einval=0 fd_live=0\n");
+        if (fd >= 0) close(fd);
+        unlink(tmpl);
+        return;
+    }
+    errno = 0;
+    void *p = mmap(NULL, PS, PROT_READ, MAP_PRIVATE, fd, 1);
+    int failed = p == MAP_FAILED;
+    int invalid = errno == EINVAL;
+    int live = fcntl(fd, F_GETFD) >= 0;
+    if (p != MAP_FAILED) munmap(p, PS);
+    printf("mmap_badoff failed=%d einval=%d fd_live=%d\n", failed, invalid, live);
+    close(fd);
+    unlink(tmpl);
+}
+
 // mmap with length 0 -> EINVAL (anon and file).
 static void t_len0(void) {
     errno = 0;
@@ -171,6 +194,7 @@ static void t_madvise(void) {
 int main(void) {
     PS = sysconf(_SC_PAGESIZE);
     t_badfd();
+    t_bad_offset();
     t_len0();
     t_munmap_einval();
     t_munmap_ok();
