@@ -222,8 +222,17 @@ int main(void) {
     HL_CHECK(services.event->wake(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
     for (size_t index = WATCH_COUNT; index != 0; --index)
         HL_CHECK(services.watch->close(services.context, watches[index - 1]).status == HL_STATUS_OK);
-    HL_CHECK(services.watch->query(services.context, watches[0], &(hl_host_watch_record){0}).status ==
-             HL_STATUS_INVALID_ARGUMENT);
+    {
+        hl_host_handle stale = watches[0];
+        hl_host_result replacement = services.watch->open(services.context, file.value);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.watch->query(services.context, stale, &(hl_host_watch_record){0}).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.watch->query(services.context, replacement.value, &(hl_host_watch_record){0}).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.watch->close(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
     HL_CHECK(services.file->metadata(services.context, file.value, &(hl_host_file_metadata){0}).status ==
              HL_STATUS_INVALID_ARGUMENT);
