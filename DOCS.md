@@ -630,7 +630,11 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Extend lifecycle baselines to engine mappings. Private host probes count authoritative live mapping handles;
       macOS and Linux lifecycle runners require the count to return to zero after normal completion, injected host
       services, and forced-stop teardown for both guest ISAs.
-- [ ] Prove all registries grow to advertised limits without stale-handle aliasing.
+- [x] Prove registry growth and reuse without stale aliasing. Native-capacity tests cross every dynamic registry's
+      initial capacity on both hosts, then close, reuse, and reject stale generation handles for each independently
+      allocated macOS kind and the shared Linux generation table. Timer and directory-watch token tables are reused
+      after growth. The fixed sync registry reaches its exact 65,536-object limit, reports exhaustion, and safely
+      reuses a slot with a new generation.
 - [ ] Fault-inject every host callback boundary and verify transactional rollback.
 
 ### Translation and cache
