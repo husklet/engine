@@ -1629,6 +1629,19 @@ static void *translate_block(uint64_t gpc) {
                 gpc += 4;
                 continue;
             }
+            // A backward CBZ/CBNZ whose loop body is only polling memory is the canonical AArch64
+            // contended-lock wait loop (glibc/musl spin locks and several runtime locks use it).  The
+            // translated thread otherwise consumes its entire host timeslice repeatedly loading the
+            // held word, which can starve the translated owner that must run to release it.  Preserve
+            // the guest-visible semantics but emit the architectural YIELD hint before retrying.  Keep
+            // this deliberately narrow: both the instruction immediately before the branch and the
+            // branch target must be scalar loads, so compute loops and ordinary backward branches remain
+            // byte-for-byte unchanged.
+            uint32_t prev = gpc >= start + 4 ? *(uint32_t *)(gpc - 4) : 0;
+            uint32_t first = taken < gpc ? *(uint32_t *)taken : 0;
+            int prev_load = (prev & 0x0A000000u) == 0x08000000u && ((prev >> 22) & 1u);
+            int first_load = (first & 0x0A000000u) == 0x08000000u && ((first >> 22) & 1u);
+            if (taken < gpc && prev_load && first_load) emit32(0xD503203Fu); // yield
             // W4E tier-2: single-block self-loop (non-stolen tested reg). Before opt4; NOTIER2 -> skipped.
             if (taken == start && !g_notier2 && !is_stolen(rt) && !loop_has_rmw_hazard(start, gpc)) {
                 int slot = g_tier2_build ? 0 : t2_slot(start);
