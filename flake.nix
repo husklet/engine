@@ -95,7 +95,10 @@
       devShells = forAllSystems (pkgs:
         let
           system = pkgs.stdenv.hostPlatform.system;
+          linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
           linuxX86 = pkgs.pkgsCross.gnu64;
+          linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
+          linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
         in {
           default = pkgs.mkShell ({
             packages = [
@@ -106,10 +109,18 @@
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
-            ] ++ pkgs.lib.optionals (system == "aarch64-linux") [ linuxX86.stdenv.cc ];
+            ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [ linuxArm.stdenv.cc linuxX86.stdenv.cc ]
+              ++ pkgs.lib.optionals (system == "aarch64-linux") [ pkgs.gcc linuxX86.stdenv.cc ];
+          } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
+            AARCH64_LINUX_CC = linuxArmCompiler;
+            X86_64_LINUX_CC = linuxX86Compiler;
+            AARCH64_DYNAMIC_LOADER = "${linuxArm.glibc}/lib/ld-linux-aarch64.so.1";
+            AARCH64_DYNAMIC_LIBC = "${linuxArm.glibc}/lib/libc.so.6";
+            X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
+            X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
           } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
-            AARCH64_LINUX_CC = "cc";
-            X86_64_LINUX_CC = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
+            AARCH64_LINUX_CC = "gcc";
+            X86_64_LINUX_CC = linuxX86Compiler;
             AARCH64_DYNAMIC_LOADER = "${pkgs.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${pkgs.glibc}/lib/libc.so.6";
             X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";

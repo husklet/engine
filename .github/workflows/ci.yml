@@ -38,11 +38,17 @@ jobs:
 
       - name: Test Linux compatibility
         if: runner.os == 'Linux'
-        run: nix develop --command make -s -j2 test-linux-production-typed 2>&1 | tee "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        run: |
+          set -o pipefail
+          nix develop --command make -s -j2 test-linux-production-typed 2>&1 | tee "$GITHUB_STEP_SUMMARY"
 
       - name: Test macOS compatibility
         if: runner.os == 'macOS'
-        run: nix develop --command make -s -j2 e2e-compat 2>&1 | tee "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        run: |
+          set -o pipefail
+          nix develop --command make -s -j2 e2e-compat 2>&1 | tee "$GITHUB_STEP_SUMMARY"
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify

@@ -30,6 +30,11 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v20
 
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Test engine
         run: nix flake check --print-build-logs
 
