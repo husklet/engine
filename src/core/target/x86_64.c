@@ -1,4 +1,5 @@
 #include "namespace.h"
+#include "../bus.h"
 
 // hl/core/target -- x86-64 Linux guest target composition.
 //

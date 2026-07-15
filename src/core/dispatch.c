@@ -1,44 +1,50 @@
 // Engine host<->guest boundary: entry trampoline + run_guest() dispatcher loop.
 
-static jit_guest_bus_query g_guest_bus_query;
-static _Atomic uint64_t g_guest_bus_generation;
-static _Atomic int g_guest_bus_enabled;
+#include "bus.h"
+
+static int bus_activate(void *p) {
+    (void)p;
+    return stw_force_dispatch_flush();
+}
+
+static void bus_begin(void *p) {
+    (void)p;
+    stw_mapping_begin();
+}
+
+static void bus_end(void *p) {
+    (void)p;
+    stw_mapping_end();
+}
+
+static const hl_guest_bus_ops bus_ops = {bus_activate, bus_begin, bus_end};
+static hl_guest_bus g_guest_bus = {.ops = &bus_ops};
 
 void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
-    uint64_t seen = atomic_load_explicit(&g_guest_bus_generation, memory_order_acquire);
     (void)opaque;
-    while (generation > seen && !atomic_compare_exchange_weak_explicit(&g_guest_bus_generation, &seen, generation,
-                                                                        memory_order_acq_rel, memory_order_acquire)) {}
-    if (generation < seen) return;
-    int was_active = atomic_load_explicit(&g_guest_bus_enabled, memory_order_acquire);
-    /* Instrumentation is deliberately sticky.  Once an EOF/BUS mapping has
-       existed, retaining guarded translations is both safe (an empty ledger
-       returns no fault) and avoids rotating the whole cache for every later
-       map/unmap cycle.  Only the first activation retires pre-guard code. */
-    if (active && !was_active) {
-        atomic_store_explicit(&g_guest_bus_enabled, 1, memory_order_release);
-        if (!stw_force_dispatch_flush()) return;
-    }
+    hl_guest_bus_changed(&g_guest_bus, generation, active);
 }
 
-void jit_guest_bus_bind(jit_guest_bus_query query, int active, uint64_t generation) {
-    g_guest_bus_query = query;
-    jit_guest_bus_changed(NULL, generation, active);
+void jit_guest_bus_bind(hl_guest_bus_query query, int active, uint64_t generation) {
+    hl_guest_bus_bind(&g_guest_bus, query, active, generation);
 }
 
-int jit_guest_bus_active(void) { return atomic_load_explicit(&g_guest_bus_enabled, memory_order_acquire); }
+int jit_guest_bus_active(void) {
+    return hl_guest_bus_active(&g_guest_bus);
+}
+
 uint64_t jit_guest_bus_fault(uint64_t address, uint64_t size) {
-    return g_guest_bus_query != NULL ? g_guest_bus_query(address, size) : 0;
+    return hl_guest_bus_fault(&g_guest_bus, address, size);
 }
 
 void jit_guest_bus_transition_begin(void *opaque) {
     (void)opaque;
-    stw_mapping_begin();
+    hl_guest_bus_begin(&g_guest_bus);
 }
 
 void jit_guest_bus_transition_end(void *opaque) {
     (void)opaque;
-    stw_mapping_end();
+    hl_guest_bus_end(&g_guest_bus);
 }
 
 // ---------------- host entry trampoline ----------------
@@ -193,8 +199,7 @@ static void run_guest(struct cpu *c) {
         if (g_threaded) pthread_mutex_lock(&g_jit_lock);
         void *code = map_host(G_PC(c));
         if (!code) {
-            uint64_t _t0 =
-                g_dispatch_profile.enabled ? hl_dispatch_profile_begin(&g_dispatch_profile, now_ns()) : 0;
+            uint64_t _t0 = g_dispatch_profile.enabled ? hl_dispatch_profile_begin(&g_dispatch_profile, now_ns()) : 0;
             // near full -> wholesale flush
             if (g_cp + (1u << 16) > g_cache + CACHE_SZ) {
                 if (g_threaded && stw_peers_live()) {
@@ -282,8 +287,7 @@ static void run_guest(struct cpu *c) {
             }
             // Frontend hook: post-translate per-arch step (x86 W6A SMC source-page write-protect; empty aarch64).
             G_AFTER_TRANSLATE(c);
-            if (g_dispatch_profile.enabled)
-                hl_dispatch_profile_translation_end(&g_dispatch_profile, _t0, now_ns());
+            if (g_dispatch_profile.enabled) hl_dispatch_profile_translation_end(&g_dispatch_profile, _t0, now_ns());
         }
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).

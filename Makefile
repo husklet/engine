@@ -83,7 +83,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
 	$(call rwildcard,include/hl/,*.h))
 
-CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
+CORE_SOURCES := src/core/bus.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c src/core/target/native.c src/core/target/run.c src/core/target/services.c
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c \
@@ -196,7 +196,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := a64_asm address affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := a64_asm address affinity arena bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a

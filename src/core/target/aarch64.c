@@ -1,4 +1,5 @@
 #include "namespace.h"
+#include "../bus.h"
 
 // HL engine: the aarch64 Linux-guest JIT runner (unity translation unit).
 //
