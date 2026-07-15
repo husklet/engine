@@ -1593,7 +1593,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     G_RET(c) = (uint64_t)(int64_t)(-EBADF);
                     break;
                 }
-                snprintf(eat_pb, sizeof eat_pb, "%s/%s", hb, ep);
+                if (path_join(eat_pb, sizeof eat_pb, hb, ep) != 0) {
+                    G_RET(c) = (uint64_t)(int64_t)(-ENAMETOOLONG);
+                    break;
+                }
             }
         }
         a0 = (uint64_t)(uintptr_t)eat_pb;
@@ -1610,7 +1613,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         char comm_src[256];
         {
             const char *cb = (const char *)a0, *cs = cb ? strrchr(cb, '/') : NULL;
-            snprintf(comm_src, sizeof comm_src, "%s", cs ? cs + 1 : (cb ? cb : ""));
+            const char *name = cs ? cs + 1 : (cb ? cb : "");
+            size_t name_length = strnlen(name, sizeof comm_src - 1);
+            memcpy(comm_src, name, name_length);
+            comm_src[name_length] = 0; // Linux path components are NAME_MAX; set_guest_comm applies TASK_COMM_LEN
         }
         // exec THROUGH the /proc magic links: execve("/proc/self/exe") (busybox re-exec, daemons,
         // test harnesses) and execve("/proc/self/fd/N") (glibc fexecve fallback) must exec the link's

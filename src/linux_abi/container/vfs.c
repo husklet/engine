@@ -1303,13 +1303,13 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
         spec += 3;
     }
     char tmp[4096];
-    snprintf(tmp, sizeof tmp, "%s", spec);
+    if (path_copy(tmp, sizeof tmp, spec) != 0) return;
     char *col = strchr(tmp, ':');
     if (!col || tmp[0] != '/') return;
     *col = 0;
     struct vol *v = &g_vols[g_nvols];
     v->ro = ro;
-    snprintf(v->guest, sizeof v->guest, "%s", tmp);
+    if (path_copy(v->guest, sizeof v->guest, tmp) != 0) return;
     v->glen = strlen(v->guest);
     while (v->glen > 1 && v->guest[v->glen - 1] == '/')
         v->guest[--v->glen] = 0;
@@ -2607,8 +2607,10 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
         snprintf(xtmp, sizeof xtmp, "%s/.xt%d", dir, (int)getpid());
         snprintf(xfin, sizeof xfin, "%s/x%d", dir, (int)getpid());
         if (hl_host_file_store(&g_jit_services, xtmp, 0644, exe, strlen(exe)) == 0) {
-            if (hl_host_file_rename(&g_jit_services, xtmp, xfin) == 0)
-                snprintf(g_reg_exe_file, sizeof g_reg_exe_file, "%s", xfin);
+            if (hl_host_file_rename(&g_jit_services, xtmp, xfin) == 0) {
+                if (path_copy(g_reg_exe_file, sizeof g_reg_exe_file, xfin) != 0)
+                    (void)hl_host_file_unlink(&g_jit_services, xfin);
+            }
             else
                 (void)hl_host_file_unlink(&g_jit_services, xtmp);
         }
@@ -3436,7 +3438,8 @@ static void proc_dir_register(int fd, const char *tmpl, const char *guestpath) {
             snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
             break;
         }
-    if (fd >= 0 && fd < 1024) snprintf(g_fdpath[fd], sizeof g_fdpath[fd], "%s%s", g_rootfs_canon, guestpath);
+    if (fd >= 0 && fd < 1024 && path_concat(g_fdpath[fd], sizeof g_fdpath[fd], g_rootfs_canon, guestpath) != 0)
+        g_fdpath[fd][0] = 0; // unrepresentable tags fail closed in relative-atpath handling
 }
 
 // Materialize a /proc/<gp> (or task/<tid>) directory as a temp dir of placeholder entries so
@@ -3623,9 +3626,8 @@ static int proc_root_dir_open(void) {
             if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
             int host = atoi(e->d_name);
             if (kill(host, 0) != 0 && errno == ESRCH) { // dead -> prune the stale registry record
-                char rp[144];
-                snprintf(rp, sizeof rp, "%s/%s", dir, e->d_name);
-                unlink(rp);
+                char rp[352];
+                if (path_join(rp, sizeof rp, dir, e->d_name) == 0) unlink(rp);
                 continue;
             }
             int guest = (g_init_hostpid && host == g_init_hostpid) ? 1 : host;
@@ -5115,21 +5117,25 @@ static uint8_t g_fd_ptsmaster[HL_NFD];       // 1 = this fd is the MASTER end, 0
 // Materialize/remove the on-disk /dev/pts/<N> node so `ls /dev/pts` reflects the live slaves (devpts
 // creates the node when a slave is allocated and drops it when the pty is gone). Backed by an empty upper
 // file; its stat()/open()/readlink are intercepted. No-op when the container has no rootfs (bare guest).
-static void pts_node_path(int n, char *buf, size_t bn) {
-    snprintf(buf, bn, "%s/dev/pts/%d", g_rootfs_canon, n);
+static int pts_node_path(int n, char *buf, size_t bn) {
+    char directory[4200], leaf[16];
+    int length = snprintf(leaf, sizeof leaf, "%d", n);
+    if (length < 0 || (size_t)length >= sizeof leaf || path_concat(directory, sizeof directory, g_rootfs_canon, "/dev/pts") != 0)
+        return -1;
+    return path_join(buf, bn, directory, leaf);
 }
 
 static void pts_publish(int n) {
     if (!g_rootfs_canon[0] || n < 0 || n >= DEVPTS_MAX) return;
     char p[4200];
-    pts_node_path(n, p, sizeof p);
+    if (pts_node_path(n, p, sizeof p) != 0) return;
     (void)hl_host_file_create(&g_jit_services, p, 0620);
 }
 
 static void pts_unpublish(int n) {
     if (!g_rootfs_canon[0] || n < 0 || n >= DEVPTS_MAX) return;
     char p[4200];
-    pts_node_path(n, p, sizeof p);
+    if (pts_node_path(n, p, sizeof p) != 0) return;
     unlink(p);
 }
 

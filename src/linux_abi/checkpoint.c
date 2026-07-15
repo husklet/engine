@@ -253,7 +253,10 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
             r.kind = CKF_FILE;
             r.flags = (int32_t)snapshot.status_flags;
             r.offset = (int64_t)snapshot.offset;
-            snprintf(r.path, sizeof r.path, "%s", p);
+            if (path_copy(r.path, sizeof r.path, p) != 0) {
+                fprintf(stderr, "[ckpt] refuse: fd %d path exceeds checkpoint record capacity\n", fd);
+                return -1;
+            }
         } else {
             const char *ty = ckpt_guest_kernel_fd(fd);
             if (ty) {
@@ -670,7 +673,8 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 close(hf);
             }
             if (r.offset > 0) lseek(r.gfd, (off_t)r.offset, SEEK_SET);
-            if (r.gfd >= 0 && r.gfd < 1024) snprintf(g_fdpath[r.gfd], sizeof g_fdpath[r.gfd], "%s", r.path);
+            if (r.gfd >= 0 && r.gfd < 1024 && path_copy(g_fdpath[r.gfd], sizeof g_fdpath[r.gfd], r.path) != 0)
+                g_fdpath[r.gfd][0] = 0;
         }
     }
     fclose(f);

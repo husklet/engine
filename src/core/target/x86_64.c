@@ -132,7 +132,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 // exact original order, with the identical operations in each phase.
 static int g_engine_inited;
 
-static void container_init(const char *rootfs) {
+static int container_init(const char *rootfs) {
     hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1. Record the init's real host pid so the shared Linux
     // personality can virtualize just the init's identity (getpid()==1, host pgid<->guest pgid 1) and
@@ -222,7 +222,7 @@ static void container_init(const char *rootfs) {
                 add_lower(t);
         }
     }
-    if (g_rootfs) chdir(g_rootfs); // container model: guest cwd "/" maps to the rootfs root
+    if (g_rootfs && chdir(g_rootfs) != 0) return -1; // guest cwd "/" maps to the rootfs root
     // Docker -w / initial working directory: start the guest in HL_CWD (must be reachable inside the
     // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
     const char *icwd = hl_option_get("HL_CWD");
@@ -230,6 +230,7 @@ static void container_init(const char *rootfs) {
     // derive the run user's supplementary group set from the image rootfs (runc additionalGids), after
     // g_uid/g_gid + the overlay lowers are resolved, so getgroups(2) and /proc/self/status Groups: report it.
     if (g_rootfs) container_parse_groups();
+    return 0;
 }
 
 // W3D: idempotent engine init (pthread key + MAP_JIT arena + trace env + fault handlers). Returns 0
@@ -387,7 +388,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
     g_pcache = hl_option_get("HL_PCACHE") != NULL;
-    container_init(rootfs);
+    if (container_init(rootfs) != 0) return 70;
     int rc = engine_global_init();
     if (rc) return rc;
     // Initial-exec shebang handling -- mirror of linux_aarch64.c (and execve case 221) via the shared

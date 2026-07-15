@@ -958,10 +958,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                mc_evict(hp);
-                ac_evict(hp);
-                if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1); // dropped-cred creator owns it
+                if (path_join(hp, sizeof hp, dp, fin) == 0) {
+                    mc_evict(hp);
+                    ac_evict(hp);
+                    if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
+                }
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -1012,10 +1013,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                mc_evict(hp);
-                ac_evict(hp);
-                if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1); // dropped-cred creator owns the dir
+                if (path_join(hp, sizeof hp, dp, fin) == 0) {
+                    mc_evict(hp);
+                    ac_evict(hp);
+                    if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
+                }
             }
             close(pfd);
             if (r >= 0 && had_lower_dir) overlay_set_opaque(gpm);
@@ -1170,10 +1172,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                mc_evict(hp);
-                ac_evict(hp);
-                rl_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) {
+                    mc_evict(hp);
+                    ac_evict(hp);
+                    rl_evict(hp);
+                }
             }
             close(pfd);
             if (r >= 0 && aino) memf_try_adopt(adev, aino);
@@ -1406,9 +1409,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (hl_native_fd_path(opfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, ofin);
-                mc_evict(hp);
-                ac_evict(hp);
+                if (path_join(hp, sizeof hp, dp, ofin) == 0) {
+                    mc_evict(hp);
+                    ac_evict(hp);
+                }
             }
             int r = renameatx_np(opfd, ofin, npfd, nfin, rxflags), e = errno;
             close(opfd);
@@ -1961,8 +1965,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                mc_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) mc_evict(hp);
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -2010,8 +2013,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                chown_xattr_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
+                if (path_join(hp, sizeof hp, dp, fin) == 0)
+                    chown_xattr_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
             }
             close(pfd);
             G_RET(c) = 0;
@@ -2502,7 +2505,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     snprintf(gdir, sizeof gdir, "%s", gp);
                 struct stat dst;
                 if (r < HL_NFD && !jail_is_vol(gdir) && fstat(r, &dst) == 0 && S_ISDIR(dst.st_mode))
-                    snprintf(g_ovldir[r], sizeof g_ovldir[r], "%s", gdir);
+                    if (path_copy(g_ovldir[r], sizeof g_ovldir[r], gdir) != 0) g_ovldir[r][0] = 0;
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
             break;
@@ -3241,8 +3244,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                snprintf(hp, sizeof hp, "%s/%s", dp, fin);
-                mc_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) mc_evict(hp);
                 // mtime changed
             }
             close(pfd);
