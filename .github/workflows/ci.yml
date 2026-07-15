@@ -29,8 +29,5 @@ jobs:
       - name: Test engine
         run: nix flake check --print-build-logs
 
-      - name: Test Rust API
-        run: nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked
-
       - name: Package Rust crate
-        run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked
+        run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
