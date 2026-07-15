@@ -15,6 +15,7 @@ typedef struct hl_options {
 } hl_options;
 
 int hl_options_init(hl_options *options);
+int hl_options_clone(hl_options *destination, const hl_options *source);
 void hl_options_destroy(hl_options *options);
 const char *hl_options_get(const hl_options *options, const char *name);
 int hl_options_set(hl_options *options, const char *name, const char *value, int overwrite);

@@ -13,5 +13,8 @@ typedef struct hl_engine_backend {
 } hl_engine_backend;
 
 void hl_engine_backend_register(const hl_engine_backend *backend);
+/* Internal launch path: atomically imports an already validated, instance-owned option snapshot. */
+hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl_host_services *host,
+                                        const hl_options *options, hl_engine **out_engine);
 
 #endif

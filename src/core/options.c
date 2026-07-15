@@ -84,6 +84,31 @@ int hl_options_init(hl_options *options) {
     return 0;
 }
 
+int hl_options_clone(hl_options *destination, const hl_options *source) {
+    size_t index;
+    if (destination == NULL || source == NULL || source->value_count != HL_OPTION_COUNT) return -1;
+    if (hl_options_init(destination) != 0) return -1;
+    for (index = 0; index < source->value_count; ++index) {
+        size_t size = source->value_sizes[index];
+        if (size == 0) continue;
+        if (size > HL_OPTION_STORE_LIMIT || source->values[index] == NULL || source->values[index][size - 1] != 0 ||
+            source->store_size > HL_OPTION_STORE_LIMIT ||
+            destination->store_size > HL_OPTION_STORE_LIMIT - size) {
+            hl_options_destroy(destination);
+            return -1;
+        }
+        destination->values[index] = malloc(size);
+        if (destination->values[index] == NULL) {
+            hl_options_destroy(destination);
+            return -1;
+        }
+        memcpy(destination->values[index], source->values[index], size);
+        destination->value_sizes[index] = size;
+        destination->store_size += size;
+    }
+    return 0;
+}
+
 void hl_options_destroy(hl_options *options) {
     size_t index;
     if (options == NULL) return;

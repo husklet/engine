@@ -4,6 +4,7 @@
 #include "hl/host_services.h"
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
+#include "../engine_backend.h"
 
 #if defined(__APPLE__)
 #include "hl/macos.h"
@@ -55,7 +56,8 @@ static inline int hl_native_host_bind(hl_native_host **native, hl_host_services 
                : -1;
 }
 
-static inline int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, char *const argv[]) {
+static inline int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, char *const argv[],
+                                       const hl_options *options) {
     hl_native_host *native = NULL;
     hl_host_services services = {0};
     hl_engine_fd_binding bindings[3] = {0};
@@ -94,7 +96,7 @@ static inline int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, u
         config.fd_bindings = bindings;
         config.fd_binding_count = binding_count;
     }
-    if (status == HL_STATUS_OK) status = hl_engine_create(&config, &services, &engine);
+    if (status == HL_STATUS_OK) status = hl_engine_create_with_options(&config, &services, options, &engine);
     if (status != HL_STATUS_OK && services.file != NULL) {
         uint32_t index;
         for (index = 0; index < binding_count; ++index)

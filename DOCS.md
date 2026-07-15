@@ -117,6 +117,9 @@ Core invariants:
 - core code includes no platform headers and calls no native operating-system APIs;
 - yielding, clocks, waits, files, processes, and memory come from host services;
 - configuration is validated before a child can observe it.
+- a serialized launcher wire is converted once into an owned option snapshot; the native-engine boundary clones that
+  snapshot into the new engine before applying typed public overrides, so nested launch scopes cannot mask CPU,
+  filesystem, identity, or isolation settings;
 
 ### 3.3 Translator (`src/translator`)
 

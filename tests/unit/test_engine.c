@@ -23,6 +23,8 @@ static const char *expected_uid;
 static const char *expected_gid;
 static uint32_t expected_box_flags;
 static const char *expected_rootfs;
+static const char *expected_seed_cpu;
+static const char *expected_seed_volume;
 
 static int option_matches(const hl_options *options, const char *name, const char *expected) {
     const char *actual = hl_options_get(options, name);
@@ -45,7 +47,9 @@ static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_
     (void)argv;
     if (!option_matches_u64(options, "HL_MEM_MAX", config->memory_limit) ||
         !option_matches_u64(options, "HL_PIDS_MAX", config->pid_limit) ||
-        !option_matches_u64(options, "HL_CPUS", config->cpu_limit))
+        (expected_seed_cpu == NULL && !option_matches_u64(options, "HL_CPUS", config->cpu_limit)) ||
+        (expected_seed_cpu != NULL && !option_matches(options, "HL_CPUS", expected_seed_cpu)) ||
+        (expected_seed_volume != NULL && !option_matches(options, "HL_VOLUMES", expected_seed_volume)))
         return HL_STATUS_CORRUPT;
     if (expected_cwd != NULL &&
         (!option_matches(options, "HL_CWD", expected_cwd) ||
@@ -136,6 +140,7 @@ int main(void) {
     hl_engine *engine = NULL;
     hl_engine *second_engine = NULL;
     hl_engine_box_config box;
+    hl_options source_options;
     char first_cwd[] = "/first";
     char first_host[] = "first-box";
     char first_env[] = "MODE=first\nTERM=xterm";
@@ -271,9 +276,28 @@ int main(void) {
     engine = NULL;
     config.box = NULL;
 
+    /* A validated launcher snapshot becomes private engine state; later source mutation cannot mask it. */
+    HL_CHECK(hl_options_init(&source_options) == 0);
+    HL_CHECK(hl_options_set(&source_options, "HL_CPUS", "2", 1) == 0);
+    HL_CHECK(hl_options_set(&source_options, "HL_HOSTNAME", "wire-host", 1) == 0);
+    HL_CHECK(hl_options_set(&source_options, "HL_VOLUMES", "/host:/guest:ro", 1) == 0);
+    HL_CHECK(hl_engine_create_with_options(&config, &services, &source_options, &engine) == HL_STATUS_OK);
+    HL_CHECK(hl_options_set(&source_options, "HL_CPUS", "99", 1) == 0);
+    HL_CHECK(hl_options_unset(&source_options, "HL_VOLUMES") == 0);
+    expected_seed_cpu = "2";
+    expected_seed_volume = "/host:/guest:ro";
+    memset(&engine_exit, 0, sizeof(engine_exit));
+    engine_exit.abi = HL_ENGINE_ABI;
+    engine_exit.size = sizeof(engine_exit);
+    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    hl_engine_destroy(engine);
+    hl_options_destroy(&source_options);
+    expected_seed_cpu = NULL;
+    expected_seed_volume = NULL;
+
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 5);
+    HL_CHECK(fake_box_seen == 6);
     HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;

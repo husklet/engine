@@ -235,7 +235,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // rootfs: "" (bare launch) maps to NULL, matching the flag path's `rootfs = NULL` default.
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
     hl_options *previous_options = hl_options_bind_process(&options);
-    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2);
+    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2, &options);
     (void)hl_options_bind_process(previous_options);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
@@ -251,7 +251,8 @@ option_failure:
     return 78;
 }
 
-static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[]) {
+static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
+    (void)options;
     return hl_run_linux_guest(NULL, NULL, rootfs, argc, argv);
 }
 

@@ -27,8 +27,16 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     return 99;
 }
 
+static uint32_t add_string(char *pool, size_t *cursor, const char *value) {
+    uint32_t offset = (uint32_t)*cursor;
+    size_t size = strlen(value) + 1;
+    memcpy(pool + *cursor, value, size);
+    *cursor += size;
+    return offset;
+}
+
 static int write_launch(const char *path) {
-    char pool[96] = {0};
+    char pool[256] = {0};
     hl_launch_config config = {0};
     size_t cursor = 1;
     int fd;
@@ -38,12 +46,14 @@ static int write_launch(const char *path) {
     config.abi = HL_CONFIG_ABI;
     config.uid = -1;
     config.gid = -1;
+    config.cpu_limit = 2;
     config.arguments_offset = (uint32_t)cursor;
     memcpy(pool + cursor, "guest", 6);
     cursor += 7; // argument terminator plus list terminator
-    config.hostname_offset = (uint32_t)cursor;
-    memcpy(pool + cursor, "typed-host", 11);
-    cursor += 11;
+    config.hostname_offset = add_string(pool, &cursor, "typed-host");
+    config.volumes_offset = add_string(pool, &cursor, "/host:/guest:ro");
+    config.lower_layers_offset = add_string(pool, &cursor, "/lower/one:/lower/two");
+    config.network_namespace_offset = add_string(pool, &cursor, "box-network");
     config.pool_size = (uint32_t)cursor;
     fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0) return -1;
@@ -54,10 +64,15 @@ static int write_launch(const char *path) {
     return close(fd);
 }
 
-static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[]) {
+static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
     (void)rootfs;
     HL_CHECK(argc == 1 && strcmp(argv[0], "guest") == 0);
     HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "typed-host") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_CPUS"), "2") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_HOSTNAME"), "typed-host") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_VOLUMES"), "/host:/guest:ro") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_LOWER"), "/lower/one:/lower/two") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_NETNS"), "box-network") == 0);
     return 37;
 }
 

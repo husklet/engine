@@ -167,7 +167,8 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     return HL_STATUS_OK;
 }
 
-hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine) {
+hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl_host_services *host,
+                                        const hl_options *source_options, hl_engine **out_engine) {
     hl_engine *engine;
     hl_host_handle *candidate_handles = NULL;
     hl_status status;
@@ -186,7 +187,8 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     if (engine == NULL) return HL_STATUS_OUT_OF_MEMORY;
     memcpy(&engine->config, config, sizeof(*config));
     memcpy(&engine->host, host, sizeof(*host));
-    if (hl_options_init(&engine->options) != 0) {
+    if ((source_options == NULL ? hl_options_init(&engine->options)
+                                : hl_options_clone(&engine->options, source_options)) != 0) {
         status = HL_STATUS_OUT_OF_MEMORY;
         goto fail;
     }
@@ -308,6 +310,10 @@ fail:
         free(engine);
     }
     return status;
+}
+
+hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine) {
+    return hl_engine_create_with_options(config, host, NULL, out_engine);
 }
 
 hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], hl_engine_exit *out_exit) {

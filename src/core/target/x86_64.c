@@ -450,8 +450,8 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[]) {
-    return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv);
+static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
+    return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options);
 }
 #ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
@@ -513,5 +513,5 @@ int hl_engine_entry(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;
     }
-    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai);
+    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL);
 }

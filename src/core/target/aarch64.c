@@ -915,8 +915,8 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[]) {
-    return hl_native_engine_run(HL_GUEST_ISA_AARCH64, rootfs, argc, argv);
+static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
+    return hl_native_engine_run(HL_GUEST_ISA_AARCH64, rootfs, argc, argv, options);
 }
 #ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
@@ -974,7 +974,7 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
-    if (hl_option_get("HL_RESTORE_DIR")) return hl_standalone_run(rootfs, 0, NULL); // resume without an ELF arg
+    if (hl_option_get("HL_RESTORE_DIR")) return hl_standalone_run(rootfs, 0, NULL, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
                 "usage: %s [--rootfs DIR] [--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
@@ -984,5 +984,5 @@ int hl_engine_entry(int argc, char **argv) {
                 argv[0], argv[0]);
         return 2;
     }
-    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai);
+    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL);
 }
