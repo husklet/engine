@@ -246,7 +246,16 @@ int main(void) {
         HL_CHECK(services.process->close(services.context, file.value).status == HL_STATUS_INVALID_ARGUMENT);
         for (size_t index = PROCESS_COUNT; index != 0; --index)
             HL_CHECK(services.process->close(services.context, processes[index - 1]).status == HL_STATUS_OK);
-        HL_CHECK(services.process->close(services.context, processes[0]).status == HL_STATUS_INVALID_ARGUMENT);
+        {
+            hl_host_handle stale = processes[0];
+            hl_host_result replacement = services.process->spawn_cloned(services.context, capacity_child, NULL);
+            HL_CHECK(replacement.status == HL_STATUS_OK);
+            HL_CHECK(replacement.value != stale);
+            HL_CHECK(services.process->close(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+            HL_CHECK(services.process->wait(services.context, replacement.value, HL_HOST_DEADLINE_INFINITE).status ==
+                     HL_STATUS_OK);
+            HL_CHECK(services.process->close(services.context, replacement.value).status == HL_STATUS_OK);
+        }
     }
     for (size_t index = EVENT_COUNT; index != 0; --index)
         HL_CHECK(services.event->close(services.context, events[index - 1]).status == HL_STATUS_OK);
