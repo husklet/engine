@@ -16,6 +16,18 @@ static int32_t fake_entry(void *context) {
 
 static uint32_t fake_box_seen;
 static hl_engine_config fake_config_seen;
+static const char *expected_cwd;
+static const char *expected_hostname;
+static const char *expected_environment;
+static const char *expected_uid;
+static const char *expected_gid;
+static uint32_t expected_box_flags;
+static const char *expected_rootfs;
+
+static int option_matches(const hl_options *options, const char *name, const char *expected) {
+    const char *actual = hl_options_get(options, name);
+    return expected == NULL ? actual == NULL : actual != NULL && strcmp(actual, expected) == 0;
+}
 
 static int option_matches_u64(const hl_options *options, const char *name, uint64_t expected) {
     char value[32];
@@ -34,6 +46,18 @@ static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_
     if (!option_matches_u64(options, "HL_MEM_MAX", config->memory_limit) ||
         !option_matches_u64(options, "HL_PIDS_MAX", config->pid_limit) ||
         !option_matches_u64(options, "HL_CPUS", config->cpu_limit))
+        return HL_STATUS_CORRUPT;
+    if (expected_cwd != NULL &&
+        (!option_matches(options, "HL_CWD", expected_cwd) ||
+         !option_matches(options, "HL_HOSTNAME", expected_hostname) ||
+         !option_matches(options, "HL_GUEST_ENV", expected_environment) ||
+         !option_matches(options, "HL_UID", expected_uid) || !option_matches(options, "HL_GID", expected_gid) ||
+         !option_matches(options, "HL_ROOTFS_RO", (expected_box_flags & HL_ENGINE_BOX_ROOTFS_READ_ONLY) ? "1" : NULL) ||
+         !option_matches(options, "HL_SANDBOX", (expected_box_flags & HL_ENGINE_BOX_SANDBOX) ? "1" : NULL) ||
+         !option_matches(options, "HL_UNTRUSTED", (expected_box_flags & HL_ENGINE_BOX_SANDBOX) ? "1" : NULL) ||
+         !option_matches(options, "HL_NET_ISOLATE", (expected_box_flags & HL_ENGINE_BOX_NETWORK_ISOLATED) ? "1" : NULL)))
+        return HL_STATUS_CORRUPT;
+    if (expected_rootfs != NULL && (config->rootfs == NULL || strcmp(config->rootfs, expected_rootfs) != 0))
         return HL_STATUS_CORRUPT;
     if (box == NULL || hl_linux_abi_validate_fds(box) != HL_STATUS_OK) return HL_STATUS_CORRUPT;
     fake_box_seen++;
@@ -110,6 +134,16 @@ int main(void) {
     hl_engine_config config;
     hl_engine_exit engine_exit;
     hl_engine *engine = NULL;
+    hl_engine *second_engine = NULL;
+    hl_engine_box_config box;
+    char first_cwd[] = "/first";
+    char first_host[] = "first-box";
+    char first_env[] = "MODE=first\nTERM=xterm";
+    char second_cwd[] = "/second";
+    char second_host[] = "second-box";
+    char second_env[] = "MODE=second";
+    char first_root[] = "/root/first";
+    char second_root[] = "/root/second";
 
     hl_fake_host_init(&fake, &services);
     memset(&config, 0, sizeof(config));
@@ -153,9 +187,93 @@ int main(void) {
     config.pid_limit = 0;
     config.cpu_limit = 0;
 
+    /* The public box input is validated before effects and deeply owned by each instance. */
+    memset(&box, 0, sizeof(box));
+    box.abi = HL_ENGINE_BOX_ABI;
+    box.size = sizeof(box);
+    box.uid = 1001;
+    box.gid = 1002;
+    box.working_directory = first_cwd;
+    box.hostname = first_host;
+    box.environment = first_env;
+    box.flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX;
+    config.box = &box;
+    config.rootfs = first_root;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
+    box.uid = 2001;
+    box.gid = 2002;
+    box.working_directory = second_cwd;
+    box.hostname = second_host;
+    box.environment = second_env;
+    box.flags = HL_ENGINE_BOX_NETWORK_ISOLATED;
+    config.rootfs = second_root;
+    HL_CHECK(hl_engine_create(&config, &services, &second_engine) == HL_STATUS_OK);
+    memset(first_cwd, 'x', sizeof(first_cwd) - 1);
+    memset(first_host, 'x', sizeof(first_host) - 1);
+    memset(first_env, 'x', sizeof(first_env) - 1);
+    memset(first_root, 'x', sizeof(first_root) - 1);
+    expected_cwd = "/first";
+    expected_hostname = "first-box";
+    expected_environment = "MODE=first\nTERM=xterm";
+    expected_uid = "1001";
+    expected_gid = "1002";
+    expected_box_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX;
+    expected_rootfs = "/root/first";
+    memset(&engine_exit, 0, sizeof(engine_exit));
+    engine_exit.abi = HL_ENGINE_ABI;
+    engine_exit.size = sizeof(engine_exit);
+    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    expected_cwd = "/second";
+    expected_hostname = "second-box";
+    expected_environment = "MODE=second";
+    expected_uid = "2001";
+    expected_gid = "2002";
+    expected_box_flags = HL_ENGINE_BOX_NETWORK_ISOLATED;
+    expected_rootfs = "/root/second";
+    HL_CHECK(hl_engine_run(second_engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    hl_engine_destroy(engine);
+    hl_engine_destroy(second_engine);
+    expected_cwd = NULL;
+    expected_rootfs = NULL;
+    config.box = NULL;
+    config.rootfs = NULL;
+
+    box.abi = HL_ENGINE_BOX_ABI + 1;
+    config.box = &box;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_ABI_MISMATCH && engine == NULL);
+    box.abi = HL_ENGINE_BOX_ABI;
+    box.flags = UINT32_MAX;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.flags = 0;
+    box.uid = -2;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.uid = -1;
+    box.gid = -1;
+    box.working_directory = "relative";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.working_directory = "/";
+    box.hostname = "hostname-that-is-deliberately-longer-than-the-linux-uts-name-limit-of-sixty-four-bytes";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.hostname = "bad/name";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.hostname = "-bad";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.hostname = "valid-box";
+    box.environment = "NO_EQUALS";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.environment = "9BAD=value";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.environment = "GOOD=value\n";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.environment = "GOOD=value\nEMPTY=";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
+    hl_engine_destroy(engine);
+    engine = NULL;
+    config.box = NULL;
+
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 3);
+    HL_CHECK(fake_box_seen == 5);
     HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;

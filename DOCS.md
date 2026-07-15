@@ -87,6 +87,22 @@ native file descriptor, a compiler-sized enum, a platform context structure, or 
 `hl_engine_config` is authoritative. Unknown flags and nonzero reserved fields are invalid. Limits are applied before
 guest startup. A field that cannot be honored is rejected; it is never accepted as a no-op.
 
+`hl_engine_box_config` is the reusable, ABI-versioned Linux-box configuration surface. Its current slice owns Linux
+identity (`uid`/`gid`), initial working directory, hostname, guest environment, read-only-root policy, host sandboxing,
+and external-network isolation. `hl_engine_create` validates the complete structure and deep-copies its strings before
+returning, so two engines never share mutable launch state and callers need not retain configuration storage. Applying
+these values to the instance option store is transactional: validation or allocation failure destroys the candidate
+instance without starting a process or changing another engine.
+
+The serialized `hl_launch_config` remains the launcher wire format, not the preferred embedding API. Its
+`lower_layers`, `publish`, `volumes`, `limits`, `network_namespace`, `translation_cache`, `network_bridge`, `ip`,
+`filesystem_generation`, `egress_proxy`, `checkpoint_directory`, and `restore_directory` strings; its
+`publish_external` and `translation_cache_disabled` booleans; and its sentry-only `HL_CONFIG_UNTRUSTED_ONLY` sandbox
+mode do not yet have typed public engine fields. The wire's rootfs and scalar memory/pid/CPU limits are already exposed
+by `hl_engine_config`; arguments are supplied to `hl_engine_run`; debug logging is deliberately a debug-build concern,
+not box configuration. Remaining settings must be added append-only to `hl_engine_box_config`, with validation and
+ownership rules; public callers must not be given raw access to the internal `HL_*` option registry.
+
 ### 3.2 Engine core (`src/core`)
 
 The core owns one engine instance and coordinates its lifecycle. It validates configuration and host capabilities,

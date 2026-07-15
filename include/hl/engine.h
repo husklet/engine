@@ -6,7 +6,8 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_ENGINE_ABI 3u
+#define HL_ENGINE_ABI 4u
+#define HL_ENGINE_BOX_ABI 1u
 
 typedef struct hl_engine hl_engine;
 
@@ -41,6 +42,29 @@ typedef struct hl_engine_fd_binding {
     hl_host_handle host_handle;
 } hl_engine_fd_binding;
 
+enum {
+    HL_ENGINE_BOX_ROOTFS_READ_ONLY = 1u << 0,
+    HL_ENGINE_BOX_SANDBOX = 1u << 1,
+    HL_ENGINE_BOX_NETWORK_ISOLATED = 1u << 2
+};
+
+/*
+ * Generic Linux-box settings.  Every pointed-to string is copied by
+ * hl_engine_create; the caller may release or change it after that call.
+ * uid/gid use -1 to inherit the engine default.
+ */
+typedef struct hl_engine_box_config {
+    HL_ABI_HEADER;
+    uint32_t flags;
+    int32_t uid;
+    int32_t gid;
+    uint32_t reserved;
+    const char *working_directory;
+    const char *hostname;
+    /* Newline-separated [A-Za-z_][A-Za-z0-9_]*=VALUE records; NULL selects engine defaults. */
+    const char *environment;
+} hl_engine_box_config;
+
 typedef struct hl_engine_config {
     HL_ABI_HEADER;
     uint32_t guest_isa;
@@ -58,6 +82,8 @@ typedef struct hl_engine_config {
     uint32_t fd_binding_count;
     /* Must be zero. */
     uint32_t reserved;
+    /* Optional, ABI-versioned Linux-box settings. */
+    const hl_engine_box_config *box;
 } hl_engine_config;
 
 typedef struct hl_engine_exit {
@@ -69,7 +95,7 @@ typedef struct hl_engine_exit {
 
 HL_API uint32_t hl_engine_abi(void);
 HL_API const char *hl_engine_version(void);
-/* host, its callback-group tables, its context, and config-owned pointers remain valid until destroy. */
+/* host, its callback-group tables, and its context remain valid until destroy. Config strings are copied. */
 HL_API hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine);
 HL_API hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], hl_engine_exit *out_exit);
 HL_API hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *data, size_t data_size);

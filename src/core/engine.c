@@ -28,6 +28,11 @@ struct hl_engine {
     uint32_t box_initialized;
     hl_options options;
     uint32_t options_initialized;
+    hl_engine_box_config box_config;
+    char *owned_rootfs;
+    char *owned_working_directory;
+    char *owned_hostname;
+    char *owned_environment;
 };
 
 enum {
@@ -62,6 +67,106 @@ const char *hl_engine_version(void) {
     return "0.1.0";
 }
 
+enum { HL_ENGINE_STRING_LIMIT = 64 * 1024 * 1024 };
+
+static char *hl_engine_copy_string(const char *value) {
+    size_t length;
+    char *copy;
+    if (value == NULL) return NULL;
+    for (length = 0; length < HL_ENGINE_STRING_LIMIT && value[length] != 0; ++length) {}
+    if (length == HL_ENGINE_STRING_LIMIT) return NULL;
+    copy = malloc(length + 1);
+    if (copy != NULL) memcpy(copy, value, length + 1);
+    return copy;
+}
+
+static int hl_engine_set_option(hl_options *options, const char *name, const char *value) {
+    return value == NULL || value[0] == 0 ? 0 : hl_options_set(options, name, value, 1);
+}
+
+static int hl_engine_name_start(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static int hl_engine_name_continue(unsigned char c) {
+    return hl_engine_name_start(c) || (c >= '0' && c <= '9');
+}
+
+static int hl_engine_environment_valid(const char *environment) {
+    size_t offset = 0;
+    if (environment == NULL) return 1;
+    if (environment[0] == 0) return 0;
+    while (offset < HL_ENGINE_STRING_LIMIT && environment[offset] != 0) {
+        if (!hl_engine_name_start((unsigned char)environment[offset])) return 0;
+        do {
+            ++offset;
+        } while (offset < HL_ENGINE_STRING_LIMIT && hl_engine_name_continue((unsigned char)environment[offset]));
+        if (offset == HL_ENGINE_STRING_LIMIT) return 0;
+        if (environment[offset++] != '=') return 0;
+        while (offset < HL_ENGINE_STRING_LIMIT && environment[offset] != 0 && environment[offset] != '\n') ++offset;
+        if (offset == HL_ENGINE_STRING_LIMIT) return 0;
+        if (environment[offset] == '\n' && environment[++offset] == 0) return 0;
+    }
+    return offset < HL_ENGINE_STRING_LIMIT;
+}
+
+static int hl_engine_hostname_valid(const char *hostname) {
+    size_t length = 0;
+    if (hostname == NULL) return 1;
+    while (length <= 64 && hostname[length] != 0) {
+        unsigned char c = (unsigned char)hostname[length];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+            return 0;
+        ++length;
+    }
+    return length != 0 && length <= 64 && hostname[0] != '-' && hostname[length - 1] != '-';
+}
+
+static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
+    char number[32];
+    const uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX |
+                                 HL_ENGINE_BOX_NETWORK_ISOLATED;
+    if (box == NULL) return HL_STATUS_OK;
+    if (box->abi != HL_ENGINE_BOX_ABI || box->size < sizeof(*box)) return HL_STATUS_ABI_MISMATCH;
+    if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1)
+        return HL_STATUS_INVALID_ARGUMENT;
+    if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
+    if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
+        return HL_STATUS_INVALID_ARGUMENT;
+    engine->owned_working_directory = hl_engine_copy_string(box->working_directory);
+    engine->owned_hostname = hl_engine_copy_string(box->hostname);
+    engine->owned_environment = hl_engine_copy_string(box->environment);
+    if ((box->working_directory != NULL && engine->owned_working_directory == NULL) ||
+        (box->hostname != NULL && engine->owned_hostname == NULL) ||
+        (box->environment != NULL && engine->owned_environment == NULL))
+        return HL_STATUS_OUT_OF_MEMORY;
+    engine->box_config = *box;
+    engine->box_config.working_directory = engine->owned_working_directory;
+    engine->box_config.hostname = engine->owned_hostname;
+    engine->box_config.environment = engine->owned_environment;
+    engine->config.box = &engine->box_config;
+    if (hl_engine_set_option(&engine->options, "HL_CWD", engine->owned_working_directory) != 0 ||
+        hl_engine_set_option(&engine->options, "HL_HOSTNAME", engine->owned_hostname) != 0 ||
+        hl_engine_set_option(&engine->options, "HL_GUEST_ENV", engine->owned_environment) != 0)
+        return HL_STATUS_OUT_OF_MEMORY;
+    if (box->uid >= 0) {
+        snprintf(number, sizeof(number), "%d", box->uid);
+        if (hl_options_set(&engine->options, "HL_UID", number, 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+    }
+    if (box->gid >= 0) {
+        snprintf(number, sizeof(number), "%d", box->gid);
+        if (hl_options_set(&engine->options, "HL_GID", number, 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+    }
+    if ((box->flags & HL_ENGINE_BOX_ROOTFS_READ_ONLY) != 0 &&
+        hl_options_set(&engine->options, "HL_ROOTFS_RO", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+    if ((box->flags & HL_ENGINE_BOX_SANDBOX) != 0 &&
+        (hl_options_set(&engine->options, "HL_SANDBOX", "1", 1) != 0 ||
+         hl_options_set(&engine->options, "HL_UNTRUSTED", "1", 1) != 0)) return HL_STATUS_OUT_OF_MEMORY;
+    if ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) != 0 &&
+        hl_options_set(&engine->options, "HL_NET_ISOLATE", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+    return HL_STATUS_OK;
+}
+
 hl_status hl_engine_create(const hl_engine_config *config, const hl_host_services *host, hl_engine **out_engine) {
     hl_engine *engine;
     hl_host_handle *candidate_handles = NULL;
@@ -86,6 +191,12 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
         goto fail;
     }
     engine->options_initialized = 1;
+    engine->owned_rootfs = hl_engine_copy_string(config->rootfs);
+    if (config->rootfs != NULL && engine->owned_rootfs == NULL) {
+        status = HL_STATUS_OUT_OF_MEMORY;
+        goto fail;
+    }
+    engine->config.rootfs = engine->owned_rootfs;
     {
         char value[32];
         if (config->memory_limit != 0) {
@@ -101,6 +212,8 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
             if (hl_options_set(&engine->options, "HL_CPUS", value, 1) != 0) goto option_fail;
         }
     }
+    status = hl_engine_apply_box(engine, config->box);
+    if (status != HL_STATUS_OK) goto fail;
     engine->box_fds = calloc(HL_LINUX_FD_LIMIT, sizeof(*engine->box_fds));
     engine->box_ofds = calloc(HL_LINUX_OFD_LIMIT, sizeof(*engine->box_ofds));
     if (engine->box_fds == NULL || engine->box_ofds == NULL) {
@@ -188,6 +301,10 @@ fail:
         free(engine->box_fds);
         free(engine->box_ofds);
         if (engine->options_initialized) hl_options_destroy(&engine->options);
+        free(engine->owned_rootfs);
+        free(engine->owned_working_directory);
+        free(engine->owned_hostname);
+        free(engine->owned_environment);
         free(engine);
     }
     return status;
@@ -327,5 +444,9 @@ void hl_engine_destroy(hl_engine *engine) {
     free(engine->box_fds);
     free(engine->box_ofds);
     if (engine->options_initialized) hl_options_destroy(&engine->options);
+    free(engine->owned_rootfs);
+    free(engine->owned_working_directory);
+    free(engine->owned_hostname);
+    free(engine->owned_environment);
     free(engine);
 }
