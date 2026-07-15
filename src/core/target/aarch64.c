@@ -43,6 +43,7 @@
 
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
+#include "hl/log.h"
 #include "../launch.h"
 #include "../options.h"
 #include "../cli.h"
@@ -82,6 +83,12 @@ static uint64_t g_host_launch_monotonic_ns;
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);
+}
+
+static void emit_crash_diagnostic(const char *message, size_t size) {
+    const hl_host_services *host = effective_host_services();
+    if (host != NULL && host->log != NULL && host->log->emit != NULL)
+        host->log->emit(host->context, HL_LOG_TAG_SIGNAL, message, size);
 }
 
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
@@ -272,7 +279,7 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
         bp += 8;
     }
     b[bp] = '\n';
-    if (write(2, b, bp + 1) < 0) {}
+    emit_crash_diagnostic(b, (size_t)bp + 1u);
     _exit(139);
 }
 
@@ -521,7 +528,7 @@ static void *exc_thread(void *arg) {
             bp += 8;
         }
         b[bp] = '\n';
-        if (write(2, b, bp + 1) < 0) {}
+        emit_crash_diagnostic(b, (size_t)bp + 1u);
         _exit(139);
     }
     return NULL;
