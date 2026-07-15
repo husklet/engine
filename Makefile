@@ -182,7 +182,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan operand persist pipe pipe_linux placement private process range resolve resolve_services rotate shm system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87math x87state xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shm system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
