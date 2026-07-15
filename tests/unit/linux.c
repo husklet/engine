@@ -549,6 +549,7 @@ int main(void) {
     {
         const uint32_t count = 65536;
         hl_host_handle *mutexes = calloc(count, sizeof(*mutexes));
+        hl_host_handle stale;
         uint32_t index;
         HL_CHECK(mutexes != NULL);
         for (index = 0; index < count; ++index) {
@@ -556,11 +557,20 @@ int main(void) {
             HL_CHECK(created.status == HL_STATUS_OK);
             mutexes[index] = created.value;
         }
+        stale = mutexes[0];
         HL_CHECK(services.sync->mutex_create(services.context).status == HL_STATUS_RESOURCE_LIMIT);
         for (index = 0; index < count; ++index) {
             HL_CHECK(services.sync->mutex_lock(services.context, mutexes[index]).status == HL_STATUS_OK);
             HL_CHECK(services.sync->mutex_unlock(services.context, mutexes[index]).status == HL_STATUS_OK);
             HL_CHECK(services.sync->mutex_close(services.context, mutexes[index]).status == HL_STATUS_OK);
+        }
+        {
+            hl_host_result replacement = services.sync->mutex_create(services.context);
+            HL_CHECK(replacement.status == HL_STATUS_OK && replacement.value != stale);
+            HL_CHECK(services.sync->mutex_lock(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+            HL_CHECK(services.sync->mutex_lock(services.context, replacement.value).status == HL_STATUS_OK);
+            HL_CHECK(services.sync->mutex_unlock(services.context, replacement.value).status == HL_STATUS_OK);
+            HL_CHECK(services.sync->mutex_close(services.context, replacement.value).status == HL_STATUS_OK);
         }
         free(mutexes);
     }
