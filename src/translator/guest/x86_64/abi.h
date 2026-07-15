@@ -5,6 +5,7 @@
 // x86-64 cpu: r[16] = rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15. Linux x86-64 syscall ABI:
 //   number = rax ; args = rdi,rsi,rdx,r10,r8,r9 ; return = rax.
 #include "../../../linux_abi/number.h"
+#include "legacy.h"
 
 #define G_NR(c) hl_linux_syscall_number(HL_LINUX_GUEST_X86_64, (c)->r[0])
 #define CANON_X86ONLY HL_LINUX_SYSCALL_X86_ONLY
@@ -45,7 +46,11 @@
 #define G_THREAD_RESUME(child, parent) ((void)0)
 
 // Syscall normalization: x86 rewrites legacy syscalls to their *at form (frontend/x86_64/legacy.c).
-#define G_NORMALIZE(c) x86_normalize(c)
+#define G_NORMALIZE(c)                                                                                                 \
+    hl_x86_legacy_normalize((c),                                                                                       \
+                            &(hl_x86_legacy_context){g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, legacy_time_seconds,     \
+                                                     legacy_set_alarm, NULL})
+#define G_FORK_PRESERVE(c) hl_x86_legacy_restore_fork(c)
 
 // Zero the integer register file (execve). x86 = r[16].
 #define G_RESET_REGS(c) memset((c)->r, 0, sizeof(c)->r)

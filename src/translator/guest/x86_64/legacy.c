@@ -1,3 +1,13 @@
+#include "legacy.h"
+
+#include "cpu.h"
+
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/time.h>
+#include <time.h>
+
 // translator/guest/x86_64/legacy.c -- x86-64 has 58 legacy syscalls aarch64 lacks (open/stat/mkdir/pipe/...).
 // The shared os/linux/service.c only knows the canonical *at forms. This rewrites each legacy call into
 // its *at-equivalent x86 syscall (number + args) BEFORE service() runs canon_x86() + the canonical
@@ -17,8 +27,10 @@ static const uint64_t ATFD = (uint64_t)-100; // Linux AT_FDCWD
 // g_nonpie_lo/g_nonpie_bias are the (tentative) globals engine_glue.c declares above; g_nonpie_hi is defined
 // later by container/vfs.c -- forward it tentatively here (all three tentative defs merge to one object, the
 // exact pattern engine_glue.c documents). Inert identity for PIE/static-PIE (g_nonpie_lo == 0).
-static inline uint64_t x86_nonpie(uint64_t a) {
-    return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
+static uint64_t x86_nonpie(const hl_x86_legacy_context *context, uint64_t address) {
+    return context->nonpie_low && address >= context->nonpie_low && address < context->nonpie_high
+               ? address + context->nonpie_bias
+               : address;
 }
 
 // Convert a guest `struct timeval[2]` (utimes/futimesat) at guest pointer `p` into `ts`. On x86-64 Linux a
@@ -26,9 +38,9 @@ static inline uint64_t x86_nonpie(uint64_t a) {
 // -- so read the four fields as raw s64 rather than casting to the host struct. Returns 1 if `ts` was filled,
 // 0 if p==NULL ("set to now": the caller then passes a NULL times pointer, which utimensat maps to UTIME_NOW
 // on both fields, matching Linux utimes(NULL)/futimesat(...,NULL)).
-static int x86_tv2ts(uint64_t p, struct timespec ts[2]) {
+static int x86_tv2ts(const hl_x86_legacy_context *context, uint64_t p, struct timespec ts[2]) {
     if (!p) return 0;
-    int64_t *tv = (int64_t *)x86_nonpie(p);
+    int64_t *tv = (int64_t *)(uintptr_t)x86_nonpie(context, p);
     ts[0].tv_sec = (time_t)tv[0];
     ts[0].tv_nsec = (long)tv[1] * 1000L;
     ts[1].tv_sec = (time_t)tv[2];
@@ -43,19 +55,17 @@ static int x86_tv2ts(uint64_t p, struct timespec ts[2]) {
 // (set only here, consumed in the clone case), so a real clone(56) call never triggers a restore.
 static __thread uint64_t g_x86_forksave[5];
 static __thread int g_x86_forksave_on;
-#define G_FORK_PRESERVE(c)                                                                                             \
-    do {                                                                                                               \
-        if (g_x86_forksave_on) {                                                                                       \
-            (c)->r[7] = g_x86_forksave[0];  /* rdi */                                                                  \
-            (c)->r[6] = g_x86_forksave[1];  /* rsi */                                                                  \
-            (c)->r[2] = g_x86_forksave[2];  /* rdx */                                                                  \
-            (c)->r[10] = g_x86_forksave[3]; /* r10 */                                                                  \
-            (c)->r[8] = g_x86_forksave[4];  /* r8  */                                                                  \
-            g_x86_forksave_on = 0;                                                                                     \
-        }                                                                                                              \
-    } while (0)
+void hl_x86_legacy_restore_fork(struct cpu *c) {
+    if (!g_x86_forksave_on) return;
+    c->r[7] = g_x86_forksave[0];
+    c->r[6] = g_x86_forksave[1];
+    c->r[2] = g_x86_forksave[2];
+    c->r[10] = g_x86_forksave[3];
+    c->r[8] = g_x86_forksave[4];
+    g_x86_forksave_on = 0;
+}
 
-static int x86_normalize(struct cpu *c) {
+int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context) {
     uint64_t *r = c->r;
     switch (r[0]) {
     case 158: // arch_prctl(code, addr): x86 segment-base TLS register; no aarch64 equivalent
@@ -186,7 +196,7 @@ static int x86_normalize(struct cpu *c) {
         static __thread struct timespec ts[2];
         uint64_t tp = r[6];
         if (tp) {
-            int64_t *ub = (int64_t *)x86_nonpie(tp);
+            int64_t *ub = (int64_t *)(uintptr_t)x86_nonpie(context, tp);
             ts[0].tv_sec = (time_t)ub[0];
             ts[0].tv_nsec = 0;
             ts[1].tv_sec = (time_t)ub[1];
@@ -202,7 +212,7 @@ static int x86_normalize(struct cpu *c) {
     }
     case 235: { // utimes(path, const struct timeval[2] | NULL)
         static __thread struct timespec ts[2];
-        r[2] = x86_tv2ts(r[6], ts) ? (uint64_t)ts : 0;
+        r[2] = x86_tv2ts(context, r[6], ts) ? (uint64_t)ts : 0;
         r[6] = r[7];
         r[7] = ATFD;
         r[10] = 0;
@@ -212,7 +222,7 @@ static int x86_normalize(struct cpu *c) {
     case 261: { // futimesat(dirfd, path, const struct timeval[2] | NULL) -- dirfd(rdi)/path(rsi) already sit
                 // in the utimensat arg slots; only the times buffer (rdx) needs conversion.
         static __thread struct timespec ts[2];
-        r[2] = x86_tv2ts(r[2], ts) ? (uint64_t)ts : 0;
+        r[2] = x86_tv2ts(context, r[2], ts) ? (uint64_t)ts : 0;
         r[10] = 0;
         r[0] = 280;
         return 0;
@@ -222,9 +232,9 @@ static int x86_normalize(struct cpu *c) {
     // x86 `time()` failed). Serve from host time(): return seconds since the epoch, and store into *tloc when
     // non-NULL (a non-PIE .bss slot -> rebase before the store).
     case 201: {
-        time_t t = time(NULL);
-        if (r[7]) *(int64_t *)x86_nonpie(r[7]) = (int64_t)t;
-        r[0] = (uint64_t)(int64_t)t;
+        int64_t seconds = context->time_seconds(context->callback_context);
+        if (r[7]) *(int64_t *)(uintptr_t)x86_nonpie(context, r[7]) = seconds;
+        r[0] = (uint64_t)seconds;
         return 1;
     }
     // pause(): x86-only (aarch64 glibc's pause() already lands in ppoll -- event.c case 73 notes it). Block
@@ -368,12 +378,9 @@ static int x86_normalize(struct cpu *c) {
     // back-edge poll then delivers it into a no-syscall loop). Returns the seconds left on any prior
     // timer, rounding a sub-second remainder up, exactly as Linux alarm() does.
     case 37: {
-        struct itimerval nw = {{0, 0}, {0, 0}}, old = {{0, 0}, {0, 0}};
-        nw.it_value.tv_sec = (time_t)r[7];
-        if (setitimer(ITIMER_REAL, &nw, &old) < 0)
-            r[0] = (uint64_t)(-errno);
-        else
-            r[0] = (uint64_t)old.it_value.tv_sec + (old.it_value.tv_usec ? 1 : 0);
+        uint64_t remaining = 0;
+        int error = context->set_alarm(context->callback_context, r[7], &remaining);
+        r[0] = error == 0 ? remaining : (uint64_t)(int64_t)-error;
         return 1;
     }
     default: break;

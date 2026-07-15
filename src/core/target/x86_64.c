@@ -116,12 +116,27 @@ static const hl_host_services *effective_host_services(void) {
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
 #include "../../linux_abi/signal.c"                  // SHARED: signal delivery driver + translation
 #include "../../translator/guest/x86_64/signal.c"    // x86-64 rt_sigframe build/restore
-#include "../../translator/guest/x86_64/legacy.c"    // x86 legacy-syscall -> *at normalization
 #include "../../linux_abi/container/vfs.c"           // SHARED: rootfs jail, overlay, /proc synth, stat
 #include "../../linux_abi/container/netns.c"         // SHARED: sockets, loopback netns, termios
 static void load_elf(const char *path, struct loaded *out);
 static int elf_interp(const char *path, char *out, size_t n);
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
+
+static int64_t legacy_time_seconds(void *context) {
+    (void)context;
+    return (int64_t)time(NULL);
+}
+
+static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining_seconds) {
+    struct itimerval next = {{0, 0}, {0, 0}};
+    struct itimerval previous = {{0, 0}, {0, 0}};
+    (void)context;
+    next.it_value.tv_sec = (time_t)seconds;
+    if (setitimer(ITIMER_REAL, &next, &previous) < 0) return errno;
+    *remaining_seconds = (uint64_t)previous.it_value.tv_sec + (previous.it_value.tv_usec != 0 ? 1u : 0u);
+    return 0;
+}
+
 #include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
