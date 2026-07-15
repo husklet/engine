@@ -516,6 +516,11 @@ int main(void) {
                      ->sleep_until(services.context, HL_HOST_CLOCK_MONOTONIC, deadline.value + UINT64_C(2000000000))
                      .status == HL_STATUS_INTERRUPTED);
         HL_CHECK(pthread_join(interrupter, NULL) == 0);
+        deadline = services.clock->monotonic_ns(services.context);
+        HL_CHECK(pthread_create(&interrupter, NULL, interrupt_clock_sleep, &interrupt) == 0);
+        HL_CHECK(services.clock->backoff_ns(services.context, UINT64_C(100000000)).status == HL_STATUS_OK);
+        HL_CHECK(pthread_join(interrupter, NULL) == 0);
+        HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline.value + UINT64_C(100000000));
         HL_CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
     }
     {
