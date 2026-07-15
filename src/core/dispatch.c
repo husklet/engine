@@ -232,7 +232,7 @@ static void run_guest(struct cpu *c) {
             jit_publish_code(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start));
             // THEN chain existing blocks to it (still write mode). Frontend hook: aarch64 chains here;
             // x86's translate_block already chained internally, so its hook is a no-op.
-            // DDDBG_NOCHAIN (debug-only, default OFF): skip so every block re-enters the dispatcher and the
+            // Debug-only no-chain mode: every block re-enters the dispatcher and the
             // JT trace records every execution (exact per-block PC attribution). Correct but slow.
             if (!g_dbg_nochain) G_DISPATCH_CHAIN(c);
             // back to execute AFTER all cache writes

@@ -12,11 +12,11 @@ static void block_return(void);
 // global only at block boundaries (set by the dispatcher before each run_block).
 static int g_trace;
 static int g_systrace; // JTS=1: syscall-entry trace only (no per-block dump) -- debug aid
-// DDDBG_NOCHAIN=1 (debug-only, default OFF, read once at init): skip direct block chaining so EVERY
+// Debug-only no-chain mode: skip direct block chaining so every
 // block re-enters the dispatcher -> the JT per-block trace logs every execution (exact per-block PC
 // attribution, alignable with `qemu -d exec,nochain`). Mirrors x86's g_nochain. Zero-cost when unset.
 static int g_dbg_nochain;
-// DDDBG_GPRDUMP=1 (debug-only, default OFF): with JT, dump ALL guest GPRs (x0..x30 + sp) per block for a
+// Debug-only register dump: dump all guest GPRs (x0..x30 + sp) per block for a
 // register-value differential vs `qemu -d cpu` (isolate a wrong-VALUE miscompile). Zero-cost when unset.
 static int g_dbg_gprdump;
 static const char *g_exe_path = "";
