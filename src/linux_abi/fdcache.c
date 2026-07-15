@@ -314,7 +314,7 @@ void hl_fdcache_readlink_store(const char *p, int rc, const char *link, int len)
     CUL;
 }
 
-void rl_evict(const char *p) {
+void hl_fdcache_readlink_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -764,7 +764,7 @@ void hl_fdcache_fd_clear(int fd) {
 void hl_fdcache_evict_path(const char *hp) {
     mc_evict(hp);
     ac_evict(hp);
-    rl_evict(hp);
+    hl_fdcache_readlink_evict(hp);
 }
 
 int hl_fdcache_bind(const hl_fdcache_binding *binding) {

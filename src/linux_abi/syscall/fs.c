@@ -1144,7 +1144,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // present via a stale mc_ hit even though it no longer appears in a readdir.
             mc_evict(host);
             ac_evict(host);
-            rl_evict(host);
+            hl_fdcache_readlink_evict(host);
             // hardlink coherence: removing one link drops the sibling links' nlink -- evict their cached
             // stats by inode (lst was captured before the removal, so nlink>=2 means aliases still exist).
             if (S_ISREG(lst.st_mode) && lst.st_nlink >= 2) hl_fdcache_metadata_evict_inode(lst.st_dev, lst.st_ino);
@@ -1176,7 +1176,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
                     mc_evict(hp);
                     ac_evict(hp);
-                    rl_evict(hp);
+                    hl_fdcache_readlink_evict(hp);
                 }
             }
             close(pfd);
@@ -1200,7 +1200,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int r = unlinkat(ATFD(a0), p, (a2 & 0x200) ? AT_REMOVEDIR : 0);
         mc_evict(p);
         ac_evict(p);
-        rl_evict(p);
+        hl_fdcache_readlink_evict(p);
         if (r >= 0 && aino) memf_try_adopt(adev, aino);
         if (r >= 0 && nlink >= 2) hl_fdcache_metadata_evict_inode((dev_t)ps.st_dev, (ino_t)ps.st_ino);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -2497,7 +2497,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     hl_fdcache_fd_setpath(r, gpa);
                     if (isw) {
                         mc_evict(gpa);
-                        rl_evict(gpa);
+                        hl_fdcache_readlink_evict(gpa);
                         ac_evict(gpa);
                     }
                 }
@@ -2556,7 +2556,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     hl_fdcache_fd_setpath(r, hostc);
                     if (lf & 3) { // write-open: keep the metadata caches coherent (same as the walk path)
                         mc_evict(hostc);
-                        rl_evict(hostc);
+                        hl_fdcache_readlink_evict(hostc);
                         ac_evict(hostc);
                     }
                 }
@@ -2626,7 +2626,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     hl_fdcache_fd_setpath(r, gp);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         mc_evict(gp);
-                        rl_evict(gp);
+                        hl_fdcache_readlink_evict(gp);
                         ac_evict(gp);
                     }
                     // W4D: memoize this walk's result (gp = F_GETPATH = canonical in-jail host path) so the
@@ -2652,7 +2652,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             hl_fdcache_fd_setpath(r, p);
             if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                 mc_evict(p);
-                rl_evict(p);
+                hl_fdcache_readlink_evict(p);
                 ac_evict(p);
             }
         }
