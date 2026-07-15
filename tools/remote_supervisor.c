@@ -24,17 +24,35 @@ static void child_handler(int signal_number) {
     child_changed = 1;
 }
 
+static void terminate_remaining_group(pid_t group) {
+    struct timespec pause = {0, 10000000};
+    (void)kill(-group, SIGTERM);
+    for (unsigned attempt = 0; attempt < 50; ++attempt) {
+        if (kill(-group, 0) < 0 && errno == ESRCH) return;
+        (void)nanosleep(&pause, NULL);
+    }
+    (void)kill(-group, SIGKILL);
+    for (unsigned attempt = 0; attempt < 50; ++attempt) {
+        if (kill(-group, 0) < 0 && errno == ESRCH) return;
+        (void)nanosleep(&pause, NULL);
+    }
+}
+
 static void terminate_group(pid_t child) {
     struct timespec pause = {0, 10000000};
     int status;
     (void)kill(-child, SIGTERM);
     for (unsigned attempt = 0; attempt < 50; ++attempt) {
         pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child || (waited < 0 && errno == ECHILD)) return;
+        if (waited == child || (waited < 0 && errno == ECHILD)) {
+            terminate_remaining_group(child);
+            return;
+        }
         (void)nanosleep(&pause, NULL);
     }
     (void)kill(-child, SIGKILL);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    terminate_remaining_group(child);
 }
 
 int main(int argc, char **argv) {
@@ -96,6 +114,10 @@ int main(int argc, char **argv) {
         }
         if (!child_changed) (void)nanosleep(&heartbeat, NULL);
     }
+    /* The engine may have spawned guests that intentionally outlive their
+       parent. The remote supervisor owns the whole launch group and must not
+       return until those descendants are gone. */
+    terminate_remaining_group(child);
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) {
         (void)signal(WTERMSIG(status), SIG_DFL);

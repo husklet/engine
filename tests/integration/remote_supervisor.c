@@ -66,6 +66,24 @@ int main(int argc, char **argv) {
     pid_t child;
     if (argc == 2 && strcmp(argv[1], "--emit") == 0)
         return write_repeated(STDOUT_FILENO, 'o') || write_repeated(STDERR_FILENO, 'e');
+    if (argc == 3 && strcmp(argv[1], "--outlive") == 0) {
+        pid_t descendant = fork();
+        int descriptor;
+        char text[64];
+        int length;
+        if (descendant < 0) return 18;
+        if (descendant == 0) {
+            struct timespec duration = {30, 0};
+            (void)nanosleep(&duration, NULL);
+            _exit(0);
+        }
+        descriptor = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        length = snprintf(text, sizeof text, "%ld\n", (long)descendant);
+        if (descriptor < 0 || length <= 0 || write(descriptor, text, (size_t)length) != length ||
+            close(descriptor) != 0)
+            return 19;
+        return 0;
+    }
     if (argc != 2 || pipe(heartbeat) != 0) return 1;
     {
         uint64_t started = now_ms();
@@ -107,6 +125,43 @@ int main(int argc, char **argv) {
         }
         unlink(output);
         unlink(error);
+    }
+    {
+        char descendant_path[] = "/tmp/hl-supervisor-descendant-XXXXXX";
+        int descriptor = mkstemp(descendant_path);
+        pid_t supervisor;
+        pid_t descendant = -1;
+        uint64_t deadline;
+        if (descriptor < 0 || close(descriptor) != 0 || unlink(descendant_path) != 0) return 20;
+        supervisor = fork();
+        if (supervisor < 0) return 21;
+        if (supervisor == 0) {
+            execl(argv[1], argv[1], argv[0], "--outlive", descendant_path, (char *)NULL);
+            _exit(127);
+        }
+        if (waitpid(supervisor, &status, 0) != supervisor || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            return 22;
+        descriptor = open(descendant_path, O_RDONLY);
+        if (descriptor < 0) return 23;
+        {
+            char text[64] = {0};
+            ssize_t size = read(descriptor, text, sizeof text - 1);
+            char *end;
+            long parsed;
+            close(descriptor);
+            unlink(descendant_path);
+            if (size <= 0) return 24;
+            errno = 0;
+            parsed = strtol(text, &end, 10);
+            if (errno != 0 || end == text || parsed <= 0) return 25;
+            descendant = (pid_t)parsed;
+        }
+        deadline = now_ms() + 3000;
+        while (kill(descendant, 0) == 0 && now_ms() < deadline) {
+            struct timespec pause = {0, 10000000};
+            (void)nanosleep(&pause, NULL);
+        }
+        if (kill(descendant, 0) == 0 || errno != ESRCH) return 26;
     }
     {
         int hup_heartbeat[2];
