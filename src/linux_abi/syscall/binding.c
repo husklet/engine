@@ -425,14 +425,8 @@ static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_fi
                                                        (hl_host_bytes){path, HL_LINUX_PATH_MAX});
     if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
         int uid, gid;
-        struct stat native;
         path[named.value] = 0;
-        uint64_t device = status->device, object = status->object;
-        if (stat(path, &native) == 0) {
-            device = (uint64_t)native.st_dev;
-            object = (uint64_t)native.st_ino;
-        }
-        if (chown_xattr_get(path, -1, device, object, &uid, &gid)) {
+        if (chown_xattr_get(path, -1, status->device, status->object, &uid, &gid)) {
             if (uid >= 0) status->user = (uint32_t)uid;
             if (gid >= 0) status->group = (uint32_t)gid;
         }
