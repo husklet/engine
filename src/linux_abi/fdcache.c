@@ -410,7 +410,7 @@ int hl_fdcache_upper_negative_lookup(const char *d) {
     return hit;
 }
 
-void updirneg_store(const char *d) {
+void hl_fdcache_upper_negative_store(const char *d) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);

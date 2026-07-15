@@ -244,7 +244,7 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
             // Parent dir chain missing in the upper -> entry/whiteout/opaque provably absent there. Memoize
             // (rootfs-routed paths only: a volume's backing dir is host-mutable and must never be
             // negative-cached -- same exclusion hl_fdcache_metadata_store applies to volume paths).
-            updirneg_store(par);
+            hl_fdcache_upper_negative_store(par);
         }
     }
     // search lowers top->down (skipped when an opaque ancestor cut the lower layers: verdict 2)
