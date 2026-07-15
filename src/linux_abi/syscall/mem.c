@@ -231,7 +231,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             filemap_unmap(u_lo, u_hi);
             futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
             wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
-            mlk_del(u_lo, u_hi - u_lo);      // an unmapped range is implicitly unlocked (mlock -> VmLck)
+            hl_gmap_lock_remove(u_lo, u_hi - u_lo); // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
             // (SIGSEGV). Without this the JIT's lazy zero-page grower (jit86_lazyguard) would re-serve the
             // fault -- growth budget for an adjacent live mapping, small budget otherwise -- and the guest
@@ -322,7 +322,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         hl_gmap_remove(a0);
                         anon_untrack(a0, (size_t)phys);
                         gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
-                        mlk_del(a0, (uint64_t)a1);
+                        hl_gmap_lock_remove(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
                     }
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
@@ -824,7 +824,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        mlk_del(a0, (uint64_t)a1);
+        hl_gmap_lock_remove(a0, (uint64_t)a1);
         G_RET(c) = 0;
         break;
     // Container-init compat: in the single-process model these are no-ops that return success so
