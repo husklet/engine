@@ -27,6 +27,57 @@ static const char *expected_seed_cpu;
 static const char *expected_seed_volume;
 static uint32_t expected_extended;
 static const char *expected_extended_values[16];
+static const hl_host_file_services *rollback_file;
+static uint32_t rollback_clone_calls;
+static uint32_t rollback_invalid_result;
+
+static hl_host_result rollback_clone(void *context, hl_host_handle handle) {
+    if (++rollback_clone_calls == 2u) {
+        if (rollback_invalid_result) return (hl_host_result){HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
+        return (hl_host_result){HL_STATUS_IO, 0, 0, 0};
+    }
+    return rollback_file->clone_for_fork(context, handle);
+}
+
+static int check_fd_import_rollback(uint32_t invalid_result) {
+    hl_fake_host fake;
+    hl_host_services services;
+    hl_host_file_services file;
+    hl_engine_config config = {0};
+    hl_engine_fd_binding bindings[2] = {0};
+    hl_host_result originals[2];
+    hl_engine *engine = NULL;
+    uint32_t index;
+    hl_fake_host_init(&fake, &services);
+    file = *services.file;
+    rollback_file = services.file;
+    rollback_clone_calls = 0;
+    rollback_invalid_result = invalid_result;
+    file.clone_for_fork = rollback_clone;
+    services.file = &file;
+    for (index = 0; index < 2; ++index) {
+        originals[index] = hl_fake_host_file_create(&fake);
+        HL_CHECK(originals[index].status == HL_STATUS_OK);
+        bindings[index].abi = HL_ENGINE_ABI;
+        bindings[index].size = sizeof(bindings[index]);
+        bindings[index].guest_fd = 3u + index;
+        bindings[index].ownership = HL_ENGINE_FD_BORROW;
+        bindings[index].host_handle = originals[index].value;
+    }
+    config.abi = HL_ENGINE_ABI;
+    config.size = sizeof(config);
+    config.guest_isa = HL_GUEST_ISA_AARCH64;
+    config.fd_bindings = bindings;
+    config.fd_binding_count = 2;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) ==
+             (invalid_result ? HL_STATUS_PLATFORM_FAILURE : HL_STATUS_IO));
+    HL_CHECK(engine == NULL && rollback_clone_calls == 2u);
+    HL_CHECK(fake.live_files == 2u && fake.live_file_clones == 0u && fake.file_close_count == 1u);
+    HL_CHECK(services.file->close(services.context, originals[0].value).status == HL_STATUS_OK);
+    HL_CHECK(services.file->close(services.context, originals[1].value).status == HL_STATUS_OK);
+    HL_CHECK(fake.live_files == 0u && fake.file_close_count == 3u);
+    return EXIT_SUCCESS;
+}
 
 static const char *const extended_option_names[16] = {
     "HL_LOWER", "HL_PUBLISH", "HL_VOLUMES", "HL_ULIMITS", "HL_NETNS", "HL_PCACHE_DIR", "HL_NETBR", "HL_IP",
@@ -205,6 +256,9 @@ int main(void) {
     char fsgen[] = "/run/fs-generation";
     char proxy[] = "127.0.0.1:1080";
     char checkpoint[] = "/checkpoints/out";
+
+    HL_CHECK(check_fd_import_rollback(0) == EXIT_SUCCESS);
+    HL_CHECK(check_fd_import_rollback(1) == EXIT_SUCCESS);
 
     hl_fake_host_init(&fake, &services);
     memset(&config, 0, sizeof(config));
