@@ -64,16 +64,34 @@ static int make_config(const char *guest, char path[64]) {
 
 static int run_one(const char *executable, uint32_t guest_isa, const char *guest, int32_t expected) {
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
+    hl_activation_process *process = NULL;
+    uint32_t ready = 0;
     char config_path[64];
     hl_status status;
     if (make_config(guest, config_path) != 0) return 1;
-    status = hl_activation_spawn(executable, guest_isa, config_path, &result);
+    status = hl_activation_start(executable, guest_isa, config_path, &process);
+    if (status == HL_STATUS_OK) status = hl_activation_try_wait(process, &ready, &result);
+    if (status == HL_STATUS_OK && !ready) status = hl_activation_wait(process, &result);
+    hl_activation_process_destroy(process);
     if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE || result.guest_status != expected) {
         fprintf(stderr, "dual backend: isa=%u status=%d kind=%u guest=%d detail=%llu\n", guest_isa,
                 status, result.kind, result.guest_status, (unsigned long long)result.detail);
         return 1;
     }
     return 0;
+}
+
+static int kill_one(const char *executable, const char *guest) {
+    hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
+    hl_activation_process *process = NULL;
+    char config_path[64];
+    hl_status status;
+    if (make_config(guest, config_path) != 0) return 1;
+    status = hl_activation_start(executable, HL_GUEST_ISA_AARCH64, config_path, &process);
+    if (status == HL_STATUS_OK) status = hl_activation_kill(process);
+    if (status == HL_STATUS_OK) status = hl_activation_wait(process, &result);
+    hl_activation_process_destroy(process);
+    return status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_SIGNAL || result.guest_status != SIGKILL;
 }
 
 static int reject_without_launch(const char *executable, const char *guest, uint32_t mode) {
@@ -88,8 +106,8 @@ static int reject_without_launch(const char *executable, const char *guest, uint
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: dual-backend-e2e AARCH64_EXIT42 X86_EXIT42 AARCH64_EXIT70 X86_EXIT70\n");
+    if (argc != 6) {
+        fprintf(stderr, "usage: dual-backend-e2e AARCH64_EXIT42 X86_EXIT42 AARCH64_EXIT70 X86_EXIT70 AARCH64_SPIN\n");
         return 64;
     }
     if (!handlers_unchanged()) return 65;
@@ -98,6 +116,6 @@ int main(int argc, char **argv) {
     if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42) ||
         run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42) ||
         run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70) ||
-        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70)) return 71;
+        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) || kill_one(argv[0], argv[5])) return 71;
     return 0;
 }
