@@ -195,7 +195,15 @@ int main(void) {
     HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[0]).status == HL_STATUS_INVALID_ARGUMENT);
     for (size_t index = COUNTER_COUNT; index != 0; --index)
         HL_CHECK(services.counter->close(services.context, counters[index - 1]).status == HL_STATUS_OK);
-    HL_CHECK(services.counter->get_flags(services.context, counters[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    {
+        hl_host_handle stale = counters[0];
+        hl_host_result replacement = services.counter->create(services.context, 0, 0);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.counter->get_flags(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.counter->get_flags(services.context, replacement.value).status == HL_STATUS_OK);
+        HL_CHECK(services.counter->close(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     for (size_t index = DIRECTORY_COUNT; index != 0; --index)
         HL_CHECK(services.directory->close(services.context, directories[index - 1]).status == HL_STATUS_OK);
     {
