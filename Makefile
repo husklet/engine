@@ -109,7 +109,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/flags.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/ports.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
 	src/linux_abi/fdcache.c \
 	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_wire.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/shared.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
@@ -196,7 +196,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := a64_asm address affinity arena bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir key launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand persist pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := a64_asm address affinity arena bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir key launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a

@@ -809,7 +809,8 @@ static void ckpt_restore_pgrp(int gpid, int pgid_gpid, int sid_gpid) {
     if (pgid_gpid == gpid) {
         setpgid(0, 0); // was its own group leader
     } else if (pgid_gpid > 0) {
-        int leader = (pgid_gpid == 1 && g_init_hostpid) ? g_init_hostpid : pidmap_to_live(pgid_gpid);
+        int leader =
+            (pgid_gpid == 1 && g_init_hostpid) ? g_init_hostpid : hl_linux_pidmap_host(&g_pidmap, pgid_gpid);
         setpgid(0, leader); // join the (usually already-inherited) parent group
     }
 }
@@ -827,7 +828,7 @@ static void ckpt_fork_children(const char *base, int gpid) {
             ckpt_restore_proc_run(base, cg); // never returns
             _exit(0);
         } else if (p > 0) {
-            pidmap_add(cg, (int)p);
+            (void)hl_linux_pidmap_add(&g_pidmap, cg, (int)p);
         } else {
             fprintf(stderr, "[restore] fork for gpid %d failed: %s\n", cg, strerror(errno));
         }

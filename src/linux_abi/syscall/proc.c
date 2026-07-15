@@ -1890,11 +1890,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         // checkpoint restore: a wait targeting a specific checkpoint-time guest pid must name the live host
-        // pid the tree was re-forked with (identity no-op on a normal launch, g_pidmap_n==0).
-        if (g_pidmap_n && (int)a0 > 0)
-            a0 = (uint64_t)(unsigned)pidmap_to_live((int)a0);
-        else if (g_pidmap_n && (int)a0 < -1)
-            a0 = (uint64_t)(int64_t)(-pidmap_to_live(-(int)a0));
+        // pid the tree was re-forked with (identity no-op on a normal launch when the pid map is empty).
+        if (hl_linux_pidmap_count(&g_pidmap) != 0 && (int)a0 > 0)
+            a0 = (uint64_t)(unsigned)hl_linux_pidmap_host(&g_pidmap, (int)a0);
+        else if (hl_linux_pidmap_count(&g_pidmap) != 0 && (int)a0 < -1)
+            a0 = (uint64_t)(int64_t)(-hl_linux_pidmap_host(&g_pidmap, -(int)a0));
         // when ptrace is already in use in this session (a tracee link exists -> nactive>0) route the
         // wait through the ptrace pump, which surfaces tracee ptrace-stops (Linux-encoded) AND real child
         // exits and tears a link down when its tracee dies. For the ENTIRE non-ptrace matrix nactive is 0,
@@ -2005,10 +2005,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (r > 0 && (st & 0xff) != 0x7f && st != 0xffff) proc_reg_reap((int)r);
         // checkpoint restore: report the reaped child under the guest pid the checkpoint recorded, and drop
         // its translation once it is reaped so a future host pid can never alias it (no-op on normal launch).
-        if (g_pidmap_n && r > 0) {
-            int gp = pidmap_to_guest((int)r);
+        if (hl_linux_pidmap_count(&g_pidmap) != 0 && r > 0) {
+            int gp = hl_linux_pidmap_guest(&g_pidmap, (int)r);
             if (gp != (int)r) {
-                if (((st & 0x7f) == 0) || (((st & 0x7f) != 0x7f) && ((st & 0x7f) != 0))) pidmap_del_live((int)r);
+                if (((st & 0x7f) == 0) || (((st & 0x7f) != 0x7f) && ((st & 0x7f) != 0)))
+                    (void)hl_linux_pidmap_remove_host(&g_pidmap, (int)r);
                 r = (pid_t)gp;
             }
         }

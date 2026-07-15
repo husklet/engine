@@ -6,6 +6,7 @@
 #include "../limits.h"
 #include "../../host/system.h"
 #include "key.h"
+#include "pidmap.h"
 #include "ports.h"
 
 // HL_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
@@ -293,59 +294,9 @@ static int container_pid(void) {
 // hl normally uses the REAL host pid as a guest child's pid (only the init is virtualized). A restore assigns
 // NEW host pids to the re-forked tree, so this table maps each restored process's checkpoint-time guest pid
 // <-> its new live host pid, keeping guest-visible pids stable across a restore (a blocked wait4's target, a
-// reaped-child pid, bash's job table, kill(pid)). It is EMPTY on every normal launch (g_pidmap_n==0 => every
-// translator below is an identity no-op), so it changes nothing outside the restore path.
-#define PIDMAP_MAX 4096
-
-static struct {
-    int gpid, live;
-} g_pidmap[PIDMAP_MAX];
-
-static int g_pidmap_n = 0;
-
-static void pidmap_add(int gpid, int live) __attribute__((unused));
-
-static void pidmap_add(int gpid, int live) {
-    if (g_pidmap_n >= PIDMAP_MAX || gpid <= 0 || live <= 0) return;
-    for (int i = 0; i < g_pidmap_n; i++)
-        if (g_pidmap[i].gpid == gpid) {
-            g_pidmap[i].live = live;
-            return;
-        }
-    g_pidmap[g_pidmap_n].gpid = gpid;
-    g_pidmap[g_pidmap_n].live = live;
-    g_pidmap_n++;
-}
-
-static void pidmap_del_live(int live) __attribute__((unused));
-
-static void pidmap_del_live(int live) {
-    for (int i = 0; i < g_pidmap_n; i++)
-        if (g_pidmap[i].live == live) {
-            g_pidmap[i] = g_pidmap[--g_pidmap_n];
-            return;
-        }
-}
-
-// guest pid -> live host pid (translate a syscall ARGUMENT: wait4/kill target). Identity on a miss.
-static int pidmap_to_live(int gpid) __attribute__((unused));
-
-static int pidmap_to_live(int gpid) {
-    if (g_pidmap_n == 0 || gpid <= 0) return gpid;
-    for (int i = 0; i < g_pidmap_n; i++)
-        if (g_pidmap[i].gpid == gpid) return g_pidmap[i].live;
-    return gpid;
-}
-
-// live host pid -> guest pid (translate a syscall RETURN: a reaped child's pid). Identity on a miss.
-static int pidmap_to_guest(int live) __attribute__((unused));
-
-static int pidmap_to_guest(int live) {
-    if (g_pidmap_n == 0 || live <= 0) return live;
-    for (int i = 0; i < g_pidmap_n; i++)
-        if (g_pidmap[i].live == live) return g_pidmap[i].gpid;
-    return live;
-}
+// reaped-child pid, bash's job table, kill(pid)). It is empty on every normal launch, so every translation is
+// an identity no-op and behavior outside the restore path is unchanged.
+static hl_linux_pidmap g_pidmap;
 
 // HL_NET_ISOLATE makes the guest loopback-only: no
 // eth0 is presented in the interface model (netlink RTM_GETLINK/GETADDR/GETROUTE dumps + SIOCGIFCONF in
