@@ -599,7 +599,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     }
     case 231:
-        mlk_unwire_all(); // drop the real host wiring before clearing the tracked state
+        hl_gmap_lock_unwire_all(); // drop the real host wiring before clearing the tracked state
         hl_gmap_lock_reset();
         G_RET(c) = 0;
         break;
