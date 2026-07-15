@@ -1,4 +1,4 @@
-use hl_engine::{BoxConfig, Engine, Guest};
+use hl_engine::{Engine, Guest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
@@ -8,13 +8,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Guest::Aarch64
     };
     let program = arguments.next().unwrap_or_else(|| "/bin/true".to_owned());
-    let engine = Engine::new()?;
-    let status = engine.run(
-        guest,
-        &BoxConfig::new(),
-        program,
-        std::iter::empty::<&str>(),
-    )?;
+    let engine = Engine::new();
+    let status = engine.command(guest, program).status()?;
     println!("guest exit: {:?}", status.code());
     Ok(())
 }

@@ -1,4 +1,4 @@
-use hl_engine::{BoxConfig, Engine, Exit, Guest};
+use hl_engine::{Engine, Exit, Guest};
 use std::path::PathBuf;
 
 fn fixture(status: i32, guest: Guest) -> PathBuf {
@@ -11,32 +11,18 @@ fn fixture(status: i32, guest: Guest) -> PathBuf {
 
 #[test]
 fn both_guest_isas_report_typed_exit_42() {
-    let engine = Engine::new().unwrap();
+    let engine = Engine::new();
     for guest in [Guest::Aarch64, Guest::X86_64] {
-        let exit = engine
-            .run(
-                guest,
-                &BoxConfig::new(),
-                fixture(42, guest),
-                std::iter::empty::<&str>(),
-            )
-            .unwrap();
+        let exit = engine.command(guest, fixture(42, guest)).status().unwrap();
         assert_eq!(exit, Exit::Code(42));
     }
 }
 
 #[test]
 fn guest_exit_70_remains_distinct_from_engine_failure() {
-    let engine = Engine::new().unwrap();
+    let engine = Engine::new();
     for guest in [Guest::Aarch64, Guest::X86_64] {
-        let exit = engine
-            .run(
-                guest,
-                &BoxConfig::new(),
-                fixture(70, guest),
-                std::iter::empty::<&str>(),
-            )
-            .unwrap();
+        let exit = engine.command(guest, fixture(70, guest)).status().unwrap();
         assert_eq!(exit, Exit::Code(70));
     }
 }

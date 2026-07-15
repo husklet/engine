@@ -12,11 +12,8 @@ categories = ["emulators", "api-bindings"]
 include = [
     "Cargo.toml",
     "README.md",
-    "build.rs",
+    "assets/**",
     "examples/**",
-    "native/include/**",
-    "native/packaging/**",
-    "native/src/**",
     "src/**",
     "testdata/**",
     "tests/**",
@@ -24,9 +21,6 @@ include = [
 
 [lib]
 name = "hl_engine"
-
-[build-dependencies]
-cc = "1.2"
 
 [lints.rust]
 unsafe_code = "forbid"
