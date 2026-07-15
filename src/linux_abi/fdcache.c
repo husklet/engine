@@ -158,7 +158,7 @@ void rc_reset(void);
 // guest-abs-path -> canonical symlink-free host path, so a repeated open collapses the TOCTOU-safe
 // per-component jail walk to a single open(host, O_NOFOLLOW). Shares g_res_epoch. Kill: W4_NOOPENCACHE=1.
 int hl_fdcache_open_lookup(const char *g, char *out, size_t n);
-void oc_store(const char *g, const char *host);
+void hl_fdcache_open_store(const char *g, const char *host);
 static void oc_reset(void);
 
 // ---- FS-metadata cache ----
@@ -622,7 +622,8 @@ void rc_store(const char *g, const char *host) {
 // prevents: every FS-namespace mutation (service.c res_bump on mknod/mkdir/unlink/rmdir/symlink/link/
 // rename/(u)mount + openat O_CREAT) bumps the epoch, so the whole cache misses -- conservative
 // over-invalidation, identical threat model to item 9 (the host outside the jail is not in scope; when in
-// doubt we MISS and re-walk). oc_store additionally refuses to cache any host path that escaped the rootfs
+// doubt we MISS and re-walk). hl_fdcache_open_store additionally refuses to cache any host path that escaped
+// the rootfs
 // (defensive strncmp). The caller EXCLUDES O_CREAT/O_EXCL/O_TRUNC (mutating/creating) and O_DIRECTORY
 // (deep-host-path reopen regressed -21%; see optimization-research/w4d-openat.md). Hard reset on fork via
 // oc_reset() (from rc_reset). Kill switch (read once): W4_NOOPENCACHE=1 -> the original uncached walk.
@@ -649,7 +650,7 @@ int hl_fdcache_open_lookup(const char *g, char *out, size_t n) {
     return hit;
 }
 
-void oc_store(const char *g, const char *host) {
+void hl_fdcache_open_store(const char *g, const char *host) {
     if (!oc_enabled() || !g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-walked every time, safely.
     size_t hl = strlen(host);

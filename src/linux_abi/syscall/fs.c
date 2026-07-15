@@ -2628,8 +2628,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         ac_evict(gp);
                     }
                     // W4D: memoize this walk's result (gp = F_GETPATH = canonical in-jail host path) so the
-                    // next open of the same guest path is a single open(). oc_store re-checks in-jail+epoch.
-                    if (cacheable) oc_store(gkey, gp);
+                    // next open of the same guest path is a single open(). hl_fdcache_open_store re-checks
+                    // in-jail+epoch.
+                    if (cacheable) hl_fdcache_open_store(gkey, gp);
                 }
             }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
