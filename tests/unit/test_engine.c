@@ -47,10 +47,11 @@ static int option_matches_u64(const hl_options *options, const char *name, uint6
     return actual != NULL && strcmp(actual, value) == 0;
 }
 
-static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
-                            const hl_engine_config *config,
-                            uint32_t argc, const char *const argv[], hl_host_handle *process,
-                            hl_host_handle *result_stream) {
+static uint32_t fake_backend_seen;
+
+static hl_status fake_start_common(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
+                                   const hl_engine_config *config, uint32_t argc, const char *const argv[],
+                                   hl_host_handle *process, hl_host_handle *result_stream) {
     hl_host_result spawned;
     (void)argc;
     (void)argv;
@@ -88,7 +89,22 @@ static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_
     return HL_STATUS_OK;
 }
 
-static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start, NULL};
+static hl_status fake_start_aarch64(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
+                                    const hl_engine_config *config, uint32_t argc, const char *const argv[],
+                                    hl_host_handle *process, hl_host_handle *result_stream) {
+    fake_backend_seen = HL_GUEST_ISA_AARCH64;
+    return fake_start_common(host, box, options, config, argc, argv, process, result_stream);
+}
+
+static hl_status fake_start_x86_64(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
+                                   const hl_engine_config *config, uint32_t argc, const char *const argv[],
+                                   hl_host_handle *process, hl_host_handle *result_stream) {
+    fake_backend_seen = HL_GUEST_ISA_X86_64;
+    return fake_start_common(host, box, options, config, argc, argv, process, result_stream);
+}
+
+static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start_aarch64, NULL};
+static const hl_engine_backend fake_x86_backend = {HL_GUEST_ISA_X86_64, fake_start_x86_64, NULL};
 
 typedef struct run_context {
     hl_engine *engine;
@@ -231,6 +247,22 @@ int main(void) {
     config.memory_limit = 0;
     config.pid_limit = 0;
     config.cpu_limit = 0;
+
+    /* Registering the second production ISA must not replace the first one. */
+    hl_engine_backend_register(&fake_x86_backend);
+    config.guest_isa = HL_GUEST_ISA_AARCH64;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
+    fake_backend_seen = 0;
+    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    HL_CHECK(fake_backend_seen == HL_GUEST_ISA_AARCH64);
+    hl_engine_destroy(engine);
+    config.guest_isa = HL_GUEST_ISA_X86_64;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
+    fake_backend_seen = 0;
+    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
+    HL_CHECK(fake_backend_seen == HL_GUEST_ISA_X86_64);
+    hl_engine_destroy(engine);
+    config.guest_isa = HL_GUEST_ISA_AARCH64;
 
     /* The public box input is validated before effects and deeply owned by each instance. */
     memset(&box, 0, sizeof(box));
@@ -480,7 +512,7 @@ int main(void) {
 
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 8);
+    HL_CHECK(fake_box_seen == 10);
     HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;

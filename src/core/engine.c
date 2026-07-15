@@ -9,10 +9,13 @@
 #include <stdio.h>
 #include <string.h>
 
-static const hl_engine_backend *production_backend;
+/* One process may embed every guest translator.  Keep registration keyed by
+ * guest ISA: a constructor for one backend must never overwrite another. */
+static const hl_engine_backend *production_backends[HL_GUEST_ISA_X86_64 + 1];
 
 void hl_engine_backend_register(const hl_engine_backend *backend) {
-    production_backend = backend;
+    if (backend == NULL || backend->guest_isa > HL_GUEST_ISA_X86_64) return;
+    production_backends[backend->guest_isa] = backend;
 }
 
 struct hl_engine {
@@ -478,7 +481,7 @@ hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl
         engine->config.fd_binding_count = 0;
     }
     atomic_flag_clear(&engine->lock);
-    engine->backend = production_backend;
+    engine->backend = production_backends[config->guest_isa];
     free(candidate_handles);
     *out_engine = engine;
     return HL_STATUS_OK;
