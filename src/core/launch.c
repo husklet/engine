@@ -66,6 +66,7 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->debug_log_offset,
         config->checkpoint_directory_offset,
         config->restore_directory_offset,
+        config->result_path_offset,
     };
     size_t i;
     for (i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
@@ -126,9 +127,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         free(wire);
         return 78;
     }
-#define APPLY_OPTION(name, value)                                                                                   \
-    do {                                                                                                            \
-        if (hl_options_set(&options, (name), (value), 1) != 0) goto option_failure;                                \
+#define APPLY_OPTION(name, value)                                                                                      \
+    do {                                                                                                               \
+        if (hl_options_set(&options, (name), (value), 1) != 0) goto option_failure;                                    \
     } while (0)
 
     // Scalars populate the same process-local values container initialization reads.
@@ -235,7 +236,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // rootfs: "" (bare launch) maps to NULL, matching the flag path's `rootfs = NULL` default.
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
     hl_options *previous_options = hl_options_bind_process(&options);
-    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2, &options);
+    const char *result_path = launch_string(&cfg, pool, cfg.result_path_offset);
+    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2, &options,
+                    result_path[0] ? result_path : NULL);
     (void)hl_options_bind_process(previous_options);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
@@ -251,8 +254,10 @@ option_failure:
     return 78;
 }
 
-static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
+static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+                            const char *result_path) {
     (void)options;
+    (void)result_path;
     return hl_run_linux_guest(NULL, NULL, rootfs, argc, argv);
 }
 

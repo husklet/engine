@@ -73,7 +73,10 @@ static hl_host_services g_jit_services;
 static hl_status g_engine_result_status;
 static hl_linux_abi *g_linux_box;
 
-hl_status hl_run_linux_guest_status(void) { return g_engine_result_status; }
+hl_status hl_run_linux_guest_status(void) {
+    return g_engine_result_status;
+}
+
 static uint64_t g_host_launch_monotonic_ns;
 
 #include "../../translator/guest/x86_64/cpu.h"
@@ -466,8 +469,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
-    return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options);
+static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+                             const char *result_path) {
+    return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options, result_path);
 }
 #ifndef HL_ENGINE_NO_MAIN
 int main(int argc, char **argv) {
@@ -529,5 +533,5 @@ int hl_engine_entry(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;
     }
-    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL);
+    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL, NULL);
 }

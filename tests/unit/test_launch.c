@@ -64,8 +64,10 @@ static int write_launch(const char *path) {
     return close(fd);
 }
 
-static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options) {
+static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+                          const char *result_path) {
     (void)rootfs;
+    HL_CHECK(result_path == NULL);
     HL_CHECK(argc == 1 && strcmp(argv[0], "guest") == 0);
     HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "typed-host") == 0);
     HL_CHECK(strcmp(hl_options_get(options, "HL_CPUS"), "2") == 0);

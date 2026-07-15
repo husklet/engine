@@ -18,12 +18,14 @@ int main(void) {
     size_t value_size;
     size_t argument_count;
 
-    HL_CHECK(sizeof(hl_launch_config) == 136);
+    HL_CHECK(sizeof(hl_launch_config) == 144);
     HL_CHECK(offsetof(hl_launch_config, magic) == 0);
     HL_CHECK(offsetof(hl_launch_config, pool_size) == 4);
     HL_CHECK(offsetof(hl_launch_config, header_size) == 8);
     HL_CHECK(offsetof(hl_launch_config, abi) == 12);
     HL_CHECK(offsetof(hl_launch_config, restore_directory_offset) == 128);
+    HL_CHECK(offsetof(hl_launch_config, result_path_offset) == 132);
+    HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));
     wire.config.magic = HL_CONFIG_MAGIC;
@@ -54,6 +56,9 @@ int main(void) {
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
     wire.config.pool_size--;
     wire.pool[0] = 'x';
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
+    wire.pool[0] = '\0';
+    wire.config.reserved = 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
     return EXIT_SUCCESS;
 }

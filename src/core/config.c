@@ -12,6 +12,7 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
     memcpy(&config, wire, sizeof(config));
     if (config.magic != HL_CONFIG_MAGIC) return HL_STATUS_CORRUPT;
     if (config.abi != HL_CONFIG_ABI) return HL_STATUS_ABI_MISMATCH;
+    if (config.reserved != 0) return HL_STATUS_CORRUPT;
     if (config.header_size < sizeof(config) || config.header_size > wire_size) return HL_STATUS_CORRUPT;
     complete_size = (size_t)config.header_size + config.pool_size;
     if (complete_size < config.header_size || complete_size != wire_size) return HL_STATUS_CORRUPT;

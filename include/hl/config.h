@@ -6,7 +6,9 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 4u
+#define HL_CONFIG_ABI 5u
+#define HL_LAUNCH_RESULT_MAGIC UINT32_C(0x484c5253)
+#define HL_LAUNCH_RESULT_ABI 1u
 #define HL_CONFIG_SANDBOX_ENABLED 1u
 #define HL_CONFIG_UNTRUSTED_ONLY 2u
 
@@ -43,7 +45,27 @@ typedef struct hl_launch_config {
     uint32_t debug_log_offset;
     uint32_t checkpoint_directory_offset;
     uint32_t restore_directory_offset;
+    /* Existing 0600 result leaf created by the launcher; zero preserves direct CLI exit semantics. */
+    uint32_t result_path_offset;
+    uint32_t reserved;
 } hl_launch_config;
+
+typedef enum hl_launch_result_kind {
+    HL_LAUNCH_RESULT_CODE = 1,
+    HL_LAUNCH_RESULT_SIGNAL = 2,
+    HL_LAUNCH_RESULT_FAULT = 3,
+    HL_LAUNCH_RESULT_ENGINE_ERROR = 4
+} hl_launch_result_kind;
+
+typedef struct hl_launch_result {
+    uint32_t magic;
+    uint32_t abi;
+    uint32_t kind;
+    int32_t guest_status;
+    int32_t engine_status;
+    uint32_t reserved;
+    uint64_t detail;
+} hl_launch_result;
 
 HL_API hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launch_config *out_config,
                                            const char **out_pool);

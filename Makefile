@@ -1016,12 +1016,15 @@ test-linux-production-core-abi: $(BUILD)/linux-production/hl-engine-linux-x86_64
 
 .PHONY: test-linux-production-config
 test-linux-production-config: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
-	$(BUILD)/tools/config-e2e-runner $(BUILD)/tools/remote-supervisor $(BUILD)/e2e/guest-exit-x86_64
+	$(BUILD)/tools/config-e2e-runner $(BUILD)/tools/remote-supervisor $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-exit70-x86_64
 	$(BUILD)/tools/config-e2e-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42 32
 	$(BUILD)/tools/config-e2e-runner $(abspath $(BUILD)/tools/remote-supervisor) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42 32
+	$(BUILD)/tools/config-e2e-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) 70
 
 LINUX_PRODUCTION_COMPAT_BINS := $(filter %/x86_64/%,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) $(LIBC_CASE_BINS) \
 	$(COMPLETENESS_BINS) $(POSIX_CASE_BINS) $(SYSCALL_CASE_BINS) $(NETWORK_CASE_BINS) $(PROCFS_CASE_BINS) \
@@ -1217,6 +1220,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
@@ -1228,6 +1232,10 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-aarch64) 70
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) 70
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
