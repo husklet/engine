@@ -68,7 +68,13 @@ static uint64_t g_host_launch_monotonic_ns;
 
 #include "../../translator/guest/aarch64/cpu.h"
 #include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
-#include "../../translator/guest/aarch64/stat.c" // the per-arch struct-stat layout os/linux/ fills
+#define HL_GUEST_STAT_SIZE HL_LINUX_STAT_AARCH64_SIZE
+#define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_aarch64
+#define HL_GUEST_BOUND_STAT hl_linux_stat_aarch64
+#include "../../linux_abi/guest_stat.h"
+#undef HL_GUEST_BOUND_STAT
+#undef HL_GUEST_STAT_ENCODE
+#undef HL_GUEST_STAT_SIZE
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
 #define GUEST_LINUX_STAT_BYTES 128

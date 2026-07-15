@@ -85,7 +85,13 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
-#include "../../translator/guest/x86_64/stat.c"     // per-arch struct-stat layout os/linux fills
+#define HL_GUEST_STAT_SIZE HL_LINUX_STAT_X86_64_SIZE
+#define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_x86_64
+#define HL_GUEST_BOUND_STAT hl_linux_stat_x86_64
+#include "../../linux_abi/guest_stat.h"
+#undef HL_GUEST_BOUND_STAT
+#undef HL_GUEST_STAT_ENCODE
+#undef HL_GUEST_STAT_SIZE
 
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
