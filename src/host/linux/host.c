@@ -3,6 +3,7 @@
 #endif
 
 #include "hl/linux.h"
+#include "probe.h"
 #include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
@@ -132,6 +133,17 @@ struct hl_host_linux {
     hl_linux_counter_subscription **counter_subscriptions;
     uint32_t counter_subscription_capacity;
 };
+
+uint32_t hl_host_linux_active_mappings(hl_host_linux *host) {
+    uint32_t active = 0;
+    uint32_t index;
+    if (host == NULL) return 0;
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < host->handle_capacity; ++index)
+        if (host->handles[index].kind == HL_LINUX_HANDLE_MAPPING) ++active;
+    pthread_mutex_unlock(&host->lock);
+    return active;
+}
 
 static hl_host_result hl_linux_fork_complete(void *context);
 static hl_host_result hl_linux_fork_child(void *context);
