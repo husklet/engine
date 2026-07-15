@@ -1957,7 +1957,7 @@ static int proc_map_region_p(char *b, size_t n, unsigned long lo, unsigned long 
     unsigned long kb = (hi - lo) / 1024;
     // "Locked:" reports the mlock/mlockall'd bytes of THIS region (LTP mlock05 mlock()s a whole mapping
     // and reads its Locked back == the mapping size).
-    unsigned long lockkb = (unsigned long)(mlk_region_locked(lo, hi) / 1024);
+    unsigned long lockkb = (unsigned long)(hl_gmap_lock_region_bytes(lo, hi) / 1024);
     // A PROT_NONE region (perms "---p", e.g. the stack guard gap) is NOT resident: its resident/dirty
     // smaps fields must read 0 like the kernel, even though its virtual Size is the full span.
     int resident = (perms[0] != '-' || perms[1] != '-' || perms[2] != '-');

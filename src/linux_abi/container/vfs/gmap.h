@@ -43,7 +43,6 @@ int hl_gmap_lock_future(void);
 void hl_gmap_lock_all(int future);
 
 /* Temporary call-site aliases while the surrounding unity roots are decomposed. */
-#define mlk_region_locked hl_gmap_lock_region_bytes
 #define mlk_total_locked hl_gmap_lock_total_bytes
 #define mlk_rlimit_gate hl_gmap_lock_limit_range
 #define mlk_rlimit_gate_all hl_gmap_lock_limit_all
