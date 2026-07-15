@@ -108,6 +108,26 @@ int main(int argc, char **argv) {
         unlink(output);
         unlink(error);
     }
+    {
+        int hup_heartbeat[2];
+        pid_t hup;
+        char byte;
+        if (pipe(hup_heartbeat) != 0) return 13;
+        hup = fork();
+        if (hup < 0) return 14;
+        if (hup == 0) {
+            close(hup_heartbeat[0]);
+            if (dup2(hup_heartbeat[1], STDERR_FILENO) < 0) _exit(126);
+            close(hup_heartbeat[1]);
+            execl(argv[1], argv[1], "/bin/sleep", "30", (char *)NULL);
+            _exit(127);
+        }
+        close(hup_heartbeat[1]);
+        if (read(hup_heartbeat[0], &byte, 1) != 1 || byte != '\036') return 15;
+        if (kill(hup, SIGHUP) != 0) return 16;
+        close(hup_heartbeat[0]);
+        if (waitpid(hup, &status, 0) != hup || !WIFEXITED(status) || WEXITSTATUS(status) != 124) return 17;
+    }
     child = fork();
     if (child < 0) return 2;
     if (child == 0) {

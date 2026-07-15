@@ -60,6 +60,10 @@ int main(int argc, char **argv) {
     sigemptyset(&action.sa_mask);
     (void)sigaction(SIGTERM, &action, NULL);
     (void)sigaction(SIGINT, &action, NULL);
+    /* A remote transport normally reports an abruptly lost client with
+       SIGHUP.  Treat it like the explicit cancellation signals so the
+       supervised process group is reaped instead of being orphaned. */
+    (void)sigaction(SIGHUP, &action, NULL);
     action.sa_handler = child_handler;
     (void)sigaction(SIGCHLD, &action, NULL);
     (void)signal(SIGPIPE, SIG_IGN);
