@@ -507,6 +507,13 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     // fallback — the same graceful degradation as before this fix.
     if (sig_default_terminates(sig)) {
         sig_diag_raise_default(c, sig);
+#if defined(__linux__)
+        // Linux uses the same signal numbering and wait-status encoding as the guest. Let the host kernel
+        // terminate this forked guest process so its parent observes a genuine WIFSIGNALED status. The
+        // shared relay below is only needed on hosts whose signal namespace cannot represent Linux exactly.
+        signal(sig, SIG_DFL);
+        raise(sig);
+#endif
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
         c->exited = 1;
