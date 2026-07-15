@@ -646,7 +646,7 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         return -EIO;
     }
     hl_gmap_add(mapped.address, mapped.mapped_size);
-    gmap_set_glen(mapped.address, size);
+    hl_gmap_set_guest_length(mapped.address, size);
     gbus_clear(mapped.address, mapped.address + size);
     if (bus_prepared && gbus_add(mapped.address + bus_accessible, mapped.address + size) != 0) {
         gbus_prepare_release();

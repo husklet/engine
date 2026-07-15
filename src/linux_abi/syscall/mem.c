@@ -326,7 +326,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         wipefork_del(a0, (uint64_t)a1);
                     }
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
-                    gmap_set_glen(a4, (uint64_t)a2);
+                    hl_gmap_set_guest_length(a4, (uint64_t)a2);
                     anon_track(a4, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
                     gna_clear(a4 & ~(uint64_t)0xfff, (nhi + 0xfff) & ~(uint64_t)0xfff);
                     // stale-translation: the mapping (and any executable code in it) relocated. Drop cached
@@ -355,7 +355,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (ext == (void *)end) {
                 gmap_del(a0);
                 hl_gmap_add(a0, want);           // track the grown extent (incl. fresh guard) for execve() teardown
-                gmap_set_glen(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
+                hl_gmap_set_guest_length(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
                 G_RET(c) = a0;
                 break;
@@ -383,7 +383,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             anon_untrack(a0, (size_t)phys);
         }
         hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);                        // track for execve() teardown
-        gmap_set_glen((uint64_t)r, (uint64_t)a2);                              // /proc maps: guest length (sans guard)
+        hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);                   // /proc maps: guest length (sans guard)
         anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE); // fresh private-anon copy
         G_RET(c) = (uint64_t)r;
         break;
@@ -636,7 +636,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
-            gmap_set_glen((uint64_t)r, (uint64_t)a1);    // /proc maps report the guest length (sans guard)
+            hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
                 filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
