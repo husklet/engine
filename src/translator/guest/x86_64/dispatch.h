@@ -1,5 +1,6 @@
 #include "cpuid.h"
 #include "cmpxchg.h"
+#include "rotate.h"
 
 // translator/guest/x86_64/dispatch.h -- the x86-64 guest's definitions of the shared run_guest()
 // dispatch seam (engine-dedup PR3/PR4). Mirror of guest/aarch64/dispatch.h: the shared
@@ -269,7 +270,7 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     } /* x87 transcendental (rip already = next) */                                                                    \
     if ((c)->reason == R_RCL) { /* RCL/RCR by CL: rotate-through-carry in C (rip already = next) */                    \
-        do_rcl(c);                                                                                                     \
+        hl_x86_rotate_carry(c);                                                                                        \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_CMPXCHG16) { /* atomic 128-bit compare-exchange in C (rip already = next) */                 \
