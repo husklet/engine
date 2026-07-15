@@ -183,7 +183,7 @@ static int overlay_dir_verdict(const char *dir) {
         }
         verdict = provided <= 0 ? 1 : (opaque_cut ? 2 : 0);
     }
-    updirverdict_store(dir, verdict);
+    hl_fdcache_upper_verdict_store(dir, verdict);
     return verdict;
 }
 

@@ -451,7 +451,7 @@ int hl_fdcache_upper_verdict_lookup(const char *d, int *verdict) {
     return hit;
 }
 
-void updirverdict_store(const char *d, int verdict) {
+void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return;
     CLK;
     uint64_t h = mc_hash(d);
