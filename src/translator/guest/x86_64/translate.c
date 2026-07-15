@@ -4,6 +4,7 @@
 #include "lower/primitives.h"
 #include "lower/alu.h"
 #include "lower/mov.h"
+#include "lower/shift.h"
 
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -1288,9 +1289,15 @@ static void *translate_block(uint64_t gpc) {
                 }
             }
             // ---- shift/rotate class (group2: C0/C1/D0/D1/D2/D3 -> SHL/SHR/SAR/ROL/ROR/RCL/RCR) ----
-            // Lowered in translate/shift.c translate_shift().
+            // Lowered in lower/shift.c.
             {
-                int s = translate_shift(&I, gpc, next);
+                const hl_x86_shift_state shift_state = {
+                    .parity_aux_dead = g_pfaf_dead,
+                    .output_flags_dead =
+                        xblkflags_on() && !(x86_flags_livein(next, gpc) & (XF_ALL & ~XF_AF)),
+                    .direct_registers = 1,
+                };
+                int s = hl_x86_lower_shift(&I, next, &shift_state);
                 if (s == TX_NEXT) {
                     gpc = next;
                     continue;
