@@ -1,6 +1,6 @@
 // Engine host<->guest boundary: entry trampoline + run_guest() dispatcher loop.
 
-#include "bus.h"
+#include "target/bus.h"
 
 static int bus_activate(void *p) {
     (void)p;
@@ -18,33 +18,34 @@ static void bus_end(void *p) {
 }
 
 static const hl_guest_bus_ops bus_ops = {bus_activate, bus_begin, bus_end};
-static hl_guest_bus g_guest_bus = {.ops = &bus_ops};
+static hl_target_bus g_target_bus;
 
 void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
     (void)opaque;
-    hl_guest_bus_changed(&g_guest_bus, generation, active);
+    hl_target_bus_changed(&g_target_bus, generation, active);
 }
 
 void jit_guest_bus_bind(hl_guest_bus_query query, int active, uint64_t generation) {
-    hl_guest_bus_bind(&g_guest_bus, query, active, generation);
+    if (g_target_bus.guest.ops == NULL) hl_target_bus_init(&g_target_bus, &bus_ops, NULL);
+    hl_target_bus_bind(&g_target_bus, query, active, generation);
 }
 
 int jit_guest_bus_active(void) {
-    return hl_guest_bus_active(&g_guest_bus);
+    return hl_target_bus_active(&g_target_bus);
 }
 
 uint64_t jit_guest_bus_fault(uint64_t address, uint64_t size) {
-    return hl_guest_bus_fault(&g_guest_bus, address, size);
+    return hl_target_bus_fault(&g_target_bus, address, size);
 }
 
 void jit_guest_bus_transition_begin(void *opaque) {
     (void)opaque;
-    hl_guest_bus_begin(&g_guest_bus);
+    hl_target_bus_begin(&g_target_bus);
 }
 
 void jit_guest_bus_transition_end(void *opaque) {
     (void)opaque;
-    hl_guest_bus_end(&g_guest_bus);
+    hl_target_bus_end(&g_target_bus);
 }
 
 // ---------------- host entry trampoline ----------------
