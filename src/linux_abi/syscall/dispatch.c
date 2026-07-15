@@ -115,7 +115,7 @@ static void mq_fd_duplicate(int newfd, int oldfd);
 #include "aio.c"
 #include "net.c"
 #include "event.c"
-#include "misc.c"
+#include "misc.h"
 // --- untrusted-guest isolation seam (subsystem #3: the sentry process-split) --------------------
 // The dispatcher's syscall boundary (run_guest -> service(c)) is the entire guest->host authority
 // crossing. We interpose a one-branch router so an UNTRUSTED guest's fs/net/proc syscalls can be
@@ -129,6 +129,16 @@ static void mq_fd_duplicate(int newfd, int oldfd);
 static int g_untrusted;                   // gate (defined + env-parsed in os/linux/sentry.c)
 static void syscall_route(struct cpu *c); // sentry router (defined in os/linux/sentry.c)
 static void service_local(struct cpu *c); // fwd: the canonical syscall switch (this file)
+
+static int misc_mapped(void *context, uintptr_t address, size_t size) {
+    (void)context;
+    return host_range_mapped(address, size);
+}
+
+static void misc_random(void *context, void *output, size_t size) {
+    (void)context;
+    arc4random_buf(output, size);
+}
 
 // g2h-style redirect for non-PIE ET_EXEC pointer args. A non-PIE links at a fixed low vaddr but is biased
 // HIGH by load_elf (__PAGEZERO forbids the low 4 GB); an un-relocated pointer baked at the low link vaddr
@@ -1004,7 +1014,25 @@ static void service_local(struct cpu *c) {
     if (svc_proc(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_net(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_event(c, nr, a0, a1, a2, a3, a4, a5)) return;
-    if (svc_misc(c, nr, a0, a1, a2, a3, a4, a5)) return;
+    {
+        const uint64_t arguments[6] = {a0, a1, a2, a3, a4, a5};
+        int64_t result = 0;
+        hl_linux_misc_context misc = {
+            .hostname = g_hostname,
+            .hostname_capacity = sizeof(g_hostname),
+            .memory_limit = g_mem_max,
+            .memory_used = atomic_load(&g_mem_charged),
+            .machine = G_UNAME_MACHINE,
+            .mapped = misc_mapped,
+            .random = misc_random,
+            .callback_context = NULL,
+        };
+        if (hl_linux_misc_dispatch(&misc, nr, arguments, &result)) {
+            G_RET(c) = (uint64_t)result;
+            (void)svc_done(c);
+            return;
+        }
+    }
     if (svc_rare(c, nr, a0, a1, a2, a3, a4, a5)) return;
     // ===================== unhandled =====================
     // Every Linux syscall is now owned by one of the svc_*() family modules above; reaching here means no

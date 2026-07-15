@@ -99,7 +99,8 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
 	src/linux_abi/fdcache.c \
 	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_wire.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
-	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c
+	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
+	src/linux_abi/syscall/misc.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c \
 	src/host/macos/system.c
