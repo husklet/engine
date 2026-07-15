@@ -112,7 +112,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 

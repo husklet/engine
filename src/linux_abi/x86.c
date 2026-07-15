@@ -15,6 +15,7 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 
 #include "../host/range.h"
 #include "page.h"
+#include "image.h"
 
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
 static uint16_t rd16(const uint8_t *p) {
@@ -40,13 +41,9 @@ static void wr64(uint8_t *p, uint64_t v) {
 // struct loaded is defined by the shared os/linux (container/netns.c).
 
 static int elf_interp(const char *path, char *out, size_t n) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    struct stat st;
-    fstat(fd, &st);
-    uint8_t *f = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (f == MAP_FAILED) return -1;
+    hl_linux_image image;
+    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) return -1;
+    uint8_t *f = image.bytes;
     int r = -1;
     uint64_t phoff = rd64(f + 32);
     int phnum = rd16(f + 56), phent = rd16(f + 54);
@@ -61,7 +58,7 @@ static int elf_interp(const char *path, char *out, size_t n) {
             break;
         }
     }
-    munmap(f, st.st_size);
+    hl_linux_image_release(&image);
     return r;
 }
 
@@ -254,18 +251,12 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
 }
 
 static void load_elf(const char *path, struct loaded *out) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "hl-engine: cannot open guest ELF %s: %s\n", path, strerror(errno));
+    hl_linux_image image;
+    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) {
+        fprintf(stderr, "hl-engine: cannot read guest ELF %s through host services\n", path);
         exit(1);
     }
-    struct stat st;
-    fstat(fd, &st);
-    uint8_t *f = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (f == MAP_FAILED) {
-        perror("mmap elf");
-        exit(1);
-    }
+    uint8_t *f = image.bytes;
     if (rd16(f + 18) != 0x3E) fprintf(stderr, "[hl] warning: e_machine=%u (want 62=x86-64)\n", rd16(f + 18));
     uint64_t e_entry = rd64(f + 24), phoff = rd64(f + 32);
     int phnum = rd16(f + 56), phentsize = rd16(f + 54);
@@ -335,7 +326,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
     // (ET_EXEC only); NOGOREBASE=1 disables for A/B testing.
-    if (g_nonpie_lo) go_rebase_nonpie(f, st.st_size, bias, g_nonpie_lo, g_nonpie_hi);
+    if (g_nonpie_lo) go_rebase_nonpie(f, image.size, bias, g_nonpie_lo, g_nonpie_hi);
     // record V8's embedded-builtins CODE base symbol (LOW link value) so the frontend can bias its one
     // baked `mov r32,imm` materialization to the high mapping -- see translate.c g_nonpie_blob_code. Only for a
     // biased non-PIE image that actually carries the symbol (node/mongosh/any embedded-V8 ET_EXEC); 0 otherwise
@@ -343,7 +334,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // Gate on THIS image being the non-PIE ET_EXEC (etype==2), not on the persistent g_nonpie_lo: the
     // interpreter (ld.so, a DYN loaded by a SECOND load_elf in the same process) has no v8 symbol and would
     // otherwise reset the value the main image just recorded. Only the main non-PIE exe carries the blob.
-    if (etype == 2) g_nonpie_blob_code = go_symval(f, st.st_size, "v8_Default_embedded_blob_code_");
+    if (etype == 2) g_nonpie_blob_code = go_symval(f, image.size, "v8_Default_embedded_blob_code_");
     // a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
     // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
     // runtime relocation entry. After we bias the image high (macOS __PAGEZERO blocks the low link range)
@@ -376,7 +367,7 @@ static void load_elf(const char *path, struct loaded *out) {
             has_interp = 1;
             break;
         } // PT_INTERP
-    if (g_nonpie_lo && !has_interp && !go_section_by_name(f, st.st_size, ".gopclntab", NULL, NULL, NULL)) {
+    if (g_nonpie_lo && !has_interp && !go_section_by_name(f, image.size, ".gopclntab", NULL, NULL, NULL)) {
         uint64_t shoff = rd64(f + 40);
         uint16_t shentsize = rd16(f + 58), shnum = rd16(f + 60), shstrndx = rd16(f + 62);
         if (shoff && shnum && shstrndx < shnum) {
@@ -409,8 +400,7 @@ static void load_elf(const char *path, struct loaded *out) {
     if (g_trace || g_diag)
         fprintf(stderr, "[LOADED] %s base=%llx span=%llx end=%llx entry=%llx\n", path, (unsigned long long)base,
                 (unsigned long long)span, (unsigned long long)((uint64_t)base + span), (unsigned long long)out->entry);
-    munmap(f, st.st_size);
-    close(fd);
+    hl_linux_image_release(&image);
 }
 
 // Build the SysV x86-64 process stack (identical layout to aarch64). Returns rsp.

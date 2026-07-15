@@ -1,6 +1,7 @@
 // hl/linux_abi -- the ELF loader (map PT_LOAD high; static-PIE + dynamic via ld.so; build stack).
 
 #include "page.h"
+#include "image.h"
 
 // ---------------- minimal ELF loader (load segments HIGH; PC-relative stays valid) ----------------
 static uint16_t rd16(const uint8_t *p) {
@@ -21,13 +22,9 @@ static uint64_t rd64(const uint8_t *p) {
 
 // Read PT_INTERP (the dynamic loader path) out of an ELF.
 static int elf_interp(const char *path, char *out, size_t n) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    struct stat st;
-    fstat(fd, &st);
-    uint8_t *f = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (f == MAP_FAILED) return -1;
+    hl_linux_image image;
+    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) return -1;
+    uint8_t *f = image.bytes;
     int r = -1;
     uint64_t phoff = rd64(f + 32);
     int phnum = rd16(f + 56), phent = rd16(f + 54);
@@ -43,7 +40,7 @@ static int elf_interp(const char *path, char *out, size_t n) {
             break;
         }
     }
-    munmap(f, st.st_size);
+    hl_linux_image_release(&image);
     return r;
 }
 
@@ -584,8 +581,8 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
         char b[224];
         int o = 0;
         const char *H = "0123456789abcdef";
-        memcpy(b, "[ENGFAULT] sig=", 15);
-        o = 15;
+        memcpy(b, "[HL-ENGINE-FAULT] sig=", 22);
+        o = 22;
         b[o++] = '0' + (sig / 10 % 10);
         b[o++] = '0' + (sig % 10);
 
@@ -606,13 +603,13 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
         b[o++] = '\n';
         if (write(2, b, o) < 0) {}
         // Name the faulting engine function (dladdr is not strictly async-signal-safe, but we _exit right
-        // after, so a rare lock stall is acceptable — this only runs under the DDDBG_ENGFAULT gate).
+        // after, so a rare lock stall is acceptable -- this only runs while engine-fault diagnostics are enabled).
         Dl_info di;
         if (hpc && dladdr((void *)hpc, &di) && di.dli_sname) {
             char c[160];
             int p = 0;
-            memcpy(c, "[ENGFAULT] fn=", 14);
-            p = 14;
+            memcpy(c, "[HL-ENGINE-FAULT] fn=", 21);
+            p = 21;
             for (const char *s = di.dli_sname; *s && p < 140; s++)
                 c[p++] = *s;
             memcpy(c + p, " +0x", 4);
@@ -662,31 +659,12 @@ __attribute__((constructor)) static void install_sync_fault_guards(void) {
 // clear within a few ms), then fail the exec LOUDLY with a clean diagnostic rather than leaving a hole.
 #define ELF_MAP_RETRIES 6
 
-// mmap fault-injection gate (inert unless the env var is set; nothing sets it in production, and
-// the mac bridge drops ambient env -- same idiom as the sibling x86 loader's NONPIE_NOFIXUP/NORELRO gates).
-// Forces the Nth LOAD-path mmap/mprotect ATTEMPT to report failure, so the retry/abort hardening below can
-// be regression-tested without inducing real host-VM fragmentation or memory pressure. DDFAILMMAP /
-// DDFAILMPROT = "N" fails attempt N once (transient; the retry must recover); "N-" fails every attempt
-// from N onward (permanent; the loader must abort cleanly / stay best-effort, never leave a hole).
-static int elf_inject_fail(const char *var, int attempt) {
-    const char *s = hl_option_get(var);
-    if (!s || !*s) return 0;
-    return strchr(s, '-') ? attempt >= atoi(s) : attempt == atoi(s);
-}
-
 // mmap (anon; fd=-1) with bounded retry under transient pressure. Never returns MAP_FAILED: on
 // persistent failure it reports the exact request and aborts, so a valid exec dies with a clean error
 // rather than continuing with an unmapped hole in the guest image.
 static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const char *what) {
-    static int attempt;
     for (int t = 0;; t++) {
-        void *p;
-        if (elf_inject_fail("DDFAILMMAP", ++attempt)) {
-            errno = ENOMEM;
-            p = MAP_FAILED;
-        } else {
-            p = mmap(hint, len, prot, flags, -1, 0);
-        }
+        void *p = mmap(hint, len, prot, flags, -1, 0);
         if (p != MAP_FAILED) return p;
         if (t >= ELF_MAP_RETRIES) {
             fprintf(stderr, "hl-engine: load_elf: cannot map %s (%zu bytes) for the guest image: %s\n", what, len,
@@ -706,14 +684,9 @@ static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const 
 // transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
 // anything else -- matching the original best-effort mprotect, so no working image regresses.
 static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char *what) {
+    (void)what;
     for (int t = 0;; t++) {
-        int r;
-        if (elf_inject_fail("DDFAILMPROT", t + 1)) {
-            errno = ENOMEM;
-            r = -1;
-        } else {
-            r = mprotect(addr, len, prot);
-        }
+        int r = mprotect(addr, len, prot);
         if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) { return; }
         usleep(2000u << t); // transient pressure: back off and re-tighten
     }
@@ -776,18 +749,12 @@ static int elf_is_go_iscgo(const uint8_t *f, size_t sz) {
 }
 
 static void load_elf(const char *path, struct loaded *out) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "hl-engine: cannot open guest ELF %s: %s\n", path, strerror(errno));
+    hl_linux_image image;
+    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) {
+        fprintf(stderr, "hl-engine: cannot read guest ELF %s through host services\n", path);
         exit(1);
     }
-    struct stat st;
-    fstat(fd, &st);
-    uint8_t *f = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (f == MAP_FAILED) {
-        perror("mmap elf");
-        exit(1);
-    }
+    uint8_t *f = image.bytes;
     // Refuse a foreign-arch ELF up front: this engine only translates aarch64 (e_machine==EM_AARCH64).
     // Without this guard an x86-64 image's bytes are decoded as aarch64 instructions -- the translator
     // runs off into a zero/garbage region and dies deep inside translate_block with a cryptic SIGSEGV.
@@ -887,9 +854,8 @@ static void load_elf(const char *path, struct loaded *out) {
     // main image THEN the ld.so interpreter -- the interp is never Go, so '|=' keeps a main-image match from
     // being clobbered by the interp load. execve resets g_go_iscgo to 0 before re-loading (proc.c) so a later
     // non-Go image starts clean. See the detailed rationale in signal.c.
-    g_go_iscgo |= elf_is_go_iscgo(f, (size_t)st.st_size);
-    munmap(f, st.st_size);
-    close(fd);
+    g_go_iscgo |= elf_is_go_iscgo(f, image.size);
+    hl_linux_image_release(&image);
 }
 
 // Build the Linux process stack: [argc][argv..][NULL][envp..][NULL][auxv..][AT_NULL].
