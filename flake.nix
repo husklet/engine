@@ -112,6 +112,7 @@
             ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [ linuxArm.stdenv.cc linuxX86.stdenv.cc ]
               ++ pkgs.lib.optionals (system == "aarch64-linux") [ pkgs.gcc linuxX86.stdenv.cc ];
           } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
+            CC = "${pkgs.stdenv.cc}/bin/cc";
             AARCH64_LINUX_CC = linuxArmCompiler;
             X86_64_LINUX_CC = linuxX86Compiler;
             AARCH64_DYNAMIC_LOADER = "${linuxArm.glibc}/lib/ld-linux-aarch64.so.1";
@@ -119,7 +120,8 @@
             X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
             X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
           } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
-            AARCH64_LINUX_CC = "gcc";
+            CC = "${pkgs.stdenv.cc}/bin/cc";
+            AARCH64_LINUX_CC = "${pkgs.stdenv.cc}/bin/cc";
             X86_64_LINUX_CC = linuxX86Compiler;
             AARCH64_DYNAMIC_LOADER = "${pkgs.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${pkgs.glibc}/lib/libc.so.6";
