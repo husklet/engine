@@ -52,10 +52,12 @@ int main(void) {
     HL_CHECK(services.file->resolve_beneath(services.context, root.value, "a/file", 6, 0, &resolved).status ==
              HL_STATUS_OK);
     HL_CHECK(resolved.target_type == HL_HOST_FILE_TYPE_REGULAR && strcmp(resolved.final, "file") == 0);
-    read = services.file->read(services.context, resolved.target, &value, 1);
-    HL_CHECK(read.status == HL_STATUS_OK && read.value == 1 && value == 'x');
     HL_CHECK(services.file->close(services.context, resolved.target).status == HL_STATUS_OK);
     HL_CHECK(services.file->close(services.context, resolved.parent).status == HL_STATUS_OK);
+    read = services.file->open_beneath(services.context, root.value, "a/file", 6, HL_HOST_FILE_READ, 0, 0, 0);
+    HL_CHECK(read.status == HL_STATUS_OK);
+    HL_CHECK(services.file->read(services.context, read.value, &value, 1).status == HL_STATUS_OK && value == 'x');
+    HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
     /* open_beneath resolves an existing target before reopening it from the
        pinned parent. Both temporary handles must be released on every call;
        this count exceeds the handle capacity of both host implementations. */
