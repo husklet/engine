@@ -1330,13 +1330,15 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
-static hl_host_result hl_linux_attachment_borrow_file(void *context, hl_host_handle file) {
+static hl_host_result hl_linux_attachment_borrow_file_at_least(void *context, hl_host_handle file,
+                                                              uint32_t minimum_descriptor) {
     hl_host_linux *host = context;
     int descriptor;
     int borrowed;
+    if (minimum_descriptor > INT_MAX) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
-    borrowed = descriptor < 0 ? -1 : fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    borrowed = descriptor < 0 ? -1 : fcntl(descriptor, F_DUPFD_CLOEXEC, (int)minimum_descriptor);
     pthread_mutex_unlock(&host->lock);
     if (borrowed < 0)
         return descriptor < 0 ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0) : hl_linux_errno_result();
@@ -1345,6 +1347,10 @@ static hl_host_result hl_linux_attachment_borrow_file(void *context, hl_host_han
         return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
     return hl_linux_result(HL_STATUS_OK, (uint64_t)(unsigned)borrowed, 0);
+}
+
+static hl_host_result hl_linux_attachment_borrow_file(void *context, hl_host_handle file) {
+    return hl_linux_attachment_borrow_file_at_least(context, file, 0);
 }
 
 static hl_host_result hl_linux_attachment_release(void *context, uint64_t borrowed_descriptor) {
@@ -3670,6 +3676,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_stream_readiness, hl_linux_stream_move};
     static const hl_host_posix_attachment_services posix_attachment = {
         HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_linux_attachment_borrow_file,
+        hl_linux_attachment_borrow_file_at_least,
         hl_linux_attachment_release};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,

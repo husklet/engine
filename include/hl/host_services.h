@@ -31,7 +31,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_DIRECTORY_ABI 1u
 #define HL_HOST_WATCH_ABI 1u
 #define HL_HOST_STREAM_ABI 1u
-#define HL_HOST_POSIX_ATTACHMENT_ABI 1u
+#define HL_HOST_POSIX_ATTACHMENT_ABI 2u
 
 typedef uint64_t hl_host_handle;
 
@@ -654,6 +654,7 @@ typedef struct hl_host_stream_services {
 typedef struct hl_host_posix_attachment_services {
     HL_ABI_HEADER;
     hl_host_result (*borrow_file)(void *context, hl_host_handle file);
+    hl_host_result (*borrow_file_at_least)(void *context, hl_host_handle file, uint32_t minimum_descriptor);
     hl_host_result (*release)(void *context, uint64_t borrowed_descriptor);
 } hl_host_posix_attachment_services;
 

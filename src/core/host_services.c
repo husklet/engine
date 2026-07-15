@@ -66,7 +66,9 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_POSIX_ATTACHMENT) != 0 &&
         (!hl_valid_group(services->posix_attachment, HL_HOST_POSIX_ATTACHMENT_ABI,
                          sizeof(*services->posix_attachment)) ||
-         services->posix_attachment->borrow_file == NULL || services->posix_attachment->release == NULL))
+         services->posix_attachment->borrow_file == NULL ||
+         services->posix_attachment->borrow_file_at_least == NULL ||
+         services->posix_attachment->release == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
         (!hl_valid_file_group(services->file) ||

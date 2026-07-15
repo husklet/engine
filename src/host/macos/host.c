@@ -1314,14 +1314,16 @@ static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, 
     return descriptor;
 }
 
-static hl_host_result hl_macos_attachment_borrow_file(void *context, hl_host_handle handle) {
+static hl_host_result hl_macos_attachment_borrow_file_at_least(void *context, hl_host_handle handle,
+                                                              uint32_t minimum_descriptor) {
     hl_host_macos *host = context;
     int descriptor = -1;
     int found;
+    if (minimum_descriptor > INT_MAX) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     hl_macos_file *file = hl_macos_file_lookup(host, handle);
     found = file != NULL;
-    if (found) descriptor = fcntl(file->descriptor, F_DUPFD_CLOEXEC, 0);
+    if (found) descriptor = fcntl(file->descriptor, F_DUPFD_CLOEXEC, (int)minimum_descriptor);
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return found ? hl_macos_errno() : hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (hl_host_process_fd_private_add(descriptor) != 0) {
@@ -1329,6 +1331,10 @@ static hl_host_result hl_macos_attachment_borrow_file(void *context, hl_host_han
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
     return hl_macos_result(HL_STATUS_OK, (uint64_t)(unsigned)descriptor, 0);
+}
+
+static hl_host_result hl_macos_attachment_borrow_file(void *context, hl_host_handle handle) {
+    return hl_macos_attachment_borrow_file_at_least(context, handle, 0);
 }
 
 static hl_host_result hl_macos_attachment_release(void *context, uint64_t borrowed_descriptor) {
@@ -4504,6 +4510,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                    hl_macos_stream_readiness, hl_macos_stream_move};
     static const hl_host_posix_attachment_services posix_attachment = {
         HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_macos_attachment_borrow_file,
+        hl_macos_attachment_borrow_file_at_least,
         hl_macos_attachment_release};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;

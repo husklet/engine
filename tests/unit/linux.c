@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -243,6 +244,21 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    {
+        hl_host_result root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, "/", 1,
+                                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
+        struct stat status;
+        hl_host_result borrowed;
+        HL_CHECK(root.status == HL_STATUS_OK);
+        borrowed = services.posix_attachment->borrow_file_at_least(services.context, root.value, 64);
+        HL_CHECK(borrowed.status == HL_STATUS_OK && borrowed.value >= 64 && borrowed.value <= INT_MAX);
+        HL_CHECK(fcntl((int)borrowed.value, F_GETFD) & FD_CLOEXEC);
+        HL_CHECK(fstat((int)borrowed.value, &status) == 0 && S_ISDIR(status.st_mode));
+        HL_CHECK(services.posix_attachment->release(services.context, borrowed.value).status == HL_STATUS_OK);
+        HL_CHECK(services.posix_attachment->borrow_file_at_least(services.context, HL_HOST_HANDLE_INVALID, 64).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->close(services.context, root.value).status == HL_STATUS_OK);
+    }
     {
         char directory[128];
         char fifo[160];
