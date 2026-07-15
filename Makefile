@@ -13,6 +13,7 @@ PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
 PERF_HEAVY_SAMPLES ?= 7
 PERF_OP_SAMPLES ?= 7
+SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
 PERF_MAC_ARCH = $(shell $(MAC) uname -m)
@@ -240,7 +241,7 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean install uninstall package-test FORCE test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains audit-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -1642,6 +1643,11 @@ audit-domains: $(BUILD)/tools/check-domains
 
 test: unit check-domains compat-native
 
+# Keep sanitizer artifacts isolated from release objects.  The recursive invocation exercises the same
+# authoritative C unit graph, including both the Linux ABI and selected native host provider.
+sanitize:
+	$(MAKE) BUILD=$(SANITIZE_BUILD) CFLAGS='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' unit
+
 format:
 	$(CLANG_FORMAT) -i $(PORTABLE_SOURCES) $(LINUX_HOST_SOURCES) $(MACOS_HOST_SOURCES) $(PRIVATE_HEADERS) src/runner/main.c include/hl/*.h tests/unit/*.c tests/unit/*.h tools/*.c
 
@@ -1655,6 +1661,7 @@ help:
 	@echo 'make all           build pure-C static libraries and runner'
 	@echo 'make linux-compile compile/link every portable unit and Linux host (not the macOS-only unity JIT)'
 	@echo 'make test          unit, domain-boundary, and native compatibility smoke tests'
+	@echo 'make sanitize      run the complete C unit graph under ASan and UBSan'
 	@echo 'make compat-build  compile every Linux behavior fixture'
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'

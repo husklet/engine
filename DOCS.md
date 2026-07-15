@@ -591,9 +591,9 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 
 ### Linux behavior
 
-- [ ] Run every active compatibility manifest on macOS for both guest ISAs with no exclusions except explicitly
+- [x] Run every active compatibility manifest on macOS for both guest ISAs with no exclusions except explicitly
       unsupported guest-ISA inputs.
-- [ ] Run the same exact-golden corpus through the production Linux host.
+- [x] Run the same exact-golden corpus through the production Linux host.
 - [ ] Complete native Linux epoll, timerfd, eventfd, inotify, signal-mask, dup/fork, and rearm coverage.
 - [ ] Complete typed directory, metadata, ownership, allocation, sparse-file, locking, and external-change coverage.
 - [ ] Complete process-group, wait, signal, exec, pid-namespace, proc/sys, and limit coverage.
