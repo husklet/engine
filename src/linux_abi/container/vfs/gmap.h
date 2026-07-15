@@ -15,6 +15,8 @@ typedef struct hl_gmap_entry {
 
 void hl_gmap_bind_limits(const hl_limit_table *limits);
 void hl_gmap_bind_host(const hl_host_services *host);
+hl_status hl_gmap_map_anonymous(uint64_t requested_address, uint64_t length, uint32_t protection, uint32_t flags,
+                                uint64_t *address);
 size_t hl_gmap_count(void);
 int hl_gmap_get(size_t index, hl_gmap_entry *entry);
 void hl_gmap_add(uint64_t address, uint64_t length);

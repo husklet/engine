@@ -48,6 +48,26 @@ void hl_gmap_bind_host(const hl_host_services *host) {
     g_gmap.host = host;
 }
 
+hl_status hl_gmap_map_anonymous(uint64_t requested_address, uint64_t length, uint32_t protection, uint32_t flags,
+                                uint64_t *address) {
+    hl_host_memory_mapping mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
+    hl_host_result mapped;
+    if (address == NULL || length == 0 || g_gmap.host == NULL || g_gmap.host->memory == NULL ||
+        g_gmap.host->memory->map_anonymous == NULL || g_gmap.host->memory->release == NULL)
+        return HL_STATUS_INVALID_ARGUMENT;
+    mapped = g_gmap.host->memory->map_anonymous(g_gmap.host->context, requested_address, length, protection, flags,
+                                                &mapping);
+    if (mapped.status != HL_STATUS_OK) return (hl_status)mapped.status;
+    if (mapping.handle == HL_HOST_HANDLE_INVALID || mapping.address == 0 || mapping.mapped_size != length ||
+        hl_exec_mapping_add(mapping.address, length, mapping.handle) != 0) {
+        (void)g_gmap.host->memory->release(g_gmap.host->context, mapping.handle);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
+    hl_gmap_add(mapping.address, length);
+    *address = mapping.address;
+    return HL_STATUS_OK;
+}
+
 size_t hl_gmap_count(void) {
     return g_gmap.mapping_count;
 }

@@ -9,8 +9,10 @@
 typedef struct mapping_probe {
     void *address;
     size_t size;
+    unsigned maps;
     unsigned releases;
     unsigned discards;
+    int fail_map;
 } mapping_probe;
 
 #define FORMER_GMAP_CAPACITY 8192u
@@ -27,6 +29,23 @@ static hl_host_result probe_discard(void *context, hl_host_handle handle) {
     mapping_probe *probe = context;
     if (handle != 1) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     probe->discards++;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result probe_map(void *context, uint64_t requested_address, uint64_t size, uint32_t protection,
+                                uint32_t flags, hl_host_memory_mapping *output) {
+    mapping_probe *probe = context;
+    (void)requested_address;
+    (void)protection;
+    (void)flags;
+    if (probe->fail_map) return (hl_host_result){HL_STATUS_OUT_OF_MEMORY, 0, 0, 0};
+    probe->address = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (probe->address == MAP_FAILED) return (hl_host_result){HL_STATUS_OUT_OF_MEMORY, 0, 0, 0};
+    probe->size = (size_t)size;
+    probe->maps++;
+    output->handle = 1;
+    output->address = (uint64_t)(uintptr_t)probe->address;
+    output->mapped_size = size;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
@@ -140,6 +159,28 @@ int main(void) {
         HL_CHECK(probe.releases == 1);
         errno = 0;
         HL_CHECK(mprotect(probe.address, probe.size, PROT_READ) == -1 && errno == ENOMEM);
+        hl_gmap_bind_host(NULL);
+    }
+    {
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(4096);
+        mapping_probe probe = {0};
+        hl_host_memory_services memory = {.map_anonymous = probe_map,
+                                          .release = probe_release,
+                                          .discard = probe_discard};
+        hl_host_services host = {.context = &probe, .memory = &memory};
+        uint64_t address = 0;
+        hl_gmap_bind_host(&host);
+        HL_CHECK(hl_gmap_map_anonymous(0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                       HL_HOST_MEMORY_PRIVATE, &address) == HL_STATUS_OK);
+        HL_CHECK(address == (uint64_t)(uintptr_t)probe.address && probe.maps == 1 && hl_gmap_count() == 1);
+        hl_gmap_reset();
+        HL_CHECK(probe.releases == 1 && hl_gmap_count() == 0);
+        probe.fail_map = 1;
+        address = 0;
+        HL_CHECK(hl_gmap_map_anonymous(0, page, HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE, &address) ==
+                 HL_STATUS_OUT_OF_MEMORY);
+        HL_CHECK(address == 0 && probe.maps == 1 && probe.releases == 1 && hl_gmap_count() == 0);
         hl_gmap_bind_host(NULL);
     }
     return EXIT_SUCCESS;
