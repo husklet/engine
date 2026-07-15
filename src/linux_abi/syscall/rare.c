@@ -900,7 +900,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        int rl = mlk_rlimit_gate(a0, (uint64_t)a1);
+        int rl = hl_gmap_lock_limit_range(a0, (uint64_t)a1);
         if (rl < 0) {
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;

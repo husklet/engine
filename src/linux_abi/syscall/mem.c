@@ -654,7 +654,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // MCL_FUTURE accounting: only wire+count the new mapping while it stays within RLIMIT_MEMLOCK.
             // A mapping that would push the locked total over the guest's limit is left pageable/uncounted
             // (the mmap still succeeds) so the tracked locked bytes never exceed the limit.
-            if (hl_gmap_lock_future() && mlk_rlimit_gate((uint64_t)r, (uint64_t)a1) == 0) {
+            if (hl_gmap_lock_future() && hl_gmap_lock_limit_range((uint64_t)r, (uint64_t)a1) == 0) {
                 mlock(r, (size_t)a1 + guard);
                 hl_gmap_lock_add((uint64_t)r, (uint64_t)a1);
             }
@@ -805,7 +805,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 228: {
         // Honor the guest's RLIMIT_MEMLOCK first (the container is unprivileged: no CAP_IPC_LOCK) -- soft
         // limit 0 -> EPERM, exceeding the limit -> ENOMEM, before touching the host wiring.
-        int rl = mlk_rlimit_gate(a0, (uint64_t)a1);
+        int rl = hl_gmap_lock_limit_range(a0, (uint64_t)a1);
         if (rl < 0) {
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;
