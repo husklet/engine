@@ -488,14 +488,14 @@ void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
 //   * fork/chroot drop via rc_reset below: each entry also carries the g_fs_fgen stamp and only
 //     hits while it matches, so the O(1) generation bump in the fork child drops every inherited (COW)
 //     entry -- same discipline as rc_/oc_/mc_ (COW/re-root hazard).
-//   * volume jails are NEVER cached (host-mutable backing): enforced by dc_jail_cacheable, which
+//   * volume jails are NEVER cached (host-mutable backing): enforced by hl_fdcache_dentry_cacheable, which
 //     recognizes only the rootfs upper + the read-only image lowers by pointer identity.
 // resolve_at (the TOCTOU-safe open walk) additionally CONSUMES entries with canon == key && nmiss == 0:
 // such an entry proves every component of the key existed as a real, non-symlink directory (realpath
 // returning its input verbatim admits no symlink hop), which is precisely the condition under which
 // the lexical fast path and the per-component walk agree -- see the guard comments at that site.
 // No dir-fds are cached (path strings only), so there is no fd-exhaustion/LRU concern.
-int dc_jail_cacheable(const char *jcanon) {
+int hl_fdcache_dentry_cacheable(const char *jcanon) {
     const struct hl_linux_vfs_namespace *vfs = g_fdcache.binding.vfs;
     if (!vfs) return 0;
     if (jcanon == vfs->root_canonical) return 1; // the writable upper (mutations bump g_res_epoch)

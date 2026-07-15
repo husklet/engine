@@ -1502,7 +1502,7 @@ static int confine_in_m(const char *jcanon, size_t jclen, const char *rel, char 
     // nofollow mode the final component was already peeled into `rem` above, so all files in one
     // directory share the key (the per-DIRECTORY sharing a stat/open storm needs). Only rootfs/lower
     // jails are cached; a miss or an over-length path falls through to the untouched climb.
-    int dcok = dc_jail_cacheable(jcanon);
+    int dcok = hl_fdcache_dentry_cacheable(jcanon);
     char hkey[DC_KEYMAX];
     if (dcok) {
         size_t hl = strlen(h);
