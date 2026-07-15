@@ -128,18 +128,9 @@ static int exec_fd_is_engine(int fd) {
     return 0;
 }
 
-static int exec_close_bound_cloexec(int fd) {
-    uint32_t closed;
-    hl_status status;
-    if (g_linux_box == NULL || fd < 0 ||
-        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &(hl_linux_fd_snapshot){0}) != HL_STATUS_OK)
-        return 0;
-    status = hl_linux_fd_exec(g_linux_box, (hl_linux_fd)fd, &closed);
-    if (status == HL_STATUS_OK && closed != 0) {
-        proc_fdvis_close(fd);
-        close(fd);
-    }
-    return 1;
+static int exec_fd_is_bound(int fd) {
+    return g_linux_box != NULL && fd >= 0 &&
+           hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &(hl_linux_fd_snapshot){0}) == HL_STATUS_OK;
 }
 
 // Close the CLOEXEC guest fds among a bounded [0,maxfd) range (host enumeration fallback path only).
@@ -149,7 +140,7 @@ static int exec_close_bound_cloexec(int fd) {
 static void exec_close_cloexec_scan(int maxfd) {
     if (maxfd < 0 || maxfd > (1 << 20)) maxfd = 4096;
     for (int fd = 0; fd < maxfd; fd++) {
-        if (exec_close_bound_cloexec(fd)) continue;
+        if (exec_fd_is_bound(fd)) continue;
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);
         if (fl >= 0 && (fl & FD_CLOEXEC)) {
@@ -157,6 +148,18 @@ static void exec_close_cloexec_scan(int maxfd) {
             close(fd);
         }
     }
+}
+
+static void exec_bound_closed(void *context, hl_linux_fd fd) {
+    (void)context;
+    proc_fdvis_close((int)fd);
+    /* Every typed guest descriptor has a same-number native shadow used only by legacy syscall paths. */
+    close((int)fd);
+}
+
+static void exec_close_bound_cloexec_all(void) {
+    uint32_t closed;
+    if (g_linux_box != NULL) (void)hl_linux_fd_exec_all(g_linux_box, exec_bound_closed, NULL, &closed);
 }
 
 #include "../../host/system.h"
@@ -171,6 +174,7 @@ static void exec_close_cloexec(void) {
     // O(open fds). The real close-on-exec semantics are unchanged: every open non-engine CLOEXEC fd is
     // still closed. Fall back to a bounded linear scan only if host enumeration is unavailable.
     size_t need = 0;
+    exec_close_bound_cloexec_all();
     if (!hl_host_process_fds(getpid(), NULL, 0, &need)) {
         exec_close_cloexec_scan(getdtablesize());
         return;
@@ -191,7 +195,7 @@ static void exec_close_cloexec(void) {
     if (got > cap) got = cap;
     for (size_t i = 0; i < got; i++) {
         int fd = fds[i].descriptor;
-        if (exec_close_bound_cloexec(fd)) continue;
+        if (exec_fd_is_bound(fd)) continue;
         if ((fds[i].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0) continue;
         if (exec_fd_is_engine(fd)) continue;
         int fl = fcntl(fd, F_GETFD);

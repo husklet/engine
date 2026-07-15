@@ -1182,7 +1182,8 @@ hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *ou
     hl_host_handle handle = HL_HOST_HANDLE_INVALID;
     hl_status status;
     hl_host_result result;
-    if (linux_abi == NULL || out_closed == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || out_closed == NULL)
+        return HL_STATUS_INVALID_ARGUMENT;
     *out_closed = 0;
     hl_linux_lock(linux_abi);
     if (fd >= linux_abi->fd_capacity || linux_abi->fds[fd].ofd == 0 || linux_abi->fds[fd].ofd == HL_LINUX_FD_RESERVED) {
@@ -1202,6 +1203,39 @@ hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *ou
     if (files == NULL || files->close == NULL) return HL_STATUS_NOT_SUPPORTED;
     result = files->close(linux_abi->host->context, handle);
     return (hl_status)result.status;
+}
+
+hl_status hl_linux_fd_exec_all(hl_linux_abi *linux_abi, hl_linux_fd_exec_callback callback, void *context,
+                               uint32_t *out_closed) {
+    hl_status first = HL_STATUS_OK;
+    hl_linux_fd cursor = 0;
+    uint32_t count = 0;
+    if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || out_closed == NULL)
+        return HL_STATUS_INVALID_ARGUMENT;
+    *out_closed = 0;
+    while (cursor < linux_abi->fd_capacity) {
+        hl_linux_fd candidate;
+        uint32_t removed = 0;
+        hl_status status;
+        hl_linux_lock(linux_abi);
+        for (candidate = cursor; candidate < linux_abi->fd_capacity; ++candidate) {
+            hl_linux_ofd ofd = linux_abi->fds[candidate].ofd;
+            if (ofd != 0 && ofd != HL_LINUX_FD_RESERVED &&
+                (linux_abi->fds[candidate].descriptor_flags & HL_LINUX_FD_CLOEXEC) != 0)
+                break;
+        }
+        cursor = candidate < linux_abi->fd_capacity ? candidate + 1 : linux_abi->fd_capacity;
+        hl_linux_unlock(linux_abi);
+        if (candidate == linux_abi->fd_capacity) break;
+        status = hl_linux_fd_exec(linux_abi, candidate, &removed);
+        if (status != HL_STATUS_OK && first == HL_STATUS_OK) first = status;
+        if (removed != 0) {
+            count++;
+            if (callback != NULL) callback(context, candidate);
+        }
+    }
+    *out_closed = count;
+    return first;
 }
 
 hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi) {

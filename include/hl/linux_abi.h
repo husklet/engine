@@ -249,6 +249,13 @@ HL_API hl_status hl_linux_fd_close(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_h
  * reference also closes its host file handle through the host-service seam.
  */
 HL_API hl_status hl_linux_fd_exec(hl_linux_abi *linux_abi, hl_linux_fd fd, uint32_t *out_closed);
+typedef void (*hl_linux_fd_exec_callback)(void *context, hl_linux_fd fd);
+/*
+ * Remove every close-on-exec descriptor without scanning through host-native fd numbers.
+ * The table lock is released before host close and callback; failures do not stop later removals.
+ */
+HL_API hl_status hl_linux_fd_exec_all(hl_linux_abi *linux_abi, hl_linux_fd_exec_callback callback, void *context,
+                                      uint32_t *out_closed);
 /* Quiescent-state diagnostic for descriptor/OFD ownership invariants. */
 HL_API hl_status hl_linux_abi_validate_fds(const hl_linux_abi *linux_abi);
 /* Returns a stable value snapshot; internal entries and mutex-bearing OFDs never escape. */

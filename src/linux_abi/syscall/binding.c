@@ -979,6 +979,13 @@ static int bound_shadow_activate(void) {
         return -1;
     }
     close(opened);
+    if (hl_host_process_fd_private_add(g_bound_sentinel) != 0) {
+        int error = ENOSPC;
+        close(g_bound_sentinel);
+        g_bound_sentinel = -1;
+        errno = error;
+        return -1;
+    }
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
@@ -1006,6 +1013,7 @@ activation_failed: {
             proc_fdvis_close((int)rollback);
             if (rollback >= 3) close((int)rollback);
         }
+    hl_host_process_fd_private_remove(g_bound_sentinel);
     close(g_bound_sentinel);
     g_bound_sentinel = -1;
     errno = error;

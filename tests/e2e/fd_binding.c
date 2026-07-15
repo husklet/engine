@@ -8,13 +8,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-enum { BOUND_FD = 100 };
+enum { BOUND_FD = 100, CLOEXEC_FD = 700 };
 
 static int fail(int code) {
     return code;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     struct stat status;
     char bytes[8] = {0};
     int duplicate;
@@ -22,6 +22,15 @@ int main(void) {
     int floored;
     pid_t child;
     int child_status;
+    if (argc == 1) {
+        char *next[] = {argv[0], (char *)"post-exec", NULL};
+        if (fstat(BOUND_FD, &status) != 0 || fstat(CLOEXEC_FD, &status) != 0) return fail(29);
+        execv("/proc/self/exe", next);
+        return fail(30);
+    }
+    if (argc != 2 || strcmp(argv[1], "post-exec") != 0) return fail(31);
+    errno = 0;
+    if (fcntl(CLOEXEC_FD, F_GETFD) != -1 || errno != EBADF) return fail(32);
     if (fstat(BOUND_FD, &status) != 0 || status.st_size != 4 || !S_ISREG(status.st_mode)) return fail(10);
     if (lseek(BOUND_FD, 0, SEEK_SET) != 0) return fail(11);
     if (read(BOUND_FD, bytes, 2) != 2 || memcmp(bytes, "ab", 2) != 0) return fail(12);

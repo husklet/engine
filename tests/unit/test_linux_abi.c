@@ -48,6 +48,16 @@ typedef struct test_object {
     _Atomic uint32_t clone_entered;
 } test_object;
 
+typedef struct exec_observer {
+    hl_linux_fd fds[4];
+    uint32_t count;
+} exec_observer;
+
+static void exec_closed(void *opaque, hl_linux_fd fd) {
+    exec_observer *observer = opaque;
+    if (observer->count < 4) observer->fds[observer->count++] = fd;
+}
+
 static int64_t object_read(void *opaque, void *buffer, size_t size) {
     test_object *object = opaque;
     if (size == 0) return 0;
@@ -596,6 +606,27 @@ int main(void) {
         HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_NOT_FOUND);
         HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
         HL_CHECK(hl_linux_close(&linux_abi, original) == 0 && file_host.closes == closes_before + 1);
+        file_host.closes = 0;
+    }
+
+    /* Bulk exec scans only typed CLOEXEC entries, reports each removal, and continues after close failure. */
+    HL_CHECK(hl_linux_fd_install(&linux_abi, 55, HL_LINUX_O_RDWR, 0, &original) == HL_STATUS_OK);
+    HL_CHECK(hl_linux_fd_dup(&linux_abi, original, HL_LINUX_FD_CLOEXEC, &duplicate) == HL_STATUS_OK);
+    {
+        hl_linux_fd independent;
+        exec_observer observer = {0};
+        uint32_t removed = 0;
+        HL_CHECK(hl_linux_fd_install(&linux_abi, 56, HL_LINUX_O_RDONLY, HL_LINUX_FD_CLOEXEC, &independent) ==
+                 HL_STATUS_OK);
+        file_host.next_status = HL_STATUS_IO;
+        HL_CHECK(hl_linux_fd_exec_all(&linux_abi, exec_closed, &observer, &removed) == HL_STATUS_IO);
+        HL_CHECK(removed == 2 && observer.count == 2);
+        HL_CHECK(observer.fds[0] == duplicate && observer.fds[1] == independent);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, duplicate, &snapshot) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, independent, &snapshot) == HL_STATUS_NOT_FOUND);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, original, &snapshot) == HL_STATUS_OK);
+        HL_CHECK(file_host.closes == 1);
+        HL_CHECK(hl_linux_close(&linux_abi, original) == 0 && file_host.closes == 2);
         file_host.closes = 0;
     }
 
