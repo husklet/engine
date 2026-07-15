@@ -579,6 +579,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     argc = (int)argument_count;
     hl_target_services_inject(&g_target_services, host);
     hl_gmap_bind_host(host);
+    eventfd_count_init(host);
+    fdvis_init(host);
+    ts_init(host);
     g_linux_box = box;
     jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());
     hl_linux_bus_set_change_callback(jit_guest_bus_changed, NULL);
@@ -675,9 +678,6 @@ void hl_target_runtime_init(void) {
     jit86_install_sync_fault_guards();
     poslk_init();
     ipc_init();
-    eventfd_count_init();
-    fdvis_init();
-    ts_init();
 }
 
 // The engine entry point uses the public HL prefix so the runtime can be linked as a library and launched

@@ -235,18 +235,16 @@ static uint64_t *g_eventfd_count;
 // SCM_RIGHTS may land on a different fd number while still needing to update the sender's shared counter.
 static int g_eventfd_cslot[HL_NFD];
 
-static void eventfd_count_init(void) {
+static void eventfd_count_init(const hl_host_services *host) {
+    void *arena = NULL;
     if (g_eventfd_count) return;
     // One slot per POSSIBLE fd number: eventfd_counter_slot() indexes this by the fd number (or a
     // SCM_RIGHTS-imported eventfd's sender-fd slot), and large workloads open far more than 1024 fds — a 1024-slot
     // array is a cross-process out-of-bounds write for any eventfd whose fd number exceeds it (silent
     // counter corruption / heap clobber past the mapped page). Size it to the whole fd space.
     size_t sz = sizeof(uint64_t) * HL_NFD;
-    void *mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) // cross-process counters degrade, but in-process eventfd still works
-        mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) abort();
-    g_eventfd_count = (uint64_t *)mem;
+    if (hl_linux_shared_create(host, sz, &arena) != HL_STATUS_OK) abort();
+    g_eventfd_count = (uint64_t *)arena;
 }
 
 // Guest-requested O_NONBLOCK for an eventfd. The backing pipe's read end is kept PERMANENTLY O_NONBLOCK at
@@ -262,12 +260,6 @@ static uint8_t g_eventfd_gnb[HL_NFD];
 static int eventfd_guest_nb(int fd) {
     return (fd >= 0 && fd < HL_NFD) ? g_eventfd_gnb[fd] : 0;
 }
-
-#ifndef HL_EMBEDDED_BUILD
-__attribute__((constructor)) static void eventfd_count_ctor(void) {
-    eventfd_count_init();
-}
-#endif
 
 // _eventfd-atomicity_: an eventfd is emulated as {accumulating counter, readiness pipe}. write() does
 // `count += add; drain-pipe; write-one-byte` and read() does `v = count; count = 0; drain-pipe; if
@@ -392,21 +384,15 @@ static uint64_t fdvis_identity(int pid, uint64_t start_ns) {
     return ((uint64_t)(uint32_t)pid << 32) | fingerprint;
 }
 
-static void fdvis_init(void) {
+static void fdvis_init(const hl_host_services *host) {
+    void *arena = NULL;
     if (g_fdvis != NULL) return;
     size_t bytes = sizeof(struct fdvis_slot) * FDVIS_N + sizeof(*g_fdvis_control);
-    void *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (memory == MAP_FAILED) return;
-    g_fdvis = memory;
-    g_fdvis_control = (void *)((unsigned char *)memory + sizeof(struct fdvis_slot) * FDVIS_N);
+    if (hl_linux_shared_create(host, bytes, &arena) != HL_STATUS_OK) return;
+    g_fdvis = arena;
+    g_fdvis_control = (void *)((unsigned char *)arena + sizeof(struct fdvis_slot) * FDVIS_N);
     (void)atexit(proc_fdvis_cleanup);
 }
-
-#ifndef HL_EMBEDDED_BUILD
-__attribute__((constructor)) static void fdvis_ctor(void) {
-    fdvis_init();
-}
-#endif
 
 static struct fdvis_slot *fdvis_find(uint64_t key, uint64_t owner_start_ns, int claim) {
     if (!g_fdvis || key == 0) return NULL;
@@ -735,20 +721,12 @@ static void proc_fdvis_cleanup(void) {
     fdvis_unlock();
 }
 
-static void ts_init(void) {
+static void ts_init(const hl_host_services *host) {
+    void *arena = NULL;
     if (g_ts_tab) return;
     size_t sz = sizeof(struct ts_slot) * TS_N;
-    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (m == MAP_FAILED) // cross-process state degrades to pbi_status, but self-reads still work
-        m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    g_ts_tab = (m == MAP_FAILED) ? NULL : (struct ts_slot *)m;
+    if (hl_linux_shared_create(host, sz, &arena) == HL_STATUS_OK) g_ts_tab = (struct ts_slot *)arena;
 }
-
-#ifndef HL_EMBEDDED_BUILD
-__attribute__((constructor)) static void ts_ctor(void) {
-    ts_init();
-}
-#endif
 
 // Find (or, when claim, atomically allocate) the slot for host pid `pid`. Open addressing with linear
 // probe; a freshly claimed slot defaults to 'R' (running), overwriting any stale value a recycled pid left.
