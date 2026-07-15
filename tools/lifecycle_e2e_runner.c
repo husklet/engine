@@ -1,6 +1,7 @@
 #include "hl/engine.h"
 #include "hl/log.h"
 #include "hl/macos.h"
+#include "../src/host/macos/probe.h"
 
 #include <stdio.h>
 #include <pthread.h>
@@ -107,6 +108,7 @@ int main(int argc, char **argv) {
     }
     status = hl_host_macos_create(&host, &services);
     if (status != HL_STATUS_OK) return 70;
+    if (hl_host_macos_active_mappings(host) != 0) return 82;
     clock_calls = mmap(NULL, 2 * sizeof(*clock_calls), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (clock_calls == MAP_FAILED) return 76;
     realtime_calls = clock_calls + 1;
@@ -163,6 +165,7 @@ int main(int argc, char **argv) {
         status = hl_engine_run(engine, argc - guest_index, (const char *const *)(argv + guest_index), &result);
     }
     hl_engine_destroy(engine);
+    if (hl_host_macos_active_mappings(host) != 0) return 83;
     hl_host_macos_destroy(host);
     if (fail_code_publish)
         return status == HL_STATUS_PLATFORM_FAILURE && result.kind == HL_ENGINE_EXIT_ENGINE_ERROR &&

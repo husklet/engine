@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "hl/macos.h"
+#include "probe.h"
 #include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
@@ -200,6 +201,17 @@ struct hl_host_macos {
     hl_macos_watch *watches;
     uint32_t watch_capacity;
 };
+
+uint32_t hl_host_macos_active_mappings(hl_host_macos *host) {
+    uint32_t active = 0;
+    uint32_t index;
+    if (host == NULL) return 0;
+    pthread_mutex_lock(&host->lock);
+    for (index = 0; index < host->mapping_capacity; ++index)
+        if (host->mappings[index].active) ++active;
+    pthread_mutex_unlock(&host->lock);
+    return active;
+}
 
 static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, int append);
 
