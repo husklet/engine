@@ -645,7 +645,8 @@ static int container_init(const char *rootfs) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", key);
             // Export the minted key so children/exec + abstract-AF_UNIX/IPC/bridge share this
             // container's namespace (hl_option_get("HL_NETNS")); a daemon-supplied key is already in the env.
-            if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(nn && nn[0])) hl_option_set("HL_NETNS", key, 1);
+            if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) == 0 && !(nn && nn[0]))
+                hl_option_set("HL_NETNS", key, 1);
         }
         const char *eu = hl_option_get("HL_UID");
         if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);

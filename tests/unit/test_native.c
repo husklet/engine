@@ -70,6 +70,22 @@ int main(void) {
         hl_target_services_destroy(&target);
         HL_CHECK(hl_target_services_effective(&target) == &target.bound);
     }
+    {
+        hl_target_services target = {0};
+        hl_host_services missing = services;
+        char directory[] = "/tmp/hl-target-directory-XXXXXX";
+        HL_CHECK(mkdtemp(directory) != NULL);
+        HL_CHECK(rmdir(directory) == 0);
+        hl_target_services_inject(&target, &services);
+        HL_CHECK(hl_target_services_make_directory(&target, directory, 0700) == 0);
+        HL_CHECK(hl_target_services_make_directory(&target, directory, 0700) == 0);
+        HL_CHECK(rmdir(directory) == 0);
+        missing.file = NULL;
+        hl_target_services_inject(&target, &missing);
+        HL_CHECK(hl_target_services_make_directory(&target, directory, 0700) == -1);
+        hl_target_services_inject(&target, &services);
+        HL_CHECK(hl_target_services_make_directory(&target, "/missing/hl-target-directory", 0700) == -1);
+    }
     HL_CHECK(host != NULL);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) ==
              HL_STATUS_OK);

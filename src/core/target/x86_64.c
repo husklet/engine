@@ -278,7 +278,8 @@ static int container_init(const char *rootfs) {
             snprintf(key, sizeof key, "%d", (int)getpid());
         namespace_key_set(key);
         snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", key);
-        if ((mkdir(g_netns, 0700) == 0 || errno == EEXIST) && !(ns && ns[0])) hl_option_set("HL_NETNS", key, 1);
+        if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) == 0 && !(ns && ns[0]))
+            hl_option_set("HL_NETNS", key, 1);
     }
     {
         const char *vs =
