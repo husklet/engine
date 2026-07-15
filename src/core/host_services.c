@@ -41,7 +41,7 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         const hl_host_memory_services *memory = services->memory;
         if (memory == NULL || memory->abi != HL_HOST_MEMORY_ABI || memory->size < sizeof(*memory) ||
             memory->reserve == NULL || memory->protect == NULL || memory->release == NULL ||
-            memory->publish_code == NULL)
+            memory->publish_code == NULL || memory->map_anonymous == NULL || memory->discard == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&

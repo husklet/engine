@@ -423,6 +423,19 @@ static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, voi
     return handle != 0 ? hl_macos_result(HL_STATUS_OK, handle, 0) : hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
 }
 
+static int hl_macos_mapping_fill(hl_host_macos *host, hl_host_handle handle, void *address, uint64_t size) {
+    int filled = 0;
+    pthread_mutex_lock(&host->lock);
+    hl_macos_mapping *mapping = hl_macos_lookup(host, handle);
+    if (mapping != NULL) {
+        mapping->writable = address;
+        mapping->size = size;
+        filled = 1;
+    }
+    pthread_mutex_unlock(&host->lock);
+    return filled;
+}
+
 static int hl_macos_protection(uint32_t flags) {
     int protection = 0;
     if ((flags & HL_HOST_MEMORY_READ) != 0) protection |= PROT_READ;
@@ -505,6 +518,23 @@ static hl_host_result hl_macos_release(void *context, hl_host_handle handle) {
     return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_discard(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    hl_macos_mapping *mapping;
+    pthread_mutex_lock(&host->lock);
+    mapping = hl_macos_lookup(host, handle);
+    if (mapping == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    mapping->active = 0;
+    mapping->writable = NULL;
+    mapping->executable = NULL;
+    mapping->size = 0;
+    pthread_mutex_unlock(&host->lock);
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static int hl_macos_pread_fill(int descriptor, void *buffer, size_t size, off_t offset) {
     size_t done = 0;
     while (done < size) {
@@ -557,25 +587,30 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
                              HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
         (sharing != HL_HOST_MEMORY_SHARED && sharing != HL_HOST_MEMORY_PRIVATE) ||
         (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
-        (placement != 0 && requested_address == 0))
+        (placement != 0 && requested_address == 0) ||
+        (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     descriptor = hl_macos_file_descriptor(host, file, 0);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    registered = hl_macos_register(host, NULL, NULL, size);
+    if (registered.status != HL_STATUS_OK) return registered;
     if (placement == 0 && sharing == HL_HOST_MEMORY_PRIVATE && (offset % (uint64_t)page) != 0) {
         address = mmap((void *)(uintptr_t)requested_address, (size_t)size, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (address == MAP_FAILED) return hl_macos_errno();
+        if (address == MAP_FAILED) {
+            hl_host_result failure = hl_macos_errno();
+            (void)hl_macos_discard(context, registered.value);
+            return failure;
+        }
         if (hl_macos_pread_fill(descriptor, address, (size_t)size, (off_t)offset) != 0) {
             int error = errno;
             munmap(address, (size_t)size);
             errno = error;
-            return hl_macos_errno();
+            hl_host_result failure = hl_macos_errno();
+            (void)hl_macos_discard(context, registered.value);
+            return failure;
         }
-        registered = hl_macos_register(host, address, NULL, size);
-        if (registered.status != HL_STATUS_OK) {
-            munmap(address, (size_t)size);
-            return registered;
-        }
+        if (!hl_macos_mapping_fill(host, registered.value, address, size)) abort();
         output->handle = registered.value;
         output->address = (uint64_t)(uintptr_t)address;
         output->mapped_size = size;
@@ -586,10 +621,19 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         ((requested_address % (uint64_t)page) != 0 || (offset % (uint64_t)page) != 0)) {
         uint64_t low = requested_address & ~((uint64_t)page - 1u);
         uint64_t head = requested_address - low;
+        if (head > UINT64_MAX - size || head + size > UINT64_MAX - ((uint64_t)page - 1u)) {
+            (void)hl_macos_discard(context, registered.value);
+            return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        }
         uint64_t total = (head + size + (uint64_t)page - 1u) & ~((uint64_t)page - 1u);
+        if (total > SIZE_MAX || low > (uint64_t)UINTPTR_MAX - total) {
+            (void)hl_macos_discard(context, registered.value);
+            return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        }
         uint8_t *head_copy = head != 0 ? malloc((size_t)head) : NULL;
         if (head != 0 && head_copy == NULL) {
             free(head_copy);
+            (void)hl_macos_discard(context, registered.value);
             return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
         }
         if (head != 0) memcpy(head_copy, (void *)(uintptr_t)low, (size_t)head);
@@ -607,12 +651,16 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
             }
         }
         free(head_copy);
-        if (address == MAP_FAILED) return hl_macos_errno();
+        if (address == MAP_FAILED) {
+            hl_host_result failure = hl_macos_errno();
+            (void)hl_macos_discard(context, registered.value);
+            return failure;
+        }
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
             uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && low < old_high && old_low < low + total) {
+            if (old->active && old->writable != NULL && low < old_high && old_low < low + total) {
                 old->active = 0;
                 old->writable = NULL;
                 old->executable = NULL;
@@ -620,38 +668,45 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
             }
         }
         pthread_mutex_unlock(&host->lock);
-        registered = hl_macos_register(host, address, NULL, total);
-        if (registered.status != HL_STATUS_OK) {
-            munmap(address, (size_t)total);
-            return registered;
-        }
+        if (!hl_macos_mapping_fill(host, registered.value, address, total)) abort();
         output->handle = registered.value;
         output->address = requested_address;
         output->mapped_size = size;
         output->reserved = head;
         return hl_macos_result(HL_STATUS_OK, 0, 0);
     }
-    if ((requested_address % (uint64_t)page) != 0 || (offset % (uint64_t)page) != 0)
+    if ((requested_address % (uint64_t)page) != 0 || (offset % (uint64_t)page) != 0) {
+        (void)hl_macos_discard(context, registered.value);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     native_flags = sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE;
     if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
     if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) {
         hl_host_result reserved = hl_macos_reserve_exact(requested_address, size);
-        if (reserved.status != HL_STATUS_OK) return reserved;
+        if (reserved.status != HL_STATUS_OK) {
+            (void)hl_macos_discard(context, registered.value);
+            return reserved;
+        }
         native_flags |= MAP_FIXED;
     }
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
                    descriptor, (off_t)offset);
     if (address == MAP_FAILED) {
+        int error = errno;
         if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE)
             (void)mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)requested_address, (mach_vm_size_t)size);
-        return hl_macos_errno();
+        errno = error;
+        hl_host_result failure = hl_macos_errno();
+        (void)hl_macos_discard(context, registered.value);
+        return failure;
     }
     if (sharing == HL_HOST_MEMORY_PRIVATE) {
         struct stat metadata;
         if (fstat(descriptor, &metadata) == 0) {
             uint64_t available = (uint64_t)metadata.st_size > offset ? (uint64_t)metadata.st_size - offset : 0;
-            uint64_t quiet = (available + (uint64_t)page - 1u) & ~((uint64_t)page - 1u);
+            uint64_t quiet = available > UINT64_MAX - ((uint64_t)page - 1u)
+                                 ? UINT64_MAX
+                                 : (available + (uint64_t)page - 1u) & ~((uint64_t)page - 1u);
             if (quiet < size)
                 (void)mmap((char *)address + quiet, (size_t)(size - quiet), PROT_READ | PROT_WRITE,
                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -664,7 +719,7 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
             uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && low < old_high && old_low < high) {
+            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
                 old->active = 0;
                 old->writable = NULL;
                 old->executable = NULL;
@@ -673,15 +728,72 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         }
         pthread_mutex_unlock(&host->lock);
     }
-    registered = hl_macos_register(host, address, NULL, size);
-    if (registered.status != HL_STATUS_OK) {
-        (void)munmap(address, (size_t)size);
-        return registered;
-    }
+    if (!hl_macos_mapping_fill(host, registered.value, address, size)) abort();
     output->handle = registered.value;
     output->address = (uint64_t)(uintptr_t)address;
     output->mapped_size = size;
     output->reserved = 0;
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_address, uint64_t size,
+                                             uint32_t protection, uint32_t flags, hl_host_memory_mapping *output) {
+    hl_host_macos *host = context;
+    hl_host_result registered;
+    void *address;
+    long page = sysconf(_SC_PAGESIZE);
+    uint32_t placement = flags & (HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE);
+    if (output == NULL || output->abi != HL_HOST_MEMORY_MAPPING_ABI || output->size < sizeof(*output) || size == 0 ||
+        size > SIZE_MAX || page <= 0 || requested_address > UINTPTR_MAX ||
+        (requested_address != 0 && requested_address % (uint64_t)page != 0) ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
+        (flags & HL_HOST_MEMORY_PRIVATE) == 0 ||
+        (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
+        (placement != 0 && requested_address == 0) ||
+        (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    registered = hl_macos_register(host, NULL, NULL, size);
+    if (registered.status != HL_STATUS_OK) return registered;
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) {
+        hl_host_result reserved = hl_macos_reserve_exact(requested_address, size);
+        if (reserved.status != HL_STATUS_OK) {
+            (void)hl_macos_discard(context, registered.value);
+            return reserved;
+        }
+    }
+    int native_flags = MAP_PRIVATE | MAP_ANON;
+    if (placement != 0) native_flags |= MAP_FIXED;
+    address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
+                   -1, 0);
+    if (address == MAP_FAILED) {
+        hl_host_result failure = hl_macos_errno();
+        if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE)
+            (void)mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)requested_address, (mach_vm_size_t)size);
+        (void)hl_macos_discard(context, registered.value);
+        return failure;
+    }
+    if (placement != 0) {
+        uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
+        pthread_mutex_lock(&host->lock);
+        for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
+            hl_macos_mapping *old = &host->mappings[index];
+            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
+            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
+                old->active = 0;
+                old->writable = NULL;
+                old->executable = NULL;
+                old->size = 0;
+            }
+        }
+        pthread_mutex_unlock(&host->lock);
+    }
+    pthread_mutex_lock(&host->lock);
+    hl_macos_mapping *owned = hl_macos_lookup(host, registered.value);
+    if (owned != NULL) owned->writable = address;
+    pthread_mutex_unlock(&host->lock);
+    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value,
+                                       (uint64_t)(uintptr_t)address, size, 0};
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -4207,7 +4319,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
-        hl_macos_unmap_range};
+        hl_macos_unmap_range,      hl_macos_map_anonymous, hl_macos_discard};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_macos_monotonic,  hl_macos_realtime,
         hl_macos_raw_monotonic, hl_macos_process_cpu, hl_macos_thread_cpu, hl_macos_clock_sleep_until};

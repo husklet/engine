@@ -412,6 +412,23 @@ int main(void) {
         HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_OK);
         HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
     }
+    {
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(16384);
+        hl_host_memory_mapping anonymous = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK);
+        unsigned char *bytes = (unsigned char *)(uintptr_t)anonymous.address;
+        bytes[0] = 0xa9;
+        HL_CHECK(services.memory->discard(services.context, anonymous.handle).status == HL_STATUS_OK);
+        HL_CHECK(bytes[0] == 0xa9 && munmap(bytes, (size_t)page) == 0);
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, UINT64_MAX - page + 2, page, HL_HOST_MEMORY_READ,
+                                     HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &anonymous)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+    }
     snprintf(path, sizeof(path), "/tmp/hl_host_macos_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                         HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,

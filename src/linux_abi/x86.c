@@ -1,13 +1,20 @@
 // hl/linux_abi -- x86-64 ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
 #include "placement.h"
 
+struct elf_host_map_context {
+    hl_host_memory_mapping mapping;
+};
+
 static void *elf_host_map(void *context, void *address, size_t length, uint32_t placement) {
-    int flags = MAP_PRIVATE | MAP_ANON;
-    void *mapped;
-    (void)context;
-    if (placement == HL_ELF_MAP_FIXED) flags |= MAP_FIXED;
-    mapped = mmap(address, length, PROT_READ | PROT_WRITE, flags, -1, 0);
-    return mapped == MAP_FAILED ? NULL : mapped;
+    struct elf_host_map_context *state = context;
+    const hl_host_services *host = effective_host_services();
+    uint32_t flags = HL_HOST_MEMORY_PRIVATE;
+    if (placement == HL_ELF_MAP_FIXED) flags |= HL_HOST_MEMORY_FIXED;
+    state->mapping = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(state->mapping), 0, 0, 0, 0};
+    hl_host_result result = host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)address, length,
+                                                        HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, flags,
+                                                        &state->mapping);
+    return result.status == HL_STATUS_OK ? (void *)(uintptr_t)state->mapping.address : NULL;
 }
 
 #include <sys/ucontext.h>
@@ -274,6 +281,8 @@ static void load_elf(const char *path, struct loaded *out) {
     // (RIP-relative leas, baked branch targets, block-map keys) are byte-identical. When g_force_base is
     // set, map MAP_FIXED at the caller-requested address; the image is PIE so basepage is ~0 and the chosen
     // base becomes out->base, deriving all guest PCs/addresses identically each run. One-shot per image.
+    struct elf_host_map_context map_context = {
+        .mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), 0, 0, 0, 0}};
     uint8_t *base;
     if (g_force_base) {
         void *want = (void *)(g_force_base + basepage);
@@ -286,7 +295,7 @@ static void load_elf(const char *path, struct loaded *out) {
         // (byte-exact execution, just not cache-revivable this run) and latch g_force_base_failed so the
         // pcache neither restores a fixed-base file over this now-mixed-base arena nor persists one. This
         // matches the aarch64 loader fallback (linux_abi/elf.c) + its g_force_base_failed pcache gate.
-        base = hl_elf_place_image(elf_host_map, NULL, want, span, &fixed_failed);
+        base = hl_elf_place_image(elf_host_map, &map_context, want, span, &fixed_failed);
         if (fixed_failed) {
             g_force_base_failed = 1;
         } else {
@@ -295,11 +304,19 @@ static void load_elf(const char *path, struct loaded *out) {
             pcache_note_fixed_img((uint64_t)base, span);
         }
     } else
-        base = hl_elf_place_image(elf_host_map, NULL, NULL, span, NULL);
+        base = hl_elf_place_image(elf_host_map, &map_context, NULL, span, NULL);
     if (base == NULL) {
-        perror("mmap base");
+        fprintf(stderr, "hl-engine: load_elf: cannot map x86 guest image (%llu bytes)\n",
+                (unsigned long long)span);
         exit(1);
     }
+    if (hl_exec_mapping_add((uint64_t)base, span, map_context.mapping.handle) != 0) {
+        (void)effective_host_services()->memory->release(effective_host_services()->context,
+                                                          map_context.mapping.handle);
+        fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
+        exit(1);
+    }
+    gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
     // W6A item 1: a non-PIE ET_EXEC (etype==2) links at a fixed low vaddr (e.g. 0x400000) but macOS
     // __PAGEZERO reserves the low 4GB, so the loader (above) biases it to a high mmap. Its un-relocated
@@ -386,7 +403,9 @@ static void load_elf(const char *path, struct loaded *out) {
             }
         }
     }
-    mprotect(base, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+    (void)effective_host_services()->memory->protect(effective_host_services()->context, map_context.mapping.handle, 0,
+                                                     span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE |
+                                                               HL_HOST_MEMORY_EXECUTE);
     // A dynamic ET_EXEC remains a LOW-address Linux object even though macOS forces its storage HIGH.
     // ld.so derives the main link_map bias and lookup range from AT_ENTRY/AT_PHDR; publishing host-biased
     // values makes dladdr/dlsym miss every LOW function pointer. The dispatcher already translates LOW
@@ -419,10 +438,25 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // The top GUARD bytes are mapped ABOVE the logical top: the topmost stack objects are the
     // AT_PLATFORM "x86_64" string and the 16 AT_RANDOM bytes, which glibc strlen/reads
     // with 16-byte SSE loads -> those over-read past the top. Keep that region mapped.
-    uint8_t *base = mmap(NULL, LOGUARD + SZ + GUARD, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    mprotect(base, LOGUARD, PROT_NONE);
+    const hl_host_services *host = effective_host_services();
+    hl_host_memory_mapping stack_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(stack_mapping), 0, 0, 0, 0};
+    hl_host_result stack_result = host->memory->map_anonymous(host->context, 0, LOGUARD + SZ + GUARD,
+                                                              HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                                              HL_HOST_MEMORY_PRIVATE, &stack_mapping);
+    if (stack_result.status != HL_STATUS_OK) {
+        fprintf(stderr, "hl-engine: cannot map x86 guest main stack (host status %d)\n", stack_result.status);
+        exit(1);
+    }
+    uint8_t *base = (uint8_t *)(uintptr_t)stack_mapping.address;
+    (void)host->memory->protect(host->context, stack_mapping.handle, 0, LOGUARD, 0);
     gna_add((uint64_t)base, (uint64_t)base + LOGUARD);
     uint8_t *stk = base + LOGUARD;
+    if (hl_exec_mapping_add((uint64_t)base, LOGUARD + SZ + GUARD, stack_mapping.handle) != 0) {
+        (void)host->memory->release(host->context, stack_mapping.handle);
+        fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
+        exit(1);
+    }
+    gmap_add((uint64_t)stk, SZ + GUARD);
     uint8_t *top = stk + SZ;
     extern uint64_t g_stack_lo, g_stack_hi; // publish for /proc/self/maps [stack] synthesis (vfs.c)
     g_stack_lo = (uint64_t)stk;
@@ -855,8 +889,10 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
                 hooked = 1;
                 atexit(lazy_diag);
             }
-            // macOS won't MAP_FIXED over a sub-range of an existing VM entry (EINVAL); try mprotect
-            // first (the page often exists as a PROT_NONE guard), then a fresh map.
+            // This executes inside a synchronous signal handler. The ordinary host-memory service owns
+            // bookkeeping locks and is intentionally not async-signal-safe, so this emergency one-page
+            // repair remains a native primitive: macOS won't MAP_FIXED over a sub-range of an existing VM
+            // entry (EINVAL); try mprotect first (often a PROT_NONE guard), then a fresh fixed map.
             if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) == 0) {
                 if (adjacent)
                     g_growmaps++;

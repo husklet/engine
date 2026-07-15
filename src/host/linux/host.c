@@ -363,6 +363,24 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_memory_discard(void *context, hl_host_handle mapping) {
+    hl_host_linux *host = context;
+    hl_linux_handle_entry *entry;
+    pthread_mutex_lock(&host->lock);
+    entry = hl_linux_lookup_locked(host, mapping, HL_LINUX_HANDLE_MAPPING);
+    if (entry == NULL) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    entry->address = NULL;
+    entry->executable_address = NULL;
+    entry->size = 0;
+    entry->descriptor = -1;
+    pthread_mutex_unlock(&host->lock);
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle file, uint64_t requested_address,
                                                uint64_t offset, uint64_t size, uint32_t protection, uint32_t flags,
                                                hl_host_file_mapping *output) {
@@ -382,22 +400,35 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
                              HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
         (sharing != HL_HOST_MEMORY_SHARED && sharing != HL_HOST_MEMORY_PRIVATE) ||
         (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
-        (placement != 0 && requested_address == 0))
+        (placement != 0 && requested_address == 0) ||
+        (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, NULL, NULL, size, -1);
+    if (registered.status != HL_STATUS_OK) return registered;
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
     pthread_mutex_unlock(&host->lock);
-    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (descriptor < 0) {
+        (void)hl_linux_memory_discard(context, registered.value);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     native_flags = sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE;
     if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
 #ifdef MAP_FIXED_NOREPLACE
     if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) native_flags |= MAP_FIXED_NOREPLACE;
 #else
-    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) {
+        (void)hl_linux_memory_discard(context, registered.value);
+        return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    }
 #endif
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags,
                    descriptor, (off_t)offset);
-    if (address == MAP_FAILED) return hl_linux_errno_result();
+    if (address == MAP_FAILED) {
+        hl_host_result failure = hl_linux_errno_result();
+        (void)hl_linux_memory_discard(context, registered.value);
+        return failure;
+    }
     /* MAP_FIXED replaced these VMAs atomically. Retire stale ownership handles without unmapping the new VMA. */
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
@@ -405,7 +436,8 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
         for (uint32_t index = 0; index < host->handle_capacity; ++index) {
             hl_linux_handle_entry *entry = &host->handles[index];
             uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
-            if (entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
+            if (hl_linux_encode_handle(index, entry->generation) != registered.value &&
+                entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
                 entry->kind = HL_LINUX_HANDLE_NONE;
                 entry->address = NULL;
                 entry->size = 0;
@@ -413,15 +445,75 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
         }
         pthread_mutex_unlock(&host->lock);
     }
-    registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, address, NULL, size, -1);
-    if (registered.status != HL_STATUS_OK) {
-        (void)munmap(address, (size_t)size);
-        return registered;
-    }
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *owned = hl_linux_lookup_locked(host, registered.value, HL_LINUX_HANDLE_MAPPING);
+    if (owned != NULL) owned->address = address;
+    pthread_mutex_unlock(&host->lock);
     output->handle = registered.value;
     output->address = (uint64_t)(uintptr_t)address;
     output->mapped_size = size;
     output->reserved = 0;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requested_address, uint64_t size,
+                                                     uint32_t protection, uint32_t flags,
+                                                     hl_host_memory_mapping *output) {
+    hl_host_linux *host = context;
+    hl_host_result registered;
+    void *address;
+    long page = sysconf(_SC_PAGESIZE);
+    uint32_t placement = flags & (HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE);
+    if (output == NULL || output->abi != HL_HOST_MEMORY_MAPPING_ABI || output->size < sizeof(*output) || size == 0 ||
+        size > SIZE_MAX || page <= 0 || requested_address > UINTPTR_MAX ||
+        (requested_address != 0 && requested_address % (uint64_t)page != 0) ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
+        (flags & HL_HOST_MEMORY_PRIVATE) == 0 ||
+        (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
+        (placement != 0 && requested_address == 0) ||
+        (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, NULL, NULL, size, -1);
+    if (registered.status != HL_STATUS_OK) return registered;
+    int native_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
+#ifdef MAP_FIXED_NOREPLACE
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) native_flags |= MAP_FIXED_NOREPLACE;
+#else
+    if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) {
+        (void)hl_linux_memory_discard(context, registered.value);
+        return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    }
+#endif
+    address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags,
+                   -1, 0);
+    if (address == MAP_FAILED) {
+        hl_host_result failure = hl_linux_errno_result();
+        (void)hl_linux_memory_discard(context, registered.value);
+        return failure;
+    }
+    if (placement == HL_HOST_MEMORY_FIXED) {
+        uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
+        pthread_mutex_lock(&host->lock);
+        for (uint32_t index = 0; index < host->handle_capacity; ++index) {
+            hl_linux_handle_entry *entry = &host->handles[index];
+            uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
+            if (hl_linux_encode_handle(index, entry->generation) != registered.value &&
+                entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
+                entry->kind = HL_LINUX_HANDLE_NONE;
+                entry->address = NULL;
+                entry->size = 0;
+            }
+        }
+        pthread_mutex_unlock(&host->lock);
+    }
+    pthread_mutex_lock(&host->lock);
+    hl_linux_handle_entry *owned = hl_linux_lookup_locked(host, registered.value, HL_LINUX_HANDLE_MAPPING);
+    if (owned != NULL) owned->address = address;
+    pthread_mutex_unlock(&host->lock);
+    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value,
+                                       (uint64_t)(uintptr_t)address, size, 0};
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -3400,7 +3492,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_reserve_code, hl_linux_memory_repair_code,
                                                    hl_linux_memory_code_write,   hl_linux_memory_code_write,
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
-                                                   hl_linux_memory_unmap_range};
+                                                   hl_linux_memory_unmap_range, hl_linux_memory_map_anonymous,
+                                                   hl_linux_memory_discard};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};

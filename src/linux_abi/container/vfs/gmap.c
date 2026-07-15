@@ -2,6 +2,7 @@
 #include "gmap.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 
 #define MLK_N 1024
@@ -20,12 +21,28 @@ struct hl_gmap_context {
     int lock_all;
     int lock_future;
     const hl_limit_table *limits;
+    const hl_host_services *host;
 };
+
+#define HL_EXEC_LOADER_SLOTS 32u
+#define HL_EXEC_MAPPING_CAPACITY (2u * HL_GMAP_CAPACITY + HL_EXEC_LOADER_SLOTS)
+typedef struct hl_exec_mapping {
+    uint64_t address;
+    uint64_t length;
+    hl_host_handle handle;
+} hl_exec_mapping;
+
+static hl_exec_mapping g_exec_mappings[HL_EXEC_MAPPING_CAPACITY];
+static size_t g_exec_mapping_count;
 
 static struct hl_gmap_context g_gmap;
 
 void hl_gmap_bind_limits(const hl_limit_table *limits) {
     g_gmap.limits = limits;
+}
+
+void hl_gmap_bind_host(const hl_host_services *host) {
+    g_gmap.host = host;
 }
 
 size_t hl_gmap_count(void) {
@@ -58,6 +75,7 @@ void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length) {
 void hl_gmap_remove(uint64_t address) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++)
         if (g_gmap.mappings[index].address == address) {
+            hl_exec_mapping_discard_range(address, g_gmap.mappings[index].length);
             g_gmap.mappings[index] = g_gmap.mappings[--g_gmap.mapping_count];
             return;
         }
@@ -80,6 +98,7 @@ int hl_gmap_contains(uint64_t address, uint64_t length) {
 }
 
 void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
+    if (end > start) hl_exec_mapping_discard_range(start, end - start);
     for (size_t index = 0; index < g_gmap.mapping_count;) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;
@@ -104,9 +123,80 @@ void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
 }
 
 void hl_gmap_reset(void) {
+    hl_exec_mapping_reset();
     for (size_t index = 0; index < g_gmap.mapping_count; index++)
         munmap((void *)(uintptr_t)g_gmap.mappings[index].address, (size_t)g_gmap.mappings[index].length);
     g_gmap.mapping_count = 0;
+}
+
+int hl_exec_mapping_add(uint64_t address, uint64_t length, hl_host_handle host_mapping) {
+    if (!address || !length || address > UINT64_MAX - length || host_mapping == HL_HOST_HANDLE_INVALID ||
+        g_exec_mapping_count >= HL_EXEC_MAPPING_CAPACITY)
+        return -1;
+    uint64_t end = address + length;
+    for (size_t index = 0; index < g_exec_mapping_count; ++index) {
+        uint64_t old_end = g_exec_mappings[index].address + g_exec_mappings[index].length;
+        if (address < old_end && g_exec_mappings[index].address < end) return -1;
+    }
+    g_exec_mappings[g_exec_mapping_count++] = (hl_exec_mapping){address, length, host_mapping};
+    return 0;
+}
+
+void hl_exec_mapping_discard_range(uint64_t address, uint64_t length) {
+    if (!length || address > UINT64_MAX - length) return;
+    uint64_t end = address + length;
+    for (size_t index = 0; index < g_exec_mapping_count;) {
+        hl_exec_mapping *entry = &g_exec_mappings[index];
+        if (end <= entry->address || address >= entry->address + entry->length) {
+            ++index;
+            continue;
+        }
+        uint64_t old_address = entry->address;
+        uint64_t old_end = old_address + entry->length;
+        if (entry->handle != HL_HOST_HANDLE_INVALID && g_gmap.host != NULL && g_gmap.host->memory != NULL &&
+            g_gmap.host->memory->discard != NULL) {
+            hl_host_result discarded = g_gmap.host->memory->discard(g_gmap.host->context, entry->handle);
+            /* INVALID_ARGUMENT means a successful MAP_FIXED provider operation
+             * already retired the overlapped handle. Any other failure leaves
+             * dangerous live ownership and is an internal contract breach. */
+            if (discarded.status != HL_STATUS_OK && discarded.status != HL_STATUS_INVALID_ARGUMENT) abort();
+        }
+        entry->handle = HL_HOST_HANDLE_INVALID;
+        int keep_head = old_address < address;
+        int keep_tail = end < old_end;
+        if (!keep_head && !keep_tail) {
+            *entry = g_exec_mappings[--g_exec_mapping_count];
+            continue;
+        }
+        if (keep_head) {
+            entry->length = address - old_address;
+        } else {
+            entry->address = end;
+            entry->length = old_end - end;
+        }
+        if (keep_head && keep_tail) {
+            /* Every split corresponds to a live guest VMA split and therefore
+             * cannot exceed the same fixed capacity as the VMA registry. */
+            if (g_exec_mapping_count >= HL_EXEC_MAPPING_CAPACITY) abort();
+            g_exec_mappings[g_exec_mapping_count++] =
+                (hl_exec_mapping){end, old_end - end, HL_HOST_HANDLE_INVALID};
+        }
+        ++index;
+    }
+}
+
+void hl_exec_mapping_reset(void) {
+    for (size_t index = 0; index < g_exec_mapping_count; ++index) {
+        hl_exec_mapping *entry = &g_exec_mappings[index];
+        if (entry->handle != HL_HOST_HANDLE_INVALID) {
+            if (g_gmap.host != NULL && g_gmap.host->memory != NULL && g_gmap.host->memory->release != NULL)
+                (void)g_gmap.host->memory->release(g_gmap.host->context, entry->handle);
+        } else {
+            (void)munmap((void *)(uintptr_t)entry->address, (size_t)entry->length);
+        }
+        entry->handle = HL_HOST_HANDLE_INVALID;
+    }
+    g_exec_mapping_count = 0;
 }
 
 void hl_gmap_lock_remove(uint64_t address, uint64_t length) {

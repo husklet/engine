@@ -545,6 +545,24 @@ int main(void) {
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_OK);
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_INVALID_ARGUMENT);
 
+    {
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(4096);
+        hl_host_memory_mapping anonymous = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK);
+        unsigned char *bytes = (unsigned char *)(uintptr_t)anonymous.address;
+        bytes[0] = 0xa9;
+        HL_CHECK(services.memory->discard(services.context, anonymous.handle).status == HL_STATUS_OK);
+        HL_CHECK(bytes[0] == 0xa9 && munmap(bytes, (size_t)page) == 0);
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, UINT64_MAX - page + 2, page, HL_HOST_MEMORY_READ,
+                                     HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &anonymous)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+    }
+
     memset(&code, 0, sizeof code);
     HL_CHECK(services.memory->reserve_code(services.context, 4096, 4096, HL_HOST_CODE_DUAL_ALIAS, &code).status ==
              HL_STATUS_OK);

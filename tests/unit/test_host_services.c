@@ -310,6 +310,42 @@ int main(void) {
     HL_CHECK(services.memory->release(services.context, mapping.value).status == HL_STATUS_OK);
     HL_CHECK(fake.live_mappings == 0);
 
+    {
+        hl_host_memory_mapping anonymous = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(anonymous.handle != HL_HOST_HANDLE_INVALID && anonymous.address != 0 &&
+                 anonymous.mapped_size == 8192 && fake.live_mappings == 1);
+        HL_CHECK(services.memory->protect(services.context, anonymous.handle, 0, 4096, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, anonymous.handle).status == HL_STATUS_OK &&
+                 fake.live_mappings == 0);
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK);
+        hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);
+        HL_CHECK(services.memory->discard(services.context, anonymous.handle).status == HL_STATUS_OK &&
+                 fake.live_mappings == 0);
+        /* discard is an infallible ownership transition and must not consume
+         * fault injection intended for the next allocating operation. */
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OUT_OF_MEMORY);
+        hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OUT_OF_MEMORY);
+        HL_CHECK(anonymous.handle == HL_HOST_HANDLE_INVALID && fake.live_mappings == 0);
+    }
+
     process = services.process->spawn_cloned(services.context, fake_process_entry, NULL);
     HL_CHECK(process.status == HL_STATUS_OK && process.value != 0 && fake.live_processes == 1);
     HL_CHECK(services.process->close(services.context, process.value).status == HL_STATUS_BUSY);

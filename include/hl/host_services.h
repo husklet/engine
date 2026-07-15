@@ -6,8 +6,9 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 4u
-#define HL_HOST_MEMORY_ABI 3u
+#define HL_HOST_MEMORY_ABI 5u
 #define HL_HOST_FILE_MAPPING_ABI 1u
+#define HL_HOST_MEMORY_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI_13 13u
@@ -183,6 +184,16 @@ typedef struct hl_host_file_mapping {
     uint64_t reserved;
 } hl_host_file_mapping;
 
+/* An owned anonymous host mapping. The address is process-local; the handle is
+ * the only token accepted by protect/release and must not expose a native fd. */
+typedef struct hl_host_memory_mapping {
+    HL_ABI_HEADER;
+    hl_host_handle handle;
+    uint64_t address;
+    uint64_t mapped_size;
+    uint64_t reserved;
+} hl_host_memory_mapping;
+
 typedef struct hl_host_memory_services {
     HL_ABI_HEADER;
     hl_host_result (*reserve)(void *context, uint64_t size, uint64_t alignment, uint32_t flags);
@@ -202,6 +213,11 @@ typedef struct hl_host_memory_services {
     hl_host_result (*sync)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
     /* Unmap a page-aligned subrange. A full-range unmap consumes the mapping handle. */
     hl_host_result (*unmap_range)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
+    /* Create an anonymous private mapping, optionally at an exact address. */
+    hl_host_result (*map_anonymous)(void *context, uint64_t requested_address, uint64_t size,
+                                    uint32_t protection, uint32_t flags, hl_host_memory_mapping *output);
+    /* Retire an ownership handle without changing the process address space. */
+    hl_host_result (*discard)(void *context, hl_host_handle mapping);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

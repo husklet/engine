@@ -7,6 +7,28 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+typedef struct mapping_probe {
+    void *address;
+    size_t size;
+    unsigned releases;
+    unsigned discards;
+} mapping_probe;
+
+static hl_host_result probe_release(void *context, hl_host_handle handle) {
+    mapping_probe *probe = context;
+    if (handle != 1 || munmap(probe->address, probe->size) != 0)
+        return (hl_host_result){HL_STATUS_PLATFORM_FAILURE, 0, 0, 0};
+    probe->releases++;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result probe_discard(void *context, hl_host_handle handle) {
+    mapping_probe *probe = context;
+    if (handle != 1) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    probe->discards++;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
 int main(void) {
     hl_limit_table limits;
     hl_gmap_entry first;
@@ -73,6 +95,44 @@ int main(void) {
         hl_gmap_lock_unwire_all();
         hl_gmap_reset();
         HL_CHECK(hl_gmap_count() == 0);
+    }
+    {
+        long page_value = sysconf(_SC_PAGESIZE);
+        size_t page = page_value > 0 ? (size_t)page_value : 4096u;
+        mapping_probe probe = {0};
+        hl_host_memory_services memory = {0};
+        hl_host_services host = {0};
+        probe.size = page * 3;
+        probe.address = mmap(NULL, probe.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        HL_CHECK(probe.address != MAP_FAILED);
+        memory.release = probe_release;
+        memory.discard = probe_discard;
+        host.context = &probe;
+        host.memory = &memory;
+        hl_gmap_bind_host(&host);
+        HL_CHECK(hl_exec_mapping_add((uint64_t)(uintptr_t)probe.address, probe.size, 1) == 0);
+        HL_CHECK(munmap((char *)probe.address + page, page) == 0);
+        hl_exec_mapping_discard_range((uint64_t)(uintptr_t)((char *)probe.address + page), page);
+        HL_CHECK(probe.discards == 1 && probe.releases == 0);
+        unsigned char *replacement = mmap((char *)probe.address + page, page, PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        HL_CHECK(replacement == (unsigned char *)probe.address + page);
+        replacement[0] = 0x5a;
+        hl_exec_mapping_reset();
+        HL_CHECK(probe.releases == 0 && replacement[0] == 0x5a);
+        errno = 0;
+        HL_CHECK(mprotect(probe.address, page, PROT_READ) == -1 && errno == ENOMEM);
+        HL_CHECK(mprotect((char *)probe.address + page * 2, page, PROT_READ) == -1 && errno == ENOMEM);
+        HL_CHECK(munmap(replacement, page) == 0);
+
+        probe.address = mmap(NULL, probe.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        HL_CHECK(probe.address != MAP_FAILED);
+        HL_CHECK(hl_exec_mapping_add((uint64_t)(uintptr_t)probe.address, probe.size, 1) == 0);
+        hl_exec_mapping_reset();
+        HL_CHECK(probe.releases == 1);
+        errno = 0;
+        HL_CHECK(mprotect(probe.address, probe.size, PROT_READ) == -1 && errno == ENOMEM);
+        hl_gmap_bind_host(NULL);
     }
     return EXIT_SUCCESS;
 }

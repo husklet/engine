@@ -369,6 +369,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
     g_host_services = host;
+    hl_gmap_bind_host(host);
     g_linux_box = box;
     jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());
     hl_linux_bus_set_change_callback(jit_guest_bus_changed, NULL);

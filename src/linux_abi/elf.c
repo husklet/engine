@@ -662,13 +662,17 @@ __attribute__((constructor)) static void install_sync_fault_guards(void) {
 // mmap (anon; fd=-1) with bounded retry under transient pressure. Never returns MAP_FAILED: on
 // persistent failure it reports the exact request and aborts, so a valid exec dies with a clean error
 // rather than continuing with an unmapped hole in the guest image.
-static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const char *what) {
+static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t protection, uint32_t flags,
+                                              const char *what) {
+    const hl_host_services *host = effective_host_services();
     for (int t = 0;; t++) {
-        void *p = mmap(hint, len, prot, flags, -1, 0);
-        if (p != MAP_FAILED) return p;
+        hl_host_memory_mapping mapped = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(mapped), 0, 0, 0, 0};
+        hl_host_result result = host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)hint, len, protection,
+                                                            flags, &mapped);
+        if (result.status == HL_STATUS_OK) return mapped;
         if (t >= ELF_MAP_RETRIES) {
-            fprintf(stderr, "hl-engine: load_elf: cannot map %s (%zu bytes) for the guest image: %s\n", what, len,
-                    strerror(errno));
+            fprintf(stderr, "hl-engine: load_elf: cannot map %s (%zu bytes) for the guest image (host status %d)\n",
+                    what, len, result.status);
             exit(1);
         }
         usleep(2000u << t); // back off and let transient pressure clear
@@ -683,11 +687,14 @@ static void *elf_map_checked(void *hint, size_t len, int prot, int flags, const 
 // memory pressure, ENOMEM (XNU cannot allocate a vm_map_entry to split the span). Retry only the
 // transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
 // anything else -- matching the original best-effort mprotect, so no working image regresses.
-static void elf_mprotect_besteffort(void *addr, size_t len, int prot, const char *what) {
+static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void *addr, size_t len, uint32_t protection,
+                                   const char *what) {
     (void)what;
+    const hl_host_services *host = effective_host_services();
     for (int t = 0;; t++) {
-        int r = mprotect(addr, len, prot);
-        if (r == 0 || errno != ENOMEM || t >= ELF_MAP_RETRIES) { return; }
+        uint64_t offset = (uint64_t)(uintptr_t)addr - mapping->address;
+        hl_host_result result = host->memory->protect(host->context, mapping->handle, offset, len, protection);
+        if (result.status == HL_STATUS_OK || result.status != HL_STATUS_OUT_OF_MEMORY || t >= ELF_MAP_RETRIES) return;
         usleep(2000u << t); // transient pressure: back off and re-tighten
     }
 }
@@ -787,6 +794,7 @@ static void load_elf(const char *path, struct loaded *out) {
     // and narrow protections per segment below. elf_map_checked retries under transient host memory
     // pressure and aborts loudly on persistent failure, so the full range is guaranteed backed here (a
     // partial/failed map never slips through to become a SIGSEGV on the guest's own text/data).
+    hl_host_memory_mapping image_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(image_mapping), 0, 0, 0, 0};
     uint8_t *base;
     if (g_force_base) {
         // map this image at a FIXED VA (one-shot) so the translated arena -- block-map keys AND any
@@ -797,15 +805,26 @@ static void load_elf(const char *path, struct loaded *out) {
         // loader could later HIT a file whose block keys/baked guest addresses belong to a random base).
         void *want = (void *)(g_force_base + basepage);
         g_force_base = 0; // one-shot (consumed here for THIS load)
-        base = mmap(want, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-        if (base == MAP_FAILED) {
+        hl_host_result fixed = effective_host_services()->memory->map_anonymous(
+            effective_host_services()->context, (uint64_t)(uintptr_t)want, span,
+            HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &image_mapping);
+        if (fixed.status != HL_STATUS_OK) {
             g_force_base_failed = 1;
-            base = elf_map_checked(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, "image base");
+            image_mapping = elf_map_checked(NULL, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                            HL_HOST_MEMORY_PRIVATE, "image base");
         }
+        base = (uint8_t *)(uintptr_t)image_mapping.address;
     } else {
-        base = elf_map_checked(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, "image base");
+        image_mapping = elf_map_checked(NULL, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                        HL_HOST_MEMORY_PRIVATE, "image base");
+        base = (uint8_t *)(uintptr_t)image_mapping.address;
     }
-    gmap_add((uint64_t)base, span); // track so execve() can reclaim the inherited image
+    if (hl_exec_mapping_add((uint64_t)base, span, image_mapping.handle) != 0) {
+        (void)effective_host_services()->memory->release(effective_host_services()->context, image_mapping.handle);
+        fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
+        exit(1);
+    }
+    gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
     if (etype == 2) {
         g_nonpie_lo = basepage;
@@ -826,8 +845,9 @@ static void load_elf(const char *path, struct loaded *out) {
         uint32_t fl = rd32(ph + 4);
         uint64_t v = rd64(ph + 16), msz = rd64(ph + 40);
         uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
-        int prot = PROT_READ | ((fl & 2) ? PROT_WRITE : 0) | ((fl & 1) ? PROT_EXEC : 0);
-        if (e > s) elf_mprotect_besteffort((void *)s, e - s, prot, "image segment");
+        uint32_t protection = HL_HOST_MEMORY_READ | ((fl & 2) ? HL_HOST_MEMORY_WRITE : 0) |
+                              ((fl & 1) ? HL_HOST_MEMORY_EXECUTE : 0);
+        if (e > s) elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
     }
     // for a non-PIE ET_EXEC the engine maps the image HIGH (+bias) but keeps every GUEST-VISIBLE
     // address at its LOW link value (baked absolute pointers, un-biased `bl` return vaddrs, the dispatcher
@@ -879,12 +899,19 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // committed pages) below g_stack_lo; not gmap-tracked so /proc/self/maps stays a clean [stack] + guard.
     size_t GUARD = 1u << 20;
     // checkpoint/restore: place the main stack in the deterministic high arena (0 hint => normal placement)
-    uint8_t *base =
-        mmap((void *)ckpt_place_hint(GUARD + SZ), GUARD + SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    mprotect(base, GUARD, PROT_NONE);
+    hl_host_memory_mapping stack_mapping =
+        elf_map_checked((void *)ckpt_place_hint(GUARD + SZ), GUARD + SZ, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                        HL_HOST_MEMORY_PRIVATE, "main stack");
+    uint8_t *base = (uint8_t *)(uintptr_t)stack_mapping.address;
+    elf_mprotect_besteffort(&stack_mapping, base, GUARD, 0, "stack guard");
     gna_add((uint64_t)base, (uint64_t)base + GUARD);
     uint8_t *stk = base + GUARD;
-    gmap_add((uint64_t)stk, SZ); // track so execve() can reclaim the inherited stack
+    if (hl_exec_mapping_add((uint64_t)base, GUARD + SZ, stack_mapping.handle) != 0) {
+        (void)effective_host_services()->memory->release(effective_host_services()->context, stack_mapping.handle);
+        fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
+        exit(1);
+    }
+    gmap_add((uint64_t)stk, SZ);
     // Publish the main-stack bounds so /proc/self/maps synthesizes a [stack] line (glibc's
     // pthread_getattr_np scans for it) and the maps/smaps builder can label the region.
     g_stack_lo = (uint64_t)stk;
