@@ -8,6 +8,7 @@ MAC ?= mac
 PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
 PERF_HEAVY_SAMPLES ?= 7
+PERF_OP_SAMPLES ?= 7
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
 PERF_MAC_ARCH = $(shell $(MAC) uname -m)
@@ -1365,6 +1366,34 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static-pie $< -o $@
 
+PERF_OPS := mmap file pipe event ipc-latency ipc-throughput
+PERF_OP_mmap := 1
+PERF_OP_file := 2
+PERF_OP_pipe := 3
+PERF_OP_event := 4
+PERF_OP_ipc-latency := 5
+PERF_OP_ipc-throughput := 6
+
+define HL_PERF_OP_RULES
+$(BUILD)/perf/$(1)-aarch64: tests/perf/ops.c
+	@mkdir -p $$(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
+
+$(BUILD)/perf/$(1)-x86_64: tests/perf/ops.c
+	@mkdir -p $$(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
+endef
+
+$(foreach operation,$(PERF_OPS),$(eval $(call HL_PERF_OP_RULES,$(operation))))
+
+$(BUILD)/perf/resource-aarch64: tests/perf/resource.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
+
+$(BUILD)/perf/resource-x86_64: tests/perf/resource.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
+
 define HL_PERF_ENGINE
 	$(BUILD)/tools/perf-runner --label $(1)-$(2) --host-os $(PERF_MAC_OS) \
 		--host-release $(PERF_MAC_RELEASE) --host-arch $(PERF_MAC_ARCH) \
@@ -1386,7 +1415,9 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(BUILD)/compat/core/workload/x86_64/busyloop $(BUILD)/compat/syscall/aarch64/gettid \
 	$(BUILD)/compat/syscall/x86_64/gettid $(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
 	$(BUILD)/compat/process/aarch64/forkstorm \
-	$(BUILD)/compat/process/x86_64/forkstorm
+	$(BUILD)/compat/process/x86_64/forkstorm \
+	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64) \
+	$(BUILD)/perf/resource-aarch64 $(BUILD)/perf/resource-x86_64
 	$(call HL_PERF_ENGINE,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
 	$(call HL_PERF_ENGINE,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
 	$(call HL_PERF_ENGINE,compute,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
@@ -1397,11 +1428,26 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(call HL_PERF_ENGINE,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
 	$(call HL_PERF_ENGINE,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
 	$(call HL_PERF_ENGINE,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
+	$(call HL_PERF_ENGINE,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
+	$(call HL_PERF_ENGINE,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
+	$(call HL_PERF_ENGINE,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
+	$(call HL_PERF_ENGINE,event,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-aarch64,0)
+	$(call HL_PERF_ENGINE,ipc-latency,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-aarch64,0)
+	$(call HL_PERF_ENGINE,ipc-throughput,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
+	$(call HL_PERF_ENGINE,mmap,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-x86_64,0)
+	$(call HL_PERF_ENGINE,file,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-x86_64,0)
+	$(call HL_PERF_ENGINE,pipe,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-x86_64,0)
+	$(call HL_PERF_ENGINE,event,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-x86_64,0)
+	$(call HL_PERF_ENGINE,ipc-latency,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-x86_64,0)
+	$(call HL_PERF_ENGINE,ipc-throughput,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-x86_64,0)
+	$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) $(abspath $(BUILD)/perf/resource-aarch64)
+	$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/perf/resource-x86_64)
 
 # Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
 perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
 	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/syscall/aarch64/gettid \
-	$(BUILD)/perf/syscall-aarch64 $(BUILD)/compat/process/aarch64/forkstorm
+	$(BUILD)/perf/syscall-aarch64 $(BUILD)/compat/process/aarch64/forkstorm \
+	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64) $(BUILD)/perf/resource-aarch64
 	@test "$$(uname -s)" = Linux && test "$$(uname -m)" = aarch64 || \
 		{ echo 'perf-native-aarch64 requires a Linux AArch64 host' >&2; exit 2; }
 	$(call HL_PERF_NATIVE,startup,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
@@ -1409,6 +1455,13 @@ perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 
 	$(call HL_PERF_NATIVE,syscall-startup,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/compat/syscall/aarch64/gettid,0)
 	$(call HL_PERF_NATIVE,syscall-1m,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-aarch64,0)
 	$(call HL_PERF_NATIVE,fork-stress,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
+	$(call HL_PERF_NATIVE,mmap,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
+	$(call HL_PERF_NATIVE,file,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
+	$(call HL_PERF_NATIVE,pipe,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
+	$(call HL_PERF_NATIVE,event,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-aarch64,0)
+	$(call HL_PERF_NATIVE,ipc-latency,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-aarch64,0)
+	$(call HL_PERF_NATIVE,ipc-throughput,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
+	$(BUILD)/perf/resource-aarch64
 
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity
 
@@ -1534,8 +1587,8 @@ help:
 	@echo 'make compat-build  compile every Linux behavior fixture'
 	@echo 'make e2e-compat    build/codesign production engines and execute both guest ISAs'
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
-	@echo 'make perf-macos    measure macOS-host engine startup, compute, syscall, and fork distributions'
-	@echo 'make perf-native-aarch64  measure matching native fixtures on Linux AArch64'
+	@echo 'make perf-macos    measure macOS-host startup, compute, syscall, fork, OS-operation, and resource baselines'
+	@echo 'make perf-native-aarch64  measure matching native and resource fixtures on Linux AArch64'
 	@echo 'make format-check  enforce the repository clang-format policy'
 
 # Compiler-generated prerequisites keep standalone objects synchronized with public and private headers.
