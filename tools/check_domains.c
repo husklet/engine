@@ -25,7 +25,7 @@ static const char *const category_names[] = {"platform-header", "filesystem", "m
 /* The checked inventory describes the production tree, not an intended allowance. */
 static const unsigned long baseline[DOMAIN_COUNT][CAT_COUNT] = {
     {1, 8, 12, 5, 29, 0, 8, 8, 0},
-    {0, 829, 64, 180, 358, 100, 32, 19, 14},
+    {0, 830, 66, 180, 358, 100, 32, 19, 14},
     {3, 12, 4, 6, 1, 0, 4, 0, 0},
 };
 

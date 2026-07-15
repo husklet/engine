@@ -28,11 +28,14 @@ static hl_status hl_x86_64_emit_rex(hl_code_buffer *output, uint8_t reg, uint8_t
 
 static hl_status hl_x86_64_emit_binary(hl_code_buffer *output, uint8_t opcode, uint8_t destination, uint8_t source,
                                        int wide) {
+    uint8_t modrm;
     hl_status status = hl_x86_64_emit_rex(output, source, destination, wide);
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_byte(output, opcode);
     if (status != HL_STATUS_OK) return status;
-    return hl_x86_64_emit_byte(output, (uint8_t)(UINT8_C(0xc0) | (uint8_t)(source & 7u) << 3 | (destination & 7u)));
+    modrm = (uint8_t)(UINT8_C(0xc0) | (uint8_t)((uint8_t)(source & UINT8_C(7)) << 3) |
+                      (uint8_t)(destination & UINT8_C(7)));
+    return hl_x86_64_emit_byte(output, modrm);
 }
 
 static hl_status hl_x86_64_emit_constant(hl_code_buffer *output, uint8_t destination, uint64_t value, int wide) {
