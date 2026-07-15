@@ -5,12 +5,12 @@
 // per-arch cache.c carried (the shared cache.c only defines the engine-core globals:
 // g_cache/g_cp/g_emit_start, g_cpu_key, g_jit_lock/g_cache_lock, g_threaded, g_map+helpers,
 // g_ibtc, g_pend/g_npend, g_prof + the aarch64-shaped g_prof_* counters). These globals are
-// USED across the x86 guest (emit.c/dispatch.c/translate.c/elf.c/signal.c) and set in
+// USED across the x86 guest and Linux loader (emit.c/dispatch.c/translate.c/signal.c + linux_abi/x86.c) and set in
 // targets/linux_x86_64.c, so the x86 unity TU must define each exactly once here.
 //
 // Storage class / type / initializer are copied verbatim from the former frontend/x86_64/cache.c
 // so behavior is unchanged. NOTE: g_diag is intentionally non-static (external linkage) because
-// frontend/x86_64/elf.c references it via `extern int g_diag;`.
+// linux_abi/x86.c references it via `extern int g_diag;`.
 //
 // Must be included after container/state.c and before translator/cache.c + emit.c in the TU.
 
@@ -98,7 +98,7 @@ static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 static int g_pcache_poison; // set if a baked host pointer could not be recorded -> do NOT persist this arena
 
 static uint64_t g_tracecap; // if >0 under trace: stop after this many blocks (runaway guard)
-int g_diag;                 // diagnostics (FAULT_ON): print LOADED bases etc. (extern'd by elf.c)
+int g_diag;                 // diagnostics (FAULT_ON): print LOADED bases etc. (used by linux_abi/x86.c)
 static int g_nochain;       // WATCH file: disable chaining (exact per-block rip attribution)
 static int g_dbg_nochain;   // aarch64 DDDBG_NOCHAIN gate in the SHARED dispatch.c; inert on x86 (chain hook is a no-op)
 static int g_dbg_gprdump;   // aarch64 DDDBG_GPRDUMP gate in the SHARED dispatch.c; inert on x86 (aarch64 dump only)
@@ -126,7 +126,7 @@ static int noeaopt(void) { return 0; }
 // a guest load/store through one would hit the unmapped low address and trap (one SIGSEGV per access).
 // Instead fold +bias into the effective host address at emit time when the EA is a LOW image address
 // (< 4GiB; stack/heap/mmap/libs are all >= the engine's 4GiB __PAGEZERO). g_nonpie_lo/g_nonpie_bias are
-// forward-declared here (tentative; merge with the real defs set by load_elf in elf.c / translate.c). 0
+// forward-declared here (tentative; merge with the real defs set by load_elf in linux_abi/x86.c / translate.c). 0
 // for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 

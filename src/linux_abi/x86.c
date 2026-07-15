@@ -1,5 +1,5 @@
-// translator/guest/x86_64 -- ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
-#include "../../../linux_abi/placement.h"
+// hl/linux_abi -- x86-64 ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
+#include "placement.h"
 
 static void *elf_host_map(void *context, void *address, size_t length, uint32_t placement) {
     int flags = MAP_PRIVATE | MAP_ANON;
@@ -11,10 +11,10 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 }
 
 #include <sys/ucontext.h>
-#include "../../../host/native_context.h"
+#include "../host/native_context.h"
 
-#include "../../../host/range.h"
-#include "../../../linux_abi/page.h"
+#include "../host/range.h"
+#include "page.h"
 
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
 static uint16_t rd16(const uint8_t *p) {
@@ -294,7 +294,7 @@ static void load_elf(const char *path, struct loaded *out) {
         // MAP_FAILED (macOS won't overwrite a live VM entry). Do NOT exit(1): retry at a kernel-chosen base
         // (byte-exact execution, just not cache-revivable this run) and latch g_force_base_failed so the
         // pcache neither restores a fixed-base file over this now-mixed-base arena nor persists one. This
-        // matches the aarch64 loader fallback (os/linux/elf.c) + its g_force_base_failed pcache gate.
+        // matches the aarch64 loader fallback (linux_abi/elf.c) + its g_force_base_failed pcache gate.
         base = hl_elf_place_image(elf_host_map, NULL, want, span, &fixed_failed);
         if (fixed_failed) {
             g_force_base_failed = 1;
@@ -449,15 +449,15 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // The container's env arrives as HL_GUEST_ENV="K=V\nK=V\n…" (set by launch config / forwarded across
     // execve by exec_forward_env). Forward EXACTLY those FIRST so they override the built-in defaults; the
     // defaults then fill ONLY the keys the container didn't set (match on the "KEY=" prefix). Mirrors the
-    // shared aarch64 build_stack (os/linux/elf.c) -- without this, x86 guests ignored the container env.
+    // shared aarch64 build_stack (linux_abi/elf.c) -- without this, x86 guests ignored the container env.
     const char *estr[256];
     const char *ge = hl_option_get("HL_GUEST_ENV");
     char *gecopy = NULL;
     // execve() escape-encodes records (HL_GUEST_ENV_ESC=1) so a value's own newline isn't mistaken for a
-    // record separator -- unescape "\\n"->'\n' and "\\\\"->'\\' after splitting. Mirrors os/linux/elf.c.
+    // record separator -- unescape "\\n"->'\n' and "\\\\"->'\\' after splitting. Mirrors linux_abi/elf.c.
     int env_escaped = (hl_option_get("HL_GUEST_ENV_ESC") != NULL);
     // Guest-initiated execve makes its envp authoritative (exec_forward_env sets HL_GUEST_ENV_EXACT): forward
-    // it verbatim and inject NO fallback defaults, so NULL/curated envp matches Linux. Mirrors os/linux/elf.c.
+    // it verbatim and inject NO fallback defaults, so NULL/curated envp matches Linux. Mirrors linux_abi/elf.c.
     int env_exact = (hl_option_get("HL_GUEST_ENV_EXACT") != NULL);
     if (ge) {
         gecopy = strdup(ge);
@@ -900,7 +900,7 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
 // it does not install a host handler for synchronous signals (they are served by the guards installed here)
 // -- so without this the trap is fatal (exit 255) instead of reaching the guest's handler.
 //
-// This is the analogue of os/linux/elf.c's install_sync_fault_guards() (aarch64). We do NOT reuse
+// This is the analogue of linux_abi/elf.c's install_sync_fault_guards() (aarch64). We do NOT reuse
 // jit86_lazyguard: its lazy zero-page path keys off si_addr, which for these signals is the faulting PC (in
 // a mapped, executable JIT page) -- lazy_neighbor_mapped() would judge it "legitimate growth", skip
 // deliver_guest_fault, and mprotect/retry the PC page in a loop. Instead route straight to nonpie_fixup

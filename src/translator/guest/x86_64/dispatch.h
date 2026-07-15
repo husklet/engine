@@ -26,18 +26,18 @@
 
 // ---- x86 dispatch support relocated out of the lifted dispatch.c -------------------------------------
 // These DEFINITIONS used to sit at the top of frontend/x86_64/dispatch.c (above run_guest). The swap
-// stops #include-ing that file, but elf.c (jit86_lazyguard / jit86_faulth) and the G_AFTER_TRANSLATE /
+// stops #include-ing that file, but linux_abi/x86.c (jit86_lazyguard / jit86_faulth) and the G_AFTER_TRANSLATE /
 // G_DISPATCH_DEBUG hooks still need them, so they move here (the x86 dispatch seam). This header is
 // #included exactly once in the x86 unity TU -> each is defined once. They reference only libc + the
 // extern g_rwx_guest (defined later in os/linux/service.c) -> position-independent here.
 
-// debug: track block transitions for fault diagnosis (extern'd by frontend/x86_64/elf.c).
+// debug: track block transitions for fault diagnosis (used by linux_abi/x86.c).
 static uint64_t g_prevpc, g_curpc;
 
 // ---- W6A item 3: SMC (self-modifying code) for in-process JIT guests ----  gate NOSMC=1
 // Once a guest takes a PROT_EXEC (RWX) mmap (g_rwx_guest, set in os/linux/service.c), it may overwrite
 // code it already executed (and we translated+cached). After translating a block we mprotect its source
-// 16KB page READ-ONLY; a guest write then traps in jit86_lazyguard (elf.c) -> smc_on_write() unprotects
+// 16KB page READ-ONLY; a guest write then traps in jit86_lazyguard (linux_abi/x86.c) -> smc_on_write() unprotects
 // the page + drops the stale translations so the modified bytes re-translate. Entirely inert unless
 // g_rwx_guest is set -> zero effect on the normal (non-JIT) matrix.
 extern int g_rwx_guest;
@@ -70,7 +70,7 @@ static void smc_protect(uint64_t pc) {
 }
 
 // If `a` falls in a protected SMC page, unprotect+forget it and return 1 (caller drops translations).
-// Re-protected the next time the page is translated. Called from jit86_lazyguard (elf.c).
+// Re-protected the next time the page is translated. Called from jit86_lazyguard (linux_abi/x86.c).
 static int smc_on_write(uint64_t a) {
     if (!g_rwx_guest) return 0;
     uint64_t size = smc_page_size();

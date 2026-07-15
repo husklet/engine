@@ -112,7 +112,7 @@ static uint64_t g_pc_restored_arena; // arena_used of the loaded file (sidecar g
 // outside these spans (and outside the manifest) is unrevivable by key construction and is neither
 // persisted nor restored into the block map.
 static uint64_t g_pc_img_lo, g_pc_img_hi, g_pc_interp_lo, g_pc_interp_hi;
-// #210: latched by load_elf (elf.c) when a fixed-VA (MAP_FIXED) image map collides and falls back to a
+// #210: latched by load_elf (linux_abi/x86.c) when a fixed-VA (MAP_FIXED) image map collides and falls back to a
 // kernel-chosen base. This run's arena then mixes bases, so the pcache must neither RESTORE a fixed-base
 // file over it (block-map keys + baked guest addresses belong to PC_IMG_BASE, not the fallback base ->
 // wild fault) nor PERSIST one (a later fixed-base run could HIT a file whose baked bytes name a random
@@ -179,7 +179,7 @@ static void pcache_file(char *out, size_t n) {
 }
 
 // ---- deterministic library-map hints + the identity manifest ----
-// load_elf (translate/x86_64/elf.c) records the two fixed images' spans when it consumes g_force_base;
+// load_elf (linux_abi/x86.c) records the two fixed images' spans when it consumes g_force_base;
 // everything else revivable must come from a manifest-validated library map.
 static void pcache_note_fixed_img(uint64_t base, uint64_t span) {
     if (base >= PC_INTERP_BASE) {

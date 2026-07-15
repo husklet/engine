@@ -209,8 +209,8 @@ static void byte_wb(struct insn *I, int regnum, int val) {
 }
 
 // W6A item 1 (non-PIE): the link range + bias of a biased ET_EXEC image (defined in os/linux/container/vfs.c,
-// set in elf.c's load_elf -- both later in the unity TU), plus the Go type section [md.types, md.etypes) in
-// low link coords (set by elf.c's go_rebase_nonpie; the range whose lea-materialized *_type pointers are made
+// set in linux_abi/x86.c's load_elf -- both later in the unity TU), plus the Go type section [md.types, md.etypes) in
+// low link coords (set by linux_abi/x86.c's go_rebase_nonpie; the range whose lea-materialized *_type pointers are made
 // low so they match the image's baked-absolute type pointers and Go's type identity holds). Forward tentative
 // declarations so the rip-relative `lea` rewrite below can see them. All zero for PIE/static-PIE / non-Go
 // images -> the rewrite is inert.
@@ -229,7 +229,7 @@ static uint64_t g_nonpie_blob_code;
 // guest-visible architectural state.  Keep it in the ELF link-address domain so DWARF FDE ranges, dladdr,
 // backtrace, and forced unwinding see the same PCs they would on Linux; RET is redirected to the high mapping
 // by the dispatcher.  Go and V8 are deliberate exceptions: their runtime code metadata is explicitly rebased
-// to the high execution domain by elf.c, and their stack walkers therefore require high return PCs.
+// to the high execution domain by linux_abi/x86.c, and their stack walkers therefore require high return PCs.
 static uint64_t call_return_pc(uint64_t pc) {
     if (g_nonpie_lo && !g_nonpie_types_lo && !g_nonpie_blob_code && pc >= g_nonpie_lo + g_nonpie_bias &&
         pc < g_nonpie_hi + g_nonpie_bias)

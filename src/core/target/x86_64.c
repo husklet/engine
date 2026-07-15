@@ -1,10 +1,8 @@
-// hl/runtime/frontend/x86_64 -- the x86-64-Linux-guest JIT (jit86), brought in WHOLE.
+// hl/core/target -- x86-64 Linux guest target composition.
 //
-// jit86 is under active improvement upstream (poc/runtime/jit86/jit86.c) and has a DIFFERENT cpu
-// struct + its own (basic) container runtime, so it is not yet decomposed onto the shared jit/ +
-// os/linux/ layer. Stage-1 goal: build the x86 binary alongside aarch64. DEDUP (next stage): lift it
-// onto the shared engine + container layer via cpu-access accessors + canonical syscall ids, then
-// split it the way aarch64 already is. Re-sync with: make sync-jit86.
+// This unity translation unit wires the x86-64 translator frontend to the shared Linux ABI,
+// container, host-service, and engine layers. Architecture-specific translation remains under
+// translator/guest/x86_64; Linux executable loading and process construction belong to linux_abi.
 
 // jit86.c — an x86-64-guest JIT (x86-64 -> ARM64) for Linux guests on macOS/arm64.
 //
@@ -13,7 +11,7 @@
 //
 //   * The ISA-AGNOSTIC scaffolding (code cache, guest-PC->host-code map, direct-
 //     branch chaining, the run_block/block_return trampolines, the Linux->macOS
-//     syscall bodies, the ELF loader, rootfs path rewriting) is COPIED+ADAPTED from
+//     syscall bodies, the Linux ELF loader, rootfs path rewriting) is COPIED+ADAPTED from
 //     jit.c. We can't refactor jit.c (it's under active dev), so we duplicate.
 //   * The FRONT-END is new: an x86-64 decoder + per-opcode ARM64 codegen, replacing
 //     jit.c's "copy the instruction verbatim" core (which only works same-arch).
@@ -119,7 +117,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 #include "../../translator/guest/x86_64/avx.c" // AVX/AVX2/AVX-512 emulation
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
-#include "../../translator/guest/x86_64/elf.c" // x86 ELF loader + stack + fault handlers
+#include "../../linux_abi/x86.c" // Linux x86-64 ELF loader + stack + fault handlers
 
 // ---- entry + main ----
 // ---------------- entry ----------------
