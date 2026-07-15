@@ -110,9 +110,127 @@ static const hl_host_services *effective_host_services(void) {
 }
 
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
-#define HL_X86_DECODER_EXTERNAL 1
-#include "../../translator/guest/x86_64/decode.c" // x86-64 effective-address emission; decoder is in its archive
-#undef HL_X86_DECODER_EXTERNAL
+#include "../../translator/guest/x86_64/address.h"
+
+static void address_addi(void *context, int rd, int rn, unsigned immediate, int sf, int shift) {
+    (void)context;
+    if (shift)
+        e_addi_sh(rd, rn, immediate, sf, shift);
+    else
+        e_addi(rd, rn, immediate, sf);
+}
+
+static void address_subi(void *context, int rd, int rn, unsigned immediate, int sf, int shift) {
+    (void)context;
+    if (shift)
+        e_subi_sh(rd, rn, immediate, sf, shift);
+    else
+        e_subi(rd, rn, immediate, sf);
+}
+
+static void address_movconst(void *context, int rd, uint64_t value) {
+    (void)context;
+    e_movconst(rd, value);
+}
+
+static void address_addreg(void *context, int rd, int rn, int rm, int sf, int shift) {
+    (void)context;
+    e_rrr(A_ADD, rd, rn, rm, sf, shift);
+}
+
+static void address_lsr(void *context, int rd, int rn, int shift, int sf) {
+    (void)context;
+    e_lsr_i(rd, rn, shift, sf);
+}
+
+static void address_movreg(void *context, int rd, int rn, int sf) {
+    (void)context;
+    e_mov_rr(rd, rn, sf);
+}
+
+static void address_movzero(void *context, int rd, uint32_t immediate, int shift) {
+    (void)context;
+    e_movz(rd, immediate, shift);
+}
+
+static void address_uxt(void *context, int rd, int rn, int bytes) {
+    (void)context;
+    e_uxt(rd, rn, bytes);
+}
+
+static void address_load_cpu(void *context, int rt, int offset) {
+    (void)context;
+    e_ldr(rt, 28, offset);
+}
+
+static void address_load_scaled(void *context, int width, int rt, int rn, unsigned offset) {
+    (void)context;
+    e_load_uoff(width, rt, rn, offset);
+}
+
+static void address_load_unscaled(void *context, int width, int rt, int rn, int offset) {
+    (void)context;
+    e_ldur(width, rt, rn, offset);
+}
+
+static void address_load(void *context, int width, int rt, int rn) {
+    (void)context;
+    e_load(width, rt, rn);
+}
+
+static void address_bus_guard(void *context, int reg, uint64_t size, uint64_t pc) {
+    (void)context;
+    emit_bus_guard(reg, size, pc);
+}
+
+static uintptr_t address_branch_placeholder(void *context) {
+    (void)context;
+    uint32_t *placeholder = (uint32_t *)g_cp;
+    emit32(0);
+    return (uintptr_t)placeholder;
+}
+
+static void address_patch_cbnz(void *context, uintptr_t token, int reg) {
+    (void)context;
+    uint32_t *placeholder = (uint32_t *)token;
+    *placeholder = UINT32_C(0xB5000000) |
+                   (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)placeholder) / 4) & UINT32_C(0x7FFFF)) << 5) |
+                   (uint32_t)reg;
+}
+
+static const hl_x86_address_emitter address_emitter = {address_addi,          address_subi,
+                                                       address_movconst,      address_addreg,
+                                                       address_lsr,           address_movreg,
+                                                       address_movzero,       address_uxt,
+                                                       address_load_cpu,      address_load_scaled,
+                                                       address_load_unscaled, address_load,
+                                                       address_bus_guard,     address_branch_placeholder,
+                                                       address_patch_cbnz};
+
+static hl_x86_address_state address_state(void) {
+    return (hl_x86_address_state){NULL,   &address_emitter, g_nonpie_lo, g_nonpie_hi,           g_nonpie_bias,
+                                  OFF_FS, OFF_GS,           !noeaopt(),  jit_guest_bus_active()};
+}
+
+void emit_ea_core(struct insn *insn, uint64_t next, int bias) {
+    hl_x86_address_state state = address_state();
+    hl_x86_address_emit(&state, insn, next, bias);
+}
+
+void emit_ea(struct insn *insn, uint64_t next) {
+    emit_ea_core(insn, next, 1);
+}
+
+int ea_imm_fold(struct insn *insn, int width, int *rn, int *offset) {
+    hl_x86_address_state state = address_state();
+    return hl_x86_address_fold(&state, insn, width, rn, offset);
+}
+
+void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
+    hl_x86_address_state state = address_state();
+    hl_x86_address_load(&state, insn, next, width, rt);
+}
+
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
@@ -182,8 +300,9 @@ static uint64_t nzcv_to_eflags(uint64_t nzcv) {
 static uint64_t eflags_to_nzcv(uint64_t eflags) {
     return hl_x86_signal_eflags_to_nzcv(eflags);
 }
-#include "../../linux_abi/container/vfs.c"           // SHARED: rootfs jail, overlay, /proc synth, stat
-#include "../../linux_abi/container/netns.c"         // SHARED: sockets, loopback netns, termios
+
+#include "../../linux_abi/container/vfs.c"   // SHARED: rootfs jail, overlay, /proc synth, stat
+#include "../../linux_abi/container/netns.c" // SHARED: sockets, loopback netns, termios
 static void load_elf(const char *path, struct loaded *out);
 static int elf_interp(const char *path, char *out, size_t n);
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base);
