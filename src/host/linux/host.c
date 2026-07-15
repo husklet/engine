@@ -149,6 +149,8 @@ static hl_host_result hl_linux_fork_complete(void *context);
 static hl_host_result hl_linux_fork_child(void *context);
 static hl_host_result hl_linux_counter_unsubscribe(void *context, hl_host_handle subscription);
 static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle handle);
+static hl_host_result hl_linux_close_descriptor_kind(void *context, hl_host_handle handle,
+                                                     hl_linux_handle_kind expected);
 static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle counter);
 static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_linux_handle_kind first,
                                hl_linux_handle_kind second);
@@ -1980,6 +1982,11 @@ static hl_host_result hl_linux_file_path(void *context, hl_host_handle file, hl_
 }
 
 static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_NONE);
+}
+
+static hl_host_result hl_linux_close_descriptor_kind(void *context, hl_host_handle handle,
+                                                     hl_linux_handle_kind expected) {
     hl_host_linux *host = context;
     uint32_t low = (uint32_t)handle;
     hl_linux_handle_entry *entry;
@@ -1987,11 +1994,12 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     int wake_descriptor;
     int result;
     if (low == 0 || low - 1u >= host->handle_capacity) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    hl_linux_counter_unsubscribe_all(host, handle);
+    if (expected == HL_LINUX_HANDLE_NONE || expected == HL_LINUX_HANDLE_COUNTER)
+        hl_linux_counter_unsubscribe_all(host, handle);
     pthread_mutex_lock(&host->lock);
     entry = &host->handles[low - 1u];
     if (entry->generation != (uint32_t)(handle >> 32) || entry->kind == HL_LINUX_HANDLE_NONE ||
-        entry->kind == HL_LINUX_HANDLE_MAPPING) {
+        entry->kind == HL_LINUX_HANDLE_MAPPING || (expected != HL_LINUX_HANDLE_NONE && entry->kind != expected)) {
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
@@ -2006,6 +2014,26 @@ static hl_host_result hl_linux_close_descriptor(void *context, hl_host_handle ha
     result = close(descriptor);
     if (wake_descriptor >= 0) close(wake_descriptor);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_file_close(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_FILE);
+}
+
+static hl_host_result hl_linux_network_close(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_SOCKET);
+}
+
+static hl_host_result hl_linux_shared_close(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_SHARED_MEMORY);
+}
+
+static hl_host_result hl_linux_counter_close(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_COUNTER);
+}
+
+static hl_host_result hl_linux_transfer_close(void *context, hl_host_handle handle) {
+    return hl_linux_close_descriptor_kind(context, handle, HL_LINUX_HANDLE_TRANSFER);
 }
 
 static uint32_t hl_linux_directory_mask(uint32_t interests) {
@@ -2686,6 +2714,10 @@ static hl_host_result hl_linux_event_close(void *context, hl_host_handle pollset
     hl_host_linux *host = context;
     uint32_t index;
     pthread_mutex_lock(&host->lock);
+    if (hl_linux_descriptor(host, pollset, HL_LINUX_HANDLE_POLLSET, HL_LINUX_HANDLE_POLLSET) < 0) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
     for (index = 0; index < host->timer_capacity; ++index) {
         hl_linux_timer_entry *timer = &host->timers[index];
         if (timer->descriptor < 0 || timer->pollset != pollset) continue;
@@ -3567,7 +3599,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_write,
                                                hl_linux_file_append,
                                                hl_linux_file_metadata_get,
-                                               hl_linux_close_descriptor,
+                                               hl_linux_file_close,
                                                hl_linux_file_read_sequential,
                                                hl_linux_file_write_sequential,
                                                hl_linux_file_clone_for_fork,
@@ -3608,22 +3640,22 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         hl_linux_event_disarm_timer};
     static const hl_host_network_services network = {
         HL_HOST_NETWORK_ABI,      sizeof(network),       hl_linux_network_socket,  hl_linux_network_bind,
-        hl_linux_network_connect, hl_linux_network_send, hl_linux_network_receive, hl_linux_close_descriptor};
+        hl_linux_network_connect, hl_linux_network_send, hl_linux_network_receive, hl_linux_network_close};
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_linux_shared_create,    hl_linux_shared_open,
-                                                                 hl_linux_shared_resize,    hl_linux_close_descriptor};
+                                                                 hl_linux_shared_resize,    hl_linux_shared_close};
     static const hl_host_counter_services counter = {
         HL_HOST_COUNTER_ABI,          sizeof(counter),
         hl_linux_counter_create,      hl_linux_counter_read,
         hl_linux_counter_write,       hl_linux_counter_get_flags,
         hl_linux_counter_set_flags,   hl_linux_counter_duplicate,
         hl_linux_counter_readiness,   hl_linux_counter_subscribe,
-        hl_linux_counter_unsubscribe, hl_linux_close_descriptor,
+        hl_linux_counter_unsubscribe, hl_linux_counter_close,
     };
     static const hl_host_transfer_services transfer = {
         HL_HOST_TRANSFER_ABI,      sizeof(transfer),          hl_linux_transfer_channel_pair,
         hl_linux_transfer_send,    hl_linux_transfer_receive, hl_linux_transfer_duplicate,
-        hl_linux_close_descriptor,
+        hl_linux_transfer_close,
     };
     static const hl_host_directory_services directory = {
         HL_HOST_DIRECTORY_ABI,     sizeof(directory),         hl_linux_directory_create, hl_linux_directory_add,

@@ -120,8 +120,13 @@ int main(void) {
              HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.counter->get_flags(services.context, directories[0]).status == HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.directory->close(services.context, counters[0]).status == HL_STATUS_INVALID_ARGUMENT);
-    if (strcmp(HL_NATIVE_HOST_NAME, "macos") == 0)
-        HL_CHECK(services.transfer->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.file->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    if (services.network != NULL)
+        HL_CHECK(services.network->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    if (services.shared_memory != NULL)
+        HL_CHECK(services.shared_memory->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.counter->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.transfer->close(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
     {
         mappings = calloc(MAPPING_COUNT, sizeof(*mappings));
         files = calloc(FILE_COUNT, sizeof(*files));
