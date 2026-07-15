@@ -88,7 +88,7 @@ CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/fata
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/host/aarch64/codegen.c \
 	src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c \
-	src/translator/guest/x86_64/ops.c \
+	src/translator/guest/x86_64/rep.c \
 	src/translator/guest/x86_64/rotate.c \
 	src/translator/guest/x86_64/x87math.c \
 	src/translator/guest/x86_64/x87state.c \

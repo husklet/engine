@@ -161,7 +161,7 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_TIER2 7
 // W4-C: rep cmps/scas (A6/A7/AE/AF) idiom -> C helper does the whole (possibly REP/REPE/REPNE)
 // compare/scan in one round-trip (descriptor in cpu->divop), writing the exact x86 RCX/RSI/RDI +
-// ZF/SF/CF/OF end-state. Gate NOREPCMP=1 -> naive per-element oracle loop. See do_repstr().
+// ZF/SF/CF/OF end-state. See hl_x86_rep_compare().
 #define R_REPSTR 8
 // VEX/EVEX-encoded AVX/AVX2/AVX-512 instruction -> exit the block and emulate it in C (do_avx), which
 // reads/writes the v[]/vhi[]/vz[]/vx[]/kreg[] register file + guest memory, then advances rip past it.
