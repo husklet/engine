@@ -411,15 +411,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
             lo_path(p, up, sizeof up);
+            struct sockaddr_un un;
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             if (lo_swap((int)a0) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             unlink(up);
-            struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_lo_port[(int)a0] = p ? p : 1;
@@ -438,15 +439,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (p == 0) p = br_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
             char up[200];
             br_path(g_myip, p, up, sizeof up); // we always listen on OUR endpoint IP
+            struct sockaddr_un un;
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             if (lo_swap((int)a0) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
             unlink(up);
-            struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_br_port[(int)a0] = p ? p : 1;
@@ -460,11 +462,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (abs_is(sa, (socklen_t)a2)) {
             char up[200];
             abs_path(sa, (socklen_t)a2, up, sizeof up);
-            unlink(up); // replace stale (cf. lo_/br_ above)
             struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            unlink(up); // replace stale (cf. lo_/br_ above)
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) { // record the guest-visible abstract name "@<name>" for /proc/net/unix
                 char an[108];
@@ -672,14 +675,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
             lo_path(p, up, sizeof up);
+            struct sockaddr_un un;
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             if (lo_swap((int)a0) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0 || errno == EINPROGRESS) {
                 g_lo_port[(int)a0] = p ? p : 1;
@@ -694,10 +698,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 char bp[200];
                 br_path(g_myip, p, bp, sizeof bp);
                 struct sockaddr_un bu;
-                memset(&bu, 0, sizeof bu);
-                bu.sun_family = AF_UNIX;
-                snprintf(bu.sun_path, sizeof bu.sun_path, "%s", bp);
-                if (lo_swap((int)a0) < 0) {
+                if (unix_addr_set(&bu, bp) < 0 || lo_swap((int)a0) < 0) {
                     r = -1;
                 } else {
                     r = connect((int)a0, (struct sockaddr *)&bu, sizeof bu);
@@ -721,9 +722,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char up[200];
             br_path(dip, p, up, sizeof up);
             struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             // Retry across a peer's brief re-listen gap: a server looping `nc -l -w N` unbinds+rebinds the
             // switch inode between connections, so a dial that lands in the window sees ENOENT (inode gone)
             // or ECONNREFUSED (stale inode). Recreate the guest fd (lo_swap) + retry for ~600ms, mirroring
@@ -765,9 +767,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char up[200];
             abs_path(sa, (socklen_t)a2, up, sizeof up);
             struct sockaddr_un un;
-            memset(&un, 0, sizeof un);
-            un.sun_family = AF_UNIX;
-            snprintf(un.sun_path, sizeof un.sun_path, "%s", up);
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
             if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected

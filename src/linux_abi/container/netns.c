@@ -2,6 +2,20 @@
 
 #include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
+// Build a pathname AF_UNIX address without ever accepting the silent truncation performed by snprintf.
+// Callers must do this before replacing a guest socket so ENAMETOOLONG leaves the original fd untouched.
+static int unix_addr_set(struct sockaddr_un *address, const char *path) {
+    size_t len = path ? strlen(path) : 0;
+    if (!address || !path || len >= sizeof address->sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memset(address, 0, sizeof *address);
+    address->sun_family = AF_UNIX;
+    memcpy(address->sun_path, path, len + 1);
+    return 0;
+}
+
 // ---- termios: Linux <-> macOS. Different field width (4 vs 8B flags), bit values, and c_cc order.
 // Linux struct termios (TCGETS): c_iflag/oflag/cflag/lflag @0,4,8,12 (u32); c_line@16; c_cc[19]@17.
 static const uint32_t TIO_I[][2] = {{0x1, IGNBRK},  {0x2, BRKINT},   {0x4, IGNPAR},    {0x8, PARMRK},  {0x10, INPCK},
