@@ -501,6 +501,7 @@ static void service(struct cpu *c) {
     // EVERY exit path below, so the ptrace/untrusted routes must not early-return past the clear.
     g_in_service = 1;
     __atomic_store_n(&c->in_service, 1, __ATOMIC_SEQ_CST);
+    filemap_replay();
     // Close the signal-vs-syscall-entry race. The signaler publishes tpending
     // before reading in_service; after publishing in_service, recheck it here
     // before entering a potentially blocking host call.
@@ -536,6 +537,7 @@ static void service(struct cpu *c) {
     } else {
         service_local(c); // trusted: byte-identical path
     }
+    filemap_replay();
     if (g_systrace)
         fprintf(stderr, "[ret pid=%d] %llu -> %lld\n", (int)getpid(), (unsigned long long)_rnr,
                 (long long)(int64_t)G_RET(c));

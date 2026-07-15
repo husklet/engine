@@ -370,11 +370,55 @@ static int gbus_clear_locked(uint64_t lo, uint64_t hi) {
 struct guest_file_mapping {
     uint64_t lo, hi, offset, device, inode;
     uint64_t follow_lo, follow_hi;
+    int fd;
     uint32_t shared;
 };
 static struct guest_file_mapping g_filemap[GNA_MAX];
 static int g_nfilemap;
 static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A file mapping survives fork in every guest process, while the bookkeeping
+   above becomes process-private COW memory.  File size/data mutations do not:
+   macOS can leave a clean MAP_PRIVATE subpage stale after another process
+   shrinks and regrows the vnode.  Journal those mutations in an inherited
+   shared arena.  Each process replays them before returning from a syscall,
+   which is the same visibility boundary that ordered the mutating process's
+   pipe/socket/file notification. */
+#define FILEMAP_EVENT_COUNT 65536u
+enum filemap_event_kind { FILEMAP_RESIZE = 1, FILEMAP_WRITE = 2 };
+struct filemap_event {
+    _Atomic uint64_t sequence;
+    uint64_t device, inode, first, second;
+    uint32_t kind;
+};
+struct filemap_events {
+    _Atomic uint64_t next;
+    struct filemap_event event[FILEMAP_EVENT_COUNT];
+};
+static struct filemap_events *g_filemap_events;
+static uint64_t g_filemap_cursor;
+static pthread_mutex_t g_filemap_replay_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void filemap_events_init_locked(void) {
+    if (g_filemap_events != NULL) return;
+    void *p = mmap(NULL, sizeof(struct filemap_events), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return;
+    g_filemap_events = p;
+    g_filemap_cursor = 0;
+}
+
+static void filemap_publish(uint32_t kind, uint64_t device, uint64_t inode, uint64_t first, uint64_t second) {
+    struct filemap_events *events = g_filemap_events;
+    if (events == NULL) return;
+    uint64_t ticket = atomic_fetch_add_explicit(&events->next, 1, memory_order_relaxed);
+    struct filemap_event *event = &events->event[ticket % FILEMAP_EVENT_COUNT];
+    event->device = device;
+    event->inode = inode;
+    event->first = first;
+    event->second = second;
+    event->kind = kind;
+    atomic_store_explicit(&event->sequence, ticket + 1, memory_order_release);
+}
 
 static uint64_t filemap_accessible(const struct guest_file_mapping *mapping, uint64_t size) {
     if (size <= mapping->offset) return 0;
@@ -389,10 +433,11 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
     struct stat st;
     if (size == 0 || address > UINT64_MAX - size || fstat(fd, &st) != 0) return;
     pthread_mutex_lock(&g_filemap_lock);
+    filemap_events_init_locked();
     if (g_nfilemap < GNA_MAX)
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
                                                               (uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                                                              0, 0, (uint32_t)shared};
+                                                              0, 0, fd, (uint32_t)shared};
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
@@ -428,13 +473,11 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
-static void filemap_resize(int fd, uint64_t old_size, uint64_t new_size) {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return;
+static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t old_size, uint64_t new_size) {
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
         struct guest_file_mapping *mapping = &g_filemap[i];
-        if (mapping->device != (uint64_t)st.st_dev || mapping->inode != (uint64_t)st.st_ino) continue;
+        if (mapping->device != device || mapping->inode != inode) continue;
         uint64_t old_accessible = filemap_accessible(mapping, old_size);
         uint64_t new_accessible = filemap_accessible(mapping, new_size);
         if (new_size < old_size && new_size > mapping->offset && new_size < mapping->offset + (mapping->hi - mapping->lo)) {
@@ -474,25 +517,85 @@ static void filemap_resize(int fd, uint64_t old_size, uint64_t new_size) {
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
-static void filemap_written(int fd, uint64_t offset, uint64_t size) {
+static void filemap_resize(int fd, uint64_t old_size, uint64_t new_size) {
     struct stat st;
-    if (size == 0 || offset > UINT64_MAX - size || fstat(fd, &st) != 0) return;
+    if (fstat(fd, &st) != 0) return;
+    uint64_t device = (uint64_t)st.st_dev, inode = (uint64_t)st.st_ino;
+    filemap_resize_identity(device, inode, old_size, new_size);
+    filemap_publish(FILEMAP_RESIZE, device, inode, old_size, new_size);
+}
+
+static int filemap_source_fd(struct guest_file_mapping *mapping) {
+    struct stat st;
+    if (mapping->fd >= 0 && fstat(mapping->fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device &&
+        (uint64_t)st.st_ino == mapping->inode)
+        return mapping->fd;
+    for (int fd = 0; fd < HL_NFD; ++fd)
+        if (fstat(fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device && (uint64_t)st.st_ino == mapping->inode) {
+            mapping->fd = fd;
+            return fd;
+        }
+    return -1;
+}
+
+static void filemap_written_identity(uint64_t device, uint64_t inode, int source_fd, uint64_t offset,
+                                     uint64_t size) {
+    if (size == 0 || offset > UINT64_MAX - size) return;
     uint64_t end = offset + size;
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
         struct guest_file_mapping *mapping = &g_filemap[i];
         if (mapping->shared || mapping->follow_hi <= mapping->follow_lo ||
-            mapping->device != (uint64_t)st.st_dev || mapping->inode != (uint64_t)st.st_ino)
+            mapping->device != device || mapping->inode != inode)
             continue;
         uint64_t map_lo = mapping->offset + mapping->follow_lo;
         uint64_t map_hi = mapping->offset + mapping->follow_hi;
         uint64_t lo = offset > map_lo ? offset : map_lo;
         uint64_t hi = end < map_hi ? end : map_hi;
-        if (hi > lo)
+        int fd = source_fd >= 0 ? source_fd : filemap_source_fd(mapping);
+        if (hi > lo && fd >= 0)
             (void)pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo),
                         (off_t)lo);
     }
     pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static void filemap_written(int fd, uint64_t offset, uint64_t size) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    uint64_t device = (uint64_t)st.st_dev, inode = (uint64_t)st.st_ino;
+    filemap_written_identity(device, inode, fd, offset, size);
+    filemap_publish(FILEMAP_WRITE, device, inode, offset, size);
+}
+
+static void filemap_replay(void) {
+    struct filemap_events *events = g_filemap_events;
+    if (events == NULL) return;
+    pthread_mutex_lock(&g_filemap_replay_lock);
+    uint64_t end = atomic_load_explicit(&events->next, memory_order_acquire);
+    if (end - g_filemap_cursor > FILEMAP_EVENT_COUNT) {
+        /* Never silently manufacture stale MAP_PRIVATE bytes after losing a
+           shrink/regrow transition.  Reconstructing which private bytes were
+           dirtied before an arbitrary missed shrink is impossible.  Treat
+           exhausting this internal journal as a fatal engine resource error,
+           before any guest instruction can observe corrupt data. */
+        static const char message[] = "[hl-engine] fatal: file mapping mutation journal exhausted\n";
+        (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+        _exit(125);
+    }
+    while (g_filemap_cursor < end) {
+        uint64_t ticket = g_filemap_cursor;
+        struct filemap_event *event = &events->event[ticket % FILEMAP_EVENT_COUNT];
+        if (atomic_load_explicit(&event->sequence, memory_order_acquire) != ticket + 1) break;
+        uint32_t kind = event->kind;
+        uint64_t device = event->device, inode = event->inode, first = event->first, second = event->second;
+        g_filemap_cursor = ticket + 1;
+        if (kind == FILEMAP_RESIZE)
+            filemap_resize_identity(device, inode, first, second);
+        else if (kind == FILEMAP_WRITE)
+            filemap_written_identity(device, inode, -1, first, second);
+    }
+    pthread_mutex_unlock(&g_filemap_replay_lock);
 }
 
 static void gbus_lock(void) {
