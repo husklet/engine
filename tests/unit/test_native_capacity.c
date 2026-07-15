@@ -189,7 +189,15 @@ int main(void) {
         HL_CHECK(services.event->disarm_timer(services.context, events[0], index).status == HL_STATUS_OK);
     for (size_t index = TRANSFER_PAIR_COUNT * 2; index != 0; --index)
         HL_CHECK(services.transfer->close(services.context, transfers[index - 1]).status == HL_STATUS_OK);
-    HL_CHECK(services.transfer->close(services.context, transfers[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    {
+        hl_host_handle stale = transfers[0];
+        hl_host_result replacement = services.transfer->channel_pair(services.context);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale && replacement.detail != stale);
+        HL_CHECK(services.transfer->close(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.transfer->close(services.context, replacement.value).status == HL_STATUS_OK);
+        HL_CHECK(services.transfer->close(services.context, replacement.detail).status == HL_STATUS_OK);
+    }
     for (size_t index = SUBSCRIPTION_COUNT; index != 0; --index)
         HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[0]).status == HL_STATUS_INVALID_ARGUMENT);
