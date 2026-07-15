@@ -9,6 +9,7 @@ DESTDIR ?=
 VERSION := 0.1.0
 DEBUG ?= 0
 MAC ?= mac
+CODESIGN ?= codesign
 PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
 PERF_HEAVY_SAMPLES ?= 7
@@ -911,13 +912,13 @@ $(BUILD)/production/hl-engine-linux-aarch64: $(BUILD)/mac/target/aarch64.o $(BUI
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $< $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $< $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 # First native-Linux production lane: AArch64 host executing an x86-64 Linux
 # guest through the production JIT. This target is smoke-scoped until the
@@ -1226,7 +1227,7 @@ endif
 $(BUILD)/package/macos-aarch64/link-test: tools/dual_backend_e2e_runner.c \
 	$(BUILD)/package/macos-aarch64/libhl-engine.a packaging/macos/jit.entitlements
 	$(MAC) clang $(CPPFLAGS) -o $@ $< -Wl,-force_load,$(BUILD)/package/macos-aarch64/libhl-engine.a
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/package/linux-aarch64/link-test: tools/dual_backend_e2e_runner.c \
 	$(BUILD)/package/linux-aarch64/libhl-engine.a
@@ -1237,7 +1238,7 @@ $(BUILD)/tools/dual-backend-e2e: tools/dual_backend_e2e_runner.c $(BUILD)/mac/li
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -o $@ $< -Wl,-force_load,$(BUILD)/mac/lib/libhl-engine-dual.a
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 .PHONY: test-dual-backend
 test-dual-backend: $(BUILD)/tools/dual-backend-e2e $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
@@ -1285,56 +1286,56 @@ $(BUILD)/tools/lifecycle-aarch64: $(BUILD)/mac/lifecycle/aarch64-runner.o \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/binding-aarch64: $(BUILD)/mac/binding/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/binding-x86_64: $(BUILD)/mac/binding/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/dir-aarch64: $(BUILD)/mac/dir/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/dir-x86_64: $(BUILD)/mac/dir/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/stdio-aarch64: $(BUILD)/mac/stdio/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
 	@mkdir -p $(@D)
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
-	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \

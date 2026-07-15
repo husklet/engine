@@ -26,7 +26,7 @@
               runHook preBuild
               make all
               ${pkgs.lib.optionalString (system == "aarch64-darwin") ''
-                make MAC= build/production/hl-engine-linux-aarch64 \
+                make MAC= CODESIGN=/usr/bin/codesign build/production/hl-engine-linux-aarch64 \
                   build/production/hl-engine-linux-x86_64
               ''}
               ${pkgs.lib.optionalString (system == "aarch64-linux") ''
