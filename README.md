@@ -2,6 +2,13 @@
 
 HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux hosts. It provides a standalone C execution engine and a safe, process-isolated Rust API for configuring Linux containers, lifecycle, isolation, filesystems, and external device integrations.
 
+| Host | Status | Linux guests |
+| --- | --- | --- |
+| macOS AArch64 | Supported | AArch64, x86-64 |
+| Linux AArch64 | Supported | AArch64, x86-64 |
+| Linux x86-64 | In progress | AArch64, x86-64 |
+| Windows x86-64 | In progress | AArch64, x86-64 |
+
 ```sh
 cargo add hl-engine
 ```
