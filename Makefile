@@ -15,6 +15,17 @@ PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
 PERF_HEAVY_SAMPLES ?= 7
 PERF_OP_SAMPLES ?= 7
+PERF_LIMIT_startup := 15000 10000
+PERF_LIMIT_compute := 750000 650000
+PERF_LIMIT_syscall-startup := 30000 25000
+PERF_LIMIT_syscall-1m := 500000 400000
+PERF_LIMIT_fork-stress := 9000000 8000000
+PERF_LIMIT_mmap := 150000 120000
+PERF_LIMIT_file := 75000 60000
+PERF_LIMIT_pipe := 250000 200000
+PERF_LIMIT_event := 250000 200000
+PERF_LIMIT_ipc-latency := 150000 120000
+PERF_LIMIT_ipc-throughput := 75000 60000
 SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
@@ -1823,7 +1834,8 @@ define HL_PERF_NATIVE
 endef
 
 define HL_PERF_LINUX
-	$(BUILD)/tools/perf-runner --label linux-$(1)-$(2) --warmups $(3) --samples $(4) --expect $(6) -- \
+	$(BUILD)/tools/perf-runner --label linux-$(1)-$(2) --warmups $(3) --samples $(4) --expect $(6) \
+		--max-cold-us $(word 1,$(PERF_LIMIT_$(1))) --max-p99-us $(word 2,$(PERF_LIMIT_$(1))) -- \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-$(2)) $(abspath $(5))
 endef
 
