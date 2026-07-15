@@ -627,7 +627,9 @@ layer immediately so completing macOS reduces, rather than increases, the later 
       compatibility case; the C matrix runner fails immediately on drift.
 - [x] Reap independently discoverable remote descendants after both normal completion and transport cancellation;
       the C supervisor integration gate proves a child that outlives its engine cannot survive the launch group.
-- [ ] Extend lifecycle baselines to engine mappings.
+- [x] Extend lifecycle baselines to engine mappings. Private host probes count authoritative live mapping handles;
+      macOS and Linux lifecycle runners require the count to return to zero after normal completion, injected host
+      services, and forced-stop teardown for both guest ISAs.
 - [ ] Prove all registries grow to advertised limits without stale-handle aliasing.
 - [ ] Fault-inject every host callback boundary and verify transactional rollback.
 
