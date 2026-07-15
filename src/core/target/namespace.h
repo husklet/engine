@@ -23,6 +23,8 @@
 #define hl_engine_entry HL_TARGET_LOCAL(engine_entry)
 #define hl_run_linux_guest HL_TARGET_LOCAL(run_linux_guest)
 #define hl_run_linux_guest_status HL_TARGET_LOCAL(run_linux_guest_status)
+#define hl_target_register_backend HL_TARGET_LOCAL(target_register_backend)
+#define hl_target_runtime_init HL_TARGET_LOCAL(target_runtime_init)
 #define hl_engine_child_result_after_fork HL_TARGET_LOCAL(engine_child_result_after_fork)
 #define hl_engine_child_result_publish HL_TARGET_LOCAL(engine_child_result_publish)
 

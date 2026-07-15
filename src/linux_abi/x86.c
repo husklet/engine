@@ -935,7 +935,7 @@ static void jit86_syncguard(int sig, siginfo_t *si, void *uc) {
     raise(sig);
 }
 
-__attribute__((constructor)) static void jit86_install_sync_fault_guards(void) {
+static void jit86_install_sync_fault_guards(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = jit86_syncguard;
@@ -944,6 +944,12 @@ __attribute__((constructor)) static void jit86_install_sync_fault_guards(void) {
     sigaction(SIGFPE, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void jit86_sync_fault_guards_constructor(void) {
+    jit86_install_sync_fault_guards();
+}
+#endif
 
 void jit86_faulth(int sig, siginfo_t *si, void *uc) {
     // host_range_mapped probe fault (thread.c) -- resolve it silently even on this diagnostic path, so a

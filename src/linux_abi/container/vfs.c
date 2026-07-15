@@ -262,9 +262,11 @@ static int eventfd_guest_nb(int fd) {
     return (fd >= 0 && fd < HL_NFD) ? g_eventfd_gnb[fd] : 0;
 }
 
+#ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void eventfd_count_ctor(void) {
     eventfd_count_init();
 }
+#endif
 
 // _eventfd-atomicity_: an eventfd is emulated as {accumulating counter, readiness pipe}. write() does
 // `count += add; drain-pipe; write-one-byte` and read() does `v = count; count = 0; drain-pipe; if
@@ -390,6 +392,7 @@ static uint64_t fdvis_identity(int pid, uint64_t start_ns) {
 }
 
 static void fdvis_init(void) {
+    if (g_fdvis != NULL) return;
     size_t bytes = sizeof(struct fdvis_slot) * FDVIS_N + sizeof(*g_fdvis_control);
     void *memory = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (memory == MAP_FAILED) return;
@@ -398,9 +401,11 @@ static void fdvis_init(void) {
     (void)atexit(proc_fdvis_cleanup);
 }
 
+#ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void fdvis_ctor(void) {
     fdvis_init();
 }
+#endif
 
 static struct fdvis_slot *fdvis_find(uint64_t key, uint64_t owner_start_ns, int claim) {
     if (!g_fdvis || key == 0) return NULL;
@@ -738,9 +743,11 @@ static void ts_init(void) {
     g_ts_tab = (m == MAP_FAILED) ? NULL : (struct ts_slot *)m;
 }
 
+#ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void ts_ctor(void) {
     ts_init();
 }
+#endif
 
 // Find (or, when claim, atomically allocate) the slot for host pid `pid`. Open addressing with linear
 // probe; a freshly claimed slot defaults to 'R' (running), overwriting any stale value a recycled pid left.

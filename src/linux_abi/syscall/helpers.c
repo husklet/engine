@@ -254,9 +254,11 @@ static void poslk_init(void) {
     g_poslk = (struct poslk_shm *)m; // MAP_ANON is zero-filled: lockword=0, hi=0, all owner=0
 }
 
+#ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void poslk_ctor(void) {
     poslk_init();
 }
+#endif
 
 // Is host pid `p` still a live process? A dead owner's records/locks are reclaimable.
 static inline int poslk_alive(int32_t p) {

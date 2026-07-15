@@ -932,6 +932,16 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
 #define FSRV_RESTORE_DONE(L, span) fsrv_restore_done_a64((L), (span))
 #include "../../linux_abi/fork.c"
 
+void hl_target_runtime_init(void) {
+    futex_table_init();
+    install_sync_fault_guards();
+    poslk_init();
+    ipc_init();
+    eventfd_count_init();
+    fdvis_init();
+    ts_init();
+}
+
 // The engine entry point uses the public HL prefix so the runtime can be linked as a library and launched
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
 // harness) launching identically.

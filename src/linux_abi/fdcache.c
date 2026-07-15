@@ -189,13 +189,20 @@ static void oc_reset(void);
 // counter; a fresh `docker exec` is a NEW hl process = its own tree = its own counter (correct per-container
 // isolation). Falls back to a private local counter if the mmap fails (degrades to the old per-process
 // behaviour, never crashes). Positive entries are still served epoch-independently, unchanged.
-__attribute__((constructor)) static void res_epoch_ctor(void) {
+void hl_fdcache_runtime_init(void) {
+    if (g_res_epoch_ptr != &g_fdcache.resolver_epoch_local) return;
     void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (m != MAP_FAILED) {
         atomic_store((_Atomic uint32_t *)m, 1);
         g_res_epoch_ptr = (_Atomic uint32_t *)m;
     }
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void res_epoch_ctor(void) {
+    hl_fdcache_runtime_init();
+}
+#endif
 
 // process-local fork/chroot GENERATION for every cache in this file (mc/rl/ac + rc/ud/oc).
 // Each entry is stamped with g_fs_fgen at store time and only hits while its stamp still matches;

@@ -466,6 +466,16 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     } while (0)
 #include "../../linux_abi/fork.c"
 
+void hl_target_runtime_init(void) {
+    futex_table_init();
+    jit86_install_sync_fault_guards();
+    poslk_init();
+    ipc_init();
+    eventfd_count_init();
+    fdvis_init();
+    ts_init();
+}
+
 // The engine entry point uses the public HL prefix so the runtime can be linked as a library and launched
 // by an in-process fork()+call; the thin `main` shim below keeps the standalone binary (used by the test
 // harness) launching identically.

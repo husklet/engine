@@ -1,6 +1,8 @@
 #ifndef HL_LINUX_FDCACHE_H
 #define HL_LINUX_FDCACHE_H
 
+void hl_fdcache_runtime_init(void);
+
 #include "container/namespace.h"
 #include "hl/host_services.h"
 

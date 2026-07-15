@@ -154,6 +154,12 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
 static const hl_engine_backend backend = {HL_PRODUCTION_GUEST_ISA, hl_production_start_process,
                                           hl_production_finish_process};
 
-__attribute__((constructor)) static void hl_production_register_backend(void) {
+void hl_target_register_backend(void) {
     hl_engine_backend_register(&backend);
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void hl_production_register_backend(void) {
+    hl_target_register_backend();
+}
+#endif

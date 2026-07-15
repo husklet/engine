@@ -159,9 +159,11 @@ static void futex_private_table_after_fork(void) {
     g_fbk_active = g_fbk_private;
 }
 
+#ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void futex_table_ctor(void) {
     futex_table_init();
 }
+#endif
 
 // ===================== shared-memory futex key (Linux "shared" futex semantics) =================
 // hl hashes a futex bucket by the WORD's host virtual address. That is exactly Linux's PRIVATE futex key

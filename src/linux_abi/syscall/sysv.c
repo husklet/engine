@@ -274,9 +274,15 @@ static struct {
     int adj; // accumulated undo adjustment (subtract on process exit)
 } g_undo[HL_UNDO_MAX];
 
-__attribute__((constructor)) static void ipc_ctor(void) {
+static void ipc_init(void) {
     g_ipc_ctor_pid = (int)getpid();
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void ipc_ctor(void) {
+    ipc_init();
+}
+#endif
 
 static int64_t hl_ipc_now(void) {
     return (int64_t)time(NULL);

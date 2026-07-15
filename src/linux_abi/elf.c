@@ -639,7 +639,7 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
 // nonpie_guard already routes any signal to deliver_guest_fault (nonpie_fixup self-declines: its si_addr is
 // the high faulting PC, never in the low link range), so reuse it. CRASHDBG handles these via its mach
 // exception port + diag_crash instead, so leave its diagnostics untouched.
-__attribute__((constructor)) static void install_sync_fault_guards(void) {
+static void install_sync_fault_guards(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = nonpie_guard;
@@ -648,6 +648,12 @@ __attribute__((constructor)) static void install_sync_fault_guards(void) {
     sigaction(SIGFPE, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void install_sync_fault_guards_constructor(void) {
+    install_sync_fault_guards();
+}
+#endif
 
 // ---------------- LOAD-path mapping hardening (never leave an unmapped hole in the image) -----
 // A large non-PIE ET_EXEC (e.g. gcc's ~29MB cc1, first PT_LOAD at a fixed low vaddr) maps its whole image

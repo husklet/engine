@@ -1,6 +1,8 @@
 #ifndef HL_HOST_SYSTEM_H
 #define HL_HOST_SYSTEM_H
 
+void hl_host_private_init(void);
+
 #include <stddef.h>
 #include <stdint.h>
 

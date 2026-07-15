@@ -133,8 +133,9 @@ static void hl_private_cleanup(void) {
     }
 }
 
-__attribute__((constructor)) static void hl_private_init(void) {
+void hl_host_private_init(void) {
     size_t records_size = sizeof(*hl_private) * HL_PRIVATE_PROCESSES;
+    if (hl_private != NULL) return;
     void *memory =
         mmap(NULL, records_size + sizeof(*hl_private_epoch), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (memory != MAP_FAILED) {
@@ -143,6 +144,12 @@ __attribute__((constructor)) static void hl_private_init(void) {
         (void)atexit(hl_private_cleanup);
     }
 }
+
+#ifndef HL_EMBEDDED_BUILD
+__attribute__((constructor)) static void hl_private_constructor(void) {
+    hl_host_private_init();
+}
+#endif
 
 static int hl_private_add_unlocked(int fd) {
     int64_t pid = (int64_t)getpid();
