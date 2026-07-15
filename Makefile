@@ -1673,7 +1673,13 @@ perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 
 	$(call HL_PERF_NATIVE,ipc-throughput,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
 	$(BUILD)/perf/resource-aarch64
 
+MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
+	run-unit-pipe_linux run-unit-private run-unit-process run-unit-range run-unit-resolve_services run-unit-system
+ifeq ($(HOST),macos)
+unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS)) test-macos
+else
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity
+endif
 
 define HL_UNIT_RULE
 run-unit-$(1): $(BUILD)/tests/test_$(1)
