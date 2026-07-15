@@ -24,9 +24,7 @@ static const uint64_t ATFD = (uint64_t)-100; // Linux AT_FDCWD
 // that we must dereference HERE to convert it to a `struct timespec[2]` for utimensat -- and we run BEFORE
 // dispatch.c's non-PIE pointer-arg rebase (nonpie_p) block. So a non-PIE ET_EXEC's .data/.bss times pointer
 // (a low link vaddr, real bytes at +bias in the high-mapped image) must be rebased by us before the deref.
-// g_nonpie_lo/g_nonpie_bias are the (tentative) globals engine_glue.c declares above; g_nonpie_hi is defined
-// later by container/vfs.c -- forward it tentatively here (all three tentative defs merge to one object, the
-// exact pattern engine_glue.c documents). Inert identity for PIE/static-PIE (g_nonpie_lo == 0).
+// The target supplies its non-PIE range through the explicit context. Inert identity for PIE/static-PIE.
 static uint64_t x86_nonpie(const hl_x86_legacy_context *context, uint64_t address) {
     return context->nonpie_low && address >= context->nonpie_low && address < context->nonpie_high
                ? address + context->nonpie_bias

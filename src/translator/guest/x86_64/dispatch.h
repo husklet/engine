@@ -17,7 +17,7 @@
 // `continue`/`break` reach that loop and the engine globals (g_ibtc/g_xibtc, map_body, g_ibtc_fill,
 // do_cpuid/do_repstr/x87_*/tier2_promote, the R_* codes, ...) are in scope there even though this header
 // is pulled in early (targets/linux_x86_64.c #includes it right after abi.h). Every name used in a macro
-// body is defined earlier in the x86 unity TU (glue.c, engine/cache.c, ops.c, translate.c) — all
+// body is defined earlier in the x86 target TU (declared glue state, cache, emitters and translation) — all
 // included before jit/dispatch.c, where the macros expand.
 //
 // Hooks the shared loop expects (the four PR2 seams + the PR3/PR4 additions for opts committed after the

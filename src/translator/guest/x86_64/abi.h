@@ -68,8 +68,7 @@
 #define G_O_NOFOLLOW 0x20000  // x86-64 O_NOFOLLOW  = 0400000
 
 // W5B tier-2: extra PROF line at exit_group (x86 engine only; aarch64 leaves G_PROF_EXTRA undefined).
-// g_prof_t2 lives in the shared jit/cache.c, g_prof_t2fold in frontend/x86_64/engine_glue.c -- both
-// defined before the shared service.c is #included in the x86 unity TU.
+// g_prof_t2 lives in the shared cache, while g_prof_t2fold lives in the independently compiled x86 glue state.
 static void xs_dump(void); // EXITSTAT diagnostic histogram (defined in avx.c; no-op unless EXITSTAT set)
 #define G_PROF_EXTRA                                                                                                   \
     do {                                                                                                               \

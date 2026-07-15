@@ -103,8 +103,15 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/container/state.c" // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
-#include "../../translator/guest/x86_64/glue.c" // x86-only engine globals the shared cache.c omits
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+#include "../../translator/guest/x86_64/glue.h" // independently compiled x86 target state
 #include "../../translator/cache.c"             // SHARED translator: code cache + block map
+
+uint64_t hl_x86_guest_pointer(uint64_t address) {
+    return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
+}
+
+static int guestfold_on(void) { return g_nonpie_lo != 0; }
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);

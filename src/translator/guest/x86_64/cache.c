@@ -481,7 +481,7 @@ static void pcache_save(void) {
         return;
     }
     if (g_pcache_skip) return; // we intentionally skipped the restore; re-saving would churn the file
-    uint64_t _t0 = g_coldprof ? coldprof_now_ns() : 0;
+    uint64_t _t0 = g_coldprof ? coldprof_now_ns(effective_host_services()) : 0;
     // count occupied map slots that are REVIVABLE (fixed images + manifest libs). Anything else is keyed
     // by a kernel-chosen address that the next run won't reproduce -- persisting it would be dead weight
     // at best, and a stale-translation hazard if the next run reuses the address range for other code.
@@ -547,7 +547,8 @@ static void pcache_save(void) {
     }
     if (g_coldprof)
         fprintf(stderr, "[pcache] save %s (%llu B arena, %llu blocks, %d libs) in %.3f ms\n", ok ? "ok" : "FAILED",
-                (unsigned long long)h.arena_used, (unsigned long long)nmap, g_pc_nlib, (coldprof_now_ns() - _t0) / 1e6);
+                (unsigned long long)h.arena_used, (unsigned long long)nmap, g_pc_nlib,
+                (coldprof_now_ns(effective_host_services()) - _t0) / 1e6);
 }
 
 // hygiene hooks (shared proc.c / engine/dispatch.c call these on both engines):
