@@ -92,6 +92,8 @@
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
 static int g_pcache;            // persistent cache active (HL_PCACHE=1)
 static int g_coldprof;          // Internal cache timing diagnostics; production entry keeps this disabled.
+static hl_persist_directory g_pc_directory;
+static char g_pc_directory_path[1024];
 static uint64_t g_force_base;   // if nonzero, load_elf() maps the NEXT image MAP_FIXED here (one-shot; elf.c)
 static int g_force_base_failed; // a fixed-VA map fell back to a kernel base -> this image can't hit OR save
 static uint64_t g_pc_binid;     // identity of the guest binary+interp+argv0+engine+mode (cache file key)
@@ -198,12 +200,7 @@ struct pc_t2 {
 };
 
 static uint64_t pcache_id_of(const char *path) {
-    hl_host_file_metadata metadata;
-    if (!path || !hl_persist_metadata(&g_jit_services, path, &metadata)) return 0;
-    uint64_t fields[5] = {metadata.stable_device, metadata.stable_object, metadata.size, metadata.modified_ns,
-                          metadata.changed_ns};
-    uint64_t h = hl_digest_bytes(HL_DIGEST_SEED, fields, sizeof fields);
-    return hl_digest_bytes(h, path, strlen(path));
+    return hl_identity_source(&g_jit_services, path);
 }
 
 // Per-engine-build tag so the cache self-invalidates across engine rebuilds (host bytes from another build
@@ -229,11 +226,31 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
     return hl_identity_mix(a, b, pcache_engine_id(), pcache_argv0_id(argv0));
 }
 
-static void pcache_file(char *out, size_t n) {
+static int pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
     if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-aarch64";
-    (void)hl_persist_prepare(&g_jit_services, dir);
-    snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
+    if (g_pc_directory.handle != HL_HOST_HANDLE_INVALID && strcmp(g_pc_directory_path, dir) != 0) {
+        (void)hl_persist_directory_close(&g_pc_directory);
+        g_pc_directory_path[0] = 0;
+    }
+    if (g_pc_directory.handle == HL_HOST_HANDLE_INVALID &&
+        !hl_persist_directory_open(&g_pc_directory, &g_jit_services, dir, 1))
+        return 0;
+    if (!g_pc_directory_path[0]) {
+        int copied = snprintf(g_pc_directory_path, sizeof g_pc_directory_path, "%s", dir);
+        if (copied <= 0 || (size_t)copied >= sizeof g_pc_directory_path) {
+            (void)hl_persist_directory_close(&g_pc_directory);
+            g_pc_directory_path[0] = 0;
+            return 0;
+        }
+    }
+    int written = snprintf(out, n, "%016llx.pcache", (unsigned long long)g_pc_binid);
+    return written > 0 && (size_t)written < n;
+}
+
+static void pcache_directory_close(void) {
+    if (g_pc_directory.handle != HL_HOST_HANDLE_INVALID) (void)hl_persist_directory_close(&g_pc_directory);
+    g_pc_directory_path[0] = 0;
 }
 
 // Re-emit / neutralize every recorded slot for THIS process. Runs inside the jit_wprot() write window,
@@ -282,10 +299,10 @@ static int pcache_load(uint64_t entry_jump) {
     if (!g_pcache || !g_pc_binid || g_force_base_failed) return 0;
     uint64_t t0 = g_coldprof ? now_ns() : 0;
     char path[1024];
-    pcache_file(path, sizeof path);
+    if (!pcache_file(path, sizeof path)) return 0;
     void *image = NULL;
     size_t image_size = 0;
-    if (!hl_persist_load(&g_jit_services, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
+    if (!hl_persist_load_at(&g_pc_directory, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
     hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
     if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
@@ -403,7 +420,7 @@ static void pcache_save(void) {
     if (g_pcache_poison || g_pcache_loaded || g_pcache_forked || g_force_base_failed || g_smc_seen) return;
     uint64_t t0 = g_coldprof ? now_ns() : 0;
     char path[1024];
-    pcache_file(path, sizeof path);
+    if (!pcache_file(path, sizeof path)) return;
     // ---- consistent snapshot under the translation lock (peers may still be running/translating) ----
     pthread_mutex_lock(&g_jit_lock);
     uint64_t nmap = 0;
@@ -470,7 +487,7 @@ static void pcache_save(void) {
         memcpy(buf, &h, sizeof h);
     }
     pthread_mutex_unlock(&g_jit_lock);
-    if (ok) ok = hl_persist_store(&g_jit_services, path, buf, total);
+    if (ok) ok = hl_persist_store_at(&g_pc_directory, path, buf, total);
     free(buf);
     if (g_coldprof)
         fprintf(stderr, "[pcache] save %s (%llu B arena, %llu blocks, %d reloc) in %.3f ms\n", ok ? "ok" : "FAILED",

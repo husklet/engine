@@ -16,6 +16,8 @@ typedef struct persist_fake {
     int truncate_read;
     int opened_parent;
     int opened_file;
+    int closed_parent;
+    int closed_file;
 } persist_fake;
 
 static hl_host_result result(hl_status status, uint64_t value) {
@@ -59,6 +61,8 @@ static hl_host_result fake_metadata(void *context, hl_host_handle file, hl_host_
 
 static hl_host_result fake_close(void *context, hl_host_handle file) {
     persist_fake *fake = context;
+    if (file == 1) fake->closed_parent++;
+    if (file == 2) fake->closed_file++;
     return file == 1 || file == 2 ? result(fake->close_status, 0) : result(HL_STATUS_INVALID_ARGUMENT, 0);
 }
 
@@ -96,41 +100,61 @@ static hl_host_result fake_unlink(void *context, hl_host_handle directory, const
 }
 
 int main(void) {
-    static const hl_host_file_services file = {
-        .abi = HL_HOST_FILE_ABI, .size = sizeof(file), .open_relative = fake_open, .read_at = fake_read_at,
+    static const hl_host_file_services file_template = {
+        .abi = HL_HOST_FILE_ABI, .size = sizeof(file_template), .open_relative = fake_open, .read_at = fake_read_at,
         .metadata = fake_metadata, .close = fake_close, .make_directory = fake_mkdir,
         .validate_private_regular = fake_private_file, .store_private_atomic = fake_store,
         .validate_private_directory = fake_private_directory, .unlink_relative = fake_unlink,
     };
+    hl_host_file_services file = file_template;
     persist_fake fake = {.input = (const unsigned char *)"cached", .input_size = 6};
     hl_host_services services = {.abi = HL_HOST_SERVICES_ABI, .size = sizeof(services), .context = &fake, .file = &file};
     void *data = NULL;
     size_t size = 0;
+    hl_persist_directory directory;
 
-    HL_CHECK(hl_persist_prepare(&services, "/tmp") == 1);
-    HL_CHECK(hl_persist_load(&services, "/tmp/cache", 64, &data, &size) == 1 && size == 6);
+    HL_CHECK(hl_persist_directory_open(&directory, &services, "/tmp", 1) == 1);
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 64, &data, &size) == 1 && size == 6);
     HL_CHECK(memcmp(data, "cached", 6) == 0);
     free(data);
 
     fake.trust_file = HL_STATUS_PERMISSION_DENIED;
-    HL_CHECK(hl_persist_load(&services, "/tmp/cache", 64, &data, &size) == 0 && data == NULL && size == 0);
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 64, &data, &size) == 0 && data == NULL && size == 0);
     fake.trust_file = HL_STATUS_OK;
     fake.truncate_read = 1;
-    HL_CHECK(hl_persist_load(&services, "/tmp/cache", 64, &data, &size) == 0 && data == NULL);
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 64, &data, &size) == 0 && data == NULL);
     fake.truncate_read = 0;
-    HL_CHECK(hl_persist_load(&services, "/tmp/cache", 5, &data, &size) == 0);
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 5, &data, &size) == 0);
 
-    HL_CHECK(hl_persist_store(&services, "/tmp/cache", "new", 3) == 1);
+    HL_CHECK(hl_persist_store_at(&directory, "cache", "new", 3) == 1);
     HL_CHECK(fake.published_size == 3 && memcmp(fake.published, "new", 3) == 0);
+    HL_CHECK(fake.opened_parent == 1);
+    file.store_private_atomic = NULL;
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 64, &data, &size) == 1 && size == 6);
+    free(data);
+    file.store_private_atomic = fake_store;
+    file.read_at = NULL;
+    HL_CHECK(hl_persist_store_at(&directory, "cache", "new", 3) == 1);
+    file.read_at = fake_read_at;
     fake.store_status = HL_STATUS_PLATFORM_FAILURE;
-    HL_CHECK(hl_persist_store(&services, "/tmp/cache", "bad", 3) == 0);
+    HL_CHECK(hl_persist_store_at(&directory, "cache", "bad", 3) == 0);
     HL_CHECK(fake.published_size == 3 && memcmp(fake.published, "new", 3) == 0);
+
+    HL_CHECK(hl_persist_store_at(&directory, "../cache", "bad", 3) == 0);
+    HL_CHECK(hl_persist_store_at(&directory, ".", "bad", 3) == 0);
+    HL_CHECK(hl_persist_store_at(&directory, "..", "bad", 3) == 0);
+    HL_CHECK(fake.published_size == 3 && memcmp(fake.published, "new", 3) == 0);
+    fake.close_status = HL_STATUS_PLATFORM_FAILURE;
+    HL_CHECK(hl_persist_load_at(&directory, "cache", 64, &data, &size) == 0);
+    fake.close_status = HL_STATUS_OK;
+    HL_CHECK(hl_persist_remove_at(&directory, "cache") == 1);
+    HL_CHECK(hl_persist_directory_close(&directory) == 1);
+    HL_CHECK(fake.opened_parent == 1 && fake.closed_parent == 1);
 
     fake.trust_directory = HL_STATUS_PERMISSION_DENIED;
-    HL_CHECK(hl_persist_store(&services, "/tmp/cache", "bad", 3) == 0);
-    fake.trust_directory = HL_STATUS_OK;
-    fake.close_status = HL_STATUS_PLATFORM_FAILURE;
-    HL_CHECK(hl_persist_load(&services, "/tmp/cache", 64, &data, &size) == 0);
+    HL_CHECK(hl_persist_directory_open(&directory, &services, "/tmp", 0) == 0);
+    HL_CHECK(directory.handle == HL_HOST_HANDLE_INVALID);
+    HL_CHECK(fake.opened_parent == 2 && fake.closed_parent == 2);
 
     const unsigned char cursor_data[] = {1, 2, 3};
     hl_persist_cursor cursor = {cursor_data, sizeof cursor_data, 0};

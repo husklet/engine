@@ -430,6 +430,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     }
     int ec = run_loaded(argc, argv, &lm, jump, at_base);
     pcache_save(); // exit via syscall 93 returns here; syscall 94 saves before _exit (idempotent atomic rename)
+    pcache_directory_close();
     return ec;
 }
 

@@ -872,6 +872,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     }
     int ec = run_loaded(argc, argv, &lm, jump, at_base);
     pcache_save(); // persist on a cold miss (guest exit via case 93 returns here; case 94 saves + _exit)
+    pcache_directory_close();
     return ec;
 }
 

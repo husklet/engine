@@ -68,6 +68,9 @@
 #define PC_LIB_SPAN (1ull << 38)          // 256 GB window (beyond it: no hint, kernel placement)
 #define PC_LIB_MAX 512                    // manifest entries persisted (beyond: unhinted, not cached)
 
+static hl_persist_directory g_pc_directory;
+static char g_pc_directory_path[1024];
+
 struct pc_hdr {
     uint64_t magic, version;
     uint64_t cpu_sz, map_n, ibtc_n;
@@ -129,19 +132,7 @@ static uint64_t g_pc_live_n;    // restored entries that went live at load (fixe
 static uint64_t g_pc_activated; // deferred entries activated by identity-matching library maps
 
 static uint64_t pcache_id_of(const char *path) {
-    hl_host_file_metadata metadata;
-    if (!hl_persist_metadata(&g_jit_services, path, &metadata)) return 0;
-    uint64_t h = 1469598103934665603ull; // FNV-1a over identity fields + path
-    uint64_t fields[4] = {metadata.stable_device, metadata.stable_object, metadata.size, metadata.modified_ns};
-    for (int i = 0; i < 4; i++) {
-        h ^= fields[i];
-        h *= 1099511628211ull;
-    }
-    for (const char *p = path; *p; p++) {
-        h ^= (uint8_t)*p;
-        h *= 1099511628211ull;
-    }
-    return h;
+    return hl_identity_source(&g_jit_services, path);
 }
 
 // A per-engine-build tag mixed into every cache id so the cache self-invalidates across hl versions:
@@ -171,11 +162,31 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
     return hl_identity_mix(a, b, pcache_engine_id(), pcache_argv0_id(argv0));
 }
 
-static void pcache_file(char *out, size_t n) {
+static int pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
     if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-x86_64";
-    (void)hl_persist_prepare(&g_jit_services, dir);
-    snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
+    if (g_pc_directory.handle != HL_HOST_HANDLE_INVALID && strcmp(g_pc_directory_path, dir) != 0) {
+        (void)hl_persist_directory_close(&g_pc_directory);
+        g_pc_directory_path[0] = 0;
+    }
+    if (g_pc_directory.handle == HL_HOST_HANDLE_INVALID &&
+        !hl_persist_directory_open(&g_pc_directory, &g_jit_services, dir, 1))
+        return 0;
+    if (!g_pc_directory_path[0]) {
+        int copied = snprintf(g_pc_directory_path, sizeof g_pc_directory_path, "%s", dir);
+        if (copied <= 0 || (size_t)copied >= sizeof g_pc_directory_path) {
+            (void)hl_persist_directory_close(&g_pc_directory);
+            g_pc_directory_path[0] = 0;
+            return 0;
+        }
+    }
+    int written = snprintf(out, n, "%016llx.pcache", (unsigned long long)g_pc_binid);
+    return written > 0 && (size_t)written < n;
+}
+
+static void pcache_directory_close(void) {
+    if (g_pc_directory.handle != HL_HOST_HANDLE_INVALID) (void)hl_persist_directory_close(&g_pc_directory);
+    g_pc_directory_path[0] = 0;
 }
 
 // ---- deterministic library-map hints + the identity manifest ----
@@ -257,8 +268,12 @@ static void pcache_note_libmap(uint64_t base, uint64_t len, const hl_host_file_m
 // ---- warm-stat sidecar ----
 static void pcache_warm_file(char *out, size_t n) {
     char p[1024];
-    pcache_file(p, sizeof p);
-    snprintf(out, n, "%s.warm", p);
+    if (!pcache_file(p, sizeof p)) {
+        if (n != 0) out[0] = 0;
+        return;
+    }
+    int written = snprintf(out, n, "%s.warm", p);
+    if (written <= 0 || (size_t)written >= n) out[0] = 0;
 }
 
 // Should this load be skipped as dead weight? Only when a PREVIOUS warm run of the SAME file generation
@@ -266,10 +281,11 @@ static void pcache_warm_file(char *out, size_t n) {
 static int pcache_warm_should_skip(const struct pc_hdr *h) {
     char wp[1200];
     pcache_warm_file(wp, sizeof wp);
+    if (!wp[0]) return 0;
     struct pc_warm w;
     void *data = NULL;
     size_t size = 0;
-    int ok = hl_persist_load(&g_jit_services, wp, sizeof w, &data, &size) && size == sizeof w;
+    int ok = hl_persist_load_at(&g_pc_directory, wp, sizeof w, &data, &size) && size == sizeof w;
     if (ok) memcpy(&w, data, sizeof w);
     free(data);
     if (!ok || w.magic != PC_WARM_MAGIC) return 0;
@@ -291,7 +307,7 @@ static void pcache_warm_note(void) {
     struct pc_warm w = {PC_WARM_MAGIC, g_pc_restored_arena, g_pc_restored_n, waste};
     char wp[1200];
     pcache_warm_file(wp, sizeof wp);
-    (void)hl_persist_store(&g_jit_services, wp, &w, sizeof w);
+    if (wp[0]) (void)hl_persist_store_at(&g_pc_directory, wp, &w, sizeof w);
     if (g_coldprof)
         fprintf(stderr, "[pcache] warm-note restored=%llu waste=%llu%s\n", (unsigned long long)g_pc_restored_n,
                 (unsigned long long)waste, waste * 2 >= g_pc_restored_n ? " (dead-weight: next run skips)" : "");
@@ -315,10 +331,10 @@ static void pcache_relocate(uint64_t saved_block_return) {
 static int pcache_load(uint64_t entry_jump) {
     if (g_force_base_failed) return 0; // #210: fixed-base map fell back -> live layout != file's baked base
     char path[1024];
-    pcache_file(path, sizeof path);
+    if (!pcache_file(path, sizeof path)) return 0;
     void *image = NULL;
     size_t image_size = 0;
-    if (!hl_persist_load(&g_jit_services, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
+    if (!hl_persist_load_at(&g_pc_directory, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
     hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
     if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
@@ -471,7 +487,7 @@ static void pcache_save(void) {
     for (uint32_t i = 0; i < JIT_MAP_N; i++)
         if (map_live(i) && (pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) nmap++;
     char path[1024];
-    pcache_file(path, sizeof path);
+    if (!pcache_file(path, sizeof path)) return;
     struct pc_hdr h;
     memset(&h, 0, sizeof h);
     h.magic = PC_MAGIC;
@@ -519,13 +535,13 @@ static void pcache_save(void) {
         w += h.arena_used;
         h.csum = hl_digest_bytes(HL_DIGEST_SEED, buf + sizeof h, total - sizeof h);
         memcpy(buf, &h, sizeof h);
-        ok = hl_persist_store(&g_jit_services, path, buf, total);
+        ok = hl_persist_store_at(&g_pc_directory, path, buf, total);
     }
     free(buf);
     if (ok) {
         char wp[1200];
         pcache_warm_file(wp, sizeof wp);
-        hl_persist_remove(&g_jit_services, wp); // old warm-stat no longer describes this generation
+        if (wp[0]) (void)hl_persist_remove_at(&g_pc_directory, wp); // old stat no longer describes this generation
     }
     if (g_coldprof)
         fprintf(stderr, "[pcache] save %s (%llu B arena, %llu blocks, %d libs) in %.3f ms\n", ok ? "ok" : "FAILED",

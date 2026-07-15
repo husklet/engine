@@ -3,68 +3,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int hl_persist_services(const hl_host_services *services) {
+static int hl_persist_file_abi(const hl_host_services *services) {
     return services != NULL && services->file != NULL && services->file->abi == HL_HOST_FILE_ABI &&
-           services->file->open_relative != NULL && services->file->read_at != NULL &&
-           services->file->metadata != NULL && services->file->close != NULL &&
-           services->file->make_directory != NULL && services->file->validate_private_regular != NULL &&
-           services->file->store_private_atomic != NULL && services->file->validate_private_directory != NULL;
+           services->file->size >= sizeof(*services->file);
 }
 
-static int hl_persist_parent(const hl_host_services *services, const char *path, hl_host_handle *parent,
-                             const char **name, size_t *name_size) {
-    const char *slash;
-    char directory[1024];
-    size_t directory_size;
-    hl_host_result opened;
-    if (path == NULL || parent == NULL || name == NULL || name_size == NULL) return 0;
-    slash = strrchr(path, '/');
-    if (slash == NULL || slash[1] == '\0') return 0;
-    directory_size = slash == path ? 1 : (size_t)(slash - path);
-    if (directory_size >= sizeof(directory)) return 0;
-    memcpy(directory, path, directory_size);
-    directory[directory_size] = '\0';
-    opened = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, directory, directory_size,
-                                           HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0, 0);
-    if (opened.status != HL_STATUS_OK) return 0;
-    if (services->file->validate_private_directory(services->context, opened.value).status != HL_STATUS_OK) {
-        (void)services->file->close(services->context, opened.value);
+static int hl_persist_leaf(const char *name, size_t *size) {
+    const char *cursor;
+    if (name == NULL || name[0] == 0 || size == NULL) return 0;
+    for (cursor = name; *cursor != 0; cursor++)
+        if (*cursor == '/') return 0;
+    if ((cursor - name == 1 && name[0] == '.') ||
+        (cursor - name == 2 && name[0] == '.' && name[1] == '.'))
         return 0;
-    }
-    *parent = opened.value;
-    *name = slash + 1;
-    *name_size = strlen(slash + 1);
+    *size = (size_t)(cursor - name);
     return 1;
 }
 
-int hl_persist_prepare(const hl_host_services *services, const char *directory) {
+int hl_persist_directory_open(hl_persist_directory *directory, const hl_host_services *services, const char *path,
+                              int create) {
     hl_host_result result;
-    if (!hl_persist_services(services) || directory == NULL || directory[0] == '\0') return 0;
-    result = services->file->make_directory(services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory), 0700);
-    /* Existing directories are expected; opening it no-follow proves the object is a directory. */
-    if (result.status != HL_STATUS_OK) {
-        result = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
-                                               HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW,
-                                               0, 0);
-        if (result.status != HL_STATUS_OK) return 0;
-        if (services->file->validate_private_directory(services->context, result.value).status != HL_STATUS_OK) {
-            (void)services->file->close(services->context, result.value);
-            return 0;
-        }
-        return services->file->close(services->context, result.value).status == HL_STATUS_OK;
-    }
-    result = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+    size_t path_size;
+    if (directory != NULL) *directory = (hl_persist_directory){0};
+    if (directory == NULL || !hl_persist_file_abi(services) || path == NULL || path[0] == 0 ||
+        services->file->open_relative == NULL || services->file->close == NULL ||
+        services->file->validate_private_directory == NULL || (create && services->file->make_directory == NULL))
+        return 0;
+    path_size = strlen(path);
+    if (create)
+        (void)services->file->make_directory(services->context, HL_HOST_HANDLE_CWD, path, path_size, 0700);
+    result = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, path, path_size,
                                            HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0, 0);
     if (result.status != HL_STATUS_OK) return 0;
-    int ok = services->file->validate_private_directory(services->context, result.value).status == HL_STATUS_OK;
-    if (services->file->close(services->context, result.value).status != HL_STATUS_OK) ok = 0;
-    return ok;
+    if (services->file->validate_private_directory(services->context, result.value).status != HL_STATUS_OK) {
+        (void)services->file->close(services->context, result.value);
+        return 0;
+    }
+    directory->services = services;
+    directory->handle = result.value;
+    return 1;
 }
 
-int hl_persist_load(const hl_host_services *services, const char *path, uint64_t limit, void **data, size_t *size) {
+int hl_persist_directory_close(hl_persist_directory *directory) {
+    hl_host_result result;
+    if (directory == NULL || directory->services == NULL || directory->handle == HL_HOST_HANDLE_INVALID) return 0;
+    result = directory->services->file->close(directory->services->context, directory->handle);
+    *directory = (hl_persist_directory){0};
+    return result.status == HL_STATUS_OK;
+}
+
+int hl_persist_load_at(const hl_persist_directory *directory, const char *name, uint64_t limit, void **data,
+                       size_t *size) {
     hl_host_result opened, result;
-    hl_host_handle parent;
-    const char *name;
     size_t name_size;
     hl_host_file_metadata metadata;
     unsigned char *bytes = NULL;
@@ -72,11 +62,16 @@ int hl_persist_load(const hl_host_services *services, const char *path, uint64_t
     int ok = 0;
     if (data != NULL) *data = NULL;
     if (size != NULL) *size = 0;
-    if (!hl_persist_services(services) || path == NULL || data == NULL || size == NULL) return 0;
-    if (!hl_persist_parent(services, path, &parent, &name, &name_size)) return 0;
-    opened = services->file->open_relative(services->context, parent, name, name_size,
+    if (directory == NULL || directory->services == NULL || directory->handle == HL_HOST_HANDLE_INVALID ||
+        data == NULL || size == NULL || !hl_persist_leaf(name, &name_size))
+        return 0;
+    const hl_host_services *services = directory->services;
+    if (services->file->open_relative == NULL || services->file->read_at == NULL ||
+        services->file->metadata == NULL || services->file->close == NULL ||
+        services->file->validate_private_regular == NULL)
+        return 0;
+    opened = services->file->open_relative(services->context, directory->handle, name, name_size,
                                            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
-    (void)services->file->close(services->context, parent);
     if (opened.status != HL_STATUS_OK) return 0;
     result = services->file->validate_private_regular(services->context, opened.value);
     if (result.status != HL_STATUS_OK) goto done;
@@ -101,27 +96,26 @@ done:
     return 1;
 }
 
-int hl_persist_store(const hl_host_services *services, const char *path, const void *data, size_t size) {
-    hl_host_handle parent;
-    const char *name;
+int hl_persist_store_at(const hl_persist_directory *directory, const char *name, const void *data, size_t size) {
     size_t name_size;
-    if (!hl_persist_services(services) || path == NULL || (size != 0 && data == NULL)) return 0;
-    if (!hl_persist_parent(services, path, &parent, &name, &name_size)) return 0;
-    hl_host_result result = services->file->store_private_atomic(
-        services->context, parent, name, name_size, (hl_host_const_bytes){data, size}, 0600);
-    if (services->file->close(services->context, parent).status != HL_STATUS_OK) return 0;
-    return result.status == HL_STATUS_OK;
+    if (directory == NULL || directory->services == NULL || directory->handle == HL_HOST_HANDLE_INVALID ||
+        (size != 0 && data == NULL) || !hl_persist_leaf(name, &name_size) ||
+        directory->services->file->store_private_atomic == NULL)
+        return 0;
+    return directory->services->file
+               ->store_private_atomic(directory->services->context, directory->handle, name, name_size,
+                                      (hl_host_const_bytes){data, size}, 0600)
+               .status == HL_STATUS_OK;
 }
 
-void hl_persist_remove(const hl_host_services *services, const char *path) {
-    hl_host_handle parent;
-    const char *name;
+int hl_persist_remove_at(const hl_persist_directory *directory, const char *name) {
     size_t name_size;
-    if (hl_persist_services(services) && services->file->unlink_relative != NULL &&
-        hl_persist_parent(services, path, &parent, &name, &name_size)) {
-        (void)services->file->unlink_relative(services->context, parent, name, name_size);
-        (void)services->file->close(services->context, parent);
-    }
+    if (directory == NULL || directory->services == NULL || directory->handle == HL_HOST_HANDLE_INVALID ||
+        !hl_persist_leaf(name, &name_size) || directory->services->file->unlink_relative == NULL)
+        return 0;
+    return directory->services->file
+               ->unlink_relative(directory->services->context, directory->handle, name, name_size)
+               .status == HL_STATUS_OK;
 }
 
 int hl_persist_take(hl_persist_cursor *cursor, void *output, size_t size) {
@@ -131,15 +125,4 @@ int hl_persist_take(hl_persist_cursor *cursor, void *output, size_t size) {
     if (size != 0) memcpy(output, cursor->data + cursor->offset, size);
     cursor->offset += size;
     return 1;
-}
-
-int hl_persist_metadata(const hl_host_services *services, const char *path, hl_host_file_metadata *metadata) {
-    hl_host_result opened, result;
-    if (!hl_persist_services(services) || path == NULL || metadata == NULL) return 0;
-    opened = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
-                                           HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
-    if (opened.status != HL_STATUS_OK) return 0;
-    result = services->file->metadata(services->context, opened.value, metadata);
-    if (services->file->close(services->context, opened.value).status != HL_STATUS_OK) return 0;
-    return result.status == HL_STATUS_OK;
 }

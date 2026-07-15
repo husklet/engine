@@ -138,6 +138,14 @@ IR blocks end with explicit terminators. Values refer only to valid prior defini
 Persistent cache identity includes every code-changing input: guest ISA, host ISA, IR ABI, codegen ABI, translator
 features, page assumptions, and relevant execution modes. A cache mismatch is a miss, never a best-effort load.
 
+Persistent artifacts use the typed File service only. The engine creates or opens the configured private cache
+directory once, validates it without following a final symlink, and pins that directory handle for the run. Every
+load, atomic publication, and removal is relative to that handle and accepts a single leaf name; absolute paths,
+slashes, `.` and `..` are rejected. Source identity is derived from a no-follow typed open plus stable metadata,
+change time, and the source path. A failed or concurrent publication cannot replace the last complete artifact, and
+an invalid or truncated artifact is handled as a cold miss. The pinned handle is closed during normal target
+teardown; process termination closes it on non-returning Linux exit paths.
+
 ### 3.4 Linux ABI (`src/linux_abi`)
 
 The Linux front is the sole owner of Linux behavior:
@@ -594,7 +602,8 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 
 - [ ] Remove the remaining unity-only dependencies from production target roots.
 - [ ] Route every production host operation through a typed host-service group.
-- [ ] Remove ambient file/mapping access from guest ELF and persistent-cache storage paths.
+- [ ] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
+      through a pinned typed File-service directory.
 - [ ] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes.
 - [ ] Add a Windows backend after macOS and Linux are complete and the common contract passes without POSIX leakage.
 

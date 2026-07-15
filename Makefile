@@ -370,9 +370,9 @@ $(BUILD)/tests/test_watch: tests/unit/test_watch.c $(BUILD)/lib/libhl-linux-abi.
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-linux-abi.a -o $@
 
-$(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
+$(BUILD)/tests/test_native: tests/unit/test_native.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_private: tests/unit/test_private.c $(BUILD)/lib/libhl-host-linux.a

@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include "../../src/core/target/native.h"
+#include "../../src/translator/persist.h"
 
 #include <string.h>
 #include <fcntl.h>
@@ -10,6 +11,42 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+typedef struct persist_stress {
+    hl_persist_directory *directory;
+    unsigned char value;
+    atomic_int *failed;
+} persist_stress;
+
+static void *persist_writer(void *opaque) {
+    persist_stress *stress = opaque;
+    unsigned char payload[257];
+    memset(payload, stress->value, sizeof payload);
+    for (int iteration = 0; iteration < 100; iteration++)
+        if (!hl_persist_store_at(stress->directory, "cache", payload, sizeof payload))
+            atomic_store(stress->failed, 1);
+    return NULL;
+}
+
+static void *persist_reader(void *opaque) {
+    persist_stress *stress = opaque;
+    for (int iteration = 0; iteration < 500; iteration++) {
+        void *data = NULL;
+        size_t size = 0;
+        if (!hl_persist_load_at(stress->directory, "cache", 1024, &data, &size) || size != 257) {
+            atomic_store(stress->failed, 1);
+            free(data);
+            continue;
+        }
+        unsigned char *bytes = data;
+        for (size_t index = 1; index < size; index++)
+            if (bytes[index] != bytes[0]) atomic_store(stress->failed, 1);
+        free(data);
+    }
+    return NULL;
+}
 
 int main(void) {
     hl_native_host *host = NULL;
@@ -79,6 +116,29 @@ int main(void) {
                      HL_STATUS_PERMISSION_DENIED);
         HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
         HL_CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+    }
+    {
+        char path[] = "/tmp/hl-persist-stress-XXXXXX";
+        hl_persist_directory directory;
+        pthread_t writers[4], reader;
+        atomic_int failed = 0;
+        persist_stress stress[4];
+        unsigned char initial[257];
+        memset(initial, 0x5a, sizeof initial);
+        HL_CHECK(mkdtemp(path) != NULL);
+        HL_CHECK(hl_persist_directory_open(&directory, &services, path, 0) == 1);
+        HL_CHECK(hl_persist_store_at(&directory, "cache", initial, sizeof initial) == 1);
+        for (int index = 0; index < 4; index++) {
+            stress[index] = (persist_stress){&directory, (unsigned char)(0x20 + index), &failed};
+            HL_CHECK(pthread_create(&writers[index], NULL, persist_writer, &stress[index]) == 0);
+        }
+        HL_CHECK(pthread_create(&reader, NULL, persist_reader, &stress[0]) == 0);
+        for (int index = 0; index < 4; index++) HL_CHECK(pthread_join(writers[index], NULL) == 0);
+        HL_CHECK(pthread_join(reader, NULL) == 0);
+        HL_CHECK(atomic_load(&failed) == 0);
+        HL_CHECK(hl_persist_remove_at(&directory, "cache") == 1);
+        HL_CHECK(hl_persist_directory_close(&directory) == 1);
+        HL_CHECK(rmdir(path) == 0); /* no temporary publication file leaked */
     }
     {
         char path[] = "/tmp/hl-native-watch-XXXXXX", moved[128];
