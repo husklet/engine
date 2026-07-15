@@ -1,9 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -39,8 +41,21 @@ int main(int argc, char **argv) {
     struct sigaction action = {0};
     struct timespec heartbeat = {0, 250000000};
     pid_t child;
+    int command = 1, capture_output = -1, capture_error = -1;
     int status = 0;
     if (argc < 2) return 125;
+    if (strcmp(argv[1], "--capture") == 0) {
+        if (argc < 5) return 125;
+        capture_output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        capture_error = open(argv[3], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (capture_output < 0 || capture_error < 0) {
+            if (capture_output >= 0) close(capture_output);
+            if (capture_error >= 0) close(capture_error);
+            if (capture_output >= 0) unlink(argv[2]);
+            return 125;
+        }
+        command = 4;
+    }
     action.sa_handler = cancel_handler;
     sigemptyset(&action.sa_mask);
     (void)sigaction(SIGTERM, &action, NULL);
@@ -52,9 +67,16 @@ int main(int argc, char **argv) {
     if (child < 0) return 125;
     if (child == 0) {
         (void)setpgid(0, 0);
-        execv(argv[1], &argv[1]);
+        if (capture_output >= 0 &&
+            (dup2(capture_output, STDOUT_FILENO) < 0 || dup2(capture_error, STDERR_FILENO) < 0))
+            _exit(126);
+        if (capture_output >= 0) close(capture_output);
+        if (capture_error >= 0) close(capture_error);
+        execv(argv[command], &argv[command]);
         _exit(127);
     }
+    if (capture_output >= 0) close(capture_output);
+    if (capture_error >= 0) close(capture_error);
     (void)setpgid(child, child);
     for (;;) {
         child_changed = 0;

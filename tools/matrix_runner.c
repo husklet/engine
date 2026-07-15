@@ -205,6 +205,37 @@ static int drain(int fd, unsigned char *buffer, size_t *size, size_t limit, int 
     }
 }
 
+static int read_capture(const char *path, unsigned char *buffer, size_t limit, size_t *size) {
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    *size = 0;
+    if (descriptor < 0) return 1;
+    while (*size < limit) {
+        ssize_t count = read(descriptor, buffer + *size, limit - *size);
+        if (count > 0) {
+            *size += (size_t)count;
+            continue;
+        }
+        if (count == 0) {
+            close(descriptor);
+            return 0;
+        }
+        if (errno != EINTR) break;
+    }
+    if (*size == limit) {
+        unsigned char extra;
+        ssize_t count;
+        do {
+            count = read(descriptor, &extra, 1);
+        } while (count < 0 && errno == EINTR);
+        if (count == 0) {
+            close(descriptor);
+            return 0;
+        }
+    }
+    close(descriptor);
+    return 1;
+}
+
 static void terminate(pid_t child) {
     (void)kill(-child, SIGKILL);
     (void)kill(child, SIGKILL);
@@ -386,7 +417,7 @@ static int make_config(const char *binary_root, const char *guest, const char *a
 static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
                      const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
-    char config_path[1024], scratch[1024], supervisor[1024];
+    char config_path[1024], scratch[1024], supervisor[1024], capture_output[1200], capture_error[1200];
     uint64_t deadline;
     pid_t child;
     memset(result, 0, sizeof(*result));
@@ -396,6 +427,11 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", binary_root) >= (int)sizeof scratch ||
         mkdtemp(scratch) == NULL)
         return 1;
+    if (snprintf(capture_output, sizeof capture_output, "%s/stdout", scratch) >= (int)sizeof capture_output ||
+        snprintf(capture_error, sizeof capture_error, "%s/stderr", scratch) >= (int)sizeof capture_error) {
+        remove_tree(scratch);
+        return 1;
+    }
     if (make_config(binary_root, guest, argument, rootfs, environment, scratch, config_path) != 0) {
         remove_tree(scratch);
         return 1;
@@ -424,7 +460,8 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]);
         close(error_pipe[1]);
-        execlp(bridge, bridge, supervisor, engine, "--configfile", config_path, (char *)NULL);
+        execlp(bridge, bridge, supervisor, "--capture", capture_output, capture_error, engine, "--configfile",
+               config_path, (char *)NULL);
         _exit(127);
     }
     (void)setpgid(child, child);
@@ -475,6 +512,12 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     }
     close(output_pipe[0]);
     close(error_pipe[0]);
+    if (read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size) != 0 ||
+        read_capture(capture_error, result->error, ERROR_MAX, &result->error_size) != 0) {
+        (void)unlink(config_path);
+        remove_tree(scratch);
+        return 1;
+    }
     (void)unlink(config_path); /* Engine normally unlinks immediately; covers pre-exec failure. */
     remove_tree(scratch);
     return 0;
