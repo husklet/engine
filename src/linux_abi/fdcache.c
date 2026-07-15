@@ -740,7 +740,7 @@ void hl_fdcache_generation_poll(void) {
         fsgen_flush();
 }
 
-void fd_setpath(int fd, const char *p) {
+void hl_fdcache_fd_setpath(int fd, const char *p) {
     if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && p && strlen(p) < HL_FDCACHE_PATH_CAPACITY)
         strcpy(g_fdcache.binding.fd_paths[fd], p);
 }

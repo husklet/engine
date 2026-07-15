@@ -2397,7 +2397,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (r < 0) r = dup(pfn); // anonymous/pipe/socket fd -> share the description
                 if (r >= 0) {
                     char tp[4200];
-                    if (hl_native_fd_path(r, tp, sizeof tp) == 0) fd_setpath(r, tp);
+                    if (hl_native_fd_path(r, tp, sizeof tp) == 0) hl_fdcache_fd_setpath(r, tp);
                 }
                 G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
                 break;
@@ -2494,7 +2494,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char gpa[4200];
                 int have_canon = hl_native_fd_path(r, gpa, sizeof gpa) == 0;
                 if (have_canon) {
-                    fd_setpath(r, gpa);
+                    hl_fdcache_fd_setpath(r, gpa);
                     if (isw) {
                         mc_evict(gpa);
                         rl_evict(gpa);
@@ -2553,7 +2553,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (r < 0 && errno == EMFILE) e = EMFILE;
                 if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
                 if (r >= 0) {
-                    fd_setpath(r, hostc);
+                    hl_fdcache_fd_setpath(r, hostc);
                     if (lf & 3) { // write-open: keep the metadata caches coherent (same as the walk path)
                         mc_evict(hostc);
                         rl_evict(hostc);
@@ -2623,7 +2623,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char gp[4200];
                 // canonical host path for tracking
                 if (hl_native_fd_path(r, gp, sizeof gp) == 0) {
-                    fd_setpath(r, gp);
+                    hl_fdcache_fd_setpath(r, gp);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         mc_evict(gp);
                         rl_evict(gp);
@@ -2649,7 +2649,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (r >= 0 && nf_new) newfile_stamp_fd(r);
         if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
         if (r >= 0) {
-            fd_setpath(r, p);
+            hl_fdcache_fd_setpath(r, p);
             if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                 mc_evict(p);
                 rl_evict(p);
