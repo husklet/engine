@@ -88,6 +88,12 @@ int main(void) {
         grown_directory_copy = duplicated.value;
         HL_CHECK(services.directory->remove(services.context, grown_directory_copy, DIRECTORY_WATCH_COUNT).status ==
                  HL_STATUS_OK);
+        HL_CHECK(services.directory
+                     ->add(services.context, directories[0], file.value, DIRECTORY_WATCH_COUNT,
+                           HL_HOST_DIRECTORY_MODIFY)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.directory->remove(services.context, directories[0], DIRECTORY_WATCH_COUNT).status ==
+                 HL_STATUS_OK);
     }
     for (size_t index = 0; index < COUNTER_COUNT; ++index) {
         hl_host_result created = services.counter->create(services.context, index, 0);
@@ -192,6 +198,8 @@ int main(void) {
     }
     for (size_t index = TIMER_COUNT; index != 0; --index)
         HL_CHECK(services.event->disarm_timer(services.context, events[0], index).status == HL_STATUS_OK);
+    HL_CHECK(services.event->arm_timer(services.context, events[0], 1, timer_deadline, 0).status == HL_STATUS_OK);
+    HL_CHECK(services.event->disarm_timer(services.context, events[0], 1).status == HL_STATUS_OK);
     for (size_t index = TRANSFER_PAIR_COUNT * 2; index != 0; --index)
         HL_CHECK(services.transfer->close(services.context, transfers[index - 1]).status == HL_STATUS_OK);
     {
