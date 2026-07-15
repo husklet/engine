@@ -3535,7 +3535,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (!hl_fdcache_access_lookup(p, &rc)) {
                 int r = faccessat(ATFD(a0), p, 0, 0);
                 rc = r < 0 ? -errno : 0;
-                ac_store(p, rc);
+                hl_fdcache_access_store(p, rc);
             }
             G_RET(c) = (uint64_t)(int64_t)rc;
             break;

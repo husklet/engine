@@ -340,7 +340,7 @@ int hl_fdcache_access_lookup(const char *p, int *rc) {
     return hit;
 }
 
-void ac_store(const char *p, int rc) {
+void hl_fdcache_access_store(const char *p, int rc) {
     if (!p || strlen(p) >= 176) return;
     CLK;
     uint64_t h = mc_hash(p);
