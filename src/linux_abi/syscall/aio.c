@@ -2,7 +2,7 @@
 // Canonical (aarch64) numbers 0-4; the x86-64 forms 206-210 are already remapped onto these by
 // sysmap.h (206->0,207->1,208->4,209->2,210->3), so this switch only sees the canonical numbers.
 // Returns 1 if nr was handled, 0 otherwise. Included by dispatch.c AFTER io.c/vfs.c (eventfd tables,
-// memf_materialize/fd_evict) and thread.c (host_range_mapped) -- same TU scope.
+// memf_materialize/hl_fdcache_fd_evict) and thread.c (host_range_mapped) -- same TU scope.
 //
 // macOS has no libaio / kernel-AIO. nginx:alpine (and mysql/mariadb innodb) call io_setup at worker
 // startup and treat ENOSYS as FATAL ("io_setup() failed"), so an unhandled syscall kills every worker.
@@ -152,14 +152,14 @@ static int64_t aio_do_one(const uint8_t *iocb) {
         if (nbytes && !host_range_mapped((uintptr_t)buf, (size_t)nbytes)) return -EFAULT;
         if (is_typed)
             return hl_linux_pwrite64(g_linux_box, typed.fd, (const void *)buf, (size_t)nbytes, (uint64_t)off);
-        fd_evict(fd);
+        hl_fdcache_fd_evict(fd);
         r = pwrite(fd, (const void *)buf, (size_t)nbytes, (off_t)off);
         return r < 0 ? -errno : r;
     case IOCB_CMD_PREADV:
     case IOCB_CMD_PWRITEV: {
         int niov = (int)nbytes; // for the *V ops aio_nbytes IS the iovec count, aio_buf the array base
         if (niov > 0 && !host_range_mapped((uintptr_t)buf, (size_t)niov * sizeof(struct iovec))) return -EFAULT;
-        if (op == IOCB_CMD_PWRITEV) fd_evict(fd);
+        if (op == IOCB_CMD_PWRITEV) hl_fdcache_fd_evict(fd);
         if (is_typed)
             return op == IOCB_CMD_PREADV
                        ? hl_linux_preadv(g_linux_box, typed.fd, (const hl_host_iovec *)(uintptr_t)buf, (uint32_t)niov,

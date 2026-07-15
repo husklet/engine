@@ -791,7 +791,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = 8;
             break;
         }
-        fd_evict(wfd);
+        hl_fdcache_fd_evict(wfd);
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking write in place (see case 63)
         do {
             r = write(wfd, (void *)a1, (size_t)a2);
@@ -874,7 +874,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        fd_evict((int)a0);
+        hl_fdcache_fd_evict((int)a0);
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking writev in place (see case 63)
         do {
             r = writev((int)a0, (void *)a1, (int)a2);
@@ -908,7 +908,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
-        fd_evict((int)a0);
+        hl_fdcache_fd_evict((int)a0);
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking pwrite in place (see case 63)
         do {
             r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
@@ -969,7 +969,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         memf_materialize(vfd);
         int fl = fcntl(vfd, F_GETFL);
         int to_pipe = (fl < 0) || ((fl & O_ACCMODE) != O_RDONLY); // write end -> user pages into the pipe
-        fd_evict(vfd);
+        hl_fdcache_fd_evict(vfd);
         ssize_t r = to_pipe ? writev(vfd, iv, niov) : readv(vfd, iv, niov);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -993,7 +993,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (len > 65536) len = 65536;
         static __thread char sb[65536];
         ssize_t n;
-        fd_evict(fout);
+        hl_fdcache_fd_evict(fout);
         if (a1) {
             n = pread(fin, sb, len, *(off_t *)a1);
         } else {
@@ -1024,7 +1024,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         size_t len = (size_t)a2;
         if (len > 65536) len = 65536;
         static __thread char sb[65536];
-        fd_evict(fout);
+        hl_fdcache_fd_evict(fout);
         // front of the source stream = existing pushback ++ kernel-buffered bytes
         size_t oldlen = (fin >= 0 && fin < HL_NFD) ? g_fd_pb_len[fin] : 0;
         if (oldlen > sizeof sb) oldlen = sizeof sb;
@@ -1612,7 +1612,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         if (poi) *poi = oi;
         if (poo) *poo = oo;
-        fd_evict(fdout);
+        hl_fdcache_fd_evict(fdout);
         G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
         break;
     }

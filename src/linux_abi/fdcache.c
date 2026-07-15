@@ -747,7 +747,7 @@ void hl_fdcache_fd_setpath(int fd, const char *p) {
         strcpy(g_fdcache.binding.fd_paths[fd], p);
 }
 
-void fd_evict(int fd) {
+void hl_fdcache_fd_evict(int fd) {
     if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && g_fdcache.binding.fd_paths[fd][0])
         hl_fdcache_metadata_evict(g_fdcache.binding.fd_paths[fd]);
 }

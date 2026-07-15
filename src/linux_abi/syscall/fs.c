@@ -1663,7 +1663,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int r = ftruncate((int)a0, (off_t)a1);
         if (r == 0 && have_before) filemap_resize((int)a0, (uint64_t)before.st_size, a1);
         if (bus_prepared) gbus_prepare_release();
-        fd_evict((int)a0);
+        hl_fdcache_fd_evict((int)a0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
         // ftruncate
@@ -1713,7 +1713,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // sparse-file, seal, and range-mode behavior.  The emulation below exists for hosts without
         // that syscall; using it here would incorrectly reject PUNCH_HOLE as unsupported.
         int native_result = fallocate(fd, mode, off, len), native_error = errno;
-        fd_evict(fd);
+        hl_fdcache_fd_evict(fd);
         G_RET(c) = native_result < 0 ? (uint64_t)(-(int64_t)native_error) : 0;
         break;
 #endif
@@ -1752,7 +1752,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
                 r = ok ? 0 : -1;
             }
-            fd_evict(fd);
+            hl_fdcache_fd_evict(fd);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
 #else
             G_RET(c) = (uint64_t)(-EOPNOTSUPP);
@@ -1785,7 +1785,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
                 p += k;
             }
-            fd_evict(fd);
+            hl_fdcache_fd_evict(fd);
             G_RET(c) = 0;
             break;
         }
@@ -1820,7 +1820,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            fd_evict(fd);
+            hl_fdcache_fd_evict(fd);
             G_RET(c) = 0;
             break;
         }
@@ -1866,7 +1866,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
                 p += k;
             }
-            fd_evict(fd);
+            hl_fdcache_fd_evict(fd);
             G_RET(c) = 0;
             break;
         }
@@ -1883,12 +1883,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
             }
-            fd_evict(fd);
+            hl_fdcache_fd_evict(fd);
             G_RET(c) = 0;
         }
         break;
     fallocate_done:
-        fd_evict(fd);
+        hl_fdcache_fd_evict(fd);
         break;
     }
     case 49: {
