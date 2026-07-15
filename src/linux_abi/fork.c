@@ -262,7 +262,8 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
         hl_option_unset("HL_PCACHE_DIR");
     }
     _exit(
-        hl_run_linux_guest(g_host_services, g_linux_box, g_srv_rootfs[0] ? g_srv_rootfs : NULL, (uint32_t)argc, argv));
+        hl_run_linux_guest(hl_target_services_effective(&g_target_services), g_linux_box,
+                           g_srv_rootfs[0] ? g_srv_rootfs : NULL, (uint32_t)argc, argv));
 }
 
 // ---- server ----
@@ -296,7 +297,9 @@ static int hl_server_main(int argc, char **argv) {
     // the old NODUALMAP single-mapping hack the x86 research forkserver needed.
 
     // Pay the expensive, per-launch-amortizable work ONCE.
-    container_init(rootfs);
+    if (hl_target_services_bind(&g_target_services) != 0) return 1;
+    hl_target_services_inject(&g_target_services, hl_target_services_bound(&g_target_services));
+    if (container_init(rootfs) != 0) return 1;
     if (engine_global_init()) return 1;
 
     if (prewarm && prewarm[0]) {
