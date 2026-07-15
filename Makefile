@@ -19,8 +19,18 @@ SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
 PERF_MAC_ARCH = $(shell $(MAC) uname -m)
+ifeq ($(HOST),linux)
+ifneq ($(filter aarch64 arm64,$(HOST_ARCH)),)
+AARCH64_LINUX_CC ?= $(CC)
+AARCH64_LINUX_AR ?= $(AR)
+else
 AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
 AARCH64_LINUX_AR ?= aarch64-linux-gnu-ar
+endif
+else
+AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
+AARCH64_LINUX_AR ?= aarch64-linux-gnu-ar
+endif
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
 AARCH64_DYNAMIC_LOADER ?= /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
 AARCH64_DYNAMIC_LIBC ?= /usr/lib/aarch64-linux-gnu/libc.so.6
