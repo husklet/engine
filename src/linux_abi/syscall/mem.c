@@ -40,7 +40,7 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
 // Mirror of hl_gmap_unmap_range for the DONTNEED private-anon registry: keep the surviving sub-region(s)
 // (with their prot) tracked so madvise(MADV_DONTNEED) still gives Linux semantics on what remains,
 // instead of forgetting the whole entry on a partial unmap. A non-anon range has no entry here and is
-// left untouched. gmap_add/anon_track append to their registries, and the appended tail starts at
+// left untouched. hl_gmap_add/anon_track append to their registries, and the appended tail starts at
 // uend so it never re-overlaps [ustart,uend) -- the loop terminates.
 static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
     for (int i = 0; i < g_nanonmap;) {

@@ -588,7 +588,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // RLIMIT_MEMLOCK (container is unprivileged, no CAP_IPC_LOCK): a soft limit of 0 refuses any lock
         // (can_do_mlock -> EPERM); with MCL_CURRENT, wiring the whole address space past the limit -> ENOMEM.
-        int rl = mlk_rlimit_gate_all();
+        int rl = hl_gmap_lock_limit_all();
         if (rl < 0 && ((f & 1u) || rl == -EPERM)) { // ENOMEM only bites MCL_CURRENT; EPERM bites either
             G_RET(c) = (uint64_t)(int64_t)rl;
             break;
