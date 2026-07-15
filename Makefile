@@ -1029,12 +1029,28 @@ $(BUILD)/linux-production/lifecycle/aarch64-runner.o: tools/lifecycle_e2e_runner
 	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_TEST_HOST_LINUX=1 -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 \
 		-O2 $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/linux-production/lifecycle/x86_64-runner.o: tools/lifecycle_e2e_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_TEST_HOST_LINUX=1 -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 \
+		-O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/linux-production/lifecycle/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_ENGINE_NO_MAIN=1 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-production/lifecycle/x86_64-target.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_ENGINE_NO_MAIN=1 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/tools/lifecycle-linux-aarch64: $(BUILD)/linux-production/lifecycle/aarch64-runner.o \
 	$(BUILD)/linux-production/lifecycle/aarch64-target.o $(BUILD)/linux-production/lifecycle/aarch64-core.o \
+	$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
+	$(BUILD)/lib/libhl-host-linux.a
+	@mkdir -p $(@D)
+	$(CC) -o $@ $^ -pthread -lm -ldl -latomic
+
+$(BUILD)/tools/lifecycle-linux-x86_64: $(BUILD)/linux-production/lifecycle/x86_64-runner.o \
+	$(BUILD)/linux-production/lifecycle/x86_64-target.o $(BUILD)/linux-production/lifecycle/x86_64-core.o \
 	$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
