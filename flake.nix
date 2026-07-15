@@ -19,7 +19,8 @@
             version = "0.1.0";
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
-            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
+              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools ];
             enableParallelBuilding = true;
 
             buildPhase = ''
@@ -40,7 +41,7 @@
             checkPhase = ''
               runHook preCheck
               make unit
-              make package-test
+              make package-test ${pkgs.lib.optionalString (system == "aarch64-darwin") "CODESIGN=:"}
               runHook postCheck
             '';
 
