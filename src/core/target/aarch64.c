@@ -169,7 +169,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 static void ckpt_poll(struct cpu *c);
 #define G_CKPT_POLL(c) ckpt_poll(c)
 // checkpoint.c's restore driver (included below) rebuilds the container from these, defined later in this TU.
-static void container_init(const char *rootfs);
+static int container_init(const char *rootfs);
 static int engine_global_init(void);
 // host trampoline + run_guest
 #include "../dispatch.c"
@@ -599,7 +599,7 @@ static void install_mach_exc(void) {
 // original order, with the identical operations in each phase.
 static int g_engine_inited;
 
-static void container_init(const char *rootfs) {
+static int container_init(const char *rootfs) {
     hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1
     if (rootfs) g_init_hostpid = getpid();
@@ -654,12 +654,7 @@ static void container_init(const char *rootfs) {
     }
     if (rootfs && rootfs[0]) {
         g_rootfs = (char *)rootfs;
-        if (!realpath(g_rootfs, g_rootfs_canon)) snprintf(g_rootfs_canon, sizeof g_rootfs_canon, "%s", g_rootfs);
-        // the immutable jail boundary for secure_resolve
-        g_rootfs_canon_len = strlen(g_rootfs_canon);
-        // pinned root for the per-component resolver
-        g_root_fd = open(g_rootfs_canon, O_RDONLY | O_DIRECTORY);
-        g_root_fd = engine_fd_hoist(g_root_fd); // keep it off the guest's low fds (else it squats fd 3)
+        if (root_handle_bind(g_rootfs) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         if (g_uid < 0) g_uid = 0;
@@ -670,7 +665,7 @@ static void container_init(const char *rootfs) {
         const char *icwd = hl_option_get("HL_CWD");
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     }
-    root_handle_bind(g_rootfs_canon[0] ? g_rootfs_canon : "/");
+    if (!rootfs && root_handle_bind("/") != 0) return -1;
     // bind-mount volumes: "[ro:]guestpath:hostdir,..." -- delegate to add_vol() (the shared vfs.c parser)
     // so the optional `ro:` read-only marker is handled in ONE place for both engines. Ingested regardless
     // of whether a rootfs is set (matching linux_x86_64.c): add_vol opens the HOST dir directly and the
@@ -686,6 +681,7 @@ static void container_init(const char *rootfs) {
     // derive the run user's supplementary group set from the image rootfs (runc additionalGids), after
     // g_uid/g_gid + the overlay lowers are resolved, so getgroups(2) and /proc/self/status Groups: report it.
     if (g_rootfs) container_parse_groups();
+    return 0;
 }
 
 // idempotent engine init (fault handlers + pthread key + code-cache arena + env-flag reads).
@@ -874,7 +870,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     // Read per invocation so a fork-server cold runner honors its typed launch configuration.
     g_pcache = hl_option_get("HL_PCACHE") != NULL;
     g_coldprof = 0;
-    container_init(rootfs);
+    if (container_init(rootfs) != 0) return 70;
     int irc = engine_global_init();
     if (irc) return irc;
     const char *prog = argv[0];

@@ -1207,20 +1207,49 @@ static hl_host_handle g_root_handle = HL_HOST_HANDLE_INVALID;
  * so absolute HOST_PATH opens do not fall back to the legacy native-fd lane.
  * Reinitialization (checkpoint/exec) replaces rather than leaks the old pin.
  */
-static void root_handle_bind(const char *path) {
+static int root_handle_bind(const char *path) {
     const hl_host_file_services *file;
+    const hl_host_posix_attachment_services *attachment;
     hl_host_result root;
+    hl_host_result canonical;
+    hl_host_result borrowed;
+    char canonical_path[sizeof g_rootfs_canon];
 
-    if (g_host_services == NULL || g_host_services->file == NULL) return;
+    if (g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->posix_attachment == NULL || path == NULL || path[0] == '\0')
+        return -1;
     file = g_host_services->file;
-    if (g_root_handle != HL_HOST_HANDLE_INVALID && file->close != NULL) {
-        file->close(g_host_services->context, g_root_handle);
-        g_root_handle = HL_HOST_HANDLE_INVALID;
-    }
-    if (file->open_relative == NULL || path == NULL || path[0] == '\0') return;
+    attachment = g_host_services->posix_attachment;
     root = file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
-                               HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
-    if (root.status == HL_STATUS_OK) g_root_handle = root.value;
+                               HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
+    if (root.status != HL_STATUS_OK) return -1;
+    canonical = file->path(g_host_services->context, root.value,
+                           (hl_host_bytes){(unsigned char *)canonical_path, sizeof(canonical_path) - 1});
+    if (canonical.status != HL_STATUS_OK || canonical.value >= sizeof(canonical_path)) goto fail_root;
+    canonical_path[canonical.value] = '\0';
+    borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 1u << 20);
+    if (borrowed.status != HL_STATUS_OK)
+        borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 64);
+    if (borrowed.status != HL_STATUS_OK || borrowed.value > INT_MAX) goto fail_root;
+    if (g_root_fd >= 0 && attachment->release(g_host_services->context, (uint64_t)(unsigned)g_root_fd).status !=
+                              HL_STATUS_OK)
+        goto fail_borrowed;
+    if (g_root_handle != HL_HOST_HANDLE_INVALID &&
+        file->close(g_host_services->context, g_root_handle).status != HL_STATUS_OK)
+        goto fail_borrowed;
+    g_root_handle = root.value;
+    g_root_fd = (int)borrowed.value;
+    if (g_rootfs != NULL) {
+        memcpy(g_rootfs_canon, canonical_path, (size_t)canonical.value + 1);
+        g_rootfs_canon_len = (size_t)canonical.value;
+    }
+    return 0;
+
+fail_borrowed:
+    (void)attachment->release(g_host_services->context, borrowed.value);
+fail_root:
+    (void)file->close(g_host_services->context, root.value);
+    return -1;
 }
 
 // Engine-private host fds (the rootfs dir-fd + each bind-mount volume dir-fd) share the guest's descriptor
