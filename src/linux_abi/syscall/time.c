@@ -105,6 +105,21 @@ static int engine_sleep_until_monotonic(const struct timespec *deadline) {
     return hl_production_clock_sleep_until(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, nanoseconds);
 }
 
+static int engine_sleep_until(clockid_t clock_id, const struct timespec *deadline) {
+    int service_clock;
+    uint64_t seconds = (uint64_t)deadline->tv_sec;
+    uint64_t nanoseconds = seconds > UINT64_MAX / UINT64_C(1000000000)
+                               ? UINT64_MAX
+                               : seconds * UINT64_C(1000000000) + (uint64_t)deadline->tv_nsec;
+    switch (clock_id) {
+    case CLOCK_REALTIME: service_clock = HL_PRODUCTION_CLOCK_REALTIME; break;
+    case CLOCK_MONOTONIC: service_clock = HL_PRODUCTION_CLOCK_MONOTONIC; break;
+    case CLOCK_PROCESS_CPUTIME_ID: service_clock = HL_PRODUCTION_CLOCK_PROCESS_CPU; break;
+    default: errno = EINVAL; return -1;
+    }
+    return hl_production_clock_sleep_until(effective_host_services(), service_clock, nanoseconds);
+}
+
 // Arm/re-arm slot `id` through the host event service. Caller holds g_gtimer_lk. value_ns is relative
 // to the current monotonic clock (zero means fire as soon as the host can schedule it).
 static int gtimer_arm(int id, uint64_t value_ns, uint64_t interval_ns) {
@@ -367,8 +382,16 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (clk == 3) {
+        if (clk == 3 || (clk >= 4 && clk <= 6)) {
             G_RET(c) = (uint64_t)(int64_t)(-95);
+            break;
+        }
+        if (clk == 8 || clk == 9) {
+            G_RET(c) = (uint64_t)(int64_t)(-EPERM);
+            break;
+        }
+        if (clk == 10) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
         // The request timespec is dereferenced by both paths below -> a bad pointer must EFAULT, not fault
@@ -393,21 +416,17 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             case 5: mc = CLOCK_REALTIME; break;
             default: mc = CLOCK_MONOTONIC; break; // 1/4/6/7 -> monotonic
             }
-            struct timespec now, d;
+            struct timespec now;
             int abs_intr = 0;
             // Loop on EINTR re-reading `now` each pass so a signal can't make the guest under-sleep:
             // recompute the remaining (deadline - now) against the ABSOLUTE deadline, not nanosleep's
             // own relative remainder, so accumulated scheduling slop never shortens the sleep.
             for (;;) {
                 engine_clock_gettime(mc, &now);
-                d.tv_sec = req->tv_sec - now.tv_sec;
-                d.tv_nsec = req->tv_nsec - now.tv_nsec;
-                if (d.tv_nsec < 0) {
-                    d.tv_sec--;
-                    d.tv_nsec += 1000000000L;
-                }
-                if (d.tv_sec < 0 || (d.tv_sec == 0 && d.tv_nsec <= 0)) break; // deadline passed
-                if (nanosleep(&d, NULL) == 0) break;
+                if (req->tv_sec < now.tv_sec ||
+                    (req->tv_sec == now.tv_sec && req->tv_nsec <= now.tv_nsec))
+                    break;
+                if (engine_sleep_until(mc, req) == 0) break;
                 if (errno != EINTR) break;                                // genuine host error -> stop
                 if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) break; // execve teardown: stop re-sleeping
                 // A deliverable guest signal must surface EINTR so the dispatcher runs the handler (Linux

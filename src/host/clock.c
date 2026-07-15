@@ -49,6 +49,7 @@ int hl_production_clock_sleep_until(const hl_host_services *services, int clock_
     case HL_PRODUCTION_CLOCK_MONOTONIC: kind = HL_HOST_CLOCK_MONOTONIC; break;
     case HL_PRODUCTION_CLOCK_REALTIME: kind = HL_HOST_CLOCK_REALTIME; break;
     case HL_PRODUCTION_CLOCK_RAW_MONOTONIC: kind = HL_HOST_CLOCK_RAW_MONOTONIC; break;
+    case HL_PRODUCTION_CLOCK_PROCESS_CPU: kind = HL_HOST_CLOCK_PROCESS_CPU; break;
     default: errno = EINVAL; return -1;
     }
     result = services->clock->sleep_until(services->context, kind, deadline_ns);

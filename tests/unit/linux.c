@@ -542,8 +542,11 @@ int main(void) {
         HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_MONOTONIC, deadline.value).status ==
                  HL_STATUS_OK);
         HL_CHECK(services.clock->monotonic_ns(services.context).value >= deadline.value);
-        HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_PROCESS_CPU, 0).status ==
-                 HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_PROCESS_CPU, 0).status == HL_STATUS_OK);
+        deadline = services.clock->realtime_ns(services.context);
+        HL_CHECK(deadline.status == HL_STATUS_OK);
+        HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_REALTIME, deadline.value).status ==
+                 HL_STATUS_OK);
 
         action.sa_handler = clock_interrupt_handler;
         HL_CHECK(sigemptyset(&action.sa_mask) == 0);

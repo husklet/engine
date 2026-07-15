@@ -853,6 +853,7 @@ static hl_host_result hl_linux_clock_sleep_until(void *context, uint32_t clock_k
     switch (clock_kind) {
     case HL_HOST_CLOCK_MONOTONIC: clock_id = CLOCK_MONOTONIC; break;
     case HL_HOST_CLOCK_REALTIME: clock_id = CLOCK_REALTIME; break;
+    case HL_HOST_CLOCK_PROCESS_CPU: clock_id = CLOCK_PROCESS_CPUTIME_ID; break;
     default: return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
     }
     deadline.tv_sec = (time_t)(deadline_ns / UINT64_C(1000000000));
