@@ -123,8 +123,11 @@ static int pt_is_execve(uint64_t nr) {
 #endif
 
 static void pt_usleep(long us) {
-    struct timespec t = {us / 1000000, (us % 1000000) * 1000};
-    nanosleep(&t, NULL);
+    const hl_host_services *host = effective_host_services();
+    uint64_t interval;
+    if (us <= 0 || host == NULL || host->clock == NULL || host->clock->backoff_ns == NULL) return;
+    interval = (uint64_t)us > UINT64_MAX / UINT64_C(1000) ? UINT64_MAX : (uint64_t)us * UINT64_C(1000);
+    (void)host->clock->backoff_ns(host->context, interval);
 }
 
 // guest pid for a host pid (container init's host pid shows through as guest pid 1)
