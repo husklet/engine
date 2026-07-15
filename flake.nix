@@ -111,9 +111,11 @@
               pkgs.clippy
             ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [
               linuxArm.stdenv.cc linuxArm.glibc.static
+              linuxArm.sqlite
               linuxX86.stdenv.cc linuxX86.glibc.static
             ] ++ pkgs.lib.optionals (system == "aarch64-linux") [
               pkgs.gcc pkgs.glibc.static
+              pkgs.sqlite
               linuxX86.stdenv.cc linuxX86.glibc.static
             ];
           } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
