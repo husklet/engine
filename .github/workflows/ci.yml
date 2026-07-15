@@ -13,7 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, ubuntu-24.04-arm]
+        include:
+          - runner: macos-26
+            nix_system: aarch64-darwin
+          - runner: ubuntu-24.04-arm
+            nix_system: aarch64-linux
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -26,8 +30,15 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Test engine
-        run: nix flake check --print-build-logs
+      - name: Test C package
+        run: nix build --print-build-logs .#checks.${{ matrix.nix_system }}.package
+
+      - name: Test Rust package
+        run: nix build --print-build-logs .#checks.${{ matrix.nix_system }}.rust
+
+      - name: Test Linux compatibility
+        if: runner.os == 'Linux'
+        run: nix build --print-build-logs .#checks.${{ matrix.nix_system }}.linux-typed
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
