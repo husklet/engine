@@ -30,21 +30,5 @@ static void fill_linux_stat(uint8_t *d, const struct stat *s, const char *hostpa
 }
 
 static void fill_linux_bound_stat(uint8_t *destination, const hl_linux_file_status *status) {
-    hl_linux_stat_record record = {0};
-    record.device = status->device;
-    record.object = status->object;
-    record.links = status->link_count;
-    record.special_device = status->special_device;
-    record.size = status->size;
-    record.blocks_512 = status->blocks_512;
-    record.accessed_seconds = (int64_t)(status->accessed_ns / UINT64_C(1000000000));
-    record.accessed_nanoseconds = status->accessed_ns % UINT64_C(1000000000);
-    record.modified_seconds = (int64_t)(status->modified_ns / UINT64_C(1000000000));
-    record.modified_nanoseconds = status->modified_ns % UINT64_C(1000000000);
-    record.changed_seconds = (int64_t)(status->changed_ns / UINT64_C(1000000000));
-    record.changed_nanoseconds = status->changed_ns % UINT64_C(1000000000);
-    record.mode = status->mode;
-    record.user = status->user;
-    record.group = status->group;
-    (void)hl_linux_stat_encode_aarch64(&record, destination, 128);
+    (void)hl_linux_stat_aarch64(status, destination, HL_LINUX_STAT_AARCH64_SIZE);
 }

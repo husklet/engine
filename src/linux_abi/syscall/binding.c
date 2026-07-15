@@ -380,19 +380,20 @@ static int bound_file_abi14(void) {
 }
 
 static void bound_fill_statfs(uint8_t *output, const hl_host_filesystem_metadata *metadata) {
-    memset(output, 0, 120);
-    *(int64_t *)(output + 0) = INT64_C(0x01021994);
-    *(uint64_t *)(output + 8) = metadata->block_size;
-    *(uint64_t *)(output + 16) = metadata->blocks;
-    *(uint64_t *)(output + 24) = metadata->blocks_free;
-    *(uint64_t *)(output + 32) = metadata->blocks_available;
-    *(uint64_t *)(output + 40) = metadata->files;
-    *(uint64_t *)(output + 48) = metadata->files_free;
-    *(uint32_t *)(output + 56) = (uint32_t)metadata->filesystem_id[0];
-    *(uint32_t *)(output + 60) = (uint32_t)metadata->filesystem_id[1];
-    *(uint64_t *)(output + 64) = metadata->name_max;
-    *(uint64_t *)(output + 72) = metadata->fragment_size;
-    *(uint64_t *)(output + 80) = metadata->flags;
+    const hl_linux_statfs_record record = {
+        .type = INT64_C(0x01021994),
+        .block_size = metadata->block_size,
+        .blocks = metadata->blocks,
+        .blocks_free = metadata->blocks_free,
+        .blocks_available = metadata->blocks_available,
+        .files = metadata->files,
+        .files_free = metadata->files_free,
+        .filesystem_id = {(uint32_t)metadata->filesystem_id[0], (uint32_t)metadata->filesystem_id[1]},
+        .name_max = metadata->name_max,
+        .fragment_size = metadata->fragment_size,
+        .flags = metadata->flags,
+    };
+    (void)hl_linux_statfs_encode(&record, output, HL_LINUX_STATFS_RECORD_SIZE);
 }
 
 static void bound_fill_statx(uint8_t *output, const hl_linux_file_status *status) {
@@ -489,7 +490,8 @@ static void bound_mapping_drop(bound_mapping *entry, bound_mapping *previous) {
     free(entry);
     if (--object->references == 0) {
         bound_watch_release(object->source);
-        (void)g_host_services->memory->release(g_host_services->context, object->handle);
+        if (object->handle != HL_HOST_HANDLE_INVALID)
+            (void)g_host_services->memory->release(g_host_services->context, object->handle);
         free(object);
     }
 }
@@ -608,6 +610,7 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         pthread_mutex_unlock(&g_bound_mapping_gate);
         return result;
     }
+    if ((flags & HL_HOST_MEMORY_FIXED) != 0) hl_exec_mapping_discard_range(mapped.address, mapped.mapped_size);
     object = calloc(1, sizeof(*object));
     entry = calloc(1, sizeof(*entry));
     if (object == NULL || entry == NULL) {
@@ -1675,6 +1678,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         pthread_mutex_lock(&g_bound_mapping_lock);
         bound_mapping *mapping = bound_mapping_find(a0, a1);
         if (mapping != NULL) {
+            if (mapping->object->handle == HL_HOST_HANDLE_INVALID) {
+                pthread_mutex_unlock(&g_bound_mapping_lock);
+                pthread_mutex_unlock(&g_bound_mapping_gate);
+                return 0;
+            }
             uint64_t offset = a0 - mapping->address;
             hl_host_result operation;
             /* Guest mprotect is modeled by the 4 KiB Linux VMA/SMC registries in svc_mem. Routing a
@@ -1699,6 +1707,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 operation = g_host_services->memory->sync(g_host_services->context, mapping->object->handle,
                                                           mapping->object_offset + offset, a1);
             if (operation.status == HL_STATUS_OK && nr == 215) {
+                hl_host_handle retired = mapping->object->handle;
+                mapping->object->handle = HL_HOST_HANDLE_INVALID;
+                (void)g_host_services->memory->discard(g_host_services->context, retired);
                 bound_mapping_retire(a0, a1);
                 gmap_split_unmap(a0, a0 + a1);
                 gbus_clear(a0, a0 + a1);

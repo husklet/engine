@@ -1571,23 +1571,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         uint64_t bavail = pseudo_zero ? 0 : (uint64_t)hs.f_bavail;
         uint64_t files = pseudo_zero ? 0 : (uint64_t)hs.f_files;
         uint64_t ffree = pseudo_zero ? 0 : (uint64_t)hs.f_ffree;
-        memset(b, 0, 120);
-        *(int64_t *)(b + 0) = f_type;              // f_type (Linux fs magic for the resolved mount)
-        *(int64_t *)(b + 8) = (int64_t)hs.f_bsize; // f_bsize
-        *(uint64_t *)(b + 16) = blocks;            // f_blocks
-        *(uint64_t *)(b + 24) = bfree;             // f_bfree
-        *(uint64_t *)(b + 32) = bavail;            // f_bavail
-        *(uint64_t *)(b + 40) = files;             // f_files
-        *(uint64_t *)(b + 48) = ffree;             // f_ffree
+        uint32_t fsid0, fsid1;
 #if defined(__linux__)
-        *(int32_t *)(b + 56) = hs.f_fsid.__val[0]; // f_fsid[0]
-        *(int32_t *)(b + 60) = hs.f_fsid.__val[1]; // f_fsid[1]
+        fsid0 = (uint32_t)hs.f_fsid.__val[0];
+        fsid1 = (uint32_t)hs.f_fsid.__val[1];
 #else
-        *(int32_t *)(b + 56) = hs.f_fsid.val[0]; // f_fsid[0]
-        *(int32_t *)(b + 60) = hs.f_fsid.val[1]; // f_fsid[1]
+        fsid0 = (uint32_t)hs.f_fsid.val[0];
+        fsid1 = (uint32_t)hs.f_fsid.val[1];
 #endif
-        *(int64_t *)(b + 64) = 255;                 // f_namelen (NAME_MAX)
-        *(int64_t *)(b + 72) = (int64_t)hs.f_bsize; // f_frsize
         // f_flags: Linux exposes the mount flags (ST_VALID + mount options). hl's mounts are all relatime;
         // the pseudo-fs + tmpfs mounts (/proc /sys /dev /dev/shm) are nosuid,nodev,noexec (per mountinfo).
         // Reporting 0 made ST_NOSUID/NODEV/NOEXEC/RDONLY probes see a false mount view.
@@ -1597,7 +1588,20 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (!strncmp(gpath, "/proc", 5) || !strncmp(gpath, "/sys", 4) || !strncmp(gpath, "/dev", 4))
                 f_flags |= 0x0002 | 0x0004 | 0x0008; // ST_NOSUID | ST_NODEV | ST_NOEXEC
         }
-        *(int64_t *)(b + 80) = f_flags; // f_flags
+        const hl_linux_statfs_record record = {
+            .type = f_type,
+            .block_size = (uint64_t)hs.f_bsize,
+            .blocks = blocks,
+            .blocks_free = bfree,
+            .blocks_available = bavail,
+            .files = files,
+            .files_free = ffree,
+            .filesystem_id = {fsid0, fsid1},
+            .name_max = 255,
+            .fragment_size = (uint64_t)hs.f_bsize,
+            .flags = (uint64_t)f_flags,
+        };
+        (void)hl_linux_statfs_encode(&record, b, HL_LINUX_STATFS_RECORD_SIZE);
         G_RET(c) = 0;
         break;
     }

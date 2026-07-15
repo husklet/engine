@@ -24,7 +24,24 @@ typedef struct hl_linux_stat_record {
 
 enum { HL_LINUX_STAT_RECORD_AARCH64_SIZE = 128, HL_LINUX_STAT_RECORD_X86_64_SIZE = 144 };
 
+typedef struct hl_linux_statfs_record {
+    int64_t type;
+    uint64_t block_size;
+    uint64_t blocks;
+    uint64_t blocks_free;
+    uint64_t blocks_available;
+    uint64_t files;
+    uint64_t files_free;
+    uint32_t filesystem_id[2];
+    uint64_t name_max;
+    uint64_t fragment_size;
+    uint64_t flags;
+} hl_linux_statfs_record;
+
+enum { HL_LINUX_STATFS_RECORD_SIZE = 120 };
+
 int hl_linux_stat_encode_aarch64(const hl_linux_stat_record *record, void *output, size_t output_size);
 int hl_linux_stat_encode_x86_64(const hl_linux_stat_record *record, void *output, size_t output_size);
+int hl_linux_statfs_encode(const hl_linux_statfs_record *record, void *output, size_t output_size);
 
 #endif

@@ -438,7 +438,9 @@ Production targets link common implementation from these archives instead of rec
 target. In particular, the resident fork-server's bounded argument/environment codec, exact stream transfer, and
 SCM_RIGHTS descriptor transport live in `libhl-linux-abi.a`; target roots retain only per-engine warm-image and JIT
 state. The transport rejects truncated or malformed ancillary data and closes received descriptors before returning
-an error.
+an error. Linux `stat` and `statfs` byte layouts are likewise encoded once in `libhl-linux-abi.a` from explicit,
+host-neutral records. Target code supplies ownership-virtualized native metadata but neither owns nor duplicates guest
+structure layouts.
 
 ## 8. Testing model
 
