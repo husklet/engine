@@ -1056,6 +1056,18 @@ $(BUILD)/tools/lifecycle-linux-x86_64: $(BUILD)/linux-production/lifecycle/x86_6
 	@mkdir -p $(@D)
 	$(CC) -o $@ $^ -pthread -lm -ldl -latomic
 
+.PHONY: test-linux-lifecycle
+test-linux-lifecycle: $(BUILD)/tools/lifecycle-linux-aarch64 $(BUILD)/tools/lifecycle-linux-x86_64 \
+	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
+	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64
+	$(BUILD)/tools/lifecycle-linux-aarch64 $(abspath $(BUILD)/e2e/guest-exit-aarch64); test $$? -eq 42
+	$(BUILD)/tools/lifecycle-linux-x86_64 $(abspath $(BUILD)/e2e/guest-exit-x86_64); test $$? -eq 42
+	$(BUILD)/tools/lifecycle-linux-aarch64 --clock-spy $(abspath $(BUILD)/e2e/clock-injected-aarch64)
+	$(BUILD)/tools/lifecycle-linux-x86_64 --clock-spy $(abspath $(BUILD)/e2e/clock-injected-x86_64)
+	$(BUILD)/tools/lifecycle-linux-aarch64 --force-stop $(abspath $(BUILD)/e2e/guest-spin-aarch64)
+	$(BUILD)/tools/lifecycle-linux-x86_64 --force-stop $(abspath $(BUILD)/e2e/guest-spin-x86_64)
+
 $(BUILD)/linux-production/hl-engine-linux-aarch64: $(BUILD)/linux-production/target/aarch64.o \
 	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
