@@ -825,9 +825,11 @@ static void stw_force_dispatch_flush(void) {
         if (pthread_equal(g_stw_threads[i].th, me)) {
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
         } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire)) {
-            /* Only the target thread's signal handler writes its non-atomic cpu->irq.
-               A cross-thread store here would be a C data race with emitted loads. */
-            pthread_kill(g_stw_threads[i].th, STW_SIG);
+            /* The emitted poll observes this aligned word directly.  The
+               thread-directed signal path uses the same atomic publication;
+               avoiding a host signal also avoids constructing an asynchronous
+               frame while guest registers are live in translated code. */
+            if (g_stw_threads[i].cpu) __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
         }
     }
     for (;;) {
@@ -867,8 +869,9 @@ static void stw_mapping_begin(void) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
         if (pthread_equal(g_stw_threads[i].th, me))
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
-        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire))
-            pthread_kill(g_stw_threads[i].th, STW_SIG);
+        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
+                 g_stw_threads[i].cpu)
+            __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
     }
     for (;;) {
         int pending = 0;
