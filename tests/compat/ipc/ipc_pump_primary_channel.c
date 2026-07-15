@@ -42,7 +42,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +74,7 @@ static int g_waitable;                // eventfd: cross-thread WaitableEvent, IO
 static _Atomic long g_processed = 0;  // messages the MAIN pump has dispatched + processed
 static _Atomic long g_recvd = 0;      // messages the IO pump has recv'd off the primary channel
 static _Atomic int  g_done = 0;
+static _Atomic int  g_main_ready = 0;
 
 static int recv_fd(int sock) {
     char b;
@@ -107,6 +110,7 @@ static void *main_pump(void *arg) {
     (void)arg;
     struct epoll_event out[8];
     long acked = 0;
+    atomic_store(&g_main_ready, 1);
     while (!atomic_load(&g_done)) {
         int n = epoll_wait(g_main_ep, out, 8, 500);
         if (n <= 0) continue; // timeout: watchdog owns liveness; loop re-checks g_done
@@ -161,9 +165,17 @@ static void *watchdog(void *arg) {
         nanosleep(&ts, NULL);
         long p = atomic_load(&g_processed);
         if (p >= ROUNDS || atomic_load(&g_done)) return NULL;
-        if (p == last) {
+        long received = atomic_load(&g_recvd);
+        struct pollfd primary = {.fd = g_primary, .events = POLLIN};
+        int primary_pending = poll(&primary, 1, 0) > 0 && (primary.revents & POLLIN) != 0;
+        // A quiet pump is not stalled merely because the independently scheduled coordinator has not
+        // supplied its first message yet.  That happened under two concurrent production matrices: the
+        // watchdog ran twice before the coordinator/IO pump, observed 0/0, and emitted the misleading
+        // "work pending" verdict.  Require direct evidence of pending work while progress is unchanged:
+        // either the IO pump has handed work to the main pump, or the primary channel is readable.
+        if (p == last && (received > p || primary_pending)) {
             fprintf(stderr, "STALL processed=%ld recvd=%ld/%d (worker pump parked with work pending)\n",
-                    p, atomic_load(&g_recvd), ROUNDS);
+                    p, received, ROUNDS);
             fflush(stderr);
             _exit(7); // lost wake: a pump is dormant with a message pending — the worker-dormancy shape
         }
@@ -210,9 +222,16 @@ static int child_main(void) {
     epoll_ctl(g_main_ep, EPOLL_CTL_ADD, g_waitable, &we);
 
     pthread_t mp, ch[NCHURN], wd;
-    pthread_create(&mp, NULL, main_pump, NULL);
-    for (int i = 0; i < NCHURN; i++) pthread_create(&ch[i], NULL, churn_thread, NULL);
-    pthread_create(&wd, NULL, watchdog, NULL);
+    if (pthread_create(&mp, NULL, main_pump, NULL) != 0) return 32;
+    for (int i = 0; i < NCHURN; i++)
+        if (pthread_create(&ch[i], NULL, churn_thread, NULL) != 0) return 33;
+
+    // pthread_create only makes the pump runnable; it does not prove the new thread has executed. The
+    // coordinator must not stream work until the main pump is genuinely live. Without this barrier a
+    // loaded host could let the IO thread consume all input before scheduling main_pump, contradicting
+    // the readiness byte's promise that "both pumps are up" and yielding a false processed=0 verdict.
+    while (!atomic_load(&g_main_ready)) sched_yield();
+    if (pthread_create(&wd, NULL, watchdog, NULL) != 0) return 34;
 
     // Tell the coordinator the primary channel is received + armed and both pumps are up.
     char rdy = 'R';
@@ -266,6 +285,9 @@ static int child_main(void) {
     atomic_store(&g_done, 1);
     uint64_t one = 1; if (write(g_waitable, &one, 8) != 8) { /* wake main to exit */ }
     long p = atomic_load(&g_processed);
+    if (p != ROUNDS)
+        fprintf(stderr, "primary-pump final processed=%ld recvd=%ld main-ready=%d\n", p, atomic_load(&g_recvd),
+                atomic_load(&g_main_ready));
     printf("child primary-pump rounds=%ld/%d ok=%d\n", p, ROUNDS, p == ROUNDS);
     return p == ROUNDS ? 0 : 30;
 }

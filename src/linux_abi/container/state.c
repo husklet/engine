@@ -50,6 +50,21 @@ static _Atomic int g_pids_cur = 1;
 static _Atomic unsigned long long g_forks_since_boot = 0;
 // PID ns: host pid of the container init -> guest sees it as PID 1
 static int g_init_hostpid = 0;
+// Stable host-side identity for filesystem-backed IPC objects. It is minted once per standalone engine
+// launch (or supplied as HL_NETNS for related launches) and inherited across guest fork/exec.
+static char g_namespace_key[40];
+
+static void namespace_key_set(const char *key) {
+    // Hash the externally supplied namespace key into a path-safe, fixed-size identity. Equal keys must
+    // deliberately meet; different keys must not alias, and path punctuation must never escape /tmp.
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const unsigned char *cursor = (const unsigned char *)key;
+    while (*cursor) {
+        hash ^= *cursor++;
+        hash *= UINT64_C(1099511628211);
+    }
+    snprintf(g_namespace_key, sizeof g_namespace_key, "%016llx", (unsigned long long)hash);
+}
 
 // ===================== cross-engine-process cgroup accounting (pids + memory) =====================
 // A container's guest processes are SEPARATE host processes (a guest fork() is a real host fork()), so

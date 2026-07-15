@@ -7,15 +7,19 @@
 // cross-container /tmp collision -- two `postgres` containers no longer alias the same DSM segment), it is
 // VISIBLE to `ls /dev/shm`/stat/df through the normal overlay machinery (the file physically sits in the
 // upper), and it is cleared when the container rootfs is torn down -- matching docker's per-container tmpfs.
-// In direct (no-rootfs) mode there is no container to scope to, so fall back to a flat /tmp file. Embedded
-// slashes in <name> are flattened so a segment can never escape the shm dir (glibc forbids them anyway).
+// In direct (no-rootfs) mode use the engine's private namespace identity. The key is minted uniquely for
+// every standalone launch and inherited by its fork/exec descendants; an explicitly supplied HL_NETNS lets
+// related launches (docker-exec shape) share it.  A former flat /tmp filename made independent engine
+// instances alias the same POSIX shm/named-sem object during concurrent matrices. Embedded slashes in
+// <name> are flattened so a segment can never escape the shm dir (glibc forbids them anyway).
 // Returns buf, or NULL when `guest` is not a "/dev/shm/<name>" path. g_rootfs_canon is defined in vfs.c,
 // which is #included ahead of this file in the unity TU.
 static const char *shm_backing_path(const char *guest, char *buf, size_t n) {
     if (!guest || guest[0] != '/' || strncmp(guest, "/dev/shm/", 9)) return NULL;
     const char *name = guest + 9;
-    int pfx = g_vfs_namespace.root_canonical[0] ? snprintf(buf, n, "%s/dev/shm/", g_vfs_namespace.root_canonical)
-                                                : snprintf(buf, n, "/tmp/.hl-shm-");
+    int pfx = g_vfs_namespace.root_canonical[0]
+                  ? snprintf(buf, n, "%s/dev/shm/", g_vfs_namespace.root_canonical)
+                  : snprintf(buf, n, "/tmp/.hl-shm-%s-", g_namespace_key[0] ? g_namespace_key : "unscoped");
     if (pfx < 0 || pfx >= (int)n - 1) return NULL;
     int m = pfx + snprintf(buf + pfx, n - (size_t)pfx, "%s", name);
     if (m > (int)n - 1) m = (int)n - 1;

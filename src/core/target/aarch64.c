@@ -582,6 +582,7 @@ static void container_init(const char *rootfs) {
                 snprintf(key, sizeof key, "%.39s", nn);
             else
                 snprintf(key, sizeof key, "%d", (int)getpid());
+            namespace_key_set(key);
             snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", key);
             // Export the minted key so children/exec + abstract-AF_UNIX/IPC/bridge share this
             // container's namespace (hl_option_get("HL_NETNS")); a daemon-supplied key is already in the env.
