@@ -3,7 +3,7 @@ AR ?= ar
 INSTALL ?= install
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
-HOST ?= linux
+HOST ?= $(if $(filter Darwin,$(shell uname -s)),macos,linux)
 PREFIX ?= /usr/local
 DESTDIR ?=
 VERSION := 0.1.0
@@ -1210,10 +1210,18 @@ $(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_AR) rcs $@ $^
 
-.PHONY: package-embedded
-package-embedded: $(BUILD)/package/macos-aarch64/libhl-engine.a \
-	$(BUILD)/package/linux-aarch64/libhl-engine.a $(BUILD)/package/macos-aarch64/link-test \
+.PHONY: package-embedded package-embedded-macos package-embedded-linux
+package-embedded-macos: $(BUILD)/package/macos-aarch64/libhl-engine.a \
+	$(BUILD)/package/macos-aarch64/link-test
+
+package-embedded-linux: $(BUILD)/package/linux-aarch64/libhl-engine.a \
 	$(BUILD)/package/linux-aarch64/link-test
+
+ifeq ($(HOST),macos)
+package-embedded: package-embedded-macos
+else
+package-embedded: package-embedded-linux
+endif
 
 $(BUILD)/package/macos-aarch64/link-test: tools/dual_backend_e2e_runner.c \
 	$(BUILD)/package/macos-aarch64/libhl-engine.a packaging/macos/jit.entitlements
