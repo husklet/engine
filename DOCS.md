@@ -647,7 +647,9 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 
 ### Performance and release
 
-- [ ] Establish reproducible native, mac-host, and Linux-host baseline distributions.
+- [x] Establish reproducible native, mac-host, and Linux-host baseline distributions. The C performance runner emits
+      cold, minimum, median, p90, p99, maximum, and mean with host identity; `perf-native-aarch64`, `perf-macos`, and
+      `perf-linux` exercise release fixtures, both production guest ISAs where applicable, and bounded resources.
 - [ ] Add tracked thresholds for cold start, warm start, translation, syscall, fork/exec, IPC, and memory overhead.
 - [ ] Run long soak and application-level Linux workloads without leaks or unbounded growth.
 - [x] Verify release binaries contain no active debug logging and require no diagnostic environment flags.
