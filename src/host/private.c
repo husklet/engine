@@ -264,7 +264,13 @@ int hl_host_process_fd_private_fork_prepare(void) {
     hl_private_fork_cells = NULL;
     hl_private_fork_count = 0;
     size_t capacity = 0;
-    uint64_t epoch = hl_private_epoch ? atomic_load_explicit(hl_private_epoch, memory_order_acquire) : 0;
+    /* Only this process's row belongs to the fork snapshot.  Other engine
+       processes legitimately mutate the shared registry at any time; a
+       registry-wide epoch check made those unrelated changes surface as a
+       spurious guest fork EAGAIN.  The row generation and identity checks
+       below detect every mutation that can affect this snapshot, while the
+       process-local fork lock serializes this process's own descriptor
+       mutations until fork_complete. */
     for (unsigned record = 0; record < HL_PRIVATE_PROCESSES; ++record) {
         hl_private_process *process = &hl_private[record];
         if (atomic_load_explicit(&process->state, memory_order_acquire) != HL_PRIVATE_LIVE ||
@@ -300,13 +306,6 @@ int hl_host_process_fd_private_fork_prepare(void) {
             (void)pthread_mutex_unlock(&hl_private_fork_lock);
             return -EAGAIN;
         }
-    }
-    if (hl_private_epoch && atomic_load_explicit(hl_private_epoch, memory_order_acquire) != epoch) {
-        free(hl_private_fork_cells);
-        hl_private_fork_cells = NULL;
-        hl_private_fork_count = 0;
-        (void)pthread_mutex_unlock(&hl_private_fork_lock);
-        return -EAGAIN;
     }
     hl_private_pid = pid;
     hl_private_start = start;

@@ -122,8 +122,10 @@ int main(void) {
 
     // (1) two racing writers, each doing N locked increments.
     pid_t a = fork();
+    if (a < 0) { perror("poslk fork a"); return 2; }
     if (a == 0) worker(path, diag, 0);
     pid_t b = fork();
+    if (b < 0) { perror("poslk fork b"); return 2; }
     if (b == 0) worker(path, diag, 1);
     int ast = 0, bst = 0;
     if (waitpid(a, &ast, 0) != a || waitpid(b, &bst, 0) != b || !WIFEXITED(ast) || WEXITSTATUS(ast) != 0 ||

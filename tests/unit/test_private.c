@@ -9,8 +9,13 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x1000
+#endif
 
 enum {
     TEST_FD = 173,
@@ -278,6 +283,51 @@ failed:
     return -1;
 }
 
+static int test_unrelated_process_mutation_does_not_abort_fork(void) {
+    struct shared_state {
+        _Atomic int ready;
+        _Atomic int stop;
+    } *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) return -1;
+    int added = 0;
+    for (; added < SPILL_FD_COUNT; ++added)
+        if (hl_host_process_fd_private_add(SPILL_FD_BASE + added) != 0) break;
+    if (added != SPILL_FD_COUNT) goto failed;
+    pid_t mutator = fork();
+    if (mutator < 0) goto failed;
+    if (mutator == 0) {
+        atomic_store_explicit(&shared->ready, 1, memory_order_release);
+        while (!atomic_load_explicit(&shared->stop, memory_order_acquire)) {
+            if (hl_host_process_fd_private_add(OTHER_FD) != 0) _exit(2);
+            hl_host_process_fd_private_remove(OTHER_FD);
+        }
+        _exit(0);
+    }
+    while (!atomic_load_explicit(&shared->ready, memory_order_acquire)) sched_yield();
+    int ok = 1;
+    for (int round = 0; round < 2000; ++round) {
+        if (hl_host_process_fd_private_fork_prepare() != 0) {
+            ok = 0;
+            break;
+        }
+        if (hl_host_process_fd_private_fork_complete(0) != 0) {
+            ok = 0;
+            break;
+        }
+    }
+    atomic_store_explicit(&shared->stop, 1, memory_order_release);
+    int status = 0;
+    ok = ok && waitpid(mutator, &status, 0) == mutator && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    munmap(shared, sizeof(*shared));
+    return ok ? 0 : -1;
+failed:
+    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    munmap(shared, sizeof(*shared));
+    return -1;
+}
+
 int main(void) {
     HL_CHECK(test_refcounts_and_reuse() == 0);
     HL_CHECK(test_fork_snapshot() == 0);
@@ -285,5 +335,6 @@ int main(void) {
     HL_CHECK(test_worker_thread_fork() == 0);
     HL_CHECK(test_mutation_serialized_across_fork() == 0);
     HL_CHECK(test_cell_spill_and_child_replay() == 0);
+    HL_CHECK(test_unrelated_process_mutation_does_not_abort_fork() == 0);
     return 0;
 }
