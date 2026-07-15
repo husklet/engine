@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,8 @@ struct options {
     const char *host_arch;
     unsigned long warmups;
     unsigned long samples;
+    unsigned long max_cold_us;
+    unsigned long max_p99_us;
     int expected_exit;
     char **command;
 };
@@ -53,7 +56,8 @@ static int parse_ulong(const char *text, unsigned long minimum, unsigned long ma
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s --label NAME [--host-os NAME] [--host-release NAME] [--host-arch NAME] "
-            "[--warmups N] [--samples N] [--expect CODE] -- COMMAND [ARG ...]\n",
+            "[--warmups N] [--samples N] [--expect CODE] [--max-cold-us N] [--max-p99-us N] "
+            "-- COMMAND [ARG ...]\n",
             program);
 }
 
@@ -65,6 +69,8 @@ static int parse_options(int argc, char **argv, struct options *options) {
     options->host_arch = NULL;
     options->warmups = 3;
     options->samples = 25;
+    options->max_cold_us = 0;
+    options->max_p99_us = 0;
     options->expected_exit = 0;
     options->command = NULL;
     for (i = 1; i < argc; ++i) {
@@ -90,6 +96,10 @@ static int parse_options(int argc, char **argv, struct options *options) {
             unsigned long value;
             if (parse_ulong(argv[++i], 0, 255, &value) != 0) return -1;
             options->expected_exit = (int)value;
+        } else if (strcmp(argv[i], "--max-cold-us") == 0) {
+            if (parse_ulong(argv[++i], 1, ULONG_MAX / 1000UL, &options->max_cold_us) != 0) return -1;
+        } else if (strcmp(argv[i], "--max-p99-us") == 0) {
+            if (parse_ulong(argv[++i], 1, ULONG_MAX / 1000UL, &options->max_p99_us) != 0) return -1;
         } else {
             return -1;
         }
@@ -142,6 +152,7 @@ int main(int argc, char **argv) {
     uint64_t ignored;
     long double sum = 0.0L;
     unsigned long i;
+    uint64_t p99;
 
     if (parse_options(argc, argv, &options) != 0) {
         usage(argv[0]);
@@ -158,6 +169,7 @@ int main(int argc, char **argv) {
         sum += (long double)values[i];
     }
     qsort(values, options.samples, sizeof(*values), compare_u64);
+    p99 = values[percentile_index(options.samples, 99)];
     if (uname(&host) != 0) {
         (void)strcpy(host.sysname, "unknown");
         (void)strcpy(host.release, "unknown");
@@ -172,9 +184,17 @@ int main(int argc, char **argv) {
            (unsigned long long)(cold / 1000), (unsigned long long)(values[0] / 1000),
            (unsigned long long)(values[percentile_index(options.samples, 50)] / 1000),
            (unsigned long long)(values[percentile_index(options.samples, 90)] / 1000),
-           (unsigned long long)(values[percentile_index(options.samples, 99)] / 1000),
+           (unsigned long long)(p99 / 1000),
            (unsigned long long)(values[options.samples - 1] / 1000), sum / (long double)options.samples / 1000.0L,
            options.command[0]);
+    if ((options.max_cold_us != 0 && cold > (uint64_t)options.max_cold_us * UINT64_C(1000)) ||
+        (options.max_p99_us != 0 && p99 > (uint64_t)options.max_p99_us * UINT64_C(1000))) {
+        fprintf(stderr, "perf-runner: metric %s exceeded threshold (cold=%llu/%luus p99=%llu/%luus)\n",
+                options.label, (unsigned long long)(cold / 1000), options.max_cold_us,
+                (unsigned long long)(p99 / 1000), options.max_p99_us);
+        free(values);
+        return 1;
+    }
     free(values);
     return 0;
 
