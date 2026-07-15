@@ -54,6 +54,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c \
 	src/translator/guest/x86_64/rotate.c \
 	src/translator/guest/x86_64/x87math.c \
+	src/translator/guest/x86_64/operand.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
@@ -142,7 +143,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services rotate shm system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87math xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan operand persist pipe pipe_linux placement private process range resolve resolve_services rotate shm system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87math xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a

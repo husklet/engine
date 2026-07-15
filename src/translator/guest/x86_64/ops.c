@@ -8,15 +8,6 @@
 // carries the direction flag (DF, bit 11), taken from the runtime cpu->df when not statically known:
 // DF=0 scans low->high (fast host memcmp/memchr paths), DF=1 (after `std`/popfq) scans high->low via
 // the generic per-element loop.
-static uint64_t repstr_rd(uint64_t p, int w) {
-    switch (w) {
-    case 1: return *(uint8_t *)p;
-    case 2: return *(uint16_t *)p;
-    case 4: return *(uint32_t *)p;
-    default: return *(uint64_t *)p;
-    }
-}
-
 // width-w (a-b) flags -> ARM NZCV, in the engine's borrow convention (stored C = NOT x86 CF),
 // byte-identical to what do_alu()/SUBS produces for a normal cmp of the same width.
 static uint64_t repstr_nzcv(uint64_t a, uint64_t b, int w) {
@@ -94,38 +85,38 @@ static void do_repstr(struct cpu *c) {
                 k = n;
             else {
                 size_t i = 0;
-                while (repstr_rd(rsi + i * w, w) == repstr_rd(rdi + i * w, w))
+                while (hl_x86_operand_read(rsi + i * w, w) == hl_x86_operand_read(rdi + i * w, w))
                     i++;
                 k = i + 1;
             }
         } else {
             size_t i = 0;
-            while (i < n && repstr_rd(rsi + i * w, w) != repstr_rd(rdi + i * w, w))
+            while (i < n && hl_x86_operand_read(rsi + i * w, w) != hl_x86_operand_read(rdi + i * w, w))
                 i++;
             k = (i < n) ? i + 1 : n;
         }
-        av = repstr_rd(rsi + (k - 1) * w, w);
-        bv = repstr_rd(rdi + (k - 1) * w, w);
+        av = hl_x86_operand_read(rsi + (k - 1) * w, w);
+        bv = hl_x86_operand_read(rdi + (k - 1) * w, w);
     } else if (!df && !norepcmp() && isrep) { // rep scas word/dword/qword: typed loop (forward)
         size_t i = 0;
         if (stop_on_equal)
-            while (i < n && (repstr_rd(rdi + i * w, w) & wmask) != acc)
+            while (i < n && (hl_x86_operand_read(rdi + i * w, w) & wmask) != acc)
                 i++;
         else
-            while (i < n && (repstr_rd(rdi + i * w, w) & wmask) == acc)
+            while (i < n && (hl_x86_operand_read(rdi + i * w, w) & wmask) == acc)
                 i++;
         k = (i < n) ? i + 1 : n;
         av = acc;
-        bv = repstr_rd(rdi + (k - 1) * w, w);
+        bv = hl_x86_operand_read(rdi + (k - 1) * w, w);
     } else {                                   // generic per-element loop: NOREPCMP oracle, bare
         for (;;) {                             // cmps/scas, OR any DF=1 (backward) scan
             uint64_t off = k * (uint64_t)step; // signed stride (forward +w, backward -w), modular
             if (isscas) {
                 av = acc;
-                bv = repstr_rd(rdi + off, w);
+                bv = hl_x86_operand_read(rdi + off, w);
             } else {
-                av = repstr_rd(rsi + off, w);
-                bv = repstr_rd(rdi + off, w);
+                av = hl_x86_operand_read(rsi + off, w);
+                bv = hl_x86_operand_read(rdi + off, w);
             }
             k++;
             int eq = ((av & wmask) == (bv & wmask));
