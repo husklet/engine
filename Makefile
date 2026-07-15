@@ -1768,6 +1768,12 @@ compat-soak: compat-engines $(BUILD)/tools/matrix-runner $(SOAK_CASE_BINS)
 		$(abspath $(BUILD)/soak/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/soak/x86_64) $(abspath tests/soak)
 
+.PHONY: compat-soak-extended
+compat-soak-extended: compat-engines $(BUILD)/tools/matrix-runner $(SOAK_CASE_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/soak/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/soak/x86_64) $(abspath tests/soak) --repeat 10
+
 compat-procfs: compat-engines $(BUILD)/tools/matrix-runner $(PROCFS_CASE_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/procfs/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
