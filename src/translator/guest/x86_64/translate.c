@@ -5,6 +5,7 @@
 #include "lower/alu.h"
 #include "lower/mov.h"
 #include "lower/shift.h"
+#include "lower/x87.h"
 
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -816,8 +817,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/repstr.c"
 
-#include "lower/x87.c"
-
 #include "lower/crypto.c"
 
 #include "lower/sse4x.c"
@@ -888,7 +887,7 @@ static void emit_dnan_post(int vd, int dbl) {
 // packed into cpu->divop; emit_exit_const spills guest GPR+xmm and sets cpu->rip = the architectural PC.
 static void emit_guest_signal(uint64_t rip, int lsig, int code) {
     if (g_fl_pending) flags_materialize();
-    if (fp_known()) fp_drop();
+    if (hl_x86_x87_known()) hl_x86_x87_drop();
     e_movconst(16, (uint64_t)((lsig & 0xff) | ((code & 0xff) << 8)));
     e_str(16, 28, OFF_DIVOP); // (linux_signo | si_code<<8) -> cpu->divop for raise_guest_trap
     emit_exit_const(rip, R_TRAP);
@@ -1126,7 +1125,7 @@ static void *translate_block(uint64_t gpc) {
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
     g_v26z = g_v27m = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
     g_df = DF_DYN; // DF unknown at block entry (a prior block's std/popfq may have left it set) -> string
-    hl_x87_stack_reset(&g_fp_stack); // x87: top unknown at block entry until a finit anchors it
+    hl_x86_x87_reset(); // x87: top unknown at block entry until a finit anchors it
     g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
     g_prof_xlate++;   // PROF (measurement-only): translate_block calls
     if (g_stitch < 0) g_stitch = 1;
@@ -1140,7 +1139,7 @@ static void *translate_block(uint64_t gpc) {
     for (;;) {
         if (g_itrace && gpc != start) {
             if (g_fl_pending) flags_materialize(); // materialize before boundary
-            fp_drop();                             // x87: spill the shadow top before the boundary
+            hl_x86_x87_drop();                             // x87: spill the shadow top before the boundary
             emit_chain_exit(gpc);
             break;
         } // 1 insn/block: per-instruction register dump
@@ -1260,7 +1259,7 @@ static void *translate_block(uint64_t gpc) {
         // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
         // cpu->fptop and drop to the runtime-top model (the run only spans consecutive x87 ops, so
         // no top assumption ever crosses a non-x87 op, a branch target, or a block boundary).
-        if (fp_known() && !(!I.two && op >= 0xD8 && op <= 0xDF)) fp_drop();
+        if (hl_x86_x87_known() && !(!I.two && op >= 0xD8 && op <= 0xDF)) hl_x86_x87_drop();
 
         if (!I.two) {
             // ---- data-move class (mov B0-BF/C6/C7/88-8B, lea 8D, push/pop 50-5F, movsxd 63) ----
@@ -2001,7 +2000,7 @@ static void *translate_block(uint64_t gpc) {
                 if (I.is_mem) {
                     // x87 mem forms do a faulting guest load/store and the m80 forms exit to a C
                     // helper -- both can escape, so make cpu->fptop reflect the (pre-op) shadow first.
-                    fp_materialize();
+                    hl_x86_x87_materialize();
                     emit_ea(&I, next);
                     int x87_bytes = (op == 0xD8 || op == 0xDA) ? 4 : op == 0xDC ? 8 : op == 0xDE ? 2 : 0;
                     if (op == 0xD9)
@@ -2018,13 +2017,13 @@ static void *translate_block(uint64_t gpc) {
                         if (reg == 0) {
                             g_ldr_s(16, 19);
                             emit32(0x1E22C000u | (16 << 5) | 16);
-                            fp_push(16);
+                            hl_x86_x87_push(16);
                         } // fld m32
                         else if (reg == 2 || reg == 3) {
-                            fp_ld(16, 0);
+                            hl_x86_x87_load(16, 0);
                             emit32(0x1E624000u | (16 << 5) | 16);
                             g_str_s(16, 19);
-                            if (reg == 3) fp_settop(1);
+                            if (reg == 3) hl_x86_x87_adjust_top(1);
                         } // fst/fstp
                         else if (reg == 5) { // fldcw m16: load the x87 control word (RC/PC/exception masks)
                             emit32(0x79400000u | (19 << 5) | 16); // ldrh w16, [x19]
@@ -2039,10 +2038,10 @@ static void *translate_block(uint64_t gpc) {
                             // The engine keeps no per-reg tags, so emit the live FCW (cpu->fpcw, mirrors fnstcw)
                             // and FTW=0xffff (all-empty); the instruction/data pointers are zeroed. OpenBLAS (R
                             // startup, the only caller) just saves/restores FCW/FSW/FTW.
-                            // x19 = EA. emit_fpsw_with_top() materializes cpu->fptop and yields FSW in x16.
+                            // x19 = EA. hl_x86_x87_status() materializes cpu->fptop and yields FSW in x16.
                             e_ldr(16, 28, OFF_FPCW);
                             emit32(0x79000000u | (0u << 10) | (19 << 5) | 16); // strh FCW, [x19,#0]
-                            emit_fpsw_with_top();                              // x16 = FSW | (TOP<<11)
+                            hl_x86_x87_status();                              // x16 = FSW | (TOP<<11)
                             emit32(0x79000000u | (2u << 10) | (19 << 5) | 16); // strh FSW, [x19,#4]
                             e_movconst(16, 0xffff);
                             emit32(0x79000000u | (4u << 10) | (19 << 5) | 16); // strh FTW, [x19,#8]
@@ -2058,7 +2057,7 @@ static void *translate_block(uint64_t gpc) {
                             // (so a later fist rounds per the reloaded RC) and the FSW condition codes + TOP;
                             // FTW (no per-reg tags) is ignored. The reloaded TOP is unknown at translate
                             // time, so leave the static-top model -> runtime-top addressing afterwards.
-                            fp_drop();
+                            hl_x86_x87_drop();
                             emit32(0x79400000u | (0u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#0]  (FCW)
                             e_str(16, 28, OFF_FPCW);                           // cpu->fpcw = FCW
                             emit32(0x79400000u | (2u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#4]  (FSW)
@@ -2073,15 +2072,15 @@ static void *translate_block(uint64_t gpc) {
                     } else if (op == 0xDD) { // f64 mem
                         if (reg == 0) {
                             g_ldr_d(16, 19);
-                            fp_push(16);
+                            hl_x86_x87_push(16);
                         } // fld m64
                         else if (reg == 2 || reg == 3) {
-                            fp_ld(16, 0);
+                            hl_x86_x87_load(16, 0);
                             g_str_d(16, 19);
-                            if (reg == 3) fp_settop(1);
+                            if (reg == 3) hl_x86_x87_adjust_top(1);
                         } // fst/fstp
                         else if (reg == 7) {
-                            emit_fpsw_with_top();
+                            hl_x86_x87_status();
                             emit32(0x79000000u | (19 << 5) | 16);
                         } // fnstsw m16
                         else {
@@ -2092,14 +2091,14 @@ static void *translate_block(uint64_t gpc) {
                         if (reg == 0) {
                             emit32(0xB9400000u | (19 << 5) | 16);
                             emit32(0x1E620000u | (16 << 5) | 16);
-                            fp_push(16);
+                            hl_x86_x87_push(16);
                         } // fild m32
                         else if (reg == 2 || reg == 3) {
-                            fp_ld(16, 0);
+                            hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
                             emit32(0xB9000000u | (19 << 5) | 16);
-                            if (reg == 3) fp_settop(1);
+                            if (reg == 3) hl_x86_x87_adjust_top(1);
                         } // fist/fistp m32
                         else if (reg == 5) {
                             e_str(19, 28, OFF_X87EA);
@@ -2119,26 +2118,26 @@ static void *translate_block(uint64_t gpc) {
                         if (reg == 0) {
                             emit32(0x79C00000u | (19 << 5) | 16);
                             emit32(0x1E620000u | (16 << 5) | 16);
-                            fp_push(16);
+                            hl_x86_x87_push(16);
                         } // fild m16 (ldrsh)
                         else if (reg == 3) {
-                            fp_ld(16, 0);
+                            hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
                             emit32(0x79000000u | (19 << 5) | 16);
-                            fp_settop(1);
+                            hl_x86_x87_adjust_top(1);
                         } // fistp m16
                         else if (reg == 5) {
                             e_ldr(16, 19, 0);
                             emit32(0x9E620000u | (16 << 5) | 16);
-                            fp_push(16);
+                            hl_x86_x87_push(16);
                         } // fild m64
                         else if (reg == 7) {
-                            fp_ld(16, 0);
+                            hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x9E780000u | (16 << 5) | 16); // FCVTZS x16,d16 (exact: d16 already integral)
                             e_str(16, 19, 0);
-                            fp_settop(1);
+                            hl_x86_x87_adjust_top(1);
                         } // fistp m64
                         else {
                             report_unimpl(gpc, &I);
@@ -2161,13 +2160,13 @@ static void *translate_block(uint64_t gpc) {
                         } else                                    // 0xDC: m64 float
                             g_ldr_d(16, 19);
                         if (reg == 2 || reg == 3) {
-                            fp_ld(18, 0);
+                            hl_x86_x87_load(18, 0);
                             e_fcom_setfpsw(18, 16);
-                            if (reg == 3) fp_settop(1);
+                            if (reg == 3) hl_x86_x87_adjust_top(1);
                             gpc = next;
                             continue;
                         } // fcom/fcomp
-                        fp_ld(18, 0);
+                        hl_x86_x87_load(18, 0);
                         if (reg == 0)
                             FAd(18, 18, 16);
                         else if (reg == 1)
@@ -2184,7 +2183,7 @@ static void *translate_block(uint64_t gpc) {
                             report_unimpl(gpc, &I);
                             break;
                         }
-                        fp_st(18, 0);
+                        hl_x86_x87_store(18, 0);
                     }
                     gpc = next;
                     continue;
@@ -2192,24 +2191,24 @@ static void *translate_block(uint64_t gpc) {
                 // ---- register forms (mod=3) ----
                 if (op == 0xD9) {
                     if (reg == 0) {
-                        fp_ld(16, rm);
-                        fp_push(16);
+                        hl_x86_x87_load(16, rm);
+                        hl_x86_x87_push(16);
                     } // fld ST(i)
                     else if (reg == 1) {
-                        fp_ld(16, 0);
-                        fp_ld(18, rm);
-                        fp_st(18, 0);
-                        fp_st(16, rm);
+                        hl_x86_x87_load(16, 0);
+                        hl_x86_x87_load(18, rm);
+                        hl_x86_x87_store(18, 0);
+                        hl_x86_x87_store(16, rm);
                     } // fxch
                     else if (reg == 4 && rm == 0) {
-                        fp_ld(16, 0);
+                        hl_x86_x87_load(16, 0);
                         emit32(0x1E614000u | (16 << 5) | 16);
-                        fp_st(16, 0);
+                        hl_x86_x87_store(16, 0);
                     } // fchs
                     else if (reg == 4 && rm == 1) {
-                        fp_ld(16, 0);
+                        hl_x86_x87_load(16, 0);
                         emit32(0x1E60C000u | (16 << 5) | 16);
-                        fp_st(16, 0);
+                        hl_x86_x87_store(16, 0);
                     } // fabs
                     else if (reg == 5) { // fld const
                         static const uint64_t k[8] = {0x3FF0000000000000ull /*1*/,
@@ -2222,70 +2221,70 @@ static void *translate_block(uint64_t gpc) {
                                                       0x0ull};
                         e_movconst(16, k[rm]);
                         e_fmov_to_d(16, 16);
-                        fp_push(16);
+                        hl_x86_x87_push(16);
                     } else if (reg == 7 && rm == 2) {
-                        fp_ld(16, 0);
+                        hl_x86_x87_load(16, 0);
                         emit32(0x1E61C000u | (16 << 5) | 16);
-                        fp_st(16, 0);
+                        hl_x86_x87_store(16, 0);
                     } // fsqrt
                     else if (reg == 2 && rm == 0) { /* fnop */
                     } else if (reg == 4 && rm == 4) {
-                        emit_ftst();
+                        hl_x86_x87_test();
                     } // ftst
                     else if (reg == 4 && rm == 5) {
-                        emit_fxam();
+                        hl_x86_x87_classify();
                     } // fxam
                     else if (reg == 6 && rm == 0) {
-                        emit_x87func(X87_F2XM1, next);
+                        hl_x86_x87_function(X87_F2XM1, next);
                         break;
                     } // f2xm1
                     else if (reg == 6 && rm == 1) {
-                        emit_x87func(X87_FYL2X, next);
+                        hl_x86_x87_function(X87_FYL2X, next);
                         break;
                     } // fyl2x
                     else if (reg == 6 && rm == 2) {
-                        emit_x87func(X87_FPTAN, next);
+                        hl_x86_x87_function(X87_FPTAN, next);
                         break;
                     } // fptan
                     else if (reg == 6 && rm == 3) {
-                        emit_x87func(X87_FPATAN, next);
+                        hl_x86_x87_function(X87_FPATAN, next);
                         break;
                     } // fpatan
                     else if (reg == 6 && rm == 4) {
-                        emit_fxtract();
+                        hl_x86_x87_extract();
                     } // fxtract
                     else if (reg == 6 && rm == 5) {
-                        emit_fprem(1);
+                        hl_x86_x87_remainder(1);
                     } // fprem1
                     else if (reg == 6 && rm == 6) {
-                        fp_settop(-1);
+                        hl_x86_x87_adjust_top(-1);
                     } // fdecstp
                     else if (reg == 6 && rm == 7) {
-                        fp_settop(1);
+                        hl_x86_x87_adjust_top(1);
                     } // fincstp
                     else if (reg == 7 && rm == 0) {
-                        emit_fprem(0);
+                        hl_x86_x87_remainder(0);
                     } // fprem
                     else if (reg == 7 && rm == 1) {
-                        emit_x87func(X87_FYL2XP1, next);
+                        hl_x86_x87_function(X87_FYL2XP1, next);
                         break;
                     } // fyl2xp1
                     else if (reg == 7 && rm == 3) {
-                        emit_x87func(X87_FSINCOS, next);
+                        hl_x86_x87_function(X87_FSINCOS, next);
                         break;
                     } // fsincos
                     else if (reg == 7 && rm == 4) {
-                        emit_frndint();
+                        hl_x86_x87_round();
                     } // frndint
                     else if (reg == 7 && rm == 5) {
-                        emit_fscale();
+                        hl_x86_x87_scale();
                     } // fscale
                     else if (reg == 7 && rm == 6) {
-                        emit_x87func(X87_FSIN, next);
+                        hl_x86_x87_function(X87_FSIN, next);
                         break;
                     } // fsin
                     else if (reg == 7 && rm == 7) {
-                        emit_x87func(X87_FCOS, next);
+                        hl_x86_x87_function(X87_FCOS, next);
                         break;
                     } // fcos
                     else {
@@ -2293,13 +2292,13 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     }
                 } else if (op == 0xD8 || op == 0xDC || op == 0xDE) { // arith ST0/ST(i) [+pop for DE]
-                    fp_ld(18, 0);
-                    fp_ld(16, rm);                     // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_load(18, 0);
+                    hl_x86_x87_load(16, rm);                     // v18=ST0, v16=ST(rm)
                     int dst_i = (op == 0xD8) ? 0 : rm; // D8 -> ST0; DC/DE -> ST(i)
                     if (reg == 2 || reg == 3) {
                         e_fcom_setfpsw(18, 16);
-                        if (op == 0xDE && rm == 1) fp_settop(1);
-                        if (reg == 3) fp_settop(1);
+                        if (op == 0xDE && rm == 1) hl_x86_x87_adjust_top(1);
+                        if (reg == 3) hl_x86_x87_adjust_top(1);
                         gpc = next;
                         continue;
                     } // fcom[p]/fcompp
@@ -2337,24 +2336,24 @@ static void *translate_block(uint64_t gpc) {
                         report_unimpl(gpc, &I);
                         break;
                     }
-                    fp_st(a, dst_i);
-                    if (op == 0xDE) fp_settop(1); // pop
+                    hl_x86_x87_store(a, dst_i);
+                    if (op == 0xDE) hl_x86_x87_adjust_top(1); // pop
                 } else if (op == 0xDD) {
                     if (reg == 0) { /* ffree: no tag tracking -> nop */
                     } else if (reg == 2) {
-                        fp_ld(16, 0);
-                        fp_st(16, rm);
+                        hl_x86_x87_load(16, 0);
+                        hl_x86_x87_store(16, rm);
                     } // fst ST(i)
                     else if (reg == 3) {
-                        fp_ld(16, 0);
-                        fp_st(16, rm);
-                        fp_settop(1);
+                        hl_x86_x87_load(16, 0);
+                        hl_x86_x87_store(16, rm);
+                        hl_x86_x87_adjust_top(1);
                     } // fstp ST(i)
                     else if (reg == 4 || reg == 5) {
-                        fp_ld(18, 0);
-                        fp_ld(16, rm);
+                        hl_x86_x87_load(18, 0);
+                        hl_x86_x87_load(16, rm);
                         e_fcom_setfpsw(18, 16);
-                        if (reg == 5) fp_settop(1);
+                        if (reg == 5) hl_x86_x87_adjust_top(1);
                     } // fucom[p]
                     else {
                         report_unimpl(gpc, &I);
@@ -2364,14 +2363,14 @@ static void *translate_block(uint64_t gpc) {
                     if (reg == 4 && rm == 3) {
                         e_movconst(16, 0);
                         e_str(16, 28, OFF_FPTOP);
-                        if (x87opt_on()) { // anchor the translate-time shadow: top is now statically 0
-                            hl_x87_stack_anchor(&g_fp_stack, 0); // memory and shadow agree
+                        if (hl_x86_x87_optimized()) { // anchor the translate-time shadow: top is now statically 0
+                            hl_x86_x87_anchor(0); // memory and shadow agree
                         }
                     } // finit -> top=0
                     else if (reg == 4) { /* fclex/etc */
                     } else if (reg == 5 || reg == 6) {
-                        fp_ld(18, 0);
-                        fp_ld(16, rm);
+                        hl_x86_x87_load(18, 0);
+                        hl_x86_x87_load(16, rm);
                         FCMPd(18, 16);
                     } // fucomi/fcomi
                     else {
@@ -2380,14 +2379,14 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDF) {
                     if (reg == 4 && rm == 0) {
-                        emit_fpsw_with_top();
+                        hl_x86_x87_status();
                         e_bfi(RAX, 16, 0, 16, 1);
                     } // fnstsw ax
                     else if (reg == 5 || reg == 6) {
-                        fp_ld(18, 0);
-                        fp_ld(16, rm);
+                        hl_x86_x87_load(18, 0);
+                        hl_x86_x87_load(16, rm);
                         FCMPd(18, 16);
-                        fp_settop(1);
+                        hl_x86_x87_adjust_top(1);
                     } // fucomip/fcomip
                     else {
                         report_unimpl(gpc, &I);
@@ -2398,17 +2397,17 @@ static void *translate_block(uint64_t gpc) {
                         int jcc = (reg == 0) ? 2 : (reg == 1) ? 4 : (reg == 2) ? 6 : 10; // jb/je/jbe/jp
                         int armc = x86cc_to_arm(jcc);
                         e_nzcv_load();
-                        fp_ld(18, 0);
-                        fp_ld(16, rm); // v18=ST0, v16=ST(i)
+                        hl_x86_x87_load(18, 0);
+                        hl_x86_x87_load(16, rm); // v18=ST0, v16=ST(i)
                         emit32(0x1E600C00u | (18 << 16) | ((armc & 0xF) << 12) | (16 << 5) |
                                17); // fcsel d17, STi, ST0, cond
-                        fp_st(17, 0);
+                        hl_x86_x87_store(17, 0);
                     } else if (reg == 5 && rm == 1) { // DA E9: fucompp (compare ST0,ST1; pop twice)
-                        fp_ld(18, 0);
-                        fp_ld(16, 1);
+                        hl_x86_x87_load(18, 0);
+                        hl_x86_x87_load(16, 1);
                         e_fcom_setfpsw(18, 16);
-                        fp_settop(1);
-                        fp_settop(1);
+                        hl_x86_x87_adjust_top(1);
+                        hl_x86_x87_adjust_top(1);
                     } else {
                         report_unimpl(gpc, &I);
                         break;
@@ -3500,7 +3499,7 @@ static void *translate_block(uint64_t gpc) {
                     emit_ea(&I, next);                    // x17 = base of the 512-byte FXSAVE area
                     e_str(17, 28, OFF_X87EA);             // preserve EA across BUS guards and scratch lowering
                     if (g_fl_pending) flags_materialize();
-                    if (fp_known()) fp_drop();
+                    if (hl_x86_x87_known()) hl_x86_x87_drop();
                     emit_exit_const(next, sub == 0 ? R_FXSAVE : R_FXRSTOR);
                     break;
                 }

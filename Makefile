@@ -92,6 +92,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/lower/alu.c \
 	src/translator/guest/x86_64/lower/mov.c \
 	src/translator/guest/x86_64/lower/shift.c \
+	src/translator/guest/x86_64/lower/x87.c \
 	src/translator/guest/x86_64/lower/x87_stack.c \
 	src/translator/guest/x86_64/rep.c \
 	src/translator/guest/x86_64/rotate.c \
@@ -190,7 +191,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_mov lower_shift misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_mov lower_shift lower_x87 misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -579,6 +580,10 @@ $(BUILD)/tests/test_digest: tests/unit/test_digest.c src/translator/digest.c
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 $(BUILD)/tests/test_x87_stack: tests/unit/test_x87_stack.c src/translator/guest/x86_64/lower/x87_stack.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_lower_x87: tests/unit/test_lower_x87.c src/translator/guest/x86_64/lower/x87.c src/translator/guest/x86_64/lower/x87_stack.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 

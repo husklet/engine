@@ -60,5 +60,15 @@ void e_nzcv_set_of(int overflow);
 void e_pf_save(int source);
 void e_csel(int destination, int when_true, int when_false, int condition, int sixty_four_bit);
 void e_subi_s(int destination, int source, unsigned immediate, int sixty_four_bit);
+void e_cset(int destination, int condition, int sixty_four_bit);
+void g_ldr_d(int destination, int address);
+void g_str_d(int source, int address);
+void e_fmov_to_d(int destination, int source);
+void e_fmov_from_d(int destination, int source);
+void e_fp_settop(int delta);
+void e_fp_ld(int destination, int index);
+void e_fp_st(int source, int index);
+void e_fp_push(int source);
+void e_fcom_setfpsw(int left, int right);
 
 #endif

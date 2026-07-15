@@ -14,7 +14,7 @@
 //
 // ===== H11 (KNOWN GAP, NOT fixed here): x87 stack is 64-bit double, not 80-bit extended ==========
 // The architectural x87 register file is 80-bit extended precision (64-bit explicit mantissa, 15-bit
-// exponent). This engine carries ST(0..7) as IEEE-754 binary64 in cpu->st[] (see fp_ld/fp_st here and
+// exponent). This engine carries ST(0..7) as IEEE-754 binary64 in cpu->st[] (see hl_x86_x87_load/hl_x86_x87_store here and
 // hl_x86_x87_load_ext80/hl_x86_x87_store_ext80_pop in x87state.c). Precisely what that loses:
 //   * mantissa: 64 explicit bits -> 52 -> every D8-DF arithmetic op (fadd/fmul/fsub/fdiv/fsqrt/frndint/
 //     fprem/fscale/fxtract above) and every transcendental (x87_func) rounds each intermediate to 53
@@ -35,20 +35,29 @@
 // instructions; any non-x87 instruction ends the run (materialize + drop to the runtime model), and
 // any x87 op we cannot statically track falls back to the baseline helpers. NOX87OPT forces the
 // runtime-top path everywhere -> byte-identical to the pre-opt engine.
+#include "x87.h"
+
+#include "../cpu.h"
+#include "../encoding.h"
+#include "primitives.h"
 #include "x87_stack.h"
 
 static struct hl_x87_stack g_fp_stack;
 
-static int x87opt_on(void) { return 1; }
+int hl_x86_x87_optimized(void) { return 1; }
+
+void hl_x86_x87_reset(void) { hl_x87_stack_reset(&g_fp_stack); }
+
+void hl_x86_x87_anchor(unsigned top) { hl_x87_stack_anchor(&g_fp_stack, top); }
 
 // &cpu->st[shadow slot i] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
 static void fp_slot_addr(int xdst, int i) {
     unsigned off = (unsigned)OFF_ST + hl_x87_stack_slot(&g_fp_stack, i) * 8u;
-    emit32(0x91000000u | (off << 10) | (28 << 5) | xdst); // add xdst, x28, #off
+    emit32(0x91000000u | (off << 10) | (28u << 5) | (unsigned)xdst); // add xdst, x28, #off
 }
 
 // Make cpu->fptop reflect the shadow (idempotent). Keeps the shadow known.
-static void fp_materialize(void) {
+void hl_x86_x87_materialize(void) {
     if (hl_x87_stack_known(&g_fp_stack) && hl_x87_stack_dirty(&g_fp_stack)) {
         e_movconst(16, (uint64_t)hl_x87_stack_top(&g_fp_stack));
         e_str(16, 28, OFF_FPTOP);
@@ -57,16 +66,16 @@ static void fp_materialize(void) {
 }
 
 // Leave the static-top model (run boundary / untrackable op): spill the shadow, go runtime-top.
-static void fp_drop(void) {
-    fp_materialize();
+void hl_x86_x87_drop(void) {
+    hl_x86_x87_materialize();
     hl_x87_stack_drop(&g_fp_stack);
 }
 
-static int fp_known(void) { return hl_x87_stack_known(&g_fp_stack); }
+int hl_x86_x87_known(void) { return hl_x87_stack_known(&g_fp_stack); }
 
-#define FP_STATIC (x87opt_on() && fp_known())
+#define FP_STATIC (hl_x86_x87_optimized() && hl_x86_x87_known())
 
-static void fp_ld(int vd, int i) { // vd = ST(i)
+void hl_x86_x87_load(int vd, int i) { // vd = ST(i)
     if (FP_STATIC) {
         fp_slot_addr(17, i);
         g_ldr_d(vd, 17);
@@ -74,7 +83,7 @@ static void fp_ld(int vd, int i) { // vd = ST(i)
         e_fp_ld(vd, i);
 }
 
-static void fp_st(int vs, int i) { // ST(i) = vs
+void hl_x86_x87_store(int vs, int i) { // ST(i) = vs
     if (FP_STATIC) {
         fp_slot_addr(17, i);
         g_str_d(vs, 17);
@@ -82,7 +91,7 @@ static void fp_st(int vs, int i) { // ST(i) = vs
         e_fp_st(vs, i);
 }
 
-static void fp_push(int vs) { // push vs -> ST(0)  (top -= 1)
+void hl_x86_x87_push(int vs) { // push vs -> ST(0)  (top -= 1)
     if (FP_STATIC) {
         hl_x87_stack_push(&g_fp_stack);
         fp_slot_addr(17, 0);
@@ -91,7 +100,7 @@ static void fp_push(int vs) { // push vs -> ST(0)  (top -= 1)
         e_fp_push(vs);
 }
 
-static void fp_settop(int delta) { // top += delta  (pop = +1)
+void hl_x86_x87_adjust_top(int delta) { // top += delta  (pop = +1)
     if (FP_STATIC) {
         hl_x87_stack_adjust(&g_fp_stack, delta);
     } else
@@ -103,20 +112,20 @@ static void fp_settop(int delta) { // top += delta  (pop = +1)
 // ===== x87 D9 Fx remainder / scale / extract group (computed on host doubles) ===========
 // These ops have no SSE counterpart; emulate them on f64 with the same write-back-to-cpu->st[]
 // and FPSW condition-code conventions as the inline D8-DF arithmetic. Scratch: GP x16/x17/x19/x21,
-// FP v16/v17/v18 (v0..v15 are guest xmm; v16+ are free). The fp_ld/fp_st/fp_push/fp_settop calls
+// FP v16/v17/v18 (v0..v15 are guest xmm; v16+ are free). The hl_x86_x87_load/hl_x86_x87_store/hl_x86_x87_push/hl_x86_x87_adjust_top calls
 // keep the translate-time static-top shadow consistent exactly like the surrounding ops.
 
 // FPREM (round-to-zero) / FPREM1 (round-to-nearest-even): ST0 = ST0 - ST1*Q, Q = round(ST0/ST1).
 // The reduction is completed in one fused step, so C2<-0 ("reduction complete"). FPREM also publishes
 // the low three bits of |Q| (C0<-Q2, C3<-Q1, C1<-Q0); FPREM1 leaves the quotient bits cleared -- both
 // matching qemu's helper_fprem and the `do { fprem } while (C2)` loop libc wraps around fmod/remainder.
-static void emit_fprem(int ieee) {
-    fp_ld(18, 0);                                                   // d18 = ST0
-    fp_ld(16, 1);                                                   // d16 = ST1
+void hl_x86_x87_remainder(int ieee) {
+    hl_x86_x87_load(18, 0);                                                   // d18 = ST0
+    hl_x86_x87_load(16, 1);                                                   // d16 = ST1
     emit32(0x1E601800u | (16 << 16) | (18 << 5) | 17);              // fdiv  d17, d18, d16
     emit32((ieee ? 0x1E644000u : 0x1E65C000u) | (17 << 5) | 17);    // frintn/frintz d17, d17  (= Q)
     emit32(0x1F408000u | (16 << 16) | (18 << 10) | (17 << 5) | 18); // fmsub d18, d17, d16, d18 (ST0-Q*ST1)
-    fp_st(18, 0);
+    hl_x86_x87_store(18, 0);
     e_ldr(16, 28, OFF_FPSW);
     e_movconst(19, ~(uint64_t)0x4700);
     e_rrr(A_AND, 16, 16, 19, 1, 0);           // clear C0/C1/C2/C3 (C2 stays 0 -> reduction complete)
@@ -134,9 +143,9 @@ static void emit_fprem(int ieee) {
 
 // FSCALE: ST0 = ST0 * 2^trunc(ST1). Build 2^n straight into the double exponent field; clamping the
 // biased exponent to [0,2047] gives +0.0 on underflow and +Inf on overflow, matching scalbn.
-static void emit_fscale(void) {
-    fp_ld(18, 0);                         // d18 = ST0
-    fp_ld(16, 1);                         // d16 = ST1
+void hl_x86_x87_scale(void) {
+    hl_x86_x87_load(18, 0);                         // d18 = ST0
+    hl_x86_x87_load(16, 1);                         // d16 = ST1
     emit32(0x1E780000u | (16 << 5) | 16); // fcvtzs w16, d16  (n = trunc(ST1), int32-saturating)
     e_sxt(16, 16, 4);                     // sign-extend n to 64-bit
     e_addi(16, 16, 1023, 1);              // biased exponent e = n + 1023
@@ -149,13 +158,13 @@ static void emit_fscale(void) {
     e_lsl_i(16, 16, 52, 1);                            // place e into the exponent field
     e_fmov_to_d(17, 16);                               // d17 = 2^n
     emit32(0x1E600800u | (17 << 16) | (18 << 5) | 18); // fmul d18, d18, d17
-    fp_st(18, 0);
+    hl_x86_x87_store(18, 0);
 }
 
 // FXTRACT: split ST0 into unbiased exponent and significand. ST0 <- significand (in [1,2) with ST0's
 // sign), then the exponent is pushed so ST1 = exponent, ST0 = significand (normal operands).
-static void emit_fxtract(void) {
-    fp_ld(16, 0);          // d16 = ST0
+void hl_x86_x87_extract(void) {
+    hl_x86_x87_load(16, 0);          // d16 = ST0
     e_fmov_from_d(16, 16); // x16 = bit pattern
     e_lsr_i(17, 16, 52, 1);
     e_movconst(19, 0x7FF);
@@ -167,20 +176,20 @@ static void emit_fxtract(void) {
     e_movconst(19, 1023ULL << 52);
     e_rrr(A_ORR, 16, 16, 19, 1, 0); // set exponent to bias -> significand in [1,2)
     e_fmov_to_d(18, 16);            // d18 = significand
-    fp_st(17, 0);                   // ST0 = exponent
-    fp_push(18);                    // push significand -> ST0 = significand, ST1 = exponent
+    hl_x86_x87_store(17, 0);                   // ST0 = exponent
+    hl_x86_x87_push(18);                    // push significand -> ST0 = significand, ST1 = exponent
 }
 
 // FRNDINT: round ST0 to an integral value using the current rounding mode.
-static void emit_frndint(void) {
-    fp_ld(16, 0);
+void hl_x86_x87_round(void) {
+    hl_x86_x87_load(16, 0);
     emit32(0x1E674000u | (16 << 5) | 16); // frintx d16, d16
-    fp_st(16, 0);
+    hl_x86_x87_store(16, 0);
 }
 
 // FTST: compare ST0 with 0.0 and set the FPSW condition codes (same path as fcom).
-static void emit_ftst(void) {
-    fp_ld(18, 0);
+void hl_x86_x87_test(void) {
+    hl_x86_x87_load(18, 0);
     e_movconst(16, 0);
     e_fmov_to_d(16, 16);    // d16 = 0.0
     e_fcom_setfpsw(18, 16); // ST0 : 0.0 -> C0/C2/C3
@@ -190,8 +199,8 @@ static void emit_ftst(void) {
 // condition codes held in cpu->fpsw -- qemu does the same, and code that follows FNSTSW with SAHF
 // relies on it. Result -> x16 (clobbers x17). The shadow top is materialized first so cpu->fptop is
 // current under the static-top optimization.
-static void emit_fpsw_with_top(void) {
-    fp_materialize();
+void hl_x86_x87_status(void) {
+    hl_x86_x87_materialize();
     e_ldr(16, 28, OFF_FPSW);
     e_ldr(17, 28, OFF_FPTOP);
     e_bfi(16, 17, 11, 3, 1); // status[13:11] = TOP
@@ -202,8 +211,8 @@ static void emit_fpsw_with_top(void) {
 // cpu->st[] is double precision, so 80-bit unsupported/pseudo-denormal forms cannot arise. Class codes
 // {C3,C2,C0}: zero=100, NaN=001, Inf=011, denormal=110, normal=010. From the IEEE-754 fields this is
 // C0=(exp==max), C3=(exp==0), C2=!(zero|NaN). Scratch: x16/x17/x19/x21/x22, v18.
-static void emit_fxam(void) {
-    fp_ld(18, 0);
+void hl_x86_x87_classify(void) {
+    hl_x86_x87_load(18, 0);
     e_fmov_from_d(16, 18);  // x16 = bit pattern of ST0
     e_lsr_i(21, 16, 63, 1); // x21 = sign            -> C1
     e_lsr_i(17, 16, 52, 1);
@@ -234,8 +243,8 @@ static void emit_fxam(void) {
 // no ARM/SSE counterpart and need host libm, so they exit the block to the C helper x87_func(), which
 // computes the op on the double-precision ST stack. cpu->x87_ea carries the X87_* selector. The block
 // ends here (like the m80 fld/fstp helpers); the caller breaks out of translation afterwards.
-static void emit_x87func(int fn, uint64_t next) {
-    fp_drop(); // the helper reads/writes cpu->st[] and cpu->fptop directly -> spill the shadow top
+void hl_x86_x87_function(int fn, uint64_t next) {
+    hl_x86_x87_drop(); // the helper reads/writes cpu->st[] and cpu->fptop directly -> spill the shadow top
     e_movconst(16, (uint64_t)fn);
     e_str(16, 28, OFF_X87EA);
     emit_exit_const(next, R_X87FUNC);

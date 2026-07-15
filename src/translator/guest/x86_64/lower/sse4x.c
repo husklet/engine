@@ -102,7 +102,7 @@ static int translate_sse4x(struct insn *I, uint64_t next) {
         case 0x16:   // PEXTRD/Q r/m, xmm, imm  (REX.W selects Q)
         case 0x17: { // EXTRACTPS r/m32, xmm, imm  (== PEXTRD of lane imm&3)
             if (nosseopt()) return TX_FALL;
-            if (fp_known()) fp_drop();
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
             int nb = (op == 0x14) ? 1 : (op == 0x15) ? 2 : (op == 0x17) ? 4 : (I->rexW ? 8 : 4);
             int lane = imm & (16 / nb - 1);
             if (I->is_mem) {
@@ -117,7 +117,7 @@ static int translate_sse4x(struct insn *I, uint64_t next) {
         case 0x20:   // PINSRB xmm, r32/m8, imm
         case 0x22: { // PINSRD/Q xmm, r/m32|64, imm  (REX.W selects Q)
             if (nosseopt()) return TX_FALL;
-            if (fp_known()) fp_drop();
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
             int nb = (op == 0x20) ? 1 : (I->rexW ? 8 : 4);
             int lane = imm & (16 / nb - 1);
             int src;
@@ -133,7 +133,7 @@ static int translate_sse4x(struct insn *I, uint64_t next) {
         }
         case 0x21: { // INSERTPS xmm, xmm/m32, imm: insert one dword lane, then zero lanes per imm[3:0]
             if (nosseopt()) return TX_FALL;
-            if (fp_known()) fp_drop();
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
             int countD = (imm >> 4) & 3, zmask = imm & 0xf;
             if (I->is_mem) {
                 emit_ea(I, next);
@@ -156,7 +156,7 @@ static int translate_sse4x(struct insn *I, uint64_t next) {
             // undoes ShiftRows and lays out the SubWord/RotWord dwords. Then XOR rcon into dwords 1,3.
             //   needed bytes:  S(in[4,5,6,7]) at out[4,1,14,11];  S(in[12..15]) at out[12,9,6,3]
             //   index vector:  {4,1,14,11, 1,14,11,4, 12,9,6,3, 9,6,3,12}
-            if (fp_known()) fp_drop();
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
             int s = crypto_rm_vec(I, next);                       // v19 when memory-backed
             if (!g_v26z || nosseopt()) e_v3(A_EOR16, 26, 26, 26); // v26 = 0 (hoisted zero round key)
             g_v26z = 1;

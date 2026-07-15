@@ -304,7 +304,7 @@ static void e_bcond(int cond, int32_t off19) {
     emit32(0x54000000u | (((uint32_t)off19 & 0x7FFFF) << 5) | (cond & 0xF));
 }
 
-static void e_cset(int rd, int cond, int sf) { // cset rd, cond
+void e_cset(int rd, int cond, int sf) { // cset rd, cond
     emit32((sf ? 0x9A9F07E0u : 0x1A9F07E0u) | (((cond ^ 1) & 0xF) << 12) | rd);
 }
 
@@ -461,13 +461,13 @@ static void g_str_q(int t, int rn, int off) {
     e_str_q(t, rn, off);
 }
 
-static void g_ldr_d(int t, int rn) {
+void g_ldr_d(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(8, 0);
     e_ldr_d(t, rn);
     e_dmb_ishld();
 }
 
-static void g_str_d(int t, int rn) {
+void g_str_d(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(8, 0);
     e_dmb_ish();
     e_str_d(t, rn);
@@ -485,7 +485,7 @@ static void g_str_s(int t, int rn) {
     e_str_s(t, rn);
 }
 
-static void e_fmov_to_d(int vd, int xn) {
+void e_fmov_to_d(int vd, int xn) {
     emit32(0x9E670000u | (xn << 5) | vd);
 } // fmov d[vd], x[xn] (zeroes hi)
 
@@ -493,7 +493,7 @@ static void e_fmov_to_s(int vd, int wn) {
     emit32(0x1E270000u | (wn << 5) | vd);
 } // fmov s[vd], w[wn]
 
-static void e_fmov_from_d(int xd, int vn) {
+void e_fmov_from_d(int xd, int vn) {
     emit32(0x9E660000u | (vn << 5) | xd);
 } // fmov x[xd], d[vn]
 
@@ -527,7 +527,7 @@ static void e_st_addr(int xa, int i) { // xa = &cpu->st[(fptop+i)&7]   (clobbers
     emit32(0x8B000000u | (16 << 16) | (3 << 10) | (xa << 5) | xa);           // add xa,xa,x16,lsl#3
 }
 
-static void e_fp_settop(int delta) { // fptop = (fptop+delta) & 7   (clobbers x16)
+void e_fp_settop(int delta) { // fptop = (fptop+delta) & 7   (clobbers x16)
     e_ldr(16, 28, OFF_FPTOP);
     if (delta < 0)
         emit32(0x51000000u | ((unsigned)(-delta) << 10) | (16 << 5) | 16); // sub w16,w16,#n
@@ -537,17 +537,17 @@ static void e_fp_settop(int delta) { // fptop = (fptop+delta) & 7   (clobbers x1
     e_str(16, 28, OFF_FPTOP);
 }
 
-static void e_fp_ld(int vd, int i) {
+void e_fp_ld(int vd, int i) {
     e_st_addr(17, i);
     e_ldr_d(vd, 17);
 } // vd = ST(i)
 
-static void e_fp_st(int vs, int i) {
+void e_fp_st(int vs, int i) {
     e_st_addr(17, i);
     e_str_d(vs, 17);
 } // ST(i) = vs
 
-static void e_fp_push(int vs) {
+void e_fp_push(int vs) {
     e_fp_settop(-1);
     e_st_addr(17, 0);
     e_str_d(vs, 17);
@@ -555,7 +555,7 @@ static void e_fp_push(int vs) {
 
 // fcom-family compare: FCMP dn,dm then set cpu->fpsw bits C0(8)/C2(10)/C3(14) so a
 // following fnstsw ax + sahf reproduces x86 ZF/PF/CF. (clobbers x16/x17/x20)
-static void e_fcom_setfpsw(int n, int m) {
+void e_fcom_setfpsw(int n, int m) {
     emit32(0x1E602000u | (m << 16) | (n << 5)); // fcmp dn, dm
     e_cset(16, 3, 0);                           // less       (LO: C clear)
     e_cset(20, 6, 0);                           // unordered  (VS)
