@@ -750,7 +750,7 @@ void fd_evict(int fd) {
         mc_evict(g_fdcache.binding.fd_paths[fd]);
 }
 
-void fd_clear(int fd) {
+void hl_fdcache_fd_clear(int fd) {
     if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity) g_fdcache.binding.fd_paths[fd][0] = 0;
 }
 

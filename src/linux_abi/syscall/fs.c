@@ -315,7 +315,7 @@ static void fd_reset_emul(int fd) {
     memf_close(fd);
     dirs_drop(fd);
     ovldents_drop(fd);
-    fd_clear(fd);
+    hl_fdcache_fd_clear(fd);
 }
 
 // Linux *at dirfd precondition, shared by the fstatat/statx/link/symlink/rename/unlink/... family.
