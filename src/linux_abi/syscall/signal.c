@@ -338,9 +338,29 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     case 137: {
         uint64_t set = a0 ? *(uint64_t *)a0 : 0; // guest sigset_t (bit signo-1)
         struct timespec *to = (struct timespec *)a2;
-        // negative/zero timeout -> single non-blocking poll; else a deadline.
-        long long budget_ns = to ? (long long)to->tv_sec * 1000000000LL + to->tv_nsec : -1;
-        long long waited_ns = 0;
+        const hl_host_services *host = effective_host_services();
+        uint64_t deadline = UINT64_MAX;
+        uint64_t fallback_waited = 0;
+        uint64_t budget_ns = 0;
+        int finite = to != NULL;
+        int deadline_valid = 0;
+        if (to && (to->tv_sec < 0 || to->tv_nsec < 0 || to->tv_nsec >= 1000000000L)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        if (to) {
+            uint64_t seconds = (uint64_t)to->tv_sec;
+            budget_ns = seconds > (UINT64_MAX - (uint64_t)to->tv_nsec) / UINT64_C(1000000000)
+                            ? UINT64_MAX
+                            : seconds * UINT64_C(1000000000) + (uint64_t)to->tv_nsec;
+            if (budget_ns != 0 && host && host->clock && host->clock->monotonic_ns) {
+                hl_host_result now = host->clock->monotonic_ns(host->context);
+                if (now.status == HL_STATUS_OK) {
+                    deadline = now.value > UINT64_MAX - budget_ns ? UINT64_MAX : now.value + budget_ns;
+                    deadline_valid = 1;
+                }
+            }
+        }
         // An awaited signal with NO guest handler is invisible to g_pending unless a host handler catches it:
         // a cross-process (or host) kill(2) would otherwise hit the default disposition and terminate us
         // instead of being consumed synchronously here (this is what made a plain sigwait() fail). Install the
@@ -392,14 +412,38 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 G_RET(c) = (uint64_t)got;
                 break;
             }
-            if (budget_ns == 0 || (budget_ns > 0 && waited_ns >= budget_ns) ||
+            if ((finite && budget_ns == 0) || (finite && fallback_waited >= budget_ns) ||
                 __atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) {
-                G_RET(c) = (uint64_t)(-EAGAIN);
+                G_RET(c) = (uint64_t)(-HL_LINUX_EAGAIN);
                 break;
             }
-            struct timespec slice = {0, 2 * 1000 * 1000}; // 2ms
-            nanosleep(&slice, NULL);
-            waited_ns += 2 * 1000 * 1000;
+            uint64_t interval = UINT64_C(2000000);
+            if (finite && !deadline_valid && interval > budget_ns - fallback_waited)
+                interval = budget_ns - fallback_waited;
+            if (host && host->clock && host->clock->monotonic_ns && host->clock->sleep_until) {
+                hl_host_result now = host->clock->monotonic_ns(host->context);
+                if (now.status == HL_STATUS_OK) {
+                    uint64_t slice_deadline = now.value > UINT64_MAX - interval ? UINT64_MAX : now.value + interval;
+                    if (finite && deadline_valid) {
+                        if (now.value >= deadline) {
+                            G_RET(c) = (uint64_t)(-HL_LINUX_EAGAIN);
+                            break;
+                        }
+                        if (slice_deadline > deadline) slice_deadline = deadline;
+                    }
+                    hl_host_result slept =
+                        host->clock->sleep_until(host->context, HL_HOST_CLOCK_MONOTONIC, slice_deadline);
+                    if (slept.status == HL_STATUS_OK || slept.status == HL_STATUS_INTERRUPTED) {
+                        if (finite && !deadline_valid) fallback_waited += interval;
+                        continue;
+                    }
+                }
+            }
+            if (finite && interval > budget_ns - fallback_waited)
+                interval = budget_ns - fallback_waited;
+            if (host && host->clock && host->clock->backoff_ns)
+                (void)host->clock->backoff_ns(host->context, interval);
+            if (finite) fallback_waited += interval;
         }
         ts_wait_leave();
         for (int s = 1; s <= 64; s++)

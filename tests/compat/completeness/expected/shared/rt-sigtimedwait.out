@@ -1,1 +1,1 @@
-rt_sigtimedwait ret=10 sig=10
+rt_sigtimedwait pending=1 zero=1 delayed=1 timeout=1
