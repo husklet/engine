@@ -1,4 +1,5 @@
 # case	group	source	legacy_source	isas	cflags	defines	env	exit	stdout	dependencies	disposition	note
+mq-lifecycle	ipc	ipc_mq_lifecycle.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_mq_lifecycle.out	linux-libc,ipc	active	mqueue descriptor capacity, dup OFD flags, reclamation, and stale fd reuse
 pipe	pipe	ipc_pipe.c	ext_ipc/ipc_pipe.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe.out	linux-libc,threads,ipc	active	byte-preserving transfer
 pipe-poll	pipe	ipc_pipe_poll.c	ext_ipc/ipc_pipe_poll.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe_poll.out	linux-libc,threads,ipc	active	byte-preserving transfer
 pipe-eof	pipe	ipc_pipe_eof.c	ext_ipc/ipc_pipe_eof.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe_eof.out	linux-libc,threads,ipc	active	byte-preserving transfer

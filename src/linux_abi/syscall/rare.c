@@ -312,8 +312,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
+        if (mq_bind(fd, qi) != 0) {
+            close(fd);
+            G_RET(c) = (uint64_t)(int64_t)(-EMFILE);
+            break;
+        }
         g_mqq[qi].refs++;
-        mq_bind(fd, qi);
         mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0); // O_NONBLOCK is a per-descriptor mq_flag
         G_RET(c) = (uint64_t)fd;
         break;

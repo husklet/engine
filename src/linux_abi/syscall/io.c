@@ -45,6 +45,7 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
+    mq_fd_duplicate(newfd, oldfd);
     if (g_pipe_identity[oldfd] != 0) {
         g_pipe_identity[newfd] = g_pipe_identity[oldfd];
         proc_fdvis_reservation_publish(reservation, newfd, HL_HOST_FD_PIPE, 1, g_pipe_identity[newfd]);

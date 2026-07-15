@@ -219,6 +219,7 @@ static void fd_reset_emul(int fd) {
             g_fdvis_private[fd] = 0;
         }
         proc_fdvis_close(fd);
+        mq_fd_close(fd);
         g_pipe_identity[fd] = 0;
         if (g_eventfd_peer[fd]) {
             // Refcounted teardown: a dup()'d eventfd shares the peer write end + counter slot, so only close

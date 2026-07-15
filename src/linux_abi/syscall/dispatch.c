@@ -103,6 +103,8 @@ static void pt_wait_disarm(int armed, const struct sigaction *saved);
 // the shared per-fd emulation-table teardown (defined in fs.c, included after io.c) -- fwd-declared so
 // the dup2/dup3-overwrite path in io.c can shed the destination fd's tables before dup2 reuses the number.
 static void fd_reset_emul(int fd);
+static void mq_fd_close(int fd);
+static void mq_fd_duplicate(int newfd, int oldfd);
 
 #include "helpers.c"
 #include "sysv.c"
@@ -306,9 +308,11 @@ struct mq_queue {
 };
 static struct mq_queue g_mqq[MQ_MAXQ];
 
-static struct {
-    int fd, qi, flags; // flags: per-descriptor O_NONBLOCK (mq_flags is a per-open-file-description flag on Linux)
-} g_mqfd[64];
+static int8_t g_mqfd_queue[HL_NFD]; /* queue index + 1; zero means this fd is not an mqueue descriptor */
+static uint16_t g_mqfd_flags[HL_NFD];
+static uint32_t g_mqfd_group[HL_NFD];
+static uint32_t g_mqfd_next_group = 1;
+static void mq_maybe_free(int qi);
 
 static int mq_find(const char *name) {
     for (int i = 0; i < MQ_MAXQ; i++)
@@ -317,35 +321,49 @@ static int mq_find(const char *name) {
 }
 
 static int mq_qof(int fd) {
-    for (int i = 0; i < 64; i++)
-        if (g_mqfd[i].fd == fd) return g_mqfd[i].qi;
-    return -1;
+    return fd >= 0 && fd < HL_NFD && g_mqfd_queue[fd] != 0 ? (int)g_mqfd_queue[fd] - 1 : -1;
 }
 
-static void mq_bind(int fd, int qi) {
-    for (int i = 0; i < 64; i++)
-        if (g_mqfd[i].fd == 0 || g_mqfd[i].fd == fd) {
-            g_mqfd[i].fd = fd;
-            g_mqfd[i].qi = qi;
-            return;
-        }
+static int mq_bind(int fd, int qi) {
+    if (fd < 0 || fd >= HL_NFD || qi < 0 || qi >= MQ_MAXQ || g_mqfd_queue[fd] != 0) return -1;
+    g_mqfd_queue[fd] = (int8_t)(qi + 1);
+    g_mqfd_group[fd] = g_mqfd_next_group++;
+    if (g_mqfd_next_group == 0) g_mqfd_next_group = 1;
+    return 0;
+}
+
+static void mq_fd_duplicate(int newfd, int oldfd) {
+    int qi = mq_qof(oldfd);
+    if (qi < 0 || newfd < 0 || newfd >= HL_NFD || g_mqfd_queue[newfd] != 0) return;
+    g_mqfd_queue[newfd] = (int8_t)(qi + 1);
+    g_mqfd_flags[newfd] = g_mqfd_flags[oldfd];
+    g_mqfd_group[newfd] = g_mqfd_group[oldfd];
+    g_mqq[qi].refs++;
+}
+
+static void mq_fd_close(int fd) {
+    int qi = mq_qof(fd);
+    if (qi < 0) return;
+    g_mqfd_queue[fd] = 0;
+    g_mqfd_flags[fd] = 0;
+    g_mqfd_group[fd] = 0;
+    g_mqq[qi].refs--;
+    mq_maybe_free(qi);
 }
 
 // Per-descriptor O_NONBLOCK: report/set the mq_flags of the open file description behind fd. Recorded at
 // mq_open time and toggled by mq_getsetattr (the mq equivalent of F_SETFL) so a blocking descriptor and a
 // non-blocking one to the same queue behave differently, as on Linux.
 static int mq_fd_nonblock(int fd) {
-    for (int i = 0; i < 64; i++)
-        if (g_mqfd[i].fd == fd) return (g_mqfd[i].flags & MQ_O_NONBLOCK) != 0;
-    return 0;
+    return mq_qof(fd) >= 0 && (g_mqfd_flags[fd] & MQ_O_NONBLOCK) != 0;
 }
 
 static void mq_fd_setnb(int fd, int on) {
-    for (int i = 0; i < 64; i++)
-        if (g_mqfd[i].fd == fd) {
-            g_mqfd[i].flags = on ? MQ_O_NONBLOCK : 0;
-            return;
-        }
+    uint32_t group;
+    if (mq_qof(fd) < 0) return;
+    group = g_mqfd_group[fd];
+    for (int i = 0; i < HL_NFD; ++i)
+        if (g_mqfd_group[i] == group) g_mqfd_flags[i] = on ? MQ_O_NONBLOCK : 0;
 }
 
 static void mq_maybe_free(int qi) {
