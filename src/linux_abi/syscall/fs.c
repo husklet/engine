@@ -1498,7 +1498,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char nc[4200];
         chroot_apply(nrabs, nc, sizeof nc);
         snprintf(g_chroot, sizeof g_chroot, "%s", nc[1] ? nc : "");
-        rc_reset();
+        hl_fdcache_reset();
         G_RET(c) = 0;
         break;
     }

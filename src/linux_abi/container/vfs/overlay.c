@@ -10,11 +10,11 @@
 //                        can never serve a pre-copy-up answer (fchmodat/utimensat/setxattr copy-ups
 //                        reach here WITHOUT a bumping syscall in dispatch.c).
 //   updirneg_*        -- the "this GUEST DIR does not exist in the upper" negative memo (epoch-gated,
-//                        fork/chroot-reset via rc_reset). overlay_lookup consults it so a fresh
+//                        fork/chroot-reset via hl_fdcache_reset). overlay_lookup consults it so a fresh
 //                        container's metadata storm (tar/find/ld.so over a still-empty upper) skips
 //                        the per-entry upper realpath climb + whiteout + opaque probes entirely.
 //   updirverdict_* -- the " merged-view directory VERDICT" memo (0 present / 1 hidden /
-//                        2 opaque-cut), epoch-gated, fork/chroot-reset via rc_reset. overlay_dir_verdict
+//                        2 opaque-cut), epoch-gated, fork/chroot-reset via hl_fdcache_reset. overlay_dir_verdict
 //                        fills it so a lower-only child under a whiteout-removed or opaque-recreated
 //                        parent is not surfaced as a stale positive by the per-layer resolve.
 static const char *xresolve_exec(const char *p, char *buf,

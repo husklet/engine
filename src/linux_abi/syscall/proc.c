@@ -241,8 +241,9 @@ static void fork_child_hooks(struct cpu *c) {
     // path (single-threaded parent, or the MAP_JIT fallback) the cache VA and content are unchanged,
     // so the inherited g_xibtc stays valid and is kept warm.
     if (g_dualmap && !g_fork_preserved) G_SHADOW_CLEAR(c);
-    rc_reset();  // S2: invalidate the inherited (COW) path/metadata caches so the child can never serve
-                 // an entry the parent populated before the FS diverged (generation bump; see fscache.c)
+    // S2: invalidate inherited path/metadata caches so the child cannot serve an
+    // entry populated before the filesystem diverged.
+    hl_fdcache_reset();
     g_ndirs = 0; // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
                  // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
     kqueue_rebuild_after_fork(); // macOS kqueue() fds (epoll/timerfd/inotify) don't survive fork ->
@@ -600,7 +601,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         char nc[4200];
         chroot_apply(gabs, nc, sizeof nc);                          // fold under any active chroot -> rootfs-abs
         snprintf(g_chroot, sizeof g_chroot, "%s", nc[1] ? nc : ""); // chroot("/") clears (rootfs IS the root)
-        rc_reset(); // drop cached guest->host path mappings -- they predate the re-root
+        hl_fdcache_reset(); // drop cached guest->host path mappings -- they predate the re-root
         G_RET(c) = 0;
         break;
     }

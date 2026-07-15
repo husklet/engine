@@ -1470,7 +1470,7 @@ static int jail_pick(const char *abs, const char **canon, size_t *clen, const ch
 // Memoizes confine_in_m's realpath climb per DIRECTORY: key = the exact pre-realpath host string
 // (jail canon + normalized rel, final component peeled in nofollow mode); value = (canonical deepest
 // EXISTING prefix, #trailing components missing). Epoch-gated on the container-shared g_res_epoch,
-// hard-reset on fork/chroot (rc_reset), and volumes are never cached. See the full
+// hard-reset on fork/chroot (hl_fdcache_reset), and volumes are never cached. See the full
 // correctness model at the impl. DC_KEYMAX bounds the fixed-size slots (longer paths bypass, safely).
 #define DC_KEYMAX 320
 

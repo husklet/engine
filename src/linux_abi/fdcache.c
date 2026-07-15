@@ -147,12 +147,12 @@ static void fdcache_unlock(void) {
 // ---- S2 path-resolution cache (forward decls; impl after mc_hash, which it reuses) ----
 // Memoizes the absolute guest-path -> resolved host-path STRING only (the real syscall still
 // runs on the result, so existence/contents are never cached). A global epoch -- bumped by
-// service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
+// service.c on every FS-namespace mutation -- invalidates the whole cache; hl_fdcache_reset() hard-clears
 // it in the fork child so a child never serves the parent's stale mappings.
 int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n);
 void hl_fdcache_resolution_store(const char *g, const char *host);
 void hl_fdcache_resolution_bump(void);
-void rc_reset(void);
+void hl_fdcache_reset(void);
 // ---- W4D openat resolution cache (forward decls; impl after the S2 rc_* cache it extends) ----
 // Extends item-9's rc_* (which memoizes only the read-only atpath() resolver) to the open-heavy half:
 // guest-abs-path -> canonical symlink-free host path, so a repeated open collapses the TOCTOU-safe
@@ -176,7 +176,7 @@ static void oc_reset(void);
 // writes a .pyc to a temp file then renames it into place and immediately stat()s the final name; the
 // rename target's earlier ENOENT must not outlive the rename. Cross-process create-after-negative (a child /
 // pipe coprocess creates a file the parent probed absent) is covered by g_res_epoch being SHARED across the
-// container process-tree (see its definition below) PLUS rc_reset() dropping the inherited caches at fork.
+// container process-tree (see its definition below) PLUS hl_fdcache_reset() dropping inherited caches at fork.
 // CROSS-PROCESS coherence (/): the epoch lives in a MAP_SHARED page so a file CREATED by ANOTHER
 // process in the same container process-tree bumps the SAME counter every process reads. The headline case is
 // apt: its http download method is a fork+exec'd, PERSISTENT pipe coprocess the parent apt never reaps -- so
@@ -207,7 +207,7 @@ __attribute__((constructor)) static void res_epoch_ctor(void) {
 
 // process-local fork/chroot GENERATION for every cache in this file (mc/rl/ac + rc/ud/oc).
 // Each entry is stamped with g_fs_fgen at store time and only hits while its stamp still matches;
-// rc_reset() (the fork-child / chroot hard reset) just bumps the counter -- O(1) -- instead of
+// hl_fdcache_reset() (the fork-child / chroot hard reset) just bumps the counter -- O(1) -- instead of
 // memset'ing ~13MB of arrays inside the fork child's critical path. The counter is ordinary process
 // memory (COW-private), so a child's bump never disturbs the parent's warm caches. Reads/writes happen
 // under the same CLK lock as the entries themselves.
@@ -375,7 +375,7 @@ void hl_fdcache_access_evict(const char *p) {
 //     compares epochs, so every entry stamped before the mutation instantly misses. This covers all
 //     stale-entry hazards conservatively (over-invalidates, never under): create-after-negative,
 //     delete-after-positive, rename, mkdir/rmdir -- when in doubt we MISS and re-resolve.
-//   * Hard reset on fork (rc_reset, called in the clone/clone3 child) so a child never serves a
+//   * Hard reset on fork (hl_fdcache_reset, called in the clone/clone3 child) so a child never serves a
 //     mapping the parent populated before the FS diverged.
 // g_res_epoch is defined up with the FS-metadata cache (the metadata caches' negative-entry gating
 // references it too); it is shared by these path-string caches and the metadata caches alike.
@@ -398,7 +398,7 @@ void hl_fdcache_resolution_bump(void) {
 //     rename/mkdir/..., PLUS the copy-up bumps in overlay.c for the non-syscall upper mutations), so an
 //     entry can never outlive an upper dir appearing. The epoch is container-SHARED (MAP_SHARED page),
 //     so another engine process (docker exec) creating upper dirs invalidates this process's memo too.
-//   * fork/chroot hard reset via rc_reset() below.
+//   * fork/chroot hard reset via hl_fdcache_reset() below.
 //   * volume paths are never stored (host-mutable backing; enforced at the overlay_lookup call site).
 int hl_fdcache_upper_negative_lookup(const char *d) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udent *)0)->dir)) return 0;
@@ -437,7 +437,7 @@ void hl_fdcache_upper_negative_store(const char *d) {
 // was removed, and a merged readdir/rmdir under an opaque-recreated parent leaks stale lower
 // entries. Correctness model is identical to the updirneg memo above: epoch-gated on the
 // container-shared g_res_epoch (every unlink/rmdir/rename/mkdir/whiteout/opaque bumps it, so a removal
-// instantly invalidates the memo), with a fork/chroot hard reset via rc_reset().
+// instantly invalidates the memo), with a fork/chroot hard reset via hl_fdcache_reset().
 int hl_fdcache_upper_verdict_lookup(const char *d, int *verdict) {
     if (!d || d[0] != '/' || strlen(d) >= sizeof(((struct udvent *)0)->dir)) return 0;
     CLK;
@@ -487,7 +487,7 @@ void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
 //     overlay copy-up relocation (hl_fdcache_resolution_bump in overlay.c) -- invalidates the WHOLE cache. A symlink
 //     flip inside a cached prefix is a symlinkat/unlinkat/renameat -> bumped. Over-invalidate, never
 //     under.
-//   * fork/chroot drop via rc_reset below: each entry also carries the g_fs_fgen stamp and only
+//   * fork/chroot drop via hl_fdcache_reset below: each entry also carries the g_fs_fgen stamp and only
 //     hits while it matches, so the O(1) generation bump in the fork child drops every inherited (COW)
 //     entry -- same discipline as rc_/oc_/mc_ (COW/re-root hazard).
 //   * volume jails are NEVER cached (host-mutable backing): enforced by hl_fdcache_dentry_cacheable, which
@@ -532,7 +532,7 @@ void hl_fdcache_dentry_store(const char *key, const char *canon, int nmiss) {
     struct dcent *e = &g_dc[h & (DCACHE_N - 1)];
     e->hash = h;
     e->epoch = g_res_epoch; // stamp the CURRENT epoch; any later namespace mutation invalidates it
-    e->fgen = g_fs_fgen;    // fork/chroot generation; a fork child's rc_reset bump drops this entry
+    e->fgen = g_fs_fgen;    // fork/chroot generation; a fork child's hl_fdcache_reset bump drops this entry
     e->nmiss = (uint16_t)nmiss;
     e->clen = (uint16_t)cl;
     strcpy(e->key, key);
@@ -549,7 +549,7 @@ void hl_fdcache_dentry_store(const char *key, const char *canon, int nmiss) {
 // ENOENT -> "no such file" / "No rule to make target"). The epoch only invalidates this process's own
 // mutations, so it can't cover a cross-process create; dropping the inherited entries at the fork point
 // makes the child re-resolve against the real FS.
-void rc_reset(void) {
+void hl_fdcache_reset(void) {
     CLK;
     // O(1) GENERATION BUMP instead of memset'ing all arrays (~13MB: rc+oc ~3.8MB each, mc
     // ~2.9MB, rl/ac/ud/dc) in the fork child's critical path -- those memsets were a fixed ~ms-scale
@@ -628,7 +628,7 @@ void hl_fdcache_resolution_store(const char *g, const char *host) {
 // the rootfs
 // (defensive strncmp). The caller EXCLUDES O_CREAT/O_EXCL/O_TRUNC (mutating/creating) and O_DIRECTORY
 // (deep-host-path reopen regressed -21%; see optimization-research/w4d-openat.md). Hard reset on fork via
-// oc_reset() (from rc_reset). Kill switch (read once): W4_NOOPENCACHE=1 -> the original uncached walk.
+// oc_reset() (from hl_fdcache_reset). Kill switch (read once): W4_NOOPENCACHE=1 -> the original uncached walk.
 static int oc_enabled(void) {
     return 1;
 }
@@ -674,7 +674,7 @@ void hl_fdcache_open_store(const char *g, const char *host) {
 }
 
 // fork child: drop every inherited (COW) entry so it cannot outlive a parent-side mutation. Called from
-// rc_reset() which already holds the cache lock, so this does NOT re-take it (non-recursive mutex).
+// hl_fdcache_reset() already holds the cache lock, so this does NOT re-take it (non-recursive mutex).
 static void oc_reset(void) {
     memset(g_oc, 0, sizeof g_oc);
 }
@@ -696,7 +696,7 @@ static void oc_reset(void) {
 // health probe) as HL_FSGEN_FILE. The daemon atomically increments the mapped u32 AFTER completing any
 // external write; each engine process maps the SAME file MAP_SHARED (ctor below; fork children inherit
 // the mapping) and polls it once per syscall (dispatch.c service_local, before any handler can consult a
-// cache). On a change it drops ALL its caches via rc_reset() -- the same conservative fork-grade full
+// cache). On a change it drops ALL its caches via hl_fdcache_reset() -- the same conservative fork-grade full
 // flush -- so a daemon write is visible no later than the guest's NEXT syscall, exactly like the
 // kernel-coherent dcache on real Linux. Hot-path cost: ONE shared-page atomic load per syscall. Without
 // the environment (tests/direct engine runs) the pointer stays on a local counter that never moves, so
@@ -707,7 +707,7 @@ static void oc_reset(void) {
 // HOT-PATH DISCIPLINE (this runs on EVERY guest syscall -- a metadata-storm workload like `tar` over a
 // big tree is millions of syscalls, so even a mispriced check regresses the overlay-metadata cache win):
 // the poll is a `static inline` two-word compare with a RELAXED load (plain LDR, not the pricier acquire
-// LDAR) and a predicted-not-taken branch; the acquire barrier + rc_reset() live in an out-of-line `cold`
+// LDAR) and a predicted-not-taken branch; the acquire barrier + hl_fdcache_reset() live out of line
 // helper reached only when the generation actually moved (i.e. only right after a real daemon write).
 static void fsgen_bind(const char *p) {
     if (!p || !p[0]) return;
@@ -728,7 +728,7 @@ static void fsgen_bind(const char *p) {
 // DURING the reset is re-noticed next syscall (never lost). Racing guest threads may both flush (harmless).
 __attribute__((noinline, cold)) static void fsgen_flush(void) {
     uint32_t g = atomic_load_explicit(g_fsgen_ptr, memory_order_acquire);
-    rc_reset(); // drops rc_/oc_/mc_/rl_/ac_/ud_ alike (the fork-grade conservative full flush)
+    hl_fdcache_reset(); // drops every descriptor cache (the fork-grade conservative full flush)
     atomic_store_explicit(&g_fsgen_seen, g, memory_order_relaxed);
 }
 
