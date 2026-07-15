@@ -607,10 +607,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 r = MAP_FAILED;
                 errno = ENOMEM;
             }
-            gbus_prepare_release();
         } else if (mapping_prepared) {
             if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1 + guard);
-            gbus_mapping_prepare_release();
         }
         // refund
         if (r == MAP_FAILED && charge) {
@@ -673,6 +671,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 pcache_note_libmap((uint64_t)(uintptr_t)r, (uint64_t)a1, (int)a4);
 #endif
         }
+        /* Keep registry publication inside the same serialized mapping
+           transaction as the host replacement.  gmap/anon/wipe/protection
+           registries are process-global and are not independently locked. */
+        if (bus_prepared)
+            gbus_prepare_release();
+        else if (mapping_prepared)
+            gbus_mapping_prepare_release();
         // stale-translation: a MAP_FIXED mmap REPLACES whatever code lived at the destination VA, so drop any
         // translations cached for it (Linux MAP_FIXED implicitly unmaps the range first).
         if (r != MAP_FAILED && (a3 & 0x10 /*MAP_FIXED*/))
