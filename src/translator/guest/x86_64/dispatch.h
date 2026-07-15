@@ -1,4 +1,5 @@
 #include "cpuid.h"
+#include "cmpxchg.h"
 
 // translator/guest/x86_64/dispatch.h -- the x86-64 guest's definitions of the shared run_guest()
 // dispatch seam (engine-dedup PR3/PR4). Mirror of guest/aarch64/dispatch.h: the shared
@@ -272,7 +273,7 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_CMPXCHG16) { /* atomic 128-bit compare-exchange in C (rip already = next) */                 \
-        do_cmpxchg16(c);                                                                                              \
+        hl_x86_cmpxchg16(c);                                                                                          \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_FXSAVE) { /* fxsave x87-register-DATA + FSW tail (rip already = next) */                     \
