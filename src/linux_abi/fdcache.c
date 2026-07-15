@@ -761,7 +761,7 @@ void hl_fdcache_fd_clear(int fd) {
 // caches are precise-evict, NOT epoch-gated like the rc_/oc_ path-string caches, so every mutation
 // must name the exact path whose existence it changed. Two shapes: a full host path, and the jail
 // idiom of a dir-fd + final component (resolved to its host path via F_GETPATH).
-void fc_evict_path(const char *hp) {
+void hl_fdcache_evict_path(const char *hp) {
     mc_evict(hp);
     ac_evict(hp);
     rl_evict(hp);

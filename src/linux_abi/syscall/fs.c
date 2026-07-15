@@ -1921,7 +1921,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // canonical host path in g_fdpath is the SAME key case 79 memoizes under).
     case 52: {
         int r = fchmod((int)a0, (mode_t)a1);
-        if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0]) fc_evict_path(g_fdpath[(int)a0]);
+        if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
+            hl_fdcache_evict_path(g_fdpath[(int)a0]);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -2054,7 +2055,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         chown_xattr_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
         // the guest-owner xattr just changed -> drop this path's cached stat so a later stat reports it
-        if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0]) fc_evict_path(g_fdpath[(int)a0]);
+        if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
+            hl_fdcache_evict_path(g_fdpath[(int)a0]);
         G_RET(c) = 0;
         break;
         // fchown(fd,uid,gid) -- best-effort

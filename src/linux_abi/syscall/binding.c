@@ -2394,7 +2394,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                                                (hl_host_bytes){path, HL_LINUX_PATH_MAX});
             if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
                 path[named.value] = 0;
-                fc_evict_path(path);
+                hl_fdcache_evict_path(path);
             }
         }
         break;
