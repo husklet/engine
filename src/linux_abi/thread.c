@@ -1008,32 +1008,57 @@ static int host_addr_mapped(uintptr_t a) { return hl_host_address_mapped(a); }
 // at run_guest exit. (x86 keeps host SP != guest SP, so its guards don't take SA_ONSTACK and never use it;
 // the reservation is uncommitted there.)
 #define HOST_ALTSTK_SZ (512u << 10)
-static _Thread_local void *g_altstk_mem;
+static _Thread_local hl_host_memory_mapping g_altstk_mapping = {
+    HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), HL_HOST_HANDLE_INVALID, 0, 0, 0};
 
 // Idempotent: (re)registers the alternate signal stack for THIS thread, allocating one on first use and
 // reusing the existing region otherwise. The sigaltstack() registration is not reliably inherited across
 // fork() on Apple Silicon (like the W^X/APRR state -- see fork_child_hooks), so the fork child re-arms via
 // this same call with its COW-inherited region.
 static void install_host_sigaltstack(void) {
-    void *mem = g_altstk_mem;
-    if (!mem) {
-        mem = mmap(NULL, HOST_ALTSTK_SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (mem == MAP_FAILED) return;
+    const hl_host_services *host = effective_host_services();
+    hl_host_memory_mapping mapped = {
+        HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), HL_HOST_HANDLE_INVALID, 0, 0, 0};
+    hl_host_memory_mapping *mapping = &g_altstk_mapping;
+    int created = mapping->handle == HL_HOST_HANDLE_INVALID;
+    if (created) {
+        hl_host_result result;
+        if (host == NULL || host->memory == NULL || host->memory->map_anonymous == NULL ||
+            host->memory->release == NULL)
+            return;
+        result = host->memory->map_anonymous(host->context, 0, HOST_ALTSTK_SZ,
+                                             HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                                             &mapped);
+        if (result.status != HL_STATUS_OK || mapped.handle == HL_HOST_HANDLE_INVALID || mapped.address == 0 ||
+            mapped.address > UINTPTR_MAX || mapped.mapped_size < HOST_ALTSTK_SZ) {
+            if (mapped.handle != HL_HOST_HANDLE_INVALID) (void)host->memory->release(host->context, mapped.handle);
+            return;
+        }
+        mapping = &mapped;
     }
-    stack_t ss = {.ss_sp = mem, .ss_size = HOST_ALTSTK_SZ, .ss_flags = 0};
+    stack_t ss = {.ss_sp = (void *)(uintptr_t)mapping->address, .ss_size = HOST_ALTSTK_SZ, .ss_flags = 0};
     if (sigaltstack(&ss, NULL) != 0) {
-        if (mem != g_altstk_mem) munmap(mem, HOST_ALTSTK_SZ);
+        if (created) (void)host->memory->release(host->context, mapping->handle);
         return;
     }
-    g_altstk_mem = mem;
+    if (created) g_altstk_mapping = mapped;
 }
 
 static void uninstall_host_sigaltstack(void) {
-    if (!g_altstk_mem) return;
+    const hl_host_services *host = effective_host_services();
+    hl_host_result released = {HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+    if (g_altstk_mapping.handle == HL_HOST_HANDLE_INVALID) return;
     stack_t ss = {.ss_flags = SS_DISABLE};
-    sigaltstack(&ss, NULL);
-    munmap(g_altstk_mem, HOST_ALTSTK_SZ);
-    g_altstk_mem = 0;
+    if (sigaltstack(&ss, NULL) != 0) return;
+    if (host == NULL || host->memory == NULL || host->memory->release == NULL) return;
+    /* A provider can report a transient teardown failure (including an injected first-call failure).
+     * The stack is already disabled, so bounded immediate retries are safe; retain the handle unless a
+     * release succeeds rather than silently forgetting provider-owned memory. */
+    for (unsigned attempt = 0; attempt < 3 && released.status != HL_STATUS_OK; ++attempt)
+        released = host->memory->release(host->context, g_altstk_mapping.handle);
+    if (released.status == HL_STATUS_OK)
+        g_altstk_mapping = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping),
+                                                    HL_HOST_HANDLE_INVALID, 0, 0, 0};
 }
 
 // Range form of host_addr_mapped: true iff every page spanning [a, a+len) is mapped. Used to validate a
