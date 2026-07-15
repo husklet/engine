@@ -434,6 +434,12 @@ the `pkg-config` program on build hosts), runs it against the real host provider
 public header was removed. Rust `build.rs` integrations consume this same installed C ABI and must not compile a second
 implementation of engine behavior.
 
+Production targets link common implementation from these archives instead of recompiling it inside each guest-ISA
+target. In particular, the resident fork-server's bounded argument/environment codec, exact stream transfer, and
+SCM_RIGHTS descriptor transport live in `libhl-linux-abi.a`; target roots retain only per-engine warm-image and JIT
+state. The transport rejects truncated or malformed ancillary data and closes received descriptors before returning
+an error.
+
 ## 8. Testing model
 
 Tests prove behavior, not the presence of source text. A test must execute a public API, host service, or production

@@ -52,7 +52,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/ir/ir.c
 LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/vfs/gmap.c src/linux_abi/device.c \
 	src/linux_abi/encode.c src/linux_abi/fdcache.c \
-	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
+	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_wire.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c
 FAKE_HOST_SOURCES := src/host/fake/host.c
 MACOS_HOST_SOURCES := src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c src/host/macos/range.c \
@@ -112,7 +112,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -423,6 +423,10 @@ $(BUILD)/tests/test_eventfd_fork: tests/unit/test_eventfd_fork.c $(BUILD)/lib/li
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_seccomp_vm: tests/unit/test_seccomp_vm.c $(BUILD)/lib/libhl-linux-abi.a
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -o $@
+
+$(BUILD)/tests/test_fork_wire: tests/unit/test_fork_wire.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a -o $@
 

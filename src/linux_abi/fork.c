@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "../host/child.h"
+#include "fork_wire.h"
 //
 // WHY: per-launch wall is dominated by the irreducible per-process posix_spawn + dyld +
 // codesign-validation floor of the engine ITSELF (opt8 measured ~2 ms of a ~3-5 ms launch), paid on
@@ -132,81 +133,6 @@ static void fsrv_restore_pristine(void) {
     }
 }
 
-// ---- SCM_RIGHTS fd passing ----
-static int send_fds_msg(int sock, const void *buf, size_t len, const int *fds, int nfd) {
-    struct iovec iov = {.iov_base = (void *)buf, .iov_len = len};
-    char cbuf[CMSG_SPACE(sizeof(int) * 8)];
-    memset(cbuf, 0, sizeof cbuf);
-    struct msghdr mh;
-    memset(&mh, 0, sizeof mh);
-    mh.msg_iov = &iov;
-    mh.msg_iovlen = 1;
-    if (nfd > 0) {
-        mh.msg_control = cbuf;
-        mh.msg_controllen = CMSG_SPACE(sizeof(int) * nfd);
-        struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
-        cm->cmsg_level = SOL_SOCKET;
-        cm->cmsg_type = SCM_RIGHTS;
-        cm->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
-        memcpy(CMSG_DATA(cm), fds, sizeof(int) * nfd);
-    }
-    ssize_t r;
-    do {
-        r = sendmsg(sock, &mh, 0);
-    } while (r < 0 && errno == EINTR);
-    return r < 0 ? -1 : 0;
-}
-
-static int recv_fds_msg(int sock, void *buf, size_t len, int *fds, int *nfd) {
-    struct iovec iov = {.iov_base = buf, .iov_len = len};
-    char cbuf[CMSG_SPACE(sizeof(int) * 8)];
-    struct msghdr mh;
-    memset(&mh, 0, sizeof mh);
-    mh.msg_iov = &iov;
-    mh.msg_iovlen = 1;
-    mh.msg_control = cbuf;
-    mh.msg_controllen = sizeof cbuf;
-    ssize_t r;
-    do {
-        r = recvmsg(sock, &mh, 0);
-    } while (r < 0 && errno == EINTR);
-    if (r < 0) return -1;
-    *nfd = 0;
-    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-            int n = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-            memcpy(fds, CMSG_DATA(cm), sizeof(int) * n);
-            *nfd = n;
-        }
-    }
-    return (int)r;
-}
-
-// send/recv exactly n bytes on a stream socket (EINTR-safe). 0 on success, -1 on error/EOF.
-static int send_full(int sock, const void *buf, size_t n) {
-    const char *p = buf;
-    while (n) {
-        ssize_t r = send(sock, p, n, 0);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
-        p += r;
-        n -= (size_t)r;
-    }
-    return 0;
-}
-
-static int recv_full(int sock, void *buf, size_t n) {
-    char *p = buf;
-    while (n) {
-        ssize_t r = recv(sock, p, n, 0);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
-        p += r;
-        n -= (size_t)r;
-    }
-    return 0;
-}
-
 #define FSRV_MAGIC UINT32_C(0x33464c48) // "HLF3" (LE)
 #define FSRV_BUFSZ (256 * 1024)
 #define FSRV_MAXARG 256
@@ -214,43 +140,6 @@ static int recv_full(int sock, void *buf, size_t n) {
 
 // Append one length-prefixed string-vector section [i32 n][n*(i32 len + bytes-with-NUL)] at out+*o.
 // Returns 0 on success, -1 if it would overflow cap.
-static int pack_strvec(char *out, size_t cap, size_t *o, int n, char *const v[]) {
-    if (*o + 4 > cap) return -1;
-    int32_t n32 = n;
-    memcpy(out + *o, &n32, 4);
-    *o += 4;
-    for (int i = 0; i < n; i++) {
-        int32_t l = (int32_t)strlen(v[i]) + 1; // include NUL
-        if (*o + 4 + (size_t)l > cap) return -1;
-        memcpy(out + *o, &l, 4);
-        *o += 4;
-        memcpy(out + *o, v[i], (size_t)l);
-        *o += (size_t)l;
-    }
-    return 0;
-}
-
-// Parse one string-vector section into v[] (pointers into `in`; NULL-terminated). Returns the count
-// (>= 0) and advances *o, or -1 on malformed/oversized input.
-static int unpack_strvec(const char *in, size_t len, size_t *o, char **v, int max) {
-    if (*o + 4 > len) return -1;
-    int32_t n;
-    memcpy(&n, in + *o, 4);
-    *o += 4;
-    if (n < 0 || n >= max) return -1;
-    for (int i = 0; i < n; i++) {
-        if (*o + 4 > len) return -1;
-        int32_t l;
-        memcpy(&l, in + *o, 4);
-        *o += 4;
-        if (l < 1 || *o + (size_t)l > len || in[*o + (size_t)l - 1] != 0) return -1;
-        v[i] = (char *)in + *o;
-        *o += (size_t)l;
-    }
-    v[n] = NULL;
-    return n;
-}
-
 // ---- runner: the guest process (ONE fork off the resident server); never returns ----
 // The SERVER keeps the control conn: it reports the runner pid right after fork and the raw wait
 // status when the portable child-wake loop reaps it -- one fork per launch,
@@ -537,7 +426,7 @@ static int hl_server_main(int argc, char **argv) {
                 if (reaped == g_fsrv_live[i].pid) {
                     if (g_fsrv_live[i].conn >= 0) {
                         int32_t status32 = (int32_t)status;
-                        (void)send_full(g_fsrv_live[i].conn, &status32, 4);
+                        (void)hl_fork_wire_send(g_fsrv_live[i].conn, &status32, 4);
                         close(g_fsrv_live[i].conn);
                     }
                     g_fsrv_live[i].pid = 0;
@@ -576,22 +465,23 @@ static int hl_server_main(int argc, char **argv) {
         int nfd = 0;
         // First recvmsg carries the 8-byte header (+ usually the whole body) and the SCM_RIGHTS fds;
         // a stream socket may split large bodies, so top up with plain recv until body_len arrives.
-        int n = recv_fds_msg(conn, buf, sizeof buf, fds, &nfd);
+        int n = hl_fork_wire_receive_descriptors(conn, buf, sizeof buf, fds, &nfd);
         uint32_t magic = 0, blen = 0;
         int ok = n >= 8;
         if (ok) {
             memcpy(&magic, buf, 4);
             memcpy(&blen, buf + 4, 4);
             ok = magic == FSRV_MAGIC && blen <= sizeof buf - 8;
-            if (ok && (size_t)n < 8 + (size_t)blen) ok = recv_full(conn, buf + n, 8 + (size_t)blen - (size_t)n) == 0;
+            if (ok && (size_t)n < 8 + (size_t)blen)
+                ok = hl_fork_wire_receive(conn, buf + n, 8 + (size_t)blen - (size_t)n) == 0;
         }
         char *wargv[FSRV_MAXARG + 1], *wenv[FSRV_MAXENV + 1];
         int wac = -1;
         size_t o = 8;
         const char *wcwd = "";
         if (ok) {
-            wac = unpack_strvec(buf, 8 + blen, &o, wargv, FSRV_MAXARG);
-            int wec = wac >= 1 ? unpack_strvec(buf, 8 + blen, &o, wenv, FSRV_MAXENV) : -1;
+            wac = hl_fork_wire_unpack_strings(buf, 8 + blen, &o, wargv, FSRV_MAXARG);
+            int wec = wac >= 1 ? hl_fork_wire_unpack_strings(buf, 8 + blen, &o, wenv, FSRV_MAXENV) : -1;
             if (wec < 0) wac = -1;
             if (wac >= 1) { // trailing [i32 cwdlen][cwd bytes]
                 int32_t cl = 0;
@@ -624,7 +514,7 @@ static int hl_server_main(int argc, char **argv) {
         for (int i = 0; i < nfd; i++)
             close(fds[i]); // ours were only for the runner
         int32_t p32 = (int32_t)(pid > 0 ? pid : -1);
-        (void)send_full(conn, &p32, 4); // the client forwards ^C/kill to this pid while it waits
+        (void)hl_fork_wire_send(conn, &p32, 4); // the client forwards ^C/kill to this pid while it waits
         if (pid < 0) {
             close(conn); // fork failure: EOF-without-status -> the client reports 125
             continue;
@@ -684,8 +574,8 @@ static int hl_client_main(int argc, char **argv) {
     char cwd[4096];
     if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
     int32_t cl = cwd[0] ? (int32_t)strlen(cwd) + 1 : 0;
-    if (pack_strvec(buf, sizeof buf, &o, argc - ai, argv + ai) != 0 ||
-        pack_strvec(buf, sizeof buf, &o, nenv, environ) != 0 || o + 4 + (size_t)cl > sizeof buf) {
+    if (hl_fork_wire_pack_strings(buf, sizeof buf, &o, argc - ai, argv + ai) != 0 ||
+        hl_fork_wire_pack_strings(buf, sizeof buf, &o, nenv, environ) != 0 || o + 4 + (size_t)cl > sizeof buf) {
         fprintf(stderr, "hl-engine --client: request too large\n");
         return 1;
     }
@@ -699,14 +589,14 @@ static int hl_client_main(int argc, char **argv) {
     memcpy(buf, &magic, 4);
     memcpy(buf + 4, &blen, 4);
     int fds[3] = {0, 1, 2};
-    if (send_fds_msg(s, buf, o, fds, 3) < 0) {
+    if (hl_fork_wire_send_descriptors(s, buf, o, fds, 3) < 0) {
         perror("sendmsg");
         return 1;
     }
     // 1st reply: the runner's pid -- forward job-control-ish signals to it while we wait, so ^C /
     // kill on the client behaves exactly as if the engine ran in this process.
     int32_t rpid = -1;
-    if (recv_full(s, &rpid, 4) != 0 || rpid <= 0) {
+    if (hl_fork_wire_receive(s, &rpid, 4) != 0 || rpid <= 0) {
         close(s);
         return 125; // server died / protocol error (matches the W3D client's error code)
     }
@@ -717,7 +607,7 @@ static int hl_client_main(int argc, char **argv) {
     // 2nd reply: the runner's raw wait status. Reproduce it exactly: re-raise a fatal signal on
     // ourselves (so the caller's WIFSIGNALED view matches a cold spawn), else exit with its code.
     int32_t st = 0;
-    if (recv_full(s, &st, 4) != 0) {
+    if (hl_fork_wire_receive(s, &st, 4) != 0) {
         close(s);
         return 125;
     }
