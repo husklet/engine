@@ -1484,7 +1484,8 @@ test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/linux-production/hl-remote-supervisor \
 	$(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS) \
 	$(PROCFS_CASE_BINS) $(PROCESS_CASE_BINS) $(MEMORY_CASE_BINS) $(SYSCALL_CASE_BINS) \
-	$(SYSCALL_EDGE_CASE_BINS)
+	$(SYSCALL_EDGE_CASE_BINS) $(ABI_CASE_BINS) $(COMPLETENESS_BINS) $(IPC_CASE_BINS) \
+	$(LIBC_CASE_BINS) $(POSIX_CASE_BINS) $(SIGNALS_CASE_BINS) $(THREAD_CASE_BINS) $(TIME_CASE_BINS)
 	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/filesystem/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
@@ -1517,6 +1518,38 @@ test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 		$(abspath $(BUILD)/compat/syscall_edges/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/syscall_edges/x86_64) $(abspath tests/compat/syscall_edges)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/abi/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/abi/x86_64) $(abspath tests/compat/abi)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/completeness/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/completeness/x86_64) $(abspath tests/compat/completeness)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/ipc/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/ipc/x86_64) $(abspath tests/compat/ipc)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/libc/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/libc/x86_64) $(abspath tests/compat/libc)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/posix/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/posix/x86_64) $(abspath tests/compat/posix)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/signals/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/signals/x86_64) $(abspath tests/compat/signals)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/threads/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/threads/x86_64) $(abspath tests/compat/threads)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/time/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/time/x86_64) $(abspath tests/compat/time)
 
 $(BUILD)/tools/remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
