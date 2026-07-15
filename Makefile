@@ -26,6 +26,17 @@ PERF_LIMIT_pipe := 250000 200000
 PERF_LIMIT_event := 250000 200000
 PERF_LIMIT_ipc-latency := 150000 120000
 PERF_LIMIT_ipc-throughput := 75000 60000
+PERF_MAC_LIMIT_startup := 30000 25000
+PERF_MAC_LIMIT_compute := 750000 650000
+PERF_MAC_LIMIT_syscall-startup := 40000 30000
+PERF_MAC_LIMIT_syscall-1m := 100000 80000
+PERF_MAC_LIMIT_fork-stress := 8000000 7000000
+PERF_MAC_LIMIT_mmap := 150000 120000
+PERF_MAC_LIMIT_file := 100000 80000
+PERF_MAC_LIMIT_pipe := 300000 250000
+PERF_MAC_LIMIT_event := 350000 300000
+PERF_MAC_LIMIT_ipc-latency := 200000 150000
+PERF_MAC_LIMIT_ipc-throughput := 100000 80000
 SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
@@ -1824,7 +1835,8 @@ $(BUILD)/perf/resource-x86_64: tests/perf/resource.c
 define HL_PERF_ENGINE
 	$(BUILD)/tools/perf-runner --label $(1)-$(2) --host-os $(PERF_MAC_OS) \
 		--host-release $(PERF_MAC_RELEASE) --host-arch $(PERF_MAC_ARCH) \
-		--warmups $(3) --samples $(4) --expect $(6) -- \
+		--warmups $(3) --samples $(4) --expect $(6) \
+		--max-cold-us $(word 1,$(PERF_MAC_LIMIT_$(1))) --max-p99-us $(word 2,$(PERF_MAC_LIMIT_$(1))) -- \
 		$(MAC) $(abspath $(BUILD)/production/hl-engine-linux-$(2)) $(abspath $(5))
 endef
 
