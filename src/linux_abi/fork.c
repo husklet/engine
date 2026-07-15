@@ -560,16 +560,8 @@ static int hl_client_main(int argc, char **argv) {
         fprintf(stderr, "usage: hl-engine --client SOCK [--rootfs DIR] PROG [args...]\n");
         return 2;
     }
-    int s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s < 0) {
-        perror("socket");
-        return 1;
-    }
-    struct sockaddr_un un;
-    memset(&un, 0, sizeof un);
-    un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof un.sun_path, "%s", sock);
-    if (connect(s, (struct sockaddr *)&un, sizeof un) < 0) {
+    hl_host_fork_client client = HL_HOST_FORK_CLIENT_INIT;
+    if (hl_host_fork_client_open(&client, sock) != 0) {
         perror("connect");
         return 1;
     }
@@ -585,6 +577,7 @@ static int hl_client_main(int argc, char **argv) {
     if (hl_fork_wire_pack_strings(buf, sizeof buf, &o, argc - ai, argv + ai) != 0 ||
         hl_fork_wire_pack_strings(buf, sizeof buf, &o, nenv, environ) != 0 || o + 4 + (size_t)cl > sizeof buf) {
         fprintf(stderr, "hl-engine --client: request too large\n");
+        hl_host_fork_client_close(&client);
         return 1;
     }
     memcpy(buf + o, &cl, 4);
@@ -596,16 +589,16 @@ static int hl_client_main(int argc, char **argv) {
     uint32_t magic = FSRV_MAGIC, blen = (uint32_t)(o - 8);
     memcpy(buf, &magic, 4);
     memcpy(buf + 4, &blen, 4);
-    int fds[3] = {0, 1, 2};
-    if (hl_fork_wire_send_descriptors(s, buf, o, fds, 3) < 0) {
+    if (hl_host_fork_client_send_launch(&client, buf, o) < 0) {
         perror("sendmsg");
+        hl_host_fork_client_close(&client);
         return 1;
     }
     // 1st reply: the runner's pid -- forward job-control-ish signals to it while we wait, so ^C /
     // kill on the client behaves exactly as if the engine ran in this process.
     int32_t rpid = -1;
-    if (hl_fork_wire_receive(s, &rpid, 4) != 0 || rpid <= 0) {
-        close(s);
+    if (hl_host_fork_client_receive(&client, &rpid, 4) != 0 || rpid <= 0) {
+        hl_host_fork_client_close(&client);
         return 125; // server died / protocol error (matches the W3D client's error code)
     }
     g_fwd_pid = (pid_t)rpid;
@@ -615,11 +608,11 @@ static int hl_client_main(int argc, char **argv) {
     // 2nd reply: the runner's raw wait status. Reproduce it exactly: re-raise a fatal signal on
     // ourselves (so the caller's WIFSIGNALED view matches a cold spawn), else exit with its code.
     int32_t st = 0;
-    if (hl_fork_wire_receive(s, &st, 4) != 0) {
-        close(s);
+    if (hl_host_fork_client_receive(&client, &st, 4) != 0) {
+        hl_host_fork_client_close(&client);
         return 125;
     }
-    close(s);
+    hl_host_fork_client_close(&client);
     if (WIFSIGNALED(st)) {
         int sig = WTERMSIG(st);
         signal(sig, SIG_DFL);

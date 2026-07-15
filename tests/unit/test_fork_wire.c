@@ -3,11 +3,28 @@
 #include "fork_codec.h"
 #include "fork_wire.h"
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
+
+static int listener_open(char *path, size_t capacity) {
+    struct sockaddr_un address;
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    HL_CHECK(listener >= 0);
+    HL_CHECK(snprintf(path, capacity, "/tmp/hl-fork-client-%ld.sock", (long)getpid()) > 0);
+    (void)unlink(path);
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    HL_CHECK(strlen(path) < sizeof address.sun_path);
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    HL_CHECK(bind(listener, (struct sockaddr *)&address, sizeof address) == 0);
+    HL_CHECK(listen(listener, 1) == 0);
+    return listener;
+}
 
 int main(void) {
     char storage[128];
@@ -98,5 +115,49 @@ int main(void) {
     HL_CHECK(close(pipe_descriptors[1]) == 0);
     HL_CHECK(close(sockets[0]) == 0);
     HL_CHECK(close(sockets[1]) == 0);
+
+    {
+        char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+        char missing[sizeof path];
+        char launch[6] = {0};
+        int launch_descriptors[8];
+        int launch_descriptor_count = 0;
+        int listener = listener_open(path, sizeof path);
+        int accepted;
+        hl_host_fork_client client = HL_HOST_FORK_CLIENT_INIT;
+
+        HL_CHECK(snprintf(missing, sizeof missing, "%s.missing", path) > 0);
+        HL_CHECK(hl_host_fork_client_open(&client, missing) == -1);
+        HL_CHECK(client.private_value == 0);
+
+        HL_CHECK(hl_host_fork_client_open(&client, path) == 0);
+        accepted = accept(listener, NULL, NULL);
+        HL_CHECK(accepted >= 0);
+        HL_CHECK(hl_host_fork_client_open(&client, path) == -1);
+
+        HL_CHECK(hl_host_fork_client_send_launch(&client, "launch", 6) == 0);
+        HL_CHECK(hl_fork_wire_receive_descriptors(accepted, launch, sizeof launch,
+                                                  launch_descriptors,
+                                                  &launch_descriptor_count) == 6);
+        HL_CHECK(memcmp(launch, "launch", 6) == 0);
+        HL_CHECK(launch_descriptor_count == 3);
+        for (int index = 0; index < launch_descriptor_count; index++)
+            HL_CHECK(close(launch_descriptors[index]) == 0);
+
+        HL_CHECK(hl_fork_wire_send(accepted, "done", 4) == 0);
+        memset(launch, 0, sizeof launch);
+        HL_CHECK(hl_host_fork_client_receive(&client, launch, 4) == 0);
+        HL_CHECK(memcmp(launch, "done", 4) == 0);
+
+        hl_host_fork_client_close(&client);
+        HL_CHECK(client.private_value == 0);
+        HL_CHECK(read(accepted, launch, 1) == 0);
+        hl_host_fork_client_close(&client);
+        HL_CHECK(hl_host_fork_client_receive(&client, launch, 1) == -1);
+
+        HL_CHECK(close(accepted) == 0);
+        HL_CHECK(close(listener) == 0);
+        HL_CHECK(unlink(path) == 0);
+    }
     return EXIT_SUCCESS;
 }
