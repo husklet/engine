@@ -319,7 +319,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     if (n) memcpy((void *)a4, (void *)a0, n);
                     if (a0) {
                         munmap((void *)a0, (size_t)phys); // free the full old extent (incl. its guard tail)
-                        gmap_del(a0);
+                        hl_gmap_remove(a0);
                         anon_untrack(a0, (size_t)phys);
                         gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
                         mlk_del(a0, (uint64_t)a1);
@@ -353,7 +353,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             void *ext =
                 mmap((void *)end, (size_t)(a0 + want - end), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ext == (void *)end) {
-                gmap_del(a0);
+                hl_gmap_remove(a0);
                 hl_gmap_add(a0, want);           // track the grown extent (incl. fresh guard) for execve() teardown
                 hl_gmap_set_guest_length(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
@@ -379,7 +379,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         memcpy(r, (void *)a0, n);
         if (a0) {
             munmap((void *)a0, (size_t)phys); // free the FULL tracked extent (incl. old guard tail)
-            gmap_del(a0);
+            hl_gmap_remove(a0);
             anon_untrack(a0, (size_t)phys);
         }
         hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);                        // track for execve() teardown
