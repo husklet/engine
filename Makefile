@@ -242,7 +242,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains audit-domains format format-check help
+	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -1244,10 +1244,6 @@ endef
 
 $(foreach test,$(E2E_CASES),$(eval $(call HL_E2E_CASE_RULE,$(test))))
 
-$(BUILD)/tools/check-domains: tools/check_domains.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
-
 $(BUILD)/tools/compat-runner: tools/compat_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
@@ -1634,14 +1630,7 @@ compat-build: $(FIXTURE_BINS)
 compat-native: $(NATIVE_SMOKE_BINS) $(BUILD)/tools/compat-runner
 	$(BUILD)/tools/compat-runner $(NATIVE_SMOKE_BINS)
 
-check-domains: $(BUILD)/tools/check-domains
-	@$(BUILD)/tools/check-domains --self-test
-	@$(BUILD)/tools/check-domains $(PRODUCTION_UNITY_DEPS)
-
-audit-domains: $(BUILD)/tools/check-domains
-	@$(BUILD)/tools/check-domains --measure $(PRODUCTION_UNITY_DEPS)
-
-test: unit check-domains compat-native
+test: unit compat-native
 
 # Keep sanitizer artifacts isolated from release objects.  The recursive invocation exercises the same
 # authoritative C unit graph, including both the Linux ABI and selected native host provider.

@@ -351,16 +351,16 @@ make BUILD=build-debug DEBUG=1 all
 HL_LOG=log:fs,log:jit build-debug/bin/hl-engine-runner ...
 ```
 
-### 7.3 Unit and domain tests
+### 7.3 Unit and behavior tests
 
 ```text
 make test
 make test-macos
-make check-domains
 make format-check
 ```
 
-`make test` runs C unit tests, domain-boundary checks, and native compatibility smoke tests. `make test-macos`
+`make test` runs C unit tests and native compatibility smoke tests. Architectural ownership is enforced by the
+library build and link graph, not by tests that inspect source text. `make test-macos`
 cross-builds the mac host tests and executes them on the real mac host using `mac`.
 
 ### 7.4 Linux-host production tests
