@@ -1,3 +1,26 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#include "signal.h"
+
+#include <stddef.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "cpu.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#include "../../../host/native_context.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
 // translator/guest/aarch64/signal.c -- the aarch64 Linux rt_sigframe (per-arch: register layout differs from
 // x86_64). os/linux/signal.c drives delivery (pending/mask/translate) and calls these to build/restore.
 
@@ -9,10 +32,10 @@
 #define SA_ONSTACK_L 0x08000000u
 #define SS_DISABLE_L 2u
 
-static void build_signal_frame(struct cpu *c, int sig) {
-    if (g_trace)
+void hl_aarch64_signal_build(struct cpu *c, int sig, const hl_aarch64_signal_state *state) {
+    if (state->trace)
         fprintf(stderr, "[sig] deliver %d sp=%llx handler=%llx\n", sig, (unsigned long long)c->sp,
-                (unsigned long long)g_sigact[sig].handler);
+                (unsigned long long)state->handler);
     // SA_ONSTACK: build the frame on the alternate signal stack, not the interrupted (guest) stack. Runtimes
     // that manage their own threads install handlers with SA_ONSTACK + a per-thread signal stack and then
     // VERIFY the handler ran on it -- Go's adjustSignalStack treats a handler that ran off its gsignal stack
@@ -21,7 +44,7 @@ static void build_signal_frame(struct cpu *c, int sig) {
     // switch to the alt stack only when SA_ONSTACK is set, an alt stack exists, and we are not ALREADY on it
     // (a nested handler keeps growing the same stack), so the interrupted SP saved below stays truthful.
     uint64_t base = c->sp;
-    if ((g_sigact[sig].flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
+    if ((state->flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
         !(c->sp >= c->alt_sp && c->sp < c->alt_sp + c->alt_size))
         base = c->alt_sp + c->alt_size; // alt stack top; the frame grows down from here
     uint64_t frame = (base - 4688) & ~15ull;
@@ -29,20 +52,20 @@ static void build_signal_frame(struct cpu *c, int sig) {
     memset(f, 0, 4688);
     // siginfo.si_signo
     *(int *)(f + 0) = sig;
-    *(int *)(f + 8) = g_sigcode[sig];       // si_code (SI_QUEUE for sigqueue, else 0)
-    *(uint64_t *)(f + 16) = g_sigaddr[sig]; // si_addr (synchronous fault address; 0 for async)
-    *(uint64_t *)(f + 24) = g_sigval[sig];  // si_value (sigqueue's sival_int/ptr)
+    *(int *)(f + 8) = *state->code;          // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(f + 16) = *state->address; // si_addr (synchronous fault address; 0 for async)
+    *(uint64_t *)(f + 24) = *state->value;   // si_value (sigqueue's sival_int/ptr)
     // SA_SIGINFO sender identity for a kill/tgkill-delivered signal: the _kill/_rt union overlays si_addr at
     // offset 16 -> si_pid@16, si_uid@20 (async kill has si_addr==0, so this simply fills those 8 bytes).
-    if (g_sigpid[sig]) {
-        *(int *)(f + 16) = g_sigpid[sig];
-        *(int *)(f + 20) = g_siguid[sig];
+    if (*state->pid) {
+        *(int *)(f + 16) = *state->pid;
+        *(int *)(f + 20) = *state->uid;
     }
-    g_sigcode[sig] = 0;
-    g_sigval[sig] = 0;
-    g_sigaddr[sig] = 0;
-    g_sigpid[sig] = 0;
-    g_siguid[sig] = 0; // consumed
+    *state->code = 0;
+    *state->value = 0;
+    *state->address = 0;
+    *state->pid = 0;
+    *state->uid = 0; // consumed
     // uc_mcontext sits at uc+176, NOT uc+168: mcontext_t is 16-byte aligned, so the kernel/glibc pad 8 bytes
     // after the 128-byte uc_sigmask (which ends at 168). The old mc=168 placed EVERY sigcontext field -- the
     // saved regs, sp, pc, pstate, and the __reserved FPSIMD area -- 8 bytes early, so a handler reading
@@ -59,14 +82,14 @@ static void build_signal_frame(struct cpu *c, int sig) {
                                                                       : 0;
     // uc_sigmask (signal mask to restore)
     *(uint64_t *)(uc + 40) = c->sigmask;
-    for (int i = 0; i < 31; i++)
+    for (size_t i = 0; i < 31; i++)
         *(uint64_t *)(mc + 8 + i * 8) = c->x[i];
     *(uint64_t *)(mc + 256) = c->sp;
     // The interrupted PC is GUEST-VISIBLE: the handler reads it (and Go looks it up in pclntab / rewrites it
     // for async-preempt). A non-PIE ET_EXEC runs c->pc biased HIGH, but its pclntab is keyed on the LOW link
     // vaddr -- a HIGH pc is "unknown pc" to the guest runtime. Hand over the UN-BIASED (low) pc; do_sigreturn
     // reads it back and the dispatcher re-biases low->high on resume. pcrel_base is identity for PIE.
-    *(uint64_t *)(mc + 264) = pcrel_base(c->pc);
+    *(uint64_t *)(mc + 264) = state->canonicalize_pc(state->callback_context, c->pc);
     *(uint64_t *)(mc + 272) = c->nzcv;
     // preserve NEON across the handler. Linux wraps it in a struct fpsimd_context inside uc_mcontext.
     // __reserved, tagged with an _aarch64_ctx{magic=FPSIMD_MAGIC, size} header so handlers and unwind/crash
@@ -87,17 +110,17 @@ static void build_signal_frame(struct cpu *c, int sig) {
     // handler(signo, siginfo*, ucontext*)
     c->x[2] = uc;
     // return address -> sigreturn
-    c->x[30] = SIGRETURN_PC;
+    c->x[30] = state->sigreturn_pc;
     c->sp = frame;
-    c->pc = g_sigact[sig].handler;
-    c->sigmask |= g_sigact[sig].mask;
+    c->pc = state->handler;
+    c->sigmask |= state->mask;
     // SA_NODEFER (sigset_t bit N-1)
-    if (!(g_sigact[sig].flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1));
+    if (!(state->flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1));
 }
 
-static void do_sigreturn(struct cpu *c) {
+void hl_aarch64_signal_restore(struct cpu *c) {
     uint64_t frame = c->sp, uc = frame + 128, mc = uc + 176; // mcontext at uc+176 (see build_signal_frame)
-    for (int i = 0; i < 31; i++)
+    for (size_t i = 0; i < 31; i++)
         c->x[i] = *(uint64_t *)(mc + 8 + i * 8);
     c->sp = *(uint64_t *)(mc + 256);
     c->pc = *(uint64_t *)(mc + 264);
@@ -114,17 +137,11 @@ static void do_sigreturn(struct cpu *c) {
 // cpu, leaving the stolen regs untouched. block_return (jit/dispatch.c, included later) unwinds a block back
 // to the dispatcher: it restores the host callee-saved state run_block saved at block entry and returns to
 // the run_guest loop, which then sees cpu->pc == handler and runs it.
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
-extern void block_return(void) __attribute__((visibility("hidden")));
-#else
-static void block_return(void);
-#endif
-
-static int sigframe_capture_fault(struct cpu *c, void *ucv) {
+int hl_aarch64_signal_capture(struct cpu *c, void *ucv, hl_aarch64_signal_cache_fn cache_contains,
+                              void *callback_context) {
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
-    extern int jit_pc_in_retained_cache(uint64_t pc);
-    if (!jit_pc_in_retained_cache(hpc)) return 0; // host PC outside all retained code caches -> engine fault
+    if (!cache_contains(callback_context, hpc)) return 0; // host PC outside all retained code caches -> engine fault
     uint64_t *X = HL_HOST_UC_REGS(uc);
     for (int r = 0; r <= 30; r++)
         if (!is_stolen(r)) c->x[r] = X[r];
@@ -135,8 +152,9 @@ static int sigframe_capture_fault(struct cpu *c, void *ucv) {
     return 1;
 }
 
-static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
+void hl_aarch64_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_return) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    HL_HOST_UC_REGS(uc)[0] = (uint64_t)c; // block_return reads &cpu from x0
-    HL_HOST_UC_PC(uc) = (uint64_t)block_return;
+    uint64_t cpu_address = (uint64_t)c;
+    memcpy(HL_HOST_UC_REGS(uc), &cpu_address, sizeof(cpu_address)); // block_return reads &cpu from x0
+    HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
 }

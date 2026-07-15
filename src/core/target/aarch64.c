@@ -67,6 +67,7 @@ hl_status hl_run_linux_guest_status(void) {
 static uint64_t g_host_launch_monotonic_ns;
 
 #include "../../translator/guest/aarch64/cpu.h"
+#include "../../translator/guest/aarch64/signal.h"
 #include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
 #define HL_GUEST_STAT_SIZE HL_LINUX_STAT_AARCH64_SIZE
 #define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_aarch64
@@ -110,7 +111,46 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
 #include "../../linux_abi/thread.c"
 // signal delivery
 #include "../../linux_abi/signal.c"
-#include "../../translator/guest/aarch64/signal.c" // per-arch rt_sigframe build/restore (uses signal.c state)
+
+static uint64_t signal_canonicalize_pc(void *context, uint64_t pc) {
+    (void)context;
+    return pcrel_base(pc);
+}
+
+static int signal_cache_contains(void *context, uint64_t pc) {
+    (void)context;
+    return jit_pc_in_retained_cache(pc);
+}
+
+static void build_signal_frame(struct cpu *c, int sig) {
+    hl_aarch64_signal_state state = {
+        .handler = g_sigact[sig].handler,
+        .flags = g_sigact[sig].flags,
+        .mask = g_sigact[sig].mask,
+        .code = &g_sigcode[sig],
+        .value = &g_sigval[sig],
+        .address = &g_sigaddr[sig],
+        .pid = &g_sigpid[sig],
+        .uid = &g_siguid[sig],
+        .sigreturn_pc = SIGRETURN_PC,
+        .trace = g_trace,
+        .canonicalize_pc = signal_canonicalize_pc,
+        .callback_context = NULL,
+    };
+    hl_aarch64_signal_build(c, sig, &state);
+}
+
+static void do_sigreturn(struct cpu *c) {
+    hl_aarch64_signal_restore(c);
+}
+
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL);
+}
+
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    hl_aarch64_signal_resume(c, native_context, (uintptr_t)block_return);
+}
 // path jail + overlay + /proc synth
 #include "../../linux_abi/container/vfs.c"
 // termios + NET-ns loopback
