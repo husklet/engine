@@ -121,6 +121,14 @@ static int same(const struct result *a, const struct result *b) {
     return a->status == b->status && a->size == b->size && memcmp(a->output, b->output, a->size) == 0;
 }
 
+static void report_difference(const char *label, const struct result *first, const struct result *second) {
+    if (same(first, second)) return;
+    fprintf(stderr, "%s mismatch: first status=%d size=%zu, second status=%d size=%zu\n", label, first->status,
+            first->size, second->status, second->size);
+    if (first->size != 0) fprintf(stderr, "%s first output: %.*s\n", label, (int)first->size, first->output);
+    if (second->size != 0) fprintf(stderr, "%s second output: %.*s\n", label, (int)second->size, second->output);
+}
+
 static int shell_status(int status) {
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -147,16 +155,20 @@ int main(int argc, char **argv) {
     if (run_guest(argv[1], argv[2], NULL, argv[3], "id", NULL, NULL, &cold) == 0 &&
         run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &served) == 0)
         identity = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 42;
+    if (!identity) report_difference("identity", &cold, &served);
     if (run_guest(argv[1], argv[2], NULL, argv[3], "stdin", NULL, "forkserver-stdin\n", &cold) == 0 &&
         run_guest(argv[1], argv[2], socket_path, argv[3], "stdin", NULL, "forkserver-stdin\n", &served) == 0)
         stdio = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 0;
+    if (!stdio) report_difference("stdio", &cold, &served);
     if (run_guest(argv[1], argv[2], NULL, argv[3], "exit", "17", NULL, &cold) == 0 &&
         run_guest(argv[1], argv[2], socket_path, argv[3], "exit", "17", NULL, &served) == 0)
         exitcode = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 17;
+    if (!exitcode) report_difference("exit", &cold, &served);
     if (run_guest(argv[1], argv[2], NULL, argv[3], "segv", NULL, NULL, &cold) == 0 &&
         run_guest(argv[1], argv[2], socket_path, argv[3], "segv", NULL, NULL, &served) == 0)
         fatal = cold.size == served.size && memcmp(cold.output, served.output, cold.size) == 0 &&
                 shell_status(cold.status) == 128 + SIGSEGV && shell_status(served.status) == 128 + SIGSEGV;
+    if (!fatal) report_difference("fatal", &cold, &served);
     stop_server(server, socket_path);
 
     server = start_server(argv[1], argv[2], socket_path, argv[3]);
@@ -164,6 +176,7 @@ int main(int argc, char **argv) {
     if (run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm1) == 0 &&
         run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm2) == 0)
         warm = same(&warm1, &warm2) && WIFEXITED(warm1.status) && WEXITSTATUS(warm1.status) == 42;
+    if (!warm) report_difference("warm", &warm1, &warm2);
     stop_server(server, socket_path);
     snprintf(summary, sizeof summary, "forkserver identity=%d stdio=%d exit=%d fatal=%d warm=%d\n", identity,
              stdio, exitcode, fatal, warm);
