@@ -214,27 +214,15 @@ static uint64_t pcache_mmap_hint(uint64_t len) {
 
 #define PCACHE_MMAP_HINT 1
 
-static uint64_t pc_fd_id(int fd) { // file identity for the manifest (dev/ino/size/mtime; no path needed)
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
-    uint64_t h = 1469598103934665603ull;
-    uint64_t fields[5] = {(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
-                          (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec};
-    for (int i = 0; i < 5; i++) {
-        h ^= fields[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
 // Called by mem.c after a hinted file-backed mmap SUCCEEDED AT ITS HINT (r == hint). Cold epoch: record
 // the mapping in the manifest so its blocks persist. Warm epoch: this is the activation gate -- if the
 // mapped file's identity matches the manifest entry restored for this base, the deferred blocks in
 // [base, base+len) become live (map_put); otherwise they are dropped (different lib/layout -> a restored
 // translation must never shadow different guest bytes).
-static void pcache_note_libmap(uint64_t base, uint64_t len, int fd) {
+static void pcache_note_libmap(uint64_t base, uint64_t len, const hl_host_file_metadata *metadata) {
     if (!g_pcache) return;
-    uint64_t id = pc_fd_id(fd);
+    /* hl_identity_file preserves the v7 five-field dev/ino/size/mtime-sec/mtime-nsec hash. */
+    uint64_t id = hl_identity_file(metadata);
     if (!id) return;
     if (!g_pcache_loaded) { // cold epoch: record for save
         if (g_pc_nlib < PC_LIB_MAX) {

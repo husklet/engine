@@ -679,13 +679,6 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     gna_clear(glo, ghi);
                 gro_clear(glo, ghi);
             }
-#ifdef PCACHE_MMAP_HINT
-            // (pcache): a hinted library map that landed ON its deterministic hint. Cold epoch:
-            // record {base, len, file identity} in the save manifest. Warm epoch: the activation gate for
-            // the restored blocks deferred over this range (identity must match, or they stay dead).
-            if (pc_hint && (uint64_t)(uintptr_t)r == pc_hint)
-                pcache_note_libmap((uint64_t)(uintptr_t)r, (uint64_t)a1, (int)a4);
-#endif
         }
         /* Keep registry publication inside the same serialized mapping
            transaction as the host replacement.  gmap/anon/wipe/protection

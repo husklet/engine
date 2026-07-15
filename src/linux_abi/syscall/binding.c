@@ -567,6 +567,7 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     int64_t result;
     uint64_t bus_accessible = size;
     uint64_t stable_device = 0, stable_object = 0, known_size = 0;
+    hl_host_file_metadata metadata = {0};
     int identity_valid = 0;
     int bus_prepared = 0;
     if (head == NULL || g_host_services == NULL || g_host_services->memory == NULL ||
@@ -576,7 +577,6 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     if (linux_flags & 0x10u) flags |= HL_HOST_MEMORY_FIXED;
     if (linux_flags & 0x100000u) flags = (flags & ~HL_HOST_MEMORY_FIXED) | HL_HOST_MEMORY_FIXED_NOREPLACE;
     if (g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
-        hl_host_file_metadata metadata;
         hl_host_result status = g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
         if (status.status == HL_STATUS_OK) {
             stable_device = metadata.stable_device;
@@ -592,6 +592,16 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
             }
         }
     }
+#ifdef PCACHE_MMAP_HINT
+    /* The typed route precedes svc_mem, so it owns the production persistent-cache hint.
+     * Metadata failure and non-regular files remain ordinary, uncacheable mappings. */
+    uint64_t pc_hint = 0;
+    if (address == 0 && (linux_flags & (0x10u | 0x20u)) == 0 && identity_valid &&
+        metadata.type == HL_HOST_FILE_TYPE_REGULAR) {
+        pc_hint = pcache_mmap_hint(size);
+        if (pc_hint != 0) address = pc_hint;
+    }
+#endif
     result = hl_linux_map_file(g_linux_box, file->fd, address, offset, size, protection & 7u, flags, &mapped);
     if (result < 0) {
         if (bus_prepared) gbus_prepare_release();
@@ -644,6 +654,12 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         return -ENOMEM;
     }
     if (bus_prepared) gbus_prepare_release();
+#ifdef PCACHE_MMAP_HINT
+    /* A hint is advisory. Publish the identity only after the provider reports that exact
+     * address, otherwise this run cannot safely restore translations for the mapping. */
+    if (pc_hint != 0 && mapped.address == pc_hint && (protection & 4u) != 0)
+        pcache_note_libmap(mapped.address, size, &metadata);
+#endif
     pthread_mutex_unlock(&g_bound_mapping_lock);
     pthread_mutex_unlock(&g_bound_mapping_gate);
     return (int64_t)mapped.address;
