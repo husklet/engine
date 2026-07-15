@@ -4,13 +4,9 @@
 #if defined(__APPLE__)
 #include "hl/macos.h"
 typedef hl_host_macos hl_activation_host;
-#define hl_activation_host_create hl_host_macos_create
-#define hl_activation_host_destroy hl_host_macos_destroy
 #elif defined(__linux__)
 #include "hl/linux.h"
 typedef hl_host_linux hl_activation_host;
-#define hl_activation_host_create hl_host_linux_create
-#define hl_activation_host_destroy hl_host_linux_destroy
 #else
 #error unsupported activation host
 #endif
@@ -27,6 +23,22 @@ typedef hl_host_linux hl_activation_host;
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static hl_status activation_host_create(hl_activation_host **host, hl_host_services *services) {
+#if defined(__APPLE__)
+    return hl_host_macos_create(host, services);
+#else
+    return hl_host_linux_create(host, services);
+#endif
+}
+
+static void activation_host_destroy(hl_activation_host *host) {
+#if defined(__APPLE__)
+    hl_host_macos_destroy(host);
+#else
+    hl_host_linux_destroy(host);
+#endif
+}
 
 extern char **environ;
 void hl_activation_test_mode(uint32_t mode);
@@ -168,7 +180,7 @@ static void hl_activation_child(void) {
         /* Explicit setup is idempotent and independent of constructor order. */
         hl_embedded_runtime_init(request.guest_isa);
         hl_embedded_runtime_init(request.guest_isa);
-        status = hl_activation_host_create(&host, &services);
+        status = activation_host_create(&host, &services);
         activation_services = &services;
         activation_guest_isa = request.guest_isa;
         activation_result = &reply.result;
@@ -183,7 +195,7 @@ static void hl_activation_child(void) {
     reply.status = (int32_t)status;
     if (request.test_flags == 5) reply.nonce[0] ^= UINT64_C(1);
     (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
-    hl_activation_host_destroy(host);
+    activation_host_destroy(host);
     (void)close((int)descriptor);
     _exit(status == HL_STATUS_OK ? 0 : 127);
 }
