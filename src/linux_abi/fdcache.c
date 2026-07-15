@@ -157,7 +157,7 @@ void rc_reset(void);
 // Extends item-9's rc_* (which memoizes only the read-only atpath() resolver) to the open-heavy half:
 // guest-abs-path -> canonical symlink-free host path, so a repeated open collapses the TOCTOU-safe
 // per-component jail walk to a single open(host, O_NOFOLLOW). Shares g_res_epoch. Kill: W4_NOOPENCACHE=1.
-int oc_lookup(const char *g, char *out, size_t n);
+int hl_fdcache_open_lookup(const char *g, char *out, size_t n);
 void oc_store(const char *g, const char *host);
 static void oc_reset(void);
 
@@ -630,7 +630,7 @@ static int oc_enabled(void) {
     return 1;
 }
 
-int oc_lookup(const char *g, char *out, size_t n) {
+int hl_fdcache_open_lookup(const char *g, char *out, size_t n) {
     if (!oc_enabled() || !g || g[0] != '/' || strlen(g) >= sizeof(((struct ocent *)0)->guest)) return 0;
     CLK;
     int hit = 0;

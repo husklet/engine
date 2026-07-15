@@ -2543,7 +2543,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int cacheable = !(lf & (0x40 | 0x80 | 0x200 | G_O_DIRECTORY | G_O_NOFOLLOW));
             char gkey[4200], hostc[4200];
             if (cacheable) abs_guest((int)a0, (const char *)a1, gkey, sizeof gkey);
-            if (cacheable && oc_lookup(gkey, hostc, sizeof hostc)) {
+            if (cacheable && hl_fdcache_open_lookup(gkey, hostc, sizeof hostc)) {
                 // ONE atomic open replaces the per-component walk; hostc is already canonical+symlink-free.
                 int r = open(hostc, mf | O_NOFOLLOW, (mode_t)a3);
                 int e = errno;
