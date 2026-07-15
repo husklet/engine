@@ -118,6 +118,10 @@ static inline uint64_t now_ns(void) {
     return result.status == HL_STATUS_OK ? result.value : 0;
 }
 
+static inline void jit_backoff_ns(uint64_t interval_ns) {
+    (void)g_jit_services.clock->backoff_ns(g_jit_services.context, interval_ns);
+}
+
 // Threads: each guest thread runs run_guest on its OWN struct cpu, stored in a
 // pthread TSD slot so emitted block-exit code can recover it from host TLS.
 static pthread_key_t g_cpu_key;
@@ -724,7 +728,7 @@ void jit_cache_diag(uint64_t *gen, uint64_t *flushes, uint32_t *retired, uint32_
     if (freed) *freed = (uint32_t)(g_nfreed_total > UINT32_MAX ? UINT32_MAX : g_nfreed_total);
 }
 
-// Park safepoint handler -- async-signal-safe (atomics + nanosleep only). A peer caught here is, by
+// Park safepoint handler -- signal-safe host backoff plus atomics only. A peer caught here is, by
 // definition, no longer executing a translated block (it is on its host stack in this handler), so the
 // flusher may safely retire the cache while we spin.
 static void stw_park_handler(int sig, siginfo_t *si, void *ucv) {
@@ -742,8 +746,7 @@ static void stw_park_handler(int sig, siginfo_t *si, void *ucv) {
     }
     atomic_fetch_add_explicit(&g_stw_parked, 1, memory_order_seq_cst);
     while (atomic_load_explicit(&g_stw_active, memory_order_seq_cst)) {
-        struct timespec ts = {0, 200000}; // 0.2ms
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(200000)); // 0.2ms
     }
     atomic_fetch_sub_explicit(&g_stw_parked, 1, memory_order_seq_cst);
 }
@@ -808,8 +811,7 @@ static void stw_dispatch_safepoint(void) {
     uint64_t request = atomic_load_explicit(&g_dispatch_request, memory_order_acquire);
     atomic_store_explicit(&g_stw_threads[g_my_stw_slot].dispatch_ack, request, memory_order_release);
     while (atomic_load_explicit(&g_dispatch_gate, memory_order_acquire)) {
-        struct timespec ts = {0, 50000};
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(50000));
     }
 }
 
@@ -872,8 +874,7 @@ static int stw_force_dispatch_flush(void) {
                 break;
             }
         if (!pending) break;
-        struct timespec ts = {0, 50000};
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(50000));
     }
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu)
@@ -914,8 +915,7 @@ static void stw_mapping_begin(void) {
                 break;
             }
         if (!pending) break;
-        struct timespec ts = {0, 50000};
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(50000));
     }
 }
 
@@ -1045,15 +1045,13 @@ static int stw_flush(void) {
             if (pthread_kill(g_stw_threads[i].th, STW_SIG) == 0) target++;
     // Wait until every signaled peer has reached the safepoint (so none is executing in the cache).
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) < target) {
-        struct timespec ts = {0, 50000};
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(50000));
     }
     int ok = jit_flush_to_fresh();
     atomic_store_explicit(&g_stw_active, 0, memory_order_seq_cst); // release the world
     // Wait for all peers to leave the handler so the counters are clean for the next flush.
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) > 0) {
-        struct timespec ts = {0, 50000};
-        nanosleep(&ts, NULL);
+        jit_backoff_ns(UINT64_C(50000));
     }
     pthread_mutex_unlock(&g_stw_reg_lock);
     return ok;

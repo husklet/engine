@@ -142,6 +142,18 @@ static hl_host_result hl_fake_architectural_counter(void *context) {
     return hl_fake_result(fake, fake->architectural_counter_hz);
 }
 
+static hl_host_result hl_fake_backoff(void *context, uint64_t interval_ns) {
+    hl_fake_host *fake = context;
+    hl_host_result result = hl_fake_result(fake, 0);
+    if (result.status == HL_STATUS_OK) {
+        if (UINT64_MAX - fake->monotonic_ns < interval_ns)
+            fake->monotonic_ns = UINT64_MAX;
+        else
+            fake->monotonic_ns += interval_ns;
+    }
+    return result;
+}
+
 static hl_host_result hl_fake_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
     hl_fake_host *fake = context;
     uint64_t *clock;
@@ -1096,7 +1108,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                   .process_cpu_ns = hl_fake_process_cpu,
                                                   .thread_cpu_ns = hl_fake_thread_cpu,
                                                   .sleep_until = hl_fake_sleep_until,
-                                                  .architectural_counter_hz = hl_fake_architectural_counter};
+                                                  .architectural_counter_hz = hl_fake_architectural_counter,
+                                                  .backoff_ns = hl_fake_backoff};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};

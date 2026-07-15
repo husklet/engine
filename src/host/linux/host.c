@@ -817,6 +817,17 @@ static hl_host_result hl_linux_architectural_counter(void *context) {
     return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
 }
 
+static hl_host_result hl_linux_backoff(void *context, uint64_t interval_ns) {
+    struct timespec remaining;
+    (void)context;
+    remaining.tv_sec = (time_t)(interval_ns / UINT64_C(1000000000));
+    remaining.tv_nsec = (long)(interval_ns % UINT64_C(1000000000));
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) return hl_linux_errno_result();
+    }
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_linux_clock_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
     clockid_t clock_id;
     struct timespec deadline;
@@ -3530,7 +3541,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                   .process_cpu_ns = hl_linux_process_cpu,
                                                   .thread_cpu_ns = hl_linux_thread_cpu,
                                                   .sleep_until = hl_linux_clock_sleep_until,
-                                                  .architectural_counter_hz = hl_linux_architectural_counter};
+                                                  .architectural_counter_hz = hl_linux_architectural_counter,
+                                                  .backoff_ns = hl_linux_backoff};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),

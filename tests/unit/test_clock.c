@@ -36,6 +36,13 @@ int main(void) {
     }
     HL_CHECK(services.clock->process_cpu_ns(services.context).value == UINT64_C(5000000017));
     HL_CHECK(services.clock->thread_cpu_ns(services.context).value == UINT64_C(6000000019));
+    fake.monotonic_ns = UINT64_C(1000000);
+    HL_CHECK(services.clock->backoff_ns(services.context, UINT64_C(250000)).status == HL_STATUS_OK);
+    HL_CHECK(fake.monotonic_ns == UINT64_C(1250000));
+    fake.monotonic_ns = UINT64_MAX - UINT64_C(10);
+    HL_CHECK(services.clock->backoff_ns(services.context, UINT64_C(20)).status == HL_STATUS_OK);
+    HL_CHECK(fake.monotonic_ns == UINT64_MAX);
+    fake.monotonic_ns = UINT64_C(1250000);
     HL_CHECK(services.clock->sleep_until(services.context, HL_HOST_CLOCK_MONOTONIC, UINT64_C(7000000000)).status ==
              HL_STATUS_OK);
     HL_CHECK(fake.monotonic_ns == UINT64_C(7000000000));

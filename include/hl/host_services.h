@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
-#define HL_HOST_CLOCK_ABI 3u
+#define HL_HOST_CLOCK_ABI 4u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI_13 13u
 #define HL_HOST_FILE_ABI_14 14u
@@ -241,6 +241,13 @@ typedef struct hl_host_clock_services {
      * HL_STATUS_NOT_SUPPORTED. This lets translators validate a hardware
      * counter without importing a platform clock API. */
     hl_host_result (*architectural_counter_hz)(void *context);
+    /* Relative timed backoff complements sleep_until, so it remains in the
+     * clock group rather than creating a thread service with one operation.
+     * This is an engine signal-context contract, not a general claim about
+     * POSIX APIs: providers must use immutable state, must not allocate, lock,
+     * or log, must consume interruptions, and must not return early for a
+     * valid interval. */
+    hl_host_result (*backoff_ns)(void *context, uint64_t interval_ns);
 } hl_host_clock_services;
 
 typedef enum hl_host_clock_kind {

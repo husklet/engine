@@ -57,7 +57,7 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         if (clock == NULL || clock->abi != HL_HOST_CLOCK_ABI || clock->size < sizeof(*clock) ||
             clock->monotonic_ns == NULL || clock->realtime_ns == NULL || clock->raw_monotonic_ns == NULL ||
             clock->process_cpu_ns == NULL || clock->thread_cpu_ns == NULL || clock->sleep_until == NULL ||
-            clock->architectural_counter_hz == NULL)
+            clock->architectural_counter_hz == NULL || clock->backoff_ns == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_LOG) != 0 &&
