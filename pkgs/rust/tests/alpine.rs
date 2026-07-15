@@ -45,6 +45,7 @@ fn public_api_runs_real_alpine_shell_with_process_io() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
+    assert_ne!(child.id(), 0);
     child.take_stdin().unwrap().write_all(b"input\n").unwrap();
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -61,4 +62,45 @@ fn public_api_runs_real_alpine_shell_with_process_io() {
     assert_eq!(child.wait().unwrap(), Exit::Code(17));
     assert_eq!(stdout, "out:alpine:/tmp:input\n");
     assert_eq!(stderr, "err:argument\n");
+}
+
+#[test]
+fn output_drains_large_stdout_and_stderr_concurrently() {
+    let engine = Engine::new();
+    let output = engine
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()))
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 6000 ]; do echo out-$i; echo err-$i >&2; i=$((i+1)); done",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.exit, Exit::Code(0));
+    assert!(output.stdout.len() > 50_000);
+    assert!(output.stderr.len() > 50_000);
+    assert!(output.stdout.ends_with(b"out-5999\n"));
+    assert!(output.stderr.ends_with(b"err-5999\n"));
+}
+
+#[test]
+fn piped_streams_enforce_their_direction() {
+    let engine = Engine::new();
+    let mut child = engine
+        .command(Guest::Aarch64, "/bin/echo")
+        .config(Config::new().root(rootfs()))
+        .arg("hello")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.take_stdin().unwrap();
+    let mut output = child.take_stdout().unwrap();
+    assert!(input.read(&mut [0]).is_err());
+    assert!(output.write_all(b"wrong direction").is_err());
+    drop(input);
+    let mut text = String::new();
+    output.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "hello\n");
+    assert_eq!(child.wait().unwrap(), Exit::Code(0));
 }

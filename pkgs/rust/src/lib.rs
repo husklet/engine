@@ -1,5 +1,5 @@
 //! Safe process-isolated lifecycle API for the HL Linux guest engine.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(not(any(
     all(target_arch = "aarch64", target_os = "macos"),
@@ -7,13 +7,13 @@
 )))]
 compile_error!("hl-engine supports only aarch64-apple-darwin and aarch64-unknown-linux-gnu hosts");
 
-mod artifacts;
 mod child;
 mod command;
 mod config;
 mod container;
 mod engine;
 mod error;
+mod ffi;
 mod result;
 mod runtime;
 mod types;

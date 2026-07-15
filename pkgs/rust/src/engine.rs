@@ -1,23 +1,23 @@
 use crate::{
-    artifacts::Artifacts, wire, Child, Command as GuestCommand, Config, Error, Guest, Stdio,
+    ffi, runtime::ConfigFile, wire, Child, Command as GuestCommand, Config, Error, Guest, Stdio,
 };
-use std::{ffi::OsStr, process::Command, sync::OnceLock};
+use std::{
+    ffi::{CString, OsStr},
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
+    os::unix::ffi::OsStrExt,
+    sync::OnceLock,
+};
 
-static ARTIFACTS: OnceLock<Result<Artifacts, String>> = OnceLock::new();
+static EXECUTABLE: OnceLock<Result<CString, String>> = OnceLock::new();
 
-/// Installed engine distribution for one host.
-#[derive(Clone, Debug)]
+/// Entry point for constructing guest commands.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Engine;
 impl Engine {
     #[must_use]
     pub const fn new() -> Self {
         Self
-    }
-    fn artifacts() -> Result<&'static Artifacts, Error> {
-        match ARTIFACTS.get_or_init(|| Artifacts::install().map_err(|e| e.to_string())) {
-            Ok(artifacts) => Ok(artifacts),
-            Err(message) => Err(Error::Distribution(message.clone())),
-        }
     }
     #[must_use]
     pub fn command(&self, guest: Guest, program: impl Into<std::ffi::OsString>) -> GuestCommand {
@@ -34,40 +34,66 @@ impl Engine {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        use std::os::unix::ffi::OsStrExt;
         let mut argv = vec![program.as_ref().to_owned()];
-        argv.extend(arguments.into_iter().map(|v| v.as_ref().to_owned()));
+        argv.extend(arguments.into_iter().map(|value| value.as_ref().to_owned()));
         if argv[0].as_bytes().is_empty() {
             return Err(Error::InvalidConfig("program must not be empty"));
         }
-        let artifacts = Self::artifacts()?;
-        let files = artifacts.runtime.files()?;
-        files.write_config(&wire::encode(config, &argv, Some(files.result_path()))?)?;
-        let executable = match guest {
-            Guest::Aarch64 => &artifacts.aarch64,
-            Guest::X86_64 => &artifacts.x86_64,
+        let config = ConfigFile::create(&wire::encode(config, &argv, None)?)?;
+        let executable = EXECUTABLE
+            .get_or_init(|| {
+                let path = std::env::current_exe().map_err(|error| error.to_string())?;
+                CString::new(path.as_os_str().as_bytes())
+                    .map_err(|_| "current executable contains NUL".into())
+            })
+            .as_ref()
+            .map_err(|message| Error::Distribution(message.clone()))?;
+        let config_path = CString::new(config.path().as_os_str().as_bytes())
+            .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
+        let (input, stdin, input_child) = prepare(streams.0, true)?;
+        let (output, stdout, output_child) = prepare(streams.1, false)?;
+        let (error, stderr, error_child) = prepare(streams.2, false)?;
+        let native = ffi::Streams {
+            input,
+            output,
+            error,
         };
-        let mut command = Command::new(executable);
-        command.arg("--configfile").arg(files.config_path());
-        command
-            .stdin(stream(streams.0))
-            .stdout(stream(streams.1))
-            .stderr(stream(streams.2));
+        let process = ffi::start(executable, guest_number(guest), &config_path, &native)
+            .map_err(native_error)?;
+        drop((input_child, output_child, error_child));
         Ok(Child {
-            process: Some(command.spawn()?),
-            files,
+            process: Some(process),
+            _config: config,
+            stdin,
+            stdout,
+            stderr,
         })
     }
 }
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
+
+fn prepare(value: Stdio, input: bool) -> Result<(i32, Option<File>, Option<File>), Error> {
+    match value {
+        Stdio::Inherit => Ok((-1, None, None)),
+        Stdio::Null => {
+            let file = OpenOptions::new()
+                .read(input)
+                .write(!input)
+                .open("/dev/null")?;
+            Ok((file.as_raw_fd(), None, Some(file)))
+        }
+        Stdio::Piped => {
+            let (read, write) = ffi::pipe_pair()?;
+            let (parent, child) = if input { (write, read) } else { (read, write) };
+            Ok((child.as_raw_fd(), Some(parent), Some(child)))
+        }
     }
 }
-fn stream(value: Stdio) -> std::process::Stdio {
-    match value {
-        Stdio::Inherit => std::process::Stdio::inherit(),
-        Stdio::Null => std::process::Stdio::null(),
-        Stdio::Piped => std::process::Stdio::piped(),
+const fn guest_number(guest: Guest) -> u32 {
+    match guest {
+        Guest::Aarch64 => 1,
+        Guest::X86_64 => 2,
     }
+}
+fn native_error(status: i32) -> Error {
+    Error::Engine { status, detail: 0 }
 }

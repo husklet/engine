@@ -1,86 +1,113 @@
-use crate::{runtime::LaunchFiles, Error, Exit};
-use std::process::{Child as Process, ChildStderr, ChildStdin, ChildStdout};
+use crate::{ffi, result, runtime::ConfigFile, Error, Exit};
+use std::{fs::File, io::Read};
 
 /// Owned running engine process.
 #[derive(Debug)]
 pub struct Child {
-    pub(crate) process: Option<Process>,
-    pub(crate) files: LaunchFiles,
+    pub(crate) process: Option<ffi::Handle>,
+    pub(crate) _config: ConfigFile,
+    pub(crate) stdin: Option<File>,
+    pub(crate) stdout: Option<File>,
+    pub(crate) stderr: Option<File>,
 }
 /// Captured output and typed guest status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Output {
-    pub status: Exit,
+    pub exit: Exit,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 impl Child {
     #[must_use]
-    pub fn id(&self) -> u32 {
-        self.process.as_ref().map_or(0, Process::id)
+    pub fn id(&self) -> u64 {
+        self.process
+            .as_ref()
+            .and_then(|process| ffi::process_id(process).ok())
+            .unwrap_or(0)
     }
-    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.process.as_mut()?.stdin.take()
+    pub fn take_stdin(&mut self) -> Option<File> {
+        self.stdin.take()
     }
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.process.as_mut()?.stdout.take()
+    pub fn take_stdout(&mut self) -> Option<File> {
+        self.stdout.take()
     }
-    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.process.as_mut()?.stderr.take()
+    pub fn take_stderr(&mut self) -> Option<File> {
+        self.stderr.take()
     }
     /// Polls for completion.
     ///
     /// # Errors
-    /// Returns process or result-protocol failures.
+    /// Returns native lifecycle or result-protocol failures.
     pub fn try_wait(&mut self) -> Result<Option<Exit>, Error> {
-        let Some(process) = self.process.as_mut() else {
-            return Ok(None);
-        };
-        let Some(status) = process.try_wait()? else {
-            return Ok(None);
-        };
-        self.process = None;
-        Ok(Some(self.files.finish(status)?))
+        ffi::try_wait(self.process.as_ref().ok_or(Error::InvalidState)?)
+            .map_err(native_error)?
+            .map(result::native)
+            .transpose()
     }
-    /// Stops the engine process.
+    /// Force-stops the child.
     ///
     /// # Errors
-    /// Returns process-control failures.
+    /// Returns native process-control failures.
     pub fn force_stop(&mut self) -> Result<(), Error> {
-        if let Some(process) = self.process.as_mut() {
-            process.kill()?;
-        }
-        Ok(())
+        ffi::kill(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(native_error)
     }
-    /// Waits for completion.
+    /// Waits for the typed guest status.
     ///
     /// # Errors
-    /// Returns process or result-protocol failures.
+    /// Returns native lifecycle or result-protocol failures.
     pub fn wait(mut self) -> Result<Exit, Error> {
-        let status = self.process.as_mut().ok_or(Error::InvalidState)?.wait()?;
-        self.process = None;
-        self.files.finish(status)
+        let exit = result::native(
+            ffi::wait(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(native_error)?,
+        )?;
+        ffi::destroy(self.process.take().ok_or(Error::InvalidState)?);
+        Ok(exit)
     }
-    /// Waits and captures piped standard output and error.
+    /// Waits while concurrently capturing standard output and error.
     ///
     /// # Errors
-    /// Returns process or result-protocol failures.
+    /// Returns I/O, native lifecycle, or result-protocol failures.
     pub fn output(mut self) -> Result<Output, Error> {
-        let process = self.process.take().ok_or(Error::InvalidState)?;
-        let output = process.wait_with_output()?;
-        let status = self.files.finish(output.status)?;
+        drop(self.stdin.take());
+        let stdout = self.stdout.take().map(|mut file| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let stderr = self.stderr.take().map(|mut file| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let status = self.wait()?;
+        let stdout = join(stdout)?;
+        let stderr = join(stderr)?;
         Ok(Output {
-            status,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            exit: status,
+            stdout,
+            stderr,
         })
     }
 }
 impl Drop for Child {
     fn drop(&mut self) {
-        if let Some(process) = self.process.as_mut() {
-            let _ = process.kill();
-            let _ = process.wait();
+        if let Some(process) = self.process.take() {
+            ffi::destroy(process);
         }
+    }
+}
+fn native_error(status: i32) -> Error {
+    Error::Engine { status, detail: 0 }
+}
+fn join(
+    thread: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, Error> {
+    match thread {
+        None => Ok(Vec::new()),
+        Some(thread) => thread
+            .join()
+            .map_err(|_| Error::InvalidState)?
+            .map_err(Error::Io),
     }
 }

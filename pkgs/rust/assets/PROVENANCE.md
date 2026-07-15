@@ -1,21 +1,19 @@
-# Embedded engine artifacts
+# Native engine archives
 
-The four executables in `bin/` are production HL engine artifacts built from
-engine commit `aa8e01e5` for an AArch64 host. They are selected at compile time;
-the crate never downloads or compiles native code.
+The crate links one target-specific archive containing both guest backends and
+the activation constructor. No native executable is stored or extracted at
+runtime. The archives were built from engine commit
+`a2f1c4443fab65d4c61c8c779f42d52ea62760dc`.
 
-| Host target | Guest | SHA-256 |
+| Host target | Build target | SHA-256 |
 |---|---|---|
-| `aarch64-apple-darwin` | AArch64 | `fa93d846906036641653d31b9a2ee42ff8282d77bb8a000aa92b706aeb5a499c` |
-| `aarch64-apple-darwin` | x86-64 | `01d37f566dcc1a804e7067fc9d11c943d36b0b38334e8445aa0ff867f879738c` |
-| `aarch64-unknown-linux-gnu` | AArch64 | `8bffdc847843624cc120841f4801f164fe949a459e28124a6c26c5477ac575f9` |
-| `aarch64-unknown-linux-gnu` | x86-64 | `f1ec2958e06917d4643186cb2c1db1b2ea58c7c9185d45210b664ba9b912a22d` |
+| `aarch64-apple-darwin` | `build/package/macos-aarch64/libhl-engine.a` | `de7c72c34d8310164a978b41e270c4fe29cae1c5ca706acd0e56dcb044c9cfe8` |
+| `aarch64-unknown-linux-gnu` | `build/package/linux-aarch64/libhl-engine.a` | `d35f4ae23c1f7c0ec3707c5e3645d5310d0b0714c14b0af971e8df4419e99f28` |
 
-The source build targets are `build/production/hl-engine-linux-{aarch64,x86_64}`
-for macOS and `build/linux-production/hl-engine-linux-{aarch64,x86_64}` for
-Linux. Linux artifacts are stripped. macOS artifacts are stripped and then
-ad-hoc signed with `packaging/macos/jit.entitlements`; both signatures were
-verified with `codesign --verify --strict` after signing.
+Cargo links the selected archive with whole-archive semantics so the private
+pre-main activation constructor is retained in downstream executables. A
+macOS application using the engine must be signed with the repository's JIT
+entitlements before distribution.
 
 # Alpine test fixture
 

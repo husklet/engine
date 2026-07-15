@@ -12,6 +12,7 @@ categories = ["emulators", "api-bindings"]
 include = [
     "Cargo.toml",
     "README.md",
+    "build.rs",
     "assets/**",
     "examples/**",
     "src/**",
@@ -23,7 +24,7 @@ include = [
 name = "hl_engine"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "warn"

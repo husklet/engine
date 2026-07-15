@@ -74,12 +74,7 @@
             version = "0.1.0";
             src = ./pkgs/rust;
             cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
-            nativeBuildInputs = [ pkgs.pkg-config ]
-              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.autoPatchelfHook ];
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.stdenv.cc.cc.lib ];
-            preBuild = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              autoPatchelf assets/bin/aarch64-unknown-linux-gnu
-            '';
+            nativeBuildInputs = [ pkgs.pkg-config ];
             doCheck = true;
           };
         });

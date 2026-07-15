@@ -18,7 +18,7 @@ impl fmt::Display for Error {
             Self::Io(e) => e.fmt(f),
             Self::InvalidConfig(m) | Self::Unsupported(m) => f.write_str(m),
             Self::InvalidState => f.write_str("engine process has already been consumed"),
-            Self::Distribution(m) => write!(f, "cannot install engine distribution: {m}"),
+            Self::Distribution(m) => write!(f, "engine distribution is unavailable: {m}"),
             Self::Engine { status, detail } => {
                 write!(f, "engine failure status={status} detail={detail}")
             }
