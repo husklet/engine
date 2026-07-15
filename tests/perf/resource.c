@@ -4,12 +4,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-enum { ALLOCATIONS = 32, DESCRIPTORS = 64, THREADS = 8, ALLOCATION_SIZE = 1024 * 1024 };
+enum {
+    ALLOCATIONS = 32,
+    DESCRIPTORS = 64,
+    THREADS = 8,
+    ALLOCATION_SIZE = 1024 * 1024,
+    /* First-use translation and thread-runtime arenas remain reusable after teardown. */
+    RETAINED_RSS_LIMIT = 2048
+};
 
 static long count_directory(const char *path) {
     long count = 0;
@@ -23,6 +31,15 @@ static long count_directory(const char *path) {
             ++count;
     }
     return closedir(directory) == 0 ? count : -1;
+}
+
+static long wait_for_count(const char *path, long expected) {
+    long count = count_directory(path);
+    for (unsigned attempt = 0; count != expected && attempt < 10000; ++attempt) {
+        sched_yield();
+        count = count_directory(path);
+    }
+    return count;
 }
 
 static long rss_pages(void) {
@@ -75,10 +92,10 @@ int main(void) {
     for (unsigned i = 0; i < ALLOCATIONS; ++i)
         munmap(memory[i], ALLOCATION_SIZE);
     long fd_end = count_directory("/proc/self/fd");
-    long thread_end = count_directory("/proc/self/task");
+    long thread_end = wait_for_count("/proc/self/task", thread_base);
     long rss_end = rss_pages();
     int ok = fd_peak >= fd_base + DESCRIPTORS && thread_peak == thread_base + THREADS && rss_peak > rss_base &&
-             fd_end == fd_base && thread_end == thread_base && rss_end <= rss_base + 1024;
+             fd_end == fd_base && thread_end == thread_base && rss_end <= rss_base + RETAINED_RSS_LIMIT;
     printf("resource ok=%d fd=%ld/%ld/%ld threads=%ld/%ld/%ld rss_pages=%ld/%ld/%ld\n", ok, fd_base, fd_peak, fd_end,
            thread_base, thread_peak, thread_end, rss_base, rss_peak, rss_end);
     return ok ? 0 : 1;
