@@ -14,8 +14,10 @@ portable contract requires host operating-system behavior to enter through `hl_h
 4. Engine state is opaque and instance-owned. New code cannot add mutable process globals.
 5. Public structures begin with `abi,size`, are append-only within an ABI, and use fixed-width types. No `pid_t`, native
    fd, compiler-sized enum or Rust layout leaks into the public boundary.
-6. Process-global signal handlers, fork behavior, and `_exit` belong to the target runner boundary. Library
-   interfaces must not acquire those responsibilities implicitly.
+6. Process-global signal handlers, fork behavior, and `_exit` belong to the target runner boundary. Ordinary library
+   interfaces must not acquire those responsibilities implicitly. The separately packaged embedded activation archive
+   is an explicit runner boundary: its retained constructor recognizes only a capability-bearing reexec child and is
+   otherwise dormant before application `main`.
 7. Logging calls use portable tags and an instance-owned `hl_log_context`. They are compiled out unless
    `HL_ENABLE_LOGGING=1`; host backends are byte sinks and never implement tag policy.
 
@@ -33,11 +35,11 @@ parts of the translator and Linux ABI and therefore compile as unity objects. In
 Linux ABI, and host-service sources live in their corresponding archives. New shared behavior belongs in those
 archives; shrinking the two target roots must preserve both guest ISAs and the public lifecycle contract.
 
-macOS is the current production host. These unity roots still reach macOS mechanisms directly, including Mach fault
-and process inspection, `kqueue`, JIT write protection, instruction-cache maintenance, and parts of fork and signal
-handling. The translator cache also creates a macOS host backend instead of receiving the engine's selected services.
-Those paths are implementation debt, not exceptions to the boundary rules above. The Linux host backend implements
-and tests service groups, but no production Linux-host guest executable is currently built or exercised end to end.
+macOS and Linux AArch64 are production hosts. Their packaged activation archives contain both Linux guest ISAs and are
+executed end to end by the C and Rust behavioral gates. The unity roots still reach host mechanisms directly,
+including Mach fault and process inspection, `kqueue`/`epoll`, JIT write protection, instruction-cache maintenance,
+and parts of fork and signal handling. The translator cache also constructs a concrete host backend instead of
+receiving the engine's selected services. Those paths are implementation debt, not exceptions to the boundary rules.
 
 ## Rebranding
 

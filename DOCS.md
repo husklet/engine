@@ -386,7 +386,8 @@ process-group cleanup. A zero exit with incorrect output is a failure.
 
 ### 7.5 macOS production tests
 
-The `MAC` variable names the command used to execute on the mac host. The default is `mac`:
+The `MAC` variable names the command used to execute on the mac host. It is empty on Darwin and defaults to `mac` on
+other hosts:
 
 ```text
 make MAC=mac compat-engines
