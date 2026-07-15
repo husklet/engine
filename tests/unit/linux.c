@@ -624,7 +624,8 @@ int main(void) {
 
     snprintf(path, sizeof(path), "/tmp/hl_host_linux_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
-                                        HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND,
+                                        HL_HOST_FILE_READ | HL_HOST_FILE_WRITE | HL_HOST_FILE_APPEND |
+                                            HL_HOST_FILE_NOFOLLOW,
                                         HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
     HL_CHECK(file.status == HL_STATUS_OK);
     {

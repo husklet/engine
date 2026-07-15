@@ -916,7 +916,10 @@ static hl_host_result hl_linux_file_open(void *context, hl_host_handle directory
     if (descriptor < 0) return hl_linux_errno_result();
     if ((access & HL_HOST_FILE_APPEND) != 0) {
         char descriptor_path[64];
-        int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+        /* O_NOFOLLOW governs the caller's original path.  The trusted
+         * /proc/self/fd indirection below must follow its magic link to the
+         * already-validated file description. */
+        int append_flags = flags & ~(O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW);
         int length = snprintf(descriptor_path, sizeof(descriptor_path), "/proc/self/fd/%d", descriptor);
         if (length < 0 || (size_t)length >= sizeof(descriptor_path)) {
             close(descriptor);
