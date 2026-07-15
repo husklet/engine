@@ -299,7 +299,7 @@ int hl_fdcache_readlink_lookup(const char *p, int *rc, char *out, int bs, int *l
     return hit;
 }
 
-void rl_store(const char *p, int rc, const char *link, int len) {
+void hl_fdcache_readlink_store(const char *p, int rc, const char *link, int len) {
     if (!p || strlen(p) >= 176 || len > 200) return;
     CLK;
     uint64_t h = mc_hash(p);

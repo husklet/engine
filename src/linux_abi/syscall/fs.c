@@ -3022,7 +3022,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ssize_t r = readlinkat(rel ? ATFD(a0) : AT_FDCWD, rp, buf, bs);
             // Cache only absolute keys, and only UNTRUNCATED reads: r == bs may be a clipped read whose
             // stored text would poison a later full-buffer readlink of the same path with the short length.
-            if (!rel && (r < 0 || (size_t)r < bs)) rl_store(rp, r < 0 ? -errno : (int)r, buf, r < 0 ? 0 : (int)r);
+            if (!rel && (r < 0 || (size_t)r < bs))
+                hl_fdcache_readlink_store(rp, r < 0 ? -errno : (int)r, buf, r < 0 ? 0 : (int)r);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         }
         break;
