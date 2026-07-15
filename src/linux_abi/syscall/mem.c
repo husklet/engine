@@ -476,7 +476,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // arena so a later restore's MAP_FIXED lands on a free VA. Inert unless armed (returns 0). A plain
         // hint: if the (reliably free) high slot were busy, the kernel just places it elsewhere.
         if (a0 == 0 && !(a3 & 0x10)) {
-            uint64_t ch = ckpt_place_hint((uint64_t)a1 + guard);
+            uint64_t ch = hl_linux_snapshot_reserve(&g_ckpt_snapshot, (uint64_t)a1 + guard);
             if (ch) a0 = ch;
         }
 #ifdef PCACHE_MMAP_HINT

@@ -843,7 +843,8 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     // checkpoint/restore: place the brk heap in the deterministic high arena (0 hint => normal NULL placement)
     uint64_t heap;
-    if (hl_gmap_map_anonymous(ckpt_place_hint(256u << 20), 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+    if (hl_gmap_map_anonymous(hl_linux_snapshot_reserve(&g_ckpt_snapshot, 256u << 20), 256u << 20,
+                              HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                               HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
         return 70;
     brk_lo = brk_cur = heap;

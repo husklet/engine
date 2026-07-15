@@ -8,6 +8,7 @@
 #include "key.h"
 #include "pidmap.h"
 #include "ports.h"
+#include "snapshot.h"
 
 // HL_NFD: capacity of every per-guest-fd state table (memfd seals, eventfd/epoll/timerfd, socket
 // tracking, pty/lock/pipe tables, ...). Was 1024, which HARD-failed for guests that use high fd numbers:
@@ -241,8 +242,7 @@ static unsigned long long acct_mem_total(void) {
 // instead HINTED into a high arena well above the engine's own mappings and the pcache image/interp bases
 // (0x40../0x48..TB) -- a range reliably free in any process, so the restore's MAP_FIXED always lands. Inert
 // (returns 0 -> normal kernel placement) unless armed, so a normal launch and the whole gate are unchanged.
-static int g_ckpt_armed = 0;
-static uint64_t g_ckpt_place_next = 0x50000000000ull;
+static hl_linux_snapshot g_ckpt_snapshot;
 
 // Shared checkpoint-request state (defined here, early, so the blocking-syscall restart decision in signal.c
 // can consult it as well as checkpoint.c). g_ckpt_trigger points at a MAP_SHARED generation counter every
@@ -261,20 +261,6 @@ static int ckpt_pending(void) __attribute__((unused));
 
 static int ckpt_pending(void) {
     return g_ckpt_trigger && (*g_ckpt_trigger != g_ckpt_seen_gen);
-}
-
-static uint64_t ckpt_place_hint(uint64_t len) {
-    if (!g_ckpt_armed || !len) return 0;
-    uint64_t a = g_ckpt_place_next;
-    uint64_t step = (len + 0xffffull) & ~0xffffull; // 16 KB granularity (macOS page)
-    g_ckpt_place_next += step + 0x100000ull;        // 1 MB gap between regions
-    return a;
-}
-
-// After a restore, keep the placement cursor ABOVE every region we mapped back, so a mapping the resumed
-// guest makes (and a SECOND checkpoint) does not alias a restored region.
-static void ckpt_place_bump_past(uint64_t end) {
-    if (end > g_ckpt_place_next) g_ckpt_place_next = (end + 0xfffffull) & ~0xfffffull;
 }
 
 // This restored process's OWN guest pid (0 => normal launch, report the host pid). A checkpoint restore

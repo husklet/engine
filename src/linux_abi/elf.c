@@ -906,7 +906,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     size_t GUARD = 1u << 20;
     // checkpoint/restore: place the main stack in the deterministic high arena (0 hint => normal placement)
     hl_host_memory_mapping stack_mapping =
-        elf_map_checked((void *)ckpt_place_hint(GUARD + SZ), GUARD + SZ, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+        elf_map_checked((void *)hl_linux_snapshot_reserve(&g_ckpt_snapshot, GUARD + SZ), GUARD + SZ,
+                        HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                         HL_HOST_MEMORY_PRIVATE, "main stack");
     uint8_t *base = (uint8_t *)(uintptr_t)stack_mapping.address;
     elf_mprotect_besteffort(&stack_mapping, base, GUARD, 0, "stack guard");

@@ -180,7 +180,7 @@ static void ckpt_poll(struct cpu *c) {
 static void ckpt_control_init(void) {
     const char *rd = hl_option_get("HL_RESTORE_DIR");
     const char *d = hl_option_get("HL_CHECKPOINT_DIR");
-    if ((d && d[0]) || (rd && rd[0])) g_ckpt_armed = 1;
+    if ((d && d[0]) || (rd && rd[0])) hl_linux_snapshot_enable(&g_ckpt_snapshot);
     if (!d || !d[0]) return;
     snprintf(g_ckpt_dir, sizeof g_ckpt_dir, "%s", d);
     g_ckpt_trigger = ckpt_map_trigger(d);
@@ -629,7 +629,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 goto fail;
             }
         }
-        ckpt_place_bump_past(reg.addr + reg.len); // keep the high-arena cursor above every restored region
+        hl_linux_snapshot_advance(&g_ckpt_snapshot, reg.addr + reg.len);
         hl_gmap_add(reg.addr, reg.len);
         hl_gmap_set_guest_length(reg.addr, reg.glen);
         if (reg.is_gna)
