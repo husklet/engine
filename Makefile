@@ -1483,7 +1483,8 @@ $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/linux-production/hl-remote-supervisor \
 	$(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS) \
-	$(PROCFS_CASE_BINS)
+	$(PROCFS_CASE_BINS) $(PROCESS_CASE_BINS) $(MEMORY_CASE_BINS) $(SYSCALL_CASE_BINS) \
+	$(SYSCALL_EDGE_CASE_BINS)
 	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/filesystem/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
@@ -1500,6 +1501,22 @@ test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 		$(abspath $(BUILD)/compat/procfs/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/procfs/x86_64) $(abspath tests/compat/procfs)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/process/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/process/x86_64) $(abspath tests/compat/process)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/memory/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/memory/x86_64) $(abspath tests/compat/memory)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/syscall/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/syscall/x86_64) $(abspath tests/compat/syscall)
+	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/syscall_edges/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/syscall_edges/x86_64) $(abspath tests/compat/syscall_edges)
 
 $(BUILD)/tools/remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
