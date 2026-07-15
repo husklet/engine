@@ -501,7 +501,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // on containment, so every fresh/whole-page/free-space fixed map keeps the direct path below and is
         // byte-identical (a non-contained map has no neighbour to protect).
         int fixed286 = 0;
-        if ((a3 & 0x10) && a1 && ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
+        if (hp > (size_t)guest_pagesz() && (a3 & 0x10) && a1 &&
+            ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0 && (aprot & PROT_WRITE)) {
                 r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
