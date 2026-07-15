@@ -647,7 +647,8 @@ static int container_init(const char *rootfs) {
             // container's namespace (hl_option_get("HL_NETNS")); a daemon-supplied key is already in the env.
             if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) == 0 && !(nn && nn[0]))
                 hl_option_set("HL_NETNS", key, 1);
-        }
+        } else if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) != 0)
+            return -1;
         const char *eu = hl_option_get("HL_UID");
         if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);
         const char *eg = hl_option_get("HL_GID");
@@ -1042,7 +1043,6 @@ int hl_engine_entry(int argc, char **argv) {
             // ro overlay lower layer
         } else if (!strcmp(argv[ai], "--netns") && ai + 1 < argc) {
             snprintf(g_netns, sizeof g_netns, "/tmp/.hl-net-%.40s", argv[ai + 1]);
-            mkdir(g_netns, 0700);
             ai += 2;
             // private loopback ns
         } else if (!strcmp(argv[ai], "--uid") && ai + 1 < argc) {
