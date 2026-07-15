@@ -2,6 +2,7 @@
 // (lower/upper + copy-up + whiteout + merged readdir), and /proc + /sys synthesis.
 
 #include "../open_plan.h"
+#include "../shared.h"
 #include "../../host/file.h"
 
 static int path_copy(char *out, size_t capacity, const char *value) {
@@ -1109,10 +1110,11 @@ struct memfd_reg {
 static struct memfd_reg *g_memfd_reg;
 
 static struct memfd_reg *memfd_reg(void) {
+    void *arena = NULL;
     if (g_memfd_reg) return g_memfd_reg;
-    void *p = mmap(NULL, sizeof(struct memfd_reg), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-    g_memfd_reg = (struct memfd_reg *)p;
+    if (hl_linux_shared_create(effective_host_services(), sizeof(struct memfd_reg), &arena) != HL_STATUS_OK)
+        return NULL;
+    g_memfd_reg = (struct memfd_reg *)arena;
     return g_memfd_reg;
 }
 
