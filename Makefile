@@ -58,6 +58,8 @@ AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
 AARCH64_LINUX_AR ?= aarch64-linux-gnu-ar
 endif
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
+AARCH64_LINUX_STATIC_CC ?= $(AARCH64_LINUX_CC)
+X86_64_LINUX_STATIC_CC ?= $(X86_64_LINUX_CC)
 AARCH64_DYNAMIC_LOADER ?= /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
 AARCH64_DYNAMIC_LIBC ?= /usr/lib/aarch64-linux-gnu/libc.so.6
 X86_64_DYNAMIC_LOADER ?= /usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2
@@ -652,55 +654,55 @@ $(BUILD)/fixtures/%: tests/compat/fixtures/%.c
 
 $(BUILD)/e2e/guest-exit-aarch64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-exit-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-exit70-aarch64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-exit70-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-exit139-aarch64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-exit139-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-fault-aarch64: tests/e2e/guest_fault.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-fault-x86_64: tests/e2e/guest_fault.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-output-aarch64: tests/e2e/guest_output.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-spin-aarch64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
 $(BUILD)/e2e/clock-injected-aarch64: tests/e2e/clock_injected.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/clock-injected-x86_64: tests/e2e/clock_injected.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/dynamic-aarch64: tests/e2e/dynamic_guest.c
 	@mkdir -p $(@D)
@@ -714,147 +716,147 @@ $(BUILD)/e2e/dynamic-x86_64: tests/e2e/dynamic_guest.c
 
 $(BUILD)/e2e/%-aarch64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -pthread $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/e2e/%-x86_64: tests/compat/fixtures/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -pthread $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -pthread $< -o $@
 
 $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -lm -o $@
 
 $(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -lm -o $@
 
 $(BUILD)/compat/abi-corpus/aarch64/%: tests/compat/abi/corpus/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
 $(BUILD)/compat/abi-corpus/x86_64/%: tests/compat/abi/corpus/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
 $(BUILD)/compat/libc/aarch64/%: tests/compat/libc/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -lm -o $@
 
 $(BUILD)/compat/libc/x86_64/%: tests/compat/libc/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -lm -o $@
 
 $(BUILD)/compat/completeness/aarch64/%: tests/compat/completeness/%.c tests/compat/completeness/compat.h
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
 
 $(BUILD)/compat/completeness/x86_64/%: tests/compat/completeness/%.c tests/compat/completeness/compat.h
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/completeness $< -o $@
 
 $(BUILD)/compat/posix/aarch64/%: tests/compat/posix/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lutil -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lutil -o $@
 
 $(BUILD)/compat/posix/x86_64/%: tests/compat/posix/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lutil -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lutil -o $@
 
 $(BUILD)/compat/syscall/aarch64/%: tests/compat/syscall/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/syscall/x86_64/%: tests/compat/syscall/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/network/x86_64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/procfs/aarch64/%: tests/compat/procfs/%.c tests/compat/procfs/pf.h
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/procfs $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/procfs $< -pthread -o $@
 
 $(BUILD)/compat/procfs/x86_64/%: tests/compat/procfs/%.c tests/compat/procfs/pf.h
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/procfs $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/procfs $< -pthread -o $@
 
 $(BUILD)/compat/memory/aarch64/%: tests/compat/memory/%.c tests/compat/memory/memrss.h
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
 
 $(BUILD)/compat/memory/x86_64/%: tests/compat/memory/%.c tests/compat/memory/memrss.h
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
 
 $(BUILD)/compat/signals/aarch64/%: tests/compat/signals/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/signals/x86_64/%: tests/compat/signals/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/filesystem/aarch64/dentry/%: tests/compat/filesystem/dentry/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/filesystem/x86_64/dentry/%: tests/compat/filesystem/dentry/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/filesystem/aarch64/pcachex/%: tests/compat/filesystem/pcachex/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/filesystem/x86_64/pcachex/%: tests/compat/filesystem/pcachex/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/process/aarch64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/aarch64/procexe/%: tests/compat/process/procexe/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/x86_64/procexe/%: tests/compat/process/procexe/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/aarch64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/x86_64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/time/aarch64/%: tests/compat/time/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/time/x86_64/%: tests/compat/time/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/isa/x86_64/%: tests/compat/isa/x86_64/%
 	@mkdir -p $(@D)
@@ -862,59 +864,59 @@ $(BUILD)/compat/isa/x86_64/%: tests/compat/isa/x86_64/%
 
 $(BUILD)/compat/core/abi/aarch64/%: tests/compat/core/abi/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/abi/x86_64/%: tests/compat/core/abi/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/workload/aarch64/%: tests/compat/core/workload/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/workload/x86_64/%: tests/compat/core/workload/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/workload/aarch64/dbserver $(BUILD)/compat/core/workload/aarch64/sqlite: \
 	$(BUILD)/compat/core/workload/aarch64/%: tests/compat/core/workload/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lsqlite3 -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lsqlite3 -lm -ldl -o $@
 
 $(BUILD)/compat/core/workload/aarch64/ibtc_dispatch: tests/compat/core/abi/ibtc_dispatch.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/workload/x86_64/ibtc_dispatch: tests/compat/core/abi/ibtc_dispatch.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/syscall/aarch64/%: tests/compat/core/syscall/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/syscall/x86_64/%: tests/compat/core/syscall/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/aarch64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/x86_64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/aarch64/nonpie_ldapr $(BUILD)/compat/core/regress/aarch64/nonpie_pairatomics: \
 	$(BUILD)/compat/core/regress/aarch64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/x86_64/nonpie_vec $(BUILD)/compat/core/regress/x86_64/repcmps_nopie \
 	$(BUILD)/compat/core/regress/x86_64/nonpie_v8blob: \
 	$(BUILD)/compat/core/regress/x86_64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/aarch64/go_cgo_stackgrow_arm: tests/compat/core/regress/go_cgo_stackgrow_arm
 	@mkdir -p $(@D)
@@ -922,51 +924,51 @@ $(BUILD)/compat/core/regress/aarch64/go_cgo_stackgrow_arm: tests/compat/core/reg
 
 $(BUILD)/compat/ipc/aarch64/%: tests/compat/ipc/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
 
 $(BUILD)/compat/ipc/x86_64/%: tests/compat/ipc/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lrt -o $@
 
 $(BUILD)/compat/threads/aarch64/%: tests/compat/threads/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/aarch64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/x86_64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/aarch64/%): $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/x86_64/%): $(BUILD)/compat/abi/x86_64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_FILESYSTEM_PIE:%=$(BUILD)/compat/filesystem/aarch64/%): $(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_FILESYSTEM_PIE:%=$(BUILD)/compat/filesystem/x86_64/%): $(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/aarch64/%): $(BUILD)/compat/process/aarch64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/x86_64/%): $(BUILD)/compat/process/x86_64/%: tests/compat/process/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/process/aarch64/nonpie_dladdr: tests/compat/process/nonpie_dladdr.c
 	@mkdir -p $(@D)
@@ -978,95 +980,95 @@ $(BUILD)/compat/process/x86_64/nonpie_dladdr: tests/compat/process/nonpie_dladdr
 
 $(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/aarch64/%): $(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/x86_64/%): $(BUILD)/compat/network/x86_64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_IPC_PIE:%=$(BUILD)/compat/ipc/aarch64/%): $(BUILD)/compat/ipc/aarch64/%: tests/compat/ipc/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_IPC_PIE:%=$(BUILD)/compat/ipc/x86_64/%): $(BUILD)/compat/ipc/x86_64/%: tests/compat/ipc/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_THREADS_PIE:%=$(BUILD)/compat/threads/aarch64/%): $(BUILD)/compat/threads/aarch64/%: tests/compat/threads/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(PURPOSE_THREADS_PIE:%=$(BUILD)/compat/threads/x86_64/%): $(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/abi/aarch64/lse_atomics: tests/compat/abi/lse_atomics.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -pthread -march=armv8.2-a+lse -mno-outline-atomics $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -pthread -march=armv8.2-a+lse -mno-outline-atomics $< -lm -o $@
 
 $(BUILD)/compat/threads/aarch64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/x86_64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/abi/aarch64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/abi/x86_64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/isolation/aarch64/%: tests/compat/isolation/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/isolation/x86_64/%: tests/compat/isolation/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/syscall_edges/aarch64/%: tests/compat/syscall_edges/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/syscall_edges/x86_64/%: tests/compat/syscall_edges/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/soak/aarch64/%: tests/soak/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
 
 $(BUILD)/soak/x86_64/%: tests/soak/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -lm -o $@
 
 $(BUILD)/e2e/fd-binding-aarch64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/fd-binding-x86_64: tests/e2e/fd_binding.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/stdio-binding-aarch64: tests/e2e/stdio_binding.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/stdio-binding-x86_64: tests/e2e/stdio_binding.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/dir-binding-aarch64: tests/e2e/dir_binding.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/dir-binding-x86_64: tests/e2e/dir_binding.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/mac/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
@@ -1887,19 +1889,19 @@ $(BUILD)/tools/perf-runner: tools/perf_runner.c
 
 $(BUILD)/perf/syscall-aarch64: tests/perf/syscall.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie $< -o $@
 
 $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie $< -o $@
 
 $(BUILD)/perf/translate-aarch64: tests/perf/translate.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=c11 $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=c11 $< -o $@
 
 $(BUILD)/perf/translate-x86_64: tests/perf/translate.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=c11 $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=c11 $< -o $@
 
 PERF_OPS := mmap file pipe event ipc-latency ipc-throughput
 PERF_OP_mmap := 1
@@ -1912,22 +1914,22 @@ PERF_OP_ipc-throughput := 6
 define HL_PERF_OP_RULES
 $(BUILD)/perf/$(1)-aarch64: tests/perf/ops.c
 	@mkdir -p $$(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
 
 $(BUILD)/perf/$(1)-x86_64: tests/perf/ops.c
 	@mkdir -p $$(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 -DHL_PERF_OP=$(PERF_OP_$(1)) $$< -o $$@
 endef
 
 $(foreach operation,$(PERF_OPS),$(eval $(call HL_PERF_OP_RULES,$(operation))))
 
 $(BUILD)/perf/resource-aarch64: tests/perf/resource.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
 
 $(BUILD)/perf/resource-x86_64: tests/perf/resource.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 -pthread $< -o $@
 
 define HL_PERF_ENGINE
 	$(BUILD)/tools/perf-runner --label $(1)-$(2) --host-os $(PERF_MAC_OS) \
