@@ -219,7 +219,15 @@ int main(void) {
     }
     for (size_t index = EVENT_COUNT; index != 0; --index)
         HL_CHECK(services.event->close(services.context, events[index - 1]).status == HL_STATUS_OK);
-    HL_CHECK(services.event->wake(services.context, events[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    {
+        hl_host_handle stale = events[0];
+        hl_host_result replacement = services.event->create(services.context);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.event->wake(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.event->wake(services.context, replacement.value).status == HL_STATUS_OK);
+        HL_CHECK(services.event->close(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     for (size_t index = WATCH_COUNT; index != 0; --index)
         HL_CHECK(services.watch->close(services.context, watches[index - 1]).status == HL_STATUS_OK);
     {
