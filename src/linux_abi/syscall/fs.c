@@ -375,30 +375,30 @@ static long guest_xattr_set(const char *host, const char *name, const void *val,
     int opt = nofollow ? XATTR_NOFOLLOW : 0;
     if ((lflags & ~UINT64_C(3)) != 0 || (lflags & 3) == 3) return -EINVAL;
     if (lflags & 3) { // XATTR_CREATE(1) | XATTR_REPLACE(2)
-        int exists = getxattr(host, hn, NULL, 0, 0, opt) >= 0;
+        int exists = hl_native_getxattr(host, hn, NULL, 0, 0, opt) >= 0;
         if ((lflags & 1) && exists) return -EEXIST;   // XATTR_CREATE on an existing attr
         if ((lflags & 2) && !exists) return -ENOATTR; // XATTR_REPLACE on a missing attr -> ENODATA (m2l)
     }
-    return setxattr(host, hn, val, sz, 0, opt) < 0 ? -errno : 0;
+    return hl_native_setxattr(host, hn, val, sz, 0, opt) < 0 ? -errno : 0;
 }
 
 static long guest_xattr_get(const char *host, const char *name, void *val, size_t sz, int opt) {
     char hn[512];
     snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
-    ssize_t r = getxattr(host, hn, val, sz, 0, opt);
+    ssize_t r = hl_native_getxattr(host, hn, val, sz, 0, opt);
     return r < 0 ? -errno : r;
 }
 
 static long guest_xattr_remove(const char *host, const char *name, int opt) {
     char hn[512];
     snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
-    return removexattr(host, hn, opt) < 0 ? -errno : 0;
+    return hl_native_removexattr(host, hn, opt) < 0 ? -errno : 0;
 }
 
 // List only guest-visible attrs, prefix stripped, into the guest buffer. sz==0 returns the required size.
 static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
     char raw[65536];
-    ssize_t n = listxattr(host, raw, sizeof raw, opt);
+    ssize_t n = hl_native_listxattr(host, raw, sizeof raw, opt);
     if (n < 0) return -errno;
     size_t need = 0, pl = strlen(HL_GUEST_XATTR_PREFIX);
     for (ssize_t i = 0; i < n;) {

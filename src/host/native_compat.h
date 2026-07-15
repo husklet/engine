@@ -11,6 +11,7 @@
 #if defined(__APPLE__)
 #include <sys/event.h>
 #include <sys/socket.h>
+#include <sys/xattr.h>
 
 #define HL_NATIVE_RENAME_NOREPLACE RENAME_EXCL
 #define HL_NATIVE_RENAME_EXCHANGE RENAME_SWAP
@@ -29,6 +30,28 @@ static inline int hl_native_set_no_sigpipe(int descriptor) {
 static inline int hl_native_birthtime(const struct stat *status, struct timespec *time) {
     *time = status->st_birthtimespec;
     return 0;
+}
+static inline int hl_native_setxattr(const char *path, const char *name, const void *value, size_t size, int position,
+                                    int options) {
+    return setxattr(path, name, value, size, position, options);
+}
+static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
+                                     int options) {
+    return fsetxattr(fd, name, value, size, position, options);
+}
+static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
+                                        int options) {
+    return getxattr(path, name, value, size, position, options);
+}
+static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
+                                         int options) {
+    return fgetxattr(fd, name, value, size, position, options);
+}
+static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t size, int options) {
+    return listxattr(path, list, size, options);
+}
+static inline int hl_native_removexattr(const char *path, const char *name, int options) {
+    return removexattr(path, name, options);
 }
 #elif defined(__linux__)
 #include <errno.h>
@@ -393,12 +416,6 @@ static inline int hl_native_removexattr(const char *path, const char *name, int 
     return options != 0 ? lremovexattr(path, name) : removexattr(path, name);
 }
 #define XATTR_NOFOLLOW 1
-#define setxattr hl_native_setxattr
-#define fsetxattr hl_native_fsetxattr
-#define getxattr hl_native_getxattr
-#define fgetxattr hl_native_fgetxattr
-#define listxattr hl_native_listxattr
-#define removexattr hl_native_removexattr
 #ifndef ENOATTR
 #define ENOATTR ENODATA
 #endif

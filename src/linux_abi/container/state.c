@@ -527,11 +527,11 @@ static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nof
     int opt = nofollow ? XATTR_NOFOLLOW : 0;
     if (uid >= 0) {
         uint32_t v = (uint32_t)uid;
-        setxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, opt);
+        hl_native_setxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, opt);
     }
     if (gid >= 0) {
         uint32_t v = (uint32_t)gid;
-        setxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, opt);
+        hl_native_setxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, opt);
     }
     struct stat metadata;
     if ((nofollow ? lstat(hostpath, &metadata) : stat(hostpath, &metadata)) == 0)
@@ -542,11 +542,11 @@ static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nof
 static void chown_xattr_set_fd(int fd, int uid, int gid) {
     if (uid >= 0) {
         uint32_t v = (uint32_t)uid;
-        fsetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0);
+        hl_native_fsetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0);
     }
     if (gid >= 0) {
         uint32_t v = (uint32_t)gid;
-        fsetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0);
+        hl_native_fsetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0);
     }
     struct stat metadata;
     if (fstat(fd, &metadata) == 0)
@@ -566,20 +566,20 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
     uint32_t v;
     int present = 0;
     if (fd >= 0) {
-        if (fgetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (hl_native_fgetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *uid = (int)v;
             present = 1;
         }
-        if (fgetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (hl_native_fgetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *gid = (int)v;
             present = 1;
         }
     } else {
-        if (getxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (hl_native_getxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *uid = (int)v;
             present = 1;
         }
-        if (getxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
+        if (hl_native_getxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
             *gid = (int)v;
             present = 1;
         }

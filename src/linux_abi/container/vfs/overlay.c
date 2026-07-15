@@ -420,13 +420,13 @@ static void overlay_mkparents(const char *guest) {
 // (the user.hl.guest.* namespace, file caps) and engine owner xattrs (user.hl.owner.*) across a copy-up.
 static void ovl_copy_xattrs(const char *src, const char *dst) {
     char names[16384];
-    ssize_t n = listxattr(src, names, sizeof names, XATTR_NOFOLLOW);
+    ssize_t n = hl_native_listxattr(src, names, sizeof names, XATTR_NOFOLLOW);
     for (ssize_t i = 0; n > 0 && i < n;) {
         const char *nm = names + i;
         i += strlen(nm) + 1;
         char val[65536];
-        ssize_t vn = getxattr(src, nm, val, sizeof val, 0, XATTR_NOFOLLOW);
-        if (vn >= 0) setxattr(dst, nm, val, (size_t)vn, 0, XATTR_NOFOLLOW);
+        ssize_t vn = hl_native_getxattr(src, nm, val, sizeof val, 0, XATTR_NOFOLLOW);
+        if (vn >= 0) hl_native_setxattr(dst, nm, val, (size_t)vn, 0, XATTR_NOFOLLOW);
     }
 }
 
