@@ -316,7 +316,7 @@ static void load_elf(const char *path, struct loaded *out) {
         fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
         exit(1);
     }
-    gmap_add((uint64_t)base, span);
+    hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
     // W6A item 1: a non-PIE ET_EXEC (etype==2) links at a fixed low vaddr (e.g. 0x400000) but macOS
     // __PAGEZERO reserves the low 4GB, so the loader (above) biases it to a high mmap. Its un-relocated
@@ -456,7 +456,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
         exit(1);
     }
-    gmap_add((uint64_t)stk, SZ + GUARD);
+    hl_gmap_add((uint64_t)stk, SZ + GUARD);
     uint8_t *top = stk + SZ;
     extern uint64_t g_stack_lo, g_stack_hi; // publish for /proc/self/maps [stack] synthesis (vfs.c)
     g_stack_lo = (uint64_t)stk;

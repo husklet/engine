@@ -603,7 +603,7 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 
 - [ ] Remove the remaining unity-only dependencies from production target roots.
 - [ ] Route every production host operation through a typed host-service group.
-- [ ] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
+- [x] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
       through a pinned typed File-service directory.
 - [x] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes. The permanent
       `test-linux-production-typed` gate runs 654 active exact-golden cases across 16 manifests and both guest ISAs,

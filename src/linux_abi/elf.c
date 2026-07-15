@@ -830,7 +830,7 @@ static void load_elf(const char *path, struct loaded *out) {
         fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
         exit(1);
     }
-    gmap_add((uint64_t)base, span);
+    hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
     if (etype == 2) {
         g_nonpie_lo = basepage;
@@ -917,7 +917,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
         exit(1);
     }
-    gmap_add((uint64_t)stk, SZ);
+    hl_gmap_add((uint64_t)stk, SZ);
     // Publish the main-stack bounds so /proc/self/maps synthesizes a [stack] line (glibc's
     // pthread_getattr_np scans for it) and the maps/smaps builder can label the region.
     g_stack_lo = (uint64_t)stk;
