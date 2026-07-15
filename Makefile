@@ -89,6 +89,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/host/aarch64/codegen.c \
 	src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c \
 	src/translator/guest/x86_64/legacy.c \
+	src/translator/guest/x86_64/lower/alu.c \
 	src/translator/guest/x86_64/rep.c \
 	src/translator/guest/x86_64/rotate.c \
 	src/translator/guest/x86_64/x87math.c \

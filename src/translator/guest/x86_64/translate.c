@@ -2,6 +2,7 @@
 // big translate_block) + host entry trampolines.
 
 #include "lower/primitives.h"
+#include "lower/alu.h"
 
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -815,8 +816,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/x87.c"
 
-#include "lower/alu.c"
-
 #include "lower/mov.c"
 
 #include "lower/shift.c"
@@ -1277,9 +1276,9 @@ static void *translate_block(uint64_t gpc) {
                 }
             }
             // ---- integer ALU class (primary 00..3D, acc imm, group1 80/81/83, test 84/85 A8/A9) ----
-            // Lowered in translate/alu.c translate_alu(); flag deferral is unchanged (do_alu drives it).
+            // Lowered in lower/alu.c; flag deferral is unchanged (do_alu drives it).
             {
-                int s = translate_alu(&I, next);
+                int s = hl_x86_lower_alu(&I, next);
                 if (s == TX_NEXT) {
                     gpc = next;
                     continue;

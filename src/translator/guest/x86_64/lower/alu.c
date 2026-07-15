@@ -6,7 +6,10 @@
 // here advances past the insn, so the helper only ever returns TX_FALL (not an ALU op -> caller falls
 // through) or TX_NEXT (caller: gpc = next; continue). #included after x87.c (uses do_alu/rm_load/rm_store/
 // narrow_adcsbb/byte_val/byte_wb/lock_rmw/alu_kind_primary, all defined above) and before translate_block.
-static int translate_alu(struct insn *I, uint64_t next) {
+#include "alu.h"
+#include "primitives.h"
+
+int hl_x86_lower_alu(struct insn *I, uint64_t next) {
     uint8_t op = I->op;
     // ---- ALU primary (00..3D): /r reg,r/m forms ----
     // gate on op<0x40: bits[7:6]==00 is primary ALU. 0x80-0x83 (group1) handled below.
@@ -55,11 +58,11 @@ static int translate_alu(struct insn *I, uint64_t next) {
         int k = alu_kind_primary(op), w = (op & 7) == 4 ? 1 : I->opsize;
         if (!((k == 2 || k == 3) && w < 4)) {
             e_movconst(16, (uint64_t)I->imm);
-            do_alu(k, k == 7 ? -1 : RAX, RAX, 16, w);
+            do_alu(k, k == 7 ? -1 : 0, 0, 16, w);
         } else { // byte/word ADC/SBB al/ax, imm -- do_alu is 32/64-only, mirror the group1 narrow path
             e_movconst(19, (uint64_t)I->imm);
-            narrow_adcsbb(k == 2, 16, RAX, 19, w);
-            e_bfi(RAX, 16, 0, 8 * w, 1); // write low w bytes into the accumulator, preserve upper
+            narrow_adcsbb(k == 2, 16, 0, 19, w);
+            e_bfi(0, 16, 0, 8 * w, 1); // write low w bytes into the accumulator, preserve upper
         }
         return TX_NEXT;
     }
@@ -99,7 +102,7 @@ static int translate_alu(struct insn *I, uint64_t next) {
     if (op == 0xA8 || op == 0xA9) {
         int w = op == 0xA8 ? 1 : I->opsize;
         e_movconst(16, (uint64_t)I->imm);
-        do_alu(4, -1, RAX, 16, w);
+        do_alu(4, -1, 0, 16, w);
         return TX_NEXT;
     }
     return TX_FALL;
