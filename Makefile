@@ -1737,6 +1737,12 @@ compat-core-workload: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOA
 		$(abspath $(BUILD)/compat/core/workload/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/core/workload/x86_64) $(abspath tests/compat/core/workload)
 
+.PHONY: compat-core-workload-extended
+compat-core-workload-extended: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOAD_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/core/workload/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/core/workload/x86_64) $(abspath tests/compat/core/workload) --repeat 10
+
 compat-core-syscall: compat-engines $(BUILD)/tools/matrix-runner $(CORE_SYSCALL_BINS)
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/core/syscall/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
