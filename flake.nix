@@ -68,9 +68,24 @@
               mainProgram = "hl-engine-runner";
             };
           };
+        } // pkgs.lib.optionalAttrs runtimeHost {
+          rust = pkgs.rustPlatform.buildRustPackage {
+            pname = "hl-engine";
+            version = "0.1.0";
+            src = ./pkgs/rust;
+            cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            doCheck = true;
+          };
         });
 
-      checks = forAllSystems (pkgs: { package = self.packages.${pkgs.stdenv.hostPlatform.system}.default; });
+      checks = forAllSystems (pkgs:
+        let system = pkgs.stdenv.hostPlatform.system;
+        in {
+          package = self.packages.${system}.default;
+        } // pkgs.lib.optionalAttrs (system == "aarch64-darwin" || system == "aarch64-linux") {
+          rust = self.packages.${system}.rust;
+        });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
