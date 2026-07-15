@@ -243,7 +243,7 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
         } else if (have_par && injail && !isvol) {
             // Parent dir chain missing in the upper -> entry/whiteout/opaque provably absent there. Memoize
             // (rootfs-routed paths only: a volume's backing dir is host-mutable and must never be
-            // negative-cached -- same exclusion mc_store applies to volume paths).
+            // negative-cached -- same exclusion hl_fdcache_metadata_store applies to volume paths).
             updirneg_store(par);
         }
     }

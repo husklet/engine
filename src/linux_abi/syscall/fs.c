@@ -3144,7 +3144,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (!hl_fdcache_metadata_lookup(p, &rc, &s)) {
                 int r = fstatat(ATFD(a0), p, &s, 0);
                 rc = r < 0 ? -errno : 0;
-                mc_store(p, rc, &s);
+                hl_fdcache_metadata_store(p, rc, &s);
             }
             // Validate the guest buffer only after a successful stat (copyout-last: a bad path still
             // reports its own errno first, matching Linux) -> a bad pointer is -EFAULT, not an engine fault.
@@ -3350,7 +3350,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (!hl_fdcache_metadata_lookup(p, &rc, &s)) {
                 int rr = fstatat(ATFD(a0), p, &s, 0);
                 rc = rr < 0 ? -errno : 0;
-                mc_store(p, rc, &s);
+                hl_fdcache_metadata_store(p, rc, &s);
             }
             if (rc == 0) xpath = p;
         } else {

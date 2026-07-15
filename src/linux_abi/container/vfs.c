@@ -1566,7 +1566,7 @@ static int confine_in(const char *jcanon, size_t jclen, const char *rel, char *o
 //                cannot exist without paying the extra lstat probes.
 //   `isvol`   -- the path routed to a bind-mount VOLUME jail, not the rootfs/overlay upper. Volume
 //                backings are host-mutable (the user can create files from macOS at any time), so the
-//                overlay's negative memo must never cache them (mirrors mc_store's volume exclusion).
+//                overlay's negative memo must never cache them (mirrors hl_fdcache_metadata_store's volume exclusion).
 static int secure_resolve_probe(const char *guest, char *out, size_t n, int nofollow, int *missing, int *isvol) {
     if (isvol) *isvol = 0;
     if (missing) *missing = 0;

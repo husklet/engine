@@ -236,7 +236,7 @@ int hl_fdcache_metadata_lookup(const char *p, int *rc, struct stat *out) {
     return hit;
 }
 
-void mc_store(const char *p, int rc, const struct stat *s) {
+void hl_fdcache_metadata_store(const char *p, int rc, const struct stat *s) {
     if (!p || strlen(p) >= 192) return;
     // don't cache mutable volume paths
     if (g_fdcache.binding.volume_count && *g_fdcache.binding.volume_count && g_fdcache.binding.root_canonical &&
