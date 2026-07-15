@@ -959,8 +959,8 @@ static void service_local(struct cpu *c) {
     if (bound_route(c, nr, a0, a1, a2, a3)) return;
     // daemon-write coherence: notice a daemon-side write into this container's fs (docker cp /
     // exec-spawn /etc rewrites) and drop the path/metadata caches BEFORE any handler below can consult
-    // them -- one shared-page atomic load per syscall (see fscache.c fsgen_poll).
-    fsgen_poll();
+    // them -- one shared-page atomic load per syscall (see hl_fdcache_generation_poll).
+    hl_fdcache_generation_poll();
     // S2 path-resolution-cache invalidation: bump the epoch BEFORE dispatch on any syscall that mutates
     // the FS namespace, so no cached guest->host string mapping can survive a create/unlink/rename/mkdir/
     // symlink (over-invalidates, never under -- when in doubt, the next lookup MISSES and re-resolves).

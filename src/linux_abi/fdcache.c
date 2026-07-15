@@ -733,7 +733,7 @@ __attribute__((noinline, cold)) static void fsgen_flush(void) {
 // The per-syscall poll (called from dispatch.c service_local BEFORE dispatch). Relaxed compare only; a
 // stale relaxed read at worst defers the flush to the very next syscall, still within "visible by the
 // guest's next syscall". Both operands are one word: the shared page (clean/shared -> L1) and a local.
-void fsgen_poll(void) {
+void hl_fdcache_generation_poll(void) {
     if (__builtin_expect(atomic_load_explicit(g_fsgen_ptr, memory_order_relaxed) !=
                              atomic_load_explicit(&g_fsgen_seen, memory_order_relaxed),
                          0))
