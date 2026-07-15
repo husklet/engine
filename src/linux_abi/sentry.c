@@ -39,6 +39,8 @@
 #include <sys/wait.h>
 #include <stdatomic.h>
 
+#include "shared.h"
+
 static int g_untrusted = 0;      // HL_UNTRUSTED: route fs/net/proc syscalls through the sentry
 static int g_sentry_sandbox = 0; // HL_SANDBOX: wrap the worker in a deny-default Seatbelt profile
 
@@ -1364,11 +1366,12 @@ static void sentry_loop(void) {
 static void sentry_init(void) {
     bound_fork_state bound_fork;
     int bound_status;
-    g_shm = mmap(NULL, sizeof(struct sentry_shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (g_shm == MAP_FAILED) {
+    void *arena = NULL;
+    if (hl_linux_shared_create(effective_host_services(), sizeof(struct sentry_shm), &arena) != HL_STATUS_OK) {
         perror("[sentry] ring mmap");
         _exit(71);
     }
+    g_shm = (struct sentry_shm *)arena;
     atomic_store_explicit(&g_shm->quit, 0, memory_order_relaxed);
     atomic_store_explicit(&g_shm->claim, 0, memory_order_relaxed);
     for (int i = 0; i < SENTRY_NRINGS; i++) {
