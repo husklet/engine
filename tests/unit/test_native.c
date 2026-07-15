@@ -29,6 +29,13 @@ int main(void) {
         const char first[] = "complete generation one";
         const char second[] = "two";
         HL_CHECK(mkdtemp(directory) != NULL);
+        hl_host_result parent = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory,
+                                                             strlen(directory), HL_HOST_FILE_READ |
+                                                                 HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW,
+                                                             0, 0);
+        HL_CHECK(parent.status == HL_STATUS_OK &&
+                 services.file->validate_private_directory(services.context, parent.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, parent.value).status == HL_STATUS_OK);
         snprintf(path, sizeof path, "%s/cache", directory);
         HL_CHECK(services.file
                      ->store_private_atomic(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
@@ -43,6 +50,15 @@ int main(void) {
                  sizeof(first) - 1);
         HL_CHECK(memcmp(bytes, first, sizeof(first) - 1) == 0);
         HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(chmod(directory, 0777) == 0);
+        parent = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+                                              HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0,
+                                              0);
+        HL_CHECK(parent.status == HL_STATUS_OK &&
+                 services.file->validate_private_directory(services.context, parent.value).status ==
+                     HL_STATUS_PERMISSION_DENIED);
+        HL_CHECK(services.file->close(services.context, parent.value).status == HL_STATUS_OK);
+        HL_CHECK(chmod(directory, 0700) == 0);
         HL_CHECK(services.file
                      ->store_private_atomic(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                             (hl_host_const_bytes){second, sizeof(second) - 1}, 0600)

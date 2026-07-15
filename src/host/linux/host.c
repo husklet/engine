@@ -989,6 +989,25 @@ static hl_host_result hl_linux_file_store_private_atomic(void *context, hl_host_
     return ok ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+static hl_host_result hl_linux_file_validate_private_directory(void *context, hl_host_handle directory) {
+    hl_host_linux *host = context;
+    struct stat st;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    if (descriptor >= 0) descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int status = fstat(descriptor, &st);
+    int saved = errno;
+    close(descriptor);
+    errno = saved;
+    if (status != 0) return hl_linux_errno_result();
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 022) == 0
+               ? hl_linux_result(HL_STATUS_OK, 0, 0)
+               : hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+}
+
 static hl_host_result hl_linux_stream_write(void *context, hl_host_handle stream, hl_host_const_bytes input) {
     int descriptor;
     ssize_t result;
@@ -3426,7 +3445,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_link,
                                                hl_linux_file_fifo,
                                                hl_linux_file_validate_private_regular,
-                                               hl_linux_file_store_private_atomic};
+                                               hl_linux_file_store_private_atomic,
+                                               hl_linux_file_validate_private_directory};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

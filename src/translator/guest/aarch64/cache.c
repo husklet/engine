@@ -80,6 +80,7 @@
 #include "../../digest.h"
 #include "../../identity.h"
 #include "../../window.h"
+#include "../../persist.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
 #define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`
@@ -197,10 +198,10 @@ struct pc_t2 {
 };
 
 static uint64_t pcache_id_of(const char *path) {
-    struct stat st;
-    if (!path || stat(path, &st) != 0) return 0;
-    uint64_t fields[5] = {(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
-                          (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec};
+    hl_host_file_metadata metadata;
+    if (!path || !hl_persist_metadata(&g_jit_services, path, &metadata)) return 0;
+    uint64_t fields[5] = {metadata.stable_device, metadata.stable_object, metadata.size, metadata.modified_ns,
+                          metadata.changed_ns};
     uint64_t h = hl_digest_bytes(HL_DIGEST_SEED, fields, sizeof fields);
     return hl_digest_bytes(h, path, strlen(path));
 }
@@ -231,7 +232,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 static void pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
     if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-aarch64";
-    mkdir(dir, 0700);
+    (void)hl_persist_prepare(&g_jit_services, dir);
     snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
 }
 
@@ -282,25 +283,18 @@ static int pcache_load(uint64_t entry_jump) {
     uint64_t t0 = g_coldprof ? now_ns() : 0;
     char path[1024];
     pcache_file(path, sizeof path);
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return 0;
-    // Trust gate: a regular file, owned by us, not group/world-writable (the cache dir may live in /tmp).
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 022)) {
-        close(fd);
-        return 0;
-    }
+    void *image = NULL;
+    size_t image_size = 0;
+    if (!hl_persist_load(&g_jit_services, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
+    hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
-    if (read(fd, &h, sizeof h) != (ssize_t)sizeof h) {
-        close(fd);
-        return 0;
-    }
+    if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
     if (h.magic != PC_MAGIC || h.version != PC_VERSION_EFF || h.cpu_sz != sizeof(struct cpu) ||
         h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
         h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
         h.arena_used > CACHE_SZ || (h.arena_used & 3) || h.n_reloc > PC_RELOC_CAP || h.n_mapent > JIT_MAP_N ||
         h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N) {
-        close(fd);
+        free(image);
         return 0;
     }
     hl_reloc *re = h.n_reloc ? malloc(h.n_reloc * sizeof *re) : NULL;
@@ -311,22 +305,15 @@ static int pcache_load(uint64_t entry_jump) {
     uint8_t *abuf = h.arena_used ? malloc(h.arena_used) : NULL;
     int ok = (h.n_reloc == 0 || re) && (h.n_mapent == 0 || me) && (h.n_pend == 0 || pe) && (h.n_t2 == 0 || te) &&
              (h.n_txpg == 0 || tx) && (h.arena_used == 0 || abuf);
-#define PC_RD(buf, nbytes) (ok && ((nbytes) == 0 || (ok = read(fd, (buf), (nbytes)) == (ssize_t)(nbytes))))
+#define PC_RD(buf, nbytes) (ok && (ok = hl_persist_take(&cursor, (buf), (size_t)(nbytes))))
     PC_RD(re, h.n_reloc * sizeof *re);
     PC_RD(me, h.n_mapent * sizeof *me);
     PC_RD(pe, h.n_pend * sizeof *pe);
     PC_RD(te, h.n_t2 * sizeof *te);
     PC_RD(tx, h.n_txpg * sizeof *tx);
-    for (uint64_t got = 0; ok && got < h.arena_used;) {
-        ssize_t r = read(fd, abuf + got, h.arena_used - got);
-        if (r <= 0) {
-            ok = 0;
-            break;
-        }
-        got += (uint64_t)r;
-    }
+    if (ok) ok = hl_persist_take(&cursor, abuf, (size_t)h.arena_used) && cursor.offset == cursor.size;
 #undef PC_RD
-    close(fd);
+    free(image);
     // Whole-payload checksum BEFORE trusting any record (bit rot / short file / foreign writer).
     if (ok) {
         hl_digest digest;
@@ -415,11 +402,8 @@ static void pcache_save(void) {
     if (!g_pcache || !g_pc_binid || g_cp == g_cache) return;
     if (g_pcache_poison || g_pcache_loaded || g_pcache_forked || g_force_base_failed || g_smc_seen) return;
     uint64_t t0 = g_coldprof ? now_ns() : 0;
-    char path[1024], tmp[1120];
+    char path[1024];
     pcache_file(path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return;
     // ---- consistent snapshot under the translation lock (peers may still be running/translating) ----
     pthread_mutex_lock(&g_jit_lock);
     uint64_t nmap = 0;
@@ -486,13 +470,8 @@ static void pcache_save(void) {
         memcpy(buf, &h, sizeof h);
     }
     pthread_mutex_unlock(&g_jit_lock);
-    if (ok) ok = write(fd, buf, total) == (ssize_t)total;
+    if (ok) ok = hl_persist_store(&g_jit_services, path, buf, total);
     free(buf);
-    close(fd);
-    if (ok)
-        rename(tmp, path); // atomic publication: readers see the old complete file or this one, never a mix
-    else
-        unlink(tmp);
     if (g_coldprof)
         fprintf(stderr, "[pcache] save %s (%llu B arena, %llu blocks, %d reloc) in %.3f ms\n", ok ? "ok" : "FAILED",
                 (unsigned long long)arena_used, (unsigned long long)nmap, g_nreloc, (now_ns() - t0) / 1e6);

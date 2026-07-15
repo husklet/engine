@@ -4186,6 +4186,22 @@ static hl_host_result hl_macos_file_store_private_atomic(void *context, hl_host_
     return ok ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+static hl_host_result hl_macos_file_validate_private_directory(void *context, hl_host_handle directory) {
+    hl_host_macos *host = context;
+    struct stat st;
+    int descriptor = hl_macos_file_descriptor(host, directory, 0);
+    if (descriptor >= 0) descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int status = fstat(descriptor, &st);
+    int saved = errno;
+    close(descriptor);
+    errno = saved;
+    if (status != 0) return hl_macos_errno();
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 022) == 0
+               ? hl_macos_result(HL_STATUS_OK, 0, 0)
+               : hl_macos_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+}
+
 hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_services) {
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
@@ -4236,7 +4252,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_link,
                                                hl_macos_file_fifo,
                                                hl_macos_file_validate_private_regular,
-                                               hl_macos_file_store_private_atomic};
+                                               hl_macos_file_store_private_atomic,
+                                               hl_macos_file_validate_private_directory};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};

@@ -26,6 +26,8 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
              file->size >= offsetof(hl_host_file_services, make_fifo)) ||
             (file->abi == HL_HOST_FILE_ABI_20 &&
              file->size >= offsetof(hl_host_file_services, validate_private_regular)) ||
+            (file->abi == HL_HOST_FILE_ABI_21 &&
+             file->size >= offsetof(hl_host_file_services, validate_private_directory)) ||
             (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
 }
 
@@ -81,7 +83,7 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
            services->file->read_directory == NULL || services->file->make_directory == NULL ||
            services->file->make_symlink == NULL || services->file->make_link == NULL ||
            services->file->make_fifo == NULL || services->file->validate_private_regular == NULL ||
-           services->file->store_private_atomic == NULL))))
+           services->file->store_private_atomic == NULL || services->file->validate_private_directory == NULL))))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||

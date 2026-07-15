@@ -18,7 +18,8 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_ABI_18 18u
 #define HL_HOST_FILE_ABI_19 19u
 #define HL_HOST_FILE_ABI_20 20u
-#define HL_HOST_FILE_ABI 21u
+#define HL_HOST_FILE_ABI_21 21u
+#define HL_HOST_FILE_ABI 22u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
 #define HL_HOST_NETWORK_ABI 1u
@@ -390,6 +391,8 @@ typedef struct hl_host_file_services {
     /* Publish a complete private file through a unique temporary and atomic replacement. */
     hl_host_result (*store_private_atomic)(void *context, hl_host_handle directory, const char *path,
                                            size_t path_size, hl_host_const_bytes input, uint32_t permissions);
+    /* Verify a pinned directory is owner-private before namespace transactions use it. */
+    hl_host_result (*validate_private_directory)(void *context, hl_host_handle directory);
 } hl_host_file_services;
 
 #define HL_HOST_DEADLINE_INFINITE UINT64_MAX

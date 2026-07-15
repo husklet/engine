@@ -54,6 +54,7 @@
 #include "../../digest.h"
 #include "../../identity.h"
 #include "../../window.h"
+#include "../../persist.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
 #define PC_VERSION 7 // v7 retires mode-dependent A/B cache identities; production codegen is fixed.
@@ -128,11 +129,10 @@ static uint64_t g_pc_live_n;    // restored entries that went live at load (fixe
 static uint64_t g_pc_activated; // deferred entries activated by identity-matching library maps
 
 static uint64_t pcache_id_of(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    hl_host_file_metadata metadata;
+    if (!hl_persist_metadata(&g_jit_services, path, &metadata)) return 0;
     uint64_t h = 1469598103934665603ull; // FNV-1a over identity fields + path
-    uint64_t fields[4] = {(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
-                          (uint64_t)st.st_mtimespec.tv_sec};
+    uint64_t fields[4] = {metadata.stable_device, metadata.stable_object, metadata.size, metadata.modified_ns};
     for (int i = 0; i < 4; i++) {
         h ^= fields[i];
         h *= 1099511628211ull;
@@ -174,7 +174,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 static void pcache_file(char *out, size_t n) {
     const char *dir = hl_option_get("HL_PCACHE_DIR");
     if (!dir || !dir[0]) dir = "/tmp/hl-engine-pcache-x86_64";
-    mkdir(dir, 0700);
+    (void)hl_persist_prepare(&g_jit_services, dir);
     snprintf(out, n, "%s/%016llx.pcache", dir, (unsigned long long)g_pc_binid);
 }
 
@@ -278,13 +278,12 @@ static void pcache_warm_file(char *out, size_t n) {
 static int pcache_warm_should_skip(const struct pc_hdr *h) {
     char wp[1200];
     pcache_warm_file(wp, sizeof wp);
-    int fd = open(wp, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return 0;
     struct pc_warm w;
-    struct stat st;
-    int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & 022) &&
-             st.st_size == (off_t)sizeof w && read(fd, &w, sizeof w) == (ssize_t)sizeof w;
-    close(fd);
+    void *data = NULL;
+    size_t size = 0;
+    int ok = hl_persist_load(&g_jit_services, wp, sizeof w, &data, &size) && size == sizeof w;
+    if (ok) memcpy(&w, data, sizeof w);
+    free(data);
     if (!ok || w.magic != PC_WARM_MAGIC) return 0;
     if (w.arena_used != h->arena_used || w.restored != h->n_mapent) return 0; // different file generation
     if (w.waste > JIT_MAP_N || w.restored > JIT_MAP_N) return 0;              // implausible: ignore
@@ -302,17 +301,9 @@ static void pcache_warm_note(void) {
     uint64_t used = g_pc_live_n + g_pc_activated;
     uint64_t waste = (g_pc_flushed || used > g_pc_restored_n) ? g_pc_restored_n : g_pc_restored_n - used;
     struct pc_warm w = {PC_WARM_MAGIC, g_pc_restored_arena, g_pc_restored_n, waste};
-    char wp[1200], tmp[1280];
+    char wp[1200];
     pcache_warm_file(wp, sizeof wp);
-    snprintf(tmp, sizeof tmp, "%s.%d.tmp", wp, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return;
-    int ok = write(fd, &w, sizeof w) == (ssize_t)sizeof w;
-    close(fd);
-    if (ok)
-        rename(tmp, wp);
-    else
-        unlink(tmp);
+    (void)hl_persist_store(&g_jit_services, wp, &w, sizeof w);
     if (g_coldprof)
         fprintf(stderr, "[pcache] warm-note restored=%llu waste=%llu%s\n", (unsigned long long)g_pc_restored_n,
                 (unsigned long long)waste, waste * 2 >= g_pc_restored_n ? " (dead-weight: next run skips)" : "");
@@ -337,32 +328,24 @@ static int pcache_load(uint64_t entry_jump) {
     if (g_force_base_failed) return 0; // #210: fixed-base map fell back -> live layout != file's baked base
     char path[1024];
     pcache_file(path, sizeof path);
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return 0;
-    // Trust gate (parity with the aarch64 pcache): a regular file, owned by us, not group/world-writable
-    // (the cache dir may live in /tmp).
-    struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 022)) {
-        close(fd);
-        return 0;
-    }
+    void *image = NULL;
+    size_t image_size = 0;
+    if (!hl_persist_load(&g_jit_services, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
+    hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
-    if (read(fd, &h, sizeof h) != (ssize_t)sizeof h) {
-        close(fd);
-        return 0;
-    }
+    if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
     if (h.magic != PC_MAGIC || h.version != PC_VERSION_EFF || h.cpu_sz != sizeof(struct cpu) || h.map_n != JIT_MAP_N ||
         h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE || h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid ||
         h.entry_jump != entry_jump || h.arena_used > CACHE_SZ || h.n_mapent > JIT_MAP_N || h.n_pend > (1u << 16) ||
         h.n_reloc > PC_RELOC_CAP || h.n_lib > PC_LIB_MAX) { // n_reloc bound tracks the g_reloc cap
-        close(fd);
+        free(image);
         return 0;
     }
     // a previous warm run of this same generation proved the restore is dead weight -> skip it
     // (header-only read: no arena I/O, no map pollution, no resave churn). The file stays for the day
     // the layout becomes deterministic again (engine update re-keys everything anyway).
     if (pcache_warm_should_skip(&h)) {
-        close(fd);
+        free(image);
         g_pcache_skip = 1;
         if (g_coldprof) fprintf(stderr, "[pcache] SKIP (previous warm run re-translated >=1/2 of restore)\n");
         return 0;
@@ -372,24 +355,15 @@ static int pcache_load(uint64_t entry_jump) {
     struct pc_pend *pe = h.n_pend ? malloc(h.n_pend * sizeof *pe) : NULL;
     uint8_t *abuf = h.arena_used ? malloc(h.arena_used) : NULL;
     int ok = (h.n_mapent == 0 || me) && (h.n_pend == 0 || pe) && (h.arena_used == 0 || abuf);
-    if (ok && h.n_reloc)
-        ok = read(fd, g_reloc, h.n_reloc * sizeof g_reloc[0]) == (ssize_t)(h.n_reloc * sizeof g_reloc[0]);
-    if (ok && h.n_mapent) ok = read(fd, me, h.n_mapent * sizeof *me) == (ssize_t)(h.n_mapent * sizeof *me);
-    if (ok && h.n_pend) ok = read(fd, pe, h.n_pend * sizeof *pe) == (ssize_t)(h.n_pend * sizeof *pe);
-    if (ok && h.n_lib)
-        ok = read(fd, g_pc_libs, h.n_lib * sizeof g_pc_libs[0]) == (ssize_t)(h.n_lib * sizeof g_pc_libs[0]);
+    if (ok && h.n_reloc) ok = hl_persist_take(&cursor, g_reloc, (size_t)h.n_reloc * sizeof g_reloc[0]);
+    if (ok && h.n_mapent) ok = hl_persist_take(&cursor, me, (size_t)h.n_mapent * sizeof *me);
+    if (ok && h.n_pend) ok = hl_persist_take(&cursor, pe, (size_t)h.n_pend * sizeof *pe);
+    if (ok && h.n_lib) ok = hl_persist_take(&cursor, g_pc_libs, (size_t)h.n_lib * sizeof g_pc_libs[0]);
     // Arena bytes: read into a heap buffer -- checksummed below BEFORE anything is trusted, and only then
     // memcpy'd into the W^X arena under write mode. (read()'s kernel copyout cannot target a MAP_JIT page
     // gated by the thread's W^X state; a userspace memcpy can, once the write window is open.)
-    for (uint64_t got = 0; ok && got < h.arena_used;) {
-        ssize_t r = read(fd, abuf + got, h.arena_used - got);
-        if (r <= 0) {
-            ok = 0;
-            break;
-        }
-        got += (uint64_t)r;
-    }
-    close(fd);
+    if (ok) ok = hl_persist_take(&cursor, abuf, (size_t)h.arena_used) && cursor.offset == cursor.size;
+    free(image);
     // v6: whole-payload checksum BEFORE trusting any record (bit rot / short file / foreign writer) --
     // the same validation-before-trust discipline as the aarch64 pcache.
     if (ok) {
@@ -508,11 +482,8 @@ static void pcache_save(void) {
     uint64_t nmap = 0;
     for (uint32_t i = 0; i < JIT_MAP_N; i++)
         if (map_live(i) && (pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) nmap++;
-    char path[1024], tmp[1056];
+    char path[1024];
     pcache_file(path, sizeof path);
-    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return;
     struct pc_hdr h;
     memset(&h, 0, sizeof h);
     h.magic = PC_MAGIC;
@@ -560,17 +531,14 @@ static void pcache_save(void) {
         w += h.arena_used;
         h.csum = hl_digest_bytes(HL_DIGEST_SEED, buf + sizeof h, total - sizeof h);
         memcpy(buf, &h, sizeof h);
-        ok = write(fd, buf, total) == (ssize_t)total;
+        ok = hl_persist_store(&g_jit_services, path, buf, total);
     }
     free(buf);
-    close(fd);
     if (ok) {
-        rename(tmp, path);
         char wp[1200];
         pcache_warm_file(wp, sizeof wp);
-        unlink(wp); // fresh generation: any old warm-stat sidecar no longer describes this file
-    } else
-        unlink(tmp);
+        hl_persist_remove(&g_jit_services, wp); // old warm-stat no longer describes this generation
+    }
     if (g_coldprof)
         fprintf(stderr, "[pcache] save %s (%llu B arena, %llu blocks, %d libs) in %.3f ms\n", ok ? "ok" : "FAILED",
                 (unsigned long long)h.arena_used, (unsigned long long)nmap, g_pc_nlib, (coldprof_now_ns() - _t0) / 1e6);
