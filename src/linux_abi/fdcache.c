@@ -280,7 +280,7 @@ void hl_fdcache_metadata_evict_inode(dev_t dev, ino_t ino) {
 }
 
 // readlink cache (ld.so resolves symlinks on every library search path)
-int rl_lookup(const char *p, int *rc, char *out, int bs, int *len) {
+int hl_fdcache_readlink_lookup(const char *p, int *rc, char *out, int bs, int *len) {
     if (!p || strlen(p) >= 176) return 0;
     CLK;
     int hit = 0;

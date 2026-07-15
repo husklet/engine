@@ -3015,7 +3015,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // link came back ENOENT/garbage. An absolute result ignores the dirfd, as before.
             int rel = rp && rp[0] != '/';
             int rc, len;
-            if (!rel && rl_lookup(rp, &rc, buf, bs, &len)) {
+            if (!rel && hl_fdcache_readlink_lookup(rp, &rc, buf, bs, &len)) {
                 G_RET(c) = rc < 0 ? (uint64_t)(int64_t)rc : (uint64_t)len;
                 break;
             }
