@@ -684,6 +684,8 @@ static int exit_matches(const capture *result, int expected) {
 }
 
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
+    if (getenv("GITHUB_ACTIONS") != NULL)
+        fprintf(stderr, "::error title=Compatibility failure (%s %s)::%s\n", item->name, isa, reason);
     fprintf(stderr, "matrix-runner: %s [%s] %s", item->name, isa, reason);
     if (result != NULL) {
         size_t index, shown = result->output_size > 64 ? 64 : result->output_size;
