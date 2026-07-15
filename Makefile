@@ -1872,7 +1872,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/compat/syscall/aarch64/gettid $(BUILD)/compat/syscall/x86_64/gettid \
 	$(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
 	$(BUILD)/compat/process/aarch64/forkstorm $(BUILD)/compat/process/x86_64/forkstorm \
-	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64)
+	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64) \
+	$(BUILD)/perf/resource-aarch64 $(BUILD)/perf/resource-x86_64
 	$(call HL_PERF_LINUX,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
 	$(call HL_PERF_LINUX,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
 	$(call HL_PERF_LINUX,compute,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
@@ -1895,6 +1896,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(call HL_PERF_LINUX,event,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/event-x86_64,0)
 	$(call HL_PERF_LINUX,ipc-latency,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-latency-x86_64,0)
 	$(call HL_PERF_LINUX,ipc-throughput,x86_64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-x86_64,0)
+	$(BUILD)/linux-production/hl-engine-linux-aarch64 $(abspath $(BUILD)/perf/resource-aarch64)
+	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(abspath $(BUILD)/perf/resource-x86_64)
 
 # Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
 perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
