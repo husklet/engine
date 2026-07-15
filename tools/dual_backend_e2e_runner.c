@@ -4,13 +4,14 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static struct sigaction initial_handlers[3];
 void hl_activation_test_mode(uint32_t mode);
 
-__attribute__((constructor(100))) static void capture_handlers(void) {
+__attribute__((constructor(101))) static void capture_handlers(void) {
     (void)sigaction(SIGILL, NULL, &initial_handlers[0]);
     (void)sigaction(SIGFPE, NULL, &initial_handlers[1]);
     (void)sigaction(SIGTRAP, NULL, &initial_handlers[2]);

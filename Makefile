@@ -18,6 +18,7 @@ PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
 PERF_MAC_ARCH = $(shell $(MAC) uname -m)
 AARCH64_LINUX_CC ?= aarch64-linux-gnu-gcc
+AARCH64_LINUX_AR ?= aarch64-linux-gnu-ar
 X86_64_LINUX_CC ?= x86_64-linux-gnu-gcc
 AARCH64_DYNAMIC_LOADER ?= /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
 AARCH64_DYNAMIC_LIBC ?= /usr/lib/aarch64-linux-gnu/libc.so.6
@@ -66,6 +67,8 @@ MAC_LINUX_ABI_OBJECTS := $(MAC_LINUX_ABI_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_HOST_OBJECTS := $(MAC_HOST_SOURCES:%.c=$(BUILD)/mac/%.o)
 EMBEDDED_MAC_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(MAC_LINUX_ABI_SOURCES) $(MAC_HOST_SOURCES)
 EMBEDDED_MAC_OBJECTS := $(EMBEDDED_MAC_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
+LINUX_AARCH64_EMBEDDED_SOURCES = $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(LINUX_HOST_SOURCES)
+LINUX_AARCH64_EMBEDDED_OBJECTS = $(LINUX_AARCH64_EMBEDDED_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
 MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
 	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES) $(COMMON_HOST_SOURCES)
@@ -268,6 +271,10 @@ $(BUILD)/mac/%.o: %.c
 $(BUILD)/mac/embedded/%.o: %.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) -DHL_EMBEDDED_BUILD=1 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/embedded/%.o: %.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) $(ENGINE_CFLAGS) -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lib/libhl-engine.a: $(MAC_CORE_OBJECTS)
 	@mkdir -p $(@D)
@@ -1159,6 +1166,60 @@ $(BUILD)/mac/lib/libhl-engine-dual.a: $(BUILD)/mac/dual/aarch64-target.o $(BUILD
 	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS)
 	@mkdir -p $(@D)
 	$(MAC) libtool -static -o $@ $^
+
+$(BUILD)/linux-aarch64/dual/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 \
+		-DHL_TARGET_NAMESPACE=aarch64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/dual/x86_64-target.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 \
+		-DHL_TARGET_NAMESPACE=x86_64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/dual/aarch64-core.o: src/core/lifecycle.c src/core/target/namespace.h
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_TARGET_NAMESPACE=aarch64 \
+		-DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/dual/x86_64-core.o: src/core/lifecycle.c src/core/target/namespace.h
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_TARGET_NAMESPACE=x86_64 \
+		-DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/dual/dispatch.o: src/core/target/dual.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/linux-aarch64/dual/activation.o: src/core/activation.c include/hl/activation.h
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) $(CPPFLAGS) $(ENGINE_CFLAGS) -D_GNU_SOURCE $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/package/macos-aarch64/libhl-engine.a: $(BUILD)/mac/lib/libhl-engine-dual.a
+	@mkdir -p $(@D)
+	cp $< $@
+
+$(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch64-target.o \
+	$(BUILD)/linux-aarch64/dual/x86_64-target.o $(BUILD)/linux-aarch64/dual/aarch64-core.o \
+	$(BUILD)/linux-aarch64/dual/x86_64-core.o $(BUILD)/linux-aarch64/dual/dispatch.o \
+	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS)
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_AR) rcs $@ $^
+
+.PHONY: package-embedded
+package-embedded: $(BUILD)/package/macos-aarch64/libhl-engine.a \
+	$(BUILD)/package/linux-aarch64/libhl-engine.a $(BUILD)/package/macos-aarch64/link-test \
+	$(BUILD)/package/linux-aarch64/link-test
+
+$(BUILD)/package/macos-aarch64/link-test: tools/dual_backend_e2e_runner.c \
+	$(BUILD)/package/macos-aarch64/libhl-engine.a packaging/macos/jit.entitlements
+	$(MAC) clang $(CPPFLAGS) -o $@ $< -Wl,-force_load,$(BUILD)/package/macos-aarch64/libhl-engine.a
+	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
+
+$(BUILD)/package/linux-aarch64/link-test: tools/dual_backend_e2e_runner.c \
+	$(BUILD)/package/linux-aarch64/libhl-engine.a
+	$(AARCH64_LINUX_CC) -D_GNU_SOURCE $(CPPFLAGS) -o $@ $< -Wl,--whole-archive \
+		$(BUILD)/package/linux-aarch64/libhl-engine.a -Wl,--no-whole-archive -pthread -ldl -lm -latomic
 
 $(BUILD)/tools/dual-backend-e2e: tools/dual_backend_e2e_runner.c $(BUILD)/mac/lib/libhl-engine-dual.a \
 	packaging/macos/jit.entitlements
