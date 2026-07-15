@@ -94,6 +94,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/x87math.c \
 	src/translator/guest/x86_64/x87state.c \
 	src/translator/guest/aarch64/signal.c \
+	src/translator/guest/x86_64/signal.c \
 	src/translator/guest/x86_64/operand.c \
 	src/translator/guest/x86_64/flags.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \

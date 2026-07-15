@@ -1,10 +1,25 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#include "frame.h"
+
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "cpu.h"
+#include "../../../host/native_context.h"
+
 // translator/guest/x86_64/signal.c -- the x86-64 Linux rt_sigframe (per-arch register layout). os/linux/
 // signal.c drives delivery + owns g_sigact/SIGRETURN_PC/g_pending; these build/restore the frame.
 
 // x86-64 sigcontext gregs index -> guest cpu->r[] index (r8..r15,rdi,rsi,rbp,rbx,rdx,rax,rcx,rsp; then rip,eflags)
 static const int GREG2R[16] = {8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4}; // gregs[0..15]
 
-static uint64_t nzcv_to_eflags(uint64_t nz) {
+uint64_t hl_x86_signal_nzcv_to_eflags(uint64_t nz) {
     uint64_t f = 0x2; // bit1 reserved (always 1)
     if (!((nz >> 29) & 1)) f |= 1u << 0;
     if ((nz >> 30) & 1) f |= 1u << 6; // CF (stored inverted), ZF
@@ -13,7 +28,7 @@ static uint64_t nzcv_to_eflags(uint64_t nz) {
     return f;
 }
 
-static uint64_t eflags_to_nzcv(uint64_t f) {
+uint64_t hl_x86_signal_eflags_to_nzcv(uint64_t f) {
     uint64_t nz = 0;
     if (!(f & 1)) nz |= 1u << 29;
     if (f & (1u << 6)) nz |= 1u << 30; // CF (invert), ZF
@@ -25,7 +40,7 @@ static uint64_t eflags_to_nzcv(uint64_t f) {
 #define SA_ONSTACK_L 0x08000000u
 #define SS_DISABLE_L 2u
 
-static void build_signal_frame(struct cpu *c, int sig) {
+void hl_x86_signal_build(struct cpu *c, int sig, const hl_x86_signal_state *state) {
     // SA_ONSTACK: build the frame on the alternate signal stack, not the interrupted (guest) stack. Runtimes
     // that manage their own threads install handlers with SA_ONSTACK + a per-thread signal stack and then
     // VERIFY the handler ran on it -- Go's adjustSignalStack treats a handler that ran off its gsignal stack
@@ -34,7 +49,7 @@ static void build_signal_frame(struct cpu *c, int sig) {
     // switch to the alt stack only when SA_ONSTACK is set, an alt stack exists, and we are not ALREADY on it
     // (a nested handler keeps growing the same stack), so the interrupted RSP saved below stays truthful.
     uint64_t base = c->r[4];
-    if ((g_sigact[sig].flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
+    if ((state->flags & SA_ONSTACK_L) && c->alt_sp && !(c->alt_flags & SS_DISABLE_L) &&
         !(c->r[4] >= c->alt_sp && c->r[4] < c->alt_sp + c->alt_size))
         base = c->alt_sp + c->alt_size;                             // alt stack top; the frame grows down from here
     uint64_t sp = (base - 2048) & ~15ull;                           // 16-aligned frame base; uc lives here
@@ -48,10 +63,10 @@ static void build_signal_frame(struct cpu *c, int sig) {
     *(int *)(uc + 24) = (!c->alt_sp || (c->alt_flags & SS_DISABLE_L)) ? (int)SS_DISABLE_L
                         : (base != c->r[4])                           ? 1 /*SS_ONSTACK*/
                                                                       : 0;
-    for (int i = 0; i < 16; i++)
+    for (size_t i = 0; i < 16; i++)
         *(uint64_t *)(mc + i * 8) = c->r[GREG2R[i]];      // gregs[0..15]
     *(uint64_t *)(mc + 16 * 8) = c->rip;                  // gregs[16] = RIP
-    *(uint64_t *)(mc + 17 * 8) = nzcv_to_eflags(c->nzcv) | ((c->df & 1) << 10); // gregs[17] = EFL (+DF bit10)
+    *(uint64_t *)(mc + 17 * 8) = hl_x86_signal_nzcv_to_eflags(c->nzcv) | ((c->df & 1) << 10);
     *(uint64_t *)(uc + 296) = c->sigmask;                 // uc_sigmask (restored on sigreturn)
     memcpy((void *)xs, c->v, sizeof c->v);                // preserve guest xmm across the handler
     // Preserve the EXTENDED vector + x87 state too: the xmm area above holds only the low 128 bits, so a
@@ -66,40 +81,40 @@ static void build_signal_frame(struct cpu *c, int sig) {
     *(uint64_t *)(xe + 392) = c->fpsw;
     *(uint64_t *)(xe + 400) = c->fpcw;
     *(int *)(info + 0) = sig;                             // siginfo.si_signo
-    *(int *)(info + 8) = g_sigcode[sig];                  // si_code (SI_QUEUE for sigqueue, else 0)
-    *(uint64_t *)(info + 16) = g_sigaddr[sig];            // si_addr (synchronous fault address; 0 for async)
-    *(uint64_t *)(info + 24) = g_sigval[sig];             // si_value
+    *(int *)(info + 8) = *state->code;                     // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(info + 16) = *state->address;            // si_addr (synchronous fault address; 0 for async)
+    *(uint64_t *)(info + 24) = *state->value;              // si_value
     // SA_SIGINFO sender identity for a kill/tgkill signal: _kill/_rt union overlays si_addr@16 -> si_pid@16,
     // si_uid@20 (async kill has si_addr==0, so this fills those 8 bytes).
-    if (g_sigpid[sig]) {
-        *(int *)(info + 16) = g_sigpid[sig];
-        *(int *)(info + 20) = g_siguid[sig];
+    if (*state->pid) {
+        *(int *)(info + 16) = *state->pid;
+        *(int *)(info + 20) = *state->uid;
     }
-    g_sigcode[sig] = 0;
-    g_sigval[sig] = 0;
-    g_sigaddr[sig] = 0;
-    g_sigpid[sig] = 0;
-    g_siguid[sig] = 0; // consumed
+    *state->code = 0;
+    *state->value = 0;
+    *state->address = 0;
+    *state->pid = 0;
+    *state->uid = 0; // consumed
     uint64_t rsp = sp - 8;
-    *(uint64_t *)rsp = SIGRETURN_PC; // pushed return address
+    *(uint64_t *)rsp = state->sigreturn_pc; // pushed return address
     c->r[7] = (uint64_t)sig;
     c->r[6] = info;
     c->r[2] = uc; // handler(signo, siginfo*, ucontext*) in rdi,rsi,rdx
     c->r[4] = rsp;
-    c->rip = g_sigact[sig].handler;
-    c->sigmask |= g_sigact[sig].mask;
-    if (!(g_sigact[sig].flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1)); // SA_NODEFER off -> block this signal
-    if (g_trace)
+    c->rip = state->handler;
+    c->sigmask |= state->mask;
+    if (!(state->flags & 0x40000000)) c->sigmask |= (1ull << (sig - 1)); // SA_NODEFER off -> block this signal
+    if (state->trace)
         fprintf(stderr, "[sig] deliver %d handler=%llx rsp=%llx\n", sig, (unsigned long long)c->rip,
                 (unsigned long long)rsp);
 }
 
-static void do_sigreturn(struct cpu *c) {
+void hl_x86_signal_restore(struct cpu *c) {
     uint64_t uc = c->r[4], mc = uc + 40, xs = uc + 768; // after the handler's ret, rsp == uc
-    for (int i = 0; i < 16; i++)
+    for (size_t i = 0; i < 16; i++)
         c->r[GREG2R[i]] = *(uint64_t *)(mc + i * 8);
     c->rip = *(uint64_t *)(mc + 16 * 8);
-    c->nzcv = eflags_to_nzcv(*(uint64_t *)(mc + 17 * 8));
+    c->nzcv = hl_x86_signal_eflags_to_nzcv(*(uint64_t *)(mc + 17 * 8));
     c->df = (*(uint64_t *)(mc + 17 * 8) >> 10) & 1; // restore DF a handler may have changed
     c->sigmask = *(uint64_t *)(uc + 296);
     memcpy(c->v, (void *)xs, sizeof c->v);
@@ -119,11 +134,11 @@ static void do_sigreturn(struct cpu *c) {
 // host x0..x15 and xmm0..15 in host v0..v15, with cpu pinned in host x28. Reconstruct the guest GPR/xmm
 // state from the host fault context (the deferred-flag NZCV is left as last spilled). block_return
 // (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
-static int sigframe_capture_fault(struct cpu *c, void *ucv) {
+int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache_contains,
+                          void *callback_context) {
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
-    uint64_t lo = (uint64_t)g_cache + g_rw2rx, hi = lo + CACHE_SZ;
-    if (hpc < lo || hpc >= hi) return 0; // host PC outside the code cache -> a genuine engine fault
+    if (!cache_contains(callback_context, hpc)) return 0; // host PC outside the code cache -> a genuine engine fault
     uint64_t *X = HL_HOST_UC_REGS(uc);
     __uint128_t *V = HL_HOST_UC_VREGS(uc);
     if (V == NULL) return 0;
@@ -133,10 +148,11 @@ static int sigframe_capture_fault(struct cpu *c, void *ucv) {
     return 1;
 }
 
-static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
+void hl_x86_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_return) {
     ucontext_t *uc = (ucontext_t *)ucv;
-    HL_HOST_UC_REGS(uc)[28] = (uint64_t)c; // block_return reads &cpu from x28 (pinned through the block)
-    HL_HOST_UC_PC(uc) = (uint64_t)block_return;
+    uint64_t cpu_address = (uint64_t)c;
+    memcpy(HL_HOST_UC_REGS(uc) + 28, &cpu_address, sizeof(cpu_address));
+    HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
 }
 
 // recover a fast-clock GUARDED store fault (emit_fast_syscall's clock_gettime/gettimeofday inline
@@ -148,17 +164,16 @@ static void sigframe_resume_dispatch(struct cpu *c, void *ucv) {
 // the in-block EFAULT tail (which does `msr nzcv,x17; b L_after`). Guest rax lives in host x0 at the fault,
 // so we set mcontext x0 = -EFAULT and redirect the PC to that tail. Inert unless armed (resume != 0), so
 // ordinary guest wild-pointer faults fall straight through to deliver_guest_fault as before.
-static int fastclk_fault_fixup(siginfo_t *si, void *ucv) {
-    struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
+int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
     if (!c || !c->fastclk_resume) return 0;
-    uintptr_t va = (uintptr_t)(si ? si->si_addr : NULL);
     // overflow-safe window test. LTP passes tv=(void*)-1 (fastclk_ptr near UINT64_MAX), where
     // `va >= fastclk_ptr + 16` wraps and wrongly rejects the fault -> SIGSEGV. Compare the unsigned
     // offset instead: an in-window fault has (va - fastclk_ptr) in [0,16); every other value (including
     // va < fastclk_ptr, which underflows to a huge number) is >= 16. Correct for both bounds and wrap.
     if ((uint64_t)(va - c->fastclk_ptr) >= 16) return 0; // fault outside the guarded 16B window
     ucontext_t *uc = (ucontext_t *)ucv;
-    HL_HOST_UC_REGS(uc)[0] = (uint64_t)(int64_t)(-EFAULT); // guest rax = -EFAULT
+    uint64_t result = (uint64_t)(int64_t)(-EFAULT);
+    memcpy(HL_HOST_UC_REGS(uc), &result, sizeof(result)); // guest rax = -EFAULT
     HL_HOST_UC_PC(uc) = c->fastclk_resume;                  // resume at the in-block EFAULT tail
     c->fastclk_resume = 0;                                       // window closed
     return 1;
@@ -172,13 +187,13 @@ static int fastclk_fault_fixup(siginfo_t *si, void *ucv) {
 // then builds the rt_sigframe and runs the handler (which typically siglongjmps out and recovers). Returns
 // 1 when queued (caller `continue`s the loop), 0 when no handler is installed (caller default-terminates).
 // cpu->rip already holds the architectural #DE PC set by the emitted block exit.
-static int raise_guest_de(struct cpu *c) {
-    if (g_sigact[8].handler <= 1) return 0; // SIG_DFL/SIG_IGN: caller applies the default #DE action
-    g_sigcode[8] = 1;                       // FPE_INTDIV
-    g_sigaddr[8] = c->rip;                  // si_addr = faulting instruction
+int hl_x86_signal_raise_divide(struct cpu *c, const hl_x86_signal_queue *queue) {
+    if (queue->handler(queue->context, 8) <= 1) return 0; // SIG_DFL/SIG_IGN
+    queue->codes[8] = 1;                                 // FPE_INTDIV
+    queue->addresses[8] = c->rip;                        // si_addr = faulting instruction
     c->sigmask &= ~(1ull << 7);             // a synchronous fault forces delivery even if SIGFPE was blocked
     c->reason = R_BRANCH;                   // resume as a plain branch (no stale special-op handling)
-    __atomic_or_fetch(&g_pending, 1ull << 8, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(queue->pending, 1ull << 8, __ATOMIC_SEQ_CST);
     return 1;
 }
 
@@ -188,14 +203,14 @@ static int raise_guest_de(struct cpu *c) {
 // branch so run_guest's maybe_deliver_signal builds the rt_sigframe and runs the handler (which typically
 // siglongjmps out, or -- for UD2 -- advances rip and resumes). Returns 1 when queued, 0 when the guest
 // has no handler (caller default-terminates with 128+signo, mirroring the #DE path).
-static int raise_guest_trap(struct cpu *c) {
+int hl_x86_signal_raise_trap(struct cpu *c, const hl_x86_signal_queue *queue) {
     int sig = (int)(c->divop & 0xff);
     int code = (int)((c->divop >> 8) & 0xff);
-    if (sig < 1 || sig > 64 || g_sigact[sig].handler <= 1) return 0; // SIG_DFL/IGN -> default action
-    g_sigcode[sig] = code;
-    g_sigaddr[sig] = (sig == 4) ? c->rip : 0; // #UD si_addr = faulting insn; int3 SIGTRAP si_addr = 0
+    if (sig < 1 || sig > 64 || queue->handler(queue->context, sig) <= 1) return 0;
+    queue->codes[sig] = code;
+    queue->addresses[sig] = (sig == 4) ? c->rip : 0;
     c->sigmask &= ~(1ull << (sig - 1));        // a synchronous trap forces delivery even if blocked
     c->reason = R_BRANCH;
-    __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(queue->pending, 1ull << sig, __ATOMIC_SEQ_CST);
     return 1;
 }

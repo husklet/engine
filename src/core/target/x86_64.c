@@ -83,6 +83,7 @@ hl_status hl_run_linux_guest_status(void) {
 static uint64_t g_host_launch_monotonic_ns;
 
 #include "../../translator/guest/x86_64/cpu.h"
+#include "../../translator/guest/x86_64/frame.h"
 #include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
 #define HL_GUEST_STAT_SIZE HL_LINUX_STAT_X86_64_SIZE
@@ -115,7 +116,71 @@ static const hl_host_services *effective_host_services(void) {
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
 #include "../../linux_abi/signal.c"                  // SHARED: signal delivery driver + translation
-#include "../../translator/guest/x86_64/signal.c"    // x86-64 rt_sigframe build/restore
+
+static int x86_signal_cache_contains(void *context, uint64_t pc) {
+    (void)context;
+    return jit_pc_in_retained_cache(pc);
+}
+
+static uint64_t x86_signal_handler(void *context, int signal_number) {
+    (void)context;
+    return g_sigact[signal_number].handler;
+}
+
+static hl_x86_signal_queue x86_signal_queue(void) {
+    return (hl_x86_signal_queue){x86_signal_handler, NULL, g_sigcode, g_sigaddr, &g_pending};
+}
+
+static void build_signal_frame(struct cpu *c, int sig) {
+    hl_x86_signal_state state = {
+        .handler = g_sigact[sig].handler,
+        .flags = g_sigact[sig].flags,
+        .mask = g_sigact[sig].mask,
+        .code = &g_sigcode[sig],
+        .value = &g_sigval[sig],
+        .address = &g_sigaddr[sig],
+        .pid = &g_sigpid[sig],
+        .uid = &g_siguid[sig],
+        .sigreturn_pc = SIGRETURN_PC,
+        .trace = g_trace,
+    };
+    hl_x86_signal_build(c, sig, &state);
+}
+
+static void do_sigreturn(struct cpu *c) {
+    hl_x86_signal_restore(c);
+}
+
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL);
+}
+
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    hl_x86_signal_resume(c, native_context, (uintptr_t)block_return);
+}
+
+static int fastclk_fault_fixup(siginfo_t *info, void *native_context) {
+    struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
+    return hl_x86_signal_fast_clock_fault(c, (uintptr_t)(info != NULL ? info->si_addr : NULL), native_context);
+}
+
+static int raise_guest_de(struct cpu *c) {
+    hl_x86_signal_queue queue = x86_signal_queue();
+    return hl_x86_signal_raise_divide(c, &queue);
+}
+
+static int raise_guest_trap(struct cpu *c) {
+    hl_x86_signal_queue queue = x86_signal_queue();
+    return hl_x86_signal_raise_trap(c, &queue);
+}
+
+static uint64_t nzcv_to_eflags(uint64_t nzcv) {
+    return hl_x86_signal_nzcv_to_eflags(nzcv);
+}
+
+static uint64_t eflags_to_nzcv(uint64_t eflags) {
+    return hl_x86_signal_eflags_to_nzcv(eflags);
+}
 #include "../../linux_abi/container/vfs.c"           // SHARED: rootfs jail, overlay, /proc synth, stat
 #include "../../linux_abi/container/netns.c"         // SHARED: sockets, loopback netns, termios
 static void load_elf(const char *path, struct loaded *out);
