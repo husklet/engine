@@ -37,7 +37,7 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
     return total;
 }
 
-// Mirror of gmap_split_unmap for the DONTNEED private-anon registry: keep the surviving sub-region(s)
+// Mirror of hl_gmap_unmap_range for the DONTNEED private-anon registry: keep the surviving sub-region(s)
 // (with their prot) tracked so madvise(MADV_DONTNEED) still gives Linux semantics on what remains,
 // instead of forgetting the whole entry on a partial unmap. A non-anon range has no entry here and is
 // left untouched. gmap_add/anon_track append to their registries, and the appended tail starts at
@@ -226,7 +226,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // freeing an aligned over-allocation) SPLITS it so the surviving sub-region(s) stay tracked --
             // reclaimed at execve() teardown and still findable by hl_gmap_find_length (the mremap grow path).
             // (PROT_NONE coverage was already dropped above via gna_clear over the guest-logical range.)
-            gmap_split_unmap(u_lo, u_hi);
+            hl_gmap_unmap_range(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
             filemap_unmap(u_lo, u_hi);
             futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range

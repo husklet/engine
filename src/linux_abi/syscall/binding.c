@@ -651,7 +651,7 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     if (bus_prepared && gbus_add(mapped.address + bus_accessible, mapped.address + size) != 0) {
         gbus_prepare_release();
         bound_mapping_drop(entry, NULL);
-        gmap_split_unmap(mapped.address, mapped.address + mapped.mapped_size);
+        hl_gmap_unmap_range(mapped.address, mapped.address + mapped.mapped_size);
         pthread_mutex_unlock(&g_bound_mapping_lock);
         pthread_mutex_unlock(&g_bound_mapping_gate);
         return -ENOMEM;
@@ -1740,7 +1740,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 mapping->object->handle = HL_HOST_HANDLE_INVALID;
                 (void)g_host_services->memory->discard(g_host_services->context, retired);
                 bound_mapping_retire(a0, a1);
-                gmap_split_unmap(a0, a0 + a1);
+                hl_gmap_unmap_range(a0, a0 + a1);
                 gbus_clear(a0, a0 + a1);
             }
             G_RET(c) = (uint64_t)bound_host_error(operation.status);
