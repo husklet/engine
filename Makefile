@@ -221,7 +221,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all linux-compile clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
-	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains format format-check help
+	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains audit-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -1567,7 +1567,11 @@ compat-native: $(NATIVE_SMOKE_BINS) $(BUILD)/tools/compat-runner
 	$(BUILD)/tools/compat-runner $(NATIVE_SMOKE_BINS)
 
 check-domains: $(BUILD)/tools/check-domains
-	$(BUILD)/tools/check-domains $(PORTABLE_SOURCES) include/hl/*.h
+	@$(BUILD)/tools/check-domains --self-test
+	@$(BUILD)/tools/check-domains $(PRODUCTION_UNITY_DEPS)
+
+audit-domains: $(BUILD)/tools/check-domains
+	@$(BUILD)/tools/check-domains --measure $(PRODUCTION_UNITY_DEPS)
 
 test: unit check-domains compat-native
 
