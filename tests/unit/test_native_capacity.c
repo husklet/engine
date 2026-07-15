@@ -159,6 +159,18 @@ int main(void) {
 
     for (size_t index = FILE_COUNT; files != NULL && index != 0; --index)
         HL_CHECK(services.file->close(services.context, files[index - 1]).status == HL_STATUS_OK);
+    {
+        hl_host_handle stale = files[0];
+        hl_host_result replacement = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path,
+                                                                  strlen(path), HL_HOST_FILE_READ, 0, 0);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.file->metadata(services.context, stale, &(hl_host_file_metadata){0}).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->metadata(services.context, replacement.value, &(hl_host_file_metadata){0}).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     for (size_t index = MAPPING_COUNT; mappings != NULL && index != 0; --index)
         HL_CHECK(services.memory->release(services.context, mappings[index - 1]).status == HL_STATUS_OK);
     {
