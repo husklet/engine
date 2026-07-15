@@ -1637,7 +1637,7 @@ $(BUILD)/tools/matrix-runner: tools/matrix_runner.c include/hl/config.h
 		-DAARCH64_DYNAMIC_LOADER='"$(AARCH64_DYNAMIC_LOADER)"' \
 		-DAARCH64_DYNAMIC_LIBC='"$(AARCH64_DYNAMIC_LIBC)"' \
 		-DX86_64_DYNAMIC_LOADER='"$(X86_64_DYNAMIC_LOADER)"' \
-		-DX86_64_DYNAMIC_LIBC='"$(X86_64_DYNAMIC_LIBC)"' $< -o $@
+		-DX86_64_DYNAMIC_LIBC='"$(X86_64_DYNAMIC_LIBC)"' $< -lc -o $@
 
 $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
