@@ -425,10 +425,11 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 // common execution tail, including calibration and diagnostic output, so standalone
 // behavior is byte-identical.
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
-    uint8_t *heap = mmap(NULL, 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    hl_gmap_add((uint64_t)heap,
-             256u << 20); // track so execve() reclaims the heap + /proc/self/maps sees it (parity w/ aarch64)
-    brk_lo = brk_cur = (uint64_t)heap;
+    uint64_t heap;
+    if (hl_gmap_map_anonymous(0, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                              &heap) != HL_STATUS_OK)
+        return 70;
+    brk_lo = brk_cur = heap;
     brk_hi = brk_lo + (256u << 20);
 
     struct cpu c;

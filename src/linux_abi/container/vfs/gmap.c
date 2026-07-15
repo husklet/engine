@@ -60,7 +60,8 @@ hl_status hl_gmap_map_anonymous(uint64_t requested_address, uint64_t length, uin
     if (mapped.status != HL_STATUS_OK) return (hl_status)mapped.status;
     if (mapping.handle == HL_HOST_HANDLE_INVALID || mapping.address == 0 || mapping.mapped_size != length ||
         hl_exec_mapping_add(mapping.address, length, mapping.handle) != 0) {
-        (void)g_gmap.host->memory->release(g_gmap.host->context, mapping.handle);
+        if (mapping.handle != HL_HOST_HANDLE_INVALID)
+            (void)g_gmap.host->memory->release(g_gmap.host->context, mapping.handle);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     hl_gmap_add(mapping.address, length);
@@ -158,10 +159,24 @@ void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
     }
 }
 
+static int hl_exec_mapping_owns(uint64_t address, uint64_t length) {
+    if (length == 0 || address > UINT64_MAX - length) return 0;
+    for (size_t index = 0; index < g_exec_mapping_count; ++index) {
+        const hl_exec_mapping *entry = &g_exec_mappings[index];
+        if (entry->handle != HL_HOST_HANDLE_INVALID && address >= entry->address &&
+            address + length <= entry->address + entry->length)
+            return 1;
+    }
+    return 0;
+}
+
 void hl_gmap_reset(void) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+        const hl_gmap_entry *entry = &g_gmap.mappings[index];
+        if (!hl_exec_mapping_owns(entry->address, entry->length))
+            (void)munmap((void *)(uintptr_t)entry->address, (size_t)entry->length);
+    }
     hl_exec_mapping_reset();
-    for (size_t index = 0; index < g_gmap.mapping_count; index++)
-        munmap((void *)(uintptr_t)g_gmap.mappings[index].address, (size_t)g_gmap.mappings[index].length);
     g_gmap.mapping_count = 0;
 }
 

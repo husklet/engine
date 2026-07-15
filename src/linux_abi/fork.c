@@ -299,6 +299,7 @@ static int hl_server_main(int argc, char **argv) {
     // Pay the expensive, per-launch-amortizable work ONCE.
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     hl_target_services_inject(&g_target_services, hl_target_services_bound(&g_target_services));
+    hl_gmap_bind_host(hl_target_services_effective(&g_target_services));
     if (container_init(rootfs) != 0) return 1;
     if (engine_global_init()) return 1;
 

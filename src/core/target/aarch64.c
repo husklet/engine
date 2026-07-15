@@ -817,10 +817,11 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 // preserve the same execution tail.
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     // checkpoint/restore: place the brk heap in the deterministic high arena (0 hint => normal NULL placement)
-    uint8_t *heap =
-        mmap((void *)ckpt_place_hint(256u << 20), 256u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    hl_gmap_add((uint64_t)heap, 256u << 20); // track so a later execve() can reclaim the inherited heap
-    brk_lo = brk_cur = (uint64_t)heap;
+    uint64_t heap;
+    if (hl_gmap_map_anonymous(ckpt_place_hint(256u << 20), 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                              HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
+        return 70;
+    brk_lo = brk_cur = heap;
     brk_hi = brk_lo + (256u << 20);
 
     struct cpu c;
