@@ -1221,7 +1221,7 @@ static int root_handle_bind(const char *path) {
     file = g_host_services->file;
     attachment = g_host_services->posix_attachment;
     root = file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
-                               HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
+                               HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
     if (root.status != HL_STATUS_OK) return -1;
     canonical = file->path(g_host_services->context, root.value,
                            (hl_host_bytes){(unsigned char *)canonical_path, sizeof(canonical_path) - 1});
