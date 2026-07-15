@@ -636,7 +636,8 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Run the complete instruction, SMC, code-cache, fork, thread-churn, and persistent-cache corpus on every host.
 - [x] Verify cache identity rejects incompatible builds, guest ISAs, host ISAs, and effective code-generation modes;
       x86 host-counter calibration runs before lookup, and the C identity gate mutates every key field.
-- [ ] Prove no translator path performs ambient host I/O.
+- [x] Prove no translator path performs ambient host I/O. Translator units compile independently; identity and
+      persistence use only typed host file services, while guest syscall names remain decoded guest operations.
 
 ### Performance and release
 
