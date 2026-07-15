@@ -27,6 +27,7 @@ PERF_LIMIT_event := 250000 200000
 PERF_LIMIT_ipc-latency := 150000 120000
 PERF_LIMIT_ipc-throughput := 75000 60000
 PERF_LIMIT_translation := 40000 30000
+PERF_LIMIT_warm-cache := 100000 80000
 PERF_MAC_LIMIT_startup := 30000 25000
 PERF_MAC_LIMIT_compute := 750000 650000
 PERF_MAC_LIMIT_syscall-startup := 40000 30000
@@ -39,6 +40,7 @@ PERF_MAC_LIMIT_event := 350000 300000
 PERF_MAC_LIMIT_ipc-latency := 200000 150000
 PERF_MAC_LIMIT_ipc-throughput := 100000 80000
 PERF_MAC_LIMIT_translation := 50000 40000
+PERF_MAC_LIMIT_warm-cache := 750000 650000
 SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
@@ -1867,11 +1869,32 @@ define HL_PERF_LINUX
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-$(2)) $(abspath $(5))
 endef
 
+define HL_PERF_CACHE_MAC
+	$(RM) -r $(BUILD)/perf/cache-warm-mac-$(1)
+	$(BUILD)/tools/perf-runner --label mac-warm-cache-$(1) --host-os $(PERF_MAC_OS) \
+		--host-release $(PERF_MAC_RELEASE) --host-arch $(PERF_MAC_ARCH) \
+		--warmups $(PERF_WARMUPS) --samples $(PERF_SAMPLES) \
+		--max-cold-us $(word 1,$(PERF_MAC_LIMIT_warm-cache)) \
+		--max-p99-us $(word 2,$(PERF_MAC_LIMIT_warm-cache)) -- \
+		$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-$(1)) \
+		$(abspath $(BUILD)/perf/translate-$(1)) 0 1 $(abspath $(BUILD)/perf/cache-warm-mac-$(1))
+endef
+
+define HL_PERF_CACHE_LINUX
+	$(RM) -r $(BUILD)/perf/cache-warm-linux-$(1)
+	$(BUILD)/tools/perf-runner --label linux-warm-cache-$(1) \
+		--warmups $(PERF_WARMUPS) --samples $(PERF_SAMPLES) \
+		--max-cold-us $(word 1,$(PERF_LIMIT_warm-cache)) \
+		--max-p99-us $(word 2,$(PERF_LIMIT_warm-cache)) -- \
+		$(BUILD)/tools/config-e2e-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-$(1)) \
+		$(abspath $(BUILD)/perf/translate-$(1)) 0 1 $(abspath $(BUILD)/perf/cache-warm-linux-$(1))
+endef
+
 # Keep the correctness gate explicit: standalone performance runs remain quick, while this target
 # proves the measured binaries still pass the complete compatibility matrix first.
 perf-compat: e2e-compat perf-macos
 
-perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
+perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/tools/config-e2e-runner $(BUILD)/e2e/guest-exit-aarch64 \
 	$(BUILD)/e2e/guest-exit-x86_64 $(BUILD)/compat/core/workload/aarch64/busyloop \
 	$(BUILD)/compat/core/workload/x86_64/busyloop $(BUILD)/compat/syscall/aarch64/gettid \
 	$(BUILD)/compat/syscall/x86_64/gettid $(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
@@ -1892,6 +1915,8 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(call HL_PERF_ENGINE,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
 	$(call HL_PERF_ENGINE,translation,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-aarch64,0)
 	$(call HL_PERF_ENGINE,translation,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-x86_64,0)
+	$(call HL_PERF_CACHE_MAC,aarch64)
+	$(call HL_PERF_CACHE_MAC,x86_64)
 	$(call HL_PERF_ENGINE,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
 	$(call HL_PERF_ENGINE,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
 	$(call HL_PERF_ENGINE,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
@@ -1909,7 +1934,7 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 
 .PHONY: perf-linux
 perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
-	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/tools/perf-runner \
+	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/tools/perf-runner $(BUILD)/tools/config-e2e-runner \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/core/workload/x86_64/busyloop \
 	$(BUILD)/compat/syscall/aarch64/gettid $(BUILD)/compat/syscall/x86_64/gettid \
@@ -1930,6 +1955,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(call HL_PERF_LINUX,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
 	$(call HL_PERF_LINUX,translation,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-aarch64,0)
 	$(call HL_PERF_LINUX,translation,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-x86_64,0)
+	$(call HL_PERF_CACHE_LINUX,aarch64)
+	$(call HL_PERF_CACHE_LINUX,x86_64)
 	$(call HL_PERF_LINUX,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
 	$(call HL_PERF_LINUX,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
 	$(call HL_PERF_LINUX,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
