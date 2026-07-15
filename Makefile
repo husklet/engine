@@ -4,6 +4,7 @@ INSTALL ?= install
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
 HOST ?= $(if $(filter Darwin,$(shell uname -s)),macos,linux)
+HOST_ARCH ?= $(shell uname -m)
 PREFIX ?= /usr/local
 DESTDIR ?=
 VERSION := 0.1.0
@@ -103,6 +104,26 @@ endif
 PACKAGE_LIBRARIES := $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(PACKAGE_HOST_LIBRARY)
 PACKAGE_PC := $(BUILD)/pkgconfig/hl-engine.pc
+PUBLIC_HEADERS := $(wildcard include/hl/*.h)
+
+ifneq ($(filter arm64 aarch64,$(HOST_ARCH)),)
+ifeq ($(HOST),macos)
+ACTIVATION_ARCHIVE := $(BUILD)/package/macos-aarch64/libhl-engine.a
+ACTIVATION_LIBS := -Wl,-force_load,$${libdir}/libhl-engine-activation.a
+ACTIVATION_CONSUMER_LIBS := -Wl,-force_load,$(abspath $(BUILD)/package-root)/usr/lib/libhl-engine-activation.a
+else
+ACTIVATION_ARCHIVE := $(BUILD)/package/linux-aarch64/libhl-engine.a
+ACTIVATION_LIBS := -Wl,--whole-archive $${libdir}/libhl-engine-activation.a -Wl,--no-whole-archive -pthread -ldl -lm -latomic
+ACTIVATION_CONSUMER_LIBS := -Wl,--whole-archive $(abspath $(BUILD)/package-root)/usr/lib/libhl-engine-activation.a \
+	-Wl,--no-whole-archive -pthread -ldl -lm -latomic
+endif
+ACTIVATION_PC := $(BUILD)/pkgconfig/hl-engine-activation.pc
+INSTALL_HEADERS := $(PUBLIC_HEADERS)
+else
+ACTIVATION_ARCHIVE :=
+ACTIVATION_PC :=
+INSTALL_HEADERS := $(filter-out include/hl/activation.h,$(PUBLIC_HEADERS))
+endif
 
 NATIVE_OBJECTS := $(CORE_OBJECTS) $(TRANSLATOR_OBJECTS) $(LINUX_ABI_OBJECTS) $(FAKE_HOST_OBJECTS) \
 	$(LINUX_HOST_OBJECTS)
@@ -328,18 +349,31 @@ $(PACKAGE_PC): Makefile FORCE
 		printf '%s\n' 'Version: $(VERSION)' 'Libs: -L$${libdir} -lhl-host-$(PACKAGE_HOST) -lhl-engine -lhl-translator -lhl-linux-abi $(PACKAGE_SYSTEM_LIBS)' 'Cflags: -I$${includedir}'; \
 	} > $@
 
-install: $(PACKAGE_LIBRARIES) $(BUILD)/bin/hl-engine-runner $(PACKAGE_PC)
+$(BUILD)/pkgconfig/hl-engine-activation.pc: Makefile FORCE
+	@mkdir -p $(@D)
+	@{ \
+		printf '%s\n' 'prefix=$(PREFIX)'; \
+		printf '%s\n' 'exec_prefix=$${prefix}' 'libdir=$${exec_prefix}/lib' 'includedir=$${prefix}/include'; \
+		printf '\nName: hl-engine-activation\nDescription: Complete embedded Linux activation engine\n'; \
+		printf '%s\n' 'Version: $(VERSION)' 'Libs: $(ACTIVATION_LIBS)' 'Cflags: -I$${includedir}'; \
+	} > $@
+
+install: $(PACKAGE_LIBRARIES) $(BUILD)/bin/hl-engine-runner $(PACKAGE_PC) $(ACTIVATION_ARCHIVE) $(ACTIVATION_PC)
 	$(INSTALL) -d '$(DESTDIR)$(PREFIX)/include/hl' '$(DESTDIR)$(PREFIX)/lib/pkgconfig' \
 		'$(DESTDIR)$(PREFIX)/bin'
-	$(INSTALL) -m 0644 include/hl/*.h '$(DESTDIR)$(PREFIX)/include/hl/'
+	$(INSTALL) -m 0644 $(INSTALL_HEADERS) '$(DESTDIR)$(PREFIX)/include/hl/'
 	$(INSTALL) -m 0644 $(PACKAGE_LIBRARIES) '$(DESTDIR)$(PREFIX)/lib/'
 	$(INSTALL) -m 0644 $(PACKAGE_PC) '$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine.pc'
+	$(if $(ACTIVATION_ARCHIVE),$(INSTALL) -m 0644 $(ACTIVATION_ARCHIVE) '$(DESTDIR)$(PREFIX)/lib/libhl-engine-activation.a')
+	$(if $(ACTIVATION_PC),$(INSTALL) -m 0644 $(ACTIVATION_PC) '$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine-activation.pc')
 	$(INSTALL) -m 0755 $(BUILD)/bin/hl-engine-runner '$(DESTDIR)$(PREFIX)/bin/'
 
 uninstall:
 	rm -f '$(DESTDIR)$(PREFIX)/bin/hl-engine-runner' '$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine.pc' \
+		'$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine-activation.pc' \
 		'$(DESTDIR)$(PREFIX)/lib/libhl-engine.a' '$(DESTDIR)$(PREFIX)/lib/libhl-translator.a' \
-		'$(DESTDIR)$(PREFIX)/lib/libhl-linux-abi.a' '$(DESTDIR)$(PREFIX)/lib/libhl-host-$(PACKAGE_HOST).a'
+		'$(DESTDIR)$(PREFIX)/lib/libhl-linux-abi.a' '$(DESTDIR)$(PREFIX)/lib/libhl-host-$(PACKAGE_HOST).a' \
+		'$(DESTDIR)$(PREFIX)/lib/libhl-engine-activation.a'
 	rm -f $(foreach header,$(notdir $(wildcard include/hl/*.h)),'$(DESTDIR)$(PREFIX)/include/hl/$(header)')
 	@rmdir '$(DESTDIR)$(PREFIX)/include/hl' '$(DESTDIR)$(PREFIX)/include' \
 		'$(DESTDIR)$(PREFIX)/lib/pkgconfig' '$(DESTDIR)$(PREFIX)/lib' '$(DESTDIR)$(PREFIX)/bin' \
@@ -355,10 +389,39 @@ package-test:
 		-lhl-translator -lhl-linux-abi $(PACKAGE_SYSTEM_LIBS) \
 		-o '$(BUILD)/package-consumer/package'
 	'$(BUILD)/package-consumer/package'
+	$(if $(ACTIVATION_ARCHIVE),$(MAKE) HOST='$(HOST)' HOST_ARCH='$(HOST_ARCH)' BUILD='$(BUILD)' package-activation-installed-test)
 	$(MAKE) HOST='$(HOST)' PREFIX=/usr DESTDIR='$(abspath $(BUILD)/package-root)' uninstall
 	test ! -e '$(BUILD)/package-root/usr/include/hl/engine.h'
 	test -e '$(BUILD)/package-root/usr/include/foreign.h'
 	rm -rf '$(BUILD)/package-root'
+
+.PHONY: package-activation-installed-test
+package-activation-installed-test:
+	$(CC) -I'$(abspath $(BUILD)/package-root)/usr/include' tests/integration/activation_package.c \
+		$(ACTIVATION_CONSUMER_LIBS) -o '$(BUILD)/package-consumer/activation-package'
+	$(if $(filter macos,$(HOST)),$(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f '$(BUILD)/package-consumer/activation-package')
+	'$(BUILD)/package-consumer/activation-package'
+
+.PHONY: package-activation-macos-test
+package-activation-macos-test: HOST = macos
+package-activation-macos-test: HOST_ARCH = aarch64
+package-activation-macos-test: ACTIVATION_LIBS = -Wl,-force_load,$${libdir}/libhl-engine-activation.a
+package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
+	$(BUILD)/pkgconfig/hl-engine-activation.pc
+	rm -rf '$(BUILD)/activation-package-root' '$(BUILD)/activation-package-consumer'
+	$(INSTALL) -d '$(BUILD)/activation-package-root/include/hl' \
+		'$(BUILD)/activation-package-root/lib/pkgconfig' '$(BUILD)/activation-package-consumer'
+	$(INSTALL) -m 0644 include/hl/*.h '$(BUILD)/activation-package-root/include/hl/'
+	$(INSTALL) -m 0644 $(BUILD)/package/macos-aarch64/libhl-engine.a \
+		'$(BUILD)/activation-package-root/lib/libhl-engine-activation.a'
+	$(INSTALL) -m 0644 $(BUILD)/pkgconfig/hl-engine-activation.pc \
+		'$(BUILD)/activation-package-root/lib/pkgconfig/hl-engine-activation.pc'
+	$(MAC) clang -I'$(abspath $(BUILD)/activation-package-root/include)' tests/integration/activation_package.c \
+		-Wl,-force_load,'$(abspath $(BUILD)/activation-package-root/lib/libhl-engine-activation.a)' \
+		-o '$(BUILD)/activation-package-consumer/activation-package'
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
+		'$(BUILD)/activation-package-consumer/activation-package'
+	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package)
 
 FORCE:
 
