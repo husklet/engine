@@ -575,14 +575,6 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     pthread_mutex_lock(&g_bound_mapping_gate);
     if (linux_flags & 0x10u) flags |= HL_HOST_MEMORY_FIXED;
     if (linux_flags & 0x100000u) flags = (flags & ~HL_HOST_MEMORY_FIXED) | HL_HOST_MEMORY_FIXED_NOREPLACE;
-    object = calloc(1, sizeof(*object));
-    entry = calloc(1, sizeof(*entry));
-    if (object == NULL || entry == NULL) {
-        free(object);
-        free(entry);
-        pthread_mutex_unlock(&g_bound_mapping_gate);
-        return -ENOMEM;
-    }
     if (g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
         hl_host_file_metadata metadata;
         hl_host_result status = g_host_services->file->metadata(g_host_services->context, file->host_handle, &metadata);
@@ -608,8 +600,18 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
         pthread_mutex_unlock(&g_bound_mapping_gate);
         return result;
     }
+    object = calloc(1, sizeof(*object));
+    entry = calloc(1, sizeof(*entry));
+    if (object == NULL || entry == NULL) {
+        free(object);
+        free(entry);
+        (void)g_host_services->memory->release(g_host_services->context, mapped.handle);
+        if (bus_prepared) gbus_prepare_release();
+        pthread_mutex_unlock(&g_bound_mapping_gate);
+        return -ENOMEM;
+    }
     pthread_mutex_lock(&g_bound_mapping_lock);
-    if (linux_flags & (0x10u | 0x100000u)) bound_mapping_retire(mapped.address, mapped.mapped_size);
+    if ((flags & HL_HOST_MEMORY_FIXED) != 0) bound_mapping_retire(mapped.address, mapped.mapped_size);
     bound_watch_source *source =
         identity_valid ? bound_watch_retain(file, stable_device, stable_object, known_size) : NULL;
     *object = (bound_mapping_object){mapped.handle,

@@ -27,11 +27,11 @@ int main(void) {
 
     arena = mmap(NULL, reserve_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (arena == MAP_FAILED) return 1;
-    vacant = (unsigned char *)(((uintptr_t)arena + host_granule - 1) & ~(uintptr_t)(host_granule - 1));
-    if (vacant + host_granule > arena + reserve_size || munmap(vacant, host_granule) != 0) return 1;
     occupied = mmap(NULL, host_granule, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (occupied == MAP_FAILED) return 1;
     memset(occupied, 0xa7, host_granule);
+    vacant = (unsigned char *)(((uintptr_t)arena + host_granule - 1) & ~(uintptr_t)(host_granule - 1));
+    if (vacant + host_granule > arena + reserve_size || munmap(vacant, host_granule) != 0) return 1;
 
     errno = 0;
     collision = mmap(occupied, host_granule, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0);
