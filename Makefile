@@ -8,7 +8,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 VERSION := 0.1.0
 DEBUG ?= 0
-MAC ?= mac
+MAC ?= $(if $(filter Darwin,$(shell uname -s)),,mac)
 CODESIGN ?= codesign
 PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
@@ -1674,7 +1674,7 @@ perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 
 	$(call HL_PERF_NATIVE,ipc-throughput,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
 	$(BUILD)/perf/resource-aarch64
 
-MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
+MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
 	run-unit-pipe_linux run-unit-private run-unit-process run-unit-range run-unit-resolve_services run-unit-system
 ifeq ($(HOST),macos)
 unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS)) test-macos

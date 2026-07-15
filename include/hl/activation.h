@@ -10,6 +10,10 @@ extern "C" {
 
 typedef struct hl_activation_process hl_activation_process;
 typedef struct hl_activation_stdio {
+    /* Borrowed host descriptors. A nonnegative descriptor is duplicated into
+     * the reexecuted child during start; -1 inherits the application's stream.
+     * Ownership never transfers, and the caller may close it as soon as start
+     * returns, whether start succeeds or fails. */
     int32_t input;
     int32_t output;
     int32_t error;
@@ -20,10 +24,16 @@ HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa,
 HL_API hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa,
                                                 const char *config_path, const hl_activation_stdio *stdio,
                                                 hl_activation_process **out_process);
+/* Returns the native child process identifier while the opaque handle exists. */
+HL_API hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id);
+/* wait is idempotent: completed status/result values are cached in the handle. */
 HL_API hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out_exit);
+/* try_wait sets out_ready=0 without modifying out_exit while the child runs. */
 HL_API hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_ready,
                                        hl_engine_exit *out_exit);
 HL_API hl_status hl_activation_kill(hl_activation_process *process);
+/* Destroying a live handle force-stops and reaps it; destroying a waited handle
+ * only releases cached parent-side state. */
 HL_API void hl_activation_process_destroy(hl_activation_process *process);
 
 /* Reexecutes the current application and activates the embedded guest backend

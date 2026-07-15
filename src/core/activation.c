@@ -309,6 +309,12 @@ hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const 
     return hl_activation_start_with_stdio(executable, guest_isa, config_path, NULL, out_process);
 }
 
+hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id) {
+    if (process == NULL || out_process_id == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    *out_process_id = (uint64_t)process->pid;
+    return HL_STATUS_OK;
+}
+
 hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out_exit) {
     hl_activation_reply reply;
     int waited = 0;

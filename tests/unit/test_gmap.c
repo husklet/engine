@@ -3,7 +3,6 @@
 #include "../../src/linux_abi/container/vfs/gmap.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -84,10 +83,7 @@ int main(void) {
     HL_CHECK(hl_gmap_count() == 0);
 
     {
-        int zero = open("/dev/zero", O_RDWR);
-        HL_CHECK(zero >= 0);
-        void *mapping = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE, zero, 0);
-        close(zero);
+        void *mapping = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         HL_CHECK(mapping != MAP_FAILED);
         hl_gmap_add((uint64_t)(uintptr_t)mapping, 0x1000);
         HL_CHECK(hl_gmap_count() == 1);
