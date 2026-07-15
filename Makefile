@@ -1870,7 +1870,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/core/workload/x86_64/busyloop \
 	$(BUILD)/compat/syscall/aarch64/gettid $(BUILD)/compat/syscall/x86_64/gettid \
-	$(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64
+	$(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
+	$(BUILD)/compat/process/aarch64/forkstorm $(BUILD)/compat/process/x86_64/forkstorm
 	$(call HL_PERF_LINUX,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
 	$(call HL_PERF_LINUX,startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-x86_64,42)
 	$(call HL_PERF_LINUX,compute,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/core/workload/aarch64/busyloop,0)
@@ -1879,6 +1880,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(call HL_PERF_LINUX,syscall-startup,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/compat/syscall/x86_64/gettid,0)
 	$(call HL_PERF_LINUX,syscall-1m,aarch64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-aarch64,0)
 	$(call HL_PERF_LINUX,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
+	$(call HL_PERF_LINUX,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
+	$(call HL_PERF_LINUX,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
 
 # Native comparison is meaningful only when the host can execute the AArch64 Linux fixtures directly.
 perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 \
