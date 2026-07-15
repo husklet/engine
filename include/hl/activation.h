@@ -9,9 +9,17 @@ extern "C" {
 #endif
 
 typedef struct hl_activation_process hl_activation_process;
+typedef struct hl_activation_stdio {
+    int32_t input;
+    int32_t output;
+    int32_t error;
+} hl_activation_stdio;
 
 HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
                                      hl_activation_process **out_process);
+HL_API hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa,
+                                                const char *config_path, const hl_activation_stdio *stdio,
+                                                hl_activation_process **out_process);
 HL_API hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out_exit);
 HL_API hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_ready,
                                        hl_engine_exit *out_exit);

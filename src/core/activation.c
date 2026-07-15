@@ -102,10 +102,22 @@ static int activation_run_config(const char *rootfs, uint32_t argc, char *const 
     (void)result_path;
     for (stream = 0; stream < 3; ++stream) {
         hl_host_result adopted = activation_services->file->standard_stream(activation_services->context, stream);
+        uint32_t access;
+        if (adopted.status == HL_STATUS_NOT_FOUND) continue;
         if (adopted.status != HL_STATUS_OK) { activation_status = (hl_status)adopted.status; return 78; }
+        access = (uint32_t)adopted.detail & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE);
         bindings[count] = (hl_engine_fd_binding){.abi = HL_ENGINE_ABI, .size = sizeof(bindings[count]),
-                                                 .guest_fd = stream, .ownership = HL_ENGINE_FD_TRANSFER,
+                                                 .guest_fd = stream,
+                                                 .status_flags = access == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)
+                                                                     ? HL_LINUX_O_RDWR
+                                                                 : access == HL_HOST_FILE_WRITE ? HL_LINUX_O_WRONLY
+                                                                                                  : HL_LINUX_O_RDONLY,
+                                                 .ownership = HL_ENGINE_FD_TRANSFER,
                                                  .host_handle = adopted.value};
+        if (((uint32_t)adopted.detail & HL_HOST_FILE_APPEND) != 0)
+            bindings[count].status_flags |= HL_LINUX_O_APPEND;
+        if (((uint32_t)adopted.detail & HL_HOST_FILE_NONBLOCK) != 0)
+            bindings[count].status_flags |= HL_LINUX_O_NONBLOCK;
         ++count;
     }
     config.fd_bindings = bindings;
@@ -192,8 +204,8 @@ static void wait_child(pid_t child, int *waited) {
     while (waitpid(child, waited, 0) < 0 && errno == EINTR) {}
 }
 
-hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *guest,
-                              hl_activation_process **out_process) {
+hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
+                                         const hl_activation_stdio *stdio, hl_activation_process **out_process) {
     int pair[2];
     pid_t child;
     posix_spawn_file_actions_t actions;
@@ -212,6 +224,8 @@ hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const 
     *out_process = NULL;
     if (executable == NULL || guest == NULL || executable[0] != '/' || guest[0] != '/' ||
         (guest_isa != HL_GUEST_ISA_AARCH64 && guest_isa != HL_GUEST_ISA_X86_64))
+        return HL_STATUS_INVALID_ARGUMENT;
+    if (stdio != NULL && (stdio->input < -1 || stdio->output < -1 || stdio->error < -1))
         return HL_STATUS_INVALID_ARGUMENT;
     path_size = strlen(guest) + 1;
     if (path_size > sizeof(request.path)) return HL_STATUS_INVALID_ARGUMENT;
@@ -247,6 +261,13 @@ hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const 
     if (posix_spawn_file_actions_init(&actions) != 0) {
         close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (stdio != NULL &&
+        ((stdio->input >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->input, 0) != 0) ||
+         (stdio->output >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->output, 1) != 0) ||
+         (stdio->error >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->error, 2) != 0))) {
+        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     if (posix_spawn_file_actions_adddup2(&actions, pair[1], HL_ACTIVATION_FD) != 0 ||
         posix_spawn_file_actions_addclose(&actions, pair[0]) != 0 ||
         posix_spawn_file_actions_addclose(&actions, pair[1]) != 0) {
@@ -281,6 +302,11 @@ hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const 
     memcpy(process->nonce, request.nonce, sizeof(process->nonce));
     *out_process = process;
     return HL_STATUS_OK;
+}
+
+hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
+                              hl_activation_process **out_process) {
+    return hl_activation_start_with_stdio(executable, guest_isa, config_path, NULL, out_process);
 }
 
 hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out_exit) {

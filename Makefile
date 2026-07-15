@@ -513,6 +513,10 @@ $(BUILD)/e2e/guest-exit70-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/guest-output-aarch64: tests/e2e/guest_output.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
 $(BUILD)/e2e/guest-spin-aarch64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
@@ -1229,10 +1233,12 @@ $(BUILD)/tools/dual-backend-e2e: tools/dual_backend_e2e_runner.c $(BUILD)/mac/li
 
 .PHONY: test-dual-backend
 test-dual-backend: $(BUILD)/tools/dual-backend-e2e $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
-	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 $(BUILD)/e2e/guest-spin-aarch64
+	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 $(BUILD)/e2e/guest-spin-aarch64 \
+	$(BUILD)/e2e/guest-output-aarch64
 	$(abspath $(BUILD)/tools/dual-backend-e2e) $(abspath $(BUILD)/e2e/guest-exit-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) $(abspath $(BUILD)/e2e/guest-exit70-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) $(abspath $(BUILD)/e2e/guest-spin-aarch64)
+		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) $(abspath $(BUILD)/e2e/guest-spin-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-output-aarch64)
 
 $(BUILD)/mac/lifecycle/aarch64-runner.o: tools/lifecycle_e2e_runner.c
 	@mkdir -p $(@D)

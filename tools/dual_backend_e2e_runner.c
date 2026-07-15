@@ -95,6 +95,28 @@ static int kill_one(const char *executable, const char *guest) {
     return status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_SIGNAL || result.guest_status != SIGKILL;
 }
 
+static int pipe_one(const char *executable, const char *guest) {
+    static const char expected[] = "activation-stdio\n";
+    hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
+    hl_activation_process *process = NULL;
+    hl_activation_stdio stdio = {.input = -1, .output = -1, .error = -1};
+    char config_path[64];
+    char output[sizeof(expected)] = {0};
+    int descriptors[2];
+    hl_status status;
+    ssize_t count;
+    if (make_config(guest, config_path) != 0 || pipe(descriptors) != 0) return 1;
+    stdio.output = descriptors[1];
+    status = hl_activation_start_with_stdio(executable, HL_GUEST_ISA_AARCH64, config_path, &stdio, &process);
+    close(descriptors[1]);
+    count = read(descriptors[0], output, sizeof(output));
+    close(descriptors[0]);
+    if (status == HL_STATUS_OK) status = hl_activation_wait(process, &result);
+    hl_activation_process_destroy(process);
+    return status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE || result.guest_status != 42 ||
+           count != (ssize_t)(sizeof(expected) - 1) || memcmp(output, expected, sizeof(expected) - 1) != 0;
+}
+
 static int reject_without_launch(const char *executable, const char *guest, uint32_t mode) {
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     char config_path[64];
@@ -107,8 +129,8 @@ static int reject_without_launch(const char *executable, const char *guest, uint
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: dual-backend-e2e AARCH64_EXIT42 X86_EXIT42 AARCH64_EXIT70 X86_EXIT70 AARCH64_SPIN\n");
+    if (argc != 7) {
+        fprintf(stderr, "usage: dual-backend-e2e A64_EXIT42 X86_EXIT42 A64_EXIT70 X86_EXIT70 A64_SPIN A64_OUTPUT\n");
         return 64;
     }
     if (!handlers_unchanged()) return 65;
@@ -117,6 +139,7 @@ int main(int argc, char **argv) {
     if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42) ||
         run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42) ||
         run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70) ||
-        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) || kill_one(argv[0], argv[5])) return 71;
+        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) || kill_one(argv[0], argv[5]) ||
+        pipe_one(argv[0], argv[6])) return 71;
     return 0;
 }
