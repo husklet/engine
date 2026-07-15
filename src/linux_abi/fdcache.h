@@ -57,7 +57,6 @@ void hl_fdcache_fd_clear(int fd);
 void hl_fdcache_evict_path(const char *host_path);
 
 /* Temporary call-site aliases while the surrounding unity roots are decomposed. */
-#define res_bump hl_fdcache_resolution_bump
 #define rc_reset hl_fdcache_reset
 #define fd_evict hl_fdcache_fd_evict
 #endif

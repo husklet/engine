@@ -151,7 +151,7 @@ static void fdcache_unlock(void) {
 // it in the fork child so a child never serves the parent's stale mappings.
 int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n);
 void hl_fdcache_resolution_store(const char *g, const char *host);
-void res_bump(void);
+void hl_fdcache_resolution_bump(void);
 void rc_reset(void);
 // ---- W4D openat resolution cache (forward decls; impl after the S2 rc_* cache it extends) ----
 // Extends item-9's rc_* (which memoizes only the read-only atpath() resolver) to the open-heavy half:
@@ -183,7 +183,8 @@ static void oc_reset(void);
 // there is no fork/wait boundary at which to drop the parent's stale caches. Without a shared epoch, the
 // parent that cached a NEGATIVE stat/access/resolve for partial/*_InRelease BEFORE the child downloaded it
 // keeps serving ENOENT forever (its own private g_res_epoch never moved), so the file looks "vanished" and
-// apt's split rename fails ENOENT. With the counter shared, the child's O_CREAT/rename res_bump() invalidates
+// apt's split rename fails ENOENT. With the counter shared, the child's O_CREAT/rename
+// hl_fdcache_resolution_bump() invalidates
 // the negative entry in the parent too. The page is created in a constructor BEFORE any guest fork, so every
 // fork descendant AND in-process execve (hl keeps its own mappings across the guest execve) share one physical
 // counter; a fresh `docker exec` is a NEW hl process = its own tree = its own counter (correct per-container
@@ -380,7 +381,7 @@ void hl_fdcache_access_evict(const char *p) {
 // references it too); it is shared by these path-string caches and the metadata caches alike.
 // Bump the epoch -> the whole cache misses. Skip 0 (the reserved "never matches" stamp).
 // Locked under threads (same model as mc_*) so a bump can't race a concurrent lookup's epoch read.
-void res_bump(void) {
+void hl_fdcache_resolution_bump(void) {
     CLK;
     g_res_epoch++;
     if (!g_res_epoch) g_res_epoch = 1;
@@ -393,7 +394,7 @@ void res_bump(void) {
 // fresh-container) upper. This memoizes exactly that proof, keyed by the parent GUEST dir, so a
 // metadata storm over the read-only image (tar/find/du/ld.so: thousands of lstats, one per file) pays
 // the upper probe once per DIRECTORY instead of once per file. Correctness model is identical to rc_*:
-//   * epoch-gated: every namespace mutation bumps g_res_epoch (dispatch.c res_bump on create/unlink/
+//   * epoch-gated: every namespace mutation bumps g_res_epoch (dispatch.c hl_fdcache_resolution_bump on create/unlink/
 //     rename/mkdir/..., PLUS the copy-up bumps in overlay.c for the non-syscall upper mutations), so an
 //     entry can never outlive an upper dir appearing. The epoch is container-SHARED (MAP_SHARED page),
 //     so another engine process (docker exec) creating upper dirs invalidates this process's memo too.
@@ -483,7 +484,7 @@ void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
 // rc_/oc_:
 //   * EVERY entry (including the nmiss>0 "parent chain missing here" ones) is epoch-gated on the
 //     container-shared g_res_epoch: any create/unlink/rename/mkdir/symlink/link/mount -- and every
-//     overlay copy-up relocation (res_bump in overlay.c) -- invalidates the WHOLE cache. A symlink
+//     overlay copy-up relocation (hl_fdcache_resolution_bump in overlay.c) -- invalidates the WHOLE cache. A symlink
 //     flip inside a cached prefix is a symlinkat/unlinkat/renameat -> bumped. Over-invalidate, never
 //     under.
 //   * fork/chroot drop via rc_reset below: each entry also carries the g_fs_fgen stamp and only
@@ -619,7 +620,8 @@ void hl_fdcache_resolution_store(const char *g, const char *host) {
 // host path obtained via F_GETPATH on a SUCCESSFUL real open. On a HIT the ~6-syscall walk collapses to a
 // single open(host, O_NOFOLLOW); the REAL open ALWAYS still runs, so a stale entry can never fabricate
 // existence/contents -- the only failure mode is a wrong host *path*, which the SHARED g_res_epoch guard
-// prevents: every FS-namespace mutation (service.c res_bump on mknod/mkdir/unlink/rmdir/symlink/link/
+// prevents: every FS-namespace mutation (service.c hl_fdcache_resolution_bump on
+// mknod/mkdir/unlink/rmdir/symlink/link/
 // rename/(u)mount + openat O_CREAT) bumps the epoch, so the whole cache misses -- conservative
 // over-invalidation, identical threat model to item 9 (the host outside the jail is not in scope; when in
 // doubt we MISS and re-walk). hl_fdcache_open_store additionally refuses to cache any host path that escaped

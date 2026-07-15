@@ -5,7 +5,7 @@
 // searched top->down when a path isn't in the upper. Whiteout (.wh.NAME) hides a lower entry;
 // copy-up brings a lower file into the upper on write. Off entirely when g_nlower==0.
 // Same-TU forward decls into fscache.c (defined later; all files are #included into one unity TU):
-//   res_bump          -- the FS-namespace epoch bump; called here whenever a copy-up MUTATES the upper
+//   hl_fdcache_resolution_bump -- the FS-namespace epoch bump; called whenever a copy-up MUTATES the upper
 //                        (mkdir/byte-copy), so the guest->host path caches AND the negative memo below
 //                        can never serve a pre-copy-up answer (fchmodat/utimensat/setxattr copy-ups
 //                        reach here WITHOUT a bumping syscall in dispatch.c).
@@ -219,7 +219,7 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
     // entry itself, its `.wh.` whiteout, and its parent's `.wh..wh..opq` opaque marker -- all of which
     // would live under that missing upper dir -- cannot exist either, so the three upper probes below are
     // provably ENOENT and we go straight to the lowers. A later mkdir/copy-up in the upper bumps
-    // g_res_epoch (dispatch.c res_bump + the copy-up bumps in this file), instantly invalidating the memo.
+    // g_res_epoch (dispatch.c plus the copy-up bumps in this file), instantly invalidating the memo.
     if (!(have_par && hl_fdcache_upper_negative_lookup(par))) {
         int upmiss = 0, isvol = 0;
         int injail = secure_resolve_probe(guest, up, sizeof up, 1, &upmiss, &isvol); // upper (or volume)
@@ -407,7 +407,7 @@ static void overlay_mkparents(const char *guest) {
     // Dirs appeared in the upper: invalidate the epoch-gated caches (updirneg memo, rc_/oc_ path strings)
     // so no pre-copy-up "absent in upper" answer survives. Bumped ONCE per call, only when something was
     // actually created -- the common already-materialized case stays bump-free.
-    if (made) res_bump();
+    if (made) hl_fdcache_resolution_bump();
 }
 
 // ---- copy-up metadata + opaque + whiteout helpers ------------------------------------------------
@@ -492,8 +492,9 @@ static void overlay_set_opaque(const char *guest) {
     char opq[4400];
     snprintf(opq, sizeof opq, "%s/%s", up, ".wh..wh..opq");
     (void)hl_host_file_create(&g_jit_services, opq, 0644);
-    res_bump(); // an opaque marker appeared: invalidate the dir-verdict memo (and negative caches) so no
-                // pre-marker "lowers contribute" verdict survives within this syscall
+    // Invalidate the directory verdict and negative caches so no pre-marker
+    // "lowers contribute" verdict survives within this syscall.
+    hl_fdcache_resolution_bump();
 }
 
 // Copy-up: bring a lower file into the UPPER so it can be modified, then return the upper host path.
@@ -534,7 +535,7 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
             if (lstat(lp, &ds) == 0) {
                 if (S_ISDIR(ds.st_mode)) {
                     overlay_mkparents(guest);
-                    if (mkdir(up, ds.st_mode & 0777) == 0) res_bump(); // dir materialized in the upper
+                    if (mkdir(up, ds.st_mode & 0777) == 0) hl_fdcache_resolution_bump(); // upper dir materialized
                     return;
                 }
                 break; // lower provides it as a non-dir (symlink/special): leave to the caller's fallback
@@ -579,7 +580,7 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
     // memo can't keep serving the stale LOWER path -- fchmodat/fchownat/utimensat/setxattr copy-ups reach
     // here with NO bumping syscall in dispatch.c (openat write-mode copy-ups bump there as well; a second
     // bump is harmless).
-    res_bump();
+    hl_fdcache_resolution_bump();
 }
 
 // Recursively copy a lower-only subtree rooted at `guest` into the writable upper, preserving metadata at
@@ -609,7 +610,8 @@ static void overlay_copyup_tree(const char *guest) {
     overlay_mkparents(guest);
     xresolve_exec(guest, up, sizeof up);
     struct stat ust;
-    if (lstat(up, &ust) != 0 && mkdir(up, lst.st_mode & 0777) == 0) res_bump(); // dir appeared in the upper
+    if (lstat(up, &ust) != 0 && mkdir(up, lst.st_mode & 0777) == 0)
+        hl_fdcache_resolution_bump(); // directory appeared in the upper
     ovl_copy_meta(lo, up, &lst);
     DIR *d = opendir(lo);
     if (!d) return;
@@ -873,6 +875,7 @@ static void overlay_whiteout(const char *guest) {
         mkdir(dir, 0755);
     }
     (void)hl_host_file_create(&g_jit_services, wh, 0644);
-    res_bump(); // a whiteout appeared (and the upper subtree was dropped): invalidate the dir-verdict memo
-                // and negative caches so no pre-removal "present" verdict/stat survives this syscall
+    // Invalidate the directory verdict and negative caches so no pre-removal
+    // "present" verdict or stat survives this syscall.
+    hl_fdcache_resolution_bump();
 }

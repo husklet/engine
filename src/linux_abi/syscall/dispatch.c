@@ -586,7 +586,7 @@ static void service_local(struct cpu *c) {
     // corrupt a count/fd that happened to fall in the link range). Whole block is inert unless g_nonpie_lo
     // is set (ET_EXEC only) -> PIE/static-PIE and the entire test matrix are byte-identical. Numbers are
     // the canonical (aarch64) syscall numbers G_NR() maps the x86 guest's calls onto. Runs BEFORE the
-    // res_bump switch below, which itself dereferences a2 (open_how*) for openat2.
+    // resolution-bump switch below, which itself dereferences a2 (open_how*) for openat2.
     if (g_nonpie_lo) {
         switch (nr) {
         case 56:  // openat(dfd, PATH, flags, mode)
@@ -975,21 +975,21 @@ static void service_local(struct cpu *c) {
     case 39:  // umount2
     case 40:  // mount
     case 276: // renameat2
-        res_bump();
+        hl_fdcache_resolution_bump();
         break;
     case 56: // openat: a2 = Linux flags. O_CREAT (0x40) adds a name. In OVERLAY mode a write-open
              // (O_WRONLY/O_RDWR, a2&3) copies the file lower->upper, RELOCATING its resolved host path
              // -- so it must invalidate too, or a cached lower path goes stale (flat rootfs: no copy-up).
-        if ((a2 & 0x40) || (g_nlower && (a2 & 3))) res_bump();
+        if ((a2 & 0x40) || (g_nlower && (a2 & 3))) hl_fdcache_resolution_bump();
         break;
     case 437: { // openat2: flags live in open_how.flags (a2 -> struct open_how *), before its case rewrites a2
         // a2 is a raw guest pointer to struct open_how; peek how[0] (flags) only if it is actually mapped, so
         // a bad pointer doesn't fault the engine in this pre-dispatch cache-invalidation probe. If it is
-        // unmapped we simply skip the res_bump -- the real openat2 handler (svc_fs) returns -EFAULT below.
+        // unmapped we simply skip the resolution bump -- the real openat2 handler (svc_fs) returns -EFAULT below.
         uint64_t *how = (uint64_t *)a2;
         if (how && host_range_mapped((uintptr_t)a2, sizeof(uint64_t)) &&
             ((how[0] & 0x40) || (g_nlower && (how[0] & 3))))
-            res_bump();
+            hl_fdcache_resolution_bump();
         break;
     }
     default: break;
