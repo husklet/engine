@@ -1,8 +1,12 @@
 CC ?= cc
 AR ?= ar
+INSTALL ?= install
 CLANG_FORMAT ?= clang-format
 BUILD ?= build
 HOST ?= linux
+PREFIX ?= /usr/local
+DESTDIR ?=
+VERSION := 0.1.0
 DEBUG ?= 0
 MAC ?= mac
 PERF_WARMUPS ?= 3
@@ -75,7 +79,23 @@ LINUX_HOST_OBJECTS := $(LINUX_HOST_SOURCES:%.c=$(BUILD)/%.o)
 ifeq ($(HOST),linux)
 LINUX_HOST_PRODUCTS := $(BUILD)/lib/libhl-host-linux.a
 LINUX_HOST_TEST := run-unit-linux
+PACKAGE_HOST := linux
+PACKAGE_HOST_LIBRARY := $(BUILD)/lib/libhl-host-linux.a
+PACKAGE_HOST_OBJECTS := $(LINUX_HOST_OBJECTS)
+PACKAGE_SYSTEM_LIBS := -pthread
+else ifeq ($(HOST),macos)
+PACKAGE_HOST := macos
+PACKAGE_HOST_LIBRARY := $(BUILD)/lib/libhl-host-macos.a
+PACKAGE_HOST_OBJECTS := $(MACOS_HOST_SOURCES:%.c=$(BUILD)/%.o) $(COMMON_HOST_SOURCES:%.c=$(BUILD)/%.o) \
+	$(BUILD)/src/host/clock.o $(BUILD)/src/host/file.o
+PACKAGE_SYSTEM_LIBS := -pthread
+else
+$(error HOST must be linux or macos)
 endif
+
+PACKAGE_LIBRARIES := $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
+	$(BUILD)/lib/libhl-linux-abi.a $(PACKAGE_HOST_LIBRARY)
+PACKAGE_PC := $(BUILD)/pkgconfig/hl-engine.pc
 
 NATIVE_OBJECTS := $(CORE_OBJECTS) $(TRANSLATOR_OBJECTS) $(LINUX_ABI_OBJECTS) $(FAKE_HOST_OBJECTS) \
 	$(LINUX_HOST_OBJECTS)
@@ -91,7 +111,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file gmap host_services identity inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -220,7 +240,7 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 check-domains audit-domains format format-check help
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
@@ -277,6 +297,53 @@ $(BUILD)/lib/libhl-host-fake.a: $(FAKE_HOST_OBJECTS)
 $(BUILD)/lib/libhl-host-linux.a: $(LINUX_HOST_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
+
+$(BUILD)/lib/libhl-host-macos.a: $(PACKAGE_HOST_OBJECTS)
+	@mkdir -p $(@D)
+	$(AR) rcs $@ $^
+
+$(PACKAGE_PC): Makefile FORCE
+	@mkdir -p $(@D)
+	@{ \
+		printf '%s\n' 'prefix=$(PREFIX)'; \
+		printf '%s\n' 'exec_prefix=$${prefix}' 'libdir=$${exec_prefix}/lib' 'includedir=$${prefix}/include'; \
+		printf '\nName: hl-engine\nDescription: Portable Linux guest translation and ABI engine\n'; \
+		printf '%s\n' 'Version: $(VERSION)' 'Libs: -L$${libdir} -lhl-host-$(PACKAGE_HOST) -lhl-engine -lhl-translator -lhl-linux-abi $(PACKAGE_SYSTEM_LIBS)' 'Cflags: -I$${includedir}'; \
+	} > $@
+
+install: $(PACKAGE_LIBRARIES) $(BUILD)/bin/hl-engine-runner $(PACKAGE_PC)
+	$(INSTALL) -d '$(DESTDIR)$(PREFIX)/include/hl' '$(DESTDIR)$(PREFIX)/lib/pkgconfig' \
+		'$(DESTDIR)$(PREFIX)/bin'
+	$(INSTALL) -m 0644 include/hl/*.h '$(DESTDIR)$(PREFIX)/include/hl/'
+	$(INSTALL) -m 0644 $(PACKAGE_LIBRARIES) '$(DESTDIR)$(PREFIX)/lib/'
+	$(INSTALL) -m 0644 $(PACKAGE_PC) '$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine.pc'
+	$(INSTALL) -m 0755 $(BUILD)/bin/hl-engine-runner '$(DESTDIR)$(PREFIX)/bin/'
+
+uninstall:
+	rm -f '$(DESTDIR)$(PREFIX)/bin/hl-engine-runner' '$(DESTDIR)$(PREFIX)/lib/pkgconfig/hl-engine.pc' \
+		'$(DESTDIR)$(PREFIX)/lib/libhl-engine.a' '$(DESTDIR)$(PREFIX)/lib/libhl-translator.a' \
+		'$(DESTDIR)$(PREFIX)/lib/libhl-linux-abi.a' '$(DESTDIR)$(PREFIX)/lib/libhl-host-$(PACKAGE_HOST).a'
+	rm -f $(foreach header,$(notdir $(wildcard include/hl/*.h)),'$(DESTDIR)$(PREFIX)/include/hl/$(header)')
+	@rmdir '$(DESTDIR)$(PREFIX)/include/hl' '$(DESTDIR)$(PREFIX)/include' \
+		'$(DESTDIR)$(PREFIX)/lib/pkgconfig' '$(DESTDIR)$(PREFIX)/lib' '$(DESTDIR)$(PREFIX)/bin' \
+		'$(DESTDIR)$(PREFIX)' 2>/dev/null || :
+
+package-test:
+	rm -rf '$(BUILD)/package-root' '$(BUILD)/package-consumer'
+	$(MAKE) HOST='$(HOST)' BUILD='$(BUILD)' PREFIX=/usr DESTDIR='$(abspath $(BUILD)/package-root)' install
+	@printf 'not owned by hl-engine\n' > '$(BUILD)/package-root/usr/include/foreign.h'
+	@mkdir -p '$(BUILD)/package-consumer'
+	$(CC) -I'$(abspath $(BUILD)/package-root)/usr/include' tests/integration/package.c \
+		-L'$(abspath $(BUILD)/package-root)/usr/lib' -lhl-host-$(PACKAGE_HOST) -lhl-engine \
+		-lhl-translator -lhl-linux-abi $(PACKAGE_SYSTEM_LIBS) \
+		-o '$(BUILD)/package-consumer/package'
+	'$(BUILD)/package-consumer/package'
+	$(MAKE) HOST='$(HOST)' PREFIX=/usr DESTDIR='$(abspath $(BUILD)/package-root)' uninstall
+	test ! -e '$(BUILD)/package-root/usr/include/hl/engine.h'
+	test -e '$(BUILD)/package-root/usr/include/foreign.h'
+	rm -rf '$(BUILD)/package-root'
+
+FORCE:
 
 $(BUILD)/bin/hl-engine-runner: src/runner/main.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a

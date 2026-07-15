@@ -416,11 +416,22 @@ children. Validate the supervisor with:
 make remote-supervisor-test
 ```
 
-### 7.6 CMake and consumers
+### 7.6 Installation and consumers
 
-The Make build is authoritative for repository development. `CMakeLists.txt` and `hl-engine.pc.in` provide packaging
-metadata for consumers. Rust `build.rs` integration links the C libraries and uses the installed public headers; it
-does not compile a second implementation of engine behavior.
+The Make build is the single authoritative source list for development and packaging. Install the public headers,
+portable archives, selected host-provider archive, generic runner, and generated `pkg-config` metadata with:
+
+```text
+make HOST=linux PREFIX=/usr/local install
+make HOST=macos PREFIX=/usr/local install
+```
+
+Packagers can prepend a staging root with `DESTDIR`; the path recorded in `hl-engine.pc` remains `PREFIX`. `uninstall`
+removes only files owned by this package. `make package-test` installs into an isolated staging root, compiles a pure-C
+consumer using only the installed include/library contract (the same flags emitted in `hl-engine.pc`, without requiring
+the `pkg-config` program on build hosts), runs it against the real host provider, uninstalls, and verifies that its
+public header was removed. Rust `build.rs` integrations consume this same installed C ABI and must not compile a second
+implementation of engine behavior.
 
 ## 8. Testing model
 
@@ -607,7 +618,8 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [ ] Add tracked thresholds for cold start, warm start, translation, syscall, fork/exec, IPC, and memory overhead.
 - [ ] Run long soak and application-level Linux workloads without leaks or unbounded growth.
 - [ ] Verify release binaries contain no active debug logging and require no diagnostic environment flags.
-- [ ] Publish the standalone C libraries, headers, pkg-config metadata, and binding integration tests.
+- [x] Publish standalone C libraries, headers, host-provider archive, runner, pkg-config metadata, and a staged C
+  consumer integration test.
 
 The roadmap is complete only when evidence from the production engines proves every checkbox. Passing a narrower unit
 test or finding matching source code is not sufficient.

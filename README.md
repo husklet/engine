@@ -17,9 +17,10 @@ make compat-build
 make format-check
 ```
 
-Make orchestrates the C compiler and archiver. Maintained tooling and tests are C, and the normal build and test path
-does not require Python or shell-script helpers. CMake metadata is also provided for installation and Rust `build.rs`
-consumers.
+Make orchestrates the C compiler, archiver, testing, and installation. Maintained tooling and tests are C, and the
+normal build and test path does not require Python or shell-script helpers. `make install` generates `pkg-config`
+metadata from the same authoritative build graph; `make package-test` proves an external C consumer can use only the
+installed headers and libraries.
 
 Tagged logging calls compile to no-ops in release builds. Build with `make DEBUG=1` to compile them in, then select
 tags with `HL_LOG=log:fs,log:jit` or the launch wire's `debug_log_offset`. Available tags are `fs`, `jit`, `syscall`,
