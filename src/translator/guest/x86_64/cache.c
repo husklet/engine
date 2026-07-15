@@ -507,7 +507,7 @@ static void pcache_save(void) {
     // at best, and a stale-translation hazard if the next run reuses the address range for other code.
     uint64_t nmap = 0;
     for (uint32_t i = 0; i < JIT_MAP_N; i++)
-        if (g_map[i].host && (pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) nmap++;
+        if (map_live(i) && (pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) nmap++;
     char path[1024], tmp[1056];
     pcache_file(path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
@@ -542,7 +542,7 @@ static void pcache_save(void) {
         memcpy(w, g_reloc, (size_t)g_nreloc * sizeof g_reloc[0]);
         w += (size_t)g_nreloc * sizeof g_reloc[0];
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
-            if (!g_map[i].host || !(pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) continue;
+            if (!map_live(i) || !(pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) continue;
             struct pc_mapent e = {g_map[i].gpc, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);

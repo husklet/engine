@@ -972,7 +972,7 @@ static void jit86_drop_range_translations(uint64_t lo, uint64_t hi) {
         }
     }
     if (!hit) return; // no translated code in the range -> nothing to invalidate (the common data-munmap case)
-    memset(g_map, 0, sizeof g_map);
+    map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     memset(g_xibtc, 0, sizeof g_xibtc);
     g_npend = 0;

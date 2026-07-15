@@ -147,6 +147,7 @@ typedef struct {
 // unchanged while reset sites can treat this as one coherent translation index.
 typedef struct {
     hl_translation_map_entry map[JIT_MAP_N];
+    uint32_t map_generation[JIT_MAP_N];
     uint64_t pages[TXPG_N];
     uint64_t lines[TXLN_N];
     uint64_t hashes[TXLN_N];
@@ -154,9 +155,26 @@ typedef struct {
 
 static hl_translation_index g_translation_index;
 #define g_map g_translation_index.map
+#define g_map_generation g_translation_index.map_generation
 #define g_txpg g_translation_index.pages
 #define g_txln g_translation_index.lines
 #define g_txlh g_translation_index.hashes
+
+// Clearing the 12 MiB translation hash on every in-place code patch made a correct SMC workload spend
+// almost all of its time in memset.  Entries belong to a logical generation instead: advancing the
+// generation invalidates the whole table in O(1), while normal lookup still stops at the first slot that
+// is empty in the current generation.  A physical clear is needed only after the 32-bit epoch wraps.
+static uint32_t g_map_epoch = 1;
+
+static int map_live(uint32_t index) { return g_map_generation[index] == g_map_epoch; }
+
+static void map_clear(void) {
+    g_map_epoch++;
+    if (g_map_epoch == 0) {
+        memset(g_map_generation, 0, sizeof g_map_generation);
+        g_map_epoch = 1;
+    }
+}
 
 // Crash-only reverse lookup: map a host RX pc back to the nearest translated block start.
 int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn) {
@@ -173,6 +191,7 @@ int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn
     uint64_t best = 0;
     uint64_t bgpc = 0;
     for (uint32_t i = 0; i < JIT_MAP_N; i++) {
+        if (!map_live(i)) continue;
         uint64_t h = (uint64_t)g_map[i].host;
         if (h && h <= rwpc && h >= best) {
             best = h;
@@ -336,8 +355,8 @@ static int map_idx(uint64_t gpc) {
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
-        if (g_map[j].host && g_map[j].gpc == gpc) return j;
-        if (!g_map[j].host) return -1;
+        if (!map_live(j)) return -1;
+        if (g_map[j].gpc == gpc) return j;
     }
     return -1;
 }
@@ -356,10 +375,11 @@ static void map_put(uint64_t gpc, void *host, void *body) {
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
-        if (!g_map[j].host) {
+        if (!map_live(j)) {
             g_map[j].gpc = gpc;
             g_map[j].host = host;
             g_map[j].body = body;
+            g_map_generation[j] = g_map_epoch;
             return;
         }
     }
@@ -980,7 +1000,7 @@ static void jit_flush_to_fresh(void) {
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache rotate generation=%llu rw=%p rx=%p",
             (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache));
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
-    memset(g_map, 0, sizeof g_map);
+    map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
 }
@@ -1035,7 +1055,7 @@ static void stw_flush(void) {
 // ever causes an EXTRA (safe) drop later, never a missed one. (txpg_clear stays: 8x smaller, prior behaviour;
 // the pcache paths still txln_clear on a new image, off the hot path.)
 static void smc_inplace_drop(void) {
-    memset(g_map, 0, sizeof g_map);
+    map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
     txpg_clear();
@@ -1127,7 +1147,7 @@ static void jit_after_fork(void) {
     }
     g_fork_preserved = preserve;
     if (!preserve) {
-        memset(g_map, 0, sizeof g_map);
+        map_clear();
         memset(g_ibtc, 0, sizeof g_ibtc);
         g_npend = 0;
     }

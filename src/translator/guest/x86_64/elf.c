@@ -831,7 +831,7 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // page (smc_on_write retries + the write lands), and let the modified bytes re-translate on next
     // execution. smc_on_write is inert unless a JIT guest is present (g_rwx_guest) -> matrix bit-exact.
     if (si && si->si_addr && smc_on_write((uint64_t)si->si_addr)) {
-        memset(g_map, 0, sizeof g_map);
+        map_clear();
         memset(g_ibtc, 0, sizeof g_ibtc);
         // (PyPy JIT bridge coherence): the x86 opt2 2-way IBTC (g_xibtc) is read by the hot
         // indirect-branch fast path and keyed by guest PC -> host body. It MUST be dropped here too, or a

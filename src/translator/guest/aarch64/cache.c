@@ -420,7 +420,7 @@ static void pcache_save(void) {
     pthread_mutex_lock(&g_jit_lock);
     uint64_t nmap = 0;
     for (uint32_t i = 0; i < JIT_MAP_N; i++)
-        if (g_map[i].host) nmap++;
+        if (map_live(i)) nmap++;
     uint64_t ntxpg = 0;
     for (uint32_t i = 0; i < TXPG_N; i++)
         if (g_txpg[i]) ntxpg++;
@@ -455,7 +455,7 @@ static void pcache_save(void) {
         memcpy(w, g_reloc, (size_t)g_nreloc * sizeof(hl_reloc));
         w += (size_t)g_nreloc * sizeof(hl_reloc);
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
-            if (!g_map[i].host) continue;
+            if (!map_live(i)) continue;
             struct pc_mapent e = {g_map[i].gpc, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
