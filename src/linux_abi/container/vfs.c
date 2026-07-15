@@ -1538,7 +1538,7 @@ static int confine_in_m(const char *jcanon, size_t jclen, const char *rel, char 
             snprintf(out, n, "%s%s", canon, rem);
             // Memoize the successful in-jail climb (canon was verified inside the jail just above);
             // escapes and exhausted climbs (the return-0 paths) are never cached.
-            if (dcok) dc_store(hkey, canon, pops);
+            if (dcok) hl_fdcache_dentry_store(hkey, canon, pops);
             return 1;
         }
         // final missing? climb to the deepest existing dir

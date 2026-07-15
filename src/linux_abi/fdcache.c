@@ -473,7 +473,8 @@ void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
 //           normalized rel, final component already peeled in nofollow mode). The jail canon prefix
 //           makes the key unique per layer (upper vs each lower) with no extra discriminator.
 //   value = (canon, nmiss): realpath() of the deepest EXISTING prefix -- already verified inside the
-//           jail by the caller before dc_store -- plus how many trailing components of the key did NOT
+//           jail by the caller before hl_fdcache_dentry_store -- plus how many trailing components of the key
+//           did NOT
 //           exist (0 = the whole key resolved). A hit replays the recorded climb outcome exactly:
 //           out = canon + (the nmiss popped components, a plain substring of the key) + rem.
 // Files in one directory share the key, so a storm pays ONE realpath per (layer, dir) instead of one
@@ -521,7 +522,7 @@ int hl_fdcache_dentry_lookup(const char *key, char *canon, size_t n, int *nmiss)
     return hit;
 }
 
-void dc_store(const char *key, const char *canon, int nmiss) {
+void hl_fdcache_dentry_store(const char *key, const char *canon, int nmiss) {
     if (!key || !key[0] || !canon || nmiss < 0 || nmiss > 0xffff) return;
     size_t cl = strlen(canon);
     if (strlen(key) >= DC_KEYMAX || cl >= DC_KEYMAX) return; // over-length: bypass, re-resolved safely
