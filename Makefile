@@ -26,6 +26,7 @@ PERF_LIMIT_pipe := 250000 200000
 PERF_LIMIT_event := 250000 200000
 PERF_LIMIT_ipc-latency := 150000 120000
 PERF_LIMIT_ipc-throughput := 75000 60000
+PERF_LIMIT_translation := 40000 30000
 PERF_MAC_LIMIT_startup := 30000 25000
 PERF_MAC_LIMIT_compute := 750000 650000
 PERF_MAC_LIMIT_syscall-startup := 40000 30000
@@ -37,6 +38,7 @@ PERF_MAC_LIMIT_pipe := 300000 250000
 PERF_MAC_LIMIT_event := 350000 300000
 PERF_MAC_LIMIT_ipc-latency := 200000 150000
 PERF_MAC_LIMIT_ipc-throughput := 100000 80000
+PERF_MAC_LIMIT_translation := 50000 40000
 SANITIZE_BUILD ?= build/sanitize
 PERF_MAC_OS = $(shell $(MAC) uname -s)
 PERF_MAC_RELEASE = $(shell $(MAC) uname -r)
@@ -1810,6 +1812,14 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -O2 -static-pie $< -o $@
 
+$(BUILD)/perf/translate-aarch64: tests/perf/translate.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -O2 -static-pie -std=c11 $< -o $@
+
+$(BUILD)/perf/translate-x86_64: tests/perf/translate.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -O2 -static-pie -std=c11 $< -o $@
+
 PERF_OPS := mmap file pipe event ipc-latency ipc-throughput
 PERF_OP_mmap := 1
 PERF_OP_file := 2
@@ -1867,6 +1877,7 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(BUILD)/compat/syscall/x86_64/gettid $(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
 	$(BUILD)/compat/process/aarch64/forkstorm \
 	$(BUILD)/compat/process/x86_64/forkstorm \
+	$(BUILD)/perf/translate-aarch64 $(BUILD)/perf/translate-x86_64 \
 	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64) \
 	$(BUILD)/perf/resource-aarch64 $(BUILD)/perf/resource-x86_64
 	$(call HL_PERF_ENGINE,startup,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/e2e/guest-exit-aarch64,42)
@@ -1879,6 +1890,8 @@ perf-macos: compat-engines $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aa
 	$(call HL_PERF_ENGINE,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
 	$(call HL_PERF_ENGINE,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
 	$(call HL_PERF_ENGINE,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
+	$(call HL_PERF_ENGINE,translation,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-aarch64,0)
+	$(call HL_PERF_ENGINE,translation,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-x86_64,0)
 	$(call HL_PERF_ENGINE,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
 	$(call HL_PERF_ENGINE,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
 	$(call HL_PERF_ENGINE,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
@@ -1901,6 +1914,7 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/compat/core/workload/aarch64/busyloop $(BUILD)/compat/core/workload/x86_64/busyloop \
 	$(BUILD)/compat/syscall/aarch64/gettid $(BUILD)/compat/syscall/x86_64/gettid \
 	$(BUILD)/perf/syscall-aarch64 $(BUILD)/perf/syscall-x86_64 \
+	$(BUILD)/perf/translate-aarch64 $(BUILD)/perf/translate-x86_64 \
 	$(BUILD)/compat/process/aarch64/forkstorm $(BUILD)/compat/process/x86_64/forkstorm \
 	$(foreach operation,$(PERF_OPS),$(BUILD)/perf/$(operation)-aarch64 $(BUILD)/perf/$(operation)-x86_64) \
 	$(BUILD)/perf/resource-aarch64 $(BUILD)/perf/resource-x86_64
@@ -1914,6 +1928,8 @@ perf-linux: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(call HL_PERF_LINUX,syscall-1m,x86_64,$(PERF_WARMUPS),$(PERF_HEAVY_SAMPLES),$(BUILD)/perf/syscall-x86_64,0)
 	$(call HL_PERF_LINUX,fork-stress,aarch64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/aarch64/forkstorm,0)
 	$(call HL_PERF_LINUX,fork-stress,x86_64,1,$(PERF_HEAVY_SAMPLES),$(BUILD)/compat/process/x86_64/forkstorm,0)
+	$(call HL_PERF_LINUX,translation,aarch64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-aarch64,0)
+	$(call HL_PERF_LINUX,translation,x86_64,$(PERF_WARMUPS),$(PERF_SAMPLES),$(BUILD)/perf/translate-x86_64,0)
 	$(call HL_PERF_LINUX,mmap,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/mmap-aarch64,0)
 	$(call HL_PERF_LINUX,file,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/file-aarch64,0)
 	$(call HL_PERF_LINUX,pipe,aarch64,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/pipe-aarch64,0)
