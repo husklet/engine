@@ -92,6 +92,33 @@ static void chroot_strip(char *guest, size_t n) {
 
 #include "namespace.h"
 
+/*
+ * realpath(3) requires a PATH_MAX-sized destination when the caller supplies
+ * storage.  Several namespace records deliberately use smaller bounded path
+ * fields, so passing those fields directly is undefined and is rejected by
+ * fortified libc builds.  Canonicalize into libc-owned storage, then perform
+ * an explicit capacity check before publishing the result.
+ */
+static int canonicalize_path(const char *path, char *destination, size_t capacity) {
+    char *canonical;
+    size_t size;
+    if (path == NULL || destination == NULL || capacity == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    canonical = realpath(path, NULL);
+    if (canonical == NULL) return -1;
+    size = strlen(canonical) + 1;
+    if (size > capacity) {
+        free(canonical);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(destination, canonical, size);
+    free(canonical);
+    return 0;
+}
+
 // realpath(g_rootfs) -- the true rootfs boundary
 static char g_rootfs_canon[4200];
 static size_t g_rootfs_canon_len;
@@ -1229,7 +1256,7 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     v->glen = strlen(v->guest);
     while (v->glen > 1 && v->guest[v->glen - 1] == '/')
         v->guest[--v->glen] = 0;
-    if (!realpath(col + 1, v->hcanon)) return;
+    if (canonicalize_path(col + 1, v->hcanon, sizeof v->hcanon) != 0) return;
     v->hlen = strlen(v->hcanon);
     struct stat hst;
     if (stat(v->hcanon, &hst) == 0 && !S_ISDIR(hst.st_mode)) {
@@ -1274,7 +1301,7 @@ static int rt_add_vol(const char *guest, const char *hostsrc, int ro) {
     v->glen = strlen(v->guest);
     while (v->glen > 1 && v->guest[v->glen - 1] == '/')
         v->guest[--v->glen] = 0;
-    if (!realpath(hostsrc, v->hcanon)) {
+    if (canonicalize_path(hostsrc, v->hcanon, sizeof v->hcanon) != 0) {
         int e = errno;
         return e ? -e : -ENOENT;
     }

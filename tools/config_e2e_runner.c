@@ -28,9 +28,11 @@ static int write_full(int fd, const void *buffer, size_t size) {
 }
 
 static int make_config(const char *path, const char *guest) {
+    static const char volume[] = "/tmp:/tmp";
     hl_launch_config config;
     size_t guest_size = strlen(guest) + 1;
-    size_t pool_size = 1 + guest_size + 1;
+    size_t volume_size = sizeof volume;
+    size_t pool_size = 1 + guest_size + 1 + volume_size;
     char *pool = calloc(pool_size, 1);
     int fd;
     int result = -1;
@@ -44,6 +46,8 @@ static int make_config(const char *path, const char *guest) {
     config.gid = -1;
     config.arguments_offset = 1;
     memcpy(pool + 1, guest, guest_size);
+    config.volumes_offset = (uint32_t)(1 + guest_size + 1);
+    memcpy(pool + config.volumes_offset, volume, volume_size);
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) goto done;
     if (write_full(fd, &config, sizeof config) == 0 && write_full(fd, pool, pool_size) == 0) result = 0;

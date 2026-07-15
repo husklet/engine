@@ -28,8 +28,10 @@ static int g_nlower = 0;
 // register a read-only lower layer (image layer)
 static void add_lower(const char *dir) {
     if (g_nlower >= 8 || !dir || !dir[0]) return;
-    if (!realpath(dir, g_lower[g_nlower].canon))
-        snprintf(g_lower[g_nlower].canon, sizeof g_lower[g_nlower].canon, "%s", dir);
+    if (canonicalize_path(dir, g_lower[g_nlower].canon, sizeof g_lower[g_nlower].canon) != 0 &&
+        snprintf(g_lower[g_nlower].canon, sizeof g_lower[g_nlower].canon, "%s", dir) >=
+            (int)sizeof g_lower[g_nlower].canon)
+        return;
     g_lower[g_nlower].clen = strlen(g_lower[g_nlower].canon);
     g_nlower++;
 }
