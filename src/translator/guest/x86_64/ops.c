@@ -1,5 +1,4 @@
 // translator/guest/x86_64/ops.c -- remaining x86-only block-exit helpers used by the production dispatcher.
-#include <math.h> // unity consumers in avx.c use isnan
 #include "x87state.h"
 
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------

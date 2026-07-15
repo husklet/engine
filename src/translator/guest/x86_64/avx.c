@@ -1,3 +1,5 @@
+#include <math.h>
+
 // translator/guest/x86_64/avx.c -- AVX/AVX2/AVX-512 (VEX/EVEX) emulation.
 //
 // The decoder (decode.c) recognises C5/C4/62-prefixed instructions and the translator exits the block to C
