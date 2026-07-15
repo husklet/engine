@@ -633,6 +633,22 @@ $(BUILD)/e2e/guest-exit70-x86_64: tests/e2e/guest_exit.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=70 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/guest-exit139-aarch64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-exit139-x86_64: tests/e2e/guest_exit.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -DHL_GUEST_EXIT_STATUS=139 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-fault-aarch64: tests/e2e/guest_fault.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
+$(BUILD)/e2e/guest-fault-x86_64: tests/e2e/guest_fault.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
+
 $(BUILD)/e2e/guest-output-aarch64: tests/e2e/guest_output.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_CC) -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
@@ -1093,10 +1109,16 @@ $(BUILD)/tools/lifecycle-linux-x86_64: $(BUILD)/linux-production/lifecycle/x86_6
 .PHONY: test-linux-lifecycle
 test-linux-lifecycle: $(BUILD)/tools/lifecycle-linux-aarch64 $(BUILD)/tools/lifecycle-linux-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-exit139-aarch64 $(BUILD)/e2e/guest-exit139-x86_64 \
+	$(BUILD)/e2e/guest-fault-aarch64 $(BUILD)/e2e/guest-fault-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64
 	$(BUILD)/tools/lifecycle-linux-aarch64 $(abspath $(BUILD)/e2e/guest-exit-aarch64); test $$? -eq 42
 	$(BUILD)/tools/lifecycle-linux-x86_64 $(abspath $(BUILD)/e2e/guest-exit-x86_64); test $$? -eq 42
+	$(BUILD)/tools/lifecycle-linux-aarch64 --expect-exit 139 $(abspath $(BUILD)/e2e/guest-exit139-aarch64)
+	$(BUILD)/tools/lifecycle-linux-x86_64 --expect-exit 139 $(abspath $(BUILD)/e2e/guest-exit139-x86_64)
+	$(BUILD)/tools/lifecycle-linux-aarch64 --expect-signal 11 $(abspath $(BUILD)/e2e/guest-fault-aarch64)
+	$(BUILD)/tools/lifecycle-linux-x86_64 --expect-signal 11 $(abspath $(BUILD)/e2e/guest-fault-x86_64)
 	$(BUILD)/tools/lifecycle-linux-aarch64 --clock-spy $(abspath $(BUILD)/e2e/clock-injected-aarch64)
 	$(BUILD)/tools/lifecycle-linux-x86_64 --clock-spy $(abspath $(BUILD)/e2e/clock-injected-x86_64)
 	$(BUILD)/tools/lifecycle-linux-aarch64 --force-stop $(abspath $(BUILD)/e2e/guest-spin-aarch64)
@@ -1509,6 +1531,8 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 \
+	$(BUILD)/e2e/guest-exit139-aarch64 $(BUILD)/e2e/guest-exit139-x86_64 \
+	$(BUILD)/e2e/guest-fault-aarch64 $(BUILD)/e2e/guest-fault-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
@@ -1528,6 +1552,14 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-exit 139 \
+		$(abspath $(BUILD)/e2e/guest-exit139-aarch64)
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-exit 139 \
+		$(abspath $(BUILD)/e2e/guest-exit139-x86_64)
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-signal 11 \
+		$(abspath $(BUILD)/e2e/guest-fault-aarch64)
+	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-signal 11 \
+		$(abspath $(BUILD)/e2e/guest-fault-x86_64)
 	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --clock-spy \
 		$(abspath $(BUILD)/e2e/clock-injected-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --clock-spy \

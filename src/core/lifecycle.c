@@ -25,10 +25,24 @@ static hl_engine_child_result *active_result;
 static int result_published;
 
 void hl_engine_child_result_publish(int32_t guest_status, hl_status engine_status, uint64_t detail) {
-    hl_engine_child_result record = {0, HL_ENGINE_CHILD_RESULT_VERSION, guest_status, engine_status, detail};
+    hl_engine_child_result record = {0, HL_ENGINE_CHILD_RESULT_VERSION, guest_status, engine_status,
+                                     HL_ENGINE_CHILD_RESULT_EXIT, 0, detail};
     if (result_published || active_result == NULL) return;
     result_published = 1;
     memcpy(active_result, &record, sizeof(record));
+    atomic_store_explicit((_Atomic uint32_t *)&active_result->magic, HL_ENGINE_CHILD_RESULT_MAGIC,
+                          memory_order_release);
+}
+
+void hl_engine_child_result_publish_signal(int32_t guest_signal) {
+    if (result_published || active_result == NULL) return;
+    result_published = 1;
+    active_result->version = HL_ENGINE_CHILD_RESULT_VERSION;
+    active_result->guest_status = guest_signal;
+    active_result->engine_status = HL_STATUS_OK;
+    active_result->kind = HL_ENGINE_CHILD_RESULT_SIGNAL;
+    active_result->reserved = 0;
+    active_result->detail = 0;
     atomic_store_explicit((_Atomic uint32_t *)&active_result->magic, HL_ENGINE_CHILD_RESULT_MAGIC,
                           memory_order_release);
 }
@@ -154,7 +168,17 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
         result->detail = record.detail;
         return (hl_status)record.engine_status;
     }
-    if ((uint32_t)record.guest_status > 255u || waited->value != (uint32_t)record.guest_status) {
+    if (record.kind == HL_ENGINE_CHILD_RESULT_SIGNAL) {
+        if (record.guest_status < 1 || record.guest_status > 64 ||
+            waited->value != (uint32_t)(128 + record.guest_status))
+            return HL_STATUS_CORRUPT;
+        result->kind = HL_ENGINE_EXIT_SIGNAL;
+        result->guest_status = record.guest_status;
+        result->detail = 0;
+        return HL_STATUS_OK;
+    }
+    if (record.kind != HL_ENGINE_CHILD_RESULT_EXIT || (uint32_t)record.guest_status > 255u ||
+        waited->value != (uint32_t)record.guest_status) {
         fprintf(stderr, "hl-engine: child result mismatch guest=%d wait=%llu engine=%d\n", record.guest_status,
                 (unsigned long long)waited->value, record.engine_status);
         return HL_STATUS_CORRUPT;

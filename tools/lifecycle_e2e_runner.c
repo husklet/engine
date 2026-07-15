@@ -17,6 +17,7 @@ typedef hl_host_macos lifecycle_host;
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <sched.h>
 #include <string.h>
@@ -112,9 +113,12 @@ int main(int argc, char **argv) {
     int force_stop = argc > 1 && strcmp(argv[1], "--force-stop") == 0;
     int fail_code_publish = argc > 1 && strcmp(argv[1], "--fail-publish") == 0;
     int bad_result = argc > 1 && strncmp(argv[1], "--result-", 9) == 0;
+    int expect_exit = argc > 2 && strcmp(argv[1], "--expect-exit") == 0 ? atoi(argv[2]) : -1;
+    int expect_signal = argc > 2 && strcmp(argv[1], "--expect-signal") == 0 ? atoi(argv[2]) : -1;
     int guest_index = 1;
     injected_clock = argc > 1 && strcmp(argv[1], "--clock-spy") == 0;
     if (injected_clock || fail_code_publish || bad_result) guest_index = 2;
+    if (expect_exit >= 0 || expect_signal >= 0) guest_index = 3;
     if (argc < 2) {
         fprintf(stderr, "usage: lifecycle-e2e-runner GUEST [args...]\n");
         return 64;
@@ -196,6 +200,13 @@ int main(int argc, char **argv) {
     (void)munmap(clock_calls, 2 * sizeof(*clock_calls));
     if (force_stop)
         return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == 9 ? 0 : 75;
+    if (expect_exit >= 0)
+        return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == expect_exit ? 0
+                                                                                                                  : 84;
+    if (expect_signal >= 0)
+        return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == expect_signal
+                   ? 0
+                   : 85;
     if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE) {
         fprintf(stderr, "lifecycle: status=%d kind=%u guest=%d detail=%llu\n", status, result.kind,
                 result.guest_status, (unsigned long long)result.detail);

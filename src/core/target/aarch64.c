@@ -50,6 +50,7 @@
 #include "native.h"
 #include "services.h"
 #include "../bus.h"
+#include "../engine_result.h"
 #include "../../linux_abi/bus.h"
 #include "../../host/range.h"
 

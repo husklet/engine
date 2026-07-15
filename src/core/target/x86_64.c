@@ -67,6 +67,7 @@
 #include "native.h"
 #include "services.h"
 #include "../bus.h"
+#include "../engine_result.h"
 #include "../../linux_abi/bus.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */

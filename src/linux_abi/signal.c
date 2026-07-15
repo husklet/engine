@@ -790,6 +790,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
     }
+    hl_engine_child_result_publish_signal(sig);
     _exit(128 + sig);
 }
 

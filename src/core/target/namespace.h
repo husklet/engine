@@ -27,6 +27,7 @@
 #define hl_target_runtime_init HL_TARGET_LOCAL(target_runtime_init)
 #define hl_engine_child_result_after_fork HL_TARGET_LOCAL(engine_child_result_after_fork)
 #define hl_engine_child_result_publish HL_TARGET_LOCAL(engine_child_result_publish)
+#define hl_engine_child_result_publish_signal HL_TARGET_LOCAL(engine_child_result_publish_signal)
 
 #define hl_linux_bus_active HL_TARGET_LOCAL(linux_bus_active)
 #define hl_linux_bus_fault HL_TARGET_LOCAL(linux_bus_fault)
