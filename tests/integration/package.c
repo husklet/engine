@@ -21,7 +21,7 @@ int main(void) {
     package_host *host = NULL;
     hl_host_services services = {0};
 
-    if (hl_engine_abi() != HL_ENGINE_ABI || strcmp(hl_engine_version(), "0.1.1") != 0) {
+    if (hl_engine_abi() != HL_ENGINE_ABI || strcmp(hl_engine_version(), "0.1.2") != 0) {
         return 1;
     }
     if (package_host_create(&host, &services) != HL_STATUS_OK || host == NULL) {

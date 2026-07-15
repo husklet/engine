@@ -19,6 +19,15 @@
 static int recv_peer_pid(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) return 0;
+    // Linux decides whether to attach SCM_CREDENTIALS when the record is queued. Enable credential
+    // delivery before the sender can run; doing this after fork races a fast child and legitimately
+    // produces a record without credentials.
+    int on = 1;
+    if (setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) < 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return 0;
+    }
     pid_t pid = fork();
     if (pid == 0) {
         close(sv[0]);
@@ -29,8 +38,6 @@ static int recv_peer_pid(void) {
         sendmsg(sv[1], &mh, 0);
         _exit(0);
     }
-    int on = 1;
-    setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
     char data[8] = {0};
     char cbuf[CMSG_SPACE(sizeof(struct ucred))];
     memset(cbuf, 0, sizeof cbuf);
