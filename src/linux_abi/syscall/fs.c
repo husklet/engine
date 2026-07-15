@@ -1371,6 +1371,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // covering the source / destination directory. Queue them now (before the move) so a watch's read()
         // can pair them -- the snapshot diff cannot. No-op when nothing watches either directory.
         inotify_notify_move((int)a0, (const char *)a1, (int)a2, (const char *)a3);
+        bound_inotify_notify_move((int)a0, (const char *)a1, (int)a2, (const char *)a3);
         unsigned int rxflags = 0;
         if (nr == 276) {
             int lf = (int)a4;

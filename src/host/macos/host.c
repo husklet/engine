@@ -2623,14 +2623,23 @@ static uint32_t hl_macos_directory_native(uint32_t interests) {
     return flags == 0 ? NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_ATTRIB | NOTE_EXTEND | NOTE_LINK : flags;
 }
 
+static void hl_macos_directory_descriptor_close(int descriptor) {
+    hl_host_process_fd_private_remove(descriptor);
+    close(descriptor);
+}
+
 static hl_host_result hl_macos_directory_add(void *context, hl_host_handle instance, hl_host_handle file,
                                              uint64_t token, uint32_t interests) {
     hl_host_macos *host = context;
     hl_macos_directory_object *object = hl_macos_directory_object_get(host, instance);
     pthread_mutex_lock(&host->lock);
     hl_macos_file *file_entry = hl_macos_file_lookup(host, file);
-    int descriptor = file_entry == NULL ? -1 : file_entry->descriptor;
+    int descriptor = file_entry == NULL ? -1 : fcntl(file_entry->descriptor, F_DUPFD_CLOEXEC, 0);
     pthread_mutex_unlock(&host->lock);
+    if (descriptor >= 0 && hl_host_process_fd_private_add(descriptor) != 0) {
+        close(descriptor);
+        descriptor = -1;
+    }
     if (object == NULL || descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     for (uint32_t index = 0; index < object->watch_capacity; ++index) {
         hl_macos_directory_watch *watch = &object->watches[index];
@@ -2641,14 +2650,21 @@ static hl_host_result hl_macos_directory_add(void *context, hl_host_handle insta
                 (uint16_t)(EV_ADD | EV_CLEAR | ((interests & HL_HOST_DIRECTORY_ONESHOT) != 0 ? EV_ONESHOT : 0));
             EV_SET(&change, descriptor, EVFILT_VNODE, flags, hl_macos_directory_native(interests), 0,
                    (void *)(uintptr_t)token);
-            if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0) return hl_macos_errno();
+            if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0) {
+                hl_macos_directory_descriptor_close(descriptor);
+                return hl_macos_errno();
+            }
+            if (watch->active) hl_macos_directory_descriptor_close(watch->descriptor);
             *watch = (hl_macos_directory_watch){token, interests, descriptor, 1};
             return hl_macos_result(HL_STATUS_OK, 0, 0);
         }
     }
     uint32_t capacity = object->watch_capacity == 0 ? HL_MACOS_DIRECTORY_WATCH_CAPACITY : object->watch_capacity * 2u;
     hl_macos_directory_watch *grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
-    if (grown == NULL) return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    if (grown == NULL) {
+        hl_macos_directory_descriptor_close(descriptor);
+        return hl_macos_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    }
     memset(grown + object->watch_capacity, 0, (size_t)(capacity - object->watch_capacity) * sizeof(*grown));
     uint32_t index = object->watch_capacity;
     object->watches = grown;
@@ -2656,7 +2672,10 @@ static hl_host_result hl_macos_directory_add(void *context, hl_host_handle insta
     struct kevent change;
     uint16_t flags = (uint16_t)(EV_ADD | EV_CLEAR | ((interests & HL_HOST_DIRECTORY_ONESHOT) != 0 ? EV_ONESHOT : 0));
     EV_SET(&change, descriptor, EVFILT_VNODE, flags, hl_macos_directory_native(interests), 0, (void *)(uintptr_t)token);
-    if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0) return hl_macos_errno();
+    if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0) {
+        hl_macos_directory_descriptor_close(descriptor);
+        return hl_macos_errno();
+    }
     object->watches[index] = (hl_macos_directory_watch){token, interests, descriptor, 1};
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
@@ -2690,6 +2709,8 @@ static hl_host_result hl_macos_directory_remove(void *context, hl_host_handle in
         EV_SET(&change, watch->descriptor, EVFILT_VNODE, EV_DELETE, 0, 0, NULL);
         if (kevent(object->descriptor, &change, 1, NULL, 0, NULL) != 0 && errno != ENOENT) return hl_macos_errno();
         watch->active = 0;
+        hl_macos_directory_descriptor_close(watch->descriptor);
+        watch->descriptor = -1;
         return hl_macos_result(HL_STATUS_OK, 0, 0);
     }
     return hl_macos_result(HL_STATUS_NOT_FOUND, 0, 0);
@@ -2723,6 +2744,8 @@ static hl_host_result hl_macos_directory_read(void *context, hl_host_handle inst
             if (watch->active && watch->token == token) interests = watch->interests;
             if (watch->active && watch->token == token && (watch->interests & HL_HOST_DIRECTORY_ONESHOT) != 0) {
                 watch->active = 0;
+                hl_macos_directory_descriptor_close(watch->descriptor);
+                watch->descriptor = -1;
                 interests |= HL_HOST_DIRECTORY_IGNORED;
             }
         }
@@ -2758,6 +2781,8 @@ static hl_host_result hl_macos_directory_close(void *context, hl_host_handle ins
     if (final) {
         hl_host_process_fd_private_remove(object->descriptor);
         close(object->descriptor);
+        for (uint32_t index = 0; index < object->watch_capacity; ++index)
+            if (object->watches[index].active) hl_macos_directory_descriptor_close(object->watches[index].descriptor);
         free(object->watches);
         free(object);
     }

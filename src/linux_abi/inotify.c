@@ -49,7 +49,11 @@ static void mutation_end(inotify_object *object) {
 static int64_t inotify_error(hl_status status) {
     switch (status) {
     case HL_STATUS_OK: return 0;
-    case HL_STATUS_NOT_FOUND: return -HL_LINUX_EINVAL;
+    case HL_STATUS_NOT_FOUND: return -HL_LINUX_ENOENT;
+    case HL_STATUS_NOT_DIRECTORY: return -HL_LINUX_ENOTDIR;
+    case HL_STATUS_NAME_TOO_LONG: return -HL_LINUX_ENAMETOOLONG;
+    case HL_STATUS_PERMISSION_DENIED: return -HL_LINUX_EACCES;
+    case HL_STATUS_IO: return -HL_LINUX_EIO;
     case HL_STATUS_ALREADY_EXISTS: return -HL_LINUX_EEXIST;
     case HL_STATUS_OUT_OF_MEMORY: return -HL_LINUX_ENOMEM;
     case HL_STATUS_INTERRUPTED: return -HL_LINUX_EINTR;

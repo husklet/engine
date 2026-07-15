@@ -484,6 +484,7 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
 // affinity_mask for proc; svc_adjtimex/pidfd_*/mq_* for rare) defined just above, so they must be
 // included AFTER them.
 #include "../watch.h"
+#include "inotify.c"
 #include "fs.c"
 static void bound_mapping_reset(void);
 static size_t bound_mapping_watch_capacity(void);

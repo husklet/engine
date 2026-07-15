@@ -103,7 +103,6 @@ typedef struct hl_linux_counter_subscription {
 
 typedef struct hl_linux_directory_watch {
     int watch;
-    int descriptor;
     uint64_t token;
     uint32_t interests;
     uint32_t active;
@@ -2043,7 +2042,6 @@ static hl_host_result hl_linux_directory_create(void *context) {
     }
     for (index = 0; index < object->watch_capacity; ++index) {
         object->watches[index].watch = -1;
-        object->watches[index].descriptor = -1;
     }
     result = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_DIRECTORY, descriptor, object, NULL, 0, -1);
     if (result.status != HL_STATUS_OK) {
@@ -2062,7 +2060,6 @@ static hl_host_result hl_linux_directory_add(void *context, hl_host_handle insta
     hl_linux_directory_watch *slot = NULL;
     char path[64];
     int file_descriptor;
-    int retained;
     int watch;
     uint32_t index;
     uint32_t valid = UINT32_C(0x8000007f);
@@ -2085,7 +2082,6 @@ static hl_host_result hl_linux_directory_add(void *context, hl_host_handle insta
                 for (index = object->watch_capacity; index < capacity; ++index) {
                     grown[index] = (hl_linux_directory_watch){0};
                     grown[index].watch = -1;
-                    grown[index].descriptor = -1;
                 }
                 slot = &grown[object->watch_capacity];
                 object->watches = grown;
@@ -2093,21 +2089,16 @@ static hl_host_result hl_linux_directory_add(void *context, hl_host_handle insta
             }
         }
     }
-    retained = file_descriptor < 0 ? -1 : fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
-    if (instance_entry == NULL || slot == NULL || retained < 0) {
+    if (instance_entry == NULL || slot == NULL || file_descriptor < 0) {
         pthread_mutex_unlock(&host->lock);
-        if (retained >= 0) close(retained);
         return hl_linux_result(slot == NULL && object != NULL ? HL_STATUS_RESOURCE_LIMIT : HL_STATUS_INVALID_ARGUMENT,
                                0, 0);
     }
-    snprintf(path, sizeof(path), "/proc/self/fd/%d", retained);
-    watch = inotify_add_watch(instance_entry->descriptor, path, hl_linux_directory_mask(interests));
-    if (watch >= 0) *slot = (hl_linux_directory_watch){watch, retained, token, interests, 1};
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", file_descriptor);
+    watch = inotify_add_watch(instance_entry->descriptor, path, hl_linux_directory_mask(UINT32_C(0x7f)));
+    if (watch >= 0) *slot = (hl_linux_directory_watch){watch, token, interests, 1};
     pthread_mutex_unlock(&host->lock);
-    if (watch < 0) {
-        close(retained);
-        return hl_linux_errno_result();
-    }
+    if (watch < 0) return hl_linux_errno_result();
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -2117,8 +2108,6 @@ static hl_host_result hl_linux_directory_modify(void *context, hl_host_handle in
     hl_linux_handle_entry *entry;
     hl_linux_directory_object *object;
     hl_linux_directory_watch *slot;
-    char path[64];
-    int watch;
     uint32_t valid = UINT32_C(0x8000007f);
     if (token == 0 || (interests & ~valid) != 0 || (interests & ~HL_HOST_DIRECTORY_ONESHOT) == 0)
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -2130,14 +2119,9 @@ static hl_host_result hl_linux_directory_modify(void *context, hl_host_handle in
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_NOT_FOUND, 0, 0);
     }
-    snprintf(path, sizeof(path), "/proc/self/fd/%d", slot->descriptor);
-    watch = inotify_add_watch(entry->descriptor, path, hl_linux_directory_mask(interests));
-    if (watch >= 0) {
-        slot->watch = watch;
-        slot->interests = interests;
-    }
+    slot->interests = interests;
     pthread_mutex_unlock(&host->lock);
-    return watch >= 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
 static hl_host_result hl_linux_directory_remove(void *context, hl_host_handle instance, uint64_t token) {
@@ -2155,8 +2139,6 @@ static hl_host_result hl_linux_directory_remove(void *context, hl_host_handle in
         return hl_linux_result(HL_STATUS_NOT_FOUND, 0, 0);
     }
     result = inotify_rm_watch(entry->descriptor, slot->watch);
-    close(slot->descriptor);
-    slot->descriptor = -1;
     slot->active = 0;
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
@@ -2214,13 +2196,14 @@ static hl_host_result hl_linux_directory_read(void *context, hl_host_handle inst
             hl_linux_directory_watch *watch = hl_linux_directory_watch_for_id(object, event->wd);
             uint64_t token = watch == NULL ? 0 : watch->token;
             uint32_t changes = hl_linux_directory_changes(event->mask);
+            if (watch != NULL)
+                changes = (changes & watch->interests) | (changes & HL_HOST_DIRECTORY_IGNORED);
             if (changes != 0 && hl_linux_directory_append(object, (hl_host_directory_record){token, changes, 0}) != 0) {
                 pthread_mutex_unlock(&host->lock);
                 return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
             }
             if ((event->mask & IN_IGNORED) != 0 && watch != NULL) {
-                close(watch->descriptor);
-                *watch = (hl_linux_directory_watch){-1, -1, 0, 0, 0};
+                *watch = (hl_linux_directory_watch){-1, 0, 0, 0};
             }
             offset += sizeof(*event) + event->len;
         }
@@ -2262,7 +2245,6 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
     hl_linux_handle_entry *entry;
     hl_linux_directory_object *object;
     int descriptor;
-    uint32_t index;
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, instance, HL_LINUX_HANDLE_DIRECTORY);
     if (entry == NULL) {
@@ -2275,8 +2257,6 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
     entry->descriptor = -1;
     entry->address = NULL;
     if (--object->references == 0) {
-        for (index = 0; index < object->watch_capacity; ++index)
-            if (object->watches[index].descriptor >= 0) close(object->watches[index].descriptor);
         free(object->pending);
         free(object->watches);
         free(object);
@@ -3762,9 +3742,6 @@ void hl_host_linux_destroy(hl_host_linux *host) {
             hl_linux_directory_object *object = entry->address;
             close(entry->descriptor);
             if (--object->references == 0) {
-                uint32_t watch;
-                for (watch = 0; watch < object->watch_capacity; ++watch)
-                    if (object->watches[watch].descriptor >= 0) close(object->watches[watch].descriptor);
                 free(object->pending);
                 free(object->watches);
                 free(object);

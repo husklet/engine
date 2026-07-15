@@ -5,7 +5,6 @@
 typedef struct bound_inotify_watch {
     uint64_t token;
     uint32_t mask;
-    hl_host_handle file;
     char *path;
     char *snapshot;
     uint8_t directory;
@@ -98,27 +97,41 @@ static hl_status bound_provider_add(void *opaque, const char *path, size_t path_
     bound_inotify_provider *provider = opaque;
     bound_inotify_watch *grown;
     bound_inotify_watch *watch;
+    hl_host_file_metadata metadata;
+    hl_host_result probe;
+    hl_host_result inspected;
+    hl_host_result closed;
     hl_host_result opened;
     hl_host_result added;
-    struct stat status;
     char *saved;
+    int is_directory;
     if (path_size > SIZE_MAX - 1u) return HL_STATUS_NAME_TOO_LONG;
     saved = malloc(path_size + 1u);
     if (saved == NULL) return HL_STATUS_OUT_OF_MEMORY;
     memcpy(saved, path, path_size);
     saved[path_size] = 0;
-    memset(&status, 0, sizeof(status));
-    if (stat(saved, &status) != 0) {
+    probe = provider->host->file->open_relative(provider->host->context, HL_HOST_HANDLE_CWD, path, path_size,
+                                                HL_HOST_FILE_PATH_ONLY, 0, 0);
+    if (probe.status != HL_STATUS_OK) {
         free(saved);
-        return HL_STATUS_NOT_FOUND;
+        return (hl_status)probe.status;
     }
-    if ((mask & HL_LINUX_IN_ONLYDIR) != 0 && !S_ISDIR(status.st_mode)) {
+    memset(&metadata, 0, sizeof(metadata));
+    inspected = provider->host->file->metadata(provider->host->context, probe.value, &metadata);
+    closed = provider->host->file->close(provider->host->context, probe.value);
+    if (inspected.status != HL_STATUS_OK || closed.status != HL_STATUS_OK) {
+        hl_status status = (hl_status)(inspected.status != HL_STATUS_OK ? inspected.status : closed.status);
+        free(saved);
+        return status;
+    }
+    is_directory = metadata.type == HL_HOST_FILE_TYPE_DIRECTORY;
+    if ((mask & HL_LINUX_IN_ONLYDIR) != 0 && !is_directory) {
         free(saved);
         return HL_STATUS_NOT_DIRECTORY;
     }
     opened = provider->host->file->open_relative(
         provider->host->context, HL_HOST_HANDLE_CWD, path, path_size,
-        HL_HOST_FILE_READ | (S_ISDIR(status.st_mode) ? HL_HOST_FILE_DIRECTORY : 0u), 0, 0);
+        HL_HOST_FILE_READ | (is_directory ? HL_HOST_FILE_DIRECTORY : 0u), 0, 0);
     if (opened.status != HL_STATUS_OK) {
         free(saved);
         return (hl_status)opened.status;
@@ -135,18 +148,24 @@ static hl_status bound_provider_add(void *opaque, const char *path, size_t path_
         provider->watch_capacity = capacity;
     }
     watch = &provider->watches[provider->watch_count];
-    *watch = (bound_inotify_watch){token, mask, opened.value, saved, NULL, 0};
-    if (S_ISDIR(status.st_mode)) {
+    *watch = (bound_inotify_watch){token, mask, saved, NULL, 0};
+    if (is_directory) {
         watch->directory = 1;
         watch->snapshot = dir_snapshot(saved);
     }
     added = provider->host->directory->add(provider->host->context, provider->directory, opened.value, token,
                                            bound_inotify_interests(mask));
+    closed = provider->host->file->close(provider->host->context, opened.value);
     if (added.status != HL_STATUS_OK) {
-        (void)provider->host->file->close(provider->host->context, opened.value);
         free(watch->snapshot);
         free(saved);
         return (hl_status)added.status;
+    }
+    if (closed.status != HL_STATUS_OK) {
+        (void)provider->host->directory->remove(provider->host->context, provider->directory, token);
+        free(watch->snapshot);
+        free(saved);
+        return (hl_status)closed.status;
     }
     provider->watch_count++;
     return HL_STATUS_OK;
@@ -172,7 +191,6 @@ static hl_status bound_provider_remove(void *opaque, uint64_t token) {
     result = provider->host->directory->remove(provider->host->context, provider->directory, token);
     if (result.status != HL_STATUS_OK && result.status != HL_STATUS_NOT_FOUND) return (hl_status)result.status;
     index = (uint32_t)(watch - provider->watches);
-    (void)provider->host->file->close(provider->host->context, watch->file);
     free(watch->snapshot);
     free(watch->path);
     provider->watches[index] = provider->watches[--provider->watch_count];
@@ -364,7 +382,6 @@ static hl_status bound_provider_close(void *opaque) {
     uint32_t index;
     bound_inotify_registry_remove(provider);
     for (index = 0; index < provider->watch_count; ++index) {
-        (void)provider->host->file->close(provider->host->context, provider->watches[index].file);
         free(provider->watches[index].snapshot);
         free(provider->watches[index].path);
     }

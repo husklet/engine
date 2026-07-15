@@ -1644,6 +1644,35 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = bound_snapshot(a0, &source);
+    if (nr == 26 && g_linux_box != NULL) {
+        bound_inotify_provider *provider;
+        if ((a0 & ~(UINT64_C(0x800) | UINT64_C(0x80000))) != 0) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            return 1;
+        }
+        provider = bound_inotify_provider_create(g_host_services);
+        if (provider == NULL) {
+            G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
+            return 1;
+        }
+        result = hl_linux_inotify_create(g_linux_box, &bound_inotify_ops, provider,
+                                         (a0 & UINT64_C(0x80000)) != 0 ? HL_LINUX_FD_CLOEXEC : 0,
+                                         (a0 & UINT64_C(0x800)) != 0 ? HL_LINUX_O_NONBLOCK : 0);
+        G_RET(c) = (uint64_t)result;
+        return 1;
+    }
+    if (nr == 27 && source_bound) {
+        char path[4200];
+        const char *resolved = atpath(-100, (const char *)(uintptr_t)a1, path, sizeof(path), 0);
+        if (resolved == NULL) result = -errno;
+        else result = hl_linux_inotify_add(g_linux_box, source.fd, resolved, strlen(resolved), (uint32_t)a2);
+        G_RET(c) = (uint64_t)result;
+        return 1;
+    }
+    if (nr == 28 && source_bound) {
+        G_RET(c) = (uint64_t)hl_linux_inotify_remove(g_linux_box, source.fd, (int32_t)a1);
+        return 1;
+    }
     if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0 && host_range_mapped((uintptr_t)a1, 1) &&
         host_range_mapped((uintptr_t)a2, (size_t)a3)) {
         int guest_fd = procfd_num((const char *)(uintptr_t)a1);
