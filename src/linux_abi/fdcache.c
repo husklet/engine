@@ -150,7 +150,7 @@ static void fdcache_unlock(void) {
 // service.c on every FS-namespace mutation -- invalidates the whole cache; rc_reset() hard-clears
 // it in the fork child so a child never serves the parent's stale mappings.
 int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n);
-void rc_store(const char *g, const char *host);
+void hl_fdcache_resolution_store(const char *g, const char *host);
 void res_bump(void);
 void rc_reset(void);
 // ---- W4D openat resolution cache (forward decls; impl after the S2 rc_* cache it extends) ----
@@ -593,7 +593,7 @@ int hl_fdcache_resolution_lookup(const char *g, char *out, size_t n) {
     return hit;
 }
 
-void rc_store(const char *g, const char *host) {
+void hl_fdcache_resolution_store(const char *g, const char *host) {
     if (!g || g[0] != '/' || !host) return;
     // over-length paths simply bypass the cache (fixed-size slot) -> re-resolved every time, safely.
     size_t hl = strlen(host);

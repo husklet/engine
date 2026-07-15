@@ -51,7 +51,7 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
         if (!nofollow && g_rootfs && hl_fdcache_resolution_lookup(raw, buf, n)) return buf;
         if (g_nlower) {
             overlay_resolve(raw, buf, n, nofollow);
-            if (!nofollow && g_rootfs) rc_store(raw, buf);
+            if (!nofollow && g_rootfs) hl_fdcache_resolution_store(raw, buf);
             return buf;
             // overlay: search upper+lowers
         }
@@ -60,7 +60,7 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
                 xlate(raw, buf, n);
             else {
                 xresolve_exec(raw, buf, n);
-                rc_store(raw, buf);
+                hl_fdcache_resolution_store(raw, buf);
             }
             return buf;
         }
