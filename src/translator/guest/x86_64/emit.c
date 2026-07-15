@@ -1,9 +1,5 @@
 // translator/guest/x86_64 -- arm64 host emitters + NEON/SSE encoders (xmm->v0..15) + x87 FPU stack
 // (ST(i) at double precision) + prologue/spill/exits.
-#ifdef __APPLE__
-#include <mach/mach_time.h> // mach_timebase_info -- authoritative CNTVCT tick->ns on Apple Silicon
-#endif
-
 // ---------------- ARM64 instruction emitters ----------------
 // (the same-ISA-independent half: these emit HOST code, copied from jit.c +
 //  a few width-typed loads/stores the x86 front-end needs.)
@@ -854,6 +850,8 @@ static uint64_t g_yield_inline_count; // # sched_yield served inline
 
 static void s1_calibrate(void) {
     uint64_t freq;
+    hl_host_result effective_frequency;
+    const hl_host_services *host = effective_host_services();
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     if (!freq) {
         g_fastsys = 0; // no readable counter frequency -> safe fallback
@@ -862,39 +860,22 @@ static void s1_calibrate(void) {
     // Tick->ns scale (Q30) from cntfrq_el0. On a well-behaved host cntfrq_el0 IS the rate the guest's
     // inline fast path reads via `mrs cntvct_el0`, so this is exact and the fast path stays enabled.
     g_cal_mult = (uint64_t)(((unsigned __int128)1000000000ull << FAST_SHIFT) / freq);
-    // test hook: force the fast path ON with the cntfrq-only scale even on a host the mach cross-
-    // check below would reject. Lets the guarded-store / EFAULT / tz paths be exercised on a virtualized
-    // dev/CI host where the fast path is otherwise auto-disabled. NOT for production use.
-#ifdef __APPLE__
-    // guard against a host that virtualizes CNTVCT inconsistently. mach_timebase_info gives the
-    // AUTHORITATIVE tick->ns for the generic-timer counter mach_absolute_time reads (ns = ticks*numer/
-    // denom). If that disagrees with cntfrq_el0's implied scale beyond a small tolerance, the effective
-    // CNTVCT rate is decoupled from the advertised CNTFRQ_EL0 (observed here: cntfrq_el0 reports 1 GHz
-    // but the hardware counter runs at 24 MHz -- the mach-timebase ratio, ~41.67x). Worse, on such a
-    // host the rate is NOT even uniform across processes: the initial process reads the nominal 1 GHz
-    // counter while fork() children read the 24 MHz hardware counter (proven with a fork+clock_gettime
-    // probe). A single baked g_cal_mult cannot be correct for both, so the inline vDSO fast path is
-    // fundamentally unsound here. Disable it and fall back to the real clock_gettime/gettimeofday
-    // syscall, which the host converts per-process and is therefore always correct (the LTP time/mm
-    // cluster passes on the slow path). Cost: the vDSO fast path is off on such (typically virtualized)
-    // hosts; on real Apple Silicon cntfrq_el0 and mach_timebase agree, so the fast path stays enabled
-    // with zero overhead change.
-    mach_timebase_info_data_t tb = {0, 0};
-    if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer && tb.denom) {
-        uint64_t mach_mult = (uint64_t)(((unsigned __int128)tb.numer << FAST_SHIFT) / tb.denom);
-        // Relative disagreement between the two authoritative scales; >~1% => untrustworthy host.
-        uint64_t lo = mach_mult < g_cal_mult ? mach_mult : g_cal_mult;
-        uint64_t hi = mach_mult < g_cal_mult ? g_cal_mult : mach_mult;
-        if (mach_mult == 0 || hi > lo + lo / 100) {
-            // CNTVCT rate decoupled from cntfrq_el0 -> the inline time math is unsound (and not even
-            // uniform across fork children). Disable ONLY the time arms; the real clock_gettime/
-            // gettimeofday syscall is per-process-correct. W4F (rt_sigprocmask/sched_yield) is unaffected.
+    /* The host clock provider owns platform-specific counter calibration.  A
+     * mismatch means CNTVCT is virtualized independently from CNTFRQ, so one
+     * baked multiplier cannot remain correct across processes. */
+    effective_frequency = host->clock->architectural_counter_hz(host->context);
+    if (effective_frequency.status != HL_STATUS_OK || effective_frequency.value == 0) {
+        g_fastclk = 0;
+        return;
+    }
+    {
+        uint64_t lo = effective_frequency.value < freq ? effective_frequency.value : freq;
+        uint64_t hi = effective_frequency.value < freq ? freq : effective_frequency.value;
+        if (hi > lo + lo / 100) {
             g_fastclk = 0;
-            return; // skip the anchor sampling (unused when the time arms are off)
+            return;
         }
     }
-#endif
-anchor:;
     if (!g_cal_mult) {
         g_fastsys = 0; // implausible scale -> safe fallback to the real syscall path
         return;
@@ -902,8 +883,11 @@ anchor:;
     // Anchor CNTVCT against the host clocks in one tight instant (base_ticks <-> base_ns).
     struct timespec tm, tr;
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(g_cal_base_ticks));
-    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tm);
-    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_REALTIME, &tr);
+    if (hl_production_clock_gettime(host, HL_PRODUCTION_CLOCK_MONOTONIC, &tm) != 0 ||
+        hl_production_clock_gettime(host, HL_PRODUCTION_CLOCK_REALTIME, &tr) != 0) {
+        g_fastclk = 0;
+        return;
+    }
     g_cal_mono_ns = (uint64_t)tm.tv_sec * 1000000000ull + (uint64_t)tm.tv_nsec;
     g_cal_real_ns = (uint64_t)tr.tv_sec * 1000000000ull + (uint64_t)tr.tv_nsec;
 }

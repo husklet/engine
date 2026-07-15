@@ -988,6 +988,17 @@ static hl_host_result hl_macos_thread_cpu(void *context) {
     return hl_macos_clock(CLOCK_THREAD_CPUTIME_ID);
 }
 
+static hl_host_result hl_macos_architectural_counter(void *context) {
+    mach_timebase_info_data_t timebase = {0, 0};
+    uint64_t frequency;
+    (void)context;
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0 || timebase.denom == 0)
+        return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    frequency = (uint64_t)(((unsigned __int128)UINT64_C(1000000000) * timebase.denom) / timebase.numer);
+    if (frequency == 0) return hl_macos_result(HL_STATUS_PLATFORM_FAILURE, 0, 0);
+    return hl_macos_result(HL_STATUS_OK, frequency, 0);
+}
+
 static void hl_macos_precise_sleep_begin(void) {
     mach_timebase_info_data_t timebase;
     thread_time_constraint_policy_data_t policy;
@@ -4344,9 +4355,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
         hl_macos_unmap_range,      hl_macos_map_anonymous, hl_macos_discard, hl_macos_repair_signal_page};
-    static const hl_host_clock_services clock = {
-        HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_macos_monotonic,  hl_macos_realtime,
-        hl_macos_raw_monotonic, hl_macos_process_cpu, hl_macos_thread_cpu, hl_macos_clock_sleep_until};
+    static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
+                                                  .size = sizeof(clock),
+                                                  .monotonic_ns = hl_macos_monotonic,
+                                                  .realtime_ns = hl_macos_realtime,
+                                                  .raw_monotonic_ns = hl_macos_raw_monotonic,
+                                                  .process_cpu_ns = hl_macos_process_cpu,
+                                                  .thread_cpu_ns = hl_macos_thread_cpu,
+                                                  .sleep_until = hl_macos_clock_sleep_until,
+                                                  .architectural_counter_hz = hl_macos_architectural_counter};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),

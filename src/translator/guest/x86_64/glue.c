@@ -14,6 +14,10 @@
 //
 // Must be included after container/state.c and before translator/cache.c + emit.c in the TU.
 
+#include "../../../host/clock.h"
+
+static const hl_host_services *effective_host_services(void);
+
 static int g_trace, g_noibtc, g_itrace; // g_itrace: 1 instruction per block (per-insn register dump)
 // IRQSLIM: guest rip of the instruction currently being translated (set per decode step in
 // translate_block); emit_chain_exit compares chain targets against it to classify forward edges.
@@ -50,9 +54,9 @@ static int ibtc1way(void) { return 0; }
 static int g_coldprof;
 
 static inline uint64_t coldprof_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    uint64_t now = 0;
+    (void)hl_production_clock_nanoseconds(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+    return now;
 }
 
 // ---- persistent translated-code cache (HL_PCACHE=1; default off) ----

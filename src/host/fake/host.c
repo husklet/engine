@@ -136,6 +136,12 @@ static hl_host_result hl_fake_thread_cpu(void *context) {
     return hl_fake_result(fake, fake->thread_cpu_ns++);
 }
 
+static hl_host_result hl_fake_architectural_counter(void *context) {
+    hl_fake_host *fake = context;
+    if (fake->architectural_counter_hz == 0) return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+    return hl_fake_result(fake, fake->architectural_counter_hz);
+}
+
 static hl_host_result hl_fake_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
     hl_fake_host *fake = context;
     uint64_t *clock;
@@ -1082,9 +1088,15 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_map_anonymous,
                                                    hl_fake_discard,
                                                    hl_fake_repair_signal_page};
-    static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI,  sizeof(clock),         hl_fake_monotonic,
-                                                 hl_fake_realtime,   hl_fake_raw_monotonic, hl_fake_process_cpu,
-                                                 hl_fake_thread_cpu, hl_fake_sleep_until};
+    static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
+                                                  .size = sizeof(clock),
+                                                  .monotonic_ns = hl_fake_monotonic,
+                                                  .realtime_ns = hl_fake_realtime,
+                                                  .raw_monotonic_ns = hl_fake_raw_monotonic,
+                                                  .process_cpu_ns = hl_fake_process_cpu,
+                                                  .thread_cpu_ns = hl_fake_thread_cpu,
+                                                  .sleep_until = hl_fake_sleep_until,
+                                                  .architectural_counter_hz = hl_fake_architectural_counter};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
@@ -1124,6 +1136,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     fake->monotonic_ns = 1000;
     fake->realtime_ns = 2000;
     fake->raw_monotonic_ns = 3000;
+    fake->architectural_counter_hz = UINT64_C(24000000);
     fake->process_cpu_ns = 4000;
     fake->thread_cpu_ns = 5000;
     fake->process_exit_kind = HL_HOST_PROCESS_EXIT_CODE;

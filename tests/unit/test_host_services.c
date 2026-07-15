@@ -200,6 +200,10 @@ int main(void) {
     malformed_clock.sleep_until = NULL;
     truncated.clock = &malformed_clock;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CLOCK) == HL_STATUS_ABI_MISMATCH);
+    malformed_clock = *services.clock;
+    malformed_clock.architectural_counter_hz = NULL;
+    truncated.clock = &malformed_clock;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CLOCK) == HL_STATUS_ABI_MISMATCH);
     malformed_sync = *services.sync;
     malformed_sync.mutex_close = NULL;
     truncated = services;

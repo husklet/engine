@@ -9,6 +9,7 @@ typedef struct hl_fake_host {
     uint64_t monotonic_ns;
     uint64_t realtime_ns;
     uint64_t raw_monotonic_ns;
+    uint64_t architectural_counter_hz;
     uint64_t process_cpu_ns;
     uint64_t thread_cpu_ns;
     uint64_t next_handle;

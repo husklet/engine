@@ -9,7 +9,7 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_MEMORY_ABI 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
-#define HL_HOST_CLOCK_ABI 2u
+#define HL_HOST_CLOCK_ABI 3u
 #define HL_HOST_LOG_ABI 1u
 #define HL_HOST_FILE_ABI_13 13u
 #define HL_HOST_FILE_ABI_14 14u
@@ -236,6 +236,11 @@ typedef struct hl_host_clock_services {
     hl_host_result (*thread_cpu_ns)(void *context);
     /* Sleep until an absolute deadline. EINTR is returned as HL_STATUS_INTERRUPTED, never retried here. */
     hl_host_result (*sleep_until)(void *context, uint32_t clock_kind, uint64_t deadline_ns);
+    /* Effective frequency of the host architectural counter used by generated
+     * code. Hosts without a userspace-readable architectural counter return
+     * HL_STATUS_NOT_SUPPORTED. This lets translators validate a hardware
+     * counter without importing a platform clock API. */
+    hl_host_result (*architectural_counter_hz)(void *context);
 } hl_host_clock_services;
 
 typedef enum hl_host_clock_kind {

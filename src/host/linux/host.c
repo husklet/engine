@@ -807,6 +807,16 @@ static hl_host_result hl_linux_thread_cpu(void *context) {
     return hl_linux_clock(CLOCK_THREAD_CPUTIME_ID);
 }
 
+static hl_host_result hl_linux_architectural_counter(void *context) {
+    (void)context;
+#if defined(__aarch64__)
+    uint64_t frequency;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    if (frequency != 0) return hl_linux_result(HL_STATUS_OK, frequency, 0);
+#endif
+    return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+}
+
 static hl_host_result hl_linux_clock_sleep_until(void *context, uint32_t clock_kind, uint64_t deadline_ns) {
     clockid_t clock_id;
     struct timespec deadline;
@@ -3512,9 +3522,15 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
                                                    hl_linux_memory_unmap_range, hl_linux_memory_map_anonymous,
                                                    hl_linux_memory_discard,     hl_linux_memory_repair_signal_page};
-    static const hl_host_clock_services clock = {
-        HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
-        hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};
+    static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
+                                                  .size = sizeof(clock),
+                                                  .monotonic_ns = hl_linux_monotonic,
+                                                  .realtime_ns = hl_linux_realtime,
+                                                  .raw_monotonic_ns = hl_linux_raw_monotonic,
+                                                  .process_cpu_ns = hl_linux_process_cpu,
+                                                  .thread_cpu_ns = hl_linux_thread_cpu,
+                                                  .sleep_until = hl_linux_clock_sleep_until,
+                                                  .architectural_counter_hz = hl_linux_architectural_counter};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),
