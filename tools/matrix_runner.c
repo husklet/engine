@@ -49,6 +49,47 @@ typedef struct capture {
     int wait_status;
 } capture;
 
+typedef struct resource_baseline {
+    long descriptors;
+    long threads;
+} resource_baseline;
+
+static long count_directory_entries(const char *path) {
+#if defined(__linux__)
+    DIR *directory = opendir(path);
+    struct dirent *entry;
+    long count = 0;
+    if (directory == NULL) return -1;
+    while ((entry = readdir(directory)) != NULL)
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) count++;
+    return closedir(directory) == 0 ? count : -1;
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+static resource_baseline resource_measure(void) {
+    resource_baseline measured = {count_directory_entries("/proc/self/fd"),
+                                  count_directory_entries("/proc/self/task")};
+    return measured;
+}
+
+static int resources_restored(resource_baseline baseline, const suite_case *item) {
+    resource_baseline current = resource_measure();
+    int child_status;
+    pid_t child = waitpid(-1, &child_status, WNOHANG);
+    int child_clean = child < 0 && errno == ECHILD;
+    int descriptor_clean = baseline.descriptors < 0 || current.descriptors == baseline.descriptors;
+    int thread_clean = baseline.threads < 0 || current.threads == baseline.threads;
+    if (child_clean && descriptor_clean && thread_clean) return 1;
+    fprintf(stderr,
+            "matrix-runner: %s resource leak: children=%s descriptors=%ld/%ld threads=%ld/%ld\n",
+            item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors, baseline.threads,
+            current.threads);
+    return 0;
+}
+
 static uint64_t monotonic_ms(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
@@ -711,6 +752,7 @@ int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
     size_t count, excluded, index, selected = 0;
     const char *only = argc == 8 ? argv[7] : NULL;
+    resource_baseline baseline;
     if (argc != 7 && argc != 8) {
         fprintf(
             stderr,
@@ -719,6 +761,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
+    baseline = resource_measure();
     for (index = 0; index < count; ++index) {
         capture a = {0}, x = {0};
         if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
@@ -743,6 +786,7 @@ int main(int argc, char **argv) {
         }
         capture_free(&a);
         capture_free(&x);
+        if (!resources_restored(baseline, &cases[index])) return 1;
     }
     if (only != NULL && selected == 0) {
         fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
