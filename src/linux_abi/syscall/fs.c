@@ -25,6 +25,7 @@ static void bound_handle_cancel(bound_handle_slot *slot);
 static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, uint32_t flags);
 static int bound_handle_dirfd_error(int fd);
 static int64_t bound_relocate_lowest(int64_t opened);
+static int bound_handle_host_path(hl_host_handle file, char *path, size_t size);
 
 static uint32_t typed_open_flags(uint64_t guest) {
 #if G_O_DIRECTORY == 0x4000
@@ -2598,10 +2599,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID && plan.target != HL_HOST_HANDLE_INVALID &&
                 ((plan.target_type == HL_HOST_FILE_TYPE_REGULAR && !(lf & G_O_DIRECTORY)) || typed_directory)) {
                 int64_t opened;
+                char typed_host_path[HL_LINUX_PATH_MAX + 1];
+                int have_typed_host_path =
+                    bound_handle_host_path(plan.target, typed_host_path, sizeof typed_host_path) == 0;
                 close(pfd);
                 opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));
                 if (opened < 0) (void)g_host_services->file->close(g_host_services->context, plan.target);
                 opened = bound_relocate_lowest(opened);
+                if (opened >= 0 && have_typed_host_path) hl_fdcache_fd_setpath((int)opened, typed_host_path);
                 G_RET(c) = (uint64_t)opened;
                 break;
             }

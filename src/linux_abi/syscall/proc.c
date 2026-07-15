@@ -1572,7 +1572,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int eflags = (int)a4;
         if (ep && !ep[0] && (eflags & 0x1000)) { // AT_EMPTY_PATH: exec the file dirfd itself names (fexecve)
             char hb[4200];
-            if ((int)a0 < 0 || hl_native_fd_path((int)a0, hb, sizeof hb) != 0 || !hb[0]) {
+            int have_path = 0;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0]) {
+                snprintf(hb, sizeof hb, "%s", g_fdpath[(int)a0]);
+                have_path = 1;
+            } else if ((int)a0 >= 0 && hl_native_fd_path((int)a0, hb, sizeof hb) == 0 && hb[0]) {
+                have_path = 1;
+            }
+            if (!have_path) {
                 G_RET(c) = (uint64_t)(int64_t)(((int)a0 < 0) ? -EBADF : -EACCES);
                 break;
             }
@@ -1603,7 +1610,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 snprintf(eat_pb, sizeof eat_pb, "%s", ep); // bare cwd-relative: case 221 resolves it as-is
             else { // bare mode, relative to a real dirfd: absolutize via the fd's host path
                 char hb[4200];
-                if (hl_native_fd_path((int)a0, hb, sizeof hb) != 0) {
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
+                    snprintf(hb, sizeof hb, "%s", g_fdpath[(int)a0]);
+                else if (hl_native_fd_path((int)a0, hb, sizeof hb) != 0) {
                     G_RET(c) = (uint64_t)(int64_t)(-EBADF);
                     break;
                 }

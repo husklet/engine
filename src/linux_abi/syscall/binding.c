@@ -1054,6 +1054,17 @@ static int bound_handle_dirfd_error(int fd) {
     return metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ? -EACCES : -ENOTDIR;
 }
 
+static int bound_handle_host_path(hl_host_handle file, char *path, size_t size) {
+    hl_host_result named;
+    if (path == NULL || size == 0 || g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->file->path == NULL)
+        return -1;
+    named = g_host_services->file->path(g_host_services->context, file, (hl_host_bytes){path, size - 1});
+    if (named.status != HL_STATUS_OK || named.value >= size) return -1;
+    path[named.value] = '\0';
+    return 0;
+}
+
 /* Resolution may temporarily occupy low native descriptors. Once its opaque
  * handles are closed, republish the new typed OFD at the true lowest logical
  * guest slot and retire the temporary shadow. */
