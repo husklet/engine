@@ -568,7 +568,7 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
 }
 
 // Rebuild this process's guest memory (MAP_FIXED) + the mapping side-registries from `procdir`. For the init
-// this runs BEFORE engine init (so MAP_FIXED lands on free VAs); a re-forked child calls gmap_reset_all() +
+// this runs BEFORE engine init (so MAP_FIXED lands on free VAs); a re-forked child calls hl_gmap_reset() +
 // clears the anon/gna counters FIRST (dropping the COW-inherited init mappings) so its own RAM lands clean.
 static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) {
     uint64_t *mapped = NULL;
@@ -847,7 +847,7 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
      * host mapping ownership. Release those handles before forgetting the generic
      * map registry, otherwise every restored child leaks its parent's mappings. */
     bound_mapping_reset();
-    gmap_reset_all();
+    hl_gmap_reset();
     g_nanonmap = 0;
     g_ngna = 0;
     if (ckpt_restore_mem_dir(pd, &m) != 0) _exit(70);
