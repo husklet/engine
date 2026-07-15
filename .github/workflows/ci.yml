@@ -38,7 +38,7 @@ jobs:
 
       - name: Test Linux compatibility
         if: runner.os == 'Linux'
-        run: nix develop --command make -j2 test-linux-production-typed
+        run: nix develop --command make -s -j2 test-linux-production-typed 2>&1 | tee "$GITHUB_STEP_SUMMARY"
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
