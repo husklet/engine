@@ -38,7 +38,7 @@ jobs:
 
       - name: Test Linux compatibility
         if: runner.os == 'Linux'
-        run: nix build --print-build-logs .#checks.${{ matrix.nix_system }}.linux-typed
+        run: nix develop --command make -j2 test-linux-production-typed
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
