@@ -1,0 +1,58 @@
+#include "x87math.h"
+#include <math.h>
+#include <stdint.h>
+#include "cpu.h"
+
+static void push(struct cpu *cpu, double value) {
+    cpu->fptop = (cpu->fptop - 1) & 7;
+    cpu->st[cpu->fptop & 7] = value;
+}
+
+void hl_x86_x87_math(struct cpu *cpu) {
+    double st0 = cpu->st[cpu->fptop & 7];
+    double st1 = cpu->st[(cpu->fptop + 1) & 7];
+    cpu->fpsw &= ~UINT64_C(0x4700);
+    switch (cpu->x87_ea) {
+    case X87_F2XM1: cpu->st[cpu->fptop & 7] = exp2(st0) - 1.0; break;
+    case X87_FYL2X:
+        cpu->st[(cpu->fptop + 1) & 7] = st1 * log2(st0);
+        cpu->fptop = (cpu->fptop + 1) & 7;
+        break;
+    case X87_FPATAN:
+        cpu->st[(cpu->fptop + 1) & 7] = atan2(st1, st0);
+        cpu->fptop = (cpu->fptop + 1) & 7;
+        break;
+    case X87_FYL2XP1:
+        cpu->st[(cpu->fptop + 1) & 7] = st1 * log2(st0 + 1.0);
+        cpu->fptop = (cpu->fptop + 1) & 7;
+        break;
+    case X87_FPTAN:
+        if (fabs(st0) >= 0x1p63) {
+            cpu->fpsw |= UINT64_C(0x400);
+            break;
+        }
+        cpu->st[cpu->fptop & 7] = tan(st0);
+        push(cpu, 1.0);
+        break;
+    case X87_FSINCOS:
+        if (fabs(st0) >= 0x1p63) {
+            cpu->fpsw |= UINT64_C(0x400);
+            break;
+        }
+        cpu->st[cpu->fptop & 7] = sin(st0);
+        push(cpu, cos(st0));
+        break;
+    case X87_FSIN:
+        if (fabs(st0) >= 0x1p63)
+            cpu->fpsw |= UINT64_C(0x400);
+        else
+            cpu->st[cpu->fptop & 7] = sin(st0);
+        break;
+    case X87_FCOS:
+        if (fabs(st0) >= 0x1p63)
+            cpu->fpsw |= UINT64_C(0x400);
+        else
+            cpu->st[cpu->fptop & 7] = cos(st0);
+        break;
+    }
+}

@@ -1,6 +1,6 @@
 // translator/guest/x86_64/ops.c -- x86-only block-exit helpers the dispatcher invokes: cpuid emulation
 // and the 80-bit x87 load/store (which need a C round-trip, not inline codegen).
-#include <math.h> // x87 transcendentals (x87_func) computed via host libm
+#include <math.h> // unity consumers in avx.c use isnan
 
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------
 // One C round-trip does the entire (possibly REP/REPE/REPNE) compare/scan, then writes the exact
@@ -339,6 +339,7 @@ static void do_fxrstor(struct cpu *c) {
 // here on the double-precision ST stack via host libm. cpu->x87_ea carries the X87_* selector. We
 // track no tag bits, so C1 (stack over/underflow) is cleared on success; C2 (argument out of range,
 // |x| >= 2^63) is set for the trig ops exactly as the hardware does, leaving the operand untouched.
+#if 0 /* Compiled independently in x87math.c. */
 static void x87_push_d(struct cpu *c, double v) {
     c->fptop = (c->fptop - 1) & 7;
     c->st[c->fptop & 7] = v;
@@ -396,3 +397,4 @@ static void x87_func(struct cpu *c) {
         break;
     }
 }
+#endif
