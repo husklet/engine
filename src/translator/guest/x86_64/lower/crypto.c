@@ -198,7 +198,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         case 0xDD:   // AESENCLAST
         case 0xDE:   // AESDEC
         case 0xDF: { // AESDECLAST
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int key = crypto_rm_vec(I, next);
             int enc = (op == 0xDC || op == 0xDD);
             int last = (op == 0xDD || op == 0xDF);
@@ -221,13 +221,13 @@ static int translate_crypto(struct insn *I, uint64_t next) {
             return TX_NEXT;
         }
         case 0xDB: { // AESIMC: d = InvMixColumns(s)  (non-destructive)
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             emit32(A_AESIMC | (s << 5) | D);
             return TX_NEXT;
         }
         case 0xC8: { // SHA1NEXTE d, s: d = s + (0,0,0, rol30(d.lane3))   [E folded into the next W0]
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             g_v26z = g_v27m = 0; // the SHA round lowering clobbers v20..v31
             int s = crypto_rm_vec(I, next);
             e_dup_s(16, D, 3);                // v16.s[0] = d.lane3 (the A from 4 rounds ago)
@@ -238,14 +238,14 @@ static int translate_crypto(struct insn *I, uint64_t next) {
             return TX_NEXT;
         }
         case 0xC9: { // SHA1MSG1 d, s: d ^= (s2,s3,d0,d1)  [W xor of the schedule, no rotate]
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             e_ext(16, s, D, 8);          // v16 = (s2,s3,d0,d1)
             e_v3(0x6E201C00u, D, D, 16); // eor
             return TX_NEXT;
         }
         case 0xCA: { // SHA1MSG2 d, s: rol1 schedule finish with the lane-3 -> lane-0 chain (see header)
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             e_rev4s(16, D);                     // v16 = (d3,d2,d1,d0)
             e_rev4s(17, s);                     // v17 = (s3,s2,s1,s0)
@@ -254,7 +254,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
             return TX_NEXT;
         }
         case 0xCB: { // SHA256RNDS2 d, s, <xmm0>: 2 rounds via ARM SHA256H/H2 (see header derivation).
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             e_rev64_4s(16, s);                               // v16 = (E,F,A,B)
             e_rev64_4s(17, D);                               // v17 = (G,H,C,D)
@@ -269,13 +269,13 @@ static int translate_crypto(struct insn *I, uint64_t next) {
             return TX_NEXT;
         }
         case 0xCC: { // SHA256MSG1 d, s: exactly ARM SHA256SU0 (see header)
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             emit32(A_SHA256SU0 | (s << 5) | D);
             return TX_NEXT;
         }
         case 0xCD: { // SHA256MSG2 d, s: ARM SHA256SU1 with Vn=0 + lane-3 pre-cancel (see header)
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             if (s == D) { // aliased d==s: SU1 must read the ORIGINAL src after we adjust d
                 e_vmov(20, s);
@@ -290,7 +290,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         }
         case 0x00: { // PSHUFB d, s: d[i] = (s[i] & 0x80) ? 0 : d[s[i] & 0x0f]  (byte permute, hi-bit zeroes)
             if (nosseopt()) return TX_FALL;
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             // x86 uses low 4 index bits + bit7-zeroing; ARM TBL zeroes when index >= 16. Mask control to
             // 0x8f: bit7-clear -> 0..15 (valid lookup), bit7-set -> 128..143 (>=16 -> TBL yields 0). Exact.
@@ -304,7 +304,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         case 0x14:   // BLENDVPS d, s (mask = xmm0, per-dword top bit)
         case 0x15: { // BLENDVPD d, s (mask = xmm0, per-qword top bit)  -- select s where mask bit set
             if (nosseopt()) return TX_FALL;
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             int esz = (op == 0x10) ? 8 : (op == 0x14) ? 32 : 64;
             e_vshr_imm(16, 0, esz, esz - 1, 1); // v16 = replicate top bit of each lane of xmm0 (v0) -> mask
@@ -324,7 +324,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         case 0x34:
         case 0x35: { // PMOVZX (zero-extend)
             if (nosseopt()) return TX_FALL;
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int sgn = op < 0x30;  // 0x2x = signed, 0x3x = unsigned
             int form = op & 0x0f; // 0=bw 1=bd 2=bq 3=wd 4=wq 5=dq
             int src_bytes = (form == 0 || form == 3 || form == 5) ? 8 : (form == 1 || form == 4) ? 4 : 2;
@@ -369,7 +369,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
     if (I->map3 == 3) { // 0F3A
         switch (op) {
         case 0xCC: { // SHA1RNDS4 d, s, imm2: 4 SHA-1 rounds; fn/K by imm2 (see header derivation)
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int s = crypto_rm_vec(I, next);
             int f = (int)I->imm & 3;
             static const uint32_t K1[4] = {0x5A827999u, 0x6ED9EBA1u, 0x8F1BBCDCu, 0xCA62C1D6u};
@@ -386,7 +386,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
             return TX_NEXT;
         }
         case 0x44: { // PCLMULQDQ d, s, imm8
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int imm = (int)I->imm;
             int selA = imm & 1;        // which 64-bit half of d
             int selB = (imm >> 4) & 1; // which 64-bit half of s
@@ -411,7 +411,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         }
         case 0x0E: { // PBLENDW d, s, imm8: word i <- s if imm bit i set, else keep d  (8 x 16-bit)
             if (nosseopt()) return TX_FALL;
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int imm = (int)I->imm & 0xff;
             int s = crypto_rm_vec(I, next);
             for (int i = 0; i < 8; i++)
@@ -420,7 +420,7 @@ static int translate_crypto(struct insn *I, uint64_t next) {
         }
         case 0x0F: { // PALIGNR d, s, imm8: r = ((d:s) >> imm*8) bytes, with s in the low 16 bytes
             if (nosseopt()) return TX_FALL;
-            if (g_fp_known) fp_drop();
+            if (fp_known()) fp_drop();
             int imm = (int)I->imm & 0xff;
             int s = crypto_rm_vec(I, next);
             if (imm >= 32) {

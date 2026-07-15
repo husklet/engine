@@ -888,7 +888,7 @@ static void emit_dnan_post(int vd, int dbl) {
 // packed into cpu->divop; emit_exit_const spills guest GPR+xmm and sets cpu->rip = the architectural PC.
 static void emit_guest_signal(uint64_t rip, int lsig, int code) {
     if (g_fl_pending) flags_materialize();
-    if (g_fp_known) fp_drop();
+    if (fp_known()) fp_drop();
     e_movconst(16, (uint64_t)((lsig & 0xff) | ((code & 0xff) << 8)));
     e_str(16, 28, OFF_DIVOP); // (linux_signo | si_code<<8) -> cpu->divop for raise_guest_trap
     emit_exit_const(rip, R_TRAP);
@@ -1126,8 +1126,7 @@ static void *translate_block(uint64_t gpc) {
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
     g_v26z = g_v27m = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
     g_df = DF_DYN; // DF unknown at block entry (a prior block's std/popfq may have left it set) -> string
-    g_fp_known = 0;         // x87: top unknown at block entry until a finit anchors it
-    g_fp_dirty = 0;
+    hl_x87_stack_reset(&g_fp_stack); // x87: top unknown at block entry until a finit anchors it
     g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
     g_prof_xlate++;   // PROF (measurement-only): translate_block calls
     if (g_stitch < 0) g_stitch = 1;
@@ -1261,7 +1260,7 @@ static void *translate_block(uint64_t gpc) {
         // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
         // cpu->fptop and drop to the runtime-top model (the run only spans consecutive x87 ops, so
         // no top assumption ever crosses a non-x87 op, a branch target, or a block boundary).
-        if (g_fp_known && !(!I.two && op >= 0xD8 && op <= 0xDF)) fp_drop();
+        if (fp_known() && !(!I.two && op >= 0xD8 && op <= 0xDF)) fp_drop();
 
         if (!I.two) {
             // ---- data-move class (mov B0-BF/C6/C7/88-8B, lea 8D, push/pop 50-5F, movsxd 63) ----
@@ -2366,9 +2365,7 @@ static void *translate_block(uint64_t gpc) {
                         e_movconst(16, 0);
                         e_str(16, 28, OFF_FPTOP);
                         if (x87opt_on()) { // anchor the translate-time shadow: top is now statically 0
-                            g_fp_known = 1;
-                            g_fp_top = 0;
-                            g_fp_dirty = 0; // memory just written, shadow == cpu->fptop
+                            hl_x87_stack_anchor(&g_fp_stack, 0); // memory and shadow agree
                         }
                     } // finit -> top=0
                     else if (reg == 4) { /* fclex/etc */
@@ -3503,7 +3500,7 @@ static void *translate_block(uint64_t gpc) {
                     emit_ea(&I, next);                    // x17 = base of the 512-byte FXSAVE area
                     e_str(17, 28, OFF_X87EA);             // preserve EA across BUS guards and scratch lowering
                     if (g_fl_pending) flags_materialize();
-                    if (g_fp_known) fp_drop();
+                    if (fp_known()) fp_drop();
                     emit_exit_const(next, sub == 0 ? R_FXSAVE : R_FXRSTOR);
                     break;
                 }

@@ -4,7 +4,7 @@
 // base; add idx,lsl#3 -- 5 insns) while each push/pop does a ldr/modify/str of cpu->fptop.
 //
 // When the absolute top is statically known at translate time we instead:
-//   * resolve ST(i) to the concrete slot (g_fp_top+i)&7 and address it with ONE `add xa,x28,#off`,
+//   * resolve ST(i) to its concrete shadow-stack slot and address it with ONE `add xa,x28,#off`,
 //   * keep push/pop as pure translate-time bookkeeping (no cpu->fptop traffic), writing the shadow
 //     back to cpu->fptop only when guest state may escape (a faulting guest memory access, a C-helper
 //     exit, or any non-x87 instruction / block boundary) -- exactly as lazy flags spill to cpu->nzcv.
@@ -35,34 +35,36 @@
 // instructions; any non-x87 instruction ends the run (materialize + drop to the runtime model), and
 // any x87 op we cannot statically track falls back to the baseline helpers. NOX87OPT forces the
 // runtime-top path everywhere -> byte-identical to the pre-opt engine.
-static int g_fp_known = 0; // 1 if the absolute top is statically known right now
-static int g_fp_top = 0;   // the known top (0..7), valid iff g_fp_known
-static int g_fp_dirty = 0; // 1 if the shadow top has not been written to cpu->fptop
+#include "x87_stack.h"
+
+static struct hl_x87_stack g_fp_stack;
 
 static int x87opt_on(void) { return 1; }
 
-// &cpu->st[(g_fp_top+i)&7] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
+// &cpu->st[shadow slot i] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
 static void fp_slot_addr(int xdst, int i) {
-    unsigned off = (unsigned)OFF_ST + (unsigned)(((g_fp_top + i) & 7) * 8);
+    unsigned off = (unsigned)OFF_ST + hl_x87_stack_slot(&g_fp_stack, i) * 8u;
     emit32(0x91000000u | (off << 10) | (28 << 5) | xdst); // add xdst, x28, #off
 }
 
-// Make cpu->fptop reflect the shadow (idempotent). Keeps g_fp_known.
+// Make cpu->fptop reflect the shadow (idempotent). Keeps the shadow known.
 static void fp_materialize(void) {
-    if (g_fp_known && g_fp_dirty) {
-        e_movconst(16, (uint64_t)g_fp_top);
+    if (hl_x87_stack_known(&g_fp_stack) && hl_x87_stack_dirty(&g_fp_stack)) {
+        e_movconst(16, (uint64_t)hl_x87_stack_top(&g_fp_stack));
         e_str(16, 28, OFF_FPTOP);
-        g_fp_dirty = 0;
+        hl_x87_stack_materialized(&g_fp_stack);
     }
 }
 
 // Leave the static-top model (run boundary / untrackable op): spill the shadow, go runtime-top.
 static void fp_drop(void) {
     fp_materialize();
-    g_fp_known = 0;
+    hl_x87_stack_drop(&g_fp_stack);
 }
 
-#define FP_STATIC (x87opt_on() && g_fp_known)
+static int fp_known(void) { return hl_x87_stack_known(&g_fp_stack); }
+
+#define FP_STATIC (x87opt_on() && fp_known())
 
 static void fp_ld(int vd, int i) { // vd = ST(i)
     if (FP_STATIC) {
@@ -82,8 +84,7 @@ static void fp_st(int vs, int i) { // ST(i) = vs
 
 static void fp_push(int vs) { // push vs -> ST(0)  (top -= 1)
     if (FP_STATIC) {
-        g_fp_top = (g_fp_top - 1) & 7;
-        g_fp_dirty = 1;
+        hl_x87_stack_push(&g_fp_stack);
         fp_slot_addr(17, 0);
         g_str_d(vs, 17);
     } else
@@ -92,8 +93,7 @@ static void fp_push(int vs) { // push vs -> ST(0)  (top -= 1)
 
 static void fp_settop(int delta) { // top += delta  (pop = +1)
     if (FP_STATIC) {
-        g_fp_top = (g_fp_top + delta) & 7;
-        g_fp_dirty = 1;
+        hl_x87_stack_adjust(&g_fp_stack, delta);
     } else
         e_fp_settop(delta);
 }
