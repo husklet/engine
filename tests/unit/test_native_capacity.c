@@ -161,6 +161,18 @@ int main(void) {
         HL_CHECK(services.file->close(services.context, files[index - 1]).status == HL_STATUS_OK);
     for (size_t index = MAPPING_COUNT; mappings != NULL && index != 0; --index)
         HL_CHECK(services.memory->release(services.context, mappings[index - 1]).status == HL_STATUS_OK);
+    {
+        hl_host_handle stale = mappings[0];
+        hl_host_result replacement = services.memory->reserve(
+            services.context, 4096, 4096, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.memory->protect(services.context, stale, 0, 4096, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->protect(services.context, replacement.value, 0, 4096, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     for (size_t index = TIMER_COUNT; index != 0; --index)
         HL_CHECK(services.event->disarm_timer(services.context, events[0], index).status == HL_STATUS_OK);
     for (size_t index = TRANSFER_PAIR_COUNT * 2; index != 0; --index)
