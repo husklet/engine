@@ -203,13 +203,15 @@ restart:;
                 char parent[8192];
                 vol_parent_guest(volidx, parent, sizeof parent);
                 char next[8192];
-                if (parent[1] == 0)
-                    snprintf(next, sizeof next, "%s", tail[0] ? tail : "/");
-                else
-                    snprintf(next, sizeof next, "%s%s", parent, tail);
+                int joined = parent[1] == 0 ? path_copy(next, sizeof next, tail[0] ? tail : "/")
+                                             : path_concat(next, sizeof next, parent, tail);
+                if (joined != 0) {
+                    ret = -ENAMETOOLONG;
+                    goto out;
+                }
                 for (int i = 0; i < nf; i++)
                     close(fds[i]);
-                snprintf(gbuf, sizeof gbuf, "%s", next);
+                if (path_copy(gbuf, sizeof gbuf, next) != 0) return -ENAMETOOLONG;
                 goto restart;
             }
             // rootfs root (or crossing budget spent) -> clamp; the walk never escapes the rootfs
@@ -237,13 +239,18 @@ restart:;
                 // Absolute link targets restart namespace routing at the guest root.  In particular, a
                 // link inside a bind volume may point outside that mount; bare mode's outer namespace is
                 // the host root, while container mode selects the configured rootfs.
-                for (int i = 0; i < nf; i++)
-                    close(fds[i]);
-                snprintf(gbuf, sizeof gbuf, "%s%s", lk, tail);
+                if (path_concat(gbuf, sizeof gbuf, lk, tail) != 0) {
+                    ret = -ENAMETOOLONG;
+                    goto out;
+                }
+                for (int i = 0; i < nf; i++) close(fds[i]);
                 goto restart;
             } else
                 // tail already carries its leading '/' (or is empty)
-                snprintf(rest, sizeof rest, "%s%s", lk, tail);
+                if (path_concat(rest, sizeof rest, lk, tail) != 0) {
+                    ret = -ENAMETOOLONG;
+                    goto out;
+                }
             continue;
         }
         if (last) {

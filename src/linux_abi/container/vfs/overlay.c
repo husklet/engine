@@ -40,10 +40,16 @@ static void wh_hostpath(const char *jcanon, size_t jclen, const char *guest, cha
                         // host path of the .wh.NAME marker
                         size_t n) {
     char par[4200];
-    snprintf(par, sizeof par, "%s", guest);
+    if (path_copy(par, sizeof par, guest) != 0) {
+        if (n) out[0] = 0;
+        return;
+    }
     char *sl = strrchr(par, '/');
     char base[256];
-    snprintf(base, sizeof base, "%s", sl ? sl + 1 : par);
+    if (path_copy(base, sizeof base, sl ? sl + 1 : par) != 0) {
+        if (n) out[0] = 0;
+        return;
+    }
     if (sl) *sl = 0;
     char gw[4500];
     snprintf(gw, sizeof gw, "%s/.wh.%s", par[0] ? par : "", base);
@@ -64,7 +70,10 @@ static int wh_exists(const char *jcanon, size_t jclen,
 // confined host path; the caller lstats it to test existence in this layer.
 static void layer_follow(const char *jc, size_t jcl, const char *guest, char *out, size_t n, int nofollow) {
     char cur[4200];
-    snprintf(cur, sizeof cur, "%s", guest);
+    if (path_copy(cur, sizeof cur, guest) != 0) {
+        if (n) out[0] = 0;
+        return;
+    }
     for (int hop = 0; hop < 40; hop++) {
         char hb[4300];
         // host path, final NOT followed
@@ -102,7 +111,10 @@ static void layer_follow(const char *jc, size_t jcl, const char *guest, char *ou
             if (sl) *sl = 0;
             char j[8400];
             snprintf(j, sizeof j, "%s/%s", d, tgt);
-            snprintf(cur, sizeof cur, "%s", j);
+            if (path_copy(cur, sizeof cur, j) != 0) {
+                if (n) out[0] = 0;
+                return;
+            }
         }
     }
     confine_in(jc, jcl, cur, out, n, nofollow);
@@ -263,7 +275,10 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
 // Bounded to 40 hops; a symlink loop terminates as absent (ENOENT), never hangs.
 static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollow) {
     char cur[4200];
-    snprintf(cur, sizeof cur, "%s", guest);
+    if (path_copy(cur, sizeof cur, guest) != 0) {
+        if (hn) host[0] = 0;
+        return 0;
+    }
     for (int hop = 0; hop < 40; hop++) {
         if (!overlay_lookup(cur, host, hn)) return 0; // absent/whiteout -> host is the upper path
         if (nofollow) return 1;                       // want the link itself, not its target
@@ -282,7 +297,7 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
             if (sl) *sl = 0;
             char j[8400];
             snprintf(j, sizeof j, "%s/%s", d, tgt);
-            snprintf(cur, sizeof cur, "%s", j);
+            if (path_copy(cur, sizeof cur, j) != 0) return 0;
         }
     }
     return 0; // chain too deep -> ENOENT (host holds the last upper path)

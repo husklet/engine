@@ -86,22 +86,33 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
                     // a lower -> guest dir
                 }
         char combined[8400];
-        snprintf(combined, sizeof combined, "/%s/%s", gdir, raw);
+        char rooted[8400];
+        if (path_join(rooted, sizeof rooted, "/", gdir) != 0 ||
+            path_join(combined, sizeof combined, rooted, raw) != 0)
+            return NULL;
         if (g_nlower) {
             overlay_resolve(combined, buf, n, nofollow);
             return buf;
         }
         // openat then ignores dirfd (path absolute)
-        return nofollow ? xlate(combined, buf, n) : xresolve(combined, buf, n);
+        if (nofollow)
+            xlate(combined, buf, n);
+        else
+            xresolve(combined, buf, n);
+        return buf;
     }
     {
         char j[8400];
         // AT_FDCWD-relative -> join the guest cwd, then confine
-        snprintf(j, sizeof j, "%s/%s", g_cwd, raw);
+        if (path_join(j, sizeof j, g_cwd, raw) != 0) return NULL;
         if (g_nlower) {
             overlay_resolve(j, buf, n, nofollow);
             return buf;
         }
-        return nofollow ? xlate(j, buf, n) : xresolve_exec(j, buf, n);
+        if (nofollow)
+            xlate(j, buf, n);
+        else
+            xresolve_exec(j, buf, n);
+        return buf;
     }
 }

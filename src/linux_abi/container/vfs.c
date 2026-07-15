@@ -3,6 +3,56 @@
 
 #include "../open_plan.h"
 
+static int path_copy(char *out, size_t capacity, const char *value) {
+    size_t length;
+    if (!out || capacity == 0 || !value) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = strlen(value);
+    if (length >= capacity) {
+        out[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, value, length + 1);
+    return 0;
+}
+
+static int path_concat(char *out, size_t capacity, const char *first, const char *second) {
+    size_t a = first ? strlen(first) : 0, b = second ? strlen(second) : 0;
+    if (!out || capacity == 0 || !first || !second) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (a >= capacity || b >= capacity - a) {
+        out[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, first, a);
+    memcpy(out + a, second, b + 1);
+    return 0;
+}
+
+static int path_join(char *out, size_t capacity, const char *directory, const char *leaf) {
+    size_t d = directory ? strlen(directory) : 0, l = leaf ? strlen(leaf) : 0;
+    int slash = d != 0 && directory[d - 1] != '/';
+    if (!out || capacity == 0 || !directory || !leaf) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (d >= capacity || (size_t)slash >= capacity - d || l >= capacity - d - (size_t)slash) {
+        out[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, directory, d);
+    if (slash) out[d++] = '/';
+    memcpy(out + d, leaf, l + 1);
+    return 0;
+}
+
 // ---- rootfs path rewriting (ported from mac_elf.c) ----
 static const char *g_rootfs = NULL;
 // guest CWD (within the rootfs) -- AT_FDCWD resolution + getcwd
@@ -67,12 +117,14 @@ static char g_chroot[4200];
 static void chroot_apply(const char *guest, char *out, size_t n) {
     char norm[4200];
     confine(guest ? guest : "/", norm, sizeof norm);
+    int rc;
     if (!g_chroot[0])
-        snprintf(out, n, "%s", norm);
+        rc = path_copy(out, n, norm);
     else if (norm[1] == 0)
-        snprintf(out, n, "%s", g_chroot); // the chroot root itself
+        rc = path_copy(out, n, g_chroot); // the chroot root itself
     else
-        snprintf(out, n, "%s%s", g_chroot, norm);
+        rc = path_concat(out, n, g_chroot, norm);
+    if (rc != 0 && n) out[0] = 0;
 }
 
 // Strip the active chroot prefix from a rootfs-relative guest path, yielding the chroot-relative view the
@@ -1623,7 +1675,10 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
             if (sl) *sl = 0;
             char j[8400];
             snprintf(j, sizeof j, "%s/%s", d, tgt);
-            snprintf(cur, sizeof cur, "%s", j);
+            if (path_copy(cur, sizeof cur, j) != 0) {
+                if (n) buf[0] = 0;
+                return buf;
+            }
             // relative to its dir
         }
     }
@@ -1674,17 +1729,22 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
             // likewise cwd-relative. Anchor both at the guest cwd so the result is a rootfs-absolute guest
             // path -- secure_resolve/xresolve_overlay then confine it inside the jail (an escaping dir lands
             // on .jail-escape-denied and simply fails to match), so this is safe.
-            if (dl == 0)
-                snprintf(gbuf, n, "%s/%s", g_cwd, prog);
+            if (dl == 0) {
+                if (path_join(gbuf, n, g_cwd, prog) != 0) continue;
+            }
             else {
                 char dir[4200];
                 if (dl >= sizeof dir) dl = sizeof dir - 1;
                 memcpy(dir, s, dl);
                 dir[dl] = 0;
-                if (dir[0] == '/')
-                    snprintf(gbuf, n, "%s/%s", dir, prog);
-                else
-                    snprintf(gbuf, n, "%s/%s/%s", g_cwd, dir, prog);
+                if (dir[0] == '/') {
+                    if (path_join(gbuf, n, dir, prog) != 0) continue;
+                } else {
+                    char rooted[8400];
+                    if (path_join(rooted, sizeof rooted, g_cwd, dir) != 0 ||
+                        path_join(gbuf, n, rooted, prog) != 0)
+                        continue;
+                }
             }
             // Search the FULL overlay (upper THEN lowers): a fresh container's upper is empty and the program
             // lives only in a read-only image lower, so a bare xresolve_exec would ENOENT every PATH dir.
