@@ -1,4 +1,5 @@
 #include "route.h"
+#include "shm.h"
 
 // POSIX shm / named-sem backing path. glibc's shm_open/sem_open create files under /dev/shm; the guest's
 // synthesized /dev tmpfs has no real host tmpfs behind it, so /dev/shm/<name> is redirected to a REAL host
@@ -14,20 +15,6 @@
 // <name> are flattened so a segment can never escape the shm dir (glibc forbids them anyway).
 // Returns buf, or NULL when `guest` is not a "/dev/shm/<name>" path. g_rootfs_canon is defined in vfs.c,
 // which is #included ahead of this file in the unity TU.
-static const char *shm_backing_path(const char *guest, char *buf, size_t n) {
-    if (!guest || guest[0] != '/' || strncmp(guest, "/dev/shm/", 9)) return NULL;
-    const char *name = guest + 9;
-    int pfx = g_vfs_namespace.root_canonical[0]
-                  ? snprintf(buf, n, "%s/dev/shm/", g_vfs_namespace.root_canonical)
-                  : snprintf(buf, n, "/tmp/.hl-shm-%s-", g_namespace_key[0] ? g_namespace_key : "unscoped");
-    if (pfx < 0 || pfx >= (int)n - 1) return NULL;
-    int m = pfx + snprintf(buf + pfx, n - (size_t)pfx, "%s", name);
-    if (m > (int)n - 1) m = (int)n - 1;
-    for (int i = pfx; i < m; i++)
-        if (buf[i] == '/') buf[i] = '_';
-    return buf;
-}
-
 static int logical_fd_path(int descriptor, char *path, size_t capacity) {
     hl_linux_fd_snapshot snapshot;
     hl_host_result result;
@@ -50,10 +37,10 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
     if (!raw) return raw;
     // POSIX shm + named semaphores: glibc backs both with files under /dev/shm (shm_open -> /dev/shm/<name>,
     // sem_open -> /dev/shm/sem.<name>). Route EVERY op (open/link/unlink/stat/rename) at the SAME host
-    // backing the open(2) handler uses (case 56, via shm_hostpath -> shm_backing_path), so glibc's
+    // backing the open(2) handler uses (case 56, via hl_shm_path), so glibc's
     // multi-step named-sem create (temp file + link to the final name) and sem_unlink all resolve together.
     {
-        const char *shp = shm_backing_path(raw, buf, n);
+        const char *shp = hl_shm_path(raw, g_vfs_namespace.root_canonical, g_namespace_key, buf, n);
         if (shp) return shp;
     }
     // absolute -> rootfs-relative + confine (final component followed unless nofollow)

@@ -164,11 +164,11 @@ static void ovldents_rewind(int fd, int pos) {
 // then link()ed to /dev/shm/sem.<name>). openat (case 56) redirects these to a real host file so the page
 // is real and MAP_SHARED across fork; the link/rename/unlink that COMPLETE glibc's create dance must use
 // the SAME backing, but the rootfs branches of those handlers resolve via jail_at into the container's
-// /dev/shm and would otherwise diverge. Delegates to shm_backing_path (fscache.c): in container mode the
+// /dev/shm and would otherwise diverge. Delegates to hl_shm_path: in container mode the
 // backing sits inside the overlay upper's /dev/shm (per-container + visible to `ls /dev/shm`), in direct
 // mode a flat /tmp file. Returns the host backing path for a /dev/shm/<name> guest path, or NULL otherwise.
 static const char *shm_hostpath(const char *guest, char *buf, size_t n) {
-    return shm_backing_path(guest, buf, n);
+    return hl_shm_path(guest, g_vfs_namespace.root_canonical, g_namespace_key, buf, n);
 }
 
 // a pty MASTER's termios + winsize are shared line-discipline state that Linux keeps on the master
