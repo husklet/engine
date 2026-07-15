@@ -855,6 +855,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     g_linux_box = box;
     jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());
     hl_linux_bus_set_change_callback(jit_guest_bus_changed, NULL);
+    hl_linux_file_events_set_callback(bound_mapping_journal_apply, NULL);
     hl_linux_bus_set_transition_callbacks(jit_guest_bus_transition_begin, jit_guest_bus_transition_end, NULL);
     g_host_launch_monotonic_ns = 0;
     if (host != NULL) {

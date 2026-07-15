@@ -588,6 +588,11 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
             }
         }
     }
+    if (identity_valid && hl_linux_file_events_enable() != 0) {
+        if (bus_prepared) gbus_prepare_release();
+        pthread_mutex_unlock(&g_bound_mapping_gate);
+        return -ENOMEM;
+    }
 #ifdef PCACHE_MMAP_HINT
     /* The typed route precedes svc_mem, so it owns the production persistent-cache hint.
      * Metadata failure and non-regular files remain ordinary, uncacheable mappings. */
@@ -724,6 +729,8 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
     bound_mapping **head = bound_mapping_head();
     hl_host_file_metadata metadata = {0};
     int have_metadata = 0;
+    uint64_t old_size = 0;
+    int resized = 0;
     if (head == NULL || size == 0 || offset > UINT64_MAX - size || g_host_services == NULL ||
         g_host_services->file == NULL || g_host_services->file->read_at == NULL)
         return;
@@ -734,6 +741,17 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
     uint64_t end = offset + size;
     pthread_mutex_lock(&g_bound_mapping_gate);
     pthread_mutex_lock(&g_bound_mapping_lock);
+    if (have_metadata) {
+        for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+            if (!bound_mapping_same_file(entry->object, file, &metadata, 1)) continue;
+            old_size = entry->object->known_size;
+            if (old_size != metadata.size) {
+                bound_mapping_file_size_changed(file, &metadata, 1, old_size, metadata.size, NULL);
+                resized = 1;
+            }
+            break;
+        }
+    }
     for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
         if (entry->object->shared || entry->follow_hi <= entry->follow_lo ||
             !bound_mapping_same_file(entry->object, file, &metadata, have_metadata))
@@ -746,6 +764,63 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
             hl_host_bytes output = {(void *)(uintptr_t)(entry->address + lo - entry->file_offset), (size_t)(hi - lo)};
             (void)g_host_services->file->read_at(g_host_services->context, file->host_handle, lo, output);
         }
+    }
+    pthread_mutex_unlock(&g_bound_mapping_lock);
+    pthread_mutex_unlock(&g_bound_mapping_gate);
+    if (resized)
+        hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_RESIZE, metadata.stable_device, metadata.stable_object,
+                                    old_size, metadata.size);
+    if (have_metadata)
+        hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_WRITE, metadata.stable_device, metadata.stable_object,
+                                    offset, size);
+}
+
+static void bound_mapping_journal_apply(void *opaque, uint32_t kind, uint64_t device, uint64_t inode,
+                                        uint64_t first, uint64_t second) {
+    bound_mapping **head = bound_mapping_head();
+    hl_host_file_metadata metadata = {.stable_device = device, .stable_object = inode};
+    (void)opaque;
+    if (head == NULL) return;
+    if (kind == HL_LINUX_FILE_EVENT_RESIZE) {
+        hl_linux_bus_transition transition = {0};
+        if (hl_linux_bus_transition_begin(&transition) != 0) return;
+        pthread_mutex_lock(&g_bound_mapping_gate);
+        pthread_mutex_lock(&g_bound_mapping_lock);
+        for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+            hl_linux_fd_snapshot file;
+            uint64_t old_size;
+            if (!entry->object->identity_valid || entry->object->device != device || entry->object->inode != inode)
+                continue;
+            old_size = entry->object->known_size;
+            if (old_size == second) continue;
+            file = (hl_linux_fd_snapshot){.host_handle = entry->object->file};
+            bound_mapping_file_size_changed(&file, &metadata, 1, old_size, second, &transition);
+            break;
+        }
+        pthread_mutex_unlock(&g_bound_mapping_lock);
+        pthread_mutex_unlock(&g_bound_mapping_gate);
+        hl_linux_bus_transition_end(&transition);
+        return;
+    }
+    if (kind != HL_LINUX_FILE_EVENT_WRITE || g_host_services == NULL || g_host_services->file == NULL ||
+        g_host_services->file->read_at == NULL)
+        return;
+    pthread_mutex_lock(&g_bound_mapping_gate);
+    pthread_mutex_lock(&g_bound_mapping_lock);
+    for (bound_mapping *entry = *head; entry != NULL; entry = entry->next) {
+        uint64_t map_lo, map_hi, event_hi, lo, hi;
+        hl_host_bytes output;
+        if (entry->object->shared || entry->follow_hi <= entry->follow_lo || !entry->object->identity_valid ||
+            entry->object->device != device || entry->object->inode != inode)
+            continue;
+        map_lo = entry->file_offset + entry->follow_lo;
+        map_hi = entry->file_offset + entry->follow_hi;
+        event_hi = first > UINT64_MAX - second ? UINT64_MAX : first + second;
+        lo = first > map_lo ? first : map_lo;
+        hi = event_hi < map_hi ? event_hi : map_hi;
+        if (hi <= lo) continue;
+        output = (hl_host_bytes){(void *)(uintptr_t)(entry->address + lo - entry->file_offset), (size_t)(hi - lo)};
+        (void)g_host_services->file->read_at(g_host_services->context, entry->object->file, lo, output);
     }
     pthread_mutex_unlock(&g_bound_mapping_lock);
     pthread_mutex_unlock(&g_bound_mapping_gate);
@@ -2274,6 +2349,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             bound_mapping_file_size_changed(&source, &metadata, 1, metadata.size, a1, NULL);
             pthread_mutex_unlock(&g_bound_mapping_lock);
             pthread_mutex_unlock(&g_bound_mapping_gate);
+            hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_RESIZE, metadata.stable_device,
+                                        metadata.stable_object, metadata.size, a1);
         }
         if (prepared) { gbus_prepare_release(); }
         break;

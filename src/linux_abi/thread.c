@@ -387,7 +387,6 @@ static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
    which is the same visibility boundary that ordered the mutating process's
    pipe/socket/file notification. */
 #define FILEMAP_EVENT_COUNT 65536u
-enum filemap_event_kind { FILEMAP_RESIZE = 1, FILEMAP_WRITE = 2 };
 struct filemap_event {
     _Atomic uint64_t sequence;
     uint64_t device, inode, first, second;
@@ -400,6 +399,8 @@ struct filemap_events {
 static struct filemap_events *g_filemap_events;
 static uint64_t g_filemap_cursor;
 static pthread_mutex_t g_filemap_replay_lock = PTHREAD_MUTEX_INITIALIZER;
+static hl_linux_file_event_fn g_file_event_callback;
+static void *g_file_event_opaque;
 
 static void filemap_events_init_locked(void) {
     if (g_filemap_events != NULL) return;
@@ -407,6 +408,21 @@ static void filemap_events_init_locked(void) {
     if (p == MAP_FAILED) return;
     g_filemap_events = p;
     g_filemap_cursor = 0;
+}
+
+int hl_linux_file_events_enable(void) {
+    pthread_mutex_lock(&g_filemap_lock);
+    filemap_events_init_locked();
+    int enabled = g_filemap_events != NULL;
+    pthread_mutex_unlock(&g_filemap_lock);
+    return enabled ? 0 : -1;
+}
+
+void hl_linux_file_events_set_callback(hl_linux_file_event_fn callback, void *opaque) {
+    pthread_mutex_lock(&g_filemap_replay_lock);
+    g_file_event_callback = callback;
+    g_file_event_opaque = opaque;
+    pthread_mutex_unlock(&g_filemap_replay_lock);
 }
 
 static void filemap_publish(uint32_t kind, uint64_t device, uint64_t inode, uint64_t first, uint64_t second) {
@@ -420,6 +436,11 @@ static void filemap_publish(uint32_t kind, uint64_t device, uint64_t inode, uint
     event->second = second;
     event->kind = kind;
     atomic_store_explicit(&event->sequence, ticket + 1, memory_order_release);
+}
+
+void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first, uint64_t second) {
+    if (kind == HL_LINUX_FILE_EVENT_RESIZE || kind == HL_LINUX_FILE_EVENT_WRITE)
+        filemap_publish(kind, device, object, first, second);
 }
 
 static uint64_t filemap_accessible(const struct guest_file_mapping *mapping, uint64_t size) {
@@ -524,7 +545,7 @@ static void filemap_resize(int fd, uint64_t old_size, uint64_t new_size) {
     if (fstat(fd, &st) != 0) return;
     uint64_t device = (uint64_t)st.st_dev, inode = (uint64_t)st.st_ino;
     filemap_resize_identity(device, inode, old_size, new_size);
-    filemap_publish(FILEMAP_RESIZE, device, inode, old_size, new_size);
+    filemap_publish(HL_LINUX_FILE_EVENT_RESIZE, device, inode, old_size, new_size);
 }
 
 static int filemap_source_fd(struct guest_file_mapping *mapping) {
@@ -574,7 +595,7 @@ static void filemap_written(int fd, uint64_t offset, uint64_t size) {
     if (fstat(fd, &st) != 0) return;
     uint64_t device = (uint64_t)st.st_dev, inode = (uint64_t)st.st_ino;
     filemap_written_identity(device, inode, fd, offset, size);
-    filemap_publish(FILEMAP_WRITE, device, inode, offset, size);
+    filemap_publish(HL_LINUX_FILE_EVENT_WRITE, device, inode, offset, size);
 }
 
 static void filemap_replay(void) {
@@ -601,10 +622,12 @@ static void filemap_replay(void) {
         uint32_t kind = event->kind;
         uint64_t device = event->device, inode = event->inode, first = event->first, second = event->second;
         g_filemap_cursor = ticket + 1;
-        if (kind == FILEMAP_RESIZE)
+        if (kind == HL_LINUX_FILE_EVENT_RESIZE)
             filemap_resize_identity(device, inode, first, second);
-        else if (kind == FILEMAP_WRITE)
+        else if (kind == HL_LINUX_FILE_EVENT_WRITE)
             filemap_written_identity(device, inode, -1, first, second);
+        if (g_file_event_callback != NULL)
+            g_file_event_callback(g_file_event_opaque, kind, device, inode, first, second);
     }
     pthread_mutex_unlock(&g_filemap_replay_lock);
 }
