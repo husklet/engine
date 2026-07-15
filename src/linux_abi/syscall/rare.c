@@ -846,7 +846,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         char pb[4200];
         const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
         int r = truncate(p, (off_t)a1);
-        if (r >= 0) mc_evict(p);
+        if (r >= 0) hl_fdcache_metadata_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }

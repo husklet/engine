@@ -960,7 +960,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
-                    mc_evict(hp);
+                    hl_fdcache_metadata_evict(hp);
                     hl_fdcache_access_evict(hp);
                     if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
                 }
@@ -973,7 +973,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = mknodat(ATFD(a0), p, (mode_t)a2, (dev_t)a3);
         if (r >= 0) {
-            mc_evict(p);
+            hl_fdcache_metadata_evict(p);
             hl_fdcache_access_evict(p);
             if (newfile_stamp_wanted()) newfile_stamp_path(p, 1);
         }
@@ -1015,7 +1015,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
-                    mc_evict(hp);
+                    hl_fdcache_metadata_evict(hp);
                     hl_fdcache_access_evict(hp);
                     if (newfile_stamp_wanted()) newfile_stamp_path(hp, 1);
                 }
@@ -1028,7 +1028,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = mkdirat(ATFD(a0), p, (mode_t)a2);
-        mc_evict(p);
+        hl_fdcache_metadata_evict(p);
         // namespace change -> evict
         hl_fdcache_access_evict(p);
         if (r >= 0 && newfile_stamp_wanted()) newfile_stamp_path(p, 1);
@@ -1142,7 +1142,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // host path, the SAME key case 79/48 memoize under, so a follow-up `test -e`/stat sees it gone
             // (mirrors the non-overlay branch below). Without this a removed upper entry kept reporting as
             // present via a stale mc_ hit even though it no longer appears in a readdir.
-            mc_evict(host);
+            hl_fdcache_metadata_evict(host);
             hl_fdcache_access_evict(host);
             hl_fdcache_readlink_evict(host);
             // hardlink coherence: removing one link drops the sibling links' nlink -- evict their cached
@@ -1174,7 +1174,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0) {
-                    mc_evict(hp);
+                    hl_fdcache_metadata_evict(hp);
                     hl_fdcache_access_evict(hp);
                     hl_fdcache_readlink_evict(hp);
                 }
@@ -1198,7 +1198,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
         }
         int r = unlinkat(ATFD(a0), p, (a2 & 0x200) ? AT_REMOVEDIR : 0);
-        mc_evict(p);
+        hl_fdcache_metadata_evict(p);
         hl_fdcache_access_evict(p);
         hl_fdcache_readlink_evict(p);
         if (r >= 0 && aino) memf_try_adopt(adev, aino);
@@ -1414,7 +1414,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (hl_native_fd_path(opfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, ofin) == 0) {
-                    mc_evict(hp);
+                    hl_fdcache_metadata_evict(hp);
                     hl_fdcache_access_evict(hp);
                 }
             }
@@ -1974,7 +1974,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                if (path_join(hp, sizeof hp, dp, fin) == 0) mc_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) hl_fdcache_metadata_evict(hp);
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -1983,7 +1983,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = fchmodat(ATFD(a0), p, (mode_t)a2, 0);
-        if (r >= 0) mc_evict(p);
+        if (r >= 0) hl_fdcache_metadata_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -2496,7 +2496,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (have_canon) {
                     hl_fdcache_fd_setpath(r, gpa);
                     if (isw) {
-                        mc_evict(gpa);
+                        hl_fdcache_metadata_evict(gpa);
                         hl_fdcache_readlink_evict(gpa);
                         hl_fdcache_access_evict(gpa);
                     }
@@ -2555,7 +2555,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (r >= 0) {
                     hl_fdcache_fd_setpath(r, hostc);
                     if (lf & 3) { // write-open: keep the metadata caches coherent (same as the walk path)
-                        mc_evict(hostc);
+                        hl_fdcache_metadata_evict(hostc);
                         hl_fdcache_readlink_evict(hostc);
                         hl_fdcache_access_evict(hostc);
                     }
@@ -2625,7 +2625,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (hl_native_fd_path(r, gp, sizeof gp) == 0) {
                     hl_fdcache_fd_setpath(r, gp);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
-                        mc_evict(gp);
+                        hl_fdcache_metadata_evict(gp);
                         hl_fdcache_readlink_evict(gp);
                         hl_fdcache_access_evict(gp);
                     }
@@ -2651,7 +2651,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (r >= 0) {
             hl_fdcache_fd_setpath(r, p);
             if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
-                mc_evict(p);
+                hl_fdcache_metadata_evict(p);
                 hl_fdcache_readlink_evict(p);
                 hl_fdcache_access_evict(p);
             }
@@ -3268,7 +3268,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                if (path_join(hp, sizeof hp, dp, fin) == 0) mc_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) hl_fdcache_metadata_evict(hp);
                 // mtime changed
             }
             close(pfd);
@@ -3278,7 +3278,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         int r = utimensat(ATFD(a0), p, ts, (a3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
-        if (r >= 0) mc_evict(p);
+        if (r >= 0) hl_fdcache_metadata_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }

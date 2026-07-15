@@ -255,7 +255,7 @@ void hl_fdcache_metadata_store(const char *p, int rc, const struct stat *s) {
     CUL;
 }
 
-void mc_evict(const char *p) {
+void hl_fdcache_metadata_evict(const char *p) {
     if (!p || !p[0]) return;
     CLK;
     uint64_t h = mc_hash(p);
@@ -747,7 +747,7 @@ void hl_fdcache_fd_setpath(int fd, const char *p) {
 
 void fd_evict(int fd) {
     if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && g_fdcache.binding.fd_paths[fd][0])
-        mc_evict(g_fdcache.binding.fd_paths[fd]);
+        hl_fdcache_metadata_evict(g_fdcache.binding.fd_paths[fd]);
 }
 
 void hl_fdcache_fd_clear(int fd) {
@@ -762,7 +762,7 @@ void hl_fdcache_fd_clear(int fd) {
 // must name the exact path whose existence it changed. Two shapes: a full host path, and the jail
 // idiom of a dir-fd + final component (resolved to its host path via F_GETPATH).
 void hl_fdcache_evict_path(const char *hp) {
-    mc_evict(hp);
+    hl_fdcache_metadata_evict(hp);
     hl_fdcache_access_evict(hp);
     hl_fdcache_readlink_evict(hp);
 }
