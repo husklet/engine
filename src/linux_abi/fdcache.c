@@ -102,6 +102,8 @@ struct hl_fdcache {
     _Atomic uint32_t filesystem_generation_local;
     _Atomic uint32_t *filesystem_generation_ptr;
     _Atomic uint32_t filesystem_generation_seen;
+    const hl_host_services *filesystem_generation_host;
+    hl_host_handle filesystem_generation_mapping;
     hl_fdcache_binding binding;
     hl_host_handle mutex;
 };
@@ -709,15 +711,38 @@ static void oc_reset(void) {
 // the poll is a `static inline` two-word compare with a RELAXED load (plain LDR, not the pricier acquire
 // LDAR) and a predicted-not-taken branch; the acquire barrier + hl_fdcache_reset() live out of line
 // helper reached only when the generation actually moved (i.e. only right after a real daemon write).
-static void fsgen_bind(const char *p) {
-    if (!p || !p[0]) return;
-    int fd = open(p, O_RDONLY); // engine only READS the counter; the daemon writes it
-    if (fd < 0) return;
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
-    void *m = mmap(NULL, sizeof(uint32_t), PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return; // degrade to the local never-moving counter; never crash
-    g_fsgen_ptr = (_Atomic uint32_t *)m;
+static void fsgen_bind(const hl_host_services *host, const char *path) {
+    hl_host_result opened;
+    hl_host_result mapped;
+    hl_host_result closed;
+    hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), HL_HOST_HANDLE_INVALID, 0, 0, 0};
+    const hl_host_services *old_host;
+    hl_host_handle old_mapping;
+
+    if (!path || !path[0] || !host || !host->file || !host->memory || !host->file->open_relative ||
+        !host->file->close || !host->memory->map_file || !host->memory->release)
+        return;
+    opened = host->file->open_relative(host->context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_FILE_READ, 0, 0);
+    if (opened.status != HL_STATUS_OK || opened.value == HL_HOST_HANDLE_INVALID) return;
+    mapped = host->memory->map_file(host->context, opened.value, 0, 0, sizeof(uint32_t), HL_HOST_MEMORY_READ,
+                                    HL_HOST_MEMORY_SHARED, &mapping);
+    closed = host->file->close(host->context, opened.value);
+    if (mapped.status != HL_STATUS_OK || mapping.handle == HL_HOST_HANDLE_INVALID || mapping.address == 0 ||
+        mapping.mapped_size < sizeof(uint32_t) || closed.status != HL_STATUS_OK) {
+        if (mapping.handle != HL_HOST_HANDLE_INVALID) (void)host->memory->release(host->context, mapping.handle);
+        return;
+    }
+
+    old_host = g_fdcache.filesystem_generation_host;
+    old_mapping = g_fdcache.filesystem_generation_mapping;
+    if (old_host && old_mapping != HL_HOST_HANDLE_INVALID &&
+        old_host->memory->release(old_host->context, old_mapping).status != HL_STATUS_OK) {
+        (void)host->memory->release(host->context, mapping.handle);
+        return;
+    }
+    g_fdcache.filesystem_generation_host = host;
+    g_fdcache.filesystem_generation_mapping = mapping.handle;
+    g_fsgen_ptr = (_Atomic uint32_t *)(uintptr_t)mapping.address;
     // Snapshot the current generation so startup doesn't pay a spurious flush; the caches are empty.
     atomic_store(&g_fsgen_seen, atomic_load(g_fsgen_ptr));
 }
@@ -781,6 +806,6 @@ int hl_fdcache_bind(const hl_fdcache_binding *binding) {
         g_fdcache.mutex = created.value;
     }
     g_fdcache.binding = *binding;
-    fsgen_bind(binding->generation_file);
+    fsgen_bind(binding->host, binding->generation_file);
     return 0;
 }
