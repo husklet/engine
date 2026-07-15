@@ -602,14 +602,14 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 
 ### Lifecycle and isolation
 
-- [ ] Repeat create/run/stop/destroy races under sanitizers where supported.
+- [x] Repeat create/run/stop/destroy races under sanitizers where supported.
 - [ ] Prove descriptor, thread, mapping, child-process, and remote-process counts return to baseline after every suite.
 - [ ] Prove all registries grow to advertised limits without stale-handle aliasing.
 - [ ] Fault-inject every host callback boundary and verify transactional rollback.
 
 ### Translation and cache
 
-- [ ] Run the complete instruction, SMC, code-cache, fork, thread-churn, and persistent-cache corpus on every host.
+- [x] Run the complete instruction, SMC, code-cache, fork, thread-churn, and persistent-cache corpus on every host.
 - [ ] Verify cache identity rejects every incompatible code-changing configuration.
 - [ ] Prove no translator path performs ambient host I/O.
 
@@ -618,7 +618,7 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [ ] Establish reproducible native, mac-host, and Linux-host baseline distributions.
 - [ ] Add tracked thresholds for cold start, warm start, translation, syscall, fork/exec, IPC, and memory overhead.
 - [ ] Run long soak and application-level Linux workloads without leaks or unbounded growth.
-- [ ] Verify release binaries contain no active debug logging and require no diagnostic environment flags.
+- [x] Verify release binaries contain no active debug logging and require no diagnostic environment flags.
 - [x] Publish standalone C libraries, headers, host-provider archive, runner, pkg-config metadata, and a staged C
   consumer integration test.
 
