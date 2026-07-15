@@ -531,7 +531,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
     hl_host_result waited;
     hl_host_result closed;
     hl_host_handle process = HL_HOST_HANDLE_INVALID;
-    hl_host_handle result_stream = HL_HOST_HANDLE_INVALID;
+    hl_host_handle process_result = HL_HOST_HANDLE_INVALID;
     uint32_t pending;
     hl_status status;
     if (engine == NULL || argc < 0 || (argc != 0 && argv == NULL) || out_exit == NULL)
@@ -556,7 +556,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
     }
     status = engine->backend->start_process(&engine->host, engine->box_initialized ? &engine->box : NULL,
                                             &engine->options,
-                                            &engine->config, (uint32_t)argc, argv, &process, &result_stream);
+                                            &engine->config, (uint32_t)argc, argv, &process, &process_result);
     if (status != HL_STATUS_OK) {
         hl_engine_lock(engine);
         engine->state = HL_ENGINE_FINISHED;
@@ -578,9 +578,9 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         status = (hl_status)waited.status;
     } else if (closed.status != HL_STATUS_OK) {
         status = (hl_status)closed.status;
-    } else if (engine->backend->finish_process != NULL && result_stream != HL_HOST_HANDLE_INVALID) {
-        status = engine->backend->finish_process(&engine->host, result_stream, &waited, out_exit);
-        result_stream = HL_HOST_HANDLE_INVALID;
+    } else if (engine->backend->finish_process != NULL && process_result != HL_HOST_HANDLE_INVALID) {
+        status = engine->backend->finish_process(&engine->host, process_result, &waited, out_exit);
+        process_result = HL_HOST_HANDLE_INVALID;
     } else {
         out_exit->detail = 0;
         if (waited.detail == HL_HOST_PROCESS_EXIT_CODE) {
@@ -596,8 +596,8 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
             status = HL_STATUS_CORRUPT;
         }
     }
-    if (result_stream != HL_HOST_HANDLE_INVALID && engine->host.stream != NULL)
-        (void)engine->host.stream->close(engine->host.context, result_stream);
+    if (process_result != HL_HOST_HANDLE_INVALID && engine->backend->release_process_result != NULL)
+        engine->backend->release_process_result(&engine->host, process_result);
     hl_engine_lock(engine);
     engine->state = HL_ENGINE_FINISHED;
     hl_engine_unlock(engine);

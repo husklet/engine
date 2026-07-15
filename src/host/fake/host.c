@@ -86,7 +86,8 @@ static hl_host_result hl_fake_map_anonymous(void *context, uint64_t address, uin
     hl_host_result result;
     (void)protection;
     if (size == 0 || output == NULL || output->abi != HL_HOST_MEMORY_MAPPING_ABI || output->size < sizeof(*output) ||
-        (flags & HL_HOST_MEMORY_PRIVATE) == 0)
+        ((flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE)) != HL_HOST_MEMORY_SHARED &&
+         (flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE)) != HL_HOST_MEMORY_PRIVATE))
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     result = hl_fake_result(fake, ++fake->next_handle);
     if (result.status != HL_STATUS_OK) return result;

@@ -482,19 +482,21 @@ static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requ
     void *address;
     long page = sysconf(_SC_PAGESIZE);
     uint32_t placement = flags & (HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE);
+    uint32_t sharing = flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE);
     if (output == NULL || output->abi != HL_HOST_MEMORY_MAPPING_ABI || output->size < sizeof(*output) || size == 0 ||
         size > SIZE_MAX || page <= 0 || requested_address > UINTPTR_MAX ||
         (requested_address != 0 && requested_address % (uint64_t)page != 0) ||
         (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
-        (flags & ~(uint32_t)(HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
-        (flags & HL_HOST_MEMORY_PRIVATE) == 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED |
+                             HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
+        (sharing != HL_HOST_MEMORY_PRIVATE && sharing != HL_HOST_MEMORY_SHARED) ||
         (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
         (placement != 0 && requested_address == 0) ||
         (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     registered = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_MAPPING, -1, NULL, NULL, size, -1);
     if (registered.status != HL_STATUS_OK) return registered;
-    int native_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int native_flags = (sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE) | MAP_ANONYMOUS;
     if (placement == HL_HOST_MEMORY_FIXED) native_flags |= MAP_FIXED;
 #ifdef MAP_FIXED_NOREPLACE
     if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE) native_flags |= MAP_FIXED_NOREPLACE;

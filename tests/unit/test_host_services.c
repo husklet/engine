@@ -343,6 +343,13 @@ int main(void) {
         anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
         HL_CHECK(services.memory
                      ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_SHARED, &anonymous)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, anonymous.handle).status == HL_STATUS_OK &&
+                 fake.live_mappings == 0);
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                                      HL_HOST_MEMORY_PRIVATE, &anonymous)
                      .status == HL_STATUS_OK);
         hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);

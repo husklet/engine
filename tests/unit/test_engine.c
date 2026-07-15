@@ -103,8 +103,8 @@ static hl_status fake_start_x86_64(const hl_host_services *host, hl_linux_abi *b
     return fake_start_common(host, box, options, config, argc, argv, process, result_stream);
 }
 
-static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start_aarch64, NULL};
-static const hl_engine_backend fake_x86_backend = {HL_GUEST_ISA_X86_64, fake_start_x86_64, NULL};
+static const hl_engine_backend fake_backend = {HL_GUEST_ISA_AARCH64, fake_start_aarch64, NULL, NULL};
+static const hl_engine_backend fake_x86_backend = {HL_GUEST_ISA_X86_64, fake_start_x86_64, NULL, NULL};
 
 typedef struct run_context {
     hl_engine *engine;

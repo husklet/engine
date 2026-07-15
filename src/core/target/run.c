@@ -2,6 +2,7 @@
 
 #include "hl/linux_abi.h"
 
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -80,6 +81,9 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
         exit_status = result.guest_status;
     else if (status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL)
         exit_status = 128 + result.guest_status;
+    else
+        fprintf(stderr, "hl-engine: execution failed status=%d kind=%u guest=%d detail=%llu\n", (int)status,
+                result.kind, result.guest_status, (unsigned long long)result.detail);
     hl_engine_destroy(engine);
     if (result_path != NULL) {
         hl_launch_result launch_result = {.magic = HL_LAUNCH_RESULT_MAGIC,

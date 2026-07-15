@@ -767,12 +767,14 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
     void *address;
     long page = sysconf(_SC_PAGESIZE);
     uint32_t placement = flags & (HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE);
+    uint32_t sharing = flags & (HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE);
     if (output == NULL || output->abi != HL_HOST_MEMORY_MAPPING_ABI || output->size < sizeof(*output) || size == 0 ||
         size > SIZE_MAX || page <= 0 || requested_address > UINTPTR_MAX ||
         (requested_address != 0 && requested_address % (uint64_t)page != 0) ||
         (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
-        (flags & ~(uint32_t)(HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED | HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
-        (flags & HL_HOST_MEMORY_PRIVATE) == 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_SHARED | HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED |
+                             HL_HOST_MEMORY_FIXED_NOREPLACE)) != 0 ||
+        (sharing != HL_HOST_MEMORY_PRIVATE && sharing != HL_HOST_MEMORY_SHARED) ||
         (placement != 0 && placement != HL_HOST_MEMORY_FIXED && placement != HL_HOST_MEMORY_FIXED_NOREPLACE) ||
         (placement != 0 && requested_address == 0) ||
         (requested_address != 0 && size > (uint64_t)UINTPTR_MAX - requested_address))
@@ -786,7 +788,7 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
             return reserved;
         }
     }
-    int native_flags = MAP_PRIVATE | MAP_ANON;
+    int native_flags = (sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE) | MAP_ANON;
     if (placement != 0) native_flags |= MAP_FIXED;
     address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
                    -1, 0);

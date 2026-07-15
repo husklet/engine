@@ -455,6 +455,23 @@ int main(void) {
         bytes[0] = 0xa9;
         HL_CHECK(services.memory->discard(services.context, anonymous.handle).status == HL_STATUS_OK);
         HL_CHECK(bytes[0] == 0xa9 && munmap(bytes, (size_t)page) == 0);
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_SHARED, &anonymous)
+                     .status == HL_STATUS_OK);
+        bytes = (unsigned char *)(uintptr_t)anonymous.address;
+        bytes[0] = 0;
+        pid_t shared_child = fork();
+        HL_CHECK(shared_child >= 0);
+        if (shared_child == 0) {
+            bytes[0] = 0x5a;
+            _exit(0);
+        }
+        int shared_status = 0;
+        HL_CHECK(waitpid(shared_child, &shared_status, 0) == shared_child && WIFEXITED(shared_status) &&
+                 WEXITSTATUS(shared_status) == 0 && bytes[0] == 0x5a);
+        HL_CHECK(services.memory->release(services.context, anonymous.handle).status == HL_STATUS_OK);
         HL_CHECK(services.memory
                      ->map_anonymous(services.context, UINT64_MAX - page + 2, page, HL_HOST_MEMORY_READ,
                                      HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &anonymous)
