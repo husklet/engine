@@ -2275,6 +2275,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // /sys/class/net: interface introspection. Directory opens (the class dir + per-iface
             // dirs) materialize a temp dir for getdents; attribute files are served by proc_open.
             if (rp && !strncmp(rp, "/sys/class/net", 14)) {
+                if (sysnet_hidden(rp)) {
+                    G_RET(c) = (uint64_t)(int64_t)-ENOENT;
+                    break;
+                }
                 int d = sysnet_dir_open(rp);
                 if (d != -2) {
                     if (d >= 0 && (lf & 0x80000)) fcntl(d, F_SETFD, FD_CLOEXEC); // honor O_CLOEXEC
@@ -3117,6 +3121,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // non-synth path falls through to the generic handler below with Linux's normal ordering.
             {
                 struct stat synth_s;
+                if (sysnet_hidden(gp)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+                    break;
+                }
                 if (synth_stat_raw(gp, &synth_s)) {
                     if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -3329,6 +3337,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 rc = stat(hp, &s) == 0 ? 0 : -errno;
                 if (rc == 0) xpath = hp;
             }
+        } else if (sysnet_hidden(gp)) {
+            rc = -ENOENT;
         } else if (synth_stat_raw(gp, &s)) {
             rc = 0;
             // synth /proc or /sys -> fill from s below (synthetic: no backing file, xpath/xfd stay NULL/-1)

@@ -3663,6 +3663,12 @@ static int proc_root_dir_open(void) {
 // walk. The class dir lists the two interfaces (lo, eth0) as subdirs; an interface dir lists its
 // attribute files. FILE content is served live via proc_open on the (re-intercepted) relative/absolute
 // open. Returns the fd, -1 on error, or -2 if `gp` is not a sysfs-net directory we synthesize.
+static int sysnet_hidden(const char *gp) {
+    static const char prefix[] = "/sys/class/net/eth0";
+    return net_isolate() && gp != NULL && strncmp(gp, prefix, sizeof(prefix) - 1) == 0 &&
+           (gp[sizeof(prefix) - 1] == 0 || gp[sizeof(prefix) - 1] == '/');
+}
+
 static int sysnet_dir_open(const char *gp) {
     if (!gp || strncmp(gp, "/sys/class/net", 14)) return -2;
     const char *r = gp + 14;
@@ -5542,6 +5548,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
     }
     // /sys/class/net: the class dir + per-iface dirs are directories; attribute files are regular.
     if (gp && !strncmp(gp, "/sys/class/net", 14)) {
+        if (sysnet_hidden(gp)) return 0;
         const char *r = gp + 14;
         // --network none: eth0 (and its statistics/ subdir) does not exist -- direct stat must ENOENT to
         // match the readdir listing, which already omits eth0 under isolation.
