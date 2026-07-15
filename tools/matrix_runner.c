@@ -759,47 +759,62 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
     size_t count, excluded, index, selected = 0;
-    const char *only = argc == 8 ? argv[7] : NULL;
+    const char *only = NULL;
+    unsigned long repetitions = 1;
+    unsigned long repetition;
     resource_baseline baseline;
-    if (argc != 7 && argc != 8) {
+    if (argc == 8) {
+        only = argv[7];
+    } else if (argc == 9 || argc == 10) {
+        char *end = NULL;
+        if (strcmp(argv[7], "--repeat") != 0) goto usage;
+        errno = 0;
+        repetitions = strtoul(argv[8], &end, 10);
+        if (errno != 0 || end == argv[8] || *end != '\0' || repetitions == 0 || repetitions > 10000) goto usage;
+        if (argc == 10) only = argv[9];
+    } else if (argc != 7) {
+usage:
         fprintf(
             stderr,
             "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT "
-            "[CASE]\n");
+            "[--repeat N] [CASE]\n");
         return 2;
     }
     if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {
-        capture a = {0}, x = {0};
         if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
         selected++;
-        if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
-            run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {
-            capture_free(&a);
-            return 1;
-        }
-        if ((cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
-            run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0) {
+        for (repetition = 0; repetition < repetitions; ++repetition) {
+            capture a = {0}, x = {0};
+            if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
+                run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {
+                capture_free(&a);
+                return 1;
+            }
+            if ((cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
+                run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0) {
+                capture_free(&a);
+                capture_free(&x);
+                return 1;
+            }
+            if (cases[index].isa == ISA_BOTH &&
+                (a.output_size != x.output_size || memcmp(a.output, x.output, a.output_size) != 0)) {
+                diagnostic(&cases[index], "cross-ISA", "stdout mismatch", &x);
+                capture_free(&a);
+                capture_free(&x);
+                return 1;
+            }
             capture_free(&a);
             capture_free(&x);
-            return 1;
+            if (!resources_restored(baseline, &cases[index])) return 1;
         }
-        if (cases[index].isa == ISA_BOTH &&
-            (a.output_size != x.output_size || memcmp(a.output, x.output, a.output_size) != 0)) {
-            diagnostic(&cases[index], "cross-ISA", "stdout mismatch", &x);
-            capture_free(&a);
-            capture_free(&x);
-            return 1;
-        }
-        capture_free(&a);
-        capture_free(&x);
-        if (!resources_restored(baseline, &cases[index])) return 1;
     }
     if (only != NULL && selected == 0) {
         fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
         return 2;
     }
-    printf("matrix-runner: %zu active cases passed; %zu manifest cases excluded\n", selected, excluded);
+    printf("matrix-runner: %zu active cases passed with %lu repetition(s); %zu manifest cases excluded\n", selected,
+           repetitions, excluded);
     return 0;
 }
