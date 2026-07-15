@@ -1,0 +1,87 @@
+#ifndef HL_LINUX_FDCACHE_H
+#define HL_LINUX_FDCACHE_H
+
+#include "container/namespace.h"
+#include "hl/host_services.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define HL_FDCACHE_PATH_CAPACITY 192u
+
+typedef struct hl_fdcache_binding {
+    const hl_host_services *host;
+    const struct hl_linux_vfs_namespace *vfs;
+    const int *volume_count;
+    const char *root_canonical;
+    const size_t *root_canonical_length;
+    char (*fd_paths)[HL_FDCACHE_PATH_CAPACITY];
+    size_t fd_capacity;
+    const int *threaded;
+    const char *generation_file;
+} hl_fdcache_binding;
+
+int hl_fdcache_bind(const hl_fdcache_binding *binding);
+
+int hl_fdcache_metadata_lookup(const char *path, int *result, struct stat *metadata);
+void hl_fdcache_metadata_store(const char *path, int result, const struct stat *metadata);
+void hl_fdcache_metadata_evict(const char *path);
+void hl_fdcache_metadata_evict_inode(dev_t device, ino_t inode);
+int hl_fdcache_readlink_lookup(const char *path, int *result, char *output, int capacity, int *length);
+void hl_fdcache_readlink_store(const char *path, int result, const char *link, int length);
+void hl_fdcache_readlink_evict(const char *path);
+int hl_fdcache_access_lookup(const char *path, int *result);
+void hl_fdcache_access_store(const char *path, int result);
+void hl_fdcache_access_evict(const char *path);
+void hl_fdcache_resolution_bump(void);
+void hl_fdcache_reset(void);
+int hl_fdcache_resolution_lookup(const char *guest, char *host, size_t capacity);
+void hl_fdcache_resolution_store(const char *guest, const char *host);
+int hl_fdcache_upper_negative_lookup(const char *directory);
+void hl_fdcache_upper_negative_store(const char *directory);
+int hl_fdcache_upper_verdict_lookup(const char *directory, int *verdict);
+void hl_fdcache_upper_verdict_store(const char *directory, int verdict);
+int hl_fdcache_dentry_cacheable(const char *jail_canonical);
+int hl_fdcache_dentry_lookup(const char *key, char *canonical, size_t capacity, int *missing);
+void hl_fdcache_dentry_store(const char *key, const char *canonical, int missing);
+int hl_fdcache_open_lookup(const char *guest, char *host, size_t capacity);
+void hl_fdcache_open_store(const char *guest, const char *host);
+void hl_fdcache_generation_poll(void);
+void hl_fdcache_fd_setpath(int fd, const char *path);
+void hl_fdcache_fd_evict(int fd);
+void hl_fdcache_fd_clear(int fd);
+void hl_fdcache_evict_path(const char *host_path);
+
+/* Temporary call-site aliases while the surrounding unity roots are decomposed. */
+#define mc_lookup hl_fdcache_metadata_lookup
+#define mc_store hl_fdcache_metadata_store
+#define mc_evict hl_fdcache_metadata_evict
+#define mc_evict_ino hl_fdcache_metadata_evict_inode
+#define rl_lookup hl_fdcache_readlink_lookup
+#define rl_store hl_fdcache_readlink_store
+#define rl_evict hl_fdcache_readlink_evict
+#define ac_lookup hl_fdcache_access_lookup
+#define ac_store hl_fdcache_access_store
+#define ac_evict hl_fdcache_access_evict
+#define res_bump hl_fdcache_resolution_bump
+#define rc_reset hl_fdcache_reset
+#define rc_lookup hl_fdcache_resolution_lookup
+#define rc_store hl_fdcache_resolution_store
+#define updirneg_lookup hl_fdcache_upper_negative_lookup
+#define updirneg_store hl_fdcache_upper_negative_store
+#define updirverdict_lookup hl_fdcache_upper_verdict_lookup
+#define updirverdict_store hl_fdcache_upper_verdict_store
+#define dc_jail_cacheable hl_fdcache_dentry_cacheable
+#define dc_lookup hl_fdcache_dentry_lookup
+#define dc_store hl_fdcache_dentry_store
+#define oc_lookup hl_fdcache_open_lookup
+#define oc_store hl_fdcache_open_store
+#define fsgen_poll hl_fdcache_generation_poll
+#define fd_setpath hl_fdcache_fd_setpath
+#define fd_evict hl_fdcache_fd_evict
+#define fd_clear hl_fdcache_fd_clear
+#define fc_evict_path hl_fdcache_evict_path
+
+#endif
