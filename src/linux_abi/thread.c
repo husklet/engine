@@ -2,6 +2,7 @@
 
 #include "../host/range.h"
 #include "bus.h"
+#include "shared.h"
 
 // ---------------- syscalls ----------------
 // ---------------- threads & futex ----------------
@@ -403,10 +404,11 @@ static hl_linux_file_event_fn g_file_event_callback;
 static void *g_file_event_opaque;
 
 static void filemap_events_init_locked(void) {
+    void *arena = NULL;
     if (g_filemap_events != NULL) return;
-    void *p = mmap(NULL, sizeof(struct filemap_events), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) return;
-    g_filemap_events = p;
+    if (hl_linux_shared_create(effective_host_services(), sizeof(struct filemap_events), &arena) != HL_STATUS_OK)
+        return;
+    g_filemap_events = arena;
     g_filemap_cursor = 0;
 }
 
