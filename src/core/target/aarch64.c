@@ -99,8 +99,32 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
         host->log->emit(host->context, HL_LOG_TAG_SIGNAL, message, size);
 }
 
-// host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
-#include "../../translator/host/aarch64/asm.c"
+// Keep the unity consumers' compact encoder vocabulary while the assembler itself is an independently
+// compiled, explicitly-stateful translator component.
+#include "../../translator/host/aarch64/asm.h"
+static void emit32(uint32_t instruction) { hl_a64_emit32(&g_emit, instruction); }
+static void e_str(int rt, int rn, int off) { hl_a64_str(&g_emit, rt, rn, off); }
+static void e_ldr(int rt, int rn, int off) { hl_a64_ldr(&g_emit, rt, rn, off); }
+static void e_mov_sp_from(int rn) { hl_a64_mov_sp_from(&g_emit, rn); }
+static void e_mov_from_sp(int rd) { hl_a64_mov_from_sp(&g_emit, rd); }
+static void e_movz(int rd, uint32_t immediate, int shift) { hl_a64_movz(&g_emit, rd, immediate, shift); }
+static void e_movk(int rd, uint32_t immediate, int shift) { hl_a64_movk(&g_emit, rd, immediate, shift); }
+static void e_br(int rn) { hl_a64_br(&g_emit, rn); }
+static void e_movconst(int rd, uint64_t value) { hl_a64_movconst(&g_emit, rd, value); }
+static void e_stp(int rt, int rt2, int rn, int off) { hl_a64_stp(&g_emit, rt, rt2, rn, off); }
+static void e_ldp(int rt, int rt2, int rn, int off) { hl_a64_ldp(&g_emit, rt, rt2, rn, off); }
+static void e_addi(int rd, int rn, unsigned immediate) { hl_a64_addi(&g_emit, rd, rn, immediate); }
+static void e_addlsl4(int rd, int rn, int rm) { hl_a64_addlsl4(&g_emit, rd, rn, rm); }
+static void e_addlsl3(int rd, int rn, int rm) { hl_a64_addlsl3(&g_emit, rd, rn, rm); }
+static void e_movr(int rd, int rm) { hl_a64_movr(&g_emit, rd, rm); }
+static void e_subi(int rd, int rn, unsigned immediate) { hl_a64_subi(&g_emit, rd, rn, immediate); }
+static void e_hret(void) { hl_a64_ret(&g_emit); }
+static void e_adrp_add(int rd, uint64_t target) { hl_a64_adrp_add(&g_emit, rd, target); }
+static void e_load_cpu(int reg) { hl_a64_load_cpu(&g_emit, reg, (uintptr_t)g_cpu_key); }
+static void e_stur(int rt, int rn, int immediate) { hl_a64_stur(&g_emit, rt, rn, immediate); }
+static void e_ldur(int rt, int rn, int immediate) { hl_a64_ldur(&g_emit, rt, rn, immediate); }
+static void e_stp_q(int rt, int rt2, int rn, int off) { hl_a64_stp_q(&g_emit, rt, rt2, rn, off); }
+static void e_ldp_q(int rt, int rt2, int rn, int off) { hl_a64_ldp_q(&g_emit, rt, rt2, rn, off); }
 // persistent cross-process translated-code cache (recorded emitters used by stubs.c/translate.c;
 // load/save/relocate). MUST precede stubs.c + translate.c (they call the recorded emitters).
 #include "../../translator/guest/aarch64/cache.c"
