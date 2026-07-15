@@ -32,7 +32,7 @@ CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 DEPFLAGS := -MMD -MP
-PRIVATE_HEADERS := src/core/cli.h src/core/target/native.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \
+PRIVATE_HEADERS := src/core/cli.h src/core/target/native.h src/core/target/services.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \
 	src/translator/host/aarch64/aarch64_codegen.h src/translator/host/x86_64/x86_64_codegen.h
 
 # Production engines are unity translation units: their target .c files textually include the engine,
@@ -48,7 +48,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,include/hl/,*.h))
 
 CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
-	src/core/options.c src/core/target/native.c src/core/target/run.c
+	src/core/options.c src/core/target/native.c src/core/target/run.c src/core/target/services.c
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/host/aarch64/codegen.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \

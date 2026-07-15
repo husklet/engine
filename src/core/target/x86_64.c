@@ -65,13 +65,14 @@
 #include "../options.h"
 #include "../cli.h"
 #include "native.h"
+#include "services.h"
 #include "../bus.h"
 #include "../../linux_abi/bus.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
-static const hl_host_services *g_host_services;
-static hl_native_host *g_native_host;
-static hl_host_services g_jit_services;
+static hl_target_services g_target_services;
+#define g_host_services (g_target_services.injected)
+#define g_jit_services (g_target_services.bound)
 static hl_status g_engine_result_status;
 static hl_linux_abi *g_linux_box;
 
@@ -86,10 +87,6 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
 #include "../../translator/guest/x86_64/stat.c"     // per-arch struct-stat layout os/linux fills
 
-static int jit_host_bind(const hl_host_services *host) {
-    return hl_native_host_bind(&g_native_host, &g_jit_services, host);
-}
-
 // Byte size of the guest `struct stat` stat.c writes -- the shared stat syscalls (os/linux/syscall/
 // fs.c cases 79/80) validate exactly this many guest bytes before filling the buffer (EFAULT guard).
 #define GUEST_LINUX_STAT_BYTES 144
@@ -101,7 +98,7 @@ static int jit_host_bind(const hl_host_services *host) {
 #include "../../translator/cache.c"             // SHARED translator: code cache + block map
 
 static const hl_host_services *effective_host_services(void) {
-    return g_host_services != NULL ? g_host_services : &g_jit_services;
+    return hl_target_services_effective(&g_target_services);
 }
 
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
@@ -243,7 +240,7 @@ static int container_init(const char *rootfs) {
 // on success, nonzero exit code on failure. First call wins; later calls are no-ops (g_engine_inited),
 // so the resident parent pays this once and the standalone path runs it exactly as before.
 static int engine_global_init(void) {
-    if (jit_host_bind(g_host_services) != 0) return 1;
+    if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {
         perror("pthread_key_create");
@@ -256,7 +253,7 @@ static int engine_global_init(void) {
         return 70;
     }
     {
-        hl_fdcache_binding binding = {&g_jit_services,
+        hl_fdcache_binding binding = {hl_target_services_bound(&g_target_services),
                                       &g_vfs_namespace,
                                       &g_nvols,
                                       g_rootfs_canon,
@@ -377,7 +374,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     g_engine_result_status = HL_STATUS_OK;
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
-    g_host_services = host;
+    hl_target_services_inject(&g_target_services, host);
     hl_gmap_bind_host(host);
     g_linux_box = box;
     jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());

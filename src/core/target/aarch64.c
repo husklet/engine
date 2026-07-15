@@ -47,14 +47,15 @@
 #include "../options.h"
 #include "../cli.h"
 #include "native.h"
+#include "services.h"
 #include "../bus.h"
 #include "../../linux_abi/bus.h"
 #include "../../host/range.h"
 
 /* Instance-scoped host seam supplied by hl_engine. CLI launches retain their native-host path with NULL. */
-static const hl_host_services *g_host_services;
-static hl_native_host *g_native_host;
-static hl_host_services g_jit_services;
+static hl_target_services g_target_services;
+#define g_host_services (g_target_services.injected)
+#define g_jit_services (g_target_services.bound)
 static hl_status g_engine_result_status;
 static hl_linux_abi *g_linux_box;
 
@@ -76,15 +77,11 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
 
-static int jit_host_bind(const hl_host_services *host) {
-    return hl_native_host_bind(&g_native_host, &g_jit_services, host);
-}
-
 // code cache + block map + chaining
 #include "../../translator/cache.c"
 
 static const hl_host_services *effective_host_services(void) {
-    return g_host_services != NULL ? g_host_services : &g_jit_services;
+    return hl_target_services_effective(&g_target_services);
 }
 
 // host ARM64 assembler (emit32 + e_* encoders) -- the lowest layer
@@ -643,7 +640,7 @@ static void container_init(const char *rootfs) {
 // (g_engine_inited), so the resident fork-server parent pays this once and the standalone path runs it
 // exactly as before.
 static int engine_global_init(void) {
-    if (jit_host_bind(g_host_services) != 0) return 1;
+    if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
     // Serve a non-PIE ET_EXEC's absolute data references at their biased host address. Faults not
     // belonging to this compatibility path are re-raised with the default action.
@@ -669,7 +666,7 @@ static int engine_global_init(void) {
         return 70;
     }
     {
-        hl_fdcache_binding binding = {&g_jit_services,
+        hl_fdcache_binding binding = {hl_target_services_bound(&g_target_services),
                                       &g_vfs_namespace,
                                       &g_nvols,
                                       g_rootfs_canon,
@@ -800,7 +797,7 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     g_engine_result_status = HL_STATUS_OK;
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
-    g_host_services = host;
+    hl_target_services_inject(&g_target_services, host);
     hl_gmap_bind_host(host);
     g_linux_box = box;
     jit_guest_bus_bind(hl_linux_bus_fault, hl_linux_bus_active(), hl_linux_bus_generation());

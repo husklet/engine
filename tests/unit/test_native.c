@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include "../../src/core/target/native.h"
+#include "../../src/core/target/services.h"
 #include "../../src/translator/persist.h"
 
 #include <string.h>
@@ -55,6 +56,20 @@ int main(void) {
     HL_CHECK(HL_NATIVE_HOST_NAME[0] != '\0');
     HL_CHECK(strcmp(HL_NATIVE_HOST_NAME, "macos") == 0 || strcmp(HL_NATIVE_HOST_NAME, "linux") == 0);
     HL_CHECK(hl_native_host_bind(&host, &services, NULL) == 0);
+    {
+        hl_target_services target = {0};
+        hl_host_services mismatch;
+        hl_target_services_inject(&target, &services);
+        HL_CHECK(hl_target_services_effective(&target) == &services);
+        HL_CHECK(hl_target_services_bind(&target) == 0);
+        HL_CHECK(hl_target_services_bound(&target)->context == services.context);
+        mismatch = services;
+        mismatch.context = NULL;
+        hl_target_services_inject(&target, &mismatch);
+        HL_CHECK(hl_target_services_bind(&target) == -1);
+        hl_target_services_destroy(&target);
+        HL_CHECK(hl_target_services_effective(&target) == &target.bound);
+    }
     HL_CHECK(host != NULL);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) ==
              HL_STATUS_OK);
