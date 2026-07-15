@@ -1,6 +1,7 @@
 // translator/guest/x86_64/ops.c -- x86-only block-exit helpers the dispatcher invokes: cpuid emulation
 // and the 80-bit x87 load/store (which need a C round-trip, not inline codegen).
 #include <math.h> // unity consumers in avx.c use isnan
+#include "x87state.h"
 
 // ---- W4-C: rep cmps/scas idiom (R_REPSTR) -------------------------------------------------
 // One C round-trip does the entire (possibly REP/REPE/REPNE) compare/scan, then writes the exact
@@ -140,120 +141,14 @@ static void do_repstr(struct cpu *c) {
 // x87 80-bit extended <-> double conversion (done in C for reliability; libm-free).
 // We emulate the ST stack at double precision, so this loses the 80-bit mantissa tail.
 static void x87_fld_m80(struct cpu *c) {
-    uint8_t *ea = (uint8_t *)c->x87_ea;
-    uint64_t sig;
-    uint16_t se;
-    memcpy(&sig, ea, 8);
-    memcpy(&se, ea + 8, 2);
-    int s = se >> 15, e = se & 0x7fff;
-    double d;
-    if (sig == 0 && e == 0)
-        d = 0.0;
-    else if (e == 0x7fff) { // ext80 Inf/NaN -> double Inf/NaN (was: NaN silently became Inf)
-        uint64_t frac = sig & ((1ull << 63) - 1);        // significand below the explicit integer bit
-        uint64_t db = ((uint64_t)s << 63) | (0x7ffull << 52) | (frac ? (1ull << 51) : 0); // NaN keeps quiet bit
-        memcpy(&d, &db, 8);
-    } else {
-        d = (double)sig;        // ~2^63 (ucvtf)
-        int k = e - 16383 - 63; // scale exponent
-        uint64_t db;
-        memcpy(&db, &d, 8);
-        int de = (int)((db >> 52) & 0x7ff) + k;
-        if (de <= 0)
-            d = 0.0;
-        else if (de >= 0x7ff) {
-            db = (db & (1ull << 63)) | (0x7ffull << 52);
-            memcpy(&d, &db, 8);
-        } else {
-            db = (db & ~(0x7ffull << 52)) | ((uint64_t)de << 52);
-            memcpy(&d, &db, 8);
-        }
-        if (s) d = -d;
-    }
     c->fptop = (c->fptop - 1) & 7;
-    c->st[c->fptop & 7] = d;
+    c->st[c->fptop & 7] = hl_x86_ext80_load((const uint8_t *)(uintptr_t)c->x87_ea);
 }
 
 static void x87_fstp_m80(struct cpu *c) {
-    uint8_t *ea = (uint8_t *)c->x87_ea;
     double d = c->st[c->fptop & 7];
     c->fptop = (c->fptop + 1) & 7;
-    uint64_t db;
-    memcpy(&db, &d, 8);
-    int s = (int)(db >> 63), de = (int)((db >> 52) & 0x7ff);
-    uint64_t dm = db & ((1ull << 52) - 1);
-    uint64_t sig;
-    uint16_t se;
-    if (de == 0) { // double zero (or subnormal, flushed): ext80 zero, sign preserved
-        sig = 0;
-        se = (uint16_t)(s ? 0x8000 : 0);
-    } else if (de == 0x7ff) { // double Inf/NaN -> ext80 Inf/NaN (exp all-ones), NOT a rebiased finite value.
-        // (Was: e80 = 0x7ff-1023+16383 = 0x43FF, silently writing ~2^1024 instead of Inf.) Integer bit set;
-        // frac carries the mantissa so a QNaN stays quiet and Inf (dm==0) writes 0x8000000000000000.
-        sig = (1ull << 63) | (dm << 11);
-        se = (uint16_t)((s << 15) | 0x7fff);
-    } else {
-        sig = (1ull << 63) | (dm << 11);
-        int e80 = de - 1023 + 16383;
-        se = (uint16_t)((s << 15) | (e80 & 0x7fff));
-    }
-    memcpy(ea, &sig, 8);
-    memcpy(ea + 8, &se, 2);
-}
-
-// Pure double<->ext80 conversions (same math as x87_fld_m80/x87_fstp_m80, without the stack push/pop) for
-// the fxsave/fxrstor x87-register-DATA area. The ST stack is modeled at double precision, so an ext80 value
-// with a mantissa tail beyond binary64 is preserved only to double precision (the documented arm64 limit).
-static void x87_double_to_m80(double d, uint8_t *ea) {
-    uint64_t db;
-    memcpy(&db, &d, 8);
-    int s = (int)(db >> 63), de = (int)((db >> 52) & 0x7ff);
-    uint64_t dm = db & ((1ull << 52) - 1), sig;
-    uint16_t se;
-    if (de == 0) {
-        sig = 0;
-        se = (uint16_t)(s ? 0x8000 : 0);
-    } else if (de == 0x7ff) {
-        sig = (1ull << 63) | (dm << 11);
-        se = (uint16_t)((s << 15) | 0x7fff);
-    } else {
-        sig = (1ull << 63) | (dm << 11);
-        se = (uint16_t)((s << 15) | ((de - 1023 + 16383) & 0x7fff));
-    }
-    memcpy(ea, &sig, 8);
-    memcpy(ea + 8, &se, 2);
-}
-static double x87_m80_to_double(const uint8_t *ea) {
-    uint64_t sig;
-    uint16_t se;
-    memcpy(&sig, ea, 8);
-    memcpy(&se, ea + 8, 2);
-    int s = se >> 15, e = se & 0x7fff;
-    double d;
-    if (sig == 0 && e == 0)
-        d = 0.0;
-    else if (e == 0x7fff) {
-        uint64_t frac = sig & ((1ull << 63) - 1);
-        uint64_t db = ((uint64_t)s << 63) | (0x7ffull << 52) | (frac ? (1ull << 51) : 0);
-        memcpy(&d, &db, 8);
-    } else {
-        d = (double)sig;
-        int k = e - 16383 - 63;
-        uint64_t db;
-        memcpy(&db, &d, 8);
-        int de = (int)((db >> 52) & 0x7ff) + k;
-        if (de <= 0)
-            d = 0.0;
-        else if (de >= 0x7ff) {
-            db = (db & (1ull << 63)) | (0x7ffull << 52);
-            memcpy(&d, &db, 8);
-        } else {
-            db = (db & ~(0x7ffull << 52)) | ((uint64_t)de << 52);
-            memcpy(&d, &db, 8);
-        }
-        if (s) d = -d;
-    }
-    return d;
+    hl_x86_ext80_store(d, (uint8_t *)(uintptr_t)c->x87_ea);
 }
 
 // fxsave/fxrstor x87-register-DATA + FSW (R_FXSAVE/R_FXRSTOR). The XMM lanes, MXCSR and FCW are handled by
@@ -280,7 +175,7 @@ static void do_fxsave(struct cpu *c) {
     p[4] = 0xff;            // abridged FTW: all registers reported valid (see note above)
     p[5] = 0;
     for (int j = 0; j < 8; j++)
-        x87_double_to_m80(c->st[j], p + 32 + j * 16);
+        hl_x86_ext80_store(c->st[j], p + 32 + j * 16);
     memcpy(p + 24, &mxcsr, sizeof(mxcsr));
     memcpy(p + 160, c->v, 16 * 16);
 }
@@ -296,7 +191,7 @@ static void do_fxrstor(struct cpu *c) {
     c->fpsw = fsw & 0x4700;    // restore C0-C3
     c->fptop = (fsw >> 11) & 7; // restore TOP
     for (int j = 0; j < 8; j++)
-        c->st[j] = x87_m80_to_double(p + 32 + j * 16);
+        c->st[j] = hl_x86_ext80_load(p + 32 + j * 16);
     memcpy(c->v, p + 160, 16 * 16);
 #if defined(__aarch64__)
     uint64_t fpcr, fpsr;
