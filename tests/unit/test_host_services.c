@@ -84,6 +84,22 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_COUNTER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
+    HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_FILE) == HL_STATUS_OK);
+    {
+        hl_host_result source = hl_fake_host_file_create(&fake);
+        hl_host_result clone;
+        HL_CHECK(source.status == HL_STATUS_OK && source.value != HL_HOST_HANDLE_INVALID);
+        HL_CHECK(fake.live_files == 1 && fake.live_file_clones == 0 && fake.file_close_count == 0);
+        clone = services.file->clone_for_fork(services.context, source.value);
+        HL_CHECK(clone.status == HL_STATUS_OK && clone.value != source.value);
+        HL_CHECK(fake.live_files == 2 && fake.live_file_clones == 1);
+        hl_fake_host_fail_next(&fake, HL_STATUS_OUT_OF_MEMORY);
+        HL_CHECK(services.file->clone_for_fork(services.context, source.value).status == HL_STATUS_OUT_OF_MEMORY);
+        HL_CHECK(fake.live_files == 2 && fake.live_file_clones == 1);
+        HL_CHECK(services.file->close(services.context, clone.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, source.value).status == HL_STATUS_OK);
+        HL_CHECK(fake.live_files == 0 && fake.live_file_clones == 0 && fake.file_close_count == 2);
+    }
     {
         hl_host_services standalone = services;
         hl_host_result pipe;

@@ -286,6 +286,142 @@ static hl_host_result hl_fake_fork_lifecycle(void *context) {
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
+static hl_host_result hl_fake_file_unsupported(void) {
+    return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+}
+
+static int hl_fake_file_index(const hl_fake_host *fake, hl_host_handle file) {
+    uint32_t index;
+    if (file == HL_HOST_HANDLE_INVALID) return -1;
+    for (index = 0; index < 64; ++index)
+        if (fake->file_handles[index] == file) return (int)index;
+    return -1;
+}
+
+static hl_host_result hl_fake_file_create_owned(hl_fake_host *fake, uint8_t clone) {
+    uint32_t index;
+    hl_host_result result;
+    for (index = 0; index < 64 && fake->file_handles[index] != HL_HOST_HANDLE_INVALID; ++index) {}
+    if (index == 64) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    result = hl_fake_result(fake, ++fake->next_handle);
+    if (result.status != HL_STATUS_OK) return result;
+    fake->file_handles[index] = result.value;
+    fake->file_clones[index] = clone;
+    fake->live_files++;
+    if (clone != 0) fake->live_file_clones++;
+    return result;
+}
+
+hl_host_result hl_fake_host_file_create(hl_fake_host *fake) {
+    if (fake == NULL) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_file_create_owned(fake, 0);
+}
+
+static hl_host_result hl_fake_file_close(void *context, hl_host_handle file) {
+    hl_fake_host *fake = context;
+    int index = hl_fake_file_index(fake, file);
+    hl_host_result result;
+    if (index < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    result = hl_fake_result(fake, 0);
+    if (result.status != HL_STATUS_OK) return result;
+    if (fake->file_clones[index] != 0) fake->live_file_clones--;
+    fake->file_handles[index] = HL_HOST_HANDLE_INVALID;
+    fake->file_clones[index] = 0;
+    fake->live_files--;
+    fake->file_close_count++;
+    return result;
+}
+
+static hl_host_result hl_fake_file_clone(void *context, hl_host_handle file) {
+    hl_fake_host *fake = context;
+    if (hl_fake_file_index(fake, file) < 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_file_create_owned(fake, 1);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+#define HL_FAKE_FILE_STUB(name, parameters) \
+    static hl_host_result name parameters { return hl_fake_file_unsupported(); }
+HL_FAKE_FILE_STUB(hl_fake_file_open_relative,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size, uint32_t access,
+                   uint32_t creation, uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_read_at,
+                  (void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output))
+HL_FAKE_FILE_STUB(hl_fake_file_write_at,
+                  (void *context, hl_host_handle file, uint64_t offset, hl_host_const_bytes input))
+HL_FAKE_FILE_STUB(hl_fake_file_append, (void *context, hl_host_handle file, hl_host_const_bytes input))
+HL_FAKE_FILE_STUB(hl_fake_file_metadata,
+                  (void *context, hl_host_handle file, hl_host_file_metadata *output))
+HL_FAKE_FILE_STUB(hl_fake_file_read, (void *context, hl_host_handle file, void *output, uint64_t output_size))
+HL_FAKE_FILE_STUB(hl_fake_file_write,
+                  (void *context, hl_host_handle file, const void *input, uint64_t input_size))
+HL_FAKE_FILE_STUB(hl_fake_file_seek, (void *context, hl_host_handle file, int64_t offset, uint32_t whence))
+HL_FAKE_FILE_STUB(hl_fake_file_readv,
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
+HL_FAKE_FILE_STUB(hl_fake_file_writev,
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
+HL_FAKE_FILE_STUB(hl_fake_file_readv_at,
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                   uint64_t offset))
+HL_FAKE_FILE_STUB(hl_fake_file_writev_at,
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
+                   uint64_t offset))
+HL_FAKE_FILE_STUB(hl_fake_file_appendv,
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
+HL_FAKE_FILE_STUB(hl_fake_file_truncate, (void *context, hl_host_handle file, uint64_t size))
+HL_FAKE_FILE_STUB(hl_fake_file_sync, (void *context, hl_host_handle file))
+HL_FAKE_FILE_STUB(hl_fake_file_rename,
+                  (void *context, hl_host_handle old_directory, const char *old_path, size_t old_path_size,
+                   hl_host_handle new_directory, const char *new_path, size_t new_path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_unlink,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_path, (void *context, hl_host_handle file, hl_host_bytes output))
+HL_FAKE_FILE_STUB(hl_fake_file_standard_stream, (void *context, uint32_t stream))
+HL_FAKE_FILE_STUB(hl_fake_file_readlink, (void *context, hl_host_handle file, hl_host_bytes output))
+HL_FAKE_FILE_STUB(hl_fake_file_set_owner,
+                  (void *context, hl_host_handle file, uint32_t uid, uint32_t gid))
+HL_FAKE_FILE_STUB(hl_fake_file_resolve,
+                  (void *context, hl_host_handle root, const char *path, size_t path_size, uint32_t policy,
+                   hl_host_file_resolution *output))
+HL_FAKE_FILE_STUB(hl_fake_file_sync_range,
+                  (void *context, hl_host_handle file, uint64_t offset, uint64_t size, uint32_t flags))
+HL_FAKE_FILE_STUB(hl_fake_file_open_beneath,
+                  (void *context, hl_host_handle root, const char *path, size_t path_size, uint32_t access,
+                   uint32_t creation, uint32_t permissions, uint32_t resolve_policy))
+HL_FAKE_FILE_STUB(hl_fake_file_allocate,
+                  (void *context, hl_host_handle file, uint32_t mode, uint64_t offset, uint64_t size))
+HL_FAKE_FILE_STUB(hl_fake_file_filesystem_metadata,
+                  (void *context, hl_host_handle file, hl_host_filesystem_metadata *output))
+HL_FAKE_FILE_STUB(hl_fake_file_set_permissions,
+                  (void *context, hl_host_handle file, uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_set_times,
+                  (void *context, hl_host_handle file, const hl_host_file_time times[2]))
+HL_FAKE_FILE_STUB(hl_fake_file_read_directory,
+                  (void *context, hl_host_handle file, hl_host_file_entry *entries, uint32_t entry_capacity,
+                   uint32_t byte_capacity))
+HL_FAKE_FILE_STUB(hl_fake_file_make_directory,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
+                   uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_make_symlink,
+                  (void *context, const char *target, size_t target_size, hl_host_handle directory,
+                   const char *path, size_t path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_make_link,
+                  (void *context, hl_host_handle old_directory, const char *old_path, size_t old_path_size,
+                   hl_host_handle new_directory, const char *new_path, size_t new_path_size, uint32_t flags))
+HL_FAKE_FILE_STUB(hl_fake_file_make_fifo,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
+                   uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_store_private,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
+                   hl_host_const_bytes input, uint32_t permissions))
+#undef HL_FAKE_FILE_STUB
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 static int hl_fake_counter_handle_index(const hl_fake_host *fake, hl_host_handle handle) {
     uint32_t index;
     for (index = 0; index < 64; ++index)
@@ -1145,6 +1281,50 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
         HL_HOST_STREAM_ABI, sizeof(stream), hl_fake_stream_pipe_pair, hl_fake_stream_read,
         hl_fake_stream_write, hl_fake_stream_duplicate, hl_fake_stream_close,
         hl_fake_stream_set_status_flags, hl_fake_stream_readiness, hl_fake_stream_move};
+    static const hl_host_file_services file = {
+        .abi = HL_HOST_FILE_ABI,
+        .size = sizeof(file),
+        .open_relative = hl_fake_file_open_relative,
+        .read_at = hl_fake_file_read_at,
+        .write_at = hl_fake_file_write_at,
+        .append = hl_fake_file_append,
+        .metadata = hl_fake_file_metadata,
+        .close = hl_fake_file_close,
+        .read = hl_fake_file_read,
+        .write = hl_fake_file_write,
+        .clone_for_fork = hl_fake_file_clone,
+        .seek = hl_fake_file_seek,
+        .readv = hl_fake_file_readv,
+        .writev = hl_fake_file_writev,
+        .readv_at = hl_fake_file_readv_at,
+        .writev_at = hl_fake_file_writev_at,
+        .appendv = hl_fake_file_appendv,
+        .truncate = hl_fake_file_truncate,
+        .sync = hl_fake_file_sync,
+        .data_sync = hl_fake_file_sync,
+        .rename_relative = hl_fake_file_rename,
+        .unlink_relative = hl_fake_file_unlink,
+        .path = hl_fake_file_path,
+        .standard_stream = hl_fake_file_standard_stream,
+        .readlink = hl_fake_file_readlink,
+        .set_owner = hl_fake_file_set_owner,
+        .resolve_beneath = hl_fake_file_resolve,
+        .sync_range = hl_fake_file_sync_range,
+        .sync_filesystem = hl_fake_file_sync,
+        .open_beneath = hl_fake_file_open_beneath,
+        .allocate_range = hl_fake_file_allocate,
+        .filesystem_metadata = hl_fake_file_filesystem_metadata,
+        .set_permissions = hl_fake_file_set_permissions,
+        .set_times = hl_fake_file_set_times,
+        .read_directory = hl_fake_file_read_directory,
+        .make_directory = hl_fake_file_make_directory,
+        .make_symlink = hl_fake_file_make_symlink,
+        .make_link = hl_fake_file_make_link,
+        .make_fifo = hl_fake_file_make_fifo,
+        .validate_private_regular = hl_fake_file_sync,
+        .store_private_atomic = hl_fake_file_store_private,
+        .validate_private_directory = hl_fake_file_sync,
+    };
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
     fake->monotonic_ns = 1000;
@@ -1158,7 +1338,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->size = sizeof(*services);
     services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
                              HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT |
-                             HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM;
+                             HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_FILE;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
@@ -1170,6 +1350,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->event = &event;
     services->watch = &watch;
     services->stream = &stream;
+    services->file = &file;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

@@ -21,6 +21,11 @@ typedef struct hl_fake_host {
     uint32_t live_mutexes;
     uint32_t code_write_begins;
     uint32_t code_write_ends;
+    uint64_t file_handles[64];
+    uint8_t file_clones[64];
+    uint32_t live_files;
+    uint32_t live_file_clones;
+    uint32_t file_close_count;
     uint64_t mutex_handles[64];
     uint8_t mutex_locked[64];
     uint64_t counter_handles[64];
@@ -73,6 +78,8 @@ typedef struct hl_fake_host {
 
 HL_API void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services);
 HL_API void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status);
+/* Create one independently closeable file handle for ownership and rollback tests. */
+HL_API hl_host_result hl_fake_host_file_create(hl_fake_host *fake);
 HL_API void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block);
 HL_API void hl_fake_host_directory_emit(hl_fake_host *fake, uint64_t token, uint32_t changes);
 HL_API void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object,
