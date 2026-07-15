@@ -194,8 +194,8 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 // a spinlock is livelock-free), sets ZF, and leaves the other flags. See x86_ops.c do_cmpxchg16().
 #define R_CMPXCHG16 14
 // fxsave/fxrstor x87-register-DATA + FSW tail: the inline emitter handles the XMM/MXCSR/FCW area; these exit
-// to do_fxsave()/do_fxrstor() to save/restore the modeled x87 stack (c->st[]/fptop/fpsw) as 80-bit ext at
-// offset 32+. cpu->x87_ea carries the FXSAVE area base. See x86_ops.c do_fxsave()/do_fxrstor().
+// to hl_x86_fxsave()/hl_x86_fxrstor() to save/restore the modeled x87 stack (c->st[]/fptop/fpsw) as
+// 80-bit ext at offset 32+. cpu->x87_ea carries the FXSAVE area base. See x87state.c.
 #define R_FXSAVE 15
 #define R_FXRSTOR 16
 #define R_BUS 17

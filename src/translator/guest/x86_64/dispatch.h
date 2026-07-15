@@ -261,11 +261,11 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     } /* W4-C rep cmps/scas idiom (rip already = next) */                                                              \
     if ((c)->reason == R_X87FLD) {                                                                                     \
-        x87_fld_m80(c);                                                                                                \
+        hl_x86_x87_load_ext80(c);                                                                                      \
         continue;                                                                                                      \
     } /* fld m80 (rip already = next) */                                                                               \
     if ((c)->reason == R_X87FSTP) {                                                                                    \
-        x87_fstp_m80(c);                                                                                               \
+        hl_x86_x87_store_ext80_pop(c);                                                                                 \
         continue;                                                                                                      \
     } /* fstp m80 */                                                                                                   \
     if ((c)->reason == R_X87FUNC) {                                                                                    \
@@ -281,11 +281,11 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_FXSAVE) { /* fxsave x87-register-DATA + FSW tail (rip already = next) */                     \
-        do_fxsave(c);                                                                                                  \
+        hl_x86_fxsave(c);                                                                                              \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_FXRSTOR) { /* fxrstor x87-register-DATA + FSW tail (rip already = next) */                   \
-        do_fxrstor(c);                                                                                                 \
+        hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
