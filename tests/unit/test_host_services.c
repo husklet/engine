@@ -136,6 +136,11 @@ int main(void) {
     }
     HL_CHECK(services.memory->begin_code_write(services.context).status == HL_STATUS_OK);
     HL_CHECK(services.memory->end_code_write(services.context).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->repair_signal_page(services.context, 0x400000, 4096,
+                                                 HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE));
+    HL_CHECK(!services.memory->repair_signal_page(services.context, 0x400001, 4096, HL_HOST_MEMORY_READ));
+    HL_CHECK(!services.memory->repair_signal_page(services.context, 0x400000, 8192, HL_HOST_MEMORY_READ));
+    HL_CHECK(!services.memory->repair_signal_page(services.context, 0x400000, 4096, UINT32_MAX));
     HL_CHECK(fake.code_write_begins == 1 && fake.code_write_ends == 1);
     directory = services.directory->create(services.context);
     HL_CHECK(directory.status == HL_STATUS_OK);
@@ -173,6 +178,11 @@ int main(void) {
     truncated.memory = &malformed_memory;
     truncated.capabilities |= HL_HOST_CAP_CODE_MAPPING;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.repair_signal_page = NULL;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
     malformed_clock = *services.clock;
     malformed_clock.raw_monotonic_ns = NULL;
     truncated = services;

@@ -48,6 +48,12 @@ static hl_host_result hl_fake_discard(void *context, hl_host_handle mapping) {
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
+static int hl_fake_repair_signal_page(void *context, uint64_t address, uint64_t size, uint32_t protection) {
+    (void)context;
+    return address != 0 && size == UINT64_C(4096) && (address & UINT64_C(4095)) == 0 &&
+           (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) == 0;
+}
+
 static hl_host_result hl_fake_publish(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
     return hl_fake_protect(context, mapping, offset, size, 0);
 }
@@ -1074,7 +1080,8 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_mapping_sync,
                                                    hl_fake_unmap_range,
                                                    hl_fake_map_anonymous,
-                                                   hl_fake_discard};
+                                                   hl_fake_discard,
+                                                   hl_fake_repair_signal_page};
     static const hl_host_clock_services clock = {HL_HOST_CLOCK_ABI,  sizeof(clock),         hl_fake_monotonic,
                                                  hl_fake_realtime,   hl_fake_raw_monotonic, hl_fake_process_cpu,
                                                  hl_fake_thread_cpu, hl_fake_sleep_until};

@@ -535,6 +535,30 @@ static hl_host_result hl_macos_discard(void *context, hl_host_handle handle) {
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static int hl_macos_repair_signal_page(void *context, uint64_t address, uint64_t size, uint32_t protection) {
+    (void)context;
+    if (address == 0 || address > UINTPTR_MAX || size != UINT64_C(4096) || (address & UINT64_C(4095)) != 0 ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0)
+        return 0;
+    void *page = (void *)(uintptr_t)address;
+    int native_protection = hl_macos_protection(protection);
+    if (mprotect(page, (size_t)size, native_protection) == 0) return 1;
+    mach_vm_address_t exact = (mach_vm_address_t)address;
+    kern_return_t allocated = mach_vm_allocate(mach_task_self(), &exact, (mach_vm_size_t)size, VM_FLAGS_FIXED);
+    if (allocated == KERN_SUCCESS) {
+        if (native_protection == (PROT_READ | PROT_WRITE)) return 1;
+        vm_prot_t vm_protection = 0;
+        if ((native_protection & PROT_READ) != 0) vm_protection |= VM_PROT_READ;
+        if ((native_protection & PROT_WRITE) != 0) vm_protection |= VM_PROT_WRITE;
+        if ((native_protection & PROT_EXEC) != 0) vm_protection |= VM_PROT_EXECUTE;
+        if (mach_vm_protect(mach_task_self(), exact, (mach_vm_size_t)size, FALSE, vm_protection) == KERN_SUCCESS)
+            return 1;
+        (void)mach_vm_deallocate(mach_task_self(), exact, (mach_vm_size_t)size);
+        return 0;
+    }
+    return mprotect(page, (size_t)size, native_protection) == 0;
+}
+
 static int hl_macos_pread_fill(int descriptor, void *buffer, size_t size, off_t offset) {
     size_t done = 0;
     while (done < size) {
@@ -4319,7 +4343,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
-        hl_macos_unmap_range,      hl_macos_map_anonymous, hl_macos_discard};
+        hl_macos_unmap_range,      hl_macos_map_anonymous, hl_macos_discard, hl_macos_repair_signal_page};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_macos_monotonic,  hl_macos_realtime,
         hl_macos_raw_monotonic, hl_macos_process_cpu, hl_macos_thread_cpu, hl_macos_clock_sleep_until};

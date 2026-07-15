@@ -889,25 +889,20 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
                 hooked = 1;
                 atexit(lazy_diag);
             }
-            // This executes inside a synchronous signal handler. The ordinary host-memory service owns
-            // bookkeeping locks and is intentionally not async-signal-safe, so this emergency one-page
-            // repair remains a native primitive: macOS won't MAP_FIXED over a sub-range of an existing VM
-            // entry (EINVAL); try mprotect first (often a PROT_NONE guard), then a fresh fixed map.
-            if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) == 0) {
+            // This executes inside a synchronous signal handler. Use only the host service's explicitly
+            // signal-context-safe, non-owning exact-page repair; ordinary mapping services take registry locks.
+            /* The accessor only reads immutable process-global pointers. Cache it so the signal path
+             * performs one accessor read followed by one explicitly signal-context-safe provider call. */
+            const hl_host_services *host = effective_host_services();
+            if (host->memory->repair_signal_page(
+                    host->context, pg, UINT64_C(4096),
+                    HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)) {
                 if (adjacent)
                     g_growmaps++;
                 else
                     g_lazymaps++;
                 return;
             }
-            void *r = mmap((void *)pg, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-            if (r != MAP_FAILED) {
-                if (adjacent)
-                    g_growmaps++;
-                else
-                    g_lazymaps++;
-                return;
-            } // retry the faulting instruction
         }
     }
     // a genuine in-translated-code guest fault with no handler and no legitimate lazy mapping ->

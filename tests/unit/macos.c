@@ -30,6 +30,19 @@ static int32_t child_exit_37(void *context) {
     return 37;
 }
 
+typedef struct signal_repair_probe {
+    const hl_host_services *services;
+    uint64_t address;
+    int result;
+} signal_repair_probe;
+
+static void *repair_signal_page_once(void *context) {
+    signal_repair_probe *probe = context;
+    probe->result = probe->services->memory->repair_signal_page(
+        probe->services->context, probe->address, UINT64_C(4096), HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+    return NULL;
+}
+
 static int32_t child_sleep(void *context) {
     struct timespec duration = {0, (long)(intptr_t)context};
     while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
@@ -428,6 +441,33 @@ int main(void) {
                      ->map_anonymous(services.context, UINT64_MAX - page + 2, page, HL_HOST_MEMORY_READ,
                                      HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED, &anonymous)
                      .status == HL_STATUS_INVALID_ARGUMENT);
+    }
+    {
+        long host_page_value = sysconf(_SC_PAGESIZE);
+        size_t host_page = host_page_value > 0 ? (size_t)host_page_value : 16384u;
+        unsigned char *page = mmap(NULL, host_page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        HL_CHECK(page != MAP_FAILED);
+        page[0] = 0x6d;
+        page[host_page > 4096 ? 4096 : host_page - 1] = 0x37;
+        HL_CHECK(mprotect(page, host_page, PROT_NONE) == 0);
+        HL_CHECK(services.memory->repair_signal_page(services.context, (uint64_t)(uintptr_t)page, 4096,
+                                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE));
+        HL_CHECK(page[0] == 0x6d && page[host_page > 4096 ? 4096 : host_page - 1] == 0x37);
+        HL_CHECK(munmap(page, host_page) == 0);
+        HL_CHECK(services.memory->repair_signal_page(services.context, (uint64_t)(uintptr_t)page + 1, 4096,
+                                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE) == 0);
+        HL_CHECK(services.memory->repair_signal_page(services.context, (uint64_t)(uintptr_t)page, 8192,
+                                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE) == 0);
+        signal_repair_probe probes[8];
+        pthread_t threads[8];
+        for (size_t index = 0; index < 8; ++index) {
+            probes[index] = (signal_repair_probe){&services, (uint64_t)(uintptr_t)page, 0};
+            HL_CHECK(pthread_create(&threads[index], NULL, repair_signal_page_once, &probes[index]) == 0);
+        }
+        for (size_t index = 0; index < 8; ++index)
+            HL_CHECK(pthread_join(threads[index], NULL) == 0 && probes[index].result == 1);
+        page[0] = 0x91;
+        HL_CHECK(page[0] == 0x91 && munmap(page, host_page) == 0);
     }
     snprintf(path, sizeof(path), "/tmp/hl_host_macos_%ld", (long)getpid());
     file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),

@@ -6,7 +6,7 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 4u
-#define HL_HOST_MEMORY_ABI 5u
+#define HL_HOST_MEMORY_ABI 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 2u
@@ -218,6 +218,13 @@ typedef struct hl_host_memory_services {
                                     uint32_t protection, uint32_t flags, hl_host_memory_mapping *output);
     /* Retire an ownership handle without changing the process address space. */
     hl_host_result (*discard)(void *context, hl_host_handle mapping);
+    /* Signal-context VM repair. This is an engine contract, not a claim that
+     * arbitrary POSIX VM APIs are generally async-signal-safe. Supported host
+     * implementations use only direct VM operations: no userspace allocation,
+     * locks, logging, ownership registries, or errno-dependent decisions. The
+     * operation first protects an existing exact range, then claims a vacant
+     * exact range without replacement. It never invalidates an owned mapping. */
+    int (*repair_signal_page)(void *context, uint64_t address, uint64_t size, uint32_t protection);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

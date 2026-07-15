@@ -381,6 +381,24 @@ static hl_host_result hl_linux_memory_discard(void *context, hl_host_handle mapp
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static int hl_linux_memory_repair_signal_page(void *context, uint64_t address, uint64_t size,
+                                              uint32_t protection) {
+    (void)context;
+    if (address == 0 || address > UINTPTR_MAX || size != UINT64_C(4096) || (address & UINT64_C(4095)) != 0 ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0)
+        return 0;
+    void *page = (void *)(uintptr_t)address;
+    int native_protection = hl_linux_protection(protection);
+    if (mprotect(page, (size_t)size, native_protection) == 0) return 1;
+#ifdef MAP_FIXED_NOREPLACE
+    if (mmap(page, (size_t)size, native_protection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == page)
+        return 1;
+    return mprotect(page, (size_t)size, native_protection) == 0;
+#else
+    return 0;
+#endif
+}
+
 static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle file, uint64_t requested_address,
                                                uint64_t offset, uint64_t size, uint32_t protection, uint32_t flags,
                                                hl_host_file_mapping *output) {
@@ -3493,7 +3511,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_code_write,   hl_linux_memory_code_write,
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
                                                    hl_linux_memory_unmap_range, hl_linux_memory_map_anonymous,
-                                                   hl_linux_memory_discard};
+                                                   hl_linux_memory_discard,     hl_linux_memory_repair_signal_page};
     static const hl_host_clock_services clock = {
         HL_HOST_CLOCK_ABI,      sizeof(clock),        hl_linux_monotonic,  hl_linux_realtime,
         hl_linux_raw_monotonic, hl_linux_process_cpu, hl_linux_thread_cpu, hl_linux_clock_sleep_until};
