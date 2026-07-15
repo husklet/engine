@@ -41,14 +41,28 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          nix develop --command make -s -j2 test-linux-production-typed 2>&1 | tee "$GITHUB_STEP_SUMMARY"
+          if ! nix develop --command make -s -j2 test-linux-production-typed 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+            message=$(tail -c 6000 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=Linux runtime compatibility failed::$message"
+            exit 1
+          fi
 
       - name: Test macOS compatibility
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -o pipefail
-          nix develop --command make -s -j2 e2e-compat 2>&1 | tee "$GITHUB_STEP_SUMMARY"
+          if ! nix develop --command make -s -j2 e2e-compat 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+            message=$(tail -c 6000 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=macOS runtime compatibility failed::$message"
+            exit 1
+          fi
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
