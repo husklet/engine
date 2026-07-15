@@ -3,6 +3,7 @@
 
 #include "lower/primitives.h"
 #include "lower/alu.h"
+#include "lower/crypto.h"
 #include "lower/mov.h"
 #include "lower/repstr.h"
 #include "lower/shift.h"
@@ -815,8 +816,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/trace.c"
 
-#include "lower/crypto.c"
-
 #include "lower/sse4x.h"
 
 // SSE2 variable-count packed shift (PSLLW/D/Q, PSRLW/D/Q, PSRAW/D by xmm/m): shift every
@@ -1113,6 +1112,7 @@ static void emit_irq_check(uint64_t rip) {
 
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
+    hl_x86_crypto_state crypto_state = {.optimize = !nosseopt()};
     uint64_t start = gpc;
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=x86_64 guest_pc=%#llx", (unsigned long long)gpc);
     void *host = g_cp;
@@ -1121,7 +1121,7 @@ static void *translate_block(uint64_t gpc) {
     // poll cpu->irq at the body entry so a caught async signal reaches a no-syscall guest loop.
     emit_irq_check(start);
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
-    g_v26z = g_v27m = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
+    crypto_state.zero_ready = crypto_state.mask_ready = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
     g_df = HL_X86_DIRECTION_DYNAMIC; // a prior block's std/popfq may have left it set
     hl_x86_x87_reset(); // x87: top unknown at block entry until a finit anchors it
     g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
@@ -1171,7 +1171,7 @@ static void *translate_block(uint64_t gpc) {
             // map the AES-NI / PCLMULQDQ / SHA-NI (SHA-1 + SHA-256, via the hardware ARM SHA
             // extension) crypto opcodes to inline ARM crypto (near-native); everything else
             // (SSSE3/SSE4/CRC32/MOVBE/aeskeygenassist) still exits to do_sse3b.
-            if (translate_crypto(&I, next) == TX_NEXT) {
+            if (hl_x86_lower_crypto(&I, next, &crypto_state) == TX_NEXT) {
                 // (missed in v0.9.19-as-shipped): the inline crypto/shuffle glue WRITES guest xmm
                 // (pshufb->TBL, palignr->EXT, AESENC, PCLMUL, ...) without passing the SSE region's mark, so
                 // a following slim R_SYSCALL exit could skip the xmm save with cpu->V stale. Mark here.
@@ -1664,7 +1664,7 @@ static void *translate_block(uint64_t gpc) {
                 if (s == TX_NEXT) {
                     // A string idiom was emitted; its ERMS funnel may `blr` a host helper, which can
                     // clobber ALL of v16..v31 -- drop the crypto constant-hoist claims (v26/v27).
-                    g_v26z = g_v27m = 0;
+                    crypto_state.zero_ready = crypto_state.mask_ready = 0;
                     gpc = next;
                     continue;
                 }
@@ -2661,8 +2661,8 @@ static void *translate_block(uint64_t gpc) {
                         if (sh > 15) {                               // x86: count > 15 -> result is all-zero
                             e_v3(0x6E201C00u, x, x, x);
                         } else if (sh) { // count 0 is the identity -> emit nothing
-                            if (!g_v26z || nosseopt()) e_v3(0x6E201C00u, 26, 26, 26); // hoisted zero (crypto.c claim)
-                            g_v26z = 1;
+                            if (!crypto_state.zero_ready || nosseopt()) e_v3(0x6E201C00u, 26, 26, 26); // hoisted zero (crypto.c claim)
+                            crypto_state.zero_ready = 1;
                             if (sub == 3)
                                 e_ext(x, x, 26, sh); // psrldq
                             else
@@ -2687,7 +2687,7 @@ static void *translate_block(uint64_t gpc) {
                     } else if (im == 0xB1) { // {1,0,3,2}: swap dwords in each qword = REV64 .4s
                         emit32(0x4EA00800u | (s << 5) | vd);
                     } else if (im == 0x00 || im == 0x55 || im == 0xAA || im == 0xFF) { // broadcast one lane
-                        e_dup_s(vd, s, (int)(im & 3));
+                        hl_x86_emit_vector_broadcast32(vd, s, (int)(im & 3));
                     } else if (vd != s) { // no self-overlap: build directly in the destination (4 insns)
                         for (int i = 0; i < 4; i++)
                             e_ins_s(vd, i, s, (im >> (2 * i)) & 3);

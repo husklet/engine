@@ -90,6 +90,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c \
 	src/translator/guest/x86_64/legacy.c \
 	src/translator/guest/x86_64/lower/alu.c \
+	src/translator/guest/x86_64/lower/crypto.c \
 	src/translator/guest/x86_64/lower/mov.c \
 	src/translator/guest/x86_64/lower/repstr.c \
 	src/translator/guest/x86_64/lower/shift.c \
@@ -193,7 +194,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_mov lower_repstr lower_shift lower_sse4x lower_x87 misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire gmap host_services identity image inotify ir launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_x87 misc native open_plan operand persist pipe pipe_linux placement private process range rep resolve resolve_services rotate shm signal_aarch64 signal_x86_64 system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -594,6 +595,10 @@ $(BUILD)/tests/test_lower_sse4x: tests/unit/test_lower_sse4x.c src/translator/gu
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 $(BUILD)/tests/test_lower_repstr: tests/unit/test_lower_repstr.c src/translator/guest/x86_64/lower/repstr.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+$(BUILD)/tests/test_lower_crypto: tests/unit/test_lower_crypto.c src/translator/guest/x86_64/lower/crypto.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 

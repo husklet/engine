@@ -81,5 +81,15 @@ void e_fcom_setfpsw(int left, int right);
 void hl_x86_emit_load_scalar32(int destination, int address);
 void hl_x86_emit_insert_scalar32(int destination, int destination_lane, int source, int source_lane);
 void hl_x86_emit_vector3(uint32_t base, int destination, int left, int right);
+void hl_x86_emit_vector_copy(int destination, int source);
+void hl_x86_emit_vector_broadcast32(int destination, int source, int lane);
+void hl_x86_emit_vector_extract(int destination, int low, int high, int byte);
+void hl_x86_emit_vector_insert32(int destination, int destination_lane, int source, int source_lane);
+void hl_x86_emit_vector_insert64(int destination, int destination_lane, int source, int source_lane);
+void hl_x86_emit_vector_shift_right(int destination, int source, int width, int shift, int arithmetic);
+void hl_x86_emit_vector_load128(int destination, int address, int offset);
+void hl_x86_emit_vector_load64(int destination, int address);
+void hl_x86_emit_vector_load32(int destination, int address);
+void hl_x86_emit_constant_part(int destination, uint32_t immediate, int shift);
 
 #endif

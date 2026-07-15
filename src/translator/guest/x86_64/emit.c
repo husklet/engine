@@ -33,6 +33,10 @@ static void e_movk(int rd, uint32_t imm16, int sh) {
     emit32(0xF2800000u | (sh << 21) | (imm16 << 5) | rd);
 }
 
+void hl_x86_emit_constant_part(int destination, uint32_t immediate, int shift) {
+    e_movk(destination, immediate, shift);
+}
+
 static void e_br(int rn) {
     emit32(0xD61F0000u | (rn << 5));
 }
@@ -455,6 +459,10 @@ static void g_ldr_q(int t, int rn, int off) {
     e_dmb_ishld();
 }
 
+void hl_x86_emit_vector_load128(int destination, int address, int offset) {
+    g_ldr_q(destination, address, offset);
+}
+
 static void g_str_q(int t, int rn, int off) {
     if (rn == 17) emit_bus_guard_mem17(16, off);
     e_dmb_ish();
@@ -466,6 +474,8 @@ void g_ldr_d(int t, int rn) {
     e_ldr_d(t, rn);
     e_dmb_ishld();
 }
+
+void hl_x86_emit_vector_load64(int destination, int address) { g_ldr_d(destination, address); }
 
 void g_str_d(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(8, 0);
@@ -480,6 +490,8 @@ static void g_ldr_s(int t, int rn) {
 }
 
 void hl_x86_emit_load_scalar32(int destination, int address) { g_ldr_s(destination, address); }
+
+void hl_x86_emit_vector_load32(int destination, int address) { g_ldr_s(destination, address); }
 
 static void g_str_s(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(4, 0);
@@ -507,6 +519,13 @@ static void e_vmov(int vd, int vn) {
     emit32(0x4EA01C00u | (vn << 16) | (vn << 5) | vd);
 } // mov vd.16b, vn.16b (orr)
 
+void hl_x86_emit_vector_copy(int destination, int source) { e_vmov(destination, source); }
+
+void hl_x86_emit_vector_broadcast32(int destination, int source, int lane) {
+    emit32(UINT32_C(0x4E000400) | ((uint32_t)((lane << 3) | 4) << 16) | ((uint32_t)source << 5) |
+           (uint32_t)destination);
+}
+
 static void e_vmov8(int vd, int vn) {
     emit32(0x0EA01C00u | (vn << 16) | (vn << 5) | vd);
 } // mov vd.8b, vn.8b (low 64, zero upper)
@@ -515,11 +534,19 @@ static void e_ins_d(int vd, int ld, int vn, int ls) { // ins vd.d[ld], vn.d[ls]
     emit32(0x6E000400u | ((unsigned)((ld << 4) | 8) << 16) | ((unsigned)(ls << 3) << 11) | (vn << 5) | vd);
 }
 
+void hl_x86_emit_vector_insert64(int destination, int destination_lane, int source, int source_lane) {
+    e_ins_d(destination, destination_lane, source, source_lane);
+}
+
 static void e_ins_s(int vd, int ls_lane, int vn, int sl) { // ins vd.s[ls_lane], vn.s[sl]
     emit32(0x6E000400u | ((unsigned)((ls_lane << 3) | 4) << 16) | ((unsigned)(sl << 2) << 11) | (vn << 5) | vd);
 }
 
 void hl_x86_emit_insert_scalar32(int destination, int destination_lane, int source, int source_lane) {
+    e_ins_s(destination, destination_lane, source, source_lane);
+}
+
+void hl_x86_emit_vector_insert32(int destination, int destination_lane, int source, int source_lane) {
     e_ins_s(destination, destination_lane, source, source_lane);
 }
 
@@ -587,6 +614,10 @@ static void e_vshr_imm(int vd, int vn, int esize, int sh, int sgn) {
     emit32((sgn ? 0x4F000400u : 0x6F000400u) | (immhb << 16) | (vn << 5) | vd);
 }
 
+void hl_x86_emit_vector_shift_right(int destination, int source, int width, int shift, int arithmetic) {
+    e_vshr_imm(destination, source, width, shift, arithmetic);
+}
+
 static void e_vshl_imm(int vd, int vn, int esize, int sh) {
     if (sh <= 0) {
         e_vmov(vd, vn);
@@ -602,6 +633,10 @@ static void e_vshl_imm(int vd, int vn, int esize, int sh) {
 
 static void e_ext(int vd, int vn, int vm, int idx) {
     emit32(0x6E000000u | (vm << 16) | ((idx & 0xF) << 11) | (vn << 5) | vd);
+}
+
+void hl_x86_emit_vector_extract(int destination, int low, int high, int byte) {
+    e_ext(destination, low, high, byte);
 }
 
 static void e_v3(uint32_t base, int vd, int vn, int vm) {
