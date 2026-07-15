@@ -19,9 +19,11 @@ enum hl_linux_file_event_kind {
 };
 typedef void (*hl_linux_file_event_fn)(void *opaque, uint32_t kind, uint64_t device, uint64_t object,
                                        uint64_t first, uint64_t second);
-int hl_linux_file_events_enable(void);
-void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first, uint64_t second);
-void hl_linux_file_events_set_callback(hl_linux_file_event_fn callback, void *opaque);
+/* Per-target runtime state: activation archives contain both guest targets. */
+static int hl_linux_file_events_enable(void);
+static void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first,
+                                        uint64_t second);
+static void hl_linux_file_events_set_callback(hl_linux_file_event_fn callback, void *opaque);
 
 /* Serializes an externally observed host mapping change with translated guest
    memory.  begin() synchronously parks pre-guard translations; end() publishes

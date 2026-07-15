@@ -410,7 +410,7 @@ static void filemap_events_init_locked(void) {
     g_filemap_cursor = 0;
 }
 
-int hl_linux_file_events_enable(void) {
+static int hl_linux_file_events_enable(void) {
     pthread_mutex_lock(&g_filemap_lock);
     filemap_events_init_locked();
     int enabled = g_filemap_events != NULL;
@@ -418,7 +418,7 @@ int hl_linux_file_events_enable(void) {
     return enabled ? 0 : -1;
 }
 
-void hl_linux_file_events_set_callback(hl_linux_file_event_fn callback, void *opaque) {
+static void hl_linux_file_events_set_callback(hl_linux_file_event_fn callback, void *opaque) {
     pthread_mutex_lock(&g_filemap_replay_lock);
     g_file_event_callback = callback;
     g_file_event_opaque = opaque;
@@ -438,7 +438,8 @@ static void filemap_publish(uint32_t kind, uint64_t device, uint64_t inode, uint
     atomic_store_explicit(&event->sequence, ticket + 1, memory_order_release);
 }
 
-void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first, uint64_t second) {
+static void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first,
+                                        uint64_t second) {
     if (kind == HL_LINUX_FILE_EVENT_RESIZE || kind == HL_LINUX_FILE_EVENT_WRITE)
         filemap_publish(kind, device, object, first, second);
 }
