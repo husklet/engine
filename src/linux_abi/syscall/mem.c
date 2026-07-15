@@ -273,7 +273,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // gmap-tracked region) and any fully-tracked PROT_NONE reservation skip the page-walk probe -- zero
         // cost and no false EFAULT there; only an untracked / partially-covered source is validated against
         // the live address space (host_range_mapped rejects both an unmapped page and a PROT_NONE page).
-        if (a1 && !gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
+        if (a1 && !hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -609,7 +609,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // result and on guest-owned coverage, so every already-correct placement (incl. all of node's, which
         // macOS honors) and anything touching engine-internal memory is left byte-identical and untouched.
         if (r != MAP_FAILED && a0 && (uint64_t)(uintptr_t)r != a0 && !(a3 & 0x10) && (a3 & 0x20) &&
-            a0 >= 0x100000000ull && gmap_contains(a0, (uint64_t)a1 + guard)) {
+            a0 >= 0x100000000ull && hl_gmap_contains(a0, (uint64_t)a1 + guard)) {
             void *fr = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3) | MAP_FIXED, -1, 0);
             if (fr != MAP_FAILED) {
                 munmap(r, (size_t)a1 + guard); // drop the relocated placement macOS chose
@@ -716,15 +716,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // fake success. Reject a range that is neither a tracked guest mapping (gmap -- covers ELF image /
             // stack / brk / anon+file mmap, INCLUDING a guest PROT_NONE reservation, which the host_range_mapped
             // probe would call unmapped) nor physically mapped host-side. Same regression-free idiom the mremap
-            // source validation (case 216) uses: a hot mprotect on the guest's own memory hits gmap_contains
+            // source validation (case 216) uses: a hot mprotect on the guest's own memory hits hl_gmap_contains
             // (no probe cost, no false ENOMEM); only a genuinely unmapped range is rejected.
             // NON-PIE: the ET_EXEC image is force-mapped HIGH (addr+g_nonpie_bias, __PAGEZERO forbids the low
             // 4 GB) but the guest still names its image by the LOW link vaddr -- static glibc's RELRO
             // mprotect(_dl_protect_relro) passes that low address, which is mapped only at the rebased VA. So
             // a low-range miss must re-check at nonpie_p(a0) before ENOMEM (inert for PIE: nonpie_p == a0).
-            if (!gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
+            if (!hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
                 // (open-coded nonpie_p: dispatch.c defines it AFTER this module in the TU)
-                if (physical_a0 == a0 || (!gmap_contains(physical_a0, (uint64_t)a1) &&
+                if (physical_a0 == a0 || (!hl_gmap_contains(physical_a0, (uint64_t)a1) &&
                                           !host_range_mapped((uintptr_t)physical_a0, (size_t)a1))) {
                     G_RET(c) = (uint64_t)(-ENOMEM);
                     break;
