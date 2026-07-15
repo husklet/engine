@@ -189,6 +189,8 @@ static void e_nzcv_save_ci(void) {  // save flags, inverting C (scratch x22: x21
     emit32(0xD51B4200u | 20); // also sync live ARM nzcv (msr) so spill persists the corrected value
 }
 
+void hl_x86_emit_flags_load(void) { e_nzcv_load(); }
+
 static void e_nzcv_load_ci(void) { // load flags into live nzcv, inverting C
     e_ldr(20, 28, OFF_NZCV);
     e_movconst(22, 1u << 29);

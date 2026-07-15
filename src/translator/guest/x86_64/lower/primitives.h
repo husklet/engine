@@ -26,6 +26,7 @@ void hl_x86_emit_spill(void);
 void hl_x86_emit_reload(void);
 void hl_x86_emit_host_pointer(int destination, uint64_t pointer);
 void hl_x86_emit_vector_reset(void);
+void hl_x86_emit_flags_load(void);
 uint32_t *hl_x86_emit_cursor(void);
 uint64_t hl_x86_guest_pointer(uint64_t address);
 void hl_x86_count_rep_movs(void);
