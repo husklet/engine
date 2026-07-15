@@ -200,7 +200,15 @@ int main(void) {
     }
     for (size_t index = SUBSCRIPTION_COUNT; index != 0; --index)
         HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[index - 1]).status == HL_STATUS_OK);
-    HL_CHECK(services.counter->unsubscribe(services.context, subscriptions[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    {
+        hl_host_handle stale = subscriptions[0];
+        hl_host_result replacement =
+            services.counter->subscribe(services.context, counters[0], capacity_notify, NULL, UINT64_C(9001));
+        HL_CHECK(replacement.status == HL_STATUS_OK);
+        HL_CHECK(replacement.value != stale);
+        HL_CHECK(services.counter->unsubscribe(services.context, stale).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.counter->unsubscribe(services.context, replacement.value).status == HL_STATUS_OK);
+    }
     for (size_t index = COUNTER_COUNT; index != 0; --index)
         HL_CHECK(services.counter->close(services.context, counters[index - 1]).status == HL_STATUS_OK);
     {
