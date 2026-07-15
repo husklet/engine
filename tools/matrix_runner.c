@@ -83,6 +83,11 @@ static int resources_restored(resource_baseline baseline, const suite_case *item
     int descriptor_clean = baseline.descriptors < 0 || current.descriptors == baseline.descriptors;
     int thread_clean = baseline.threads < 0 || current.threads == baseline.threads;
     if (child_clean && descriptor_clean && thread_clean) return 1;
+    if (getenv("GITHUB_ACTIONS") != NULL)
+        fprintf(stderr, "::error title=Compatibility resource leak (%s)::children=%s descriptors=%ld/%ld "
+                        "threads=%ld/%ld\n",
+                item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors,
+                baseline.threads, current.threads);
     fprintf(stderr,
             "matrix-runner: %s resource leak: children=%s descriptors=%ld/%ld threads=%ld/%ld\n",
             item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors, baseline.threads,
