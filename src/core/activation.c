@@ -1,0 +1,269 @@
+#include "hl/activation.h"
+#include "engine_backend.h"
+#include "launch.h"
+#if defined(__APPLE__)
+#include "hl/macos.h"
+typedef hl_host_macos hl_activation_host;
+#define hl_activation_host_create hl_host_macos_create
+#define hl_activation_host_destroy hl_host_macos_destroy
+#elif defined(__linux__)
+#include "hl/linux.h"
+typedef hl_host_linux hl_activation_host;
+#define hl_activation_host_create hl_host_linux_create
+#define hl_activation_host_destroy hl_host_linux_destroy
+#else
+#error unsupported activation host
+#endif
+
+#include <errno.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+void hl_activation_test_mode(uint32_t mode);
+
+enum { HL_ACTIVATION_FD = 198, HL_ACTIVATION_ABI = 1, HL_ACTIVATION_PATH_MAX = 4096 };
+#define HL_ACTIVATION_MAGIC UINT64_C(0x484c414354495631)
+
+typedef struct hl_activation_request {
+    uint64_t magic;
+    uint32_t abi;
+    uint32_t size;
+    uint64_t nonce[2];
+    uint32_t guest_isa;
+    uint32_t path_size;
+    uint32_t test_flags;
+    uint32_t reserved;
+    char path[HL_ACTIVATION_PATH_MAX];
+} hl_activation_request;
+
+typedef struct hl_activation_reply {
+    uint64_t magic;
+    uint32_t abi;
+    uint32_t size;
+    uint64_t nonce[2];
+    int32_t status;
+    uint32_t reserved;
+    hl_engine_exit result;
+} hl_activation_reply;
+
+static int transfer(int fd, void *data, size_t size, int writing) {
+    unsigned char *bytes = data;
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t count = writing ? send(fd, bytes + offset, size - offset, 0) : read(fd, bytes + offset, size - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        offset += (size_t)count;
+    }
+    return 0;
+}
+
+void hl_aarch64_target_register_backend(void);
+void hl_x86_64_target_register_backend(void);
+void hl_aarch64_target_runtime_init(void);
+void hl_x86_64_target_runtime_init(void);
+void hl_host_private_init(void);
+void hl_fdcache_runtime_init(void);
+
+static void hl_embedded_runtime_init(uint32_t guest_isa) {
+    hl_host_private_init();
+    hl_fdcache_runtime_init();
+    hl_aarch64_target_register_backend();
+    hl_x86_64_target_register_backend();
+    if (guest_isa == HL_GUEST_ISA_AARCH64)
+        hl_aarch64_target_runtime_init();
+    else
+        hl_x86_64_target_runtime_init();
+}
+
+static hl_host_services *activation_services;
+static uint32_t activation_guest_isa;
+static hl_engine_exit *activation_result;
+static hl_status activation_status;
+
+static int activation_run_config(const char *rootfs, uint32_t argc, char *const argv[],
+                                 const hl_options *options, const char *result_path) {
+    hl_engine_fd_binding bindings[3] = {0};
+    hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config),
+                               .guest_isa = activation_guest_isa, .rootfs = rootfs};
+    hl_engine *engine = NULL;
+    uint32_t count = 0;
+    uint32_t stream;
+    (void)result_path;
+    for (stream = 0; stream < 3; ++stream) {
+        hl_host_result adopted = activation_services->file->standard_stream(activation_services->context, stream);
+        if (adopted.status != HL_STATUS_OK) { activation_status = (hl_status)adopted.status; return 78; }
+        bindings[count] = (hl_engine_fd_binding){.abi = HL_ENGINE_ABI, .size = sizeof(bindings[count]),
+                                                 .guest_fd = stream, .ownership = HL_ENGINE_FD_TRANSFER,
+                                                 .host_handle = adopted.value};
+        ++count;
+    }
+    config.fd_bindings = bindings;
+    config.fd_binding_count = count;
+    activation_status = hl_engine_create_with_options(&config, activation_services, options, &engine);
+    if (activation_status == HL_STATUS_OK)
+        activation_status = hl_engine_run(engine, (int)argc, (const char *const *)argv, activation_result);
+    hl_engine_destroy(engine);
+    return activation_status == HL_STATUS_OK ? 0 : 78;
+}
+
+static void hl_activation_child(void) {
+    const char *value = getenv("HL_ACTIVATION_FD");
+    hl_activation_request request;
+    hl_activation_reply reply = {0};
+    hl_activation_host *host = NULL;
+    hl_host_services services;
+    char *end = NULL;
+    long descriptor;
+    hl_status status = HL_STATUS_CORRUPT;
+    unsigned char commit;
+    if (value == NULL) return;
+    descriptor = strtol(value, &end, 10);
+    (void)unsetenv("HL_ACTIVATION_FD");
+    if (end == value || *end != 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
+    if (transfer((int)descriptor, &request, sizeof(request), 0) != 0) _exit(126);
+    reply.magic = HL_ACTIVATION_MAGIC;
+    reply.abi = HL_ACTIVATION_ABI;
+    reply.size = sizeof(reply);
+    reply.nonce[0] = request.nonce[0];
+    reply.nonce[1] = request.nonce[1];
+    reply.result.abi = HL_ENGINE_ABI;
+    reply.result.size = sizeof(reply.result);
+    if (request.test_flags == 1) reply.nonce[0] ^= UINT64_C(1);
+    if (request.magic == HL_ACTIVATION_MAGIC && request.abi == HL_ACTIVATION_ABI &&
+        request.size == sizeof(request) && request.path_size > 1 && request.path_size <= sizeof(request.path) &&
+        request.path[0] == '/' && request.path[request.path_size - 1] == 0 &&
+        (request.guest_isa == HL_GUEST_ISA_AARCH64 || request.guest_isa == HL_GUEST_ISA_X86_64)) {
+        reply.status = HL_STATUS_OK;
+        if (transfer((int)descriptor, &reply, sizeof(reply), 1) != 0 ||
+            transfer((int)descriptor, &commit, 1, 0) != 0 || commit != 0xa5u) _exit(124);
+        /* Explicit setup is idempotent and independent of constructor order. */
+        hl_embedded_runtime_init(request.guest_isa);
+        hl_embedded_runtime_init(request.guest_isa);
+        status = hl_activation_host_create(&host, &services);
+        activation_services = &services;
+        activation_guest_isa = request.guest_isa;
+        activation_result = &reply.result;
+        activation_status = status;
+        if (status == HL_STATUS_OK && hl_run_config_file_with(request.path, activation_run_config) != 0 &&
+            activation_status == HL_STATUS_OK) activation_status = HL_STATUS_CORRUPT;
+        status = activation_status;
+    } else {
+        (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
+        _exit(127);
+    }
+    reply.status = (int32_t)status;
+    (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
+    hl_activation_host_destroy(host);
+    (void)close((int)descriptor);
+    _exit(status == HL_STATUS_OK ? 0 : 127);
+}
+
+static uint32_t activation_test_mode;
+
+void hl_activation_test_mode(uint32_t mode) {
+    activation_test_mode = mode;
+}
+
+__attribute__((constructor)) static void hl_activation_constructor(void) {
+    hl_activation_child();
+}
+
+hl_status hl_activation_spawn(const char *executable, uint32_t guest_isa, const char *guest,
+                              hl_engine_exit *out_exit) {
+    int pair[2];
+    pid_t child;
+    posix_spawn_file_actions_t actions;
+    hl_activation_request request = {0};
+    hl_activation_reply reply;
+    char activation[] = "HL_ACTIVATION_FD=198";
+    char *child_argv[2];
+    char **child_env;
+    size_t env_count = 0;
+    size_t env_output = 0;
+    size_t path_size;
+    int waited;
+    uint32_t test_mode;
+    if (executable == NULL || guest == NULL || executable[0] != '/' || guest[0] != '/' || out_exit == NULL ||
+        (guest_isa != HL_GUEST_ISA_AARCH64 && guest_isa != HL_GUEST_ISA_X86_64))
+        return HL_STATUS_INVALID_ARGUMENT;
+    path_size = strlen(guest) + 1;
+    if (path_size > sizeof(request.path)) return HL_STATUS_INVALID_ARGUMENT;
+    while (environ[env_count] != NULL) ++env_count;
+    child_env = calloc(env_count + 2, sizeof(*child_env));
+    if (child_env == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    for (env_count = 0; environ[env_count] != NULL; ++env_count)
+        if (strncmp(environ[env_count], "HL_ACTIVATION_FD=", 17) != 0) child_env[env_output++] = environ[env_count];
+    child_env[env_output] = activation;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { free(child_env); return HL_STATUS_PLATFORM_FAILURE; }
+#if defined(__APPLE__)
+    { int enabled = 1; if (setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0 ||
+                           setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
+        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+    } }
+#endif
+    if (fcntl(pair[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(pair[1], F_SETFD, FD_CLOEXEC) != 0) {
+        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+    }
+    request.magic = HL_ACTIVATION_MAGIC;
+    request.abi = HL_ACTIVATION_ABI;
+    request.size = sizeof(request);
+    request.guest_isa = guest_isa;
+    request.path_size = (uint32_t)path_size;
+    test_mode = activation_test_mode;
+    request.test_flags = test_mode == 1 ? 1u : 0u;
+    if (test_mode == 2) request.magic ^= UINT64_C(1);
+    activation_test_mode = 0;
+    memcpy(request.path, guest, path_size);
+    arc4random_buf(request.nonce, sizeof(request.nonce));
+    child_argv[0] = (char *)(uintptr_t)executable;
+    child_argv[1] = NULL;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+    }
+    if (posix_spawn_file_actions_adddup2(&actions, pair[1], HL_ACTIVATION_FD) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, pair[0]) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, pair[1]) != 0) {
+        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
+    if (posix_spawn(&child, executable, &actions, NULL, child_argv, child_env) != 0) {
+        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    close(pair[1]);
+    free(child_env);
+    if (transfer(pair[0], &request, test_mode == 3 ? sizeof(request) / 2u : sizeof(request), 1) != 0) {
+        close(pair[0]); while (waitpid(child, &waited, 0) < 0 && errno == EINTR) {} return HL_STATUS_CORRUPT;
+    }
+    if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
+    if (transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
+        close(pair[0]); while (waitpid(child, &waited, 0) < 0 && errno == EINTR) {} return HL_STATUS_CORRUPT;
+    }
+    if (reply.magic != request.magic || reply.abi != request.abi || reply.size != sizeof(reply) ||
+        memcmp(reply.nonce, request.nonce, sizeof(request.nonce)) != 0 || reply.status != HL_STATUS_OK) {
+        close(pair[0]); while (waitpid(child, &waited, 0) < 0 && errno == EINTR) {} return HL_STATUS_CORRUPT;
+    }
+    { unsigned char commit = 0xa5u; if (transfer(pair[0], &commit, 1, 1) != 0 ||
+          transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
+        close(pair[0]); while (waitpid(child, &waited, 0) < 0 && errno == EINTR) {} return HL_STATUS_CORRUPT;
+    } }
+    close(pair[0]);
+    while (waitpid(child, &waited, 0) < 0 && errno == EINTR) {}
+    if (reply.magic != HL_ACTIVATION_MAGIC || reply.abi != HL_ACTIVATION_ABI || reply.size != sizeof(reply) ||
+        memcmp(reply.nonce, request.nonce, sizeof(request.nonce)) != 0 ||
+        reply.status < HL_STATUS_OK || reply.status > HL_STATUS_ADDRESS_IN_USE) return HL_STATUS_CORRUPT;
+    if (!WIFEXITED(waited) || (reply.status == HL_STATUS_OK ? WEXITSTATUS(waited) != 0 : WEXITSTATUS(waited) != 127))
+        return HL_STATUS_CORRUPT;
+    *out_exit = reply.result;
+    return (hl_status)reply.status;
+}

@@ -64,6 +64,8 @@ MAC_CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_TRANSLATOR_OBJECTS := $(IR_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_LINUX_ABI_OBJECTS := $(MAC_LINUX_ABI_SOURCES:%.c=$(BUILD)/mac/%.o)
 MAC_HOST_OBJECTS := $(MAC_HOST_SOURCES:%.c=$(BUILD)/mac/%.o)
+EMBEDDED_MAC_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(MAC_LINUX_ABI_SOURCES) $(MAC_HOST_SOURCES)
+EMBEDDED_MAC_OBJECTS := $(EMBEDDED_MAC_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
 MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
 	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES) $(COMMON_HOST_SOURCES)
@@ -262,6 +264,10 @@ $(BUILD)/src/%.o: src/%.c
 $(BUILD)/mac/%.o: %.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/mac/embedded/%.o: %.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) -DHL_EMBEDDED_BUILD=1 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/lib/libhl-engine.a: $(MAC_CORE_OBJECTS)
 	@mkdir -p $(@D)
@@ -1126,26 +1132,31 @@ $(BUILD)/mac/lifecycle/x86_64-core.o: src/core/lifecycle.c
 
 $(BUILD)/mac/dual/aarch64-target.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -DHL_TARGET_NAMESPACE=aarch64 -O2 $(DEPFLAGS) -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 -DHL_TARGET_NAMESPACE=aarch64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/dual/x86_64-target.o: src/core/target/x86_64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_ENGINE_NO_MAIN=1 -DHL_TARGET_NAMESPACE=x86_64 -O2 $(DEPFLAGS) -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 -DHL_TARGET_NAMESPACE=x86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/dual/aarch64-core.o: src/core/lifecycle.c src/core/target/namespace.h
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_TARGET_NAMESPACE=aarch64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_EMBEDDED_BUILD=1 -DHL_TARGET_NAMESPACE=aarch64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/dual/x86_64-core.o: src/core/lifecycle.c src/core/target/namespace.h
 	@mkdir -p $(@D)
-	$(MAC) clang $(CPPFLAGS) -DHL_TARGET_NAMESPACE=x86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
+	$(MAC) clang $(CPPFLAGS) -DHL_EMBEDDED_BUILD=1 -DHL_TARGET_NAMESPACE=x86_64 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/mac/dual/dispatch.o: src/core/target/dual.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/mac/dual/activation.o: src/core/activation.c include/hl/activation.h
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) $(ENGINE_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/mac/lib/libhl-engine-dual.a: $(BUILD)/mac/dual/aarch64-target.o $(BUILD)/mac/dual/x86_64-target.o \
-	$(BUILD)/mac/dual/aarch64-core.o $(BUILD)/mac/dual/x86_64-core.o $(BUILD)/mac/dual/dispatch.o $(MAC_LIBS)
+	$(BUILD)/mac/dual/aarch64-core.o $(BUILD)/mac/dual/x86_64-core.o $(BUILD)/mac/dual/dispatch.o \
+	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS)
 	@mkdir -p $(@D)
 	$(MAC) libtool -static -o $@ $^
 
@@ -1156,9 +1167,11 @@ $(BUILD)/tools/dual-backend-e2e: tools/dual_backend_e2e_runner.c $(BUILD)/mac/li
 	$(MAC) codesign -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 .PHONY: test-dual-backend
-test-dual-backend: $(BUILD)/tools/dual-backend-e2e $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64
-	$(BUILD)/tools/dual-backend-e2e $(abspath $(BUILD)/e2e/guest-exit-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit-x86_64)
+test-dual-backend: $(BUILD)/tools/dual-backend-e2e $(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64
+	$(abspath $(BUILD)/tools/dual-backend-e2e) $(abspath $(BUILD)/e2e/guest-exit-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) $(abspath $(BUILD)/e2e/guest-exit70-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-x86_64)
 
 $(BUILD)/mac/lifecycle/aarch64-runner.o: tools/lifecycle_e2e_runner.c
 	@mkdir -p $(@D)
