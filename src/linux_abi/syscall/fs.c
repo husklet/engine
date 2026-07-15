@@ -3141,7 +3141,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // cacheable: named path, follow
         if (raw && raw[0] && !(a3 & 0x100)) {
             int rc;
-            if (!mc_lookup(p, &rc, &s)) {
+            if (!hl_fdcache_metadata_lookup(p, &rc, &s)) {
                 int r = fstatat(ATFD(a0), p, &s, 0);
                 rc = r < 0 ? -errno : 0;
                 mc_store(p, rc, &s);
@@ -3347,7 +3347,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // cacheable (only the follow case -- the path cache doesn't distinguish follow vs nofollow)
         else if (raw && raw[0] && !empty && !nofollow) {
-            if (!mc_lookup(p, &rc, &s)) {
+            if (!hl_fdcache_metadata_lookup(p, &rc, &s)) {
                 int rr = fstatat(ATFD(a0), p, &s, 0);
                 rc = rr < 0 ? -errno : 0;
                 mc_store(p, rc, &s);

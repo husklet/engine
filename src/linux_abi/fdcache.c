@@ -219,7 +219,7 @@ static uint64_t mc_hash(const char *s) {
     return h ? h : 1;
 }
 
-int mc_lookup(const char *p, int *rc, struct stat *out) {
+int hl_fdcache_metadata_lookup(const char *p, int *rc, struct stat *out) {
     if (!p || strlen(p) >= 192) return 0;
     CLK;
     int hit = 0;
