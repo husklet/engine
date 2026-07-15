@@ -1,5 +1,4 @@
-// Authoritative engine option registry.
-//
+// Authoritative engine option registry and instance-owned value store.
 #include "options.h"
 
 #include <stddef.h>
@@ -12,34 +11,18 @@ typedef struct hl_option_definition {
     const char *purpose;
     uint8_t ownership;
     uint8_t shape;
-    char *value;
-    size_t value_size;
 } hl_option_definition;
 
-enum hl_option_ownership {
-    HL_OPTION_LAUNCH_INPUT = 1,
-    HL_OPTION_INTERNAL_STATE = 2,
-    HL_OPTION_DEBUG_ONLY = 3,
-};
+enum hl_option_ownership { HL_OPTION_LAUNCH_INPUT = 1, HL_OPTION_INTERNAL_STATE = 2, HL_OPTION_DEBUG_ONLY = 3 };
+enum hl_option_shape { HL_OPTION_TEXT = 1, HL_OPTION_PATH = 2, HL_OPTION_INTEGER = 3, HL_OPTION_FLAG = 4, HL_OPTION_RECORDS = 5 };
 
-enum hl_option_shape {
-    HL_OPTION_TEXT = 1,
-    HL_OPTION_PATH = 2,
-    HL_OPTION_INTEGER = 3,
-    HL_OPTION_FLAG = 4,
-    HL_OPTION_RECORDS = 5,
-};
-
-#define HL_LAUNCH_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_LAUNCH_INPUT, shape, NULL, 0}
-#define HL_INTERNAL_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_INTERNAL_STATE, shape, NULL, 0}
-#define HL_DEBUG_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_DEBUG_ONLY, shape, NULL, 0}
+#define HL_LAUNCH_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_LAUNCH_INPUT, shape}
+#define HL_INTERNAL_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_INTERNAL_STATE, shape}
+#define HL_DEBUG_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_DEBUG_ONLY, shape}
 
 enum { HL_OPTION_STORE_LIMIT = 64 * 1024 * 1024 };
 
-static size_t hl_option_store_size;
-
-static hl_option_definition hl_option_definitions[] = {
-    /* Public launch-config inputs and their process-local representation. */
+static const hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_CHECKPOINT_DIR", "aarch64 checkpoint output directory", HL_OPTION_PATH),
     HL_LAUNCH_OPTION("HL_CPUS", "guest-visible CPU quota", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_CWD", "initial guest working directory", HL_OPTION_PATH),
@@ -58,8 +41,7 @@ static hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_PCACHE_DIR", "persistent translated-code cache storage", HL_OPTION_PATH),
     HL_LAUNCH_OPTION("HL_PIDS_MAX", "guest process limit", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_PUBLISH", "guest-to-host port publication rules", HL_OPTION_RECORDS),
-    HL_LAUNCH_OPTION("HL_PUBLISH_DAEMON", "suppress engine listeners because the host daemon publishes ports",
-                     HL_OPTION_FLAG),
+    HL_LAUNCH_OPTION("HL_PUBLISH_DAEMON", "host daemon publishes guest ports", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_RESTORE_DIR", "aarch64 checkpoint directory selected for restore", HL_OPTION_PATH),
     HL_LAUNCH_OPTION("HL_ROOTFS_RO", "mount the guest root filesystem read-only", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_SANDBOX", "apply host confinement to the untrusted worker", HL_OPTION_FLAG),
@@ -67,78 +49,134 @@ static hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_ULIMITS", "serialized Linux resource limits", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_UNTRUSTED", "route host-authority operations through the sentry", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_VOLUMES", "guest volume mount specification", HL_OPTION_RECORDS),
-
-    /* State produced by guest exec/launch translation, never an independent public input. */
     HL_INTERNAL_OPTION("HL_GUEST_ENV_ESC", "guest environment uses escaped record encoding", HL_OPTION_FLAG),
     HL_INTERNAL_OPTION("HL_GUEST_ENV_EXACT", "guest exec environment suppresses engine defaults", HL_OPTION_FLAG),
-
-    /* Compile-time-disabled in production; ambient ingestion is guarded by HL_ENABLE_LOGGING. */
     HL_DEBUG_OPTION("HL_LOG", "debug-build logging tag selector", HL_OPTION_TEXT),
 };
 
-static hl_option_definition *hl_option_find(const char *name) {
+#define HL_OPTION_COUNT (sizeof hl_option_definitions / sizeof hl_option_definitions[0])
+
+static _Thread_local hl_options *hl_bound_options;
+static hl_options *hl_process_options;
+static _Thread_local hl_options hl_default_options;
+static _Thread_local int hl_default_options_ready;
+
+static size_t hl_option_index(const char *name) {
     size_t index;
-    if (name == NULL) return NULL;
-    for (index = 0; index < sizeof hl_option_definitions / sizeof hl_option_definitions[0]; index++)
-        if (strcmp(name, hl_option_definitions[index].name) == 0) return &hl_option_definitions[index];
-    return NULL;
+    if (name != NULL)
+        for (index = 0; index < HL_OPTION_COUNT; ++index)
+            if (strcmp(name, hl_option_definitions[index].name) == 0) return index;
+    return HL_OPTION_COUNT;
 }
 
-const char *hl_option_get(const char *name) {
-    hl_option_definition *definition = hl_option_find(name);
-    if (definition == NULL) return NULL;
-    return definition->value;
+int hl_options_init(hl_options *options) {
+    if (options == NULL) return -1;
+    memset(options, 0, sizeof(*options));
+    options->values = (char **)calloc(HL_OPTION_COUNT, sizeof(*options->values));
+    options->value_sizes = (size_t *)calloc(HL_OPTION_COUNT, sizeof(*options->value_sizes));
+    if (options->values == NULL || options->value_sizes == NULL) {
+        free(options->values);
+        free(options->value_sizes);
+        memset(options, 0, sizeof(*options));
+        return -1;
+    }
+    options->value_count = HL_OPTION_COUNT;
+    return 0;
+}
+
+void hl_options_destroy(hl_options *options) {
+    size_t index;
+    if (options == NULL) return;
+    if (options->values != NULL)
+        for (index = 0; index < options->value_count; ++index) free(options->values[index]);
+    free(options->values);
+    free(options->value_sizes);
+    memset(options, 0, sizeof(*options));
+}
+
+const char *hl_options_get(const hl_options *options, const char *name) {
+    size_t index = hl_option_index(name);
+    if (options == NULL || options->values == NULL || index >= options->value_count) return NULL;
+    return options->values[index];
 }
 
 static size_t hl_option_value_size(const char *value) {
     size_t length;
-    for (length = 0; length < HL_OPTION_STORE_LIMIT; length++)
+    for (length = 0; length < HL_OPTION_STORE_LIMIT; ++length)
         if (value[length] == 0) return length + 1;
     return 0;
 }
 
-int hl_option_set(const char *name, const char *value, int overwrite) {
-    hl_option_definition *definition = hl_option_find(name);
-    size_t value_size;
+int hl_options_set(hl_options *options, const char *name, const char *value, int overwrite) {
+    size_t index = hl_option_index(name), value_size;
     char *copy;
-    if (definition == NULL || value == NULL) return -1;
-    if (!overwrite && definition->value != NULL) return 0;
+    if (options == NULL || options->values == NULL || index >= options->value_count || value == NULL) return -1;
+    if (!overwrite && options->values[index] != NULL) return 0;
     value_size = hl_option_value_size(value);
-    if (value_size == 0 || hl_option_store_size - definition->value_size > HL_OPTION_STORE_LIMIT - value_size)
+    if (value_size == 0 || options->store_size - options->value_sizes[index] > HL_OPTION_STORE_LIMIT - value_size)
         return -1;
     copy = (char *)malloc(value_size);
     if (copy == NULL) return -1;
     memcpy(copy, value, value_size);
-    free(definition->value);
-    definition->value = copy;
-    hl_option_store_size = hl_option_store_size - definition->value_size + value_size;
-    definition->value_size = value_size;
+    free(options->values[index]);
+    options->values[index] = copy;
+    options->store_size = options->store_size - options->value_sizes[index] + value_size;
+    options->value_sizes[index] = value_size;
     return 0;
 }
 
-int hl_option_unset(const char *name) {
-    hl_option_definition *definition = hl_option_find(name);
-    if (definition == NULL) return -1;
-    free(definition->value);
-    definition->value = NULL;
-    hl_option_store_size -= definition->value_size;
-    definition->value_size = 0;
+int hl_options_unset(hl_options *options, const char *name) {
+    size_t index = hl_option_index(name);
+    if (options == NULL || options->values == NULL || index >= options->value_count) return -1;
+    free(options->values[index]);
+    options->values[index] = NULL;
+    options->store_size -= options->value_sizes[index];
+    options->value_sizes[index] = 0;
     return 0;
 }
 
-void hl_option_reset(void) {
-    size_t index;
-    for (index = 0; index < sizeof hl_option_definitions / sizeof hl_option_definitions[0]; index++) {
-        free(hl_option_definitions[index].value);
-        hl_option_definitions[index].value = NULL;
-        hl_option_definitions[index].value_size = 0;
-    }
-    hl_option_store_size = 0;
+hl_options *hl_options_bind(hl_options *options) {
+    hl_options *previous = hl_bound_options;
+    hl_bound_options = options;
+    return previous;
+}
+
+hl_options *hl_options_bind_process(hl_options *options) {
+    hl_options *previous = hl_process_options;
+    hl_process_options = options;
+    return previous;
+}
+
+static hl_options *hl_options_current(void) {
+    if (hl_bound_options != NULL) return hl_bound_options;
+    if (hl_process_options != NULL) return hl_process_options;
+    if (!hl_default_options_ready) {
+        if (hl_options_init(&hl_default_options) != 0) return NULL;
+        hl_default_options_ready = 1;
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
-    /* Debug builds alone may opt into diagnostics from the process environment. */
+        {
+            const char *selector = getenv("HL_LOG");
+            if (selector != NULL) (void)hl_options_set(&hl_default_options, "HL_LOG", selector, 1);
+        }
+#endif
+    }
+    return &hl_default_options;
+}
+
+const char *hl_option_get(const char *name) { return hl_options_get(hl_options_current(), name); }
+int hl_option_set(const char *name, const char *value, int overwrite) {
+    return hl_options_set(hl_options_current(), name, value, overwrite);
+}
+int hl_option_unset(const char *name) { return hl_options_unset(hl_options_current(), name); }
+void hl_option_reset(void) {
+    hl_options *options = hl_options_current();
+    if (options == NULL) return;
+    hl_options_destroy(options);
+    (void)hl_options_init(options);
+#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     {
         const char *selector = getenv("HL_LOG");
-        if (selector != NULL) (void)hl_option_set("HL_LOG", selector, 1);
+        if (selector != NULL) (void)hl_options_set(options, "HL_LOG", selector, 1);
     }
 #endif
 }

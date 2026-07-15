@@ -1,9 +1,11 @@
 #include "hl/engine.h"
 #include "hl/linux_abi.h"
 #include "engine_backend.h"
+#include "options.h"
 
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 static const hl_engine_backend *production_backend;
@@ -24,6 +26,8 @@ struct hl_engine {
     hl_linux_fd_entry *box_fds;
     hl_linux_ofd_entry *box_ofds;
     uint32_t box_initialized;
+    hl_options options;
+    uint32_t options_initialized;
 };
 
 enum {
@@ -77,6 +81,26 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     if (engine == NULL) return HL_STATUS_OUT_OF_MEMORY;
     memcpy(&engine->config, config, sizeof(*config));
     memcpy(&engine->host, host, sizeof(*host));
+    if (hl_options_init(&engine->options) != 0) {
+        status = HL_STATUS_OUT_OF_MEMORY;
+        goto fail;
+    }
+    engine->options_initialized = 1;
+    {
+        char value[32];
+        if (config->memory_limit != 0) {
+            snprintf(value, sizeof(value), "%llu", (unsigned long long)config->memory_limit);
+            if (hl_options_set(&engine->options, "HL_MEM_MAX", value, 1) != 0) goto option_fail;
+        }
+        if (config->pid_limit != 0) {
+            snprintf(value, sizeof(value), "%u", config->pid_limit);
+            if (hl_options_set(&engine->options, "HL_PIDS_MAX", value, 1) != 0) goto option_fail;
+        }
+        if (config->cpu_limit != 0) {
+            snprintf(value, sizeof(value), "%u", config->cpu_limit);
+            if (hl_options_set(&engine->options, "HL_CPUS", value, 1) != 0) goto option_fail;
+        }
+    }
     engine->box_fds = calloc(HL_LINUX_FD_LIMIT, sizeof(*engine->box_fds));
     engine->box_ofds = calloc(HL_LINUX_OFD_LIMIT, sizeof(*engine->box_ofds));
     if (engine->box_fds == NULL || engine->box_ofds == NULL) {
@@ -140,6 +164,8 @@ hl_status hl_engine_create(const hl_engine_config *config, const hl_host_service
     free(candidate_handles);
     *out_engine = engine;
     return HL_STATUS_OK;
+option_fail:
+    status = HL_STATUS_OUT_OF_MEMORY;
 fail:
     if (candidate_handles != NULL && engine != NULL) {
         uint32_t index;
@@ -161,6 +187,7 @@ fail:
         }
         free(engine->box_fds);
         free(engine->box_ofds);
+        if (engine->options_initialized) hl_options_destroy(&engine->options);
         free(engine);
     }
     return status;
@@ -193,6 +220,7 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         return HL_STATUS_NOT_SUPPORTED;
     }
     status = engine->backend->start_process(&engine->host, engine->box_initialized ? &engine->box : NULL,
+                                            &engine->options,
                                             &engine->config, (uint32_t)argc, argv, &process);
     if (status != HL_STATUS_OK) {
         hl_engine_lock(engine);
@@ -298,5 +326,6 @@ void hl_engine_destroy(hl_engine *engine) {
     }
     free(engine->box_fds);
     free(engine->box_ofds);
+    if (engine->options_initialized) hl_options_destroy(&engine->options);
     free(engine);
 }

@@ -3,6 +3,7 @@
 #include "test.h"
 
 #include "../../src/core/launch.h"
+#include "../../src/core/options.h"
 #include "hl/config.h"
 #include "hl/host_services.h"
 #include "hl/linux_abi.h"
@@ -40,6 +41,9 @@ static int write_launch(const char *path) {
     config.arguments_offset = (uint32_t)cursor;
     memcpy(pool + cursor, "guest", 6);
     cursor += 7; // argument terminator plus list terminator
+    config.hostname_offset = (uint32_t)cursor;
+    memcpy(pool + cursor, "typed-host", 11);
+    cursor += 11;
     config.pool_size = (uint32_t)cursor;
     fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0) return -1;
@@ -50,6 +54,13 @@ static int write_launch(const char *path) {
     return close(fd);
 }
 
+static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[]) {
+    (void)rootfs;
+    HL_CHECK(argc == 1 && strcmp(argv[0], "guest") == 0);
+    HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "typed-host") == 0);
+    return 37;
+}
+
 int main(void) {
     char path[] = "/tmp/hl_launch_XXXXXX";
     static const char malformed[] = "not a launch configuration";
@@ -57,15 +68,20 @@ int main(void) {
 
     HL_CHECK(hl_run_config_file(NULL) == 78);
     HL_CHECK(hl_run_config_file("") == 78);
+    HL_CHECK(hl_option_set("HL_HOSTNAME", "caller-host", 1) == 0);
     fd = mkstemp(path);
     HL_CHECK(fd >= 0);
     HL_CHECK(write(fd, malformed, sizeof(malformed)) == (ssize_t)sizeof(malformed));
     HL_CHECK(close(fd) == 0);
     HL_CHECK(hl_run_config_file(path) == 78);
+    HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "caller-host") == 0);
     errno = 0;
     HL_CHECK(access(path, F_OK) == -1 && errno == ENOENT);
 
     HL_CHECK(write_launch(path) == 0);
-    HL_CHECK(hl_run_config_file(path) == 99);
+    HL_CHECK(hl_run_config_file_with(path, inspect_launch) == 37);
+    /* Applying the wire is scoped and transactional; caller state survives the run. */
+    HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "caller-host") == 0);
+    hl_option_reset();
     return EXIT_SUCCESS;
 }

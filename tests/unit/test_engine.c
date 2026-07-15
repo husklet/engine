@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <string.h>
 
 static int32_t fake_entry(void *context) {
@@ -16,11 +17,24 @@ static int32_t fake_entry(void *context) {
 static uint32_t fake_box_seen;
 static hl_engine_config fake_config_seen;
 
-static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, const hl_engine_config *config,
+static int option_matches_u64(const hl_options *options, const char *name, uint64_t expected) {
+    char value[32];
+    const char *actual = hl_options_get(options, name);
+    if (expected == 0) return actual == NULL;
+    snprintf(value, sizeof(value), "%llu", (unsigned long long)expected);
+    return actual != NULL && strcmp(actual, value) == 0;
+}
+
+static hl_status fake_start(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
+                            const hl_engine_config *config,
                             uint32_t argc, const char *const argv[], hl_host_handle *process) {
     hl_host_result spawned;
     (void)argc;
     (void)argv;
+    if (!option_matches_u64(options, "HL_MEM_MAX", config->memory_limit) ||
+        !option_matches_u64(options, "HL_PIDS_MAX", config->pid_limit) ||
+        !option_matches_u64(options, "HL_CPUS", config->cpu_limit))
+        return HL_STATUS_CORRUPT;
     if (box == NULL || hl_linux_abi_validate_fds(box) != HL_STATUS_OK) return HL_STATUS_CORRUPT;
     fake_box_seen++;
     fake_config_seen = *config;

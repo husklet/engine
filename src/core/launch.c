@@ -1,10 +1,10 @@
 // Production launch bridge. Wire parsing is owned by the portable hl config library. This file maps the
-// validated launch model onto the current engine initialization state until that state becomes instance-owned.
+// validated launch model onto an owned option store scoped to this launch.
 //
 // A host launcher serializes the container into the position-independent hl_launch_config wire buffer
 // and spawns the architecture-matching Linux engine as `<engine> --configfile <path>`. This is the engine
 // side: open, unlink, read, and validate the buffer, then translate
-// every populated field into the process-local option store, rebuilds the guest argv, and enters
+// every populated field into the launch-owned option store, rebuilds the guest argv, and enters
 // the Linux guest engine.
 #include <errno.h>
 #include <fcntl.h>
@@ -119,88 +119,97 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         return 78;
     }
 
+    hl_options options;
     char num[32];
     const char *s;
+    if (hl_options_init(&options) != 0) {
+        free(wire);
+        return 78;
+    }
+#define APPLY_OPTION(name, value)                                                                                   \
+    do {                                                                                                            \
+        if (hl_options_set(&options, (name), (value), 1) != 0) goto option_failure;                                \
+    } while (0)
 
     // Scalars populate the same process-local values container initialization reads.
     if (cfg.memory_limit) {
         snprintf(num, sizeof num, "%llu", (unsigned long long)cfg.memory_limit);
-        hl_option_set("HL_MEM_MAX", num, 1);
+        APPLY_OPTION("HL_MEM_MAX", num);
     }
     if (cfg.pid_limit) {
         snprintf(num, sizeof num, "%u", cfg.pid_limit);
-        hl_option_set("HL_PIDS_MAX", num, 1);
+        APPLY_OPTION("HL_PIDS_MAX", num);
     }
     if (cfg.cpu_limit) {
         snprintf(num, sizeof num, "%u", cfg.cpu_limit);
-        hl_option_set("HL_CPUS", num, 1);
+        APPLY_OPTION("HL_CPUS", num);
     }
-    if (cfg.rootfs_read_only) hl_option_set("HL_ROOTFS_RO", "1", 1);
-    if (cfg.network_isolated) hl_option_set("HL_NET_ISOLATE", "1", 1);
-    if (cfg.publish_external) hl_option_set("HL_PUBLISH_DAEMON", "1", 1);
+    if (cfg.rootfs_read_only) APPLY_OPTION("HL_ROOTFS_RO", "1");
+    if (cfg.network_isolated) APPLY_OPTION("HL_NET_ISOLATE", "1");
+    if (cfg.publish_external) APPLY_OPTION("HL_PUBLISH_DAEMON", "1");
     if (cfg.uid >= 0) {
         snprintf(num, sizeof num, "%d", cfg.uid);
-        hl_option_set("HL_UID", num, 1);
+        APPLY_OPTION("HL_UID", num);
     }
     if (cfg.gid >= 0) {
         snprintf(num, sizeof num, "%d", cfg.gid);
-        hl_option_set("HL_GID", num, 1);
+        APPLY_OPTION("HL_GID", num);
     }
 
     // Pooled strings are copied by hl_option_set; an empty field leaves the option unset.
     s = launch_string(&cfg, pool, cfg.hostname_offset);
-    if (s[0]) hl_option_set("HL_HOSTNAME", s, 1);
+    if (s[0]) APPLY_OPTION("HL_HOSTNAME", s);
     s = launch_string(&cfg, pool, cfg.limits_offset);
-    if (s[0]) hl_option_set("HL_ULIMITS", s, 1);
+    if (s[0]) APPLY_OPTION("HL_ULIMITS", s);
     s = launch_string(&cfg, pool, cfg.publish_offset);
-    if (s[0]) hl_option_set("HL_PUBLISH", s, 1);
+    if (s[0]) APPLY_OPTION("HL_PUBLISH", s);
     s = launch_string(&cfg, pool, cfg.lower_layers_offset);
-    if (s[0]) hl_option_set("HL_LOWER", s, 1);
+    if (s[0]) APPLY_OPTION("HL_LOWER", s);
     s = launch_string(&cfg, pool, cfg.network_namespace_offset);
-    if (s[0]) hl_option_set("HL_NETNS", s, 1);
+    if (s[0]) APPLY_OPTION("HL_NETNS", s);
     s = launch_string(&cfg, pool, cfg.volumes_offset);
-    if (s[0]) hl_option_set("HL_VOLUMES", s, 1);
+    if (s[0]) APPLY_OPTION("HL_VOLUMES", s);
     s = launch_string(&cfg, pool, cfg.working_directory_offset);
-    if (s[0]) hl_option_set("HL_CWD", s, 1);
+    if (s[0]) APPLY_OPTION("HL_CWD", s);
     s = launch_string(&cfg, pool, cfg.environment_offset);
-    if (s[0]) hl_option_set("HL_GUEST_ENV", s, 1);
+    if (s[0]) APPLY_OPTION("HL_GUEST_ENV", s);
     s = launch_string(&cfg, pool, cfg.network_bridge_offset);
-    if (s[0]) hl_option_set("HL_NETBR", s, 1);
+    if (s[0]) APPLY_OPTION("HL_NETBR", s);
     s = launch_string(&cfg, pool, cfg.ip_offset);
-    if (s[0]) hl_option_set("HL_IP", s, 1);
+    if (s[0]) APPLY_OPTION("HL_IP", s);
     s = launch_string(&cfg, pool, cfg.filesystem_generation_offset);
-    if (s[0]) hl_option_set("HL_FSGEN_FILE", s, 1);
+    if (s[0]) APPLY_OPTION("HL_FSGEN_FILE", s);
     // Per-workspace VPN egress: netns.c reads HL_EGRESS_SOCKS to funnel the
     // guest's genuine external TCP connects through this SOCKS5 proxy. Carried in the typed wire (not the
     // ambient host env, which the FFI spawn never forwards) — "" leaves it unset so direct egress is unchanged.
     s = launch_string(&cfg, pool, cfg.egress_proxy_offset);
-    if (s[0]) hl_option_set("HL_EGRESS_SOCKS", s, 1);
+    if (s[0]) APPLY_OPTION("HL_EGRESS_SOCKS", s);
     s = launch_string(&cfg, pool, cfg.checkpoint_directory_offset);
-    if (s[0]) hl_option_set("HL_CHECKPOINT_DIR", s, 1);
+    if (s[0]) APPLY_OPTION("HL_CHECKPOINT_DIR", s);
     s = launch_string(&cfg, pool, cfg.restore_directory_offset);
-    if (s[0]) hl_option_set("HL_RESTORE_DIR", s, 1);
+    if (s[0]) APPLY_OPTION("HL_RESTORE_DIR", s);
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     s = launch_string(&cfg, pool, cfg.debug_log_offset);
-    if (s[0]) hl_option_set("HL_LOG", s, 1);
+    if (s[0]) APPLY_OPTION("HL_LOG", s);
 #endif
 
     // Persistent translated-code cache: presence of a directory enables it.
     s = launch_string(&cfg, pool, cfg.translation_cache_offset);
     if (s[0]) {
-        hl_option_set("HL_PCACHE", "1", 1);
-        hl_option_set("HL_PCACHE_DIR", s, 1);
+        APPLY_OPTION("HL_PCACHE", "1");
+        APPLY_OPTION("HL_PCACHE_DIR", s);
     }
     /* A typed per-container disable removes cache activation instead of creating a second kill-switch contract. */
     if (cfg.translation_cache_disabled) {
-        hl_option_unset("HL_PCACHE");
-        hl_option_unset("HL_PCACHE_DIR");
+        if (hl_options_unset(&options, "HL_PCACHE") != 0 || hl_options_unset(&options, "HL_PCACHE_DIR") != 0)
+            goto option_failure;
     }
     // Untrusted sentry routing is independently useful for compatibility/security tests; public sandbox
     // mode additionally confines the worker. Value 1 retains the ABI4 public behavior, while value 2 selects
     // sentry-only routing without applying a Seatbelt profile to paths supplied by a developer harness.
     if (cfg.sandbox) {
-        hl_option_set("HL_UNTRUSTED", "1", 1);
-        if (cfg.sandbox == HL_CONFIG_SANDBOX_ENABLED) hl_option_set("HL_SANDBOX", "1", 1);
+        APPLY_OPTION("HL_UNTRUSTED", "1");
+        if (cfg.sandbox == HL_CONFIG_SANDBOX_ENABLED) APPLY_OPTION("HL_SANDBOX", "1");
     }
 
     // guest argv: NUL-separated, double-NUL terminated, at argv_off. Count, then point argv2[] into the pool.
@@ -208,6 +217,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     (void)hl_launch_config_arguments_validate(&cfg, pool, &argument_count);
     char **argv2 = (char **)calloc(argument_count + 1, sizeof(char *));
     if (!argv2) {
+        hl_options_destroy(&options);
         free(wire);
         return 78;
     }
@@ -215,6 +225,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         const char *argument = NULL;
         if (hl_launch_config_argument(&cfg, pool, i, &argument, NULL) != HL_STATUS_OK) {
             free(argv2);
+            hl_options_destroy(&options);
             free(wire);
             return 78;
         }
@@ -223,11 +234,21 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
 
     // rootfs: "" (bare launch) maps to NULL, matching the flag path's `rootfs = NULL` default.
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
+    hl_options *previous_options = hl_options_bind_process(&options);
     int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2);
+    (void)hl_options_bind_process(previous_options);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
+    hl_options_destroy(&options);
     free(wire);
+#undef APPLY_OPTION
     return rc;
+
+option_failure:
+    hl_options_destroy(&options);
+    free(wire);
+#undef APPLY_OPTION
+    return 78;
 }
 
 static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[]) {
