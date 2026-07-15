@@ -603,7 +603,7 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
       through a pinned typed File-service directory.
 - [x] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes. The permanent
-      `test-linux-production-typed` gate runs 655 active exact-golden cases across 16 manifests and both guest ISAs,
+      `test-linux-production-typed` gate runs 656 active exact-golden cases across 16 manifests and both guest ISAs,
       with zero exclusions.
 
 ### Linux behavior
