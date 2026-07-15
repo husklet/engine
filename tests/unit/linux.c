@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -242,6 +243,28 @@ int main(void) {
     char socket_path[108];
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
+    {
+        char directory[128];
+        char fifo[160];
+        hl_host_result root;
+        hl_host_file_resolution resolved;
+        int writer;
+        snprintf(directory, sizeof(directory), "/tmp/hl_resolve_fifo_%ld", (long)getpid());
+        snprintf(fifo, sizeof(fifo), "%s/probe", directory);
+        HL_CHECK(mkdir(directory, 0700) == 0 && mkfifo(fifo, 0600) == 0);
+        root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
+        HL_CHECK(root.status == HL_STATUS_OK);
+        HL_CHECK(services.file->resolve_beneath(services.context, root.value, "probe", 5, 0, &resolved).status ==
+                 HL_STATUS_OK);
+        errno = 0;
+        writer = open(fifo, O_WRONLY | O_NONBLOCK);
+        HL_CHECK(writer < 0 && errno == ENXIO);
+        HL_CHECK(services.file->close(services.context, resolved.target).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, resolved.parent).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, root.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(fifo) == 0 && rmdir(directory) == 0);
+    }
     {
         char range_path[128];
         hl_host_filesystem_metadata filesystem;
