@@ -34,6 +34,66 @@ typedef struct bound_inotify_provider {
 static bound_inotify_provider *g_bound_inotify_providers;
 static uint32_t g_bound_inotify_cookie;
 
+static char *bound_inotify_snapshot(bound_inotify_provider *provider, const char *path) {
+    hl_host_file_entry entries[32];
+    hl_host_result opened;
+    hl_host_result read;
+    hl_host_result closed;
+    char *snapshot = NULL;
+    size_t capacity = 256;
+    size_t size = 0;
+    opened = provider->host->file->open_relative(provider->host->context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                                 HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY, 0, 0);
+    if (opened.status != HL_STATUS_OK) return NULL;
+    snapshot = malloc(capacity);
+    if (snapshot == NULL) {
+        (void)provider->host->file->close(provider->host->context, opened.value);
+        return NULL;
+    }
+    snapshot[0] = 0;
+    for (;;) {
+        uint32_t index;
+        read = provider->host->file->read_directory(provider->host->context, opened.value, entries, 32, 16384);
+        if (read.status != HL_STATUS_OK || read.value == 0) break;
+        if (read.value > 32) {
+            read.status = HL_STATUS_CORRUPT;
+            break;
+        }
+        for (index = 0; index < (uint32_t)read.value; ++index) {
+            size_t name_size = entries[index].name_size;
+            char *grown;
+            if ((name_size == 1 && entries[index].name[0] == '.') ||
+                (name_size == 2 && entries[index].name[0] == '.' && entries[index].name[1] == '.'))
+                continue;
+            if (size > SIZE_MAX - name_size - 2u) {
+                read.status = HL_STATUS_OUT_OF_MEMORY;
+                break;
+            }
+            if (size + name_size + 2u > capacity) {
+                size_t required = size + name_size + 2u;
+                capacity = required > SIZE_MAX / 2u ? required : required * 2u;
+                grown = realloc(snapshot, capacity);
+                if (grown == NULL) {
+                    read.status = HL_STATUS_OUT_OF_MEMORY;
+                    break;
+                }
+                snapshot = grown;
+            }
+            memcpy(snapshot + size, entries[index].name, name_size);
+            size += name_size;
+            snapshot[size++] = '\n';
+            snapshot[size] = 0;
+        }
+        if (read.status != HL_STATUS_OK) break;
+    }
+    closed = provider->host->file->close(provider->host->context, opened.value);
+    if (read.status != HL_STATUS_OK || closed.status != HL_STATUS_OK) {
+        free(snapshot);
+        return NULL;
+    }
+    return snapshot;
+}
+
 static uint32_t bound_inotify_interests(uint32_t mask) {
     uint32_t interests = 0;
     if ((mask & (HL_LINUX_IN_ACCESS | HL_LINUX_IN_OPEN | HL_LINUX_IN_CLOSE_NOWRITE | HL_LINUX_IN_CLOSE_WRITE)) != 0)
@@ -151,7 +211,7 @@ static hl_status bound_provider_add(void *opaque, const char *path, size_t path_
     *watch = (bound_inotify_watch){token, mask, saved, NULL, 0};
     if (is_directory) {
         watch->directory = 1;
-        watch->snapshot = dir_snapshot(saved);
+        watch->snapshot = bound_inotify_snapshot(provider, saved);
     }
     added = provider->host->directory->add(provider->host->context, provider->directory, opened.value, token,
                                            bound_inotify_interests(mask));
@@ -201,7 +261,7 @@ static hl_status bound_inotify_snapshot_events(bound_inotify_provider *provider,
     char *current;
     uint32_t pass;
     if (!watch->directory) return HL_STATUS_OK;
-    current = dir_snapshot(watch->path);
+    current = bound_inotify_snapshot(provider, watch->path);
     if (current == NULL) return HL_STATUS_IO;
     for (pass = 0; pass < 2; ++pass) {
         const char *source = pass == 0 ? current : watch->snapshot;
@@ -409,7 +469,7 @@ static void bound_inotify_move_side(bound_inotify_provider *provider, const char
             continue;
         (void)bound_inotify_queue(provider, watch->token, mask, cookie, slash + 1, strlen(slash + 1));
         {
-            char *current = dir_snapshot(watch->path);
+            char *current = bound_inotify_snapshot(provider, watch->path);
             if (current != NULL) {
                 free(watch->snapshot);
                 watch->snapshot = current;
