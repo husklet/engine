@@ -94,7 +94,7 @@ typedef struct hl_engine_config {
     /* Reserved for a future executable-image API. Nonempty payloads are not currently supported. */
     const void *payload;
     size_t payload_size;
-    /* Optional Linux root filesystem path owned by the caller for the engine lifetime. */
+    /* Optional Linux root filesystem path copied by hl_engine_create. */
     const char *rootfs;
     const hl_engine_fd_binding *fd_bindings;
     uint32_t fd_binding_count;

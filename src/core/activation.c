@@ -60,7 +60,12 @@ static int transfer(int fd, void *data, size_t size, int writing) {
     unsigned char *bytes = data;
     size_t offset = 0;
     while (offset < size) {
-        ssize_t count = writing ? send(fd, bytes + offset, size - offset, 0) : read(fd, bytes + offset, size - offset);
+        int flags = 0;
+#if defined(MSG_NOSIGNAL)
+        if (writing) flags = MSG_NOSIGNAL;
+#endif
+        ssize_t count = writing ? send(fd, bytes + offset, size - offset, flags)
+                                : read(fd, bytes + offset, size - offset);
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) return -1;
         offset += (size_t)count;
@@ -157,8 +162,9 @@ static void hl_activation_child(void) {
         request.path[0] == '/' && request.path[request.path_size - 1] == 0 &&
         (request.guest_isa == HL_GUEST_ISA_AARCH64 || request.guest_isa == HL_GUEST_ISA_X86_64)) {
         reply.status = HL_STATUS_OK;
-        if (transfer((int)descriptor, &reply, sizeof(reply), 1) != 0 ||
-            transfer((int)descriptor, &commit, 1, 0) != 0 || commit != 0xa5u) _exit(124);
+        if (transfer((int)descriptor, &reply, sizeof(reply), 1) != 0) _exit(124);
+        if (request.test_flags == 4) _exit(123);
+        if (transfer((int)descriptor, &commit, 1, 0) != 0 || commit != 0xa5u) _exit(124);
         /* Explicit setup is idempotent and independent of constructor order. */
         hl_embedded_runtime_init(request.guest_isa);
         hl_embedded_runtime_init(request.guest_isa);
@@ -175,6 +181,7 @@ static void hl_activation_child(void) {
         _exit(127);
     }
     reply.status = (int32_t)status;
+    if (request.test_flags == 5) reply.nonce[0] ^= UINT64_C(1);
     (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
     hl_activation_host_destroy(host);
     (void)close((int)descriptor);
@@ -200,8 +207,30 @@ struct hl_activation_process {
     hl_engine_exit final_exit;
 };
 
-static void wait_child(pid_t child, int *waited) {
-    while (waitpid(child, waited, 0) < 0 && errno == EINTR) {}
+static int wait_child(pid_t child, int *waited) {
+    pid_t result;
+    do { result = waitpid(child, waited, 0); } while (result < 0 && errno == EINTR);
+    return result == child ? 0 : -1;
+}
+
+static int reserve_control_descriptors(int pair[2]) {
+    size_t index;
+    for (index = 0; index < 2; ++index) {
+        int replacement;
+        if (pair[index] > STDERR_FILENO) continue;
+        replacement = fcntl(pair[index], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        if (replacement < 0) return -1;
+        (void)close(pair[index]);
+        pair[index] = replacement;
+    }
+    return 0;
+}
+
+static void cache_failure(hl_activation_process *process, hl_status status) {
+    process->finished = 1;
+    process->final_status = status;
+    process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI, .size = sizeof(process->final_exit),
+                                           .kind = HL_ENGINE_EXIT_ENGINE_ERROR, .detail = (uint64_t)status};
 }
 
 hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
@@ -236,6 +265,9 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
         if (strncmp(environ[env_count], "HL_ACTIVATION_FD=", 17) != 0) child_env[env_output++] = environ[env_count];
     child_env[env_output] = activation;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { free(child_env); return HL_STATUS_PLATFORM_FAILURE; }
+    if (reserve_control_descriptors(pair) != 0) {
+        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+    }
 #if defined(__APPLE__)
     { int enabled = 1; if (setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0 ||
                            setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
@@ -251,7 +283,7 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     request.guest_isa = guest_isa;
     request.path_size = (uint32_t)path_size;
     test_mode = activation_test_mode;
-    request.test_flags = test_mode == 1 ? 1u : 0u;
+    request.test_flags = test_mode == 1 ? 1u : test_mode == 4 ? 4u : test_mode == 5 ? 5u : 0u;
     if (test_mode == 2) request.magic ^= UINT64_C(1);
     activation_test_mode = 0;
     memcpy(request.path, guest, path_size);
@@ -282,18 +314,18 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     close(pair[1]);
     free(child_env);
     if (transfer(pair[0], &request, test_mode == 3 ? sizeof(request) / 2u : sizeof(request), 1) != 0) {
-        close(pair[0]); wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
     if (transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
-        close(pair[0]); wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (reply.magic != request.magic || reply.abi != request.abi || reply.size != sizeof(reply) ||
         memcmp(reply.nonce, request.nonce, sizeof(request.nonce)) != 0 || reply.status != HL_STATUS_OK) {
-        close(pair[0]); wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     { unsigned char commit = 0xa5u; if (transfer(pair[0], &commit, 1, 1) != 0) {
-        close(pair[0]); wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     } }
     process = calloc(1, sizeof(*process));
     if (process == NULL) { close(pair[0]); (void)kill(child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
@@ -321,9 +353,14 @@ hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out
     if (process == NULL || out_exit == NULL) return HL_STATUS_INVALID_ARGUMENT;
     if (process->finished) { *out_exit = process->final_exit; return process->final_status; }
     if (transfer(process->descriptor, &reply, sizeof(reply), 0) != 0) {
-        (void)close(process->descriptor); wait_child(process->pid, &waited);
-        process->finished = 1;
+        (void)close(process->descriptor);
+        if (wait_child(process->pid, &waited) != 0) {
+            cache_failure(process, HL_STATUS_PLATFORM_FAILURE);
+            *out_exit = process->final_exit;
+            return process->final_status;
+        }
         if (WIFSIGNALED(waited)) {
+            process->finished = 1;
             process->final_status = HL_STATUS_OK;
             process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI, .size = sizeof(process->final_exit),
                                                    .kind = HL_ENGINE_EXIT_SIGNAL,
@@ -331,19 +368,25 @@ hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out
             *out_exit = process->final_exit;
             return HL_STATUS_OK;
         }
-        process->final_status = HL_STATUS_CORRUPT;
-        return HL_STATUS_CORRUPT;
+        cache_failure(process, HL_STATUS_CORRUPT);
+        *out_exit = process->final_exit;
+        return process->final_status;
     }
     (void)close(process->descriptor);
-    wait_child(process->pid, &waited);
-    process->finished = 1;
+    if (wait_child(process->pid, &waited) != 0) {
+        cache_failure(process, HL_STATUS_PLATFORM_FAILURE);
+        *out_exit = process->final_exit;
+        return process->final_status;
+    }
     if (reply.magic != HL_ACTIVATION_MAGIC || reply.abi != HL_ACTIVATION_ABI || reply.size != sizeof(reply) ||
         memcmp(reply.nonce, process->nonce, sizeof(process->nonce)) != 0 || reply.status < HL_STATUS_OK ||
         reply.status > HL_STATUS_ADDRESS_IN_USE || !WIFEXITED(waited) ||
         (reply.status == HL_STATUS_OK ? WEXITSTATUS(waited) != 0 : WEXITSTATUS(waited) != 127)) {
-        process->final_status = HL_STATUS_CORRUPT;
-        return HL_STATUS_CORRUPT;
+        cache_failure(process, HL_STATUS_CORRUPT);
+        *out_exit = process->final_exit;
+        return process->final_status;
     }
+    process->finished = 1;
     process->final_status = (hl_status)reply.status;
     process->final_exit = reply.result;
     *out_exit = process->final_exit;
@@ -380,7 +423,9 @@ void hl_activation_process_destroy(hl_activation_process *process) {
 hl_status hl_activation_spawn(const char *executable, uint32_t guest_isa, const char *config_path,
                               hl_engine_exit *out_exit) {
     hl_activation_process *process = NULL;
-    hl_status status = hl_activation_start(executable, guest_isa, config_path, &process);
+    hl_status status;
+    if (out_exit == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    status = hl_activation_start(executable, guest_isa, config_path, &process);
     if (status == HL_STATUS_OK) status = hl_activation_wait(process, out_exit);
     hl_activation_process_destroy(process);
     return status;
