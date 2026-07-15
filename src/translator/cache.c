@@ -4,7 +4,7 @@
 // ---------------- JIT code cache ----------------
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
-#include "../host/file.h"
+#include "../core/fatal.h"
 #include "arena.h"
 #include "emit.h"
 
@@ -29,6 +29,8 @@ static hl_emit_state g_emit;
 // convert RW<->RX. g_rw2rx == 0 selects the single-MAP_JIT fallback that toggles the whole
 // region's W^X per translation/IC-fill (NODUALMAP=1).
 static hl_log_context g_jit_log;
+static hl_fatal_context g_jit_fatal;
+static int cache_oom_fail(void);
 #define J_RX(p) hl_emit_rx(&g_emit, (const void *)(uintptr_t)(p)) // RW alias addr -> RX alias addr
 #define J_RW(p) hl_emit_rw(&g_emit, (const void *)(uintptr_t)(p)) // RX alias addr -> RW alias addr
 
@@ -41,19 +43,24 @@ int jit_pc_in_cache(uint64_t pc, uint64_t *base) {
 
 // The single W^X gate. Under dual mapping it is a no-op: writes land on the RW alias and
 // execution reads the RX alias, so no per-region permission flip (and no peer-thread race).
-static inline void jit_wprot(int enable_exec) {
+static int jit_fail(hl_status status, const char *message, size_t size) {
+    (void)hl_fatal_report(&g_jit_fatal, status, HL_LOG_TAG_JIT, message, size);
+    return 0;
+}
+
+static inline int jit_wprot(int enable_exec) {
     hl_host_result result;
-    if (g_dualmap) return;
+    if (g_dualmap) return 1;
     g_wx_toggles++;
     result = enable_exec ? g_jit_services.memory->end_code_write(g_jit_services.context)
                          : g_jit_services.memory->begin_code_write(g_jit_services.context);
-    if (result.status != HL_STATUS_OK) {
-        fprintf(stderr, "hl-engine: unable to change JIT write protection\n");
-        _exit(70);
-    }
+    if (result.status != HL_STATUS_OK)
+        return jit_fail(result.status, "unable to change JIT write protection",
+                        sizeof("unable to change JIT write protection") - 1u);
+    return 1;
 }
 
-static void jit_publish_code(const void *address, size_t size) {
+static int jit_publish_code(const void *address, size_t size) {
     uintptr_t current = (uintptr_t)address;
     uintptr_t writable = (uintptr_t)g_cache;
     uintptr_t executable = (uintptr_t)J_RX(g_cache);
@@ -64,14 +71,14 @@ static void jit_publish_code(const void *address, size_t size) {
     else if (current >= executable && current - executable <= CACHE_SZ && size <= CACHE_SZ - (current - executable))
         offset = (uint64_t)(current - executable);
     else {
-        fprintf(stderr, "hl-engine: code publication outside JIT mapping\n");
-        _exit(70);
+        return jit_fail(HL_STATUS_INVALID_ARGUMENT, "code publication outside JIT mapping",
+                        sizeof("code publication outside JIT mapping") - 1u);
     }
     result = g_jit_services.memory->publish_code(g_jit_services.context, g_code_mapping.handle, offset, size);
-    if (result.status != HL_STATUS_OK) {
-        fprintf(stderr, "hl-engine: unable to publish translated code\n");
-        _exit(70);
-    }
+    if (result.status != HL_STATUS_OK)
+        return jit_fail(result.status, "unable to publish translated code",
+                        sizeof("unable to publish translated code") - 1u);
+    return 1;
 }
 
 static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
@@ -83,9 +90,13 @@ static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
 }
 
 static int jit_cache_init(void) {
+    hl_fatal_context_init(&g_jit_fatal, &g_jit_services);
     // Dual aliases avoid global W^X flips. Hosts that cannot create them still have a correct MAP_JIT
     // path; this is a capability fallback, not a user-facing mode switch.
-    if (code_mapping_reserve(&g_code_mapping, 1) != 0 && code_mapping_reserve(&g_code_mapping, 0) != 0) return -1;
+    if (code_mapping_reserve(&g_code_mapping, 1) != 0 && code_mapping_reserve(&g_code_mapping, 0) != 0) {
+        (void)cache_oom_fail();
+        return -1;
+    }
     hl_arena_bind(&g_emit, &g_code_mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache reserve rw=%p rx=%p bytes=%u dual=%d", (void *)g_cache, J_RX(g_cache),
             CACHE_SZ, g_dualmap);
@@ -585,7 +596,7 @@ static void patch_links_to(uint64_t gpc, void *body) {
             *g_pend[i].slot =
                 // bl / b target.body (+8: forward edge skips the entry poll under IRQSLIM)
                 (g_pend[i].is_bl ? 0x94000000u : 0x14000000u) | ((uint32_t)d & 0x3FFFFFFu);
-            jit_publish_code(g_pend[i].slot, 4);
+            if (!jit_publish_code(g_pend[i].slot, 4)) return;
             // swap-remove
             g_pend[i] = g_pend[--g_npend];
         } else
@@ -671,8 +682,7 @@ static struct {
 
 static uint64_t g_nfreed_total;
 
-static _Noreturn void cache_oom_abort(void);
-static void jit_flush_to_fresh(void);
+static int jit_flush_to_fresh(void);
 
 int jit_pc_in_retained_cache(uint64_t pc) {
     if (!g_cache) return 0;
@@ -829,7 +839,7 @@ static void stw_after_translated(void) {
     stw_dispatch_safepoint();
 }
 
-static void stw_force_dispatch_flush(void) {
+static int stw_force_dispatch_flush(void) {
     pthread_t me = pthread_self();
     /* Serialize activation ownership before publishing its epoch/gate.  If two
        callbacks publish first and lock second, the first can clear the second's
@@ -869,10 +879,11 @@ static void stw_force_dispatch_flush(void) {
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu)
             G_ACTIVATION_CLEAR_CPU(g_stw_threads[i].cpu);
     G_ACTIVATION_CLEAR_GLOBAL();
-    jit_flush_to_fresh();
+    int ok = jit_flush_to_fresh();
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
     pthread_mutex_unlock(&g_jit_lock);
+    return ok;
 }
 
 /* Hold every translated peer at a dispatcher boundary while a host mapping
@@ -965,26 +976,25 @@ static void reclaim_retired(void) {
 
 // Record the CURRENT cache as retired (its blocks may still be reached by parked peers / baked-in chains)
 // so a later reclaim_retired() frees it once every thread has drifted off its generation.
-static void retire_current(void) {
+static int retire_current(void) {
     if (g_nretired < STW_RETIRED_MAX) {
         g_retired[g_nretired].handle = g_code_mapping.handle;
         g_retired[g_nretired].rw = g_cache;
         g_retired[g_nretired].rw2rx = g_rw2rx;
         g_retired[g_nretired].gen = g_cache_gen;
         g_nretired++;
+        return 1;
     } else {
-        cache_oom_abort();
+        return cache_oom_fail();
     }
 }
 
 // A fresh cache could not be allocated and the peers are quiesced IN / parked ON the current cache, so
 // reusing it in place would corrupt them on resume. Reclamation has already freed everything safe to free,
 // so we cannot proceed -- abort cleanly rather than corrupt guest state.
-static _Noreturn void cache_oom_abort(void) {
-    static const char msg[] = "hl-engine: JIT code cache exhausted (out of VA for a fresh cache under threads)\n";
-    ssize_t ignored = write(STDERR_FILENO, msg, sizeof msg - 1);
-    (void)ignored;
-    _exit(70);
+static int cache_oom_fail(void) {
+    static const char message[] = "JIT code cache exhausted (out of VA for a fresh cache under threads)";
+    return jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
 }
 
 // Retire the current cache, switch to a brand-new one, and drop every cross-block link (map / IBTC /
@@ -992,11 +1002,14 @@ static _Noreturn void cache_oom_abort(void) {
 // peers and by baked-in chains/inline ICs); reclaim_retired() unmaps it once no thread is in its
 // generation, so retained VA stays bounded (no per-flush leak). MUST run with all peers quiesced
 // (stw_flush) and the dispatcher holding g_jit_lock.
-static void jit_flush_to_fresh(void) {
+static int jit_flush_to_fresh(void) {
     hl_host_code_mapping mapping;
     reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
-    if (code_mapping_reserve(&mapping, g_dualmap) != 0) cache_oom_abort();
-    retire_current();
+    if (code_mapping_reserve(&mapping, g_dualmap) != 0) return cache_oom_fail();
+    if (!retire_current()) {
+        hl_arena_release(&g_jit_services, mapping.handle);
+        return 0;
+    }
     hl_arena_bind(&g_emit, &mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache rotate generation=%llu rw=%p rx=%p",
             (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache));
@@ -1004,11 +1017,12 @@ static void jit_flush_to_fresh(void) {
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     g_npend = 0;
+    return 1;
 }
 
 // Stop-the-world flush. Called from the dispatcher (holding g_jit_lock) when the cache is full and a peer
 // guest thread is live: quiesce every peer at the park safepoint, switch to a fresh cache, then release.
-static void stw_flush(void) {
+static int stw_flush(void) {
     g_stw_flushes++;
     atomic_store_explicit(&g_stw_active, 1, memory_order_seq_cst);
     pthread_t me = pthread_self();
@@ -1034,7 +1048,7 @@ static void stw_flush(void) {
         struct timespec ts = {0, 50000};
         nanosleep(&ts, NULL);
     }
-    jit_flush_to_fresh();
+    int ok = jit_flush_to_fresh();
     atomic_store_explicit(&g_stw_active, 0, memory_order_seq_cst); // release the world
     // Wait for all peers to leave the handler so the counters are clean for the next flush.
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) > 0) {
@@ -1042,6 +1056,7 @@ static void stw_flush(void) {
         nanosleep(&ts, NULL);
     }
     pthread_mutex_unlock(&g_stw_reg_lock);
+    return ok;
 }
 
 // SMC coherence: the guest overwrote already-translated code -> drop the cross-block link tables so the
@@ -1104,7 +1119,7 @@ static void stw_after_fork(void) {
 // cache VAs (x86 g_xibtc) survived (1) or must be dropped (0).
 static int g_fork_preserved;
 
-static void jit_after_fork(void) {
+static int jit_after_fork(void) {
     int preserve;
     stw_after_fork(); // single-threaded child: shed the inherited thread registry (also for the MAP_JIT path)
     // fork() only clones the CALLING thread. If a peer M was translating (holding g_jit_lock, and g_cache_lock
@@ -1140,7 +1155,11 @@ static void jit_after_fork(void) {
             cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
         g_nretired = 0;
     }
-    if (hl_arena_repair(&g_jit_services, &g_emit, preserve) != 0) cache_oom_abort();
+    if (hl_arena_repair(&g_jit_services, &g_emit, preserve) != 0) {
+        (void)cache_oom_fail();
+        g_fork_preserved = 0;
+        return 0;
+    }
     if (preserve) {
         for (int i = 0; i < g_nretired; i++)
             cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
@@ -1154,4 +1173,5 @@ static void jit_after_fork(void) {
     }
     HL_LOGF(&g_jit_log, HL_LOG_TAG_PROCESS, "fork cache preserve=%d rw=%p rx=%p", preserve, (void *)g_cache,
             J_RX(g_cache));
+    return 1;
 }

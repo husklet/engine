@@ -1,4 +1,5 @@
 #include "hl/engine.h"
+#include "hl/log.h"
 #include "hl/macos.h"
 
 #include <stdio.h>
@@ -23,6 +24,27 @@ static const hl_host_clock_services *native_clock;
 static uint32_t *clock_calls;
 static uint32_t *realtime_calls;
 static int injected_clock;
+static const hl_host_memory_services *native_memory;
+static uint32_t fatal_events;
+static uint32_t fatal_tag;
+static char fatal_message[96];
+
+static hl_host_result fail_publish(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
+    (void)context;
+    (void)mapping;
+    (void)offset;
+    (void)size;
+    return (hl_host_result){HL_STATUS_PLATFORM_FAILURE, 0, 0, 0};
+}
+
+static void capture_fatal(void *context, uint32_t tag, const char *message, size_t size) {
+    size_t copy = size < sizeof(fatal_message) - 1u ? size : sizeof(fatal_message) - 1u;
+    (void)context;
+    fatal_events++;
+    fatal_tag = tag;
+    memcpy(fatal_message, message, copy);
+    fatal_message[copy] = 0;
+}
 
 static hl_host_result spy_monotonic_ns(void *context) {
     (void)__atomic_add_fetch(clock_calls, UINT32_C(1), __ATOMIC_RELAXED);
@@ -45,14 +67,17 @@ int main(int argc, char **argv) {
     hl_host_macos *host = NULL;
     hl_host_services services;
     hl_host_clock_services clock;
+    hl_host_memory_services memory;
+    hl_host_log_services log;
     hl_engine_config config;
     hl_engine_exit result;
     hl_engine *engine = NULL;
     hl_status status;
     int force_stop = argc > 1 && strcmp(argv[1], "--force-stop") == 0;
+    int fail_code_publish = argc > 1 && strcmp(argv[1], "--fail-publish") == 0;
     int guest_index = 1;
     injected_clock = argc > 1 && strcmp(argv[1], "--clock-spy") == 0;
-    if (injected_clock) guest_index = 2;
+    if (injected_clock || fail_code_publish) guest_index = 2;
     if (argc < 2) {
         fprintf(stderr, "usage: lifecycle-e2e-runner GUEST [args...]\n");
         return 64;
@@ -67,6 +92,15 @@ int main(int argc, char **argv) {
     clock.monotonic_ns = spy_monotonic_ns;
     clock.realtime_ns = spy_realtime_ns;
     services.clock = &clock;
+    if (fail_code_publish) {
+        native_memory = services.memory;
+        memory = *native_memory;
+        memory.publish_code = fail_publish;
+        services.memory = &memory;
+        log = *services.log;
+        log.emit = capture_fatal;
+        services.log = &log;
+    }
     memset(&config, 0, sizeof config);
     config.abi = HL_ENGINE_ABI;
     config.size = sizeof config;
@@ -96,6 +130,11 @@ int main(int argc, char **argv) {
     }
     hl_engine_destroy(engine);
     hl_host_macos_destroy(host);
+    if (fail_code_publish)
+        return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 70 &&
+                       fatal_events == 0
+                   ? 0
+                   : 79;
     if (!force_stop && __atomic_load_n(clock_calls, __ATOMIC_RELAXED) == 0) return 77;
     if (injected_clock && __atomic_load_n(realtime_calls, __ATOMIC_RELAXED) == 0) return 78;
     (void)munmap(clock_calls, 2 * sizeof(*clock_calls));

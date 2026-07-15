@@ -44,7 +44,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
 	$(call rwildcard,include/hl/,*.h))
 
-CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/host_services.c src/core/launch.c src/core/log.c \
+CORE_SOURCES := src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/host/aarch64/codegen.c \
@@ -112,7 +112,7 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
 	$(BINDING_AUX_OBJECTS:.o=.d)
 
-UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fdcache file fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
+UNIT_NAMES := affinity arena child cli clock codegen config decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file fork_wire gmap host_services identity image inotify ir launch linux_abi linux_fork native open_plan persist pipe pipe_linux placement private process range resolve resolve_services system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc watch window xattr_cache
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -1629,6 +1629,13 @@ $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	$(CC) $(filter-out -DHL_ENABLE_LOGGING=%,$(CPPFLAGS)) -DHL_ENABLE_LOGGING=1 -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
 
 test-debug-log: $(BUILD)/tests/test-log-debug
+	$<
+
+$(BUILD)/tests/test-fatal-debug: tests/unit/test_fatal.c src/core/fatal.c
+	@mkdir -p $(@D)
+	$(CC) $(filter-out -DHL_ENABLE_LOGGING=%,$(CPPFLAGS)) -DHL_ENABLE_LOGGING=1 -Itests/unit $(ENGINE_CFLAGS) $^ -o $@
+
+test-debug-fatal: $(BUILD)/tests/test-fatal-debug
 	$<
 
 compat-build: $(FIXTURE_BINS)

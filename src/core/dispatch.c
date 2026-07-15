@@ -17,7 +17,7 @@ void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
        map/unmap cycle.  Only the first activation retires pre-guard code. */
     if (active && !was_active) {
         atomic_store_explicit(&g_guest_bus_enabled, 1, memory_order_release);
-        stw_force_dispatch_flush();
+        if (!stw_force_dispatch_flush()) return;
     }
 }
 
@@ -159,6 +159,11 @@ static void run_guest(struct cpu *c) {
     // even when the (aarch64) host SP == the exhausted guest SP. No-op reservation on x86 (host SP differs).
     install_host_sigaltstack();
     while (!c->exited) {
+        if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+            c->exit_code = 70;
+            c->exited = 1;
+            break;
+        }
         // reset the async-interrupt poll each dispatcher iteration. The emitted body check sets us
         // here when cpu->irq is seen; delivery happens at the bottom of the loop (maybe_deliver_signal).
         // Clearing here is what stops a masked-but-pending signal (which stays in g_pending, undelivered)
@@ -196,10 +201,20 @@ static void run_guest(struct cpu *c) {
                     // More than one guest thread is live: reusing the arena in place could free code out
                     // from under a peer mid-block. Stop the world and switch to a fresh cache instead
                     // (the old one is retained until peers drift off it). See jit/cache.c.
-                    stw_flush();
+                    if (!stw_flush()) {
+                        if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                        c->exit_code = 70;
+                        c->exited = 1;
+                        continue;
+                    }
                 } else {
                     // Single-threaded (or every spawned peer has exited): safe wholesale in-place flush.
-                    jit_wprot(0);
+                    if (!jit_wprot(0)) {
+                        if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                        c->exit_code = 70;
+                        c->exited = 1;
+                        continue;
+                    }
                     g_cp = g_cache;
                     memset(g_map, 0, sizeof g_map);
                     g_npend = 0;
@@ -207,7 +222,12 @@ static void run_guest(struct cpu *c) {
                     memset(g_ibtc, 0, sizeof g_ibtc);
                     // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)
                     G_SHADOW_CLEAR(c);
-                    jit_wprot(1);
+                    if (!jit_wprot(1)) {
+                        if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                        c->exit_code = 70;
+                        c->exited = 1;
+                        continue;
+                    }
                 }
 #ifdef PCACHE_FLUSH_HOOK
                 // the reloc records described the arena we just dropped/renewed; reset so the
@@ -216,7 +236,12 @@ static void run_guest(struct cpu *c) {
                 PCACHE_FLUSH_HOOK;
 #endif
             }
-            jit_wprot(0);
+            if (!jit_wprot(0)) {
+                if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                c->exit_code = 70;
+                c->exited = 1;
+                continue;
+            }
             // A3 §B-off: align each new block ENTRY to 16B. §B-off shrinks the per-bl stubs, which
             // shifts where hot loops land in the cache and can deterministically de-align a NEON loop
             // (e.g. sha256, which has no hot returns yet wobbled ~7%). Padding lives BEFORE the entry
@@ -229,14 +254,32 @@ static void run_guest(struct cpu *c) {
             code = translate_block(G_PC(c));
             hl_dispatch_profile_translation(&g_dispatch_profile);
             // new block coherent on all cores FIRST (icache is on the RX alias under dual map)
-            jit_publish_code(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start));
+            if (!jit_publish_code(J_RX(g_emit_start), (size_t)(g_cp - g_emit_start))) {
+                (void)jit_wprot(1);
+                if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                c->exit_code = 70;
+                c->exited = 1;
+                continue;
+            }
             // THEN chain existing blocks to it (still write mode). Frontend hook: aarch64 chains here;
             // x86's translate_block already chained internally, so its hook is a no-op.
             // Debug-only no-chain mode: every block re-enters the dispatcher and the
             // JT trace records every execution (exact per-block PC attribution). Correct but slow.
             if (!g_dbg_nochain) G_DISPATCH_CHAIN(c);
+            if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+                (void)jit_wprot(1);
+                if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                c->exit_code = 70;
+                c->exited = 1;
+                continue;
+            }
             // back to execute AFTER all cache writes
-            jit_wprot(1);
+            if (!jit_wprot(1)) {
+                if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+                c->exit_code = 70;
+                c->exited = 1;
+                continue;
+            }
             // Frontend hook: post-translate per-arch step (x86 W6A SMC source-page write-protect; empty aarch64).
             G_AFTER_TRANSLATE(c);
             if (g_dispatch_profile.enabled)
@@ -245,6 +288,12 @@ static void run_guest(struct cpu *c) {
         // IBTC: insert the indirect target that just missed (frontend hook -- per-arch IBTC contract:
         // aarch64 keys on ic_site/body-8/per-site IC literals; x86 will key on ic_miss/plain body).
         G_IBTC_FILL(c);
+        if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+            if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+            c->exit_code = 70;
+            c->exited = 1;
+            continue;
+        }
         // Resolve the RX alias to execute through WHILE STILL HOLDING the lock: a concurrent stop-the-world
         // flush may swap g_rw2rx (and g_cache) the instant we drop it, yet `code` is an address in the cache
         // that was current under the lock -- so J_RX(code) must use the matching g_rw2rx. (Single-threaded

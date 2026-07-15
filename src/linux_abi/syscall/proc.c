@@ -212,11 +212,19 @@ static void fork_child_hooks(struct cpu *c) {
     // so the child's first run_block can instruction-abort fetching from the (non-executable) code
     // cache -> the intermittent fork+exec SIGBUS. The host end-write gate re-asserts RX execution.
     // (No-op under the dual map, which never toggles W^X.)
-    jit_wprot(1);
+    if (!jit_wprot(1)) {
+        c->exit_code = 70;
+        c->exited = 1;
+        return;
+    }
     install_host_sigaltstack(); // the altstack registration doesn't survive fork on Apple Silicon --
                                 // re-arm it (COW-inherited region) so the child can still take a stack-overflow
                                 // guard fault (host SP == guest SP) instead of double-faulting into SIGILL.
-    jit_after_fork();           // dual map: re-alias RX from the child's COW RW pages at the same VA (~1us; keeps
+    if (!jit_after_fork()) {
+        c->exit_code = 70;
+        c->exited = 1;
+        return;
+    }                           // dual map: re-alias RX from the child's COW RW pages at the same VA (~1us; keeps
                                 // every inherited translation valid) -- or, threaded parent, rebuild a fresh cache
 #ifdef PCACHE_FORK_HOOK
     PCACHE_FORK_HOOK; // drop inherited reloc records + bar child saves (an execve re-keys + unbars)

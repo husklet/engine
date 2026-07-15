@@ -2148,7 +2148,7 @@ static void tier2_promote(uint64_t gpc) {
     if (g_cp + (1u << 16) > g_cache + CACHE_SZ) return;
     int mi = map_idx(gpc);
     if (mi < 0) return;
-    jit_wprot(0);
+    if (!jit_wprot(0)) return;
     g_emit_start = g_cp;
     g_tier2_build = 1;
     void *nh = translate_block(gpc); // folded recompile; no counter, no map_put
@@ -2161,7 +2161,7 @@ static void tier2_promote(uint64_t gpc) {
         fprintf(stderr, "\n");
     }
     // make the tier-2 code coherent on all cores BEFORE anything can branch into it
-    jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start));
+    if (!jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start))) { (void)jit_wprot(1); return; }
     // Redirect the OLD tier-1 body to tier-2: overwrite its first instruction with `b nb`. Chains from
     // predecessors were resolved to the old body when they were translated (patch_links_to only fixes
     // still-PENDING ones), so without this an outer loop re-entering this inner loop would keep hitting
@@ -2175,7 +2175,7 @@ static void tier2_promote(uint64_t gpc) {
         int64_t bd8 = (((uint8_t *)nb + 8) - ((uint8_t *)old_body + 8)) / 4;
         ((uint32_t *)old_body)[2] = 0x14000000u | ((uint32_t)bd8 & 0x3FFFFFFu);
     }
-    jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0));
+    if (!jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0))) { (void)jit_wprot(1); return; }
     // swap the live map entry: future dispatcher lookups + IBTC fills resolve to tier-2 directly
     g_map[mi].host = nh;
     g_map[mi].body = nb;
@@ -2187,6 +2187,6 @@ static void tier2_promote(uint64_t gpc) {
         g_ibtc[h].target = 0;
         g_ibtc[h].body = NULL;
     }
-    jit_wprot(1);
+    if (!jit_wprot(1)) return;
     g_prof_t2++;
 }

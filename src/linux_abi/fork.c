@@ -215,14 +215,14 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     // W^X / APRR per-thread execute state is NOT reliably inherited across fork() on Apple Silicon
     // (see the proc.c fork path) -- re-assert RX so the first run_block can fetch executable code
     // (no-op under the dual map, which never toggles W^X).
-    jit_wprot(1);
+    if (!jit_wprot(1)) _exit(70);
     // preserved-arena fork: re-couple the dual map's RX alias to THIS child's COW RW pages at the
     // same VA (single-threaded parent: ~1us preserve; threaded parent: rebuild fresh), so the
     // COW-inherited warm arena + block maps stay valid and this runner executes real code instead of
     // stale/empty RX. Same hook a guest fork runs (proc.c fork_child_hooks); inheriting these warm
     // translations intact is the whole point of a warm worker. Also sheds the parent's thread registry
     // + reinits the engine locks a dead peer could have held (jit_after_fork).
-    jit_after_fork();
+    if (!jit_after_fork()) _exit(70);
     // wave-2 discipline: this process is a fork child on a COW copy of the PARENT's arena +
     // recording state -- it must NEVER pcache_save under the request binary's identity. A guest
     // execve re-keys + lifts the bar (pcache_exec_reload), same as any other fork child.

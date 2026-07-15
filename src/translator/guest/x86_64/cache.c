@@ -395,9 +395,9 @@ static int pcache_load(uint64_t entry_jump) {
         g_pc_nlib = 0;
         return 0;
     }
-    jit_wprot(0);
+    if (!jit_wprot(0)) { free(abuf); g_pc_nlib = 0; return 0; }
     memcpy(g_cache, abuf, h.arena_used);
-    jit_wprot(1);
+    if (!jit_wprot(1)) { free(abuf); g_pc_nlib = 0; return 0; }
     free(abuf);
     // rebuild the engine state from the offset-relative records. fixed-image blocks (main+interp,
     // identity-validated by the cache key itself) go live NOW; manifest (library) blocks are DEFERRED
@@ -434,10 +434,9 @@ static int pcache_load(uint64_t entry_jump) {
     free(me);
     free(pe);
     // re-slide every baked PIE host pointer for THIS process + publish the restored code to the i-cache
-    jit_wprot(0);
+    if (!jit_wprot(0)) return 0;
     pcache_relocate(h.block_return_at);
-    jit_wprot(1);
-    jit_publish_code(g_cache, h.arena_used);
+    if (!jit_wprot(1) || !jit_publish_code(g_cache, h.arena_used)) return 0;
     memset(g_ibtc, 0, sizeof g_ibtc); // runtime cache: repopulates lazily
     g_pcache_loaded = 1;
     g_pc_restored_n = nlive + g_pc_ndefer; // what the warm-stat measures waste against

@@ -244,8 +244,7 @@ static int engine_global_init(void) {
     // macOS host services own code mappings and post-fork alias repair. NODUALMAP keeps the single-MAP_JIT
     // compatibility mode; the default remains a stable dual RW/RX mapping.
     if (jit_cache_init() != 0) {
-        fprintf(stderr, "hl-engine: unable to allocate JIT code mapping\n");
-        return 1;
+        return 70;
     }
     {
         hl_fdcache_binding binding = {&g_jit_services,
@@ -427,9 +426,15 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         g_pc_entry = jump;
         int hit = pcache_load(jump); // graceful MISS on any stale/corrupt/truncated cache -> translate fresh
         if (g_coldprof) fprintf(stderr, "[pcache] %s reloc=%d\n", hit ? "HIT (translation skipped)" : "MISS", g_nreloc);
+        if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) {
+            pcache_directory_close();
+            return 70;
+        }
     }
     int ec = run_loaded(argc, argv, &lm, jump, at_base);
-    pcache_save(); // exit via syscall 93 returns here; syscall 94 saves before _exit (idempotent atomic rename)
+    if (hl_fatal_status(&g_jit_fatal) == HL_STATUS_OK)
+        pcache_save(); // exit via syscall 93 returns here; syscall 94 saves before _exit (idempotent atomic rename)
+    if (hl_fatal_status(&g_jit_fatal) != HL_STATUS_OK) ec = 70;
     pcache_directory_close();
     return ec;
 }

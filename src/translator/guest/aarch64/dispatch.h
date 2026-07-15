@@ -82,10 +82,11 @@ static uint64_t g_smc_flushes;
                 if ((c)->ic_site != 1 && !(g_rwx_guest || g_smc_seen)) { /* per-site monomorphic IC */                 \
                     /* ic_site is the RX address of the literal pair (from a runtime adr); write via RW. */            \
                     uint64_t *site = (uint64_t *)J_RW((c)->ic_site);                                                   \
-                    jit_wprot(0);                                                                                      \
-                    site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                                    \
-                    site[0] = (c)->pc;        /* Lsite_tgt       */                                                    \
-                    jit_wprot(1);                                                                                      \
+                    if (jit_wprot(0)) {                                                                                \
+                        site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                                \
+                        site[0] = (c)->pc;        /* Lsite_tgt       */                                                \
+                        (void)jit_wprot(1);                                                                            \
+                    }                                                                                                  \
                 }                                                                                                      \
             }                                                                                                          \
         }                                                                                                              \

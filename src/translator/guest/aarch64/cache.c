@@ -396,11 +396,10 @@ static int pcache_load(uint64_t entry_jump) {
     free(tx);
 
     // Commit the arena bytes + re-emit every baked host pointer, then publish to the I-cache.
-    jit_wprot(0);
+    if (!jit_wprot(0)) { free(abuf); return 0; }
     memcpy(g_cache, abuf, h.arena_used);
     pcache_relocate();
-    jit_wprot(1);
-    jit_publish_code(J_RX(g_cache), h.arena_used);
+    if (!jit_wprot(1) || !jit_publish_code(J_RX(g_cache), h.arena_used)) { free(abuf); return 0; }
     memset(g_ibtc, 0, sizeof g_ibtc); // shared IBTC data table: refills lazily
     free(abuf);
     g_pcache_loaded = 1;
