@@ -1,7 +1,20 @@
 #include "hl/engine.h"
 #include "hl/log.h"
+#if defined(HL_TEST_HOST_LINUX)
+#include "hl/linux.h"
+#include "../src/host/linux/probe.h"
+typedef hl_host_linux lifecycle_host;
+#define lifecycle_host_create hl_host_linux_create
+#define lifecycle_host_destroy hl_host_linux_destroy
+#define lifecycle_active_mappings hl_host_linux_active_mappings
+#else
 #include "hl/macos.h"
 #include "../src/host/macos/probe.h"
+typedef hl_host_macos lifecycle_host;
+#define lifecycle_host_create hl_host_macos_create
+#define lifecycle_host_destroy hl_host_macos_destroy
+#define lifecycle_active_mappings hl_host_macos_active_mappings
+#endif
 
 #include <stdio.h>
 #include <pthread.h>
@@ -86,7 +99,7 @@ static void *run_guest(void *opaque) {
 }
 
 int main(int argc, char **argv) {
-    hl_host_macos *host = NULL;
+    lifecycle_host *host = NULL;
     hl_host_services services;
     hl_host_clock_services clock;
     hl_host_memory_services memory;
@@ -106,9 +119,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: lifecycle-e2e-runner GUEST [args...]\n");
         return 64;
     }
-    status = hl_host_macos_create(&host, &services);
+    status = lifecycle_host_create(&host, &services);
     if (status != HL_STATUS_OK) return 70;
-    if (hl_host_macos_active_mappings(host) != 0) return 82;
+    if (lifecycle_active_mappings(host) != 0) return 82;
     clock_calls = mmap(NULL, 2 * sizeof(*clock_calls), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (clock_calls == MAP_FAILED) return 76;
     realtime_calls = clock_calls + 1;
@@ -165,8 +178,8 @@ int main(int argc, char **argv) {
         status = hl_engine_run(engine, argc - guest_index, (const char *const *)(argv + guest_index), &result);
     }
     hl_engine_destroy(engine);
-    if (hl_host_macos_active_mappings(host) != 0) return 83;
-    hl_host_macos_destroy(host);
+    if (lifecycle_active_mappings(host) != 0) return 83;
+    lifecycle_host_destroy(host);
     if (fail_code_publish)
         return status == HL_STATUS_PLATFORM_FAILURE && result.kind == HL_ENGINE_EXIT_ENGINE_ERROR &&
                        result.guest_status == HL_STATUS_PLATFORM_FAILURE && result.detail == 0 &&
