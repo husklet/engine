@@ -13,8 +13,6 @@ typedef struct hl_gmap_entry {
     uint64_t guest_length;
 } hl_gmap_entry;
 
-#define HL_GMAP_CAPACITY 8192u
-
 void hl_gmap_bind_limits(const hl_limit_table *limits);
 void hl_gmap_bind_host(const hl_host_services *host);
 size_t hl_gmap_count(void);

@@ -7,6 +7,7 @@
 
 #define MLK_N 1024
 #define HL_GUEST_RLIMIT_MEMLOCK 8
+#define HL_GMAP_INITIAL_CAPACITY 256u
 
 struct hl_gmap_lock_range {
     uint64_t low;
@@ -14,8 +15,9 @@ struct hl_gmap_lock_range {
 };
 
 struct hl_gmap_context {
-    hl_gmap_entry mappings[HL_GMAP_CAPACITY];
+    hl_gmap_entry *mappings;
     size_t mapping_count;
+    size_t mapping_capacity;
     struct hl_gmap_lock_range locks[MLK_N];
     size_t lock_count;
     int lock_all;
@@ -25,7 +27,8 @@ struct hl_gmap_context {
 };
 
 #define HL_EXEC_LOADER_SLOTS 32u
-#define HL_EXEC_MAPPING_CAPACITY (2u * HL_GMAP_CAPACITY + HL_EXEC_LOADER_SLOTS)
+#define HL_EXEC_MAPPING_CAPACITY (16384u + HL_EXEC_LOADER_SLOTS)
+
 typedef struct hl_exec_mapping {
     uint64_t address;
     uint64_t length;
@@ -55,9 +58,22 @@ int hl_gmap_get(size_t index, hl_gmap_entry *entry) {
     return 1;
 }
 
+static void hl_gmap_reserve_one(void) {
+    size_t capacity;
+    hl_gmap_entry *mappings;
+    if (g_gmap.mapping_count < g_gmap.mapping_capacity) return;
+    capacity = g_gmap.mapping_capacity != 0 ? g_gmap.mapping_capacity * 2 : HL_GMAP_INITIAL_CAPACITY;
+    if (capacity < g_gmap.mapping_capacity || capacity > SIZE_MAX / sizeof(*mappings)) abort();
+    mappings = realloc(g_gmap.mappings, capacity * sizeof(*mappings));
+    if (mappings == NULL) abort();
+    g_gmap.mappings = mappings;
+    g_gmap.mapping_capacity = capacity;
+}
+
 void hl_gmap_add(uint64_t address, uint64_t length) {
     hl_gmap_entry *entry;
-    if (!address || address == UINT64_MAX || !length || g_gmap.mapping_count >= HL_GMAP_CAPACITY) return;
+    if (!address || !length || address > UINT64_MAX - length) return;
+    hl_gmap_reserve_one();
     entry = &g_gmap.mappings[g_gmap.mapping_count++];
     entry->address = address;
     entry->length = length;
@@ -178,8 +194,7 @@ void hl_exec_mapping_discard_range(uint64_t address, uint64_t length) {
             /* Every split corresponds to a live guest VMA split and therefore
              * cannot exceed the same fixed capacity as the VMA registry. */
             if (g_exec_mapping_count >= HL_EXEC_MAPPING_CAPACITY) abort();
-            g_exec_mappings[g_exec_mapping_count++] =
-                (hl_exec_mapping){end, old_end - end, HL_HOST_HANDLE_INVALID};
+            g_exec_mappings[g_exec_mapping_count++] = (hl_exec_mapping){end, old_end - end, HL_HOST_HANDLE_INVALID};
         }
         ++index;
     }

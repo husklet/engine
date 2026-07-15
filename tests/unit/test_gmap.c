@@ -13,6 +13,8 @@ typedef struct mapping_probe {
     unsigned discards;
 } mapping_probe;
 
+#define FORMER_GMAP_CAPACITY 8192u
+
 static hl_host_result probe_release(void *context, hl_host_handle handle) {
     mapping_probe *probe = context;
     if (handle != 1 || munmap(probe->address, probe->size) != 0)
@@ -35,6 +37,16 @@ int main(void) {
 
     hl_limit_table_init(&limits);
     hl_gmap_bind_limits(&limits);
+    HL_CHECK(hl_gmap_count() == 0);
+
+    /* The registry is not an advertised guest limit. It must grow rather than
+     * silently forgetting live VMAs after the historical fixed capacity. */
+    for (size_t index = 0; index <= FORMER_GMAP_CAPACITY; ++index)
+        hl_gmap_add(UINT64_C(0x100000000) + index * UINT64_C(0x2000), UINT64_C(0x1000));
+    HL_CHECK(hl_gmap_count() == FORMER_GMAP_CAPACITY + 1u);
+    HL_CHECK(hl_gmap_contains(UINT64_C(0x100000000) + FORMER_GMAP_CAPACITY * UINT64_C(0x2000), 1));
+    for (size_t index = 0; index <= FORMER_GMAP_CAPACITY; ++index)
+        hl_gmap_remove(UINT64_C(0x100000000) + index * UINT64_C(0x2000));
     HL_CHECK(hl_gmap_count() == 0);
 
     hl_gmap_add(0, 0x1000);

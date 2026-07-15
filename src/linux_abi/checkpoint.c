@@ -571,6 +571,10 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
 // this runs BEFORE engine init (so MAP_FIXED lands on free VAs); a re-forked child calls gmap_reset_all() +
 // clears the anon/gna counters FIRST (dropping the COW-inherited init mappings) so its own RAM lands clean.
 static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) {
+    uint64_t *mapped = NULL;
+    uint64_t *mapped_a;
+    uint64_t *mapped_e;
+    size_t nmapped = 0;
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/pages", procdir);
     FILE *f = fopen(pf, "rb");
@@ -578,17 +582,27 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         fprintf(stderr, "[restore] open %s: %s\n", pf, strerror(errno));
         return -1;
     }
-    uint64_t mapped_a[HL_GMAP_CAPACITY], mapped_e[HL_GMAP_CAPACITY];
-    int nmapped = 0;
-    for (uint64_t i = 0; i < m->n_regions; i++) {
-        struct ckpt_region reg;
-        if (ckpt_rd_all(f, &reg, sizeof reg) != 0) {
+    if (m->n_regions > SIZE_MAX / (2u * sizeof(*mapped))) {
+        fclose(f);
+        return -1;
+    }
+    if (m->n_regions != 0) {
+        mapped = calloc((size_t)m->n_regions * 2u, sizeof(*mapped));
+        if (mapped == NULL) {
             fclose(f);
             return -1;
         }
+    }
+    mapped_a = mapped;
+    mapped_e = mapped != NULL ? mapped + (size_t)m->n_regions : NULL;
+    for (uint64_t i = 0; i < m->n_regions; i++) {
+        struct ckpt_region reg;
+        if (ckpt_rd_all(f, &reg, sizeof reg) != 0) {
+            goto fail;
+        }
         uint64_t a = reg.addr, e = reg.addr + reg.len;
         int contained = 0;
-        for (int j = 0; j < nmapped; j++)
+        for (size_t j = 0; j < nmapped; j++)
             if (mapped_a[j] <= a && e <= mapped_e[j]) {
                 contained = 1;
                 break;
@@ -599,25 +613,20 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
             if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
                 fprintf(stderr, "[restore] cannot map guest region %llx+%llx: %s\n", (unsigned long long)a,
                         (unsigned long long)reg.len, strerror(errno));
-                fclose(f);
-                return -1;
+                goto fail;
             }
-            if (nmapped < HL_GMAP_CAPACITY) {
-                mapped_a[nmapped] = a;
-                mapped_e[nmapped] = e;
-                nmapped++;
-            }
+            mapped_a[nmapped] = a;
+            mapped_e[nmapped] = e;
+            nmapped++;
         }
         for (uint64_t p = 0; p < reg.npages; p++) {
             uint64_t va;
             if (ckpt_rd_all(f, &va, sizeof va) != 0) {
-                fclose(f);
-                return -1;
+                goto fail;
             }
             size_t n = (va - reg.addr + m->pagesz > reg.len) ? (size_t)(reg.len - (va - reg.addr)) : (size_t)m->pagesz;
             if (ckpt_rd_all(f, (void *)va, n) != 0) {
-                fclose(f);
-                return -1;
+                goto fail;
             }
         }
         ckpt_place_bump_past(reg.addr + reg.len); // keep the high-arena cursor above every restored region
@@ -629,6 +638,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
             anon_track(reg.addr, reg.len, reg.prot);
     }
     fclose(f);
+    free(mapped);
     brk_lo = m->brk_lo;
     brk_cur = m->brk_cur;
     brk_hi = m->brk_hi;
@@ -638,6 +648,10 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     g_stack_lo = m->stack_lo;
     g_stack_hi = m->stack_hi;
     return 0;
+fail:
+    fclose(f);
+    free(mapped);
+    return -1;
 }
 
 // Reopen this process's own path-backed fds. TTY fds are NOT reopened here -- they are inherited down the
