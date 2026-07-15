@@ -45,6 +45,7 @@ int main(void) {
     hl_host_handle *files = NULL;
     hl_host_handle *processes = NULL;
     hl_host_result cross_mapping;
+    hl_host_handle grown_directory_copy = HL_HOST_HANDLE_INVALID;
     char path[] = "/tmp/hl-native-capacity-XXXXXX";
     int native = mkstemp(path);
     HL_CHECK(native >= 0);
@@ -81,6 +82,13 @@ int main(void) {
         HL_CHECK(services.directory
                      ->add(services.context, directories[0], file.value, index + 1, HL_HOST_DIRECTORY_MODIFY)
                      .status == HL_STATUS_OK);
+    {
+        hl_host_result duplicated = services.directory->duplicate(services.context, directories[0]);
+        HL_CHECK(duplicated.status == HL_STATUS_OK);
+        grown_directory_copy = duplicated.value;
+        HL_CHECK(services.directory->remove(services.context, grown_directory_copy, DIRECTORY_WATCH_COUNT).status ==
+                 HL_STATUS_OK);
+    }
     for (size_t index = 0; index < COUNTER_COUNT; ++index) {
         hl_host_result created = services.counter->create(services.context, index, 0);
         HL_CHECK(created.status == HL_STATUS_OK);
@@ -167,6 +175,8 @@ int main(void) {
     for (size_t index = DIRECTORY_COUNT; index != 0; --index)
         HL_CHECK(services.directory->close(services.context, directories[index - 1]).status == HL_STATUS_OK);
     HL_CHECK(services.directory->close(services.context, directories[0]).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.directory->close(services.context, grown_directory_copy).status == HL_STATUS_OK);
+    HL_CHECK(services.directory->close(services.context, grown_directory_copy).status == HL_STATUS_INVALID_ARGUMENT);
     if (strcmp(HL_NATIVE_HOST_NAME, "macos") == 0) {
         processes = calloc(PROCESS_COUNT, sizeof(*processes));
         HL_CHECK(processes != NULL);

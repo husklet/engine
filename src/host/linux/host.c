@@ -2050,6 +2050,7 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
         for (index = 0; index < object->watch_capacity; ++index)
             if (object->watches[index].descriptor >= 0) close(object->watches[index].descriptor);
         free(object->pending);
+        free(object->watches);
         free(object);
     }
     pthread_mutex_unlock(&host->lock);
