@@ -654,7 +654,10 @@ layer immediately so completing macOS reduces, rather than increases, the later 
       one-million-syscall execution, fork/exec stress, file/pipe/event IPC, and latency/throughput IPC on macOS and
       Linux for both guest ISAs. Resource fixtures also bound retained JIT memory to 8 MiB and require mappings,
       descriptors, and thread counts to return to their lifecycle baseline.
-- [ ] Run long soak and application-level Linux workloads without leaks or unbounded growth.
+- [x] Run extended synthetic and application-level workloads without leaks or unbounded growth. The synthetic soak
+      repeats all 18 dual-ISA production cases ten times; the workload gate independently repeats all 18 supported
+      compute, memory, code-cache, thread/fork churn, SMC, SQLite, and database-server cases ten times. Both require
+      exact golden output and stable mapping, descriptor, and thread lifecycle counts after every repetition.
 - [x] Verify release binaries contain no active debug logging and require no diagnostic environment flags.
 - [x] Publish standalone C libraries, headers, host-provider archive, runner, pkg-config metadata, and a staged C
   consumer integration test.
