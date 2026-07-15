@@ -1,12 +1,17 @@
+#include "repstr.h"
+
+#include "../cpu.h"
+#include "../encoding.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
 // translator/guest/x86_64 -- rep movs/stos idiom upgrade.
 // Generalizes the LSE idiom-upgrade lever to the x86 string ops: a `rep movs`/`rep stos`
 // (the idiomatic memcpy/memset of every musl/glibc x86 guest) is lowered to ONE optimized
 // host libc call instead of the per-element `ldr;str;sub;cbnz` host loop. Bit-exact with
 // that scalar loop for all lengths (incl. 0), alignments, and the forward-overlap smear.
-// Kill-switch: NOREP=1 (or any non-"0" value) -> fall back to the original element loop.
-static int norep_disabled(void) {
-    return 0;
-}
 
 // Host helper for `rep movs`: copy `nbytes` forward, x86 element-by-element semantics.
 // rep movs always copies LOW->HIGH; a plain memcpy/memmove is correct only when the
@@ -18,15 +23,13 @@ static int norep_disabled(void) {
 // W6A item 1 (non-PIE): a biased ET_EXEC's guest pointer may still carry its low link address (e.g. a
 // rip-relative lea into the type/rodata section); rebase it to the real high mapping so these bulk C string
 // helpers touch the mapped bytes (the single-access fault path nonpie_fixup cannot serve a libc memcpy).
-// Inert for PIE/static-PIE (g_nonpie_lo == 0).
-static inline uint64_t repstr_g2h(uint64_t a) {
-    return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
-}
-
-static void hl_rep_movs(uint8_t *dst, const uint8_t *src, uint64_t nbytes, int w, int df) {
-    g_repmovs_n++;
-    dst = (uint8_t *)repstr_g2h((uint64_t)dst);
-    src = (const uint8_t *)repstr_g2h((uint64_t)src);
+// Inert for PIE/static-PIE (the translator's non-PIE range is empty).
+void hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int w, int df) {
+    uint8_t *dst = destination;
+    const uint8_t *src = source;
+    hl_x86_count_rep_movs();
+    dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
+    src = (const uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)src);
     if (nbytes == 0) return;
     if (df) { // DF=1 backward: dst/src point at the HIGHEST element; copy high->low, element-granular (the
         // x86 `std; rep movs` used by memmove for dst>src overlap). Element-by-element replays the scalar
@@ -72,9 +75,10 @@ static void hl_rep_movs(uint8_t *dst, const uint8_t *src, uint64_t nbytes, int w
 }
 
 // Host helper for `rep stos`: fill `n` elements of width `w` with `val` (AL/AX/EAX/RAX).
-static void hl_rep_stos(uint8_t *dst, uint64_t val, uint64_t n, int w, int df) {
-    g_repstos_n++;
-    dst = (uint8_t *)repstr_g2h((uint64_t)dst);
+void hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df) {
+    uint8_t *dst = destination;
+    hl_x86_count_rep_stos();
+    dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
     if (df) { // DF=1 backward: dst points at the highest element; write val at dst, dst-w, dst-2w, ...
         uint8_t *p = dst;
         for (uint64_t i = 0; i < n; i++, p -= (unsigned)w)
@@ -104,41 +108,29 @@ static void hl_rep_stos(uint8_t *dst, uint64_t val, uint64_t n, int w, int df) {
     }
 }
 
-// Reload guest state (flags + xmm0..15 + r0..15) from the membank into host regs, WITHOUT
-// re-pinning x28 (== &cpu, callee-saved across the host call). Mirrors emit_prologue minus
-// the `mov x28,x0`.
-static void emit_reload(void) {
-    e_nzcv_load();
-    for (int t = 0; t < 16; t += 2)
-        e_ldp_q(t, t + 1, 28, OFF_V + t * 16);
-    for (int r = 1; r <= 15; r++)
-        e_ldr(r, 28, R_OFF(r));
-    e_ldr(0, 28, 0); // rax last
-}
-
 // Codegen for the idiom: spill guest state, marshal args, blr the host helper, then fix up
 // RDI/RSI (+= count*w) and RCX (->0) in the membank snapshot, and reload. Guest GPRs live in
 // host x0..x15 (caller-saved) so the spill/reload around the call is mandatory; x28 (cpu) is
 // callee-saved and survives; the host SP is untouched (guest RSP is x4), so ABI alignment holds.
-// df_static: the block-static DF (DF_FWD/DF_BWD/DF_DYN). The helper takes the runtime direction as its 5th
-// arg (x4); on DF_DYN we load cpu->df and the pointer fixup negates the delta at runtime (backward => -nbytes).
-static void emit_rep_string(int movs, int w, int shift, int df_static) {
+// df_static is the block-static direction shadow. The helper takes the runtime direction as its fifth
+// argument; for a dynamic direction we load cpu->df and negate the pointer delta at runtime when backward.
+static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df_static) {
     // emit_spill (below) clears cpu->vdirty and republishes cpu->V, and emit_reload restores host
     // v0..v15 FROM cpu->V, so this leaves cpu->V current -> no vdirty mark needed (a later syscall may slim).
-    emit_spill();                          // x0..x15 + xmm0..15 + flags -> cpu (membank)
+    hl_x86_emit_spill();                          // x0..x15 + xmm0..15 + flags -> cpu (membank)
     e_ldr(0, 28, R_OFF(RDI));              // x0 = dst (rdi)
     e_ldr(1, 28, R_OFF(movs ? RSI : RAX)); // x1 = src (rsi) / fill value (rax)
     e_ldr(2, 28, R_OFF(RCX));              // x2 = element count (rcx)
     e_movconst(3, (uint64_t)w);            // x3 = element width
-    if (df_static == DF_DYN)
+    if (df_static == HL_X86_DIRECTION_DYNAMIC)
         e_ldr(4, 28, OFF_DF); // x4 = cpu->df (0 fwd / 1 bwd) -- runtime direction
     else
-        e_movconst(4, (uint64_t)(df_static == DF_BWD)); // x4 = statically-known direction
+        e_movconst(4, (uint64_t)(df_static == HL_X86_DIRECTION_BACKWARD)); // x4 = statically-known direction
     if (movs) {
         if (shift) e_lsl_i(2, 2, shift, 1); // x2 = nbytes = count << shift
-        emit_host_ptr(16, (uint64_t)(uintptr_t)&hl_rep_movs, PRELOC_HOSTGLOBAL);
+        hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&hl_x86_rep_movs);
     } else {
-        emit_host_ptr(16, (uint64_t)(uintptr_t)&hl_rep_stos, PRELOC_HOSTGLOBAL);
+        hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&hl_x86_rep_stos);
     }
     emit32(0xD63F0000u | (16 << 5)); // blr x16
     // membank still holds the pre-call rcx/rdi/rsi (the helper takes its args by value):
@@ -148,9 +140,9 @@ static void emit_rep_string(int movs, int w, int shift, int df_static) {
     else
         e_mov_rr(16, 17, 1);
     // signed pointer delta: forward => +nbytes, backward => -nbytes.
-    if (df_static == DF_BWD) {
+    if (df_static == HL_X86_DIRECTION_BACKWARD) {
         e_rrr(A_SUB, 16, 31, 16, 1, 0); // x16 = -nbytes
-    } else if (df_static == DF_DYN) {
+    } else if (df_static == HL_X86_DIRECTION_DYNAMIC) {
         e_ldr(20, 28, OFF_DF);               // x20 = cpu->df
         emit32(0x34000000u | (2 << 5) | 20); // cbz x20, .+8  (df==0 -> keep +nbytes)
         e_rrr(A_SUB, 16, 31, 16, 1, 0);      // df==1 -> x16 = -nbytes
@@ -164,18 +156,18 @@ static void emit_rep_string(int movs, int w, int shift, int df_static) {
         e_str(19, 28, R_OFF(RSI));
     }
     e_str(31, 28, R_OFF(RCX)); // rcx = 0 (str xzr); EFLAGS unchanged by movs/stos
-    emit_reload();
+    hl_x86_emit_reload();
     // the emit_spill above cleared cpu->vdirty at RUNTIME, so the once-per-trace mark latch must
     // reset -- a later xmm write in this same region has to re-mark or a following slim syscall exit would
     // skip the xmm save with host v0..v15 newer than cpu->V.
-    g_vmark_done = 0;
+    hl_x86_emit_vector_reset();
 }
 
 // ---- string ops dispatch: stos/movs/lods (AA/AB/A4/A5/AC/AD), cmps/scas (A6/A7/AE/AF), cld/std (FC/FD).
 // Lifted VERBATIM out of translate_block's one-byte switch (behavior-preserving move). DF assumed 0 (fwd)
-// for stos/movs/lods unless std set g_df. Returns TX_FALL if `op` is not a string op (caller falls through
+// for stos/movs/lods unless std set state->direction. Returns TX_FALL if `op` is not a string op (caller falls through
 // to the next handler), TX_NEXT (caller: `gpc = next; continue;`), or TX_BREAK (block ends; caller: break).
-static int translate_string(struct insn *I, uint64_t next) {
+int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *state) {
     uint8_t op = I->op;
     if (op == 0xAA || op == 0xAB || op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
         int w = (op & 1) ? I->opsize : 1;
@@ -186,15 +178,15 @@ static int translate_string(struct insn *I, uint64_t next) {
         // `lods` (result is RAX, not a bulk move), or a segment override / 32-bit address size (the scalar
         // loop ignores both too).
         if (I->rep && !lods && !I->seg && !I->addr32 && (w == 1 || w == 2 || w == 4 || w == 8) &&
-            !norep_disabled()) {
+            state->optimize) {
             int shift = w == 1 ? 0 : w == 2 ? 1 : w == 4 ? 2 : 3;
-            emit_rep_string(movs, w, shift, g_df);
+            emit_rep_string(movs, w, shift, state->direction);
             return TX_NEXT;
         }
-        // Scalar element loop. DF stride: forward +w, backward -w. When DF is statically known (DF_FWD/DF_BWD)
-        // use an immediate add/sub; when DF_DYN (block entry / after popfq) compute a runtime stride reg (x17)
+        // Scalar element loop. DF stride: forward +w, backward -w. When DF is statically known (HL_X86_DIRECTION_FORWARD/HL_X86_DIRECTION_BACKWARD)
+        // use an immediate add/sub; when HL_X86_DIRECTION_DYNAMIC (block entry / after popfq) compute a runtime stride reg (x17)
         // from cpu->df so a cross-block `std`/popfq direction is honored.
-        int dyn = (g_df == DF_DYN);
+        int dyn = (state->direction == HL_X86_DIRECTION_DYNAMIC);
         if (dyn) {
             e_movconst(17, (uint64_t)w);         // x17 = +w
             e_ldr(16, 28, OFF_DF);               // x16 = cpu->df
@@ -205,15 +197,15 @@ static int translate_string(struct insn *I, uint64_t next) {
     do {                                                                                                               \
         if (dyn)                                                                                                       \
             e_rrr(A_ADD, (reg), (reg), 17, 1, 0);                                                                      \
-        else if (g_df == DF_BWD)                                                                                       \
-            e_subi((reg), (reg), w, 1);                                                                                \
+        else if (state->direction == HL_X86_DIRECTION_BACKWARD)                                                                                       \
+            e_subi((reg), (reg), (unsigned)w, 1);                                                                                \
         else                                                                                                          \
-            e_addi((reg), (reg), w, 1);                                                                                \
+            e_addi((reg), (reg), (unsigned)w, 1);                                                                                \
     } while (0)
         uint32_t *cbz = NULL, *top = NULL;
         if (I->rep) {
-            top = (uint32_t *)g_cp;
-            cbz = (uint32_t *)g_cp;
+            top = hl_x86_emit_cursor();
+            cbz = hl_x86_emit_cursor();
             emit32(0);
         } // cbz RCX,done
         if (movs) {
@@ -231,9 +223,9 @@ static int translate_string(struct insn *I, uint64_t next) {
 #undef REP_STEP
         if (I->rep) {
             e_subi(RCX, RCX, 1, 1);
-            int64_t back = (int64_t)(top - (uint32_t *)g_cp);
+            int64_t back = (int64_t)(top - hl_x86_emit_cursor());
             emit32(0x14000000u | ((uint32_t)back & 0x3FFFFFFu)); // b top
-            int64_t d = ((uint32_t *)g_cp - cbz);
+            int64_t d = (hl_x86_emit_cursor() - cbz);
             *cbz = 0xB4000000u | (((uint32_t)d & 0x7FFFF) << 5) | RCX; // cbz x_rcx,done
         }
         return TX_NEXT;
@@ -247,9 +239,9 @@ static int translate_string(struct insn *I, uint64_t next) {
         int isscas = (op == 0xAE || op == 0xAF);
         int isrep = (I->rep || I->repne);
         uint64_t desc = (uint64_t)w | ((uint64_t)isscas << 8) | ((uint64_t)(I->repne ? 1 : 0) << 9) |
-                        ((uint64_t)isrep << 10) | ((uint64_t)(g_df == DF_BWD ? 1 : 0) << 11);
+                        ((uint64_t)isrep << 10) | ((uint64_t)(state->direction == HL_X86_DIRECTION_BACKWARD ? 1 : 0) << 11);
         e_movconst(16, desc);
-        if (g_df == DF_DYN) {              // DF unknown statically -> OR in the runtime direction bit
+        if (state->direction == HL_X86_DIRECTION_DYNAMIC) {              // DF unknown statically -> OR in the runtime direction bit
             e_ldr(18, 28, OFF_DF);         // x18 = cpu->df (0/1)
             e_rrr(A_ORR, 16, 16, 18, 1, 11); // desc |= df << 11
         }
@@ -260,7 +252,7 @@ static int translate_string(struct insn *I, uint64_t next) {
     if (op == 0xFC || op == 0xFD) { // cld (FC) / std (FD): update BOTH the runtime bit and the static shadow
         e_movconst(16, (uint64_t)(op == 0xFD));
         e_str(16, 28, OFF_DF);            // cpu->df = 0 (fwd) / 1 (bwd) -- persists across blocks
-        g_df = (op == 0xFD) ? DF_BWD : DF_FWD; // statically known for the rest of THIS block (fast stride)
+        state->direction = (op == 0xFD) ? HL_X86_DIRECTION_BACKWARD : HL_X86_DIRECTION_FORWARD; // statically known for the rest of THIS block (fast stride)
         return TX_NEXT;
     }
     return TX_FALL;

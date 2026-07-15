@@ -708,6 +708,26 @@ static void emit_reload_full(void) {
     e_ldr(0, 28, R_OFF(0));
 }
 
+void hl_x86_emit_spill(void) {
+    emit_spill();
+}
+
+void hl_x86_emit_reload(void) {
+    emit_reload_full();
+}
+
+void hl_x86_emit_host_pointer(int destination, uint64_t pointer) {
+    emit_host_ptr(destination, pointer, PRELOC_HOSTGLOBAL);
+}
+
+void hl_x86_emit_vector_reset(void) {
+    g_vmark_done = 0;
+}
+
+uint32_t *hl_x86_emit_cursor(void) {
+    return (uint32_t *)g_cp;
+}
+
 /* Emitted only in BUS-active translation generations. */
 void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     if (!jit_guest_bus_active()) return;

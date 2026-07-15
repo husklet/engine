@@ -129,6 +129,18 @@ static int noeaopt(void) { return 0; }
 // for PIE/static-PIE -> guestfold_on() is 0 -> codegen byte-identical to baseline.
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 
+uint64_t hl_x86_guest_pointer(uint64_t address) {
+    return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
+}
+
+void hl_x86_count_rep_movs(void) {
+    g_repmovs_n++;
+}
+
+void hl_x86_count_rep_stos(void) {
+    g_repstos_n++;
+}
+
 static int guestfold_on(void) { return g_nonpie_lo != 0; }
 
 // ---- W5B adaptive tier-2 (x86 engine) — x86-only glue over the SHARED W4E substrate ----

@@ -4,6 +4,7 @@
 #include "lower/primitives.h"
 #include "lower/alu.h"
 #include "lower/mov.h"
+#include "lower/repstr.h"
 #include "lower/shift.h"
 #include "lower/x87.h"
 
@@ -410,10 +411,9 @@ static int g_pfaf_dead;
 // cld/std/popfq and read at runtime by pushfq and the string-op lowering -- so a `std` (or popfq-set DF)
 // whose `rep movs/stos/scas` lands in a LATER block honors the backward direction (previously it silently
 // ran forward). g_df additionally tracks the STATICALLY-known value within the current block for codegen:
-// DF_FWD/DF_BWD emit a constant +w/-w stride (fast, no cpu->df load); DF_DYN means "unknown at translate
+// Known forward/backward states emit a constant stride; dynamic means "unknown at translate
 // time" (block entry, or after popfq) so the lowering loads cpu->df and picks the stride at runtime.
-enum { DF_FWD = 0, DF_BWD = 1, DF_DYN = 2 };
-static int g_df; // one of DF_FWD/DF_BWD/DF_DYN; the runtime truth is cpu->df
+static enum hl_x86_direction g_df; // block-static shadow; the runtime truth is cpu->df
 
 static int lazyflags_on(void) { return 1; }
 
@@ -815,8 +815,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/trace.c"
 
-#include "lower/repstr.c"
-
 #include "lower/crypto.c"
 
 #include "lower/sse4x.h"
@@ -1124,7 +1122,7 @@ static void *translate_block(uint64_t gpc) {
     emit_irq_check(start);
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
     g_v26z = g_v27m = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
-    g_df = DF_DYN; // DF unknown at block entry (a prior block's std/popfq may have left it set) -> string
+    g_df = HL_X86_DIRECTION_DYNAMIC; // a prior block's std/popfq may have left it set
     hl_x86_x87_reset(); // x87: top unknown at block entry until a finit anchors it
     g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
     g_prof_xlate++;   // PROF (measurement-only): translate_block calls
@@ -1657,10 +1655,12 @@ static void *translate_block(uint64_t gpc) {
                 continue;
             }
             // ---- string ops: stos/movs/lods (AA/AB/A4/A5/AC/AD), cmps/scas (A6/A7/AE/AF), cld/std (FC/FD).
-            // Lifted into translate/repstr.c translate_string(); it returns how to steer this translate loop
+            // The independent repstr lowering returns how to steer this translate loop
             // (TX_NEXT -> gpc=next;continue, TX_BREAK -> end the block, TX_FALL -> not a string op).
             {
-                int s = translate_string(&I, next);
+                hl_x86_repstr_state repstr_state = {.direction = g_df, .optimize = 1};
+                int s = hl_x86_lower_repstr(&I, next, &repstr_state);
+                g_df = repstr_state.direction;
                 if (s == TX_NEXT) {
                     // A string idiom was emitted; its ERMS funnel may `blr` a host helper, which can
                     // clobber ALL of v16..v31 -- drop the crypto constant-hoist claims (v26/v27).
@@ -1954,7 +1954,7 @@ static void *translate_block(uint64_t gpc) {
             // popfq (9D): pop RFLAGS and distribute back into the flag substrate (cpu->nzcv + PF/AF/ID/DF).
             // DF (bit10) IS now restored to the runtime cpu->df (formerly a documented M-gap): the direction
             // flag persists across block boundaries and a `popfq` of a value with bit10=1 followed by a
-            // later-block `rep movs/stos/scas` copies BACKWARD correctly. g_df drops to DF_DYN because the
+            // later-block `rep movs/stos/scas` copies BACKWARD correctly. g_df becomes dynamic because the
             // restored value is runtime (the string-op lowering will load cpu->df).
             if (op == 0x9D) {
                 e_load(8, 16, RSP); // x16 = popped RFLAGS
@@ -1978,7 +1978,7 @@ static void *translate_block(uint64_t gpc) {
                 e_str(18, 28, OFF_ID);  // stash RFLAGS.ID so a later pushfq observes the toggle (CPUID probe)
                 emit32(0x53000000u | (10 << 16) | (10 << 10) | (16 << 5) | 18); // ubfx w18,w16,#10,#1 (DF)
                 e_str(18, 28, OFF_DF);  // restore the runtime direction flag (was a documented M-gap)
-                g_df = DF_DYN;          // DF value is now runtime (popped) -> not statically known
+                g_df = HL_X86_DIRECTION_DYNAMIC; // DF value is now runtime (popped)
                 g_fl_pending = FL_NONE; // flags now materialized directly into cpu->nzcv
                 gpc = next;
                 continue;

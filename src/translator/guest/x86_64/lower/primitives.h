@@ -22,6 +22,14 @@ void narrow_adcsbb(int adc, int destination, int left, int right, int width);
 int lock_rmw(int kind, int width, int source);
 void emit_rcl_rcr(struct insn *insn, uint64_t next, int width, int rotate_right, int count);
 void emit_exit_const(uint64_t rip, uint64_t reason);
+void hl_x86_emit_spill(void);
+void hl_x86_emit_reload(void);
+void hl_x86_emit_host_pointer(int destination, uint64_t pointer);
+void hl_x86_emit_vector_reset(void);
+uint32_t *hl_x86_emit_cursor(void);
+uint64_t hl_x86_guest_pointer(uint64_t address);
+void hl_x86_count_rep_movs(void);
+void hl_x86_count_rep_stos(void);
 
 void emit_ea(struct insn *insn, uint64_t next);
 void emit_ea_core(struct insn *insn, uint64_t next, int bias);
