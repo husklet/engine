@@ -16,7 +16,7 @@ static void e_ldr(int rt, int rn, int off) {
     emit32(0xF9400000u | (((unsigned)off / 8) << 10) | (rn << 5) | rt);
 } // ldr x
 
-static void e_movz(int rd, uint32_t imm16, int sh) {
+void e_movz(int rd, uint32_t imm16, int sh) {
     emit32(0xD2800000u | (sh << 21) | (imm16 << 5) | rd);
 }
 
@@ -82,19 +82,19 @@ static void e_dmb_ishld(void) {
 }
 
 // Guest width-typed load/store at [rn, #0]. w = 1/2/4/8 bytes. (zero-extends on load)
-static void e_load(int w, int rt, int rn) {
+void e_load(int w, int rt, int rn) {
     uint32_t b = w == 1 ? 0x39400000u : w == 2 ? 0x79400000u : w == 4 ? 0xB9400000u : 0xF9400000u;
     emit32(b | (rn << 5) | rt);
     e_dmb_ishld();
 }
 
-static void e_store(int w, int rt, int rn) {
+void e_store(int w, int rt, int rn) {
     uint32_t b = w == 1 ? 0x39000000u : w == 2 ? 0x79000000u : w == 4 ? 0xB9000000u : 0xF9000000u;
     e_dmb_ish();
     emit32(b | (rn << 5) | rt);
 }
 
-static void e_ldrs(int w, int rt, int rn) {                                 // sign-extending load into X
+void e_ldrs(int w, int rt, int rn) {                                        // sign-extending load into X
     uint32_t b = w == 1 ? 0x39800000u : w == 2 ? 0x79800000u : 0xB9800000u; // ldrsb/ldrsh/ldrsw
     emit32(b | (rn << 5) | rt);
 }
@@ -107,7 +107,7 @@ static void e_load_uoff(int w, int rt, int rn, unsigned disp) { // ldr{b,h,,} rt
     e_dmb_ishld();
 }
 
-static void e_store_uoff(int w, int rt, int rn, unsigned disp) { // str{b,h,,} rt,[rn,#disp]
+void e_store_uoff(int w, int rt, int rn, unsigned disp) { // str{b,h,,} rt,[rn,#disp]
     uint32_t b = w == 1 ? 0x39000000u : w == 2 ? 0x79000000u : w == 4 ? 0xB9000000u : 0xF9000000u;
     e_dmb_ish();
     emit32(b | (((disp / (unsigned)w) & 0xFFF) << 10) | (rn << 5) | rt);
@@ -120,21 +120,21 @@ static void e_ldur(int w, int rt, int rn, int simm9) { // ldur{b,h,,} rt,[rn,#si
     e_dmb_ishld();
 }
 
-static void e_stur(int w, int rt, int rn, int simm9) { // stur{b,h,,} rt,[rn,#simm9]
+void e_stur(int w, int rt, int rn, int simm9) { // stur{b,h,,} rt,[rn,#simm9]
     uint32_t b = w == 1 ? 0x38000000u : w == 2 ? 0x78000000u : w == 4 ? 0xB8000000u : 0xF8000000u;
     e_dmb_ish();
     emit32(b | (((uint32_t)simm9 & 0x1FF) << 12) | (rn << 5) | rt);
 }
 
-static void e_mov_rr(int rd, int rm, int sf) { // mov rd, rm  (orr rd, xzr, rm)
+void e_mov_rr(int rd, int rm, int sf) { // mov rd, rm  (orr rd, xzr, rm)
     emit32((sf ? 0xAA0003E0u : 0x2A0003E0u) | (rm << 16) | rd);
 }
 
-static void e_addi(int rd, int rn, unsigned imm12, int sf) { // add rd, rn, #imm
+void e_addi(int rd, int rn, unsigned imm12, int sf) { // add rd, rn, #imm
     emit32((sf ? 0x91000000u : 0x11000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
-static void e_subi(int rd, int rn, unsigned imm12, int sf) { // sub rd, rn, #imm
+void e_subi(int rd, int rn, unsigned imm12, int sf) { // sub rd, rn, #imm
     emit32((sf ? 0xD1000000u : 0x51000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
@@ -329,7 +329,7 @@ static void e_uxt(int rd, int rn, int w) { // uxtb/uxth/uxtw (zero-extend reg)
     emit32(b | (rn << 5) | rd);
 }
 
-static void e_sxt(int rd, int rn, int w) { // sxtb/sxth/sxtw into X
+void e_sxt(int rd, int rn, int w) { // sxtb/sxth/sxtw into X
     uint32_t b = w == 1 ? 0x93401C00u : w == 2 ? 0x93403C00u : 0x93407C00u;
     emit32(b | (rn << 5) | rd);
 }
@@ -714,7 +714,7 @@ static void emit_reload_full(void) {
 }
 
 /* Emitted only in BUS-active translation generations. */
-static void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
+void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     if (!jit_guest_bus_active()) return;
     /* Sticky guarded translations become nearly inert after the final BUS
        range is released: two loads plus this flag-free state branch, with no

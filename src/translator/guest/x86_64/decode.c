@@ -338,13 +338,13 @@ static void ea_bias17(void) {
     *cb = 0xB5000000u | (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)cb) / 4) & 0x7FFFF) << 5) | 16; // cbnz x16
 }
 
-static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias);
+void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias);
 
-static void emit_ea(struct insn *I, uint64_t next_rip) {
+void emit_ea(struct insn *I, uint64_t next_rip) {
     emit_ea_core(I, next_rip, 1);
 }
 
-static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
+void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
     if (noeaopt()) { // exact baseline lowering
         if (I->rip_rel) {
             e_movconst(17, next_rip + (uint64_t)I->disp);
@@ -399,7 +399,7 @@ static void emit_ea_core(struct insn *I, uint64_t next_rip, int do_bias) {
 // into one ldr/str addressing mode. Returns 0 = no fold; 1 = scaled unsigned imm; 2 = unscaled
 // signed imm. On success sets *rn = host base reg, *off = displacement to pass to the encoder.
 // NOEAOPT=1 forces 0 (no fold) -> the caller uses the baseline emit_ea + e_load/e_store.
-static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
+int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
     if (jit_guest_bus_active()) return 0;
     if (noeaopt()) return 0;
     // guest_base bias-fold: the direct [base+disp] fold uses the guest base register unbiased -> route
@@ -417,7 +417,7 @@ static int ea_imm_fold(struct insn *I, int w, int *rn, int *off) {
 
 // Single-instruction folded zero-extending load of a memory operand into rt.
 // Falls back to emit_ea + e_load for index/seg/rip/large-disp forms (identical to before).
-static void emit_load_mem(struct insn *I, uint64_t next, int w, int rt) {
+void emit_load_mem(struct insn *I, uint64_t next, int w, int rt) {
     int rn, off, f = ea_imm_fold(I, w, &rn, &off);
     if (f == 1)
         e_load_uoff(w, rt, rn, (unsigned)off);

@@ -241,7 +241,7 @@ static uint64_t call_return_pc(uint64_t pc) {
 }
 
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
-static void emit_ea(struct insn *I, uint64_t next_rip);
+void emit_ea(struct insn *I, uint64_t next_rip);
 // unimplemented-insn diagnostic (defined below translate_block); fwd-declared so the instruction-class
 // helpers in translate/<class>.c (#included above translate_block) can defer a rare unhandled form.
 static void report_unimpl(uint64_t pc, struct insn *I);
