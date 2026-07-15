@@ -1,3 +1,5 @@
+#include "cpuid.h"
+
 // translator/guest/x86_64/dispatch.h -- the x86-64 guest's definitions of the shared run_guest()
 // dispatch seam (engine-dedup PR3/PR4). Mirror of guest/aarch64/dispatch.h: the shared
 // jit/dispatch.c calls these hooks at every spot where the dispatcher historically diverged per guest
@@ -238,7 +240,7 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_CPUID) {                                                                                      \
-        do_cpuid(c);                                                                                                   \
+        hl_x86_cpuid(c);                                                                                               \
         continue;                                                                                                      \
     } /* rip already = next */                                                                                         \
     if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
