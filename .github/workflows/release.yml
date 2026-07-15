@@ -1,8 +1,12 @@
 name: Publish
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,6 +48,11 @@ jobs:
         with:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify release version
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pkgs/rust/Cargo.toml | head -1)
+          test "${GITHUB_REF_NAME}" = "v${version}"
 
       - name: Publish Rust crate
         env:
