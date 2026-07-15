@@ -1641,7 +1641,7 @@ $(BUILD)/tools/matrix-runner: tools/matrix_runner.c include/hl/config.h
 
 $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+	$(CC) $(CFLAGS) $(WARNINGS) $< -lc -o $@
 
 .PHONY: test-linux-production-typed
 test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
