@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -921,6 +922,71 @@ static hl_host_result hl_linux_stream_read(void *context, hl_host_handle stream,
         result < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, (uint64_t)result, 0);
     close(descriptor);
     return output_result;
+}
+
+static hl_host_result hl_linux_file_validate_private_regular(void *context, hl_host_handle file) {
+    hl_host_linux *host = context;
+    struct stat st;
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    if (descriptor >= 0) descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    int status = fstat(descriptor, &st);
+    int saved = errno;
+    close(descriptor);
+    errno = saved;
+    if (status != 0) return hl_linux_errno_result();
+    return S_ISREG(st.st_mode) && st.st_uid == geteuid() && (st.st_mode & 022) == 0
+               ? hl_linux_result(HL_STATUS_OK, 0, 0)
+               : hl_linux_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+}
+
+static hl_host_result hl_linux_file_store_private_atomic(void *context, hl_host_handle directory, const char *path,
+                                                          size_t path_size, hl_host_const_bytes input,
+                                                          uint32_t permissions) {
+    static _Atomic uint64_t sequence;
+    hl_host_linux *host = context;
+    char name[PATH_MAX], temporary[PATH_MAX];
+    int directory_fd = AT_FDCWD, descriptor = -1;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(name) || memchr(path, '\0', path_size) != NULL ||
+        (permissions & ~0777u) != 0 || (input.size != 0 && input.data == NULL))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(name, path, path_size); name[path_size] = '\0';
+    if (directory != HL_HOST_HANDLE_CWD) {
+        pthread_mutex_lock(&host->lock);
+        directory_fd = hl_linux_descriptor(host, directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+        if (directory_fd >= 0) directory_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+        pthread_mutex_unlock(&host->lock);
+        if (directory_fd < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        uint64_t token = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+        int count = snprintf(temporary, sizeof temporary, "%s.hl-%llx-%llx.tmp", name,
+                             (unsigned long long)(uint64_t)getpid(), (unsigned long long)token);
+        if (count <= 0 || (size_t)count >= sizeof temporary) break;
+        descriptor = openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                            (mode_t)permissions);
+        if (descriptor >= 0 || errno != EEXIST) break;
+    }
+    if (descriptor < 0) { if (directory_fd != AT_FDCWD) close(directory_fd); return hl_linux_errno_result(); }
+    size_t done = 0;
+    int saved = 0;
+    while (done < input.size) {
+        ssize_t count = write(descriptor, (const uint8_t *)input.data + done, input.size - done);
+        if (count > 0) done += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else { saved = count == 0 ? EIO : errno; break; }
+    }
+    int ok = done == input.size;
+    if (ok && fsync(descriptor) != 0) { ok = 0; saved = errno; }
+    if (close(descriptor) != 0 && ok) { ok = 0; saved = errno; }
+    if (ok && renameat(directory_fd, temporary, directory_fd, name) != 0) { ok = 0; saved = errno; }
+    if (!ok) (void)unlinkat(directory_fd, temporary, 0);
+    if (directory_fd != AT_FDCWD) close(directory_fd);
+    errno = saved != 0 ? saved : EIO;
+    return ok ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
 static hl_host_result hl_linux_stream_write(void *context, hl_host_handle stream, hl_host_const_bytes input) {
@@ -3358,7 +3424,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_mkdir,
                                                hl_linux_file_symlink,
                                                hl_linux_file_link,
-                                               hl_linux_file_fifo};
+                                               hl_linux_file_fifo,
+                                               hl_linux_file_validate_private_regular,
+                                               hl_linux_file_store_private_atomic};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

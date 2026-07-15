@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 int main(void) {
@@ -22,6 +23,47 @@ int main(void) {
              HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT | HL_HOST_CAP_FILE) ==
              HL_STATUS_OK);
+    {
+        char directory[] = "/tmp/hl-private-store-XXXXXX";
+        char path[160];
+        const char first[] = "complete generation one";
+        const char second[] = "two";
+        HL_CHECK(mkdtemp(directory) != NULL);
+        snprintf(path, sizeof path, "%s/cache", directory);
+        HL_CHECK(services.file
+                     ->store_private_atomic(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                            (hl_host_const_bytes){first, sizeof(first) - 1}, 0600)
+                     .status == HL_STATUS_OK);
+        hl_host_result file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                                           HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        char bytes[32] = {0};
+        HL_CHECK(file.status == HL_STATUS_OK);
+        HL_CHECK(services.file->validate_private_regular(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->read_at(services.context, file.value, 0, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 sizeof(first) - 1);
+        HL_CHECK(memcmp(bytes, first, sizeof(first) - 1) == 0);
+        HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file
+                     ->store_private_atomic(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                            (hl_host_const_bytes){second, sizeof(second) - 1}, 0600)
+                     .status == HL_STATUS_OK);
+        file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        memset(bytes, 0, sizeof bytes);
+        HL_CHECK(file.status == HL_STATUS_OK &&
+                 services.file->read_at(services.context, file.value, 0, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                     sizeof(second) - 1);
+        HL_CHECK(memcmp(bytes, second, sizeof(second) - 1) == 0);
+        HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(chmod(path, 0666) == 0);
+        file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        HL_CHECK(file.status == HL_STATUS_OK &&
+                 services.file->validate_private_regular(services.context, file.value).status ==
+                     HL_STATUS_PERMISSION_DENIED);
+        HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+    }
     {
         char path[] = "/tmp/hl-native-watch-XXXXXX", moved[128];
         int native = mkstemp(path);
