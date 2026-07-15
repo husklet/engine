@@ -13,6 +13,9 @@
 // unaffected. Conservative + safe: block enders => all live => never elided; AF is left untouched by
 // the shift either way (the shift path writes no AF), so eliding cannot perturb it.
 #include "shift.h"
+#include "primitives.h"
+#include "../cpu.h"
+#include "../encoding.h"
 
 int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *state) {
     uint8_t op = I->op;
@@ -57,12 +60,12 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             e_bfi(16, 16, width, width, 0);       // replicate v -> [2w-1:w] (16-bit: now 32 bits = v|v)
             if (w == 1) e_bfi(16, 16, 16, 16, 0); // byte: replicate the pair again -> 4 copies fill 32 bits
             if (bycl) {                           // count = CL masked to the operand width
-                e_movconst(19, width - 1);
+                e_movconst(19, (uint64_t)(width - 1));
                 e_rrr(A_AND, 20, RCX, 19, 0, 0); // x20 = CL & (width-1)
                 if (k == 0) {
-                    e_movconst(19, width);
+                    e_movconst(19, (uint64_t)width);
                     e_rrr(A_SUB, 20, 19, 20, 0, 0); // ROL by n == ROR by (width-n)
-                    e_movconst(19, width - 1);
+                    e_movconst(19, (uint64_t)(width - 1));
                     e_rrr(A_AND, 20, 20, 19, 0, 0);
                 }
                 e_shv(S_RORV, 16, 16, 20, 0); // 32-bit RORV of the replicated value -> low `width` bits correct
@@ -111,11 +114,11 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
         if (bycl) {
             if (k == 0) { // ROL r/m32|64 by CL == ROR by (width - n); leaves SF/ZF unchanged (no flag save)
                 int width = ssf ? 64 : 32;
-                e_movconst(19, width - 1);
+                e_movconst(19, (uint64_t)(width - 1));
                 e_rrr(A_AND, 20, RCX, 19, ssf, 0); // x20 = n = CL & (width-1)
-                e_movconst(19, width);
+                e_movconst(19, (uint64_t)width);
                 e_rrr(A_SUB, 20, 19, 20, ssf, 0); // x20 = width - n
-                e_movconst(19, width - 1);
+                e_movconst(19, (uint64_t)(width - 1));
                 e_rrr(A_AND, 20, 20, 19, ssf, 0); // x20 = (width - n) & (width-1)  -> n==0 maps to rot 0
                 e_shv(S_RORV, 16, src, 20, ssf);  // rorv x16, src, x20
                 e_rot_flags_cl(16, 0, width);     // ROL CF=LSB(result), OF (1-bit) -- SF/ZF unchanged
@@ -200,7 +203,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             int cmask = (w == 8) ? 63 : 31;
             emit32(0xD53B4200u | 20); // mrs x20, nzcv  (new N/Z from result; C/V from the tst)
             e_ldr(24, 28, OFF_NZCV);  // x24 = old nzcv
-            e_movconst(19, cmask);
+            e_movconst(19, (uint64_t)cmask);
             e_rrr(A_ANDS, 22, RCX, 19, ssf, 0); // x22 = n = CL & cmask; Z = (n == 0)
             if (k == 4 || k == 5 || k == 7) {
                 // Exact x86 CF = last bit shifted out of the ORIGINAL operand (x26): SHL -> bit
@@ -208,7 +211,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                 // ARM tst left C=0; replace the stored borrow C with NOT CF. All ops below are
                 // flag-free, so the ANDS's Z survives to the csel.
                 if (k == 4) {
-                    e_movconst(19, width);
+                    e_movconst(19, (uint64_t)width);
                     e_rrr(A_SUB, 23, 19, 22, ssf, 0); // x23 = width - n
                 } else {
                     e_subi(23, 22, 1, ssf); // x23 = n - 1
@@ -247,7 +250,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                     e_rrr(A_AND, 22, 22, 19, ssf, 0);
                     e_rrr(A_EOR, 23, 23, 22, 0, 0); // x23 = OF
                 }
-                e_movconst(19, cmask);
+                e_movconst(19, (uint64_t)cmask);
                 e_rrr(A_AND, 22, RCX, 19, ssf, 0); // x22 = n
                 e_subi_s(22, 22, 1, ssf);          // Z = (n == 1)
                 e_ldr(20, 28, OFF_NZCV);

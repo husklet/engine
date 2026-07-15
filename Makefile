@@ -91,6 +91,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/legacy.c \
 	src/translator/guest/x86_64/lower/alu.c \
 	src/translator/guest/x86_64/lower/mov.c \
+	src/translator/guest/x86_64/lower/shift.c \
 	src/translator/guest/x86_64/rep.c \
 	src/translator/guest/x86_64/rotate.c \
 	src/translator/guest/x86_64/x87math.c \

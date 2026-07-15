@@ -818,8 +818,6 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/x87.c"
 
-#include "lower/shift.c"
-
 #include "lower/crypto.c"
 
 #include "lower/sse4x.c"
