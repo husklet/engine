@@ -87,6 +87,24 @@ static int gettime_remaining(void) {
     return ok;
 }
 
+// Timer ids are per-process resources, not a 32-entry engine implementation
+// detail. Keep more than the former fixed table live at once, then prove every
+// id remains independently deletable.
+static int timer_capacity(void) {
+    struct sigevent ev;
+    timer_t timers[64];
+    size_t created = 0;
+    size_t deleted = 0;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_NONE;
+    while (created < sizeof(timers) / sizeof(timers[0]) &&
+           timer_create(CLOCK_MONOTONIC, &ev, &timers[created]) == 0)
+        created++;
+    for (size_t index = 0; index < created; index++)
+        if (timer_delete(timers[index]) == 0) deleted++;
+    return created == sizeof(timers) / sizeof(timers[0]) && deleted == created;
+}
+
 // A signal-BLOCKED fast periodic timer accumulates a large overrun while the guest sleeps in a PLAIN
 // blocking usleep (task #422). The engine derives the overrun from elapsed monotonic time against the
 // timer's fixed first-expiry anchor, so the count is correct even though the guest is descheduled the whole
@@ -145,6 +163,7 @@ int main(void) {
     int real = oneshot_signal(CLOCK_REALTIME);
     int mono = oneshot_signal(CLOCK_MONOTONIC);
     int rem = gettime_remaining();
+    int capacity = timer_capacity();
     int over = overrun_counts();
 
     // Error surface.
@@ -168,7 +187,8 @@ int main(void) {
     int ov_zero = timer_getoverrun(t) == 0;
     timer_delete(t);
 
-    printf("posixtimer real=%d mono=%d rem=%d overrun=%d badclock=%d gt_efault=%d st_einval=%d ov_zero=%d\n",
-           real, mono, rem, over, badclock, gt_efault, st_einval, ov_zero);
+    printf("posixtimer real=%d mono=%d rem=%d capacity=%d overrun=%d badclock=%d gt_efault=%d st_einval=%d "
+           "ov_zero=%d\n",
+           real, mono, rem, capacity, over, badclock, gt_efault, st_einval, ov_zero);
     return 0;
 }

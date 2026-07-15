@@ -9,7 +9,7 @@
 // host_sigh() does for a real host signal -- so maybe_deliver_signal() builds the rt_sigframe at the
 // next dispatcher boundary. We NEVER raise a real host signal into the JIT thread. Remaining time
 // (timer_gettime) and overrun are tracked in software from the recorded monotonic deadline.
-#define GTIMER_MAX 32
+#define GTIMER_INITIAL_CAPACITY 32u
 #define HL_SI_TIMER (-2) // Linux si_code SI_TIMER (the value the guest's siginfo expects)
 
 struct gtimer {
@@ -48,11 +48,33 @@ static int gtimer_take_overrun(struct gtimer *t, uint64_t now) {
     t->reported_expiries = elapsed;
     return extra > 2147483647ull ? 2147483647 : (int)extra;
 }
-static struct gtimer g_gtimer[GTIMER_MAX];
+static struct gtimer *g_gtimer;
+static size_t g_gtimer_capacity;
 static hl_host_handle g_gtimer_events = HL_HOST_HANDLE_INVALID;
 static pthread_t g_gtimer_thr;
 static int g_gtimer_thr_up;
 static pthread_mutex_t g_gtimer_lk = PTHREAD_MUTEX_INITIALIZER;
+
+// Ensure that one unused timer id exists. Timer ids are stable array indices;
+// all callers hold g_gtimer_lk, so growing the backing store cannot race a
+// syscall or the event worker.
+static int gtimer_reserve_one(void) {
+    size_t capacity;
+    size_t maximum = SIZE_MAX / sizeof(*g_gtimer);
+    struct gtimer *timers;
+    if (maximum > (size_t)INT_MAX) maximum = (size_t)INT_MAX;
+    if (g_gtimer_capacity < maximum) {
+        capacity = g_gtimer_capacity != 0 ? g_gtimer_capacity * 2u : GTIMER_INITIAL_CAPACITY;
+        if (capacity > maximum) capacity = maximum;
+        timers = realloc(g_gtimer, capacity * sizeof(*timers));
+        if (timers == NULL) return -EAGAIN;
+        memset(timers + g_gtimer_capacity, 0, (capacity - g_gtimer_capacity) * sizeof(*timers));
+        g_gtimer = timers;
+        g_gtimer_capacity = capacity;
+        return 0;
+    }
+    return -EAGAIN;
+}
 
 static uint64_t gtimer_now_ns(void) {
     uint64_t value = 0;
@@ -133,10 +155,13 @@ static void *gtimer_loop(void *arg) {
             break;
         }
         if (waited.value == 0 || (event.readiness & HL_HOST_READY_TIMER) == 0) continue;
-        int id = (int)event.token - 1;
-        if (id < 0 || id >= GTIMER_MAX) continue;
-        struct gtimer *t = &g_gtimer[id];
         pthread_mutex_lock(&g_gtimer_lk);
+        if (event.token == 0 || event.token - 1u >= g_gtimer_capacity) {
+            pthread_mutex_unlock(&g_gtimer_lk);
+            continue;
+        }
+        int id = (int)(event.token - 1u);
+        struct gtimer *t = &g_gtimer[id];
         if (!t->used || t->next_ns == 0) {
             pthread_mutex_unlock(&g_gtimer_lk);
             continue;
@@ -172,7 +197,7 @@ static void *gtimer_loop(void *arg) {
 // POSIX: per-process timers are NOT inherited across fork(). Drop the inherited table + the now-dead
 // host-event pollset/drain thread so a forked child starts clean (lazy-recreated on its own first timer_create).
 static void gtimer_atfork_child(void) {
-    memset(g_gtimer, 0, sizeof g_gtimer);
+    if (g_gtimer != NULL) memset(g_gtimer, 0, g_gtimer_capacity * sizeof(*g_gtimer));
     g_gtimer_events = HL_HOST_HANDLE_INVALID;
     g_gtimer_thr_up = 0;
     pthread_mutex_init(&g_gtimer_lk, NULL);
@@ -519,15 +544,20 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         int id = -1;
-        for (int i = 0; i < GTIMER_MAX; i++)
+        for (size_t i = 0; i < g_gtimer_capacity; i++)
             if (!g_gtimer[i].used) {
-                id = i;
+                id = (int)i;
+                break;
+        }
+        if (id < 0) {
+            size_t first_new = g_gtimer_capacity;
+            rc = gtimer_reserve_one();
+            if (rc < 0) {
+                pthread_mutex_unlock(&g_gtimer_lk);
+                G_RET(c) = (uint64_t)rc;
                 break;
             }
-        if (id < 0) {
-            pthread_mutex_unlock(&g_gtimer_lk);
-            G_RET(c) = (uint64_t)(-EAGAIN);
-            break;
+            id = (int)first_new;
         }
         struct gtimer *t = &g_gtimer[id];
         memset(t, 0, sizeof *t);
@@ -610,7 +640,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // 110 timer_settime(timerid, flags, new*, old*) -- arm/disarm via the itimerspec.
     case 110: {
         int id = (int)a0;
-        if (id < 0 || id >= GTIMER_MAX) {
+        if (id < 0 || (size_t)id >= g_gtimer_capacity) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -693,7 +723,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // 108 timer_gettime(timerid, curr*) -- remaining time + interval.
     case 108: {
         int id = (int)a0;
-        if (id < 0 || id >= GTIMER_MAX) {
+        if (id < 0 || (size_t)id >= g_gtimer_capacity) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -725,7 +755,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // delivery and advances the reported mark past them (capped at INT_MAX; one-shot / unexpired => 0).
     case 109: {
         int id = (int)a0;
-        if (id < 0 || id >= GTIMER_MAX) {
+        if (id < 0 || (size_t)id >= g_gtimer_capacity) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -744,7 +774,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // 111 timer_delete(timerid) -- disarm + free the slot.
     case 111: {
         int id = (int)a0;
-        if (id < 0 || id >= GTIMER_MAX) {
+        if (id < 0 || (size_t)id >= g_gtimer_capacity) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
