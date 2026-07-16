@@ -38,8 +38,17 @@ fn read_until(terminal: &mut hl_engine::Terminal, marker: &[u8]) -> Vec<u8> {
     output
 }
 
+fn open_files() -> usize {
+    #[cfg(target_os = "linux")]
+    let directory = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    let directory = "/dev/fd";
+    fs::read_dir(directory).unwrap().count()
+}
+
 #[test]
 fn terminal_is_controlling_merged_resizable_and_reaped() {
+    let files = open_files();
     let initial = Size::new(24, 80).unwrap();
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
@@ -66,6 +75,8 @@ fn terminal_is_controlling_merged_resizable_and_reaped() {
     assert!(text.contains("OUT\nERR\n"), "{text}");
     assert!(text.contains("41 109"), "{text}");
     assert!(text.contains("LINE=hello"), "{text}");
+    drop(terminal);
+    assert_eq!(open_files(), files, "terminal launch leaked a host descriptor");
 }
 
 #[test]
