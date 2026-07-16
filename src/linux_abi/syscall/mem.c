@@ -98,7 +98,8 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
     if (lo < he) {
         uint64_t page = lo & ~((uint64_t)hp - 1);
         size_t prefix = (size_t)(lo - page);
-        void *saved = NULL;
+        size_t suffix = he == hi ? (size_t)(page + hp - hi) : 0;
+        void *saved = NULL, *saved_suffix = NULL;
         if (anon || hl_linux_bus_hit(lo, he - lo)) {
             if (prefix != 0) {
                 saved = malloc(prefix);
@@ -108,13 +109,25 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
                 }
                 memcpy(saved, (void *)page, prefix);
             }
+            if (suffix != 0) {
+                saved_suffix = malloc(suffix);
+                if (saved_suffix == NULL || hl_linux_bus_hit(hi, suffix)) {
+                    free(saved);
+                    free(saved_suffix);
+                    return -1;
+                }
+                memcpy(saved_suffix, (void *)hi, suffix);
+            }
             if (mmap((void *)page, hp, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
                 MAP_FAILED) {
                 free(saved);
+                free(saved_suffix);
                 return -1;
             }
             if (saved != NULL) memcpy((void *)page, saved, prefix);
+            if (saved_suffix != NULL) memcpy((void *)hi, saved_suffix, suffix);
             free(saved);
+            free(saved_suffix);
         }
         if (anon || fd < 0)
             memset((void *)lo, 0, (size_t)(he - lo));
@@ -130,9 +143,20 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
                Linux rounds the mapping to guest pages, and bytes beyond hi in
                this host page were inaccessible past-EOF reservation bytes. */
             if (anon) {
-                if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
-                    MAP_FAILED)
+                size_t suffix = (size_t)((tl + hp) - hi);
+                void *saved_suffix = suffix != 0 ? malloc(suffix) : NULL;
+                if ((suffix != 0 && saved_suffix == NULL) || hl_linux_bus_hit(hi, suffix)) {
+                    free(saved_suffix);
                     return -1;
+                }
+                if (saved_suffix != NULL) memcpy(saved_suffix, (void *)hi, suffix);
+                if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
+                    MAP_FAILED) {
+                    free(saved_suffix);
+                    return -1;
+                }
+                if (saved_suffix != NULL) memcpy((void *)hi, saved_suffix, suffix);
+                free(saved_suffix);
             } else {
                 memset((void *)tl, 0, (size_t)(hi - tl));
             }
