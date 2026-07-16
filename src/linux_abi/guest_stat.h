@@ -9,6 +9,7 @@
 
 static void stat_virt_ids(const struct stat *status, const char *host_path, int descriptor, uint32_t *user,
                           uint32_t *group);
+static mode_t stat_virt_mode(const struct stat *status, const char *host_path, int descriptor);
 
 static void fill_linux_stat(uint8_t *destination, const struct stat *status, const char *host_path, int descriptor) {
     uint32_t user, group;
@@ -26,7 +27,7 @@ static void fill_linux_stat(uint8_t *destination, const struct stat *status, con
         (uint64_t)status->st_mtimespec.tv_nsec,
         status->st_ctimespec.tv_sec,
         (uint64_t)status->st_ctimespec.tv_nsec,
-        status->st_mode,
+        stat_virt_mode(status, host_path, descriptor),
         user,
         group,
     };

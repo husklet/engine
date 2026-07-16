@@ -1925,7 +1925,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // subsequent stat() of the same path serves the stale pre-chmod mode from the mc cache (the fd's
     // canonical host path in g_fdpath is the SAME key case 79 memoizes under).
     case 52: {
-        int r = fchmod((int)a0, (mode_t)a1);
+        struct stat status;
+        mode_t host_mode = (mode_t)a1 & 0777;
+        if (cred_euid() == 0 && fstat((int)a0, &status) == 0)
+            host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
+        int r = fchmod((int)a0, host_mode);
+        if (r == 0) mode_xattr_set_fd((int)a0, (mode_t)a1);
         if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
             hl_fdcache_evict_path(g_fdpath[(int)a0]);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -1975,11 +1980,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(int64_t)pfd;
                 break;
             }
-            int r = fchmodat(pfd, fin, (mode_t)a2, 0), e = errno;
+            struct stat status;
+            mode_t host_mode = (mode_t)a2 & 0777;
+            if (cred_euid() == 0 && fstatat(pfd, fin, &status, 0) == 0)
+                host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
+            int r = fchmodat(pfd, fin, host_mode, 0), e = errno;
             char dp[4200];
             if (r >= 0 && hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
-                if (path_join(hp, sizeof hp, dp, fin) == 0) hl_fdcache_metadata_evict(hp);
+                if (path_join(hp, sizeof hp, dp, fin) == 0) {
+                    mode_xattr_set_path(hp, (mode_t)a2);
+                    hl_fdcache_metadata_evict(hp);
+                }
             }
             close(pfd);
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
@@ -1987,8 +1999,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
-        int r = fchmodat(ATFD(a0), p, (mode_t)a2, 0);
-        if (r >= 0) hl_fdcache_metadata_evict(p);
+        struct stat status;
+        mode_t host_mode = (mode_t)a2 & 0777;
+        if (cred_euid() == 0 && fstatat(ATFD(a0), p, &status, 0) == 0)
+            host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
+        int r = fchmodat(ATFD(a0), p, host_mode, 0);
+        if (r >= 0) {
+            mode_xattr_set_path(p, (mode_t)a2);
+            hl_fdcache_metadata_evict(p);
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
@@ -3402,7 +3421,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         *(uint32_t *)(d + 20) = vuid;
         *(uint32_t *)(d + 24) = vgid;
         // stx_mode @28
-        *(uint16_t *)(d + 28) = (uint16_t)s.st_mode;
+        *(uint16_t *)(d + 28) = (uint16_t)stat_virt_mode(&s, xpath, xfd);
         // stx_ino @32
         *(uint64_t *)(d + 32) = s.st_ino;
         // stx_size @40

@@ -371,6 +371,7 @@ static int cgid(void) {
 #include <sys/xattr.h>
 #define HL_OWNER_XATTR_UID "user.hl.owner.uid"
 #define HL_OWNER_XATTR_GID "user.hl.owner.gid"
+#define HL_MODE_XATTR "user.hl.mode"
 #define HL_OWNER_DIR "/tmp/.hl-owner"
 
 typedef struct hl_owner_record {
@@ -527,6 +528,31 @@ static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t 
         hl_xattr_cache_record_negative(dev, ino);
     }
     return present;
+}
+
+static void mode_xattr_set_path(const char *hostpath, mode_t mode) {
+    uint32_t value = (uint32_t)mode & 07777u;
+    (void)hl_native_setxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0);
+}
+
+static void mode_xattr_set_fd(int fd, mode_t mode) {
+    uint32_t value = (uint32_t)mode & 07777u;
+    (void)hl_native_fsetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0);
+}
+
+static int mode_xattr_get(const char *hostpath, int fd, mode_t *mode) {
+    uint32_t value;
+    ssize_t size = fd >= 0 ? hl_native_fgetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0)
+                           : hostpath ? hl_native_getxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0) : -1;
+    if (size != (ssize_t)sizeof value) return 0;
+    *mode = (mode_t)(value & 07777u);
+    return 1;
+}
+
+static mode_t stat_virt_mode(const struct stat *status, const char *hostpath, int fd) {
+    if (S_ISLNK(status->st_mode)) return (status->st_mode & S_IFMT) | 0777;
+    mode_t mode;
+    return mode_xattr_get(hostpath, fd, &mode) ? (status->st_mode & S_IFMT) | mode : status->st_mode;
 }
 
 // the SINGLE source of truth for guest-visible file ownership. Map a host stat's raw uid/gid to
