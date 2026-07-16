@@ -166,7 +166,7 @@ int main(void) {
     HL_CHECK(hl_fdcache_metadata_lookup("/root/file", &result, &found) == 1);
     HL_CHECK(result == 0 && found.st_ino == 42);
     hl_fdcache_resolution_bump();
-    HL_CHECK(hl_fdcache_metadata_lookup("/root/file", &result, &found) == 1);
+    HL_CHECK(hl_fdcache_metadata_lookup("/root/file", &result, &found) == 0);
 
     hl_fdcache_metadata_store("/root/missing", -2, &stored);
     HL_CHECK(hl_fdcache_metadata_lookup("/root/missing", &result, &found) == 1 && result == -2);
