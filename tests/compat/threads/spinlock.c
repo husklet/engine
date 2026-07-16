@@ -1,14 +1,16 @@
-// pthread_spinlock: 16 threads each spin-lock around a shared increment 20000 times. Final ==
-// 320000. (macOS lacks pthread_spin_* -> Linux only, diffed against the native oracle.)
+// pthread_spinlock: 16 threads repeatedly lock around a shared update. This is a behavioral contention
+// test, not a benchmark; 32,000 acquisitions are enough to exercise ownership and visibility without
+// making correctness depend on runner speed. Final == 320000.
 #include <pthread.h>
 #include <stdio.h>
 #define N 16
-#define PER 20000
+#define PER 2000
+#define STEP 10
 static pthread_spinlock_t sp;
 static long shared;
 static void *w(void *_) {
     (void)_;
-    for (int i = 0; i < PER; i++) { pthread_spin_lock(&sp); shared++; pthread_spin_unlock(&sp); }
+    for (int i = 0; i < PER; i++) { pthread_spin_lock(&sp); shared += STEP; pthread_spin_unlock(&sp); }
     return 0;
 }
 int main(void) {

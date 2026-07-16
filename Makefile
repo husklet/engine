@@ -9,7 +9,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 VERSION := 0.1.2
 DEBUG ?= 0
-MAC ?= $(if $(filter Darwin,$(shell uname -s)),,mac)
+MAC ?= $(if $(filter Darwin,$(shell uname -s)),env,mac)
 CODESIGN ?= codesign
 PERF_WARMUPS ?= 3
 PERF_SAMPLES ?= 25
@@ -219,6 +219,11 @@ E2E_CASES := atomics clockelapsed epoll epoll_dup_lifetime epoll_edge epoll_et e
 	signalfd_multi signalfd_rt signals stat_layout statx_agree sysv_ipc timerfd timerfd_interval
 E2E_CASE_BINS := $(E2E_CASES:%=$(BUILD)/e2e/%-aarch64) $(E2E_CASES:%=$(BUILD)/e2e/%-x86_64)
 E2E_CASE_RUNS := $(E2E_CASES:%=run-e2e-compat-%)
+ifeq ($(HOST),linux)
+E2E_NATIVE_ORACLE_RUNS := $(E2E_CASE_RUNS)
+else
+E2E_NATIVE_ORACLE_RUNS :=
+endif
 ABI_CASE_SOURCES := $(sort $(wildcard tests/compat/abi/*.c))
 ABI_CASE_NAMES := $(basename $(notdir $(ABI_CASE_SOURCES)))
 ABI_CASE_AARCH64_NAMES := $(filter-out cpuid_features rflags_id,$(ABI_CASE_NAMES))
@@ -461,18 +466,19 @@ package-test:
 	rm -rf '$(BUILD)/package-root'
 
 .PHONY: package-activation-installed-test
-package-activation-installed-test:
+package-activation-installed-test: $(BUILD)/e2e/guest-descendant-aarch64
 	$(CC) -I'$(abspath $(BUILD)/package-root)/usr/include' tests/integration/activation_package.c \
 		$(ACTIVATION_CONSUMER_LIBS) -o '$(BUILD)/package-consumer/activation-package'
 	$(if $(filter macos,$(HOST)),$(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f '$(BUILD)/package-consumer/activation-package')
 	'$(BUILD)/package-consumer/activation-package'
+	'$(BUILD)/package-consumer/activation-package' '$(abspath $(BUILD)/e2e/guest-descendant-aarch64)'
 
 .PHONY: package-activation-macos-test
 package-activation-macos-test: HOST = macos
 package-activation-macos-test: HOST_ARCH = aarch64
 package-activation-macos-test: ACTIVATION_LIBS = -Wl,-force_load,$${libdir}/libhl-engine-activation.a
 package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
-	$(BUILD)/pkgconfig/hl-engine-activation.pc
+	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-descendant-aarch64
 	rm -rf '$(BUILD)/activation-package-root' '$(BUILD)/activation-package-consumer'
 	$(INSTALL) -d '$(BUILD)/activation-package-root/include/hl' \
 		'$(BUILD)/activation-package-root/lib/pkgconfig' '$(BUILD)/activation-package-consumer'
@@ -487,6 +493,8 @@ package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
 		'$(BUILD)/activation-package-consumer/activation-package'
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package)
+	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package) \
+		$(abspath $(BUILD)/e2e/guest-descendant-aarch64)
 
 FORCE:
 
@@ -696,6 +704,10 @@ $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O0 -nostdlib -static -fno-stack-protector -Wl,-e,_start $< -o $@
 
+$(BUILD)/e2e/guest-descendant-aarch64: tests/e2e/guest_descendant.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
 $(BUILD)/e2e/clock-injected-aarch64: tests/e2e/clock_injected.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
@@ -844,11 +856,11 @@ $(BUILD)/compat/process/x86_64/procexe/%: tests/compat/process/procexe/%.c
 
 $(BUILD)/compat/process/aarch64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/process/x86_64/nonpie_ptrargs: tests/compat/process/nonpie_ptrargs.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -std=gnu11 $< -pthread -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -std=gnu11 $< -pthread -o $@
 
 $(BUILD)/compat/time/aarch64/%: tests/compat/time/%.c
 	@mkdir -p $(@D)
@@ -910,13 +922,13 @@ $(BUILD)/compat/core/regress/x86_64/%: tests/compat/core/regress/%.c
 $(BUILD)/compat/core/regress/aarch64/nonpie_ldapr $(BUILD)/compat/core/regress/aarch64/nonpie_pairatomics: \
 	$(BUILD)/compat/core/regress/aarch64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/x86_64/nonpie_vec $(BUILD)/compat/core/regress/x86_64/repcmps_nopie \
 	$(BUILD)/compat/core/regress/x86_64/nonpie_v8blob: \
 	$(BUILD)/compat/core/regress/x86_64/%: tests/compat/core/regress/%.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/core/regress/aarch64/go_cgo_stackgrow_arm: tests/compat/core/regress/go_cgo_stackgrow_arm
 	@mkdir -p $(@D)
@@ -940,11 +952,11 @@ $(BUILD)/compat/threads/x86_64/%: tests/compat/threads/%.c
 
 $(BUILD)/compat/threads/aarch64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/x86_64/threads_mutex_nopie: tests/compat/threads/threads_mutex_queue.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(PURPOSE_ABI_PIE:%=$(BUILD)/compat/abi/aarch64/%): $(BUILD)/compat/abi/aarch64/%: tests/compat/abi/%.c
 	@mkdir -p $(@D)
@@ -972,11 +984,11 @@ $(PURPOSE_PROCESS_PIE:%=$(BUILD)/compat/process/x86_64/%): $(BUILD)/compat/proce
 
 $(BUILD)/compat/process/aarch64/nonpie_dladdr: tests/compat/process/nonpie_dladdr.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_CC) -O2 -no-pie -rdynamic -pthread $< -ldl -o $@
+	$(AARCH64_LINUX_CC) -O2 -no-pie -rdynamic -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1,-rpath,/lib $< -o $@
 
 $(BUILD)/compat/process/x86_64/nonpie_dladdr: tests/compat/process/nonpie_dladdr.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_CC) -O2 -no-pie -rdynamic -pthread $< -ldl -o $@
+	$(X86_64_LINUX_CC) -O2 -no-pie -rdynamic -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2,-rpath,/lib $< -o $@
 
 $(PURPOSE_NETWORK_PIE:%=$(BUILD)/compat/network/aarch64/%): $(BUILD)/compat/network/aarch64/%: tests/compat/network/%.c
 	@mkdir -p $(@D)
@@ -1008,19 +1020,19 @@ $(BUILD)/compat/abi/aarch64/lse_atomics: tests/compat/abi/lse_atomics.c
 
 $(BUILD)/compat/threads/aarch64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/threads/x86_64/threads_nopie_tls: tests/compat/threads/threads_nopie_tls.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -o $@
 
 $(BUILD)/compat/abi/aarch64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/abi/x86_64/tlsmodels_main: tests/compat/abi/tlsmodels_main.c
 	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -pthread $< -lm -ldl -o $@
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -pthread $< -lm -ldl -o $@
 
 $(BUILD)/compat/isolation/aarch64/%: tests/compat/isolation/%.c
 	@mkdir -p $(@D)
@@ -1570,7 +1582,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/guest-fault-aarch64 $(BUILD)/e2e/guest-fault-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
-	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_CASE_RUNS)
+	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_NATIVE_ORACLE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \

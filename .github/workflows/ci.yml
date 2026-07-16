@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          if ! nix develop --command sh -c 'make -s -j2 CC="$AARCH64_LINUX_CC" test-linux-production-typed' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+          if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-linux-production-typed' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}
             message=${message//$'\n'/'%0A'}
@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          if ! nix develop --command make -s -j2 e2e-compat 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+          if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-compat' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}
             message=${message//$'\n'/'%0A'}

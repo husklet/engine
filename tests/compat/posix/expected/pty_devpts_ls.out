@@ -1,1 +1,1 @@
-ls index=0 entries=0,ptmx
+ls live=1 ptmx=1

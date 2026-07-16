@@ -100,6 +100,7 @@
           system = pkgs.stdenv.hostPlatform.system;
           linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
           linuxX86 = pkgs.pkgsCross.gnu64;
+          linuxArmSqlite = linuxArm.pkgsStatic.sqlite;
           linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
           linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
         in {
@@ -119,9 +120,10 @@
             ];
           } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
             CC = "${pkgs.stdenv.cc}/bin/cc";
+            NATIVE_CC = "${pkgs.stdenv.cc}/bin/cc";
             AARCH64_LINUX_CC = linuxArmCompiler;
             X86_64_LINUX_CC = linuxX86Compiler;
-            AARCH64_LINUX_STATIC_CC = "${linuxArmCompiler} -I${linuxArm.sqlite.dev}/include -L${linuxArm.sqlite}/lib -L${linuxArm.glibc.static}/lib";
+            AARCH64_LINUX_STATIC_CC = "${linuxArmCompiler} -I${nixpkgs.lib.getDev linuxArmSqlite}/include -L${nixpkgs.lib.getLib linuxArmSqlite}/lib -L${linuxArm.glibc.static}/lib";
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             AARCH64_DYNAMIC_LOADER = "${linuxArm.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${linuxArm.glibc}/lib/libc.so.6";
@@ -129,9 +131,10 @@
             X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
           } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
             CC = "${pkgs.stdenv.cc}/bin/cc";
+            NATIVE_CC = "${pkgs.stdenv.cc}/bin/cc";
             AARCH64_LINUX_CC = "${pkgs.stdenv.cc}/bin/cc";
             X86_64_LINUX_CC = linuxX86Compiler;
-            AARCH64_LINUX_STATIC_CC = "${pkgs.stdenv.cc}/bin/cc -I${pkgs.sqlite.dev}/include -L${pkgs.sqlite}/lib -L${pkgs.glibc.static}/lib";
+            AARCH64_LINUX_STATIC_CC = "${pkgs.stdenv.cc}/bin/cc -I${nixpkgs.lib.getDev pkgs.pkgsStatic.sqlite}/include -L${nixpkgs.lib.getLib pkgs.pkgsStatic.sqlite}/lib -L${pkgs.glibc.static}/lib";
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             AARCH64_DYNAMIC_LOADER = "${pkgs.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${pkgs.glibc}/lib/libc.so.6";

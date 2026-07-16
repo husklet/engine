@@ -1,7 +1,7 @@
 // devpts directory listing (#280): when a guest allocates a pty, /dev/pts must list the live slave node
 // plus the ptmx multiplexer (real devpts creates /dev/pts/N on slave allocation). Runs inside a container
-// rootfs (so /dev/pts is the populated devpts mount). No controlling terminal in the harness (stdio is
-// piped), so the first guest pty takes index 0 -> `ls /dev/pts` == {0, ptmx}. Golden, deterministic.
+// rootfs (so /dev/pts is the populated devpts mount). The host may already own ptys, so validate that
+// the allocated slave and ptmx are visible without baking a host-global pty index into the golden.
 #define _XOPEN_SOURCE 600
 #include <dirent.h>
 #include <fcntl.h>
@@ -40,9 +40,16 @@ int main(void) {
         closedir(d);
     }
     qsort(names, cnt, sizeof names[0], cmp);
-    printf("ls index=%d entries=", n);
-    for (int i = 0; i < cnt; i++) printf("%s%s", i ? "," : "", names[i]);
-    printf("\n");
+    int live = 0;
+    int ptmx = 0;
+    char index[32];
+    snprintf(index, sizeof index, "%d", n);
+    for (int i = 0; i < cnt; i++) {
+        if (!strcmp(names[i], index)) live = 1;
+        if (!strcmp(names[i], "ptmx")) ptmx = 1;
+        free(names[i]);
+    }
+    printf("ls live=%d ptmx=%d\n", live, ptmx);
     if (s >= 0) close(s);
     close(m);
     return 0;
