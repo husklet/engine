@@ -28,6 +28,11 @@ pub(crate) struct TerminalSize {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub(crate) struct ProcessDomain {
+    pub identity: [u64; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct EngineExit {
     pub abi: u32,
     pub size: u32,
@@ -71,6 +76,7 @@ unsafe extern "C" {
         exit: *mut EngineExit,
     ) -> i32;
     pub(crate) fn hl_activation_kill(process: *mut Process) -> i32;
+    pub(crate) fn hl_activation_domain_terminate(domain: ProcessDomain) -> i32;
     pub(crate) fn hl_activation_process_destroy(process: *mut Process);
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
     fn pipe(descriptors: *mut c_int) -> c_int;
@@ -159,6 +165,10 @@ pub(crate) fn kill(process: &Handle) -> Result<(), i32> {
     } else {
         Err(status)
     }
+}
+pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
+    let status = unsafe { hl_activation_domain_terminate(ProcessDomain { identity }) };
+    if status == 0 { Ok(()) } else { Err(status) }
 }
 #[allow(clippy::needless_pass_by_value)] // Consumption enforces exactly-once destruction.
 pub(crate) fn destroy(process: Handle) {

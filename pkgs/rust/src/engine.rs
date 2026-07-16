@@ -41,7 +41,9 @@ impl Engine {
         if argv[0].as_bytes().is_empty() {
             return Err(Error::InvalidConfig("program must not be empty"));
         }
-        let config = ConfigFile::create(&wire::encode(config, &argv, None)?)?;
+        let encoded = wire::encode(config, &argv, None)?;
+        let domain = crate::Domain::new(wire::domain(&encoded));
+        let config = ConfigFile::create(&encoded)?;
         let executable = EXECUTABLE
             .get_or_init(|| {
                 let path = std::env::current_exe().map_err(|error| error.to_string())?;
@@ -78,6 +80,7 @@ impl Engine {
             stdout,
             stderr,
             terminal,
+            domain,
         })
     }
 }

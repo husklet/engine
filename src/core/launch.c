@@ -149,6 +149,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     hl_options options;
     char num[32];
     char publish[1024];
+    char process_domain[33];
     const char *s;
     if (hl_options_init(&options) != 0) {
         free(wire);
@@ -183,6 +184,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         snprintf(num, sizeof num, "%d", cfg.gid);
         APPLY_OPTION("HL_GID", num);
     }
+    snprintf(process_domain, sizeof process_domain, "%016llx%016llx",
+             (unsigned long long)cfg.process_domain[0], (unsigned long long)cfg.process_domain[1]);
+    APPLY_OPTION("HL_PROCESS_DOMAIN", process_domain);
 
     // Pooled strings are copied by hl_option_set; an empty field leaves the option unset.
     s = launch_string(&cfg, pool, cfg.hostname_offset);

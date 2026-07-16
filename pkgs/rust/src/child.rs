@@ -1,4 +1,4 @@
-use crate::{ffi, result, runtime::ConfigFile, Error, Exit, Terminal};
+use crate::{ffi, result, runtime::ConfigFile, Domain, Error, Exit, Terminal};
 use std::{fs::File, io::Read};
 
 /// Owned running engine process.
@@ -10,6 +10,7 @@ pub struct Child {
     pub(crate) stdout: Option<File>,
     pub(crate) stderr: Option<File>,
     pub(crate) terminal: Option<Terminal>,
+    pub(crate) domain: Domain,
 }
 /// Captured output and typed guest status.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +20,11 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 impl Child {
+    /// Returns a durable control handle for all processes descended from this launch.
+    #[must_use]
+    pub const fn domain(&self) -> Domain {
+        self.domain
+    }
     #[must_use]
     pub fn id(&self) -> u64 {
         self.process

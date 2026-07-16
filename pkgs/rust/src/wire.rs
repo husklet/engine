@@ -382,6 +382,11 @@ fn process_domain() -> Result<[u64; 2], Error> {
     Ok(domain)
 }
 
+pub(crate) fn domain(wire: &[u8]) -> [u64; 2] {
+    let word = |offset| u64::from_le_bytes(wire[offset..offset + 8].try_into().unwrap());
+    [word(PROCESS_DOMAIN_OFFSET), word(PROCESS_DOMAIN_OFFSET + 8)]
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;

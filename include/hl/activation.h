@@ -22,6 +22,9 @@ typedef struct hl_terminal_size {
     uint16_t rows;
     uint16_t columns;
 } hl_terminal_size;
+typedef struct hl_process_domain {
+    uint64_t identity[2];
+} hl_process_domain;
 
 HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
                                      hl_activation_process **out_process);
@@ -43,6 +46,9 @@ HL_API hl_status hl_activation_wait(hl_activation_process *process, hl_engine_ex
 HL_API hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_ready,
                                        hl_engine_exit *out_exit);
 HL_API hl_status hl_activation_kill(hl_activation_process *process);
+/* Terminates every live member whose native PID and birth identity match this domain registry.
+ * Repeated termination is successful; zero identities are rejected. */
+HL_API hl_status hl_activation_domain_terminate(hl_process_domain domain);
 /* Destroying a live handle force-stops and reaps it; destroying a waited handle
  * only releases cached parent-side state. */
 HL_API void hl_activation_process_destroy(hl_activation_process *process);

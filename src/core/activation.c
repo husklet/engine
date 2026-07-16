@@ -1,6 +1,8 @@
 #include "hl/activation.h"
 #include "engine_backend.h"
 #include "launch.h"
+#include "../host/system.h"
+#include "hl/config.h"
 #if defined(__APPLE__)
 #include "hl/macos.h"
 typedef hl_host_macos hl_activation_host;
@@ -12,6 +14,7 @@ typedef hl_host_linux hl_activation_host;
 #endif
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -315,6 +318,64 @@ struct hl_activation_process {
     hl_status final_status;
     hl_engine_exit final_exit;
 };
+
+static void domain_path(hl_process_domain domain, char *path, size_t capacity) {
+    snprintf(path, capacity, "/tmp/.hl-domain.%016llx%016llx",
+             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+}
+
+static int domain_birth(const char *directory, pid_t pid, uint64_t *birth) {
+    char path[160], text[32], *end;
+    unsigned long long value;
+    ssize_t count;
+    int descriptor;
+    snprintf(path, sizeof path, "%s/b%d", directory, (int)pid);
+    descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return 0;
+    do { count = read(descriptor, text, sizeof text - 1); } while (count < 0 && errno == EINTR);
+    (void)close(descriptor);
+    if (count <= 0) return 0;
+    text[count] = 0;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || (*end != '\n' && *end != 0) || value == 0) return 0;
+    *birth = (uint64_t)value;
+    return 1;
+}
+
+hl_status hl_activation_domain_terminate(hl_process_domain domain) {
+    char directory[96];
+    unsigned round;
+    if ((domain.identity[0] | domain.identity[1]) == 0) return HL_STATUS_INVALID_ARGUMENT;
+    domain_path(domain, directory, sizeof directory);
+    for (round = 0; round < 8; ++round) {
+        DIR *entries = opendir(directory);
+        struct dirent *entry;
+        unsigned live = 0;
+        if (entries == NULL) return errno == ENOENT ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
+        while ((entry = readdir(entries)) != NULL) {
+            char *end;
+            long raw;
+            uint64_t expected;
+            hl_host_process_info process;
+            if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+            errno = 0;
+            raw = strtol(entry->d_name, &end, 10);
+            if (errno != 0 || *end != 0 || raw <= 0 || raw > INT32_MAX) continue;
+            if (!domain_birth(directory, (pid_t)raw, &expected)) continue;
+            if (!hl_host_process_read(raw, &process) || process.start_time_ns != expected) continue;
+            ++live;
+            if (kill((pid_t)raw, SIGKILL) != 0 && errno != ESRCH) {
+                (void)closedir(entries);
+                return HL_STATUS_PLATFORM_FAILURE;
+            }
+        }
+        (void)closedir(entries);
+        if (live == 0) return HL_STATUS_OK;
+        (void)poll(NULL, 0, 2);
+    }
+    return HL_STATUS_BUSY;
+}
 
 static int wait_child(pid_t child, int *waited) {
     pid_t result;

@@ -2568,11 +2568,16 @@ static int proc_mountinfo_text(char *b, size_t n) {
 // and synthesize /proc/<pid>/{stat,status,cmdline,comm} for its peers, with GUEST pids throughout.
 #include "../../host/system.h"
 
-// The registry directory is keyed per-container (HL_NETNS / HL_HOSTNAME are set once at launch and
-// inherited across fork + survive guest execve), so two containers on the same host never collide; a
-// direct-mode run with neither falls back to the host session id. All peers compute the SAME key.
+// ABI9 gives every launch an opaque ownership domain independent of networking, hostname, and filesystem
+// generation. It is inherited in process memory across every guest fork and survives guest exec. Older
+// direct-mode entry points retain the namespace/session fallback until they are removed.
 static void proc_reg_key(char *out, size_t n) {
-    const char *k = hl_option_get("HL_NETNS");
+    const char *k = hl_option_get("HL_PROCESS_DOMAIN");
+    if (k && strlen(k) == 32) {
+        snprintf(out, n, "/tmp/.hl-domain.%s", k);
+        return;
+    }
+    k = hl_option_get("HL_NETNS");
     if (!k || !k[0]) k = hl_option_get("HL_HOSTNAME");
     if (k && k[0]) {
         char s[48];
@@ -2592,6 +2597,7 @@ static void proc_reg_key(char *out, size_t n) {
 // _exit bypasses atexit). Stale files from a crash are pruned lazily by the enumerator (dead-pid check).
 static char g_reg_file[128];
 static char g_reg_exe_file[128]; // sibling "x<pid>" record: the canonical exe path (for /proc/<pid>/exe)
+static char g_reg_birth_file[128]; // sibling "b<pid>": native start time, preventing PID-reuse kills
 static char g_reg_last_buf[4096];
 static int g_reg_last_len;
 static char g_reg_last_exe[4200];
@@ -2604,6 +2610,10 @@ static void proc_reg_unlink(void) {
     if (g_reg_exe_file[0]) {
         (void)hl_host_file_unlink(&g_jit_services, g_reg_exe_file);
         g_reg_exe_file[0] = 0;
+    }
+    if (g_reg_birth_file[0]) {
+        (void)hl_host_file_unlink(&g_jit_services, g_reg_birth_file);
+        g_reg_birth_file[0] = 0;
     }
 }
 
@@ -2631,6 +2641,16 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
             }
             else
                 (void)hl_host_file_unlink(&g_jit_services, xtmp);
+        }
+    }
+    {
+        hl_host_process_info process;
+        char birth[32], path[144];
+        if (hl_host_process_read(getpid(), &process)) {
+            int size = snprintf(birth, sizeof birth, "%llu\n", (unsigned long long)process.start_time_ns);
+            snprintf(path, sizeof path, "%s/b%d", dir, (int)getpid());
+            if (size > 0 && hl_host_file_store(&g_jit_services, path, 0600, birth, (size_t)size) == 0)
+                snprintf(g_reg_birth_file, sizeof g_reg_birth_file, "%s", path);
         }
     }
 }
@@ -2685,6 +2705,7 @@ static void proc_reg_after_fork(void) {
     // child's exit_group cleanup can unlink the parent's /proc registry entry.
     g_reg_file[0] = 0;
     g_reg_exe_file[0] = 0;
+    g_reg_birth_file[0] = 0;
     if (g_reg_last_len <= 0) {
         char *argv[] = {(char *)g_exe_path, NULL};
         proc_reg_publish(g_exe_path, 1, argv);
@@ -3244,6 +3265,15 @@ static void proc_reg_mark_child(int hostpid) {
     snprintf(path, sizeof path, "%s/%d", dir, hostpid);
     // EXCL: never clobber the child's real record.
     (void)hl_host_file_exclusive(&g_jit_services, path, 0644);
+    {
+        hl_host_process_info process;
+        char birth[32];
+        if (hl_host_process_read(hostpid, &process)) {
+            int size = snprintf(birth, sizeof birth, "%llu\n", (unsigned long long)process.start_time_ns);
+            snprintf(path, sizeof path, "%s/b%d", dir, hostpid);
+            if (size > 0) (void)hl_host_file_store(&g_jit_services, path, 0600, birth, (size_t)size);
+        }
+    }
 }
 
 // Drop a reaped child's registry records from the PARENT at wait4/waitid time. A child that exits cleanly
@@ -3257,6 +3287,8 @@ static void proc_reg_reap(int hostpid) {
     snprintf(path, sizeof path, "%s/%d", dir, hostpid);
     unlink(path);
     snprintf(path, sizeof path, "%s/x%d", dir, hostpid);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/b%d", dir, hostpid);
     unlink(path);
 }
 
