@@ -1661,6 +1661,23 @@ static hl_host_result hl_linux_file_unlink(void *context, hl_host_handle directo
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_linux_file_rmdir(void *context, hl_host_handle directory, const char *path,
+                                          size_t path_size) {
+    hl_host_linux *host = context;
+    char local[PATH_MAX];
+    int directory_fd;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    pthread_mutex_lock(&host->lock);
+    directory_fd = hl_linux_descriptor(host, directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (unlinkat(directory_fd, local, AT_REMOVEDIR) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_linux_file_mkdir(void *context, hl_host_handle directory, const char *path, size_t path_size,
                                           uint32_t permissions) {
     hl_host_linux *host = context;
@@ -3646,7 +3663,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                hl_linux_file_fifo,
                                                hl_linux_file_validate_private_regular,
                                                hl_linux_file_store_private_atomic,
-                                               hl_linux_file_validate_private_directory};
+                                               hl_linux_file_validate_private_directory,
+                                               hl_linux_file_rmdir};
     static const hl_host_event_services event = {
         HL_HOST_EVENT_ABI,          sizeof(event),       hl_linux_event_create, hl_linux_event_control,
         hl_linux_event_wait,        hl_linux_event_wake, hl_linux_event_close,  hl_linux_event_arm_timer,

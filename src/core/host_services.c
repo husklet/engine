@@ -28,6 +28,8 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
              file->size >= offsetof(hl_host_file_services, validate_private_regular)) ||
             (file->abi == HL_HOST_FILE_ABI_21 &&
              file->size >= offsetof(hl_host_file_services, validate_private_directory)) ||
+            (file->abi == HL_HOST_FILE_ABI_22 &&
+             file->size >= offsetof(hl_host_file_services, remove_directory)) ||
             (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
 }
 

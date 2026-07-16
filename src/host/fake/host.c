@@ -378,6 +378,8 @@ HL_FAKE_FILE_STUB(hl_fake_file_rename,
                    hl_host_handle new_directory, const char *new_path, size_t new_path_size))
 HL_FAKE_FILE_STUB(hl_fake_file_unlink,
                   (void *context, hl_host_handle directory, const char *path, size_t path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_rmdir,
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size))
 HL_FAKE_FILE_STUB(hl_fake_file_path, (void *context, hl_host_handle file, hl_host_bytes output))
 HL_FAKE_FILE_STUB(hl_fake_file_standard_stream, (void *context, uint32_t stream))
 HL_FAKE_FILE_STUB(hl_fake_file_readlink, (void *context, hl_host_handle file, hl_host_bytes output))
@@ -1324,6 +1326,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
         .validate_private_regular = hl_fake_file_sync,
         .store_private_atomic = hl_fake_file_store_private,
         .validate_private_directory = hl_fake_file_sync,
+        .remove_directory = hl_fake_file_rmdir,
     };
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));

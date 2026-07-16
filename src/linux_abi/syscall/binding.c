@@ -2023,13 +2023,22 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = bound_path_copy(a1, path, &path_size);
         if (result != 0) break;
         if (path[0] == '/') return 0;
-        if ((a2 & UINT64_C(0x200)) != 0 || g_host_services->file->unlink_relative == NULL) {
+        if ((a2 & UINT64_C(0x200)) != 0 && g_host_services->file->remove_directory == NULL) {
             result = -ENOSYS;
             break;
         }
-        result = bound_host_error(
-            g_host_services->file->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
-                .status);
+        if ((a2 & UINT64_C(0x200)) != 0) {
+            result = bound_host_error(g_host_services->file
+                                          ->remove_directory(g_host_services->context, source.host_handle, path,
+                                                             path_size)
+                                          .status);
+        } else if (g_host_services->file->unlink_relative == NULL) {
+            result = -ENOSYS;
+        } else {
+            result = bound_host_error(
+                g_host_services->file->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
+                    .status);
+        }
         break;
     }
     case 53:
@@ -2165,7 +2174,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 56: {
         struct fdvis_reservation fdvis;
         const uint32_t supported = HL_LINUX_O_ACCMODE | HL_LINUX_O_CREAT | HL_LINUX_O_EXCL | HL_LINUX_O_TRUNC |
-                                   HL_LINUX_O_APPEND | HL_LINUX_O_DIRECTORY | HL_LINUX_O_CLOEXEC;
+                                   HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK | HL_LINUX_O_NOFOLLOW |
+                                   HL_LINUX_O_DIRECTORY | HL_LINUX_O_PATH | HL_LINUX_O_CLOEXEC;
+        uint32_t flags = typed_open_flags(a2);
         size_t path_size;
         char path[HL_LINUX_PATH_MAX + 1];
         int shadow;
@@ -2174,7 +2185,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = bound_path_copy(a1, path, &path_size);
         if (result != 0) break;
         if (path[0] == '/') return 0;
-        if ((a2 & ~(uint64_t)supported) != 0) {
+        if ((flags & ~supported) != 0) {
             result = -HL_LINUX_EINVAL;
             break;
         }
@@ -2206,7 +2217,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -HL_LINUX_EMFILE;
             break;
         }
-        result = hl_linux_openat_reserved(g_linux_box, &reservation, (int32_t)source.fd, path, path_size, (uint32_t)a2,
+        result = hl_linux_openat_reserved(g_linux_box, &reservation, (int32_t)source.fd, path, path_size, flags,
                                           (uint32_t)a3);
         if (result < 0) {
             (void)hl_linux_fd_cancel(g_linux_box, &reservation);

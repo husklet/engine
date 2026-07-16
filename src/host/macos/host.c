@@ -2227,6 +2227,21 @@ static hl_host_result hl_macos_file_unlink(void *context, hl_host_handle directo
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
+static hl_host_result hl_macos_file_rmdir(void *context, hl_host_handle directory, const char *path,
+                                          size_t path_size) {
+    hl_host_macos *host = context;
+    char local[PATH_MAX];
+    int directory_fd;
+    if (path == NULL || path_size == 0 || path_size >= sizeof(local))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memcpy(local, path, path_size);
+    local[path_size] = '\0';
+    directory_fd = hl_macos_file_directory(host, directory);
+    if (directory_fd < 0 && directory != HL_HOST_HANDLE_CWD) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (unlinkat(directory_fd, local, AT_REMOVEDIR) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
 static hl_host_result hl_macos_file_mkdir(void *context, hl_host_handle directory, const char *path, size_t path_size,
                                           uint32_t permissions) {
     hl_host_macos *host = context;
@@ -4489,7 +4504,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                hl_macos_file_fifo,
                                                hl_macos_file_validate_private_regular,
                                                hl_macos_file_store_private_atomic,
-                                               hl_macos_file_validate_private_directory};
+                                               hl_macos_file_validate_private_directory,
+                                               hl_macos_file_rmdir};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_macos_process_spawn,         hl_macos_process_wait,
         hl_macos_process_terminate, hl_macos_process_close, hl_macos_process_spawn_prepared};
