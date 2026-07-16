@@ -23,17 +23,22 @@
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "hl-engine";
-            version = "0.1.6";
+            version = "0.1.10";
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
-              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools linuxArm.stdenv.cc ]
+              ++ pkgs.lib.optionals (system == "aarch64-darwin") [
+                pkgs.darwin.cctools
+                linuxArm.stdenv.cc
+                linuxX86.stdenv.cc
+              ]
               ++ pkgs.lib.optionals (system == "aarch64-linux") [ linuxX86.stdenv.cc ];
             AARCH64_LINUX_CC = if system == "aarch64-darwin" then linuxArmCompiler else "${pkgs.stdenv.cc}/bin/cc";
             AARCH64_LINUX_STATIC_CC = if system == "aarch64-darwin"
               then "${linuxArmCompiler} -L${linuxArm.glibc.static}/lib"
               else "${pkgs.stdenv.cc}/bin/cc -L${pkgs.glibc.static}/lib";
-            X86_64_LINUX_CC = if system == "aarch64-linux" then linuxX86Compiler else "x86_64-linux-gnu-gcc";
+            X86_64_LINUX_CC = linuxX86Compiler;
+            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             enableParallelBuilding = true;
 
             buildPhase = ''
@@ -85,7 +90,7 @@
         } // pkgs.lib.optionalAttrs runtimeHost {
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
-            version = "0.1.6";
+            version = "0.1.10";
             src = ./pkgs/rust;
             cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
