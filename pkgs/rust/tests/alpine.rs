@@ -74,6 +74,20 @@ fn process_domain_stops_double_forked_new_session_without_touching_siblings() {
 }
 
 #[test]
+fn process_domain_termination_tolerates_an_unreaped_init() {
+    let mut child = Engine::new()
+        .command(Guest::Aarch64, "/bin/sleep")
+        .config(Config::new().root(rootfs()))
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let domain = child.domain();
+    child.force_stop().unwrap();
+    domain.terminate().unwrap();
+    assert_eq!(child.wait().unwrap(), Exit::Signal(9));
+}
+
+#[test]
 fn public_api_runs_real_alpine_shell_with_process_io() {
     let engine = Engine::new();
     let config = Config::new()
