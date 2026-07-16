@@ -1172,6 +1172,7 @@ static int bound_handle_chdir(int fd, int *result) {
         return 1;
     }
     *result = chdir(path) == 0 ? 0 : -errno;
+    if (*result == 0 && g_rootfs) guest_from_host(path, g_cwd, sizeof g_cwd);
     return 1;
 }
 
