@@ -2608,7 +2608,7 @@ static void proc_reg_key(char *out, size_t n) {
 // _exit bypasses atexit). Stale files from a crash are pruned lazily by the enumerator (dead-pid check).
 static char g_reg_file[128];
 static char g_reg_exe_file[128]; // sibling "x<pid>" record: the canonical exe path (for /proc/<pid>/exe)
-static char g_reg_birth_file[128]; // sibling "b<pid>": native start time, preventing PID-reuse kills
+static char g_reg_birth_file[160]; // sibling "b<pid>": native start time, preventing PID-reuse kills
 static char g_reg_last_buf[4096];
 static int g_reg_last_len;
 static char g_reg_last_exe[4200];
