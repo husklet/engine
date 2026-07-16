@@ -57,6 +57,24 @@ typedef struct resource_baseline {
     long threads;
 } resource_baseline;
 
+static volatile sig_atomic_t interrupted_signal;
+static volatile sig_atomic_t active_group;
+
+static void interrupt_runner(int signal_number) {
+    sig_atomic_t group = active_group;
+    interrupted_signal = signal_number;
+    if (group > 0) (void)kill(-(pid_t)group, SIGTERM);
+}
+
+static int install_interrupt_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = interrupt_runner;
+    if (sigemptyset(&action.sa_mask) != 0) return 1;
+    return sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGTERM, &action, NULL) != 0 ||
+           sigaction(SIGHUP, &action, NULL) != 0;
+}
+
 static long count_directory_entries(const char *path) {
 #if defined(__linux__)
     DIR *directory = opendir(path);
@@ -286,9 +304,19 @@ static int read_capture(const char *path, unsigned char *buffer, size_t limit, s
 }
 
 static void terminate(pid_t child) {
+    const struct timespec tick = {0, 10000000};
+    (void)kill(-child, SIGTERM);
+    for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        pid_t waited = waitpid(child, NULL, WNOHANG);
+        if (waited == child || (waited < 0 && errno == ECHILD)) goto done;
+        if (waited < 0 && errno != EINTR) break;
+        (void)nanosleep(&tick, NULL);
+    }
     (void)kill(-child, SIGKILL);
     (void)kill(child, SIGKILL);
     while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+done:
+    if (active_group == (sig_atomic_t)child) active_group = 0;
 }
 
 typedef struct config_wire {
@@ -520,6 +548,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         _exit(127);
     }
     (void)setpgid(child, child);
+    active_group = (sig_atomic_t)child;
     close(output_pipe[1]);
     close(error_pipe[1]);
     if (fcntl(output_pipe[0], F_SETFL, O_NONBLOCK) < 0 || fcntl(error_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
@@ -532,7 +561,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     while (!exited || !output_eof || !error_eof) {
         struct pollfd descriptors[2] = {{output_pipe[0], POLLIN | POLLHUP, 0}, {error_pipe[0], POLLIN | POLLHUP, 0}};
         pid_t waited;
-        if (monotonic_ms() >= deadline) {
+        if (interrupted_signal != 0 || monotonic_ms() >= deadline) {
             terminate(child);
             close(output_pipe[0]);
             close(error_pipe[0]);
@@ -565,6 +594,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
             }
         }
     }
+    active_group = 0;
     close(output_pipe[0]);
     close(error_pipe[0]);
     if (read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size) != 0 ||
@@ -766,6 +796,7 @@ int main(int argc, char **argv) {
     unsigned long repetitions = 1;
     unsigned long repetition;
     resource_baseline baseline;
+    if (install_interrupt_handlers() != 0) return 1;
     if (argc == 8) {
         only = argv[7];
     } else if (argc == 9 || argc == 10) {
@@ -786,9 +817,11 @@ usage:
     if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {
+        if (interrupted_signal != 0) return 128 + interrupted_signal;
         if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
         selected++;
         for (repetition = 0; repetition < repetitions; ++repetition) {
+            if (interrupted_signal != 0) return 128 + interrupted_signal;
             capture a = {0}, x = {0};
             if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
                 run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {

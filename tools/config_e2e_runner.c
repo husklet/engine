@@ -17,6 +17,40 @@
 #include <time.h>
 #include <unistd.h>
 
+static volatile sig_atomic_t interrupted_signal;
+static volatile sig_atomic_t active_group;
+
+static void interrupt_runner(int signal_number) {
+    sig_atomic_t group = active_group;
+    interrupted_signal = signal_number;
+    if (group > 0) (void)kill(-(pid_t)group, SIGTERM);
+}
+
+static int install_interrupt_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = interrupt_runner;
+    if (sigemptyset(&action.sa_mask) != 0) return 1;
+    return sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGTERM, &action, NULL) != 0 ||
+           sigaction(SIGHUP, &action, NULL) != 0;
+}
+
+static void terminate(pid_t child) {
+    const struct timespec tick = {0, 10000000};
+    (void)kill(-child, SIGTERM);
+    for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        pid_t waited = waitpid(child, NULL, WNOHANG);
+        if (waited == child || (waited < 0 && errno == ECHILD)) goto done;
+        if (waited < 0 && errno != EINTR) break;
+        (void)nanosleep(&tick, NULL);
+    }
+    (void)kill(-child, SIGKILL);
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+done:
+    if (active_group == (sig_atomic_t)child) active_group = 0;
+}
+
 static int write_full(int fd, const void *buffer, size_t size) {
     const unsigned char *cursor = buffer;
     while (size != 0) {
@@ -122,13 +156,17 @@ static int run_config(const char *bridge, const char *engine, const char *config
     pid_t child = fork();
     if (child < 0) return 1;
     if (child == 0) {
+        (void)setpgid(0, 0);
         execlp(bridge, bridge, engine, "--configfile", config_path, (char *)NULL);
         _exit(127);
     }
+    (void)setpgid(child, child);
+    active_group = (sig_atomic_t)child;
     while (elapsed_ms < 30000) {
         int status;
         pid_t result = waitpid(child, &status, WNOHANG);
         if (result == child) {
+            active_group = 0;
             unlink(config_path);
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
                 fprintf(stderr, "%s config launch: expected transport exit 0, status=%d\n", engine, status);
@@ -138,12 +176,16 @@ static int run_config(const char *bridge, const char *engine, const char *config
             nanosleep(&tick, NULL);
             return read_result(result_path, expected_exit);
         }
+        if (interrupted_signal != 0) {
+            terminate(child);
+            unlink(config_path);
+            return 1;
+        }
         if (result < 0 && errno != EINTR) return 1;
         nanosleep(&tick, NULL);
         elapsed_ms += 10;
     }
-    kill(child, SIGKILL);
-    waitpid(child, NULL, 0);
+    terminate(child);
     unlink(config_path);
     return 1;
 }
@@ -155,6 +197,7 @@ int main(int argc, char **argv) {
     char result_path[1200];
     const char *cache_path = NULL;
     int expected_exit, repetitions = 1;
+    if (install_interrupt_handlers() != 0) return 1;
     if (argc < 5 || argc > 7) {
         fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [REPETITIONS [CACHE]]\n");
         return 2;
@@ -188,6 +231,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     for (int iteration = 0; iteration < repetitions; ++iteration) {
+        if (interrupted_signal != 0) return 128 + interrupted_signal;
         if (snprintf(path, sizeof path, "%s/config-%d", directory, iteration) >= (int)sizeof path ||
             snprintf(result_path, sizeof result_path, "%s/result-%d", directory, iteration) >=
                 (int)sizeof result_path) {
