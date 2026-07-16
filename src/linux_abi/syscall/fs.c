@@ -2011,12 +2011,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    // fchownat(dirfd,path,uid,gid,flags) -- best-effort (rootless)
+    // fchownat(dirfd,path,uid,gid,flags) -- virtualized guest ownership
     case 54: {
         // Linux validates the flag word before touching the path: only AT_SYMLINK_NOFOLLOW (0x100) and
         // AT_EMPTY_PATH (0x1000) are defined; any other bit is EINVAL. hl emulates a root container, so an
-        // actual ownership change is faked-success (a real host chown is a rootless no-op), but a syntactically
-        // invalid call must still fail exactly as Linux does rather than silently mutate the owner xattr.
+        // ownership is guest metadata and never changes the host inode, but a syntactically invalid call must
+        // still fail exactly as Linux does rather than silently mutate the virtual owner record.
         if (a4 & ~0x1100u) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -2034,15 +2034,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             int nofollow = (a4 & 0x100) ? 1 : 0;
-            int chown_result = fchownat(pfd, fin, (uid_t)a2, (gid_t)a3, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
-            if (chown_result < 0 && errno != EPERM && errno != EACCES) {
+            struct stat target;
+            if (fstatat(pfd, fin, &target, nofollow ? AT_SYMLINK_NOFOLLOW : 0) < 0) {
                 int error = errno;
                 close(pfd);
                 G_RET(c) = (uint64_t)(int64_t)(-error);
                 break;
             }
-            // the host chown is a rootless no-op; persist the guest-set owner as an xattr on
-            // the backing file so a later stat reports it (not the cuid/cgid default). -1 = keep.
+            // Ownership belongs to the guest metadata model. Never mutate the host inode: a privileged
+            // launcher or build sandbox could make a real chown succeed and leak guest state to the host.
             char dp[4200];
             if (hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
@@ -2052,7 +2052,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             close(pfd);
             G_RET(c) = 0;
             break;
-            // EPERM on the host -> faked OK
         }
         char pb[4200];
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
@@ -2060,21 +2059,21 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
            dirfd for an absolute pathname; Darwin's fchownat validates it first, so use AT_FDCWD once
            resolution is absolute to preserve the Linux contract on every host. */
         int host_dirfd = p != NULL && p[0] == '/' ? AT_FDCWD : ATFD(a0);
-        int chown_result = fchownat(host_dirfd, p, (uid_t)a2, (gid_t)a3, 0);
-        if (chown_result < 0 && errno != EPERM && errno != EACCES) {
+        struct stat target;
+        int nofollow = (a4 & 0x100) ? 1 : 0;
+        if (fstatat(host_dirfd, p, &target, nofollow ? AT_SYMLINK_NOFOLLOW : 0) < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-errno);
             break;
         }
-        hl_owner_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, 0);
+        hl_owner_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
         G_RET(c) = 0;
         break;
     }
     case 55: {
-        // A genuinely invalid fd must fail EBADF like Linux -- don't fake-success and poison the owner
-        // xattr on a descriptor that isn't open. (Host EPERM from the rootless chown is still faked OK,
-        // matching the emulated root container.)
-        if (fchown((int)a0, (uid_t)a1, (gid_t)a2) < 0 && errno == EBADF) {
-            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+        // A genuinely invalid descriptor must fail like Linux instead of poisoning virtual metadata.
+        struct stat target;
+        if (fstat((int)a0, &target) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-errno);
             break;
         }
         hl_owner_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
@@ -2083,7 +2082,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             hl_fdcache_evict_path(g_fdpath[(int)a0]);
         G_RET(c) = 0;
         break;
-        // fchown(fd,uid,gid) -- best-effort
     }
     // openat2(dirfd, path, open_how*, size): unpack open_how { u64 flags; u64 mode; u64 resolve; } into
     // the openat arg positions, then share the full openat path (O_* xlate, overlay, jail). Linux validates
@@ -2512,6 +2510,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int nf_new = nf_want && access(host, F_OK) != 0;
             // Gate the new fd against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (host table larger).
             int r = nofile_gate(open(host, mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), (mode_t)a3));
+            if (strstr(gp, "/opt/couchdb") != NULL)
+                fprintf(stderr, "couch-open gp=%s host=%s lf=%#x mf=%#x r=%d errno=%d\n", gp, host, lf,
+                        mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), r, errno);
             if (r >= 0 && nf_new) newfile_stamp_fd(r);
             if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
             if (r >= 0) {
