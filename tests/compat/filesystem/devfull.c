@@ -19,6 +19,16 @@ int main(void) {
     errno = 0;
     ssize_t wr = write(fd, "x", 1);
     int enospc = wr < 0 && errno == ENOSPC;
+    int saved = dup(STDOUT_FILENO);
+    if (saved < 0 || dup2(fd, STDOUT_FILENO) < 0) {
+        enospc = 0;
+    } else {
+        errno = 0;
+        wr = write(STDOUT_FILENO, "x", 1);
+        enospc &= wr < 0 && errno == ENOSPC;
+        if (dup2(saved, STDOUT_FILENO) < 0) enospc = 0;
+    }
+    if (saved >= 0) close(saved);
     close(fd);
     printf("devfull opened=%d zeros=%d enospc=%d\n", opened, zeros, enospc);
     return 0;

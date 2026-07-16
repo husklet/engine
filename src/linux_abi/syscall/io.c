@@ -45,6 +45,12 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
+    // Synthetic character devices keep their Linux behavior across descriptor duplication. Shell
+    // redirections open the target and dup2 it onto stdout before writing; dropping these tags made
+    // `echo x > /dev/full` write successfully to the /dev/zero backing instead of failing ENOSPC.
+    g_devfull[newfd] = g_devfull[oldfd];
+    g_devseed[newfd] = g_devseed[oldfd];
+    g_devtty[newfd] = g_devtty[oldfd];
     mq_fd_duplicate(newfd, oldfd);
     if (g_pipe_identity[oldfd] != 0) {
         g_pipe_identity[newfd] = g_pipe_identity[oldfd];
