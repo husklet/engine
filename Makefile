@@ -268,10 +268,14 @@ MEMORY_CASE_SOURCES := $(sort $(wildcard tests/compat/memory/*.c))
 MEMORY_CASE_NAMES := $(basename $(notdir $(MEMORY_CASE_SOURCES)))
 MEMORY_CASE_BINS := $(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/aarch64/%) \
 	$(MEMORY_CASE_NAMES:%=$(BUILD)/compat/memory/x86_64/%)
-FILESYSTEM_CASE_SOURCES := $(sort $(wildcard tests/compat/filesystem/*.c tests/compat/filesystem/*/*.c))
+FILESYSTEM_CASE_SOURCES := $(sort $(wildcard tests/compat/filesystem/*.c tests/compat/filesystem/dentry/*.c tests/compat/filesystem/pcachex/*.c))
 FILESYSTEM_CASE_NAMES := $(patsubst tests/compat/filesystem/%.c,%,$(FILESYSTEM_CASE_SOURCES))
+FILESYSTEM_CORPUS_SOURCES := $(sort $(wildcard tests/compat/filesystem/corpus/*.c))
+FILESYSTEM_CORPUS_NAMES := $(basename $(notdir $(FILESYSTEM_CORPUS_SOURCES)))
 FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aarch64/%) \
-	$(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/x86_64/%)
+	$(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/x86_64/%) \
+	$(FILESYSTEM_CORPUS_NAMES:%=$(BUILD)/compat/filesystem/aarch64/%) \
+	$(FILESYSTEM_CORPUS_NAMES:%=$(BUILD)/compat/filesystem/x86_64/%)
 SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
@@ -855,6 +859,14 @@ $(BUILD)/compat/filesystem/aarch64/pcachex/%: tests/compat/filesystem/pcachex/%.
 $(BUILD)/compat/filesystem/x86_64/pcachex/%: tests/compat/filesystem/pcachex/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
+
+$(addprefix $(BUILD)/compat/filesystem/aarch64/,$(FILESYSTEM_CORPUS_NAMES)): $(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/corpus/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(addprefix $(BUILD)/compat/filesystem/x86_64/,$(FILESYSTEM_CORPUS_NAMES)): $(BUILD)/compat/filesystem/x86_64/%: tests/compat/filesystem/corpus/%.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
 
 $(BUILD)/compat/filesystem/aarch64/%: tests/compat/filesystem/%.c
 	@mkdir -p $(@D)
@@ -1914,6 +1926,10 @@ compat-memory: compat-engines $(BUILD)/tools/matrix-runner $(MEMORY_CASE_BINS)
 		$(abspath $(BUILD)/compat/memory/x86_64) $(abspath tests/compat/memory)
 
 compat-filesystem: compat-engines $(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS)
+	@test -x $(BUILD)/compat/filesystem/aarch64/child_create_reopen \
+		-a -x $(BUILD)/compat/filesystem/x86_64/child_create_reopen \
+		-a -x $(BUILD)/compat/filesystem/aarch64/sibling_generation_stress \
+		-a -x $(BUILD)/compat/filesystem/x86_64/sibling_generation_stress
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/filesystem/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/filesystem/x86_64) $(abspath tests/compat/filesystem)
