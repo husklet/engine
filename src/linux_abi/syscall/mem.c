@@ -1,6 +1,7 @@
 // Extracted from service(): Memory — mmap/brk/mprotect/madvise syscalls. Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
 #include "../page.h"
+
 // process_vm_readv/writev between two iovec arrays. In this single-address-space DBT the "remote"
 // process is always the guest itself, so both vectors point into directly-dereferenceable guest memory
 // and the transfer is a scatter/gather memcpy -- exactly the kernel's stream semantics: bytes flow from
@@ -81,7 +82,7 @@ static ssize_t pread_retry(int fd, void *buffer, size_t length, off_t offset) {
     return result;
 }
 
-static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int replace_tail, int fd, off_t off) {
+static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int fd, off_t off) {
     size_t hp = (size_t)getpagesize();
     uint64_t lo = a0, hi = a0 + a1;
     uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
@@ -95,10 +96,30 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int r
     }
     uint64_t he = ilo < hi ? ilo : hi; // partial head edge [lo, he)
     if (lo < he) {
+        uint64_t page = lo & ~((uint64_t)hp - 1);
+        size_t prefix = (size_t)(lo - page);
+        void *saved = NULL;
+        if (anon || hl_linux_bus_hit(lo, he - lo)) {
+            if (prefix != 0) {
+                saved = malloc(prefix);
+                if (saved == NULL || hl_linux_bus_hit(page, prefix)) {
+                    free(saved);
+                    return -1;
+                }
+                memcpy(saved, (void *)page, prefix);
+            }
+            if (mmap((void *)page, hp, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
+                MAP_FAILED) {
+                free(saved);
+                return -1;
+            }
+            if (saved != NULL) memcpy((void *)page, saved, prefix);
+            free(saved);
+        }
         if (anon || fd < 0)
             memset((void *)lo, 0, (size_t)(he - lo));
-        else
-            if (pread_retry(fd, (void *)lo, (size_t)(he - lo), off) < 0) return -1;
+        else if (pread_retry(fd, (void *)lo, (size_t)(he - lo), off) < 0)
+            return -1;
     }
     uint64_t tl = he > ihi ? he : ihi; // partial tail edge [tl, hi) (never re-covers the head)
     if (tl < hi) {
@@ -108,16 +129,15 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int r
                page boundary; replace that poisoned page before zeroing it.
                Linux rounds the mapping to guest pages, and bytes beyond hi in
                this host page were inaccessible past-EOF reservation bytes. */
-            if (anon && replace_tail) {
-                if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE,
-                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
+            if (anon) {
+                if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
+                    MAP_FAILED)
                     return -1;
             } else {
                 memset((void *)tl, 0, (size_t)(hi - tl));
             }
-        }
-        else
-            if (pread_retry(fd, (void *)tl, (size_t)(hi - tl), off + (off_t)(tl - lo)) < 0) return -1;
+        } else if (pread_retry(fd, (void *)tl, (size_t)(hi - tl), off + (off_t)(tl - lo)) < 0)
+            return -1;
     }
     return 0;
 }
@@ -241,8 +261,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             hl_gmap_unmap_range(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
             filemap_unmap(u_lo, u_hi);
-            futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
-            wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
+            futex_shared_unmap(u_lo, u_hi);         // drop/trim shared-futex-key coverage for the released range
+            wipefork_del(u_lo, u_hi - u_lo);        // a wipe-on-fork range that was unmapped no longer applies
             hl_gmap_lock_remove(u_lo, u_hi - u_lo); // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
             // (SIGSEGV). Without this the JIT's lazy zero-page grower (jit86_lazyguard) would re-serve the
@@ -322,7 +342,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 } else {
                     int aprot = anon_prot_if_contained(a4, (size_t)a2);
                     r = (aprot >= 0 && (aprot & PROT_WRITE) &&
-                         host_fixed_map286(a4, (uint64_t)a2, PROT_READ | PROT_WRITE, 1, 0, -1, 0) == 0)
+                         host_fixed_map286(a4, (uint64_t)a2, PROT_READ | PROT_WRITE, 1, -1, 0) == 0)
                             ? (void *)a4
                             : MAP_FAILED;
                 }
@@ -366,7 +386,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 mmap((void *)end, (size_t)(a0 + want - end), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ext == (void *)end) {
                 hl_gmap_remove(a0);
-                hl_gmap_add(a0, want);           // track the grown extent (incl. fresh guard) for execve() teardown
+                hl_gmap_add(a0, want); // track the grown extent (incl. fresh guard) for execve() teardown
                 hl_gmap_set_guest_length(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
                 G_RET(c) = a0;
@@ -475,7 +495,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 bus_accessible = available > UINT64_MAX - UINT64_C(4095)
                                      ? UINT64_MAX
                                      : (available + UINT64_C(4095)) & ~UINT64_C(4095);
-                if (bus_accessible < a1) { gbus_prepare(); bus_prepared = 1; }
+                if (bus_accessible < a1) {
+                    gbus_prepare();
+                    bus_prepared = 1;
+                }
             }
         }
         if (!bus_prepared && (a3 & 0x10)) {
@@ -513,12 +536,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // on containment, so every fresh/whole-page/free-space fixed map keeps the direct path below and is
         // byte-identical (a non-contained map has no neighbour to protect).
         int fixed286 = 0;
-        if (hp > (size_t)guest_pagesz() && (a3 & 0x10) && a1 &&
-            ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
+        if (hp > (size_t)guest_pagesz() && (a3 & 0x10) && a1 && ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0 && (aprot & PROT_WRITE)) {
-                r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, gna_hit(a0, a1),
-                                      (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
+                r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
                         ? (void *)a0
                         : MAP_FAILED;
                 fixed286 = 1;
@@ -599,9 +620,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             void *ar =
                 mmap((void *)lo, (size_t)a1 + head, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
             if (ar != MAP_FAILED) {
-                if (hsave) memcpy((void *)lo, hsave, head);            // restore the previous seg's tail
-                if (!(a3 & 0x20) && (int)a4 >= 0 &&
-                    pread_retry((int)a4, (void *)a0, (size_t)a1, (off_t)a5) < 0) {
+                if (hsave) memcpy((void *)lo, hsave, head); // restore the previous seg's tail
+                if (!(a3 & 0x20) && (int)a4 >= 0 && pread_retry((int)a4, (void *)a0, (size_t)a1, (off_t)a5) < 0) {
                     munmap(ar, (size_t)a1 + head);
                     ar = MAP_FAILED;
                 }
@@ -631,8 +651,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (bus_prepared) {
             if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1);
-            if (r != MAP_FAILED && gbus_add((uint64_t)(uintptr_t)r + bus_accessible,
-                                            (uint64_t)(uintptr_t)r + a1) != 0) {
+            if (r != MAP_FAILED &&
+                gbus_add((uint64_t)(uintptr_t)r + bus_accessible, (uint64_t)(uintptr_t)r + a1) != 0) {
                 munmap(r, (size_t)a1 + guard);
                 r = MAP_FAILED;
                 errno = ENOMEM;
@@ -648,7 +668,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r != MAP_FAILED) {
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
-            hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+            hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard);      // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
                 filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);
@@ -716,8 +736,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // ET_EXEC addresses remain LOW in the Linux ABI while their storage is mapped at the engine's
             // HIGH bias. Keep all logical permission registries in guest coordinates, but use this translated
             // address for mapping validation and any safe host-side protection change.
-            uint64_t physical_a0 =
-                (g_nonpie_lo && a0 >= g_nonpie_lo && a0 < g_nonpie_hi) ? a0 + g_nonpie_bias : a0;
+            uint64_t physical_a0 = (g_nonpie_lo && a0 >= g_nonpie_lo && a0 < g_nonpie_hi) ? a0 + g_nonpie_bias : a0;
             // Linux mm/mprotect.c rejects a start not aligned to the (guest) page size with EINVAL BEFORE
             // touching anything, so a bad-alignment probe must not read as success.
             if (a0 & (uint64_t)(guest_pagesz() - 1)) {

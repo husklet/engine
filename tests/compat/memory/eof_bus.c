@@ -62,13 +62,19 @@ static int guarded_canary_load(volatile unsigned char *base) {
 
 static int expect_bus_load(volatile unsigned char *address) {
     expected_address = address;
-    if (sigsetjmp(jump, 1) == 0) { (void)*address; return 0; }
+    if (sigsetjmp(jump, 1) == 0) {
+        (void)*address;
+        return 0;
+    }
     return 1;
 }
 
 static int expect_bus_store(volatile unsigned char *address) {
     expected_address = address;
-    if (sigsetjmp(jump, 1) == 0) { *address = 1; return 0; }
+    if (sigsetjmp(jump, 1) == 0) {
+        *address = 1;
+        return 0;
+    }
     return 1;
 }
 
@@ -83,7 +89,7 @@ int main(void) {
     action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGBUS, &action, NULL) != 0) return 2;
-    unsigned char *mapping = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE, descriptor, 0);
+    unsigned char *mapping = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE, descriptor, 0);
     if (mapping == MAP_FAILED) return 3;
     int partial_zero = mapping[4999] == 0x3c && mapping[5000] == 0 && mapping[8191] == 0;
     int canary_miss = guarded_canary_load(mapping + 4096);
@@ -120,20 +126,25 @@ int main(void) {
     int child_status = 0;
     if (child < 0 || waitpid(child, &child_status, 0) != child) return 6;
     int default_bus = WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGBUS;
-    if (mmap(mapping + 8192, 4096, PROT_READ | PROT_WRITE,
-             MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != mapping + 8192) return 4;
+    if (mmap(mapping + 8192, 49152, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) !=
+        mapping + 8192)
+        return 4;
     mapping[8192] = 0x71;
+    mapping[57343] = 0x72;
     _Atomic uint32_t *word = (_Atomic uint32_t *)(void *)(mapping + 8192);
     uint32_t old = atomic_exchange_explicit(word, UINT32_C(0x12345678), memory_order_seq_cst);
     int replacement = old == 0x71 && atomic_load_explicit(word, memory_order_relaxed) == UINT32_C(0x12345678);
-    printf("eof-bus partial=%d load=%d far=%d store=%d crossing=%d atomic=%d metadata=%d default=%d replacement=%d canary-miss=%d canary-hit=%d signals=%d\n",
+    int edges = mapping[4096] == 0x3c && mapping[8191] == 0 && mapping[57343] == 0x72;
+    int suffix_bus = expect_bus_load(mapping + 57344);
+    printf("eof-bus partial=%d load=%d far=%d store=%d crossing=%d atomic=%d metadata=%d default=%d replacement=%d "
+           "edges=%d suffix=%d canary-miss=%d canary-hit=%d signals=%d\n",
            partial_zero, load_bus, far_bus, store_bus, crossing_bus, atomic_bus, metadata_ok == bus_count, default_bus,
-           replacement, canary_miss, canary_hit, (int)bus_count);
-    munmap(mapping, 16384);
+           replacement, edges, suffix_bus, canary_miss, canary_hit, (int)bus_count);
+    munmap(mapping, 65536);
     close(descriptor);
     unlink(path);
-    return partial_zero && load_bus && far_bus && store_bus && crossing_bus && atomic_bus &&
-                   metadata_ok == bus_count && default_bus && replacement && canary_miss && canary_hit && bus_count == 6
+    return partial_zero && load_bus && far_bus && store_bus && crossing_bus && atomic_bus && metadata_ok == bus_count &&
+                   default_bus && replacement && edges && suffix_bus && canary_miss && canary_hit && bus_count == 7
                ? 0
                : 5;
 }
