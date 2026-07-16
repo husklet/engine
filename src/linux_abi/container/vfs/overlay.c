@@ -69,6 +69,25 @@ static int wh_exists(const char *jcanon, size_t jclen,
 // like xresolve_exec does for the rootfs). nofollow keeps the final component unresolved. Returns the
 // confined host path; the caller lstats it to test existence in this layer.
 static void layer_follow(const char *jc, size_t jcl, const char *guest, char *out, size_t n, int nofollow) {
+    int root = open(jc, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root >= 0) {
+        hl_host_resolved_path resolved;
+        const char *relative = guest;
+        while (*relative == '/') relative++;
+        if (!*relative) relative = ".";
+        unsigned policy = nofollow ? HL_HOST_RESOLVE_NOFOLLOW_FINAL : 0;
+        if (hl_host_resolve_beneath(root, relative, policy, -1, &resolved) == 0) {
+            char parent[4200];
+            if (hl_native_fd_path(resolved.parent_fd, parent, sizeof parent) == 0 &&
+                path_join(out, n, parent, resolved.leaf) == 0) {
+                hl_host_resolved_path_destroy(&resolved);
+                close(root);
+                return;
+            }
+            hl_host_resolved_path_destroy(&resolved);
+        }
+        close(root);
+    }
     char cur[4200];
     if (path_copy(cur, sizeof cur, guest) != 0) {
         if (n) out[0] = 0;

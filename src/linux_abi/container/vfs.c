@@ -4,6 +4,7 @@
 #include "../open_plan.h"
 #include "../shared.h"
 #include "../../host/file.h"
+#include "../../host/resolve.h"
 
 static int path_copy(char *out, size_t capacity, const char *value) {
     size_t length;
@@ -1610,7 +1611,17 @@ static int secure_resolve_probe(const char *guest, char *out, size_t n, int nofo
     return confine_in_m(jcanon, jclen, rel, out, n, nofollow, missing);
 }
 
+static int resolve_at(const char *guest, char *final, size_t fn, int nofollow);
+
 static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) {
+    char final[512], parent[4200];
+    int descriptor = resolve_at(guest, final, sizeof final, nofollow);
+    if (descriptor >= 0) {
+        int ok = hl_native_fd_path(descriptor, parent, sizeof parent) == 0 &&
+                 path_join(out, n, parent, final) == 0;
+        close(descriptor);
+        if (ok) return 1;
+    }
     return secure_resolve_probe(guest, out, n, nofollow, NULL, NULL);
 }
 
