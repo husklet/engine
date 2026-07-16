@@ -40,8 +40,11 @@ int main(void) {
     struct echo request = {.type = 8, .identifier = htons(0x1234), .sequence = htons(7)};
     memcpy(request.payload, "hl-icmp", 7);
     request.checksum = checksum(&request, sizeof request);
-    if (connect(fd, (struct sockaddr *)&peer, sizeof peer) < 0 || write(fd, &request, sizeof request) != sizeof request)
-        return 4;
+    if (connect(fd, (struct sockaddr *)&peer, sizeof peer) < 0) return 4;
+    int moved = dup(fd);
+    close(fd);
+    if (moved < 0 || write(moved, &request, sizeof request) != sizeof request) return 4;
+    fd = moved;
 
     struct echo packet;
     struct sockaddr_in source;

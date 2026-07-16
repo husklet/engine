@@ -1011,6 +1011,9 @@ static uint16_t g_br_port[HL_NFD]; // fd -> virtual port of a bridge socket (0 =
 static uint32_t g_br_ip[HL_NFD];   // fd -> virtual IP (network order) reported via getsockname/getpeername
 static uint8_t g_br_interface[HL_NFD]; // fd -> interface index + 1
 static int g_br_init;
+static uint8_t g_icmp_kind[HL_NFD]; // 1=dgram ping socket, 2=raw ping socket
+static uint8_t g_icmp_sock[HL_NFD]; // fd has been replaced by a reply socketpair
+static uint32_t g_icmp_ip[HL_NFD];  // connected/last echo destination
 
 // Carry the per-fd socket-emulation metadata (SOCK_STREAM-ness, loopback/bridge port + ip) from `src`
 // to `dst` when an fd is duplicated/moved (dup/dup3/fcntl F_DUPFD). Without this, a guest that creates a
@@ -1038,6 +1041,8 @@ static void fd_carry_sock(int dst, int src) {
     g_tcp_l6[dst] = g_tcp_l6[src];
     g_tcp_listen[dst] = g_tcp_listen[src];
     memcpy(g_tcp_laddr6[dst], g_tcp_laddr6[src], 16);
+    g_icmp_kind[dst] = g_icmp_kind[src];
+    g_icmp_ip[dst] = g_icmp_ip[src];
 }
 
 // ---- listening-TCP introspection (ss/netstat -l): a socket the guest bind()+listen()s MUST appear in
@@ -2094,15 +2099,23 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
     for (; i < hplen && i + 1 < sizeof hpath && u->sun_path[i]; i++)
         hpath[i] = u->sun_path[i];
     hpath[i] = 0;
+    char canonical[4200];
+    const char *backing = hpath;
+    /* Kernels preserve the pathname spelling used at bind time, including symlinked ancestors. Volume
+     * roots are canonical, so normalize an existing socket pathname before the prefix lookup; otherwise
+     * a peer address created through /tmp -> /private/tmp escapes reverse mapping and cannot be echoed. */
+    if (hpath[0] == '/' && canonicalize_path(hpath, canonical, sizeof canonical) == 0) backing = canonical;
     char gpath[256];
     int guest_backing = g_rootfs != NULL;
     for (int volume = 0; !guest_backing && volume < g_nvols; ++volume)
-        guest_backing = !strncmp(hpath, g_vols[volume].hcanon, g_vols[volume].hlen) &&
-                        (hpath[g_vols[volume].hlen] == '/' || hpath[g_vols[volume].hlen] == 0);
+        guest_backing = !strncmp(backing, g_vols[volume].hcanon, g_vols[volume].hlen) &&
+                        (backing[g_vols[volume].hlen] == '/' || backing[g_vols[volume].hlen] == 0);
     if (hpath[0] == '/' && guest_backing)
-        guest_from_host(hpath, gpath, sizeof gpath); // overlay host path -> guest-visible path
+        guest_from_host(backing, gpath, sizeof gpath); // overlay host path -> guest-visible path
     else
         snprintf(gpath, sizeof gpath, "%s", hpath); // unnamed/autobind (empty) or non-jail: pass through
+    fprintf(stderr, "[unix-map] host=%s backing=%s guest=%s matched=%d vols=%d\n", hpath, backing, gpath,
+            guest_backing, g_nvols);
     uint8_t t[2 + sizeof gpath];
     *(uint16_t *)t = AF_UNIX;
     size_t pl = strlen(gpath);
@@ -2698,9 +2711,6 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 #define HL_DNS_NS 0x0b00007fu      // 127.0.0.11, network byte order (bytes 7f 00 00 0b == LE u32 0x0b00007f)
 static uint8_t g_dns_sock[HL_NFD]; // fd -> 1 if this fd is an intercepted, socketpair-backed DNS socket
 static int g_dns_peer[HL_NFD];     // fd -> engine-held socketpair end we write synthesized responses into
-static uint8_t g_icmp_kind[HL_NFD]; // 1=dgram ping socket, 2=raw ping socket
-static uint8_t g_icmp_sock[HL_NFD]; // fd has been replaced by a reply socketpair
-static uint32_t g_icmp_ip[HL_NFD];  // connected/last echo destination
 
 // DNS interception is off under HL_NET_ISOLATE: the isolated network has no resolver, so
 // :53 to 127.0.0.11 is left to fall through to the (dead) host loopback and name resolution fails, matching.
