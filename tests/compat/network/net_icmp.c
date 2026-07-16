@@ -40,15 +40,17 @@ int main(void) {
     struct echo request = {.type = 8, .identifier = htons(0x1234), .sequence = htons(7)};
     memcpy(request.payload, "hl-icmp", 7);
     request.checksum = checksum(&request, sizeof request);
-    if (sendto(fd, &request, sizeof request, 0, (struct sockaddr *)&peer, sizeof peer) != sizeof request) return 4;
+    if (connect(fd, (struct sockaddr *)&peer, sizeof peer) < 0 || write(fd, &request, sizeof request) != sizeof request)
+        return 4;
 
-    struct echo reply;
+    struct echo packet;
     struct sockaddr_in source;
     socklen_t source_size = sizeof source;
-    ssize_t size = recvfrom(fd, &reply, sizeof reply, 0, (struct sockaddr *)&source, &source_size);
+    ssize_t size = recvfrom(fd, &packet, sizeof packet, 0, (struct sockaddr *)&source, &source_size);
     close(fd);
-    if (size != sizeof reply || reply.type != 0 || reply.code != 0 || reply.identifier != request.identifier ||
-        reply.sequence != request.sequence || memcmp(reply.payload, request.payload, sizeof reply.payload) != 0 ||
+    struct echo *reply = &packet;
+    if (size != sizeof *reply || reply->type != 0 || reply->code != 0 || reply->identifier != request.identifier ||
+        reply->sequence != request.sequence || memcmp(reply->payload, request.payload, sizeof reply->payload) != 0 ||
         source.sin_addr.s_addr != peer.sin_addr.s_addr)
         return 5;
     puts("icmp echo=1 source=172.28.0.9");
