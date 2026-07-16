@@ -549,10 +549,12 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     if (sig < 1 || sig > 64 || !ucv) return 0;
     // macOS reports ordinary bad-address/protection faults as SIGBUS, while Linux reports SIGSEGV. Do not
     // query the Mach VM map from this synchronous signal handler: mach_vm_region is not async-signal-safe.
-    // The lock-free BUS ledger is the sole positive classification for a genuine guest file-EOF SIGBUS.
+    // The lock-free BUS ledger is the sole positive classification for a synchronous guest file-EOF
+    // SIGBUS. A fault-class signal received while blocked in a host service is asynchronous guest delivery
+    // and retains its signal number (macOS siginfo does not reliably distinguish that case).
     if (hostsig == SIGBUS &&
 #if defined(__APPLE__)
-        (!si || !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
+        !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1)
 #else
         HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
             (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
@@ -760,7 +762,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     // Apply the same async-signal-safe host-to-guest classification as the guest-handler path above.
     if (hostsig == SIGBUS &&
 #if defined(__APPLE__)
-        (!si || !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
+        !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1)
 #else
         HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
             (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
