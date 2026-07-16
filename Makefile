@@ -201,7 +201,7 @@ DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJEC
 	$(LINUX_AARCH64_EMBEDDED_OBJECTS:.o=.d) \
 	$(wildcard $(BUILD)/mac/dual/*.d $(BUILD)/linux-aarch64/dual/*.d)
 
-UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy lifecycle_identity linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -1553,6 +1553,15 @@ $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
+define HL_LIFECYCLE_IDENTITY
+$(BUILD)/tools/lifecycle-$(1)-$(2): $(BUILD)/tools/lifecycle-$(2) packaging/macos/jit.entitlements
+	@mkdir -p $$(@D)
+	cp $$< $$@
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $$@
+endef
+
+$(foreach scenario,exit signal clock force,$(foreach isa,aarch64 x86_64,$(eval $(call HL_LIFECYCLE_IDENTITY,$(scenario),$(isa)))))
+
 $(BUILD)/tools/binding-aarch64: $(BUILD)/mac/binding/aarch64-runner.o \
 	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -1602,6 +1611,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
 	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
 	$(BUILD)/tools/bridge-runner \
+	$(foreach scenario,exit signal clock force,$(foreach isa,aarch64 x86_64,$(BUILD)/tools/lifecycle-$(scenario)-$(isa))) \
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 \
@@ -1626,21 +1636,21 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-exit 139 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-exit-aarch64) --expect-exit 139 \
 		$(abspath $(BUILD)/e2e/guest-exit139-aarch64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-exit 139 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-exit-x86_64) --expect-exit 139 \
 		$(abspath $(BUILD)/e2e/guest-exit139-x86_64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-signal 11 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-signal-aarch64) --expect-signal 11 \
 		$(abspath $(BUILD)/e2e/guest-fault-aarch64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-signal 11 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-signal-x86_64) --expect-signal 11 \
 		$(abspath $(BUILD)/e2e/guest-fault-x86_64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --clock-spy \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-clock-aarch64) --clock-spy \
 		$(abspath $(BUILD)/e2e/clock-injected-aarch64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --clock-spy \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-clock-x86_64) --clock-spy \
 		$(abspath $(BUILD)/e2e/clock-injected-x86_64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --force-stop \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-force-aarch64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-aarch64)
-	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --force-stop \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-force-x86_64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-x86_64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-aarch64) $(abspath $(BUILD)/e2e/fd-binding-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)

@@ -1,0 +1,9 @@
+# scenario	isa	artifact
+exit139	aarch64	lifecycle-exit-aarch64
+exit139	x86_64	lifecycle-exit-x86_64
+signal	aarch64	lifecycle-signal-aarch64
+signal	x86_64	lifecycle-signal-x86_64
+clock	aarch64	lifecycle-clock-aarch64
+clock	x86_64	lifecycle-clock-x86_64
+force	aarch64	lifecycle-force-aarch64
+force	x86_64	lifecycle-force-x86_64
