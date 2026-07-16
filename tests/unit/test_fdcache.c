@@ -221,7 +221,10 @@ int main(void) {
     hl_fdcache_metadata_store("/root/steady", 0, &stored);
     hl_fdcache_generation_poll();
     HL_CHECK(hl_fdcache_metadata_lookup("/root/steady", &result, &found) == 1);
-    HL_CHECK(generation_expect_coherence(&generation, current, 8) == EXIT_SUCCESS);
+    uint32_t published = atomic_load(current->address);
+    hl_fdcache_resolution_bump();
+    HL_CHECK(atomic_load(current->address) == published + 1);
+    HL_CHECK(generation_expect_coherence(&generation, current, 16) == EXIT_SUCCESS);
 
     /* Guest mutations publish through the rootfs-shared generation to sibling processes. */
     hl_fdcache_metadata_store("/root/sibling-created", -2, &stored);

@@ -341,14 +341,14 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-mac-build e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-io \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 # A mac bridge launch owns a remote process group and a shared capture mount.
 # Concurrent suites can starve a launch past the transport deadline and overlap
 # remote cleanup with the next case. Keep the release gate sequential even when
 # its caller requests parallel make.
-.NOTPARALLEL: e2e-compat e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-io
+.NOTPARALLEL: e2e-compat e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -1648,6 +1648,31 @@ e2e-mac-build: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/e2e-runner 
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64
 	$(BUILD)/tests/test_lifecycle_identity
 
+e2e-mac-build-signal: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/lifecycle-exit-aarch64 $(BUILD)/tools/lifecycle-exit-x86_64 \
+	$(BUILD)/tools/lifecycle-signal-aarch64 $(BUILD)/tools/lifecycle-signal-x86_64 \
+	$(BUILD)/e2e/guest-exit139-aarch64 $(BUILD)/e2e/guest-exit139-x86_64 \
+	$(BUILD)/e2e/guest-fault-aarch64 $(BUILD)/e2e/guest-fault-x86_64
+e2e-mac-build-control: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/lifecycle-clock-aarch64 $(BUILD)/tools/lifecycle-clock-x86_64 \
+	$(BUILD)/tools/lifecycle-force-aarch64 $(BUILD)/tools/lifecycle-force-x86_64 \
+	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
+	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64
+e2e-mac-build-hygiene: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/e2e-runner \
+	$(BUILD)/tools/bridge-runner $(BUILD)/tools/bridge-jobserver-test \
+	$(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+	$(BUILD)/tools/lifecycle-signal-aarch64 $(BUILD)/e2e/guest-exit-aarch64 \
+	$(BUILD)/e2e/guest-exit-x86_64 $(BUILD)/e2e/guest-fault-aarch64
+e2e-mac-build-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
+	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64
+e2e-mac-build-stdio: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
+	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64
+e2e-mac-build-dir: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
+	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64
+
 e2e-lifecycle-hygiene: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/lifecycle-aarch64 \
 	$(BUILD)/tools/lifecycle-x86_64 $(BUILD)/tools/lifecycle-signal-aarch64 \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/bridge-runner $(BUILD)/tools/bridge-jobserver-test \
@@ -1698,14 +1723,17 @@ e2e-embedding-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-r
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-aarch64) $(abspath $(BUILD)/e2e/fd-binding-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)
 
-e2e-embedding-io: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+e2e-embedding-stdio: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
-	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
-	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
-	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64
+	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64
 	$(BUILD)/tests/test_lifecycle_identity
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/stdio-aarch64) $(abspath $(BUILD)/e2e/stdio-binding-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/stdio-x86_64) $(abspath $(BUILD)/e2e/stdio-binding-x86_64)
+
+e2e-embedding-dir: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
+	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64
+	$(BUILD)/tests/test_lifecycle_identity
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/dir-aarch64) $(abspath $(BUILD)/e2e/dir-binding-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/dir-x86_64) $(abspath $(BUILD)/e2e/dir-binding-x86_64)
 

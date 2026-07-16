@@ -399,7 +399,8 @@ make MAC=mac e2e-lifecycle-signal
 make MAC=mac e2e-lifecycle-control
 make MAC=mac e2e-lifecycle-hygiene
 make MAC=mac e2e-embedding-fd
-make MAC=mac e2e-embedding-io
+make MAC=mac e2e-embedding-stdio
+make MAC=mac e2e-embedding-dir
 ```
 
 Production mac engines are compiled, linked, codesigned with the JIT entitlement, and actually executed. A successful
@@ -422,15 +423,14 @@ compat-threads           compat-time
 compat-soak
 ```
 
-The complete production gate is six independent top-level invocations: `e2e-compat` runs the full compatibility
+The complete production gate is seven independent top-level invocations: `e2e-compat` runs the full compatibility
 matrix; `e2e-lifecycle-signal`, `e2e-lifecycle-control`, and `e2e-lifecycle-hygiene` cover lifecycle behavior; and
-`e2e-embedding-fd` and `e2e-embedding-io` cover descriptor, stdio, and directory embedding for both guest ISAs. Run
-each as a separate process with its own timeout. The host firewall reliably allows four signed launches per
-launching-process lifetime, so a
-recursive umbrella target would retain an exhausted firewall session and invalidate later results. A checked manifest
-audits every gate's launch count and ensures artifact identities are distinct within that gate before any launch.
-Run `e2e-mac-build` in its own process first so compilation and signing never consume a behavioral gate's firewall
-budget.
+`e2e-embedding-fd`, `e2e-embedding-stdio`, and `e2e-embedding-dir` cover embedding for both guest ISAs. Run each with
+its own timeout. The host firewall scanner retains host-global identity state, so CI assigns every behavioral subgate
+its own fresh macOS runner. A checked manifest caps each subgate at four signed launches and ensures artifact identities
+are distinct within it. CI builds and signs only that subgate's artifacts in a preceding step; compilation never shares
+the execution process. Local shared-host runs must be serialized, verify no other `mac` workload is active, and allow a
+bounded settle interval between gates. There is deliberately no recursive umbrella and no firewall retry.
 
 Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process group and reaps
 children. Validate the supervisor with:

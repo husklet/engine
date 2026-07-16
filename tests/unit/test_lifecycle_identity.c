@@ -50,6 +50,6 @@ int main(void) {
         count++;
     }
     HL_CHECK(fclose(file) == 0);
-    HL_CHECK(unique_gates == 5 && count == 17);
+    HL_CHECK(unique_gates == 6 && count == 17);
     return 0;
 }
