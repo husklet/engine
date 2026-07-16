@@ -547,11 +547,17 @@ static void raise_guest_signal(struct cpu *c, int sig) {
 static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t *si, void *ucv) {
     int sig = sig_m2l(hostsig);
     if (sig < 1 || sig > 64 || !ucv) return 0;
-    // macOS reports ordinary bad-address/protection faults as SIGBUS/BUS_ADRERR, while Linux reports
-    // SIGSEGV. Do not query the Mach VM map from this synchronous signal handler: mach_vm_region is not
-    // async-signal-safe and made identical faults intermittently escape as the raw host SIGBUS. A genuine
-    // alignment fault remains SIGBUS; file-EOF BUS faults are identified by the dispatcher BUS ledger.
-    if (hostsig == SIGBUS && (!si || si->si_code != BUS_ADRALN))
+    // macOS reports ordinary bad-address/protection faults as SIGBUS, while Linux reports SIGSEGV. Do not
+    // query the Mach VM map from this synchronous signal handler: mach_vm_region is not async-signal-safe.
+    // The lock-free BUS ledger is the sole positive classification for a genuine guest file-EOF SIGBUS.
+    if (hostsig == SIGBUS &&
+#if defined(__APPLE__)
+        (!si || !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
+#else
+        HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
+            (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
+#endif
+    )
         sig = 11;
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
@@ -752,7 +758,14 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     int sig = sig_m2l(hostsig);
     if (sig < 1 || sig > 64 || !ucv) return 0;
     // Apply the same async-signal-safe host-to-guest classification as the guest-handler path above.
-    if (hostsig == SIGBUS && (!si || si->si_code != BUS_ADRALN))
+    if (hostsig == SIGBUS &&
+#if defined(__APPLE__)
+        (!si || !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
+#else
+        HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
+            (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
+#endif
+    )
         sig = 11;
     if (g_sigact[sig].handler > 1) return 0; // a guest handler exists -> not ours (deliver_guest_fault owns it)
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);

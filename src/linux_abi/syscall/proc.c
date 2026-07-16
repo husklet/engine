@@ -1980,7 +1980,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if ((st & 0xff) == 0x7f && ((st >> 8) & 0xff) == SIGCONT) {
             st = 0xffff;
         } else if (rawsig != 0 && rawsig != 0x7f) {
+#if defined(__APPLE__)
+            // A raw macOS SIGBUS from a translated child is the host's bad-address/protection fault;
+            // Linux reports it as SIGSEGV. Intentional guest SIGBUS deaths use the shared sigexit relay.
+            int lsig = rawsig == SIGBUS ? 11 : sig_m2l(rawsig) & 0x7f;
+#else
             int lsig = sig_m2l(rawsig) & 0x7f;
+#endif
             int core = sig_coredumps(lsig) && (((st & 0x80) != 0) || svc_core_rlimit_cur() > 0);
             st = (st & ~0xff) | lsig | (core ? 0x80 : 0);
         }
