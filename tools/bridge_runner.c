@@ -47,7 +47,9 @@ int main(int argc, char **argv) {
         int outcome = run(argv + 1, &status);
         if (outcome == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
         if (outcome == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 18 && attempt < ATTEMPTS) {
+            const struct timespec firewall_backoff = {2, 0};
             fprintf(stderr, "bridge-runner: transient bridge exit 18; retry %d/%d\n", attempt + 1, ATTEMPTS);
+            (void)nanosleep(&firewall_backoff, NULL);
             continue;
         }
         if (outcome == 1) fprintf(stderr, "bridge-runner: command timed out after %d seconds\n", TIMEOUT_SECONDS);
