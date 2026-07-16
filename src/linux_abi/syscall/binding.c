@@ -1163,6 +1163,18 @@ static int bound_handle_host_path(hl_host_handle file, char *path, size_t size) 
     return 0;
 }
 
+static int bound_handle_chdir(int fd, int *result) {
+    hl_linux_fd_snapshot snapshot;
+    char path[HL_LINUX_PATH_MAX + 1];
+    if (result == NULL || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return 0;
+    if (bound_handle_host_path(snapshot.host_handle, path, sizeof path) != 0) {
+        *result = -EBADF;
+        return 1;
+    }
+    *result = chdir(path) == 0 ? 0 : -errno;
+    return 1;
+}
+
 static void bound_evict_relative(hl_host_handle directory, const char *path) {
     char base[HL_LINUX_PATH_MAX + 1];
     char joined[HL_LINUX_PATH_MAX + 1];
