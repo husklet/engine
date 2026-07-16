@@ -236,20 +236,33 @@ int main(int argc, char **argv) {
             snprintf(result_path, sizeof result_path, "%s/result-%d", directory, iteration) >=
                 (int)sizeof result_path) {
             fprintf(stderr, "config path is too long\n");
+            (void)rmdir(directory);
             return 1;
         }
         int result_fd = open(result_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
         if (result_fd < 0 || close(result_fd) != 0) {
             perror("make result");
+            (void)unlink(result_path);
+            (void)rmdir(directory);
             return 1;
         }
         if (make_config(path, argv[3], result_path, cache_path) != 0) {
             perror("make config");
             unlink(path);
+            unlink(result_path);
+            (void)rmdir(directory);
             return 1;
         }
-        if (run_config(argv[1], argv[2], path, result_path, expected_exit) != 0) return 1;
-        if (unlink(result_path) != 0) return 1;
+        if (run_config(argv[1], argv[2], path, result_path, expected_exit) != 0) {
+            (void)unlink(path);
+            (void)unlink(result_path);
+            (void)rmdir(directory);
+            return interrupted_signal == 0 ? 1 : 128 + interrupted_signal;
+        }
+        if (unlink(result_path) != 0) {
+            (void)rmdir(directory);
+            return 1;
+        }
     }
     if (rmdir(directory) != 0) return 1;
     return 0;
