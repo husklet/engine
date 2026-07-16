@@ -1601,6 +1601,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
 	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
 	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
+	$(BUILD)/tools/bridge-runner \
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 \
@@ -1625,28 +1626,28 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-exit 139 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-exit 139 \
 		$(abspath $(BUILD)/e2e/guest-exit139-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-exit 139 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-exit 139 \
 		$(abspath $(BUILD)/e2e/guest-exit139-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-signal 11 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --expect-signal 11 \
 		$(abspath $(BUILD)/e2e/guest-fault-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-signal 11 \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --expect-signal 11 \
 		$(abspath $(BUILD)/e2e/guest-fault-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --clock-spy \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --clock-spy \
 		$(abspath $(BUILD)/e2e/clock-injected-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --clock-spy \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --clock-spy \
 		$(abspath $(BUILD)/e2e/clock-injected-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --force-stop \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --force-stop \
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/binding-aarch64) $(abspath $(BUILD)/e2e/fd-binding-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/stdio-aarch64) $(abspath $(BUILD)/e2e/stdio-binding-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/stdio-x86_64) $(abspath $(BUILD)/e2e/stdio-binding-x86_64)
-	$(MAC) $(abspath $(BUILD)/tools/dir-aarch64) $(abspath $(BUILD)/e2e/dir-binding-aarch64)
-	$(MAC) $(abspath $(BUILD)/tools/dir-x86_64) $(abspath $(BUILD)/e2e/dir-binding-x86_64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-aarch64) $(abspath $(BUILD)/e2e/fd-binding-aarch64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/stdio-aarch64) $(abspath $(BUILD)/e2e/stdio-binding-aarch64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/stdio-x86_64) $(abspath $(BUILD)/e2e/stdio-binding-x86_64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/dir-aarch64) $(abspath $(BUILD)/e2e/dir-binding-aarch64)
+	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/dir-x86_64) $(abspath $(BUILD)/e2e/dir-binding-x86_64)
 
 define HL_E2E_CASE_RULE
 run-e2e-compat-$(1): $(BUILD)/e2e/$(1)-aarch64 $(BUILD)/e2e/$(1)-x86_64 $(BUILD)/tools/e2e-runner \
@@ -1664,6 +1665,10 @@ $(BUILD)/tools/compat-runner: tools/compat_runner.c
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
 $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/bridge-runner: tools/bridge_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
