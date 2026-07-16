@@ -81,7 +81,7 @@ static ssize_t pread_retry(int fd, void *buffer, size_t length, off_t offset) {
     return result;
 }
 
-static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int fd, off_t off) {
+static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int replace_tail, int fd, off_t off) {
     size_t hp = (size_t)getpagesize();
     uint64_t lo = a0, hi = a0 + a1;
     uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
@@ -102,8 +102,20 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
     }
     uint64_t tl = he > ihi ? he : ihi; // partial tail edge [tl, hi) (never re-covers the head)
     if (tl < hi) {
-        if (anon || fd < 0)
-            memset((void *)tl, 0, (size_t)(hi - tl));
+        if (anon || fd < 0) {
+            /* A fixed anonymous BSS map can replace the BUS tail of the file
+               reservation immediately below it.  The tail begins on a host
+               page boundary; replace that poisoned page before zeroing it.
+               Linux rounds the mapping to guest pages, and bytes beyond hi in
+               this host page were inaccessible past-EOF reservation bytes. */
+            if (anon && replace_tail) {
+                if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE,
+                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
+                    return -1;
+            } else {
+                memset((void *)tl, 0, (size_t)(hi - tl));
+            }
+        }
         else
             if (pread_retry(fd, (void *)tl, (size_t)(hi - tl), off + (off_t)(tl - lo)) < 0) return -1;
     }
@@ -310,7 +322,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 } else {
                     int aprot = anon_prot_if_contained(a4, (size_t)a2);
                     r = (aprot >= 0 && (aprot & PROT_WRITE) &&
-                         host_fixed_map286(a4, (uint64_t)a2, PROT_READ | PROT_WRITE, 1, -1, 0) == 0)
+                         host_fixed_map286(a4, (uint64_t)a2, PROT_READ | PROT_WRITE, 1, 0, -1, 0) == 0)
                             ? (void *)a4
                             : MAP_FAILED;
                 }
@@ -505,7 +517,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0 && (aprot & PROT_WRITE)) {
-                r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
+                r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, gna_hit(a0, a1),
+                                      (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
                         ? (void *)a0
                         : MAP_FAILED;
                 fixed286 = 1;
