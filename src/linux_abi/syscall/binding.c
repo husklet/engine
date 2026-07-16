@@ -431,7 +431,8 @@ static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_fi
     if (named.status == HL_STATUS_OK && named.value <= HL_LINUX_PATH_MAX) {
         int uid, gid;
         path[named.value] = 0;
-        if (chown_xattr_get(path, -1, status->device, status->object, &uid, &gid)) {
+        struct stat native_status;
+        if (lstat(path, &native_status) == 0 && hl_owner_get(path, -1, &native_status, S_ISLNK(native_status.st_mode), &uid, &gid)) {
             if (uid >= 0) status->user = (uint32_t)uid;
             if (gid >= 0) status->group = (uint32_t)gid;
         }
@@ -652,6 +653,21 @@ static int64_t bound_mmap_file(const hl_linux_fd_snapshot *file, uint64_t addres
     hl_gmap_add(mapped.address, mapped.mapped_size);
     hl_gmap_set_guest_length(mapped.address, size);
     gbus_clear(mapped.address, mapped.address + size);
+    /* A typed file mapping bypasses svc_mem, so publish the same guest protection
+       transition here.  In particular, MAP_FIXED over a PROT_NONE reservation
+       must retire the stale inaccessible interval before pointer validation. */
+    {
+        uint64_t lo = mapped.address & ~UINT64_C(0xfff);
+        uint64_t hi = (mapped.address + size + UINT64_C(0xfff)) & ~UINT64_C(0xfff);
+        if ((protection & 7u) == 0)
+            gna_add(lo, hi);
+        else
+            gna_clear(lo, hi);
+        if ((protection & 2u) == 0 && (protection & 7u) != 0)
+            gro_add(lo, hi);
+        else
+            gro_clear(lo, hi);
+    }
     if (bus_prepared && gbus_add(mapped.address + bus_accessible, mapped.address + size) != 0) {
         gbus_prepare_release();
         bound_mapping_drop(entry, NULL);
@@ -2533,8 +2549,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             break;
         }
         path[status.value] = 0;
-        chown_xattr_set_path(path, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2, 0);
-        hl_xattr_cache_invalidate();
+        hl_owner_set_path(path, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2, 0);
         result = 0;
         break;
     }
