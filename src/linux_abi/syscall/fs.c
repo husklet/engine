@@ -1940,7 +1940,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 52: {
         struct stat status;
         mode_t host_mode = (mode_t)a1 & 0777;
-        if (cred_euid() == 0 && fstat((int)a0, &status) == 0) host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
+        /* Guest mode lives in the xattr. Keep the private backing inode owner-manageable so a later
+           chmod can replace that xattr even after guest mode 0000/0444. */
+        if (fstat((int)a0, &status) == 0) host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
         int r = fchmod((int)a0, host_mode);
         if (r == 0) mode_xattr_set_fd((int)a0, (mode_t)a1);
         if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
@@ -1994,7 +1996,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             struct stat status;
             mode_t host_mode = (mode_t)a2 & 0777;
-            if (cred_euid() == 0 && fstatat(pfd, fin, &status, 0) == 0)
+            if (fstatat(pfd, fin, &status, 0) == 0)
                 host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
             int r = fchmodat(pfd, fin, host_mode, 0), e = errno;
             char dp[4200];
@@ -2013,7 +2015,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         struct stat status;
         mode_t host_mode = (mode_t)a2 & 0777;
-        if (cred_euid() == 0 && fstatat(ATFD(a0), p, &status, 0) == 0)
+        if (fstatat(ATFD(a0), p, &status, 0) == 0)
             host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
         int r = fchmodat(ATFD(a0), p, host_mode, 0);
         if (r >= 0) {
