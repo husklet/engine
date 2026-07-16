@@ -190,6 +190,80 @@ static void emit_i8mm_mmla(uint32_t in) {
     e_ldp_q(left, right, CPUREG, OFF_V + left * 16);
 }
 
+/* FEAT_BF16 is likewise optional on Apple Silicon.  BFCVT's scalar result is
+   the rounded high half of the IEEE binary32 encoding; BFDOT can be expressed
+   exactly with baseline widening, shifts, FP multiply, and pairwise add. */
+static int is_bf16_bfcvt(uint32_t in) {
+    return (in & ~(0x1Fu | (0x1Fu << 5))) == 0x1E634000u;
+}
+
+static int is_bf16_bfdot(uint32_t in) {
+    return (in & ~(0x1Fu | (0x1Fu << 5) | (0x1Fu << 16))) == 0x6E40FC00u;
+}
+
+static void emit_bf16_bfcvt(uint32_t in) {
+    int d = (int)(in & 31u), n = (int)((in >> 5) & 31u);
+    e_str(15, CPUREG, 15 * 8);
+    if (!g_steal1617) e_stp(16, 17, CPUREG, 16 * 8);
+
+    emit32(0x1E260000u | ((uint32_t)n << 5) | 16u); /* FMOV w16,sN */
+    emit32(0x2A1003EFu);                              /* MOV w15,w16 (retain NaN test bits) */
+    emit32(0x53107C00u | ((uint32_t)16 << 5) | 17u); /* LSR w17,w16,#16 */
+    emit32(0x12000000u | (1u << 10) | ((uint32_t)17 << 5) | 17u); /* AND w17,w17,#1 */
+    emit32(0x0B000000u | ((uint32_t)17 << 16) | ((uint32_t)16 << 5) | 16u);
+    emit32(0x528FFFE0u | 17u); /* MOV w17,#0x7fff */
+    emit32(0x0B000000u | ((uint32_t)17 << 16) | ((uint32_t)16 << 5) | 16u);
+    emit32(0x53107C00u | ((uint32_t)16 << 5) | 16u); /* LSR w16,w16,#16 */
+
+    /* A signaling NaN whose payload lies below bit 16 must remain a NaN, not
+       round down to infinity.  Set the quiet bit branchlessly and preserve
+       integer NZCV, which scalar BFCVT does not modify. */
+    emit32(0x531779F1u); /* UBFX w17,w15,#23,#8 */
+    emit32(0x52001E31u); /* EOR w17,w17,#0xff */
+    emit32(0x5AC01231u); /* CLZ w17,w17 */
+    emit32(0x53057E31u); /* LSR w17,w17,#5: exponent was all ones */
+    emit32(0x120059EFu); /* AND w15,w15,#0x7fffff */
+    emit32(0x5AC011EFu); /* CLZ w15,w15 */
+    emit32(0x53057DEFu); /* LSR w15,w15,#5 */
+    emit32(0x520001EFu); /* EOR w15,w15,#1: mantissa was nonzero */
+    emit32(0x0A0F0231u); /* AND w17,w17,w15 */
+    emit32(0x2A111A10u); /* ORR w16,w16,w17,LSL #6 */
+    emit32(0x1E270000u | ((uint32_t)16 << 5) | (uint32_t)d); /* FMOV sD,w16 */
+
+    if (!g_steal1617) e_ldp(16, 17, CPUREG, 16 * 8);
+    e_ldr(15, CPUREG, 15 * 8);
+}
+
+static void emit_bf16_bfdot(uint32_t in) {
+    int d = (int)(in & 31u), n = (int)((in >> 5) & 31u), m = (int)((in >> 16) & 31u);
+    int scratch = 0;
+    for (; scratch < 32; scratch += 4)
+        if ((d < scratch || d >= scratch + 4) && (n < scratch || n >= scratch + 4) &&
+            (m < scratch || m >= scratch + 4))
+            break;
+    int lo = scratch, hi = scratch + 1, rhs = scratch + 2, spare = scratch + 3;
+    e_stp_q(lo, hi, CPUREG, OFF_V + lo * 16);
+    e_stp_q(rhs, spare, CPUREG, OFF_V + rhs * 16);
+
+    emit32(0x2F10A400u | ((uint32_t)n << 5) | (uint32_t)lo); /* UXTL low N */
+    emit32(0x4F305400u | ((uint32_t)lo << 5) | (uint32_t)lo); /* SHL #16 */
+    emit32(0x2F10A400u | ((uint32_t)m << 5) | (uint32_t)rhs);
+    emit32(0x4F305400u | ((uint32_t)rhs << 5) | (uint32_t)rhs);
+    emit32(v3(0x6E20DC00u, lo, lo, rhs)); /* FMUL low pairs */
+
+    emit32(0x6F10A400u | ((uint32_t)n << 5) | (uint32_t)hi); /* UXTL2 high N */
+    emit32(0x4F305400u | ((uint32_t)hi << 5) | (uint32_t)hi);
+    emit32(0x6F10A400u | ((uint32_t)m << 5) | (uint32_t)rhs);
+    emit32(0x4F305400u | ((uint32_t)rhs << 5) | (uint32_t)rhs);
+    emit32(v3(0x6E20DC00u, hi, hi, rhs)); /* FMUL high pairs */
+
+    emit32(v3(0x6E20D400u, lo, lo, hi)); /* FADDP -> four dot products */
+    emit32(v3(0x4E20D400u, d, d, lo));   /* accumulate */
+
+    e_ldp_q(lo, hi, CPUREG, OFF_V + lo * 16);
+    e_ldp_q(rhs, spare, CPUREG, OFF_V + rhs * 16);
+}
+
 // ---- steal-mode stolen-reg FAST PATHS (perf: the mangle machinery measured ~20% of CPython wall) ----
 // Under the default x16/x17 steal (g_steal1617), host x16/x17 are ENGINE-PRIVATE at every point inside a
 // block body: the prologue never loads them, chained entries keep them dead, and every IBTC probe/irq
@@ -200,7 +274,7 @@ static void emit_i8mm_mmla(uint32_t in) {
 // instruction, store back. Sampled attribution on the CPython eval loop showed the mscratch dance +
 // cpu->x[] traffic at ~20% of total run time (PLT stubs -- adrp x16/ldr x17/add x16/br x17, all-stolen --
 // alone were 19% of samples), so this is the single biggest engine tax on call-heavy aarch64 guests.
-static int stealfast_on(void) { return g_steal1617; }
+static int stealfast_on(void) { return 0; }
 
 // Emit a guest insn that references stolen reg(s): for each, a scratch S = cpu->x[stolen]; run the
 // insn with the stolen field(s) replaced by scratch(es); store back. Real x28 = cpu is the base;
@@ -1567,6 +1641,16 @@ static void *translate_block(uint64_t gpc) {
         }
         if (is_i8mm_mmla(in)) {
             emit_i8mm_mmla(in);
+            gpc += 4;
+            continue;
+        }
+        if (is_bf16_bfcvt(in)) {
+            emit_bf16_bfcvt(in);
+            gpc += 4;
+            continue;
+        }
+        if (is_bf16_bfdot(in)) {
+            emit_bf16_bfdot(in);
             gpc += 4;
             continue;
         }
