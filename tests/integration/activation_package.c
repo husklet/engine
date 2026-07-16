@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static int config(const char *guest, char path[64]) {
     hl_launch_config launch = {0};
