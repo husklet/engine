@@ -33,7 +33,8 @@ int main(void) {
     HL_CHECK(offsetof(hl_launch_config, publish_count) == 136);
     HL_CHECK(offsetof(hl_launch_config, network_interfaces_offset) == 140);
     HL_CHECK(offsetof(hl_launch_config, file_owners_offset) == 144);
-    HL_CHECK(sizeof(hl_launch_config) == 152);
+    HL_CHECK(offsetof(hl_launch_config, process_domain) == 152);
+    HL_CHECK(sizeof(hl_launch_config) == 168);
     HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));
@@ -41,6 +42,7 @@ int main(void) {
     wire.config.pool_size = sizeof(wire.pool);
     wire.config.header_size = sizeof(wire.config);
     wire.config.abi = HL_CONFIG_ABI;
+    wire.config.process_domain[0] = 1;
     memcpy(wire.pool + 1, "guest", 6);
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), &config, &pool) == HL_STATUS_OK);
     HL_CHECK(hl_launch_config_string(&config, pool, 1, &value, &value_size) == HL_STATUS_OK);
@@ -56,6 +58,11 @@ int main(void) {
     HL_CHECK(hl_launch_config_argument(&config, pool, 1, &value, &value_size) == HL_STATUS_OK);
     HL_CHECK(value_size == 6 && memcmp(value, "--flag", 6) == 0);
     HL_CHECK(hl_launch_config_argument(&config, pool, 2, NULL, NULL) == HL_STATUS_NOT_FOUND);
+
+    wire.config.process_domain[0] = 0;
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_INVALID_ARGUMENT);
+    wire.config.process_domain[1] = 1;
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_OK);
 
     wire.config.magic = UINT32_C(0x44434647);
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);

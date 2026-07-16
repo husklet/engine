@@ -14,9 +14,9 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 8;
-const HEADER_SIZE: usize = 152;
-const HEADER_SIZE_U32: u32 = 152;
+const ABI: u32 = 9;
+const HEADER_SIZE: usize = 168;
+const HEADER_SIZE_U32: u32 = 168;
 const MAGIC_OFFSET: usize = 0;
 const POOL_SIZE_OFFSET: usize = 4;
 const HEADER_SIZE_OFFSET: usize = 8;
@@ -46,10 +46,11 @@ const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
 const INTERFACES_OFFSET: usize = 140;
 const FILE_OWNERS_OFFSET: usize = 144;
+const PROCESS_DOMAIN_OFFSET: usize = 152;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
-const _: () = assert!(FILE_OWNERS_OFFSET + 8 == HEADER_SIZE);
+const _: () = assert!(PROCESS_DOMAIN_OFFSET + 16 == HEADER_SIZE);
 
 struct Pool(Vec<u8>);
 
@@ -356,12 +357,29 @@ pub(crate) fn encode(
     header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
     header.u32(INTERFACES_OFFSET, interfaces);
     header.u32(FILE_OWNERS_OFFSET, file_owners);
+    let process_domain = process_domain()?;
+    header.u64(PROCESS_DOMAIN_OFFSET, process_domain[0]);
+    header.u64(PROCESS_DOMAIN_OFFSET + 8, process_domain[1]);
 
     let mut wire = Vec::with_capacity(HEADER_SIZE + pool.0.len());
     wire.extend_from_slice(&header.0);
     wire.extend_from_slice(&pool.0);
     debug_assert_eq!(wire.len(), HEADER_SIZE + pool_size as usize);
     Ok(wire)
+}
+
+fn process_domain() -> Result<[u64; 2], Error> {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let domain = [
+        u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+    ];
+    if domain == [0, 0] {
+        return process_domain();
+    }
+    Ok(domain)
 }
 
 #[cfg(test)]

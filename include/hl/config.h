@@ -7,7 +7,7 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 8u
+#define HL_CONFIG_ABI 9u
 #define HL_LAUNCH_RESULT_MAGIC UINT32_C(0x484c5253)
 #define HL_LAUNCH_RESULT_ABI 1u
 #define HL_CONFIG_SANDBOX_ENABLED 1u
@@ -51,6 +51,8 @@ typedef struct hl_launch_config {
     uint32_t publish_count;
     uint32_t network_interfaces_offset;
     uint32_t file_owners_offset;
+    /* Opaque host-generated launch ownership domain. Zero is never valid. */
+    uint64_t process_domain[2];
 } hl_launch_config;
 
 typedef enum hl_launch_result_kind {

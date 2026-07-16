@@ -44,6 +44,7 @@ static int write_launch(const char *path) {
     config.magic = HL_CONFIG_MAGIC;
     config.header_size = sizeof config;
     config.abi = HL_CONFIG_ABI;
+    config.process_domain[0] = 1;
     config.uid = -1;
     config.gid = -1;
     config.cpu_limit = 2;

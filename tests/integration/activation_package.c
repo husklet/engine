@@ -23,6 +23,7 @@ static int config(const char *guest, char path[64]) {
     memcpy(pool + 1, guest, guest_size);
     launch.magic = HL_CONFIG_MAGIC;
     launch.abi = HL_CONFIG_ABI;
+    launch.process_domain[0] = 1;
     launch.header_size = sizeof(launch);
     launch.pool_size = (uint32_t)(guest_size + 2);
     launch.uid = -1;
