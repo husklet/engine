@@ -48,12 +48,17 @@ int main(int argc, char **argv) {
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     uint32_t ready = 0;
     uint64_t process_id = 0;
+    int32_t master = 99;
+    hl_terminal_size empty = {0};
 
     if (hl_activation_start(NULL, HL_GUEST_ISA_AARCH64, NULL, &process) != HL_STATUS_INVALID_ARGUMENT ||
         process != NULL || hl_activation_process_id(NULL, &process_id) != HL_STATUS_INVALID_ARGUMENT ||
         hl_activation_wait(NULL, &result) != HL_STATUS_INVALID_ARGUMENT ||
         hl_activation_try_wait(NULL, &ready, &result) != HL_STATUS_INVALID_ARGUMENT ||
-        hl_activation_kill(NULL) != HL_STATUS_INVALID_ARGUMENT ||
+        hl_activation_kill(NULL) != HL_STATUS_INVALID_ARGUMENT || sizeof(hl_terminal_size) != 4 ||
+        hl_activation_start_terminal(argv[0], HL_GUEST_ISA_AARCH64, argv[0], empty, &master, &process) !=
+            HL_STATUS_INVALID_ARGUMENT || master != -1 || process != NULL ||
+        hl_terminal_resize(-1, (hl_terminal_size){.rows = 24, .columns = 80}) != HL_STATUS_INVALID_ARGUMENT ||
         hl_activation_spawn(NULL, HL_GUEST_ISA_AARCH64, NULL, NULL) != HL_STATUS_INVALID_ARGUMENT)
         return 1;
     hl_activation_process_destroy(NULL);

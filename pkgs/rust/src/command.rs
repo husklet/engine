@@ -1,4 +1,4 @@
-use crate::{Child, Config, Container, Engine, Error, Exit, Guest, Mount, Output, Stdio};
+use crate::{Child, Config, Container, Engine, Error, Exit, Guest, Mount, Output, Size, Stdio};
 use std::ffi::OsString;
 
 /// A configured guest process command.
@@ -11,6 +11,7 @@ pub struct Command {
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
+    terminal: Option<Size>,
 }
 impl Command {
     pub(crate) fn new(guest: Guest, program: OsString) -> Self {
@@ -23,6 +24,7 @@ impl Command {
             stdin: Stdio::inherit(),
             stdout: Stdio::inherit(),
             stderr: Stdio::inherit(),
+            terminal: None,
         }
     }
     #[must_use]
@@ -69,6 +71,12 @@ impl Command {
         self.stderr = value;
         self
     }
+    /// Gives the guest a controlling terminal with merged output.
+    #[must_use]
+    pub const fn terminal(mut self, size: Size) -> Self {
+        self.terminal = Some(size);
+        self
+    }
     #[must_use]
     pub fn apply(mut self, edit: impl FnOnce(&mut Container)) -> Self {
         edit(&mut self.container);
@@ -95,6 +103,7 @@ impl Command {
             &this.program,
             this.args,
             (this.stdin, this.stdout, this.stderr),
+            this.terminal,
         )
     }
     /// Runs the command and returns its typed status.

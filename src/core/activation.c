@@ -21,7 +21,13 @@ typedef hl_host_linux hl_activation_host;
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 #include <unistd.h>
 
 static hl_status activation_host_create(hl_activation_host **host, hl_host_services *services) {
@@ -245,8 +251,9 @@ static void cache_failure(hl_activation_process *process, hl_status status) {
                                            .kind = HL_ENGINE_EXIT_ENGINE_ERROR, .detail = (uint64_t)status};
 }
 
-hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
-                                         const hl_activation_stdio *stdio, hl_activation_process **out_process) {
+static hl_status activation_start(const char *executable, uint32_t guest_isa, const char *guest,
+                                  const hl_activation_stdio *stdio, const hl_terminal_size *terminal,
+                                  int32_t *out_master, hl_activation_process **out_process) {
     int pair[2];
     pid_t child;
     posix_spawn_file_actions_t actions;
@@ -262,12 +269,17 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     int waited = 0;
     uint32_t test_mode;
     hl_activation_process *process;
+    int master = -1;
+    int slave = -1;
     if (out_process == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_process = NULL;
+    if (out_master != NULL) *out_master = -1;
     if (executable == NULL || guest == NULL || executable[0] != '/' || guest[0] != '/' ||
         (guest_isa != HL_GUEST_ISA_AARCH64 && guest_isa != HL_GUEST_ISA_X86_64))
         return HL_STATUS_INVALID_ARGUMENT;
     if (stdio != NULL && (stdio->input < -1 || stdio->output < -1 || stdio->error < -1))
+        return HL_STATUS_INVALID_ARGUMENT;
+    if (terminal != NULL && (stdio != NULL || out_master == NULL || terminal->rows == 0 || terminal->columns == 0))
         return HL_STATUS_INVALID_ARGUMENT;
     path_size = strlen(guest) + 1;
     if (path_size > sizeof(request.path)) return HL_STATUS_INVALID_ARGUMENT;
@@ -303,6 +315,33 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     arc4random_buf(request.nonce, sizeof(request.nonce));
     child_argv[0] = (char *)(uintptr_t)executable;
     child_argv[1] = NULL;
+    if (terminal != NULL) {
+        struct winsize size = {.ws_row = terminal->rows, .ws_col = terminal->columns};
+        if (openpty(&master, &slave, NULL, NULL, &size) != 0 ||
+            fcntl(master, F_SETFD, FD_CLOEXEC) != 0 || fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
+            if (master >= 0) close(master);
+            if (slave >= 0) close(slave);
+            close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+        }
+        child = fork();
+        if (child == 0) {
+            (void)close(master);
+            (void)close(pair[0]);
+            if (setsid() < 0 || ioctl(slave, TIOCSCTTY, 0) < 0 || dup2(slave, 0) < 0 || dup2(slave, 1) < 0 ||
+                dup2(slave, 2) < 0 || dup2(pair[1], HL_ACTIVATION_FD) < 0)
+                _exit(126);
+            if (slave > STDERR_FILENO) (void)close(slave);
+            if (pair[1] != HL_ACTIVATION_FD) (void)close(pair[1]);
+            execve(executable, child_argv, child_env);
+            _exit(127);
+        }
+        (void)close(slave);
+        slave = -1;
+        if (child < 0) {
+            close(master); close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+        }
+        goto spawned;
+    }
     if (posix_spawn_file_actions_init(&actions) != 0) {
         close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
     }
@@ -337,29 +376,48 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     }
     posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
+spawned:
     close(pair[1]);
     free(child_env);
     if (transfer(pair[0], &request, test_mode == 3 ? sizeof(request) / 2u : sizeof(request), 1) != 0) {
-        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
     if (transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
-        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (reply.magic != request.magic || reply.abi != request.abi || reply.size != sizeof(reply) ||
         memcmp(reply.nonce, request.nonce, sizeof(request.nonce)) != 0 || reply.status != HL_STATUS_OK) {
-        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     { unsigned char commit = 0xa5u; if (transfer(pair[0], &commit, 1, 1) != 0) {
-        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     } }
     process = calloc(1, sizeof(*process));
-    if (process == NULL) { close(pair[0]); (void)kill(-child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
+    if (process == NULL) { close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
     process->descriptor = pair[0];
     process->pid = child;
     memcpy(process->nonce, request.nonce, sizeof(process->nonce));
+    if (out_master != NULL) *out_master = master;
     *out_process = process;
     return HL_STATUS_OK;
+}
+
+hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
+                                         const hl_activation_stdio *stdio, hl_activation_process **out_process) {
+    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, out_process);
+}
+
+hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa, const char *guest,
+                                       hl_terminal_size size, int32_t *out_master,
+                                       hl_activation_process **out_process) {
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, out_process);
+}
+
+hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {
+    struct winsize native = {.ws_row = size.rows, .ws_col = size.columns};
+    if (master < 0 || size.rows == 0 || size.columns == 0) return HL_STATUS_INVALID_ARGUMENT;
+    return ioctl(master, TIOCSWINSZ, &native) == 0 ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
 }
 
 hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,

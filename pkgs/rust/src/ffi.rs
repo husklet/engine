@@ -2,7 +2,7 @@
 use std::{
     ffi::{c_char, c_int, c_void},
     fs::File,
-    os::fd::FromRawFd,
+    os::fd::{AsRawFd, FromRawFd},
 };
 
 #[repr(C)]
@@ -19,6 +19,12 @@ pub(crate) struct Streams {
     pub input: i32,
     pub output: i32,
     pub error: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalSize {
+    pub rows: u16,
+    pub columns: u16,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,6 +55,15 @@ unsafe extern "C" {
         streams: *const Streams,
         process: *mut *mut Process,
     ) -> i32;
+    pub(crate) fn hl_activation_start_terminal(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        size: TerminalSize,
+        master: *mut i32,
+        process: *mut *mut Process,
+    ) -> i32;
+    pub(crate) fn hl_terminal_resize(master: i32, size: TerminalSize) -> i32;
     pub(crate) fn hl_activation_wait(process: *mut Process, exit: *mut EngineExit) -> i32;
     pub(crate) fn hl_activation_try_wait(
         process: *mut Process,
@@ -60,6 +75,38 @@ unsafe extern "C" {
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
+}
+pub(crate) fn start_terminal(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    size: TerminalSize,
+) -> Result<(Handle, File), i32> {
+    let mut process = std::ptr::null_mut();
+    let mut master = -1;
+    let status = unsafe {
+        hl_activation_start_terminal(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            size,
+            &mut master,
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() && master >= 0 {
+        Ok((Handle(process), unsafe { File::from_raw_fd(master) }))
+    } else {
+        Err(status)
+    }
+}
+pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
+    let status = unsafe { hl_terminal_resize(file.as_raw_fd(), size) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 
 pub(crate) fn start(

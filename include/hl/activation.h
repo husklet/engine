@@ -18,12 +18,23 @@ typedef struct hl_activation_stdio {
     int32_t output;
     int32_t error;
 } hl_activation_stdio;
+typedef struct hl_terminal_size {
+    uint16_t rows;
+    uint16_t columns;
+} hl_terminal_size;
 
 HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
                                      hl_activation_process **out_process);
 HL_API hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa,
                                                 const char *config_path, const hl_activation_stdio *stdio,
                                                 hl_activation_process **out_process);
+/* Starts the child in a new session with a controlling terminal. The returned
+ * master descriptor is owned by the caller; stdin/stdout/stderr are merged on
+ * it. The initial size is applied before the child can execute. */
+HL_API hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa,
+                                              const char *config_path, hl_terminal_size size,
+                                              int32_t *out_master, hl_activation_process **out_process);
+HL_API hl_status hl_terminal_resize(int32_t master, hl_terminal_size size);
 /* Returns the native child process identifier while the opaque handle exists. */
 HL_API hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id);
 /* wait is idempotent: completed status/result values are cached in the handle. */

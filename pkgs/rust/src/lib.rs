@@ -17,6 +17,7 @@ mod ffi;
 pub mod network;
 mod result;
 mod runtime;
+mod terminal;
 mod types;
 mod wire;
 
@@ -27,4 +28,5 @@ pub use container::Container;
 pub use engine::Engine;
 pub use error::Error;
 pub use result::Exit;
+pub use terminal::{Size, Terminal};
 pub use types::{Access, Guest, Mount, Sandbox, Stdio};

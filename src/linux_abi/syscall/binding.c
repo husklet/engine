@@ -2615,6 +2615,73 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 *(int *)(uintptr_t)a2 = available > INT_MAX ? INT_MAX : (int)available;
                 result = 0;
             }
+        } else if (request == 0x5401u || request == 0x5402u || request == 0x5403u ||
+                   request == 0x5404u || request == 0x5413u || request == 0x5414u ||
+                   request == 0x540fu || request == 0x5410u || request == 0x540eu) {
+            int native_fd = -1;
+            int borrowed = bound_attachment_borrow((int)source.fd, &native_fd);
+            if (borrowed < 0) {
+                result = borrowed;
+                break;
+            }
+            if (request == 0x5401u) { /* TCGETS */
+                struct termios native;
+                if (!host_range_mapped((uintptr_t)a2, 36))
+                    result = -EFAULT;
+                else if (tcgetattr(native_fd, &native) != 0)
+                    result = -errno;
+                else {
+#if defined(__linux__)
+                    memcpy((void *)(uintptr_t)a2, &native, 36);
+#else
+                    termios_m2l(&native, (uint8_t *)(uintptr_t)a2);
+#endif
+                    result = 0;
+                }
+            } else if (request >= 0x5402u && request <= 0x5404u) { /* TCSETS{,W,F} */
+                struct termios native;
+                if (!host_range_mapped((uintptr_t)a2, 36))
+                    result = -EFAULT;
+                else {
+#if defined(__linux__)
+                    memset(&native, 0, sizeof(native));
+                    memcpy(&native, (const void *)(uintptr_t)a2, 36);
+#else
+                    termios_l2m((const uint8_t *)(uintptr_t)a2, &native);
+#endif
+                    int action = request == 0x5402u ? TCSANOW : request == 0x5403u ? TCSADRAIN : TCSAFLUSH;
+                    result = tcsetattr(native_fd, action, &native) == 0 ? 0 : -errno;
+                }
+            } else if (request == 0x5413u || request == 0x5414u) { /* TIOCGWINSZ/TIOCSWINSZ */
+                if (!host_range_mapped((uintptr_t)a2, sizeof(struct winsize)))
+                    result = -EFAULT;
+                else
+                    result = ioctl(native_fd, request == 0x5413u ? TIOCGWINSZ : TIOCSWINSZ,
+                                   (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+            } else if (request == 0x540fu) { /* TIOCGPGRP */
+                if (!host_range_mapped((uintptr_t)a2, sizeof(int)))
+                    result = -EFAULT;
+                else {
+                    pid_t group = tcgetpgrp(native_fd);
+                    if (group < 0)
+                        result = -errno;
+                    else {
+                        *(int *)(uintptr_t)a2 = group == g_init_hostpid ? 1 : (int)group;
+                        result = 0;
+                    }
+                }
+            } else if (request == 0x5410u) { /* TIOCSPGRP */
+                if (!host_range_mapped((uintptr_t)a2, sizeof(int)))
+                    result = -EFAULT;
+                else {
+                    pid_t group = *(const int *)(uintptr_t)a2;
+                    if (group == 1 && g_init_hostpid) group = g_init_hostpid;
+                    result = tcsetpgrp(native_fd, group) == 0 ? 0 : -errno;
+                }
+            } else { /* TIOCSCTTY */
+                result = ioctl(native_fd, TIOCSCTTY, 0) == 0 || errno == EPERM ? 0 : -errno;
+            }
+            if (borrowed > 0) bound_attachment_release(native_fd);
         } else {
             result = -ENOTTY;
         }

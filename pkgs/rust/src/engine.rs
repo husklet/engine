@@ -1,5 +1,6 @@
 use crate::{
-    ffi, runtime::ConfigFile, wire, Child, Command as GuestCommand, Config, Error, Guest, Stdio,
+    ffi, runtime::ConfigFile, wire, Child, Command as GuestCommand, Config, Error, Guest, Size,
+    Stdio,
 };
 use std::{
     ffi::{CString, OsStr},
@@ -29,6 +30,7 @@ impl Engine {
         program: impl AsRef<OsStr>,
         arguments: I,
         streams: (Stdio, Stdio, Stdio),
+        terminal: Option<Size>,
     ) -> Result<Child, Error>
     where
         I: IntoIterator<Item = S>,
@@ -50,23 +52,32 @@ impl Engine {
             .map_err(|message| Error::Distribution(message.clone()))?;
         let config_path = CString::new(config.path().as_os_str().as_bytes())
             .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
-        let (input, stdin, input_child) = prepare(streams.0, true)?;
-        let (output, stdout, output_child) = prepare(streams.1, false)?;
-        let (error, stderr, error_child) = prepare(streams.2, false)?;
-        let native = ffi::Streams {
-            input,
-            output,
-            error,
+        let (process, stdin, stdout, stderr, terminal) = if let Some(size) = terminal {
+            let (process, file) =
+                ffi::start_terminal(executable, guest_number(guest), &config_path, size.native())
+                    .map_err(native_error)?;
+            (process, None, None, None, Some(crate::Terminal::new(file)))
+        } else {
+            let (input, stdin, input_child) = prepare(streams.0, true)?;
+            let (output, stdout, output_child) = prepare(streams.1, false)?;
+            let (error, stderr, error_child) = prepare(streams.2, false)?;
+            let native = ffi::Streams {
+                input,
+                output,
+                error,
+            };
+            let process = ffi::start(executable, guest_number(guest), &config_path, &native)
+                .map_err(native_error)?;
+            drop((input_child, output_child, error_child));
+            (process, stdin, stdout, stderr, None)
         };
-        let process = ffi::start(executable, guest_number(guest), &config_path, &native)
-            .map_err(native_error)?;
-        drop((input_child, output_child, error_child));
         Ok(Child {
             process: Some(process),
             _config: config,
             stdin,
             stdout,
             stderr,
+            terminal,
         })
     }
 }

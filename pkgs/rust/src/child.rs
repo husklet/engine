@@ -1,4 +1,4 @@
-use crate::{ffi, result, runtime::ConfigFile, Error, Exit};
+use crate::{ffi, result, runtime::ConfigFile, Error, Exit, Terminal};
 use std::{fs::File, io::Read};
 
 /// Owned running engine process.
@@ -9,6 +9,7 @@ pub struct Child {
     pub(crate) stdin: Option<File>,
     pub(crate) stdout: Option<File>,
     pub(crate) stderr: Option<File>,
+    pub(crate) terminal: Option<Terminal>,
 }
 /// Captured output and typed guest status.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +34,10 @@ impl Child {
     }
     pub fn take_stderr(&mut self) -> Option<File> {
         self.stderr.take()
+    }
+    /// Takes ownership of the controlling terminal, when one was requested.
+    pub fn take_terminal(&mut self) -> Option<Terminal> {
+        self.terminal.take()
     }
     /// Polls for completion.
     ///
