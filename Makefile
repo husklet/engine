@@ -1553,10 +1553,20 @@ $(BUILD)/tools/lifecycle-x86_64: $(BUILD)/mac/lifecycle/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
+HL_LIFECYCLE_ISA_aarch64 := HL_GUEST_ISA_AARCH64
+HL_LIFECYCLE_ISA_x86_64 := HL_GUEST_ISA_X86_64
+
 define HL_LIFECYCLE_IDENTITY
-$(BUILD)/tools/lifecycle-$(1)-$(2): $(BUILD)/tools/lifecycle-$(2) packaging/macos/jit.entitlements
+$(BUILD)/mac/lifecycle/$(1)-$(2)-runner.o: tools/lifecycle_e2e_runner.c
 	@mkdir -p $$(@D)
-	cp $$< $$@
+	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=$(HL_LIFECYCLE_ISA_$(2)) \
+		-DHL_LIFECYCLE_SCENARIO='"$(1)"' -O2 $(DEPFLAGS) -c $$< -o $$@
+
+$(BUILD)/tools/lifecycle-$(1)-$(2): $(BUILD)/mac/lifecycle/$(1)-$(2)-runner.o \
+	$(BUILD)/mac/lifecycle/$(2)-target.o $(BUILD)/mac/lifecycle/$(2)-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $$(@D)
+	$(MAC) clang -o $$@ $$(filter %.o %.a,$$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $$@
 endef
 

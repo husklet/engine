@@ -23,6 +23,11 @@ typedef hl_host_macos lifecycle_host;
 #include <string.h>
 #include <sys/mman.h>
 
+#ifndef HL_LIFECYCLE_SCENARIO
+#define HL_LIFECYCLE_SCENARIO "generic"
+#endif
+__attribute__((used)) static const char lifecycle_scenario_identity[] = HL_LIFECYCLE_SCENARIO;
+
 #ifndef HL_TEST_GUEST_ISA
 #error HL_TEST_GUEST_ISA is required
 #endif
