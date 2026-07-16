@@ -394,10 +394,12 @@ make MAC=mac compat-memory
 make MAC=mac compat-filesystem
 make MAC=mac compat-ipc
 make MAC=mac e2e-compat
+make MAC=mac e2e-mac-build
 make MAC=mac e2e-lifecycle-signal
 make MAC=mac e2e-lifecycle-control
 make MAC=mac e2e-lifecycle-hygiene
-make MAC=mac e2e-embedding
+make MAC=mac e2e-embedding-fd
+make MAC=mac e2e-embedding-io
 ```
 
 Production mac engines are compiled, linked, codesigned with the JIT entitlement, and actually executed. A successful
@@ -420,12 +422,15 @@ compat-threads           compat-time
 compat-soak
 ```
 
-The complete production gate is five independent top-level invocations: `e2e-compat` runs the full compatibility
+The complete production gate is six independent top-level invocations: `e2e-compat` runs the full compatibility
 matrix; `e2e-lifecycle-signal`, `e2e-lifecycle-control`, and `e2e-lifecycle-hygiene` cover lifecycle behavior; and
-`e2e-embedding` covers descriptor, stdio, and directory embedding for both guest ISAs. Run each as a separate process
-with its own timeout. The host firewall allows at most six signed launches per launching-process lifetime, so a
+`e2e-embedding-fd` and `e2e-embedding-io` cover descriptor, stdio, and directory embedding for both guest ISAs. Run
+each as a separate process with its own timeout. The host firewall reliably allows four signed launches per
+launching-process lifetime, so a
 recursive umbrella target would retain an exhausted firewall session and invalidate later results. A checked manifest
 audits every gate's launch count and ensures artifact identities are distinct within that gate before any launch.
+Run `e2e-mac-build` in its own process first so compilation and signing never consume a behavioral gate's firewall
+budget.
 
 Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process group and reaps
 children. Validate the supervisor with:

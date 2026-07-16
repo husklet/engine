@@ -10,9 +10,9 @@ lifecycle-control	build/tools/lifecycle-force-x86_64
 lifecycle-hygiene	build/tools/lifecycle-aarch64
 lifecycle-hygiene	build/tools/lifecycle-x86_64
 lifecycle-hygiene	build/tools/lifecycle-signal-aarch64
-embedding	build/tools/binding-aarch64
-embedding	build/tools/binding-x86_64
-embedding	build/tools/stdio-aarch64
-embedding	build/tools/stdio-x86_64
-embedding	build/tools/dir-aarch64
-embedding	build/tools/dir-x86_64
+embedding-fd	build/tools/binding-aarch64
+embedding-fd	build/tools/binding-x86_64
+embedding-io	build/tools/stdio-aarch64
+embedding-io	build/tools/stdio-x86_64
+embedding-io	build/tools/dir-aarch64
+embedding-io	build/tools/dir-x86_64

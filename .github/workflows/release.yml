@@ -46,6 +46,10 @@ jobs:
         if: runner.os == 'macOS'
         run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-compat'
 
+      - name: Build macOS lifecycle artifacts
+        if: runner.os == 'macOS'
+        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-mac-build'
+
       - name: Test macOS lifecycle signals
         if: runner.os == 'macOS'
         run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-lifecycle-signal'
@@ -58,9 +62,13 @@ jobs:
         if: runner.os == 'macOS'
         run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-lifecycle-hygiene'
 
-      - name: Test macOS embedding
+      - name: Test macOS descriptor embedding
         if: runner.os == 'macOS'
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-embedding'
+        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-embedding-fd'
+
+      - name: Test macOS IO embedding
+        if: runner.os == 'macOS'
+        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-embedding-io'
 
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify

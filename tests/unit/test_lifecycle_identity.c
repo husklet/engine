@@ -42,7 +42,7 @@ int main(void) {
             HL_CHECK(strcmp(artifact[index], tab) != 0);
         }
         if (gate_launches == 0) unique_gates++;
-        HL_CHECK(gate_launches < 6);
+        HL_CHECK(gate_launches < 4);
         HL_CHECK(strlen(line) < sizeof gates[count]);
         HL_CHECK(strlen(tab) < sizeof artifact[count]);
         strcpy(gates[count], line);
@@ -50,6 +50,6 @@ int main(void) {
         count++;
     }
     HL_CHECK(fclose(file) == 0);
-    HL_CHECK(unique_gates == 4 && count == 17);
+    HL_CHECK(unique_gates == 5 && count == 17);
     return 0;
 }
