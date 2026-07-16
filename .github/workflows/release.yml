@@ -46,6 +46,10 @@ jobs:
         if: runner.os == 'macOS'
         run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-compat'
 
+      - name: Test macOS lifecycle
+        if: runner.os == 'macOS'
+        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-lifecycle'
+
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
 

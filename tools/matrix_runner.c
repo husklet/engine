@@ -18,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "launch.h"
+
 #include "hl/config.h"
 
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 120000 };
@@ -568,18 +570,13 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         return 1;
     }
     if (child == 0) {
-        long maximum;
         (void)setpgid(0, 0);
         close(output_pipe[0]);
         close(error_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0 || dup2(error_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(output_pipe[1]);
         close(error_pipe[1]);
-        (void)unsetenv("MAKEFLAGS");
-        (void)unsetenv("MFLAGS");
-        maximum = sysconf(_SC_OPEN_MAX);
-        if (maximum < 0 || maximum > 4096) maximum = 4096;
-        for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
+        hl_launch_hygiene();
         execlp(bridge, bridge, supervisor, "--capture", capture_output, capture_error, engine, "--configfile",
                config_path, (char *)NULL);
         _exit(127);

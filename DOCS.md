@@ -394,6 +394,7 @@ make MAC=mac compat-memory
 make MAC=mac compat-filesystem
 make MAC=mac compat-ipc
 make MAC=mac e2e-compat
+make MAC=mac e2e-lifecycle
 ```
 
 Production mac engines are compiled, linked, codesigned with the JIT entitlement, and actually executed. A successful
@@ -416,7 +417,12 @@ compat-threads           compat-time
 compat-soak
 ```
 
-`make e2e-compat` is the complete production gate. It builds both guest ISAs and runs all active suites.
+The complete production gate is two independent top-level invocations: `make e2e-compat` runs the full compatibility
+matrix and `make e2e-lifecycle` validates lifecycle, signal, clock, force-stop, descriptor, stdio, and directory
+embedding for both guest ISAs. Run them as separate processes with independent timeouts. The host firewall accounts
+bridge admission to the launching process lifetime, so a recursive umbrella target would retain an exhausted firewall
+session and would not be a valid lifecycle result. The lifecycle gate audits that every scenario and ISA has a distinct
+artifact identity before launching it.
 
 Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process group and reaps
 children. Validate the supervisor with:

@@ -341,14 +341,14 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-lifecycle \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 # A mac bridge launch owns a remote process group and a shared capture mount.
 # Concurrent suites can starve a launch past the transport deadline and overlap
 # remote cleanup with the next case. Keep the release gate sequential even when
 # its caller requests parallel make.
-.NOTPARALLEL: e2e-compat
+.NOTPARALLEL: e2e-compat e2e-lifecycle
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
@@ -1614,7 +1614,25 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time \
+	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_NATIVE_ORACLE_RUNS)
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
+	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-aarch64) 70
+	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) 70
+
+# The host firewall accounts bridge admission to the lifetime of its launching process. Keep the
+# lifecycle/embedding audit in a fresh top-level make process after e2e-compat; an umbrella recursive
+# target would retain the exhausted session and invalidate the result.
+e2e-lifecycle: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
@@ -1630,19 +1648,8 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/guest-fault-aarch64 $(BUILD)/e2e/guest-fault-x86_64 \
 	$(BUILD)/e2e/guest-spin-aarch64 $(BUILD)/e2e/guest-spin-x86_64 \
 	$(BUILD)/e2e/clock-injected-aarch64 $(BUILD)/e2e/clock-injected-x86_64 \
-	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_NATIVE_ORACLE_RUNS)
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
-	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/e2e/guest-exit70-aarch64) 70
-	$(BUILD)/tools/config-e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) 70
+	$(BUILD)/tools/e2e-runner
+	$(BUILD)/tests/test_lifecycle_identity
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
@@ -1688,11 +1695,11 @@ $(BUILD)/tools/compat-runner: tools/compat_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
-$(BUILD)/tools/e2e-runner: tools/e2e_runner.c
+$(BUILD)/tools/e2e-runner: tools/e2e_runner.c tools/launch.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
-$(BUILD)/tools/bridge-runner: tools/bridge_runner.c
+$(BUILD)/tools/bridge-runner: tools/bridge_runner.c tools/launch.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
@@ -1708,7 +1715,7 @@ $(BUILD)/tests/deny-icmp: tests/integration/deny_icmp.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
-$(BUILD)/tools/matrix-runner: tools/matrix_runner.c include/hl/config.h
+$(BUILD)/tools/matrix-runner: tools/matrix_runner.c tools/launch.h include/hl/config.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) \
 		-DAARCH64_DYNAMIC_LOADER='"$(AARCH64_DYNAMIC_LOADER)"' \
@@ -1944,7 +1951,7 @@ compat-procfs: compat-engines $(BUILD)/tools/matrix-runner $(PROCFS_CASE_BINS)
 		$(abspath $(BUILD)/compat/procfs/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/procfs/x86_64) $(abspath tests/compat/procfs)
 
-$(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c include/hl/config.h
+$(BUILD)/tools/config-e2e-runner: tools/config_e2e_runner.c tools/launch.h include/hl/config.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< -o $@
 

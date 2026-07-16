@@ -68,5 +68,19 @@ jobs:
             exit 1
           fi
 
+      - name: Test macOS lifecycle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-lifecycle' 2>&1 | tee lifecycle.log "$GITHUB_STEP_SUMMARY"; then
+            message=$(tail -c 1500 lifecycle.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=macOS lifecycle compatibility failed::$message"
+            exit 1
+          fi
+
       - name: Package Rust crate
         run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify

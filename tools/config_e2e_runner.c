@@ -17,6 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "launch.h"
+
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
@@ -172,13 +174,8 @@ static int run_config(const char *bridge, const char *engine, const char *config
     pid_t child = fork();
     if (child < 0) return 1;
     if (child == 0) {
-        long maximum;
         (void)setpgid(0, 0);
-        (void)unsetenv("MAKEFLAGS");
-        (void)unsetenv("MFLAGS");
-        maximum = sysconf(_SC_OPEN_MAX);
-        if (maximum < 0 || maximum > 4096) maximum = 4096;
-        for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
+        hl_launch_hygiene();
         execlp(bridge, bridge, engine, "--configfile", config_path, (char *)NULL);
         _exit(127);
     }

@@ -8,6 +8,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "launch.h"
+
 enum { ATTEMPTS = 3, TOTAL_TIMEOUT_SECONDS = 75 };
 
 static void stop(pid_t child) {
@@ -27,11 +29,7 @@ static int run(char **arguments, time_t deadline, int *status) {
         command = fork();
         if (command < 0) _exit(125);
         if (command == 0) {
-            long maximum = sysconf(_SC_OPEN_MAX);
-            (void)unsetenv("MAKEFLAGS");
-            (void)unsetenv("MFLAGS");
-            if (maximum < 0 || maximum > 4096) maximum = 4096;
-            for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
+            hl_launch_hygiene();
             execvp(arguments[0], arguments);
             _exit(127);
         }
