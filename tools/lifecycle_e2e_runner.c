@@ -203,10 +203,13 @@ int main(int argc, char **argv) {
     if (expect_exit >= 0)
         return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == expect_exit ? 0
                                                                                                                   : 84;
-    if (expect_signal >= 0)
-        return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == expect_signal
-                   ? 0
-                   : 85;
+    if (expect_signal >= 0) {
+        if (status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == expect_signal)
+            return 0;
+        fprintf(stderr, "lifecycle: expected signal=%d status=%d kind=%u guest=%d detail=%llu\n", expect_signal,
+                status, result.kind, result.guest_status, (unsigned long long)result.detail);
+        return 85;
+    }
     if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE) {
         fprintf(stderr, "lifecycle: status=%d kind=%u guest=%d detail=%llu\n", status, result.kind,
                 result.guest_status, (unsigned long long)result.detail);

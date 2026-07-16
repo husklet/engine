@@ -4,6 +4,7 @@
 #include "options.h"
 
 #include <stdatomic.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -140,7 +141,14 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
     if (waited->detail == HL_HOST_PROCESS_EXIT_SIGNAL) {
         hl_production_result_release(host, token);
         result->kind = HL_ENGINE_EXIT_SIGNAL;
+#if defined(__APPLE__)
+        // A translated bad-address fault may reach waitpid as the raw macOS SIGBUS when the kernel does
+        // not enter the POSIX guard. Linux reports that access as SIGSEGV. Genuine guest file-EOF SIGBUS
+        // is published through hl_engine_child_result and therefore takes the record path below.
+        result->guest_status = waited->value == SIGBUS ? 11 : (int32_t)waited->value;
+#else
         result->guest_status = (int32_t)waited->value;
+#endif
         result->detail = 0;
         return HL_STATUS_OK;
     }

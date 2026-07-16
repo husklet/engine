@@ -547,14 +547,11 @@ static void raise_guest_signal(struct cpu *c, int sig) {
 static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t *si, void *ucv) {
     int sig = sig_m2l(hostsig);
     if (sig < 1 || sig > 64 || !ucv) return 0;
-    // Linux reports a BAD-ADDRESS fault (unmapped page / PROT_NONE guard / a stack overflow into the
-    // guard gap) as SIGSEGV, but macOS raises a PROT_NONE access as host SIGBUS (-> Linux SIGBUS(7)). Rewrite
-    // it to SIGSEGV(11) when the address is a tracked guard (gna_hit) or is unmapped, so a guest's own SIGSEGV
-    // handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it. A genuine SIGBUS on
-    // MAPPED memory (misalignment, file mapping past EOF) is left as SIGBUS. Only host SIGBUS needs the check
-    // (host SIGSEGV already maps to Linux SIGSEGV), so the common fault path pays no extra probe.
-    if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
-        (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr)))
+    // macOS reports ordinary bad-address/protection faults as SIGBUS/BUS_ADRERR, while Linux reports
+    // SIGSEGV. Do not query the Mach VM map from this synchronous signal handler: mach_vm_region is not
+    // async-signal-safe and made identical faults intermittently escape as the raw host SIGBUS. A genuine
+    // alignment fault remains SIGBUS; file-EOF BUS faults are identified by the dispatcher BUS ledger.
+    if (hostsig == SIGBUS && (!si || si->si_code != BUS_ADRALN))
         sig = 11;
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
@@ -754,10 +751,8 @@ static void sig_diag_raise_default(struct cpu *c, int sig) {
 static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     int sig = sig_m2l(hostsig);
     if (sig < 1 || sig > 64 || !ucv) return 0;
-    // Bad-address fault normalization (see deliver_guest_fault): macOS raises a PROT_NONE/guard access as host
-    // SIGBUS -> Linux SIGBUS(7), but Linux reports SIGSEGV. Rewrite to SIGSEGV(11) for a guard/unmapped fault.
-    if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
-        (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr)))
+    // Apply the same async-signal-safe host-to-guest classification as the guest-handler path above.
+    if (hostsig == SIGBUS && (!si || si->si_code != BUS_ADRALN))
         sig = 11;
     if (g_sigact[sig].handler > 1) return 0; // a guest handler exists -> not ours (deliver_guest_fault owns it)
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
