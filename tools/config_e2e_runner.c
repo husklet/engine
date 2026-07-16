@@ -80,6 +80,21 @@ static int read_full(int fd, void *buffer, size_t size) {
     return 0;
 }
 
+static int process_domain(uint64_t identity[2]) {
+    unsigned char *output = (unsigned char *)identity;
+    size_t offset = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (offset < sizeof(uint64_t) * 2u) {
+        ssize_t count = read(fd, output + offset, sizeof(uint64_t) * 2u - offset);
+        if (count > 0) offset += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else { (void)close(fd); return -1; }
+    }
+    if (close(fd) != 0) return -1;
+    return (identity[0] | identity[1]) != 0 ? 0 : -1;
+}
+
 static int make_config(const char *path, const char *guest, const char *result_path, const char *cache_path) {
     static const char volume[] = "/tmp:/tmp";
     hl_launch_config config;
@@ -99,6 +114,7 @@ static int make_config(const char *path, const char *guest, const char *result_p
     config.abi = HL_CONFIG_ABI;
     config.uid = -1;
     config.gid = -1;
+    if (process_domain(config.process_domain) != 0) goto done;
     config.arguments_offset = 1;
     memcpy(pool + 1, guest, guest_size);
     config.volumes_offset = (uint32_t)(1 + guest_size + 1);

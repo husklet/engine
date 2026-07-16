@@ -43,6 +43,21 @@ static int write_full(int fd, const void *data, size_t size) {
     return 0;
 }
 
+static int process_domain(uint64_t identity[2]) {
+    unsigned char *output = (unsigned char *)identity;
+    size_t offset = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (offset < sizeof(uint64_t) * 2u) {
+        ssize_t count = read(fd, output + offset, sizeof(uint64_t) * 2u - offset);
+        if (count > 0) offset += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else { (void)close(fd); return -1; }
+    }
+    if (close(fd) != 0) return -1;
+    return (identity[0] | identity[1]) != 0 ? 0 : -1;
+}
+
 static int make_config(const char *guest, char path[64]) {
     hl_launch_config config = {0};
     char pool[4096] = {0};
@@ -59,6 +74,7 @@ static int make_config(const char *guest, char path[64]) {
     config.pool_size = (uint32_t)(guest_size + 2);
     config.uid = -1;
     config.gid = -1;
+    if (process_domain(config.process_domain) != 0) { close(fd); unlink(path); return -1; }
     config.arguments_offset = 1;
     if (write_full(fd, &config, sizeof(config)) != 0 || write_full(fd, pool, config.pool_size) != 0 ||
         close(fd) != 0) { close(fd); unlink(path); return -1; }
