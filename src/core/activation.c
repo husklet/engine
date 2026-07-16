@@ -250,6 +250,7 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     int pair[2];
     pid_t child;
     posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
     hl_activation_request request = {0};
     hl_activation_reply reply;
     char activation[] = "HL_ACTIVATION_FD=198";
@@ -305,42 +306,55 @@ hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_
     if (posix_spawn_file_actions_init(&actions) != 0) {
         close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
     }
+    if (posix_spawnattr_init(&attributes) != 0) {
+        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
+    if (posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP) != 0 ||
+        posix_spawnattr_setpgroup(&attributes, 0) != 0) {
+        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     if (stdio != NULL &&
         ((stdio->input >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->input, 0) != 0) ||
          (stdio->output >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->output, 1) != 0) ||
          (stdio->error >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->error, 2) != 0))) {
-        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (posix_spawn_file_actions_adddup2(&actions, pair[1], HL_ACTIVATION_FD) != 0 ||
         posix_spawn_file_actions_addclose(&actions, pair[0]) != 0 ||
         posix_spawn_file_actions_addclose(&actions, pair[1]) != 0) {
-        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
-    if (posix_spawn(&child, executable, &actions, NULL, child_argv, child_env) != 0) {
-        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+    if (posix_spawn(&child, executable, &actions, &attributes, child_argv, child_env) != 0) {
+        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
+    posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
     close(pair[1]);
     free(child_env);
     if (transfer(pair[0], &request, test_mode == 3 ? sizeof(request) / 2u : sizeof(request), 1) != 0) {
-        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
     if (transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
-        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (reply.magic != request.magic || reply.abi != request.abi || reply.size != sizeof(reply) ||
         memcmp(reply.nonce, request.nonce, sizeof(request.nonce)) != 0 || reply.status != HL_STATUS_OK) {
-        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     { unsigned char commit = 0xa5u; if (transfer(pair[0], &commit, 1, 1) != 0) {
-        close(pair[0]); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+        close(pair[0]); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     } }
     process = calloc(1, sizeof(*process));
-    if (process == NULL) { close(pair[0]); (void)kill(child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
+    if (process == NULL) { close(pair[0]); (void)kill(-child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
     process->descriptor = pair[0];
     process->pid = child;
     memcpy(process->nonce, request.nonce, sizeof(process->nonce));
@@ -422,7 +436,7 @@ hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_r
 hl_status hl_activation_kill(hl_activation_process *process) {
     if (process == NULL) return HL_STATUS_INVALID_ARGUMENT;
     if (process->finished) return HL_STATUS_BUSY;
-    return kill(process->pid, SIGKILL) == 0 ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
+    return kill(-process->pid, SIGKILL) == 0 ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
 }
 
 void hl_activation_process_destroy(hl_activation_process *process) {
