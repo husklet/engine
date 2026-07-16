@@ -587,7 +587,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
-                *(uint64_t *)a1 = (uint64_t)kv.data;
+                /*
+                 * EVFILT_TIMER may report several host wakeup quanta when a busy runner services an
+                 * overdue EV_ONESHOT. Linux timerfd one-shots have exactly one expiration; only a
+                 * periodic timer accumulates multiple expirations.
+                 */
+                *(uint64_t *)a1 = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
             }
             // A periodic timerfd whose first expiry (it_value) differed from its interval was armed as a
             // one-shot for that first tick (event.c case 86). Now that the first tick has been consumed,
