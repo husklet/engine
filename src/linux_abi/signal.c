@@ -314,6 +314,16 @@ static void host_sigh(int sig) {
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv);
 static void sig_diag_raise_default(struct cpu *c, int sig);
 
+static _Noreturn void guest_group_fatal(struct cpu *c, int sig) {
+    sig_diag_raise_default(c, sig);
+    if (container_pid() != 1) {
+        int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
+        sigexit_record(sig, core);
+    }
+    hl_engine_child_result_publish_signal(sig);
+    _exit(128 + sig);
+}
+
 // SA_SIGINFO host handler: same delivery as host_sigh, plus it captures the sender's pid/uid so an
 // SA_SIGINFO guest handler (or sigwaitinfo) sees si_pid/si_uid. macOS populates si_pid for a kill(2) but
 // does NOT set the Linux SI_USER si_code, so gate on si_pid>0 (a real sender) rather than the code.
@@ -426,9 +436,7 @@ static void maybe_deliver_signal(struct cpu *c) {
             // the container with 128+signo (the code `docker run` reports for a PID 1 killed by a signal).
             // SIG_IGN (h==1) and the default-ignore/stop signals stay dropped here.
             if (h == 0 && container_pid() == 1 && sig_default_terminates(sig)) {
-                c->exited = 1;
-                c->exit_code = 128 + sig;
-                return;
+                guest_group_fatal(c, sig);
             }
             continue;
         }
@@ -497,17 +505,7 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     // RLIMIT_CORE > 0. If the relay slot table is exhausted the parent simply sees the WIFEXITED(128+signo)
     // fallback — the same graceful degradation as before this fix.
     if (sig_default_terminates(sig)) {
-        sig_diag_raise_default(c, sig);
-        if (container_pid() != 1) {
-            int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
-            sigexit_record(sig, core);
-        }
-        /* A Linux fatal default action terminates the complete thread group.
-         * Production guests own their child process, so _exit is the only
-         * async-safe, race-free operation that cannot leave a blocked peer
-         * alive. */
-        hl_engine_child_result_publish_signal(sig);
-        _exit(128 + sig);
+        guest_group_fatal(c, sig);
     }
     // Non-terminating default reaching here = a stop signal (STOP/TSTP/TTIN/TTOU): mirror it onto the host so
     // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask).
@@ -599,19 +597,7 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
 /* Dispatcher-only delivery for a translated access rejected by the file-mapping BUS ledger. */
 static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) {
-        if (container_pid() != 1) {
-#if defined(__linux__)
-            // This dispatcher-side EOF fault is a real guest SIGBUS. Linux can carry that termination
-            // status without translation, so let the kernel produce the parent's wait status directly.
-            signal(SIGBUS, SIG_DFL);
-            raise(SIGBUS);
-#endif
-            int core = sig_coredumps(7) && svc_core_rlimit_cur() > 0;
-            sigexit_record(7, core);
-        }
-        c->exited = 1;
-        c->exit_code = 135;
-        return 0;
+        guest_group_fatal(c, 7);
     }
     g_sigaddr[7] = c->fault_addr;
     g_sigcode[7] = 2; /* BUS_ADRERR */
@@ -774,12 +760,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     // termination signo so the parent's wait4/waitid reconstructs WIFSIGNALED/WTERMSIG=sig (proc.c case 260);
     // the container init just exits 128+signo (what `docker run` reports for a crash). This is hl's standard
     // fatal-signal relay -- the same mechanism as a fatal-default signal in maybe_deliver_signal.
-    if (container_pid() != 1) {
-        int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
-        sigexit_record(sig, core);
-    }
-    hl_engine_child_result_publish_signal(sig);
-    _exit(128 + sig);
+    guest_group_fatal(c, sig);
 }
 
 // Linux mmap flags -> macOS.

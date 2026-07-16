@@ -76,11 +76,7 @@ static uint32_t hl_linux_seccomp_evaluate(const struct hl_linux_seccomp_data *sd
 // path: run_guest unwinds on c->exited and run_loaded returns c->exit_code (128+signo), so the parent's
 // wait4/waitid reconstructs WIFSIGNALED/WTERMSIG.
 static void hl_linux_seccomp_kill(struct cpu *c, int signo) {
-    sig_diag_raise_default(c, signo);
-    int core = sig_coredumps(signo) && svc_core_rlimit_cur() > 0;
-    sigexit_record(signo, core);
-    c->exited = 1;
-    c->exit_code = 128 + signo;
+    guest_group_fatal(c, signo);
 }
 
 // The syscall-entry gate. Returns 1 if the syscall was intercepted (its result is already set in G_RET, a
