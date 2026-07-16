@@ -1,6 +1,6 @@
 [package]
 name = "hl-engine"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.81"
 description = "Safe Rust lifecycle API for the standalone HL Linux guest engine"
