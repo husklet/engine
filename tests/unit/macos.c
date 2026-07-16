@@ -187,6 +187,10 @@ int main(void) {
                  HL_STATUS_OK);
         HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
                  range_metadata.size == 8192);
+        HL_CHECK(services.file->allocate_range(services.context, range_file.value, 0, 8192, 8192).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
+                 range_metadata.size == 16384 && range_metadata.allocated_size <= 16384);
         HL_CHECK(services.file->filesystem_metadata(services.context, range_file.value, &filesystem).status ==
                      HL_STATUS_OK && filesystem.block_size > 0 && filesystem.blocks > 0 &&
                  filesystem.blocks_free <= filesystem.blocks);

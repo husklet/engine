@@ -2056,8 +2056,8 @@ static hl_host_result hl_macos_file_allocate_range(void *context, hl_host_handle
     {
         fstore_t store = {.fst_flags = F_ALLOCATECONTIG,
                           .fst_posmode = F_PEOFPOSMODE,
-                          .fst_offset = 0,
-                          .fst_length = end,
+                          .fst_offset = begin - current,
+                          .fst_length = length,
                           .fst_bytesalloc = 0};
         if (fcntl(descriptor, F_PREALLOCATE, &store) != 0) {
             store.fst_flags = F_ALLOCATEALL;
