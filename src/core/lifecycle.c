@@ -23,21 +23,30 @@ typedef struct hl_production_result_state {
 } hl_production_result_state;
 
 static hl_engine_child_result *active_result;
-static int result_published;
+static _Atomic int result_published;
+
+static int hl_engine_child_result_claim(void) {
+    int expected = 0;
+    if (active_result == NULL) return 0;
+    if (atomic_compare_exchange_strong_explicit(&result_published, &expected, 1,
+                                                memory_order_acq_rel, memory_order_acquire))
+        return 1;
+    while (atomic_load_explicit(&result_published, memory_order_acquire) == 1) {}
+    return 0;
+}
 
 void hl_engine_child_result_publish(int32_t guest_status, hl_status engine_status, uint64_t detail) {
     hl_engine_child_result record = {0, HL_ENGINE_CHILD_RESULT_VERSION, guest_status, engine_status,
                                      HL_ENGINE_CHILD_RESULT_EXIT, 0, detail};
-    if (result_published || active_result == NULL) return;
-    result_published = 1;
+    if (!hl_engine_child_result_claim()) return;
     memcpy(active_result, &record, sizeof(record));
     atomic_store_explicit((_Atomic uint32_t *)&active_result->magic, HL_ENGINE_CHILD_RESULT_MAGIC,
                           memory_order_release);
+    atomic_store_explicit(&result_published, 2, memory_order_release);
 }
 
 void hl_engine_child_result_publish_signal(int32_t guest_signal) {
-    if (result_published || active_result == NULL) return;
-    result_published = 1;
+    if (!hl_engine_child_result_claim()) return;
     active_result->version = HL_ENGINE_CHILD_RESULT_VERSION;
     active_result->guest_status = guest_signal;
     active_result->engine_status = HL_STATUS_OK;
@@ -46,11 +55,12 @@ void hl_engine_child_result_publish_signal(int32_t guest_signal) {
     active_result->detail = 0;
     atomic_store_explicit((_Atomic uint32_t *)&active_result->magic, HL_ENGINE_CHILD_RESULT_MAGIC,
                           memory_order_release);
+    atomic_store_explicit(&result_published, 2, memory_order_release);
 }
 
 void hl_engine_child_result_after_fork(void) {
     active_result = NULL;
-    result_published = 1;
+    atomic_store_explicit(&result_published, 2, memory_order_release);
 }
 
 typedef struct hl_production_entry_context {
@@ -66,7 +76,7 @@ typedef struct hl_production_entry_context {
 static int32_t hl_production_entry(void *opaque) {
     hl_production_entry_context *context = opaque;
     active_result = context->result;
-    result_published = 0;
+    atomic_store_explicit(&result_published, 0, memory_order_release);
     hl_options *previous = hl_options_bind_process(context->options);
     int32_t result = hl_run_linux_guest(context->host, context->box, context->config->rootfs, context->argc,
                                         (char *const *)(uintptr_t)context->argv);

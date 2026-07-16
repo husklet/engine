@@ -487,17 +487,6 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     }
     // SIGCHLD/CONT/URG/WINCH: ignore
     if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return;
-    // Unhandled fatal signal aimed at the container init: real Linux would protect a PID-namespace init and
-    // drop it, but hl's init is just the entrypoint -- take the default action and end the container with
-    // 128+signo (what `docker run` reports for a PID 1 killed by a signal) rather than raising a real host
-    // signal that kills the engine BY the signal. The stop signals keep the host path below (job control
-    // mirrors them onto the host mask, so a real host stop is the correct default action).
-    if (container_pid() == 1 && sig_default_terminates(sig)) {
-        sig_diag_raise_default(c, sig);
-        c->exited = 1;
-        c->exit_code = 128 + sig;
-        return;
-    }
     // Non-init guest process dying from a fatal-default signal. A guest process IS a real host process, so
     // its parent reaps it with the host wait4/waitid. Raising the mapped HOST signal cannot faithfully carry
     // the Linux signo for every signal: SIGPOLL(29)/SIGSTKFLT(16) map to host signals that DEFAULT-IGNORE on
@@ -509,11 +498,16 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     // fallback — the same graceful degradation as before this fix.
     if (sig_default_terminates(sig)) {
         sig_diag_raise_default(c, sig);
-        int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
-        sigexit_record(sig, core);
-        c->exited = 1;
-        c->exit_code = 128 + sig;
-        return;
+        if (container_pid() != 1) {
+            int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
+            sigexit_record(sig, core);
+        }
+        /* A Linux fatal default action terminates the complete thread group.
+         * Production guests own their child process, so _exit is the only
+         * async-safe, race-free operation that cannot leave a blocked peer
+         * alive. */
+        hl_engine_child_result_publish_signal(sig);
+        _exit(128 + sig);
     }
     // Non-terminating default reaching here = a stop signal (STOP/TSTP/TTIN/TTOU): mirror it onto the host so
     // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask).
