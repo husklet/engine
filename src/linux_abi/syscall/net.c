@@ -434,9 +434,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // A dual-stack listener that binds `::` (busybox nc's default, and many servers') is the IPv6 analogue
         // of 0.0.0.0 and takes the same path (br6_any_is), so it's reachable by peer containers over the switch
         // instead of landing on the isolated per-container loopback (which broke cross-container reach-by-name).
-        int bridge_interface = br_bind_interface(sa, (socklen_t)a2);
-        if (br6_any_is(sa, (socklen_t)a2)) bridge_interface = br_on() ? 0 : -1;
-        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
+        int bridge_enabled = br_on();
+        int bridge_interface = bridge_enabled ? br_bind_interface(sa, (socklen_t)a2) : -1;
+        if (bridge_enabled && br6_any_is(sa, (socklen_t)a2)) bridge_interface = 0;
+        if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
             bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
@@ -722,8 +723,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
-        int connect_interface = br_connect_interface(sa, (socklen_t)a2);
-        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && connect_interface >= 0) {
+        int bridge_enabled = br_on();
+        int connect_interface = bridge_enabled ? br_connect_interface(sa, (socklen_t)a2) : -1;
+        if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && connect_interface >= 0) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
