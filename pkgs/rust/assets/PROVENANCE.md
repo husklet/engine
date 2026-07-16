@@ -2,12 +2,12 @@
 
 The crate links one target-specific archive containing both guest backends and
 the activation constructor. No native executable is stored or extracted at
-runtime. The macOS archive contains the sources committed as `0a923270`; the
+runtime. The macOS archive contains the sources committed through `ffaf04d1`; the
 Linux archive remains the target-specific archive shipped with this crate revision.
 
 | Host target | Build target | SHA-256 |
 |---|---|---|
-| `aarch64-apple-darwin` | `build/package/macos-aarch64/libhl-engine.a` | `1f2d86e0398a6ba27f66f02786728d7f491422ceb61558e748c196b2e14fdf13` |
+| `aarch64-apple-darwin` | `build/package/macos-aarch64/libhl-engine.a` | `7b1126588f4674ee99bdafe09c161c5cd269288aaf5cd2725b95057c41f4a85f` |
 | `aarch64-unknown-linux-gnu` | `build/package/linux-aarch64/libhl-engine.a` | `9f196a4b2a78da9608f7dceacc916bef671e4de6a8f63e94ec25a1ae0ef4169d` |
 
 Cargo links the selected archive with whole-archive semantics so the private
