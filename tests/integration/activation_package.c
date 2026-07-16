@@ -74,7 +74,7 @@ static int force_stop_descendants(const char *self, const char *guest) {
                : 5;
 }
 
-static int forward_term(const char *self, const char *guest) {
+static int forward_signal(const char *self, const char *guest, int signal_number, const char expected[13]) {
     hl_activation_process *process = NULL;
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     hl_activation_stdio stdio;
@@ -102,7 +102,7 @@ static int forward_term(const char *self, const char *guest) {
     if (memcmp(output, "READY", 5) != 0) {
         close(descriptors[0]); hl_activation_process_destroy(process); return 9;
     }
-    if (kill((pid_t)process_id, SIGTERM) != 0) {
+    if (kill((pid_t)process_id, signal_number) != 0) {
         close(descriptors[0]); hl_activation_process_destroy(process); return 11;
     }
     while (used < sizeof(output)) {
@@ -115,7 +115,7 @@ static int forward_term(const char *self, const char *guest) {
     hl_activation_process_destroy(process);
     close(descriptors[0]);
     return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 0 &&
-                   used == sizeof(output) && memcmp(output, "READYGOT_TERM", sizeof(output)) == 0
+                   used == sizeof(output) && memcmp(output, expected, sizeof(output)) == 0
                ? 0
                : 10;
 }
@@ -144,7 +144,9 @@ int main(int argc, char **argv) {
         if (stopped != 0) return stopped;
     }
     if (argc >= 3) {
-        int forwarded = forward_term(argv[0], argv[2]);
+        int forwarded = forward_signal(argv[0], argv[2], SIGTERM, "READYGOT_TERM");
+        if (forwarded != 0) return forwarded;
+        forwarded = forward_signal(argv[0], argv[2], SIGQUIT, "READYGOT_QUIT");
         if (forwarded != 0) return forwarded;
     }
     puts("installed hl-engine activation package: ok");

@@ -156,7 +156,7 @@ static void *activation_signal_relay(void *unused) {
 }
 
 static int activation_signal_relay_start(pthread_t *thread) {
-    static const int forwarded[] = {SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+    static const int forwarded[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
     struct sigaction action;
     size_t index;
     int flags;
