@@ -170,9 +170,9 @@ static void emit_i8mm_mmla(uint32_t in) {
     }
 
     emit_i8mm_dot(out, 0, product, left, right, is_unsigned && !is_mixed);
-    emit32(v3(0x6E004000u | (8u << 11), right, right, right)); /* rotate right rows */
+    emit32(v3(0x6E000000u | (8u << 11), right, right, right)); /* EXT right rows by eight bytes */
     emit_i8mm_dot(out, 1, product, left, right, is_unsigned && !is_mixed);
-    emit32(v3(0x6E004000u | (8u << 11), left, left, left)); /* rotate left rows */
+    emit32(v3(0x6E000000u | (8u << 11), left, left, left)); /* EXT left rows by eight bytes */
     emit_i8mm_dot(out, 3, product, left, right, is_unsigned && !is_mixed);
     emit_i8mm_dot(out, 2, product, left, m, is_unsigned && !is_mixed);
 
