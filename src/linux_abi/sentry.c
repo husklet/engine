@@ -601,14 +601,18 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
         }
     }
     if (cp && pp)
-        for (uint32_t v = 3; v < SENTRY_VFD_MAX; v++) { // 0/1/2 already mapped borrowed by proc_init_table
+        for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++) {
             if (pp->real[v] < 0) continue;
             cp->cloexec[v] = pp->cloexec[v]; // FD_CLOEXEC is inherited across fork (Linux fd semantics)
             if (pp->borrowed[v]) {
                 cp->real[v] = pp->real[v];
                 cp->borrowed[v] = 1;
             } else {
-                int d = dup(pp->real[v]);
+                hl_linux_fd_snapshot typed;
+                int d = bound_snapshot((uint64_t)(uint32_t)pp->real[v], &typed)
+                            ? (int)bound_dup_at_least(typed.fd, 0,
+                                                      cp->cloexec[v] ? HL_LINUX_FD_CLOEXEC : 0)
+                            : dup(pp->real[v]);
                 cp->real[v] = d;
                 cp->borrowed[v] = (d < 0); // dup failure: leave the slot unusable but never closeable
                 if (d >= 0 && d < HL_NFD && pp->real[v] >= 0 && pp->real[v] < HL_NFD) {
