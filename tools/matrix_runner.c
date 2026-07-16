@@ -339,6 +339,26 @@ static int write_full(int fd, const void *buffer, size_t size) {
     return 0;
 }
 
+static int process_domain(uint64_t identity[2]) {
+    unsigned char *output = (unsigned char *)identity;
+    size_t offset = 0;
+    int descriptor = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return -1;
+    while (offset < sizeof(uint64_t) * 2u) {
+        ssize_t count = read(descriptor, output + offset, sizeof(uint64_t) * 2u - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            (void)close(descriptor);
+            return -1;
+        }
+    }
+    if (close(descriptor) != 0) return -1;
+    return (identity[0] | identity[1]) != 0 ? 0 : -1;
+}
+
 static void remove_tree(const char *path) {
     DIR *directory = opendir(path);
     struct dirent *entry;
@@ -430,6 +450,7 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     wire.config.abi = HL_CONFIG_ABI;
     wire.config.uid = -1;
     wire.config.gid = -1;
+    if (process_domain(wire.config.process_domain) != 0) return 1;
     {
         const char *debug_log = getenv("HL_LOG");
         if (debug_log != NULL && *debug_log != 0 && pool_string(&wire, debug_log, &wire.config.debug_log_offset) != 0)
