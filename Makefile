@@ -522,6 +522,13 @@ $(BUILD)/bin/hl-engine-runner: src/runner/main.c $(BUILD)/lib/libhl-engine.a $(B
 	$(CC) $(CPPFLAGS) $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 		$(BUILD)/lib/libhl-linux-abi.a -o $@
 
+# Manifest-only firewall audit: keep it independent from engine archives so a fresh macOS gate build
+# does not link GNU archives into a Darwin test executable or consume signing/scanner state.
+$(BUILD)/tests/test_lifecycle_identity: tests/unit/test_lifecycle_identity.c tests/unit/test.h \
+	tests/e2e/lifecycle.tsv tests/e2e/mac_gates.tsv
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< -o $@
+
 $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
