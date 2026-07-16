@@ -361,174 +361,9 @@ static int cgid(void) {
     return g_gid >= 0 ? g_gid : (int)getgid();
 }
 
-// --: guest-set ownership persistence (chown(2)/fchownat on overlay-upper files) ----
-// Rootless: a guest chown can't change the host file's REAL owner, and reports host-owned files
-// as the container uid/gid -- so a guest-set owner was silently lost (chown returned 0 but a re-stat
-// still showed the default). Persist the guest-set (uid,gid) as host xattrs on the overlay
-// backing file; fill_linux_stat prefers them over the cuid/cgid default. A guest id of -1 means
-// "don't change" (POSIX chown) -> leave that xattr untouched so the other id / the default survives.
-// xattrs live on the real APFS upper file, so they persist across a re-stat AND across processes.
 #include <sys/xattr.h>
-#define HL_OWNER_XATTR_UID "user.hl.owner.uid"
-#define HL_OWNER_XATTR_GID "user.hl.owner.gid"
+#include "owner.h"
 #define HL_MODE_XATTR "user.hl.mode"
-#define HL_OWNER_DIR "/tmp/.hl-owner"
-
-typedef struct hl_owner_record {
-    uint32_t magic;
-    int32_t uid;
-    int32_t gid;
-    uint64_t birth_ns;
-} hl_owner_record;
-
-static uint64_t owner_birth_ns(const struct stat *metadata) {
-#if defined(__APPLE__)
-    return (uint64_t)metadata->st_birthtimespec.tv_sec * UINT64_C(1000000000) +
-           (uint64_t)metadata->st_birthtimespec.tv_nsec;
-#else
-    return (uint64_t)metadata->st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)metadata->st_ctim.tv_nsec;
-#endif
-}
-
-static int owner_sidecar_open(uint64_t dev, uint64_t ino) {
-    char path[96];
-    (void)mkdir(HL_OWNER_DIR, 0700);
-    (void)chmod(HL_OWNER_DIR, 0700);
-    struct stat directory;
-    if (lstat(HL_OWNER_DIR, &directory) != 0 || !S_ISDIR(directory.st_mode) || directory.st_uid != getuid())
-        return -1;
-    snprintf(path, sizeof(path), HL_OWNER_DIR "/%llx.%llx", (unsigned long long)dev, (unsigned long long)ino);
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    struct stat metadata;
-    if (fd >= 0 && (fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode))) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static void owner_sidecar_set(uint64_t dev, uint64_t ino, uint64_t birth_ns, int uid, int gid) {
-    int fd = owner_sidecar_open(dev, ino);
-    if (fd < 0) return;
-    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
-    while (fcntl(fd, F_SETLKW, &lock) < 0 && errno == EINTR) {}
-    hl_owner_record record = {0x484c4f57u, -1, -1, birth_ns};
-    ssize_t loaded;
-    do {
-        loaded = pread(fd, &record, sizeof(record), 0);
-    } while (loaded < 0 && errno == EINTR);
-    if (loaded != (ssize_t)sizeof(record)) record = (hl_owner_record){0x484c4f57u, -1, -1, birth_ns};
-    if (record.magic != 0x484c4f57u || record.birth_ns != birth_ns)
-        record = (hl_owner_record){0x484c4f57u, -1, -1, birth_ns};
-    if (uid >= 0) record.uid = uid;
-    if (gid >= 0) record.gid = gid;
-    ssize_t stored;
-    do {
-        stored = pwrite(fd, &record, sizeof(record), 0);
-    } while (stored < 0 && errno == EINTR);
-    if (stored != (ssize_t)sizeof(record) && ftruncate(fd, 0) != 0) {
-        // The sidecar is advisory metadata.  Leaving an unreadable record is safe: get validates its
-        // exact size/magic/birth generation and falls back to the container owner.
-    }
-    lock.l_type = F_UNLCK;
-    (void)fcntl(fd, F_SETLK, &lock);
-    close(fd);
-}
-
-static int owner_sidecar_get(uint64_t dev, uint64_t ino, uint64_t birth_ns, int *uid, int *gid) {
-    int fd = owner_sidecar_open(dev, ino);
-    if (fd < 0) return 0;
-    hl_owner_record record;
-    ssize_t count = pread(fd, &record, sizeof(record), 0);
-    close(fd);
-    if (count != (ssize_t)sizeof(record) || record.magic != 0x484c4f57u || record.birth_ns != birth_ns) return 0;
-    *uid = record.uid;
-    *gid = record.gid;
-    return record.uid >= 0 || record.gid >= 0;
-}
-
-// PERF (sqlite-select / any stat-heavy workload): reading the guest-chown xattr back on EVERY stat cost
-// two macOS fgetxattr/getxattr per stat (~2.5us each on APFS even for a MISS -> ~5us/stat, 40-50x native
-// fstat). But the owner uid/gid xattr is set ONLY by an explicit guest chown or a cred-dropped create
-// (chown_xattr_set_*); the overwhelmingly common file has none. So keep a per-inode NEGATIVE cache: once
-// we confirm an inode carries no hl xattr, skip the syscalls on repeat stats of the same inode. A global
-// generation counter (bumped on every set) invalidates the whole cache the instant any chown xattr is
-// written, so a stale "no xattr" verdict can never outlive the xattr appearing. Cross-process correctness
-// is free: a new engine process starts with an empty cache, so its first stat of any inode does the real
-// read and sees a pre-existing (persisted-on-disk) xattr. fork inherits the cache (same host files, same
-// xattr state); in-process execve keeps it. HL_NOXATTRCACHE=1 forces the uncached
-// always-read path. Keyed on (st_dev,st_ino) which fill_linux_stat already has from the just-done stat.
-static void chown_xattr_set_path(const char *hostpath, int uid, int gid, int nofollow) {
-    int opt = nofollow ? XATTR_NOFOLLOW : 0;
-    if (uid >= 0) {
-        uint32_t v = (uint32_t)uid;
-        hl_native_setxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, opt);
-    }
-    if (gid >= 0) {
-        uint32_t v = (uint32_t)gid;
-        hl_native_setxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, opt);
-    }
-    struct stat metadata;
-    if ((nofollow ? lstat(hostpath, &metadata) : stat(hostpath, &metadata)) == 0)
-        owner_sidecar_set((uint64_t)metadata.st_dev, (uint64_t)metadata.st_ino, owner_birth_ns(&metadata), uid, gid);
-    if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
-}
-
-static void chown_xattr_set_fd(int fd, int uid, int gid) {
-    if (uid >= 0) {
-        uint32_t v = (uint32_t)uid;
-        hl_native_fsetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0);
-    }
-    if (gid >= 0) {
-        uint32_t v = (uint32_t)gid;
-        hl_native_fsetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0);
-    }
-    struct stat metadata;
-    if (fstat(fd, &metadata) == 0)
-        owner_sidecar_set((uint64_t)metadata.st_dev, (uint64_t)metadata.st_ino, owner_birth_ns(&metadata), uid, gid);
-    if (uid >= 0 || gid >= 0) hl_xattr_cache_invalidate();
-}
-
-// Read back the guest-set ids (fd preferred when fd>=0, else hostpath). Each out is the set id or -1
-// (no xattr -> keep the cuid/cgid default). Returns 1 if either id was guest-set. dev/ino identify
-// the just-stat'd inode for the negative cache above (0/0 = skip caching, e.g. synthetic entries).
-static int chown_xattr_get(const char *hostpath, int fd, uint64_t dev, uint64_t ino, int *uid, int *gid) {
-    *uid = -1;
-    *gid = -1;
-    if (fd < 0 && !hostpath) return 0; // synthetic: no backing file to read
-    int use_cache = ino != 0;
-    if (use_cache && hl_xattr_cache_is_negative(dev, ino)) return 0;
-    uint32_t v;
-    int present = 0;
-    if (fd >= 0) {
-        if (hl_native_fgetxattr(fd, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
-            *uid = (int)v;
-            present = 1;
-        }
-        if (hl_native_fgetxattr(fd, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
-            *gid = (int)v;
-            present = 1;
-        }
-    } else {
-        if (hl_native_getxattr(hostpath, HL_OWNER_XATTR_UID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
-            *uid = (int)v;
-            present = 1;
-        }
-        if (hl_native_getxattr(hostpath, HL_OWNER_XATTR_GID, &v, sizeof v, 0, 0) == (ssize_t)sizeof v) {
-            *gid = (int)v;
-            present = 1;
-        }
-    }
-    if (!present) {
-        struct stat metadata;
-        int have_metadata = fd >= 0 ? fstat(fd, &metadata) == 0 : hostpath != NULL && stat(hostpath, &metadata) == 0;
-        if (have_metadata && owner_sidecar_get(dev, ino, owner_birth_ns(&metadata), uid, gid)) present = 1;
-    }
-    if (use_cache && !present) { // record the confirmed miss so a repeat stat skips both backing stores
-        hl_xattr_cache_record_negative(dev, ino);
-    }
-    return present;
-}
 
 static void mode_xattr_set_path(const char *hostpath, mode_t mode) {
     uint32_t value = (uint32_t)mode & 07777u;
@@ -555,18 +390,11 @@ static mode_t stat_virt_mode(const struct stat *status, const char *hostpath, in
     return mode_xattr_get(hostpath, fd, &mode) ? (status->st_mode & S_IFMT) | mode : status->st_mode;
 }
 
-// the SINGLE source of truth for guest-visible file ownership. Map a host stat's raw uid/gid to
-// the ids the guest must see: the cuid/cgid container default for engine-owned files, overridden by
-// the guest-chown xattr (read through the negative cache). EVERY stat-family syscall routes its
-// owner fields through here -- fill_linux_stat (fstat/stat/newfstatat) AND the statx handler -- so all of
-// them report identical ownership for the same file (statx previously copied the RAW host uid/gid,
-// diverging from fstat wherever cuid/cgid or a guest chown applied). hostpath/fd identify the backing file
-// for the xattr read (NULL/-1 when synthetic -> the cuid/cgid default applies).
 static void stat_virt_ids(const struct stat *s, const char *hostpath, int fd, uint32_t *out_uid, uint32_t *out_gid) {
     uint32_t uid = (s->st_uid == (uid_t)getuid()) ? (uint32_t)cuid() : (uint32_t)s->st_uid;
     uint32_t gid = (s->st_gid == (gid_t)getgid()) ? (uint32_t)cgid() : (uint32_t)s->st_gid;
     int xu, xg;
-    if (chown_xattr_get(hostpath, fd, (uint64_t)s->st_dev, (uint64_t)s->st_ino, &xu, &xg)) {
+    if (hl_owner_get(hostpath, fd, s, hostpath != NULL && S_ISLNK(s->st_mode), &xu, &xg)) {
         if (xu >= 0) uid = (uint32_t)xu;
         if (xg >= 0) gid = (uint32_t)xg;
     }
@@ -727,12 +555,12 @@ static int newfile_stamp_wanted(void) {
 // root-created file stays xattr-free). fd form for openat(O_CREAT); path form for mkdir/mknod.
 static void newfile_stamp_fd(int fd) {
     int u = newfile_uid(), g = newfile_gid();
-    chown_xattr_set_fd(fd, u != cuid() ? u : -1, g != cgid() ? g : -1);
+    hl_owner_set_fd(fd, u != cuid() ? u : -1, g != cgid() ? g : -1);
 }
 
 static void newfile_stamp_path(const char *hostpath, int nofollow) {
     int u = newfile_uid(), g = newfile_gid();
-    chown_xattr_set_path(hostpath, u != cuid() ? u : -1, g != cgid() ? g : -1, nofollow);
+    hl_owner_set_path(hostpath, u != cuid() ? u : -1, g != cgid() ? g : -1, nofollow);
 }
 
 // ---- NET ns Phase 1: port-map (docker run -p H:C). bind(:C) actually binds the host port :H;

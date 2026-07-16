@@ -2047,7 +2047,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (hl_native_fd_path(pfd, dp, sizeof dp) == 0) {
                 char hp[4400];
                 if (path_join(hp, sizeof hp, dp, fin) == 0)
-                    chown_xattr_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
+                    hl_owner_set_path(hp, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, nofollow);
             }
             close(pfd);
             G_RET(c) = 0;
@@ -2065,7 +2065,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-errno);
             break;
         }
-        chown_xattr_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, 0);
+        hl_owner_set_path(p, (int)(int32_t)(uint32_t)a2, (int)(int32_t)(uint32_t)a3, 0);
         G_RET(c) = 0;
         break;
     }
@@ -2077,7 +2077,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
             break;
         }
-        chown_xattr_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
+        hl_owner_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
         // the guest-owner xattr just changed -> drop this path's cached stat so a later stat reports it
         if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
             hl_fdcache_evict_path(g_fdpath[(int)a0]);

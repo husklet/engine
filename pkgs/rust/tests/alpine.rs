@@ -132,3 +132,32 @@ fn piped_streams_enforce_their_direction() {
     assert_eq!(text, "hello\n");
     assert_eq!(child.wait().unwrap(), Exit::Code(0));
 }
+
+#[test]
+fn guest_ownership_is_seeded_and_shared_by_inode() {
+    let name = format!("owner-{}", std::process::id());
+    let relative = PathBuf::from("tmp").join(&name);
+    let hard_relative = PathBuf::from("tmp").join(format!("{name}-hard"));
+    let file = rootfs().join(&relative);
+    let hard = rootfs().join(&hard_relative);
+    fs::write(&file, b"ownership\n").unwrap();
+    fs::hard_link(&file, &hard).unwrap();
+
+    let script = format!(
+        "stat -c '%u:%g' /{0}; stat -c '%u:%g' /{1}; (chown 56:78 /{1}); stat -c '%u:%g' /{0}",
+        relative.display(),
+        hard_relative.display()
+    );
+    let output = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()).owner(&relative, 12, 34))
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.exit, Exit::Code(0));
+    assert_eq!(output.stdout, b"12:34\n12:34\n56:78\n");
+    assert!(output.stderr.is_empty());
+    fs::remove_file(hard).unwrap();
+    fs::remove_file(file).unwrap();
+}
