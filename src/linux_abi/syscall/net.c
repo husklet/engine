@@ -268,6 +268,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_tcp_lport[r] = 0;
                 g_tcp_listen[r] = 0;
                 g_dns_sock[r] = 0;
+                g_icmp_kind[r] = ((int)a0 == AF_INET && (int)a2 == 1 &&
+                                  (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)))
+                                     ? (uint8_t)(((ty & 0xf) == SOCK_RAW) ? 2 : 1)
+                                     : 0;
+                g_icmp_sock[r] = 0;
+                g_icmp_ip[r] = 0;
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -722,6 +728,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
             break;
         }
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0] && sa && (socklen_t)a2 >= 8 &&
+            *(const uint16_t *)sa == AF_INET && br_on() && br_for_ip(*(const uint32_t *)(sa + 4)) >= 0) {
+            g_icmp_ip[(int)a0] = *(const uint32_t *)(sa + 4);
+            G_RET(c) = 0;
+            break;
+        }
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
         int bridge_enabled = br_on();
         int connect_interface = bridge_enabled ? br_connect_interface(sa, (socklen_t)a2) : -1;
@@ -945,6 +957,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)dret;
                 break;
             }
+            if (icmp_try_send((int)a0, (const uint8_t *)a1, (size_t)a2, (const uint8_t *)a4, (socklen_t)a5,
+                              &dret)) {
+                G_RET(c) = (uint64_t)dret;
+                break;
+            }
         }
         // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
         // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
@@ -1008,7 +1025,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // SEQPACKET-as-DGRAM EOF: a peer-closed DGRAM recv reports ECONNRESET, but Linux SEQPACKET
         // returns 0 (EOF). Translate so the guest sees the expected end-of-stream. (See case 199.)
         if (r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
-        if (r >= 0 && want && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
+        if (r >= 0 && want && (int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_sock[(int)a0]) {
+            fill_inet_br((uint8_t *)a4, (socklen_t *)a5, g_icmp_ip[(int)a0], 0);
+        } else if (r >= 0 && want && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
             // DNS socket: report the source as the nameserver (127.0.0.11:53) so the guest resolver's
             // "answer came from the server we queried" anti-spoof check passes (the real src is AF_UNIX).
             dns_fill_ns((uint8_t *)a4, (socklen_t *)a5);
@@ -1249,6 +1268,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 }
             }
         }
+        if (nr == 211 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0]) {
+            uint8_t tmp[2048];
+            uint8_t *nm = (uint8_t *)net_nonpie_p(*(uint64_t *)(g + 0));
+            socklen_t nml = *(uint32_t *)(g + 8);
+            size_t tl = dns_gather(rebased_iov, (int)giov_count, tmp, sizeof tmp);
+            int64_t iret;
+            if (icmp_try_send((int)a0, tmp, tl, nm, nml, &iret)) {
+                G_RET(c) = (uint64_t)iret;
+                break;
+            }
+        }
         struct msghdr mh;
         // Linux: iovlen/controllen are 8-byte; macOS 4
         memset(&mh, 0, sizeof mh);
@@ -1357,7 +1387,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
         if (nr == 212 && r >= 0) {
             // recvmsg writes back name len + (host->guest) control + translated flags
-            if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
+            if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_sock[(int)a0]) {
+                fill_inet_br(gname, NULL, g_icmp_ip[(int)a0], 0);
+                *(uint32_t *)(g + 8) = 16;
+            } else if (gname && gnamelen && (int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
                 // DNS socket: report the nameserver (127.0.0.11:53) as the source (see case 207).
                 dns_fill_ns(gname, NULL);
                 *(uint32_t *)(g + 8) = 16;

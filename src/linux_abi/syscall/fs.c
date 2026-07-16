@@ -298,11 +298,14 @@ static void fd_reset_emul(int fd) {
         g_br_interface[fd] = 0;
         g_tcp_lport[fd] = 0; // drop a reused fd's stale listener so /proc/net/tcp doesn't show a ghost
         g_tcp_listen[fd] = 0;
-        if (g_dns_sock[fd]) { // container DNS: close the engine-held socketpair peer
+        if (g_dns_sock[fd] || g_icmp_sock[fd]) { // synthetic network socket: close the engine-held peer
             if (g_dns_peer[fd] >= 0) close(g_dns_peer[fd]);
             g_dns_peer[fd] = -1;
             g_dns_sock[fd] = 0;
+            g_icmp_sock[fd] = 0;
         }
+        g_icmp_kind[fd] = 0;
+        g_icmp_ip[fd] = 0;
         nl_close(fd); // tear down a netlink socket's socketpair peer
         // (eventfd counter/cslot/sema teardown is handled refcounted in the g_eventfd_peer block above so a
         // surviving dup keeps the shared counter; do NOT unconditionally zero the shared slot here.)

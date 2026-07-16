@@ -2698,6 +2698,9 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 #define HL_DNS_NS 0x0b00007fu      // 127.0.0.11, network byte order (bytes 7f 00 00 0b == LE u32 0x0b00007f)
 static uint8_t g_dns_sock[HL_NFD]; // fd -> 1 if this fd is an intercepted, socketpair-backed DNS socket
 static int g_dns_peer[HL_NFD];     // fd -> engine-held socketpair end we write synthesized responses into
+static uint8_t g_icmp_kind[HL_NFD]; // 1=dgram ping socket, 2=raw ping socket
+static uint8_t g_icmp_sock[HL_NFD]; // fd has been replaced by a reply socketpair
+static uint32_t g_icmp_ip[HL_NFD];  // connected/last echo destination
 
 // DNS interception is off under HL_NET_ISOLATE: the isolated network has no resolver, so
 // :53 to 127.0.0.11 is left to fall through to the (dead) host loopback and name resolution fails, matching.
@@ -2746,6 +2749,84 @@ static int dns_swap(int fd, int stream) {
     g_dns_peer[fd] = sv[1];
     g_dns_sock[fd] = 1;
     return 0;
+}
+
+static uint16_t icmp_checksum(const void *data, size_t size) {
+    const uint8_t *bytes = data;
+    uint32_t sum = 0;
+    while (size > 1) {
+        sum += (uint32_t)((bytes[0] << 8) | bytes[1]);
+        bytes += 2;
+        size -= 2;
+    }
+    if (size) sum += (uint32_t)bytes[0] << 8;
+    while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
+    return htons((uint16_t)~sum);
+}
+
+static int icmp_swap(int fd) {
+    int fl, df, sv[2];
+    if (fd < 0 || fd >= HL_NFD) return -1;
+    if (g_icmp_sock[fd]) return 0;
+    fl = fcntl(fd, F_GETFL);
+    df = fcntl(fd, F_GETFD);
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return -1;
+    if (sv[0] != fd) {
+        if (dup2(sv[0], fd) < 0) {
+            close(sv[0]);
+            close(sv[1]);
+            return -1;
+        }
+        close(sv[0]);
+    }
+    if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
+    if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+    g_dns_peer[fd] = sv[1];
+    g_icmp_sock[fd] = 1;
+    return 0;
+}
+
+static int icmp_try_send(int fd, const uint8_t *input, size_t size, const uint8_t *destination,
+                         socklen_t destination_size, int64_t *result) {
+    uint8_t reply[2048];
+    uint8_t *icmp = reply;
+    size_t reply_size = size;
+    uint32_t peer;
+    if (fd < 0 || fd >= HL_NFD || !g_icmp_kind[fd] || input == NULL || size < 8 || size > 2000) return 0;
+    if (destination && destination_size >= 8 && *(const uint16_t *)destination == AF_INET)
+        peer = *(const uint32_t *)(destination + 4);
+    else
+        peer = g_icmp_ip[fd];
+    if (!peer) {
+        *result = -EDESTADDRREQ;
+        return 1;
+    }
+    if (!br_on() || br_for_ip(peer) < 0) {
+        *result = -ENETUNREACH;
+        return 1;
+    }
+    if (icmp_swap(fd) < 0) return 0;
+    g_icmp_ip[fd] = peer;
+    if (g_icmp_kind[fd] == 2) {
+        memset(reply, 0, 20);
+        reply[0] = 0x45;
+        *(uint16_t *)(reply + 2) = htons((uint16_t)(20 + size));
+        reply[8] = 64;
+        reply[9] = 1;
+        *(uint32_t *)(reply + 12) = peer;
+        *(uint32_t *)(reply + 16) = g_netif[br_for_ip(peer)].ip;
+        *(uint16_t *)(reply + 10) = icmp_checksum(reply, 20);
+        icmp = reply + 20;
+        reply_size += 20;
+    }
+    memcpy(icmp, input, size);
+    if (icmp[0] == 8) icmp[0] = 0;
+    icmp[2] = icmp[3] = 0;
+    *(uint16_t *)(icmp + 2) = icmp_checksum(icmp, size);
+    (void)write(g_dns_peer[fd], reply, reply_size);
+    *result = (int64_t)size;
+    return 1;
 }
 
 // Encode a dotted host name into DNS wire label format (len-prefixed labels + a 0 terminator). -1 if it
