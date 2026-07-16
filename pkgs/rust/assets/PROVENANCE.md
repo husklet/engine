@@ -3,12 +3,12 @@
 The crate links one target-specific archive containing both guest backends and
 the activation constructor. No native executable is stored or extracted at
 runtime. The archives were built from engine commit
-`84a0a615a5c57e13072c3fc4f5b2c0ad19e723e8`.
+`3cce2bfdf25177e9bb335750add9ed7c7ba63a8c`.
 
 | Host target | Build target | SHA-256 |
 |---|---|---|
-| `aarch64-apple-darwin` | `build/package/macos-aarch64/libhl-engine.a` | `1fe09467a927d4e3d2d1ad47c4042c72a630e3c5fe593d49ff04959d6bbbda5b` |
-| `aarch64-unknown-linux-gnu` | `build/package/linux-aarch64/libhl-engine.a` | `44874d61a41fec58fb794a1fdb53feab91a868a3448bda09c169ad0e6d4c1dd9` |
+| `aarch64-apple-darwin` | `build/package/macos-aarch64/libhl-engine.a` | `bd359d72e14ba24d5fd6e2353dfcdc3ad2eb06f8e005943337ff400e8bca89fe` |
+| `aarch64-unknown-linux-gnu` | `build/package/linux-aarch64/libhl-engine.a` | `60d3cd52288dfb756703915d55e5b4ca91f9c43ae55517d4c7d6ed41a8eb4e8c` |
 
 Cargo links the selected archive with whole-archive semantics so the private
 pre-main activation constructor is retained in downstream executables. A
