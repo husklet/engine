@@ -23,7 +23,7 @@
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "hl-engine";
-            version = "0.1.2";
+            version = "0.1.6";
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
@@ -85,7 +85,7 @@
         } // pkgs.lib.optionalAttrs runtimeHost {
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
-            version = "0.1.2";
+            version = "0.1.6";
             src = ./pkgs/rust;
             cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
