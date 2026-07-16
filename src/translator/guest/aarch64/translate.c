@@ -113,6 +113,83 @@ static int uses_x18(uint32_t in, int mask) {
            field_is(in, mask & 8, 10);
 }
 
+/* FEAT_I8MM matrix multiply is not present on every Apple Silicon generation.
+   A Linux guest may still select it from its own build target, so copying these
+   same-ISA opcodes verbatim would turn a supported guest instruction into a
+   host SIGILL.  Lower the three integer matrix forms to baseline AdvSIMD.
+
+   The architectural 2x8 by 8x2 operation treats each source's low/high eight
+   bytes as the two rows.  Each output lane is one eight-element dot product.
+   Widening the byte products to halfwords, pairwise widening to words, and
+   ADDV therefore preserves the exact 32-bit modular accumulation semantics.
+   USMMLA is U8*S8: reinterpret (u8 - 128) as s8, then add 128*sum(s8) for
+   each right-hand row. */
+static int is_i8mm_mmla(uint32_t in) {
+    uint32_t op = in & ~(0x1Fu | (0x1Fu << 5) | (0x1Fu << 16));
+    return op == 0x4E80A400u || op == 0x6E80A400u || op == 0x4E80AC00u;
+}
+
+static uint32_t v3(uint32_t base, int d, int n, int m) {
+    return base | ((uint32_t)m << 16) | ((uint32_t)n << 5) | (uint32_t)d;
+}
+
+static void emit_i8mm_dot(int out, int lane, int product, int left, int right, int is_unsigned) {
+    /* SMULL/UMULL vProduct.8h, vLeft.8b, vRight.8b. */
+    emit32(v3(is_unsigned ? 0x2E20C000u : 0x0E20C000u, product, left, right));
+    /* [SU]ADDLP vProduct.4s, vProduct.8h; ADDV sProduct,vProduct.4s. */
+    emit32((is_unsigned ? 0x6E602800u : 0x4E602800u) | ((uint32_t)product << 5) | (uint32_t)product);
+    emit32(0x4EB1B800u | ((uint32_t)product << 5) | (uint32_t)product);
+    /* INS vOut.s[lane],vProduct.s[0]. */
+    emit32(0x6E040400u | ((uint32_t)lane << 19) | ((uint32_t)product << 5) | (uint32_t)out);
+}
+
+static void emit_i8mm_mmla(uint32_t in) {
+    int d = (int)(in & 31u), n = (int)((in >> 5) & 31u), m = (int)((in >> 16) & 31u);
+    int scratch = 0;
+    /* Three operands cannot intersect every aligned group of four registers. */
+    for (; scratch < 32; scratch += 4)
+        if ((d < scratch || d >= scratch + 4) && (n < scratch || n >= scratch + 4) && (m < scratch || m >= scratch + 4))
+            break;
+    int out = scratch, product = scratch + 1, left = scratch + 2, right = scratch + 3;
+    int is_unsigned = (in & 0x20000000u) != 0;
+    int is_mixed = (in & 0x00000800u) != 0;
+
+    /* Preserve scratch registers in their canonical cpu->v slots.  Async host
+       signals resume this straight-line sequence and observe restored state at
+       the next dispatcher boundary; no guest-SP window is introduced. */
+    e_stp_q(out, product, CPUREG, OFF_V + out * 16);
+    e_stp_q(left, right, CPUREG, OFF_V + left * 16);
+
+    emit32(0x4F000400u | (uint32_t)out);  /* MOVI vOut.4s,#0 */
+    emit32(v3(0x4EA01C00u, left, n, n));  /* MOV vLeft.16b,vN.16b */
+    emit32(v3(0x4EA01C00u, right, m, m)); /* MOV vRight.16b,vM.16b */
+    if (is_mixed) {
+        /* U8 left -> signed (left-128), without widening. */
+        emit32(0x4F04E400u | (uint32_t)product); /* MOVI vProduct.16b,#0x80 */
+        emit32(v3(0x6E201C00u, left, left, product));
+    }
+
+    emit_i8mm_dot(out, 0, product, left, right, is_unsigned && !is_mixed);
+    emit32(v3(0x6E004000u | (8u << 11), right, right, right)); /* rotate right rows */
+    emit_i8mm_dot(out, 1, product, left, right, is_unsigned && !is_mixed);
+    emit32(v3(0x6E004000u | (8u << 11), left, left, left)); /* rotate left rows */
+    emit_i8mm_dot(out, 3, product, left, right, is_unsigned && !is_mixed);
+    emit_i8mm_dot(out, 2, product, left, m, is_unsigned && !is_mixed);
+
+    if (is_mixed) {
+        /* vM row sums become [lo,hi,lo,hi], then multiply by 128. */
+        emit32(0x4E202800u | ((uint32_t)m << 5) | (uint32_t)product);       /* SADDLP 8h */
+        emit32(0x4E602800u | ((uint32_t)product << 5) | (uint32_t)product); /* SADDLP 4s */
+        emit32(v3(0x4EA0BC00u, product, product, product));                 /* ADDP 4s */
+        emit32(0x4F275400u | ((uint32_t)product << 5) | (uint32_t)product); /* SHL #7 */
+        emit32(v3(0x4EA08400u, out, out, product));
+    }
+    emit32(v3(0x4EA08400u, d, d, out)); /* architectural accumulate */
+
+    e_ldp_q(out, product, CPUREG, OFF_V + out * 16);
+    e_ldp_q(left, right, CPUREG, OFF_V + left * 16);
+}
+
 // ---- steal-mode stolen-reg FAST PATHS (perf: the mangle machinery measured ~20% of CPython wall) ----
 // Under the default x16/x17 steal (g_steal1617), host x16/x17 are ENGINE-PRIVATE at every point inside a
 // block body: the prologue never loads them, chained entries keep them dead, and every IBTC probe/irq
@@ -1487,6 +1564,11 @@ static void *translate_block(uint64_t gpc) {
                 continue;
             }
             // ldxr/stxr loop -> LSE
+        }
+        if (is_i8mm_mmla(in)) {
+            emit_i8mm_mmla(in);
+            gpc += 4;
+            continue;
         }
         // Load/store-exclusive family is bits[29:24]=001000. The o2 bit (bit23) distinguishes the
         // EXCLUSIVE monitor variants (o2=0: LDXR/LDAXR/STXR/STLXR/LDXP/STXP) from the merely ORDERED
