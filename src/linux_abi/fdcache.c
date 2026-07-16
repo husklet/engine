@@ -380,6 +380,10 @@ void hl_fdcache_resolution_bump(void) {
     CLK;
     g_res_epoch++;
     if (!g_res_epoch) g_res_epoch = 1;
+    if (g_fsgen_ptr != &g_fdcache.filesystem_generation_local) {
+        uint32_t generation = atomic_fetch_add_explicit(g_fsgen_ptr, 1, memory_order_release) + 1;
+        atomic_store_explicit(&g_fsgen_seen, generation, memory_order_relaxed);
+    }
     CUL;
 }
 
@@ -686,8 +690,9 @@ static void oc_reset(void) {
 // Mechanism: the daemon owns a 4-byte generation file, <hl-home>/containers/<cid>/fsgen, created before
 // the first engine of the container spawns and handed to EVERY engine of that container (run + exec +
 // health probe) as HL_FSGEN_FILE. The daemon atomically increments the mapped u32 AFTER completing any
-// external write; each engine process maps the SAME file MAP_SHARED (ctor below; fork children inherit
-// the mapping) and polls it once per syscall (dispatch.c service_local, before any handler can consult a
+// external write, and engines increment it after every guest namespace mutation. Each engine process
+// maps the SAME file MAP_SHARED (fork children inherit the mapping) and polls it once per syscall
+// (dispatch.c service_local, before any handler can consult a
 // cache). On a change it drops ALL its caches via hl_fdcache_reset() -- the same conservative fork-grade full
 // flush -- so a daemon write is visible no later than the guest's NEXT syscall, exactly like the
 // kernel-coherent dcache on real Linux. Hot-path cost: ONE shared-page atomic load per syscall. Without
@@ -712,10 +717,11 @@ static void fsgen_bind(const hl_host_services *host, const char *path) {
     if (!path || !path[0] || !host || !host->file || !host->memory || !host->file->open_relative ||
         !host->file->close || !host->memory->map_file || !host->memory->release)
         return;
-    opened = host->file->open_relative(host->context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_FILE_READ, 0, 0);
+    opened = host->file->open_relative(host->context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                      HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
     if (opened.status != HL_STATUS_OK || opened.value == HL_HOST_HANDLE_INVALID) return;
-    mapped = host->memory->map_file(host->context, opened.value, 0, 0, sizeof(uint32_t), HL_HOST_MEMORY_READ,
-                                    HL_HOST_MEMORY_SHARED, &mapping);
+    mapped = host->memory->map_file(host->context, opened.value, 0, 0, sizeof(uint32_t),
+                                    HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_SHARED, &mapping);
     closed = host->file->close(host->context, opened.value);
     if (mapped.status != HL_STATUS_OK || mapping.handle == HL_HOST_HANDLE_INVALID || mapping.address == 0 ||
         mapping.mapped_size < sizeof(uint32_t) || closed.status != HL_STATUS_OK) {

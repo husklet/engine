@@ -7,6 +7,8 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 enum generation_fault {
     GENERATION_OK,
@@ -42,7 +44,7 @@ static hl_host_result generation_open(void *opaque, hl_host_handle directory, co
     host->open_calls++;
     assert(directory == HL_HOST_HANDLE_CWD);
     assert(path_size == strlen("/run/fsgen") && memcmp(path, "/run/fsgen", path_size) == 0);
-    assert(access == HL_HOST_FILE_READ && creation == 0 && permissions == 0);
+    assert(access == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE) && creation == 0 && permissions == 0);
     if (host->fault == GENERATION_OPEN_FAIL) return (hl_host_result){HL_STATUS_IO, 0, 0, 0};
     return (hl_host_result){HL_STATUS_OK, 0, 41, 0};
 }
@@ -55,7 +57,7 @@ static hl_host_result generation_map(void *opaque, hl_host_handle file, uint64_t
     void *address;
     host->map_calls++;
     assert(file == 41 && requested_address == 0 && offset == 0 && size == sizeof(uint32_t));
-    assert(protection == HL_HOST_MEMORY_READ && flags == HL_HOST_MEMORY_SHARED);
+    assert(protection == (HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE) && flags == HL_HOST_MEMORY_SHARED);
     assert(output->abi == HL_HOST_FILE_MAPPING_ABI && output->size >= sizeof(*output));
     if (host->fault == GENERATION_MAP_FAIL) return (hl_host_result){HL_STATUS_IO, 0, 0, 0};
     if (host->fault == GENERATION_MAP_NO_HANDLE) return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
@@ -173,6 +175,19 @@ int main(void) {
     hl_fdcache_resolution_bump();
     HL_CHECK(hl_fdcache_metadata_lookup("/root/missing", &result, &found) == 0);
 
+    /* A namespace mutation in a fork child invalidates the parent's negative entry. */
+    hl_fdcache_metadata_store("/root/child-created", -2, &stored);
+    HL_CHECK(hl_fdcache_metadata_lookup("/root/child-created", &result, &found) == 1 && result == -2);
+    pid_t child = fork();
+    if (child == 0) {
+        hl_fdcache_resolution_bump();
+        _exit(0);
+    }
+    int child_status = 0;
+    HL_CHECK(child > 0 && waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+             WEXITSTATUS(child_status) == 0);
+    HL_CHECK(hl_fdcache_metadata_lookup("/root/child-created", &result, &found) == 0);
+
     hl_fdcache_resolution_store("/guest", "/root/guest");
     HL_CHECK(hl_fdcache_resolution_lookup("/guest", path, sizeof path) == 1);
     HL_CHECK(strcmp(path, "/root/guest") == 0);
@@ -208,6 +223,19 @@ int main(void) {
     HL_CHECK(hl_fdcache_metadata_lookup("/root/steady", &result, &found) == 1);
     HL_CHECK(generation_expect_coherence(&generation, current, 8) == EXIT_SUCCESS);
 
+    /* Guest mutations publish through the rootfs-shared generation to sibling processes. */
+    hl_fdcache_metadata_store("/root/sibling-created", -2, &stored);
+    child = fork();
+    if (child == 0) {
+        hl_fdcache_resolution_bump();
+        _exit(0);
+    }
+    child_status = 0;
+    HL_CHECK(child > 0 && waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+             WEXITSTATUS(child_status) == 0);
+    hl_fdcache_generation_poll();
+    HL_CHECK(hl_fdcache_metadata_lookup("/root/sibling-created", &result, &found) == 0);
+
     /* Every preparation failure leaves the active mapping authoritative. */
     const enum generation_fault faults[] = {GENERATION_OPEN_FAIL,       GENERATION_MAP_FAIL,
                                             GENERATION_MAP_FAIL_OWNED,  GENERATION_MAP_NO_HANDLE,
@@ -223,7 +251,7 @@ int main(void) {
         else
             HL_CHECK(generation.release_calls == releases);
         HL_CHECK(generation_live_count(&generation) == 1);
-        HL_CHECK(generation_expect_coherence(&generation, current, 9 + (uint32_t)index) == EXIT_SUCCESS);
+        HL_CHECK(generation_expect_coherence(&generation, current, 64 + (uint32_t)index) == EXIT_SUCCESS);
     }
     generation.fault = GENERATION_OK;
 
