@@ -48,9 +48,15 @@ static int run_process(const char *bridge, const char *engine, const char *guest
         return 1;
     }
     if (child == 0) {
+        long maximum;
         close(output_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) < 0) _exit(127);
         close(output_pipe[1]);
+        (void)unsetenv("MAKEFLAGS");
+        (void)unsetenv("MFLAGS");
+        maximum = sysconf(_SC_OPEN_MAX);
+        if (maximum < 0 || maximum > 4096) maximum = 4096;
+        for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
         if (bridge != NULL)
             execlp(bridge, bridge, engine, guest, (char *)NULL);
         else
