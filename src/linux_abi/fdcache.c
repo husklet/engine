@@ -169,12 +169,11 @@ static void oc_reset(void);
 // from cache. Precise invalidation: record fd->path on open, evict that path's
 // entry on write/truncate/create. Single-threaded only (no cross-thread races).
 //
-// POSITIVE entries are evicted precisely (the mutating syscall names the exact path it changed) and
-// otherwise survive across unrelated mutations -- the hot path (ld.so probing existing libraries) stays
-// warm. NEGATIVE (ENOENT) entries are additionally EPOCH-GATED on g_res_epoch: every name-adding syscall
-// (create/rename-into/mkdir/symlink/link, see dispatch.c) bumps the epoch BEFORE dispatch, so a negative
-// entry stamped before the mutation instantly misses and the next stat/access re-resolves the now-real
-// file. This closes the same-process create->stat coherence gap that precise eviction missed -- e.g. pip
+// Entries are epoch-gated on g_res_epoch. Precise eviction keeps the mutating process coherent without
+// waiting for another lookup, while the shared epoch also invalidates positive entries held by sibling
+// guest processes after delete/rename. Every namespace syscall bumps the epoch BEFORE dispatch, so an
+// entry stamped before the mutation instantly misses and the next stat/access re-resolves the current
+// file. This closes same-process and cross-process namespace coherence gaps -- e.g. pip
 // writes a .pyc to a temp file then renames it into place and immediately stat()s the final name; the
 // rename target's earlier ENOENT must not outlive the rename. Cross-process create-after-negative (a child /
 // pipe coprocess creates a file the parent probed absent) is covered by g_res_epoch being SHARED across the
@@ -190,8 +189,8 @@ static void oc_reset(void);
 // the negative entry in the parent too. The page is created in a constructor BEFORE any guest fork, so every
 // fork descendant AND in-process execve (hl keeps its own mappings across the guest execve) share one physical
 // counter; a fresh `docker exec` is a NEW hl process = its own tree = its own counter (correct per-container
-// isolation). Falls back to a private local counter if the mmap fails (degrades to the old per-process
-// behaviour, never crashes). Positive entries are still served epoch-independently, unchanged.
+// isolation). Falls back to a private local counter if the mmap fails (degrades to per-process
+// behaviour, never crashes).
 void hl_fdcache_runtime_init(void) {
     if (g_res_epoch_ptr != &g_fdcache.resolver_epoch_local) return;
     void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
@@ -228,9 +227,7 @@ int hl_fdcache_metadata_lookup(const char *p, int *rc, struct stat *out) {
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct mcent *e = &g_mc[h & (MCACHE_N - 1)];
-    // A negative (ENOENT) entry is only valid within the epoch it was recorded: a later create/rename can
-    // turn it positive, and every such mutation bumps g_res_epoch -> miss and re-stat the now-real file.
-    if (e->hash == h && e->fgen == g_fs_fgen && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
+    if (e->hash == h && e->fgen == g_fs_fgen && e->epoch == g_res_epoch && !strcmp(e->path, p)) {
         *rc = e->rc;
         *out = e->st;
         hit = 1;
@@ -289,9 +286,7 @@ int hl_fdcache_readlink_lookup(const char *p, int *rc, char *out, int bs, int *l
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct rlent *e = &g_rl[h & 2047];
-    // a negative readlink (ENOENT/EINVAL) only hits within its epoch -- a later symlink/create can make it
-    // resolve, and that mutation bumps g_res_epoch.
-    if (e->hash == h && e->fgen == g_fs_fgen && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
+    if (e->hash == h && e->fgen == g_fs_fgen && e->epoch == g_res_epoch && !strcmp(e->path, p)) {
         *rc = e->rc;
         int n = e->linklen < bs ? e->linklen : bs;
         if (e->rc >= 0) memcpy(out, e->link, (size_t)n);
@@ -333,9 +328,7 @@ int hl_fdcache_access_lookup(const char *p, int *rc) {
     int hit = 0;
     uint64_t h = mc_hash(p);
     struct hl_fdcache_access_entry *e = &g_ac[h & 2047];
-    // a negative existence probe only hits within its epoch -- a later create can make the path exist, and
-    // that mutation bumps g_res_epoch -> miss and re-probe.
-    if (e->hash == h && e->fgen == g_fs_fgen && (e->rc >= 0 || e->epoch == g_res_epoch) && !strcmp(e->path, p)) {
+    if (e->hash == h && e->fgen == g_fs_fgen && e->epoch == g_res_epoch && !strcmp(e->path, p)) {
         *rc = e->rc;
         hit = 1;
     }
@@ -686,12 +679,9 @@ static void oc_reset(void) {
 // (dispatch.c/overlay.c) or evict precisely. But the DAEMON also writes into a LIVE container's fs from
 // OUTSIDE any engine -- `docker cp` (PUT /containers/{id}/archive) extracts a tar into the overlay upper
 // or a bind/volume source, and an exec/health-probe spawn rewrites /etc/{hosts,resolv.conf,hostname} in
-// the upper -- and no guest syscall ever announces those. A cached NEGATIVE would then hide a file
-// docker-cp just delivered (guest polls ENOENT forever), and a stale POSITIVE would survive a cp OVER an
-// existing file (old size/mtime -- positive mc_/rl_/ac_ entries are NOT epoch-gated, only
-// precise-evicted, and the daemon can't call the evictors). Bumping g_res_epoch alone can't fix this:
-// (a) its page is MAP_ANON, shared only by THIS engine's fork tree, unreachable from the daemon; and
-// (b) it wouldn't invalidate the positives anyway.
+// the upper -- and no guest syscall ever announces those. A cached result would then hide or misdescribe
+// the daemon's completed write. Bumping g_res_epoch cannot fix this because its page is MAP_ANON, shared
+// only by THIS engine's fork tree and unreachable from the daemon.
 //
 // Mechanism: the daemon owns a 4-byte generation file, <hl-home>/containers/<cid>/fsgen, created before
 // the first engine of the container spawns and handed to EVERY engine of that container (run + exec +

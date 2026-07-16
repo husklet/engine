@@ -966,7 +966,6 @@ static void service_local(struct cpu *c) {
         default: break;
         }
     }
-    if (bound_route(c, nr, a0, a1, a2, a3)) return;
     // daemon-write coherence: notice a daemon-side write into this container's fs (docker cp /
     // exec-spawn /etc rewrites) and drop the path/metadata caches BEFORE any handler below can consult
     // them -- one shared-page atomic load per syscall (see hl_fdcache_generation_poll).
@@ -1004,6 +1003,7 @@ static void service_local(struct cpu *c) {
     }
     default: break;
     }
+    if (bound_route(c, nr, a0, a1, a2, a3)) return;
     if (svc_sysv(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_mem(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_signal(c, nr, a0, a1, a2, a3, a4, a5)) return;

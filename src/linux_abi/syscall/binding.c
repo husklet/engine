@@ -1142,6 +1142,17 @@ static int bound_handle_host_path(hl_host_handle file, char *path, size_t size) 
     return 0;
 }
 
+static void bound_evict_relative(hl_host_handle directory, const char *path) {
+    char base[HL_LINUX_PATH_MAX + 1];
+    char joined[HL_LINUX_PATH_MAX + 1];
+    int written;
+    if (path == NULL || path[0] == '\0' || bound_handle_host_path(directory, base, sizeof(base)) != 0) return;
+    written = snprintf(joined, sizeof(joined), "%s%s%s", base,
+                       base[0] != '\0' && base[strlen(base) - 1] == '/' ? "" : "/", path);
+    if (written < 0 || (size_t)written >= sizeof(joined)) return;
+    hl_fdcache_evict_path(joined);
+}
+
 /* Resolution may temporarily occupy low native descriptors. Once its opaque
  * handles are closed, republish the new typed OFD at the true lowest logical
  * guest slot and retire the temporary shadow. */
@@ -1883,6 +1894,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                               ->make_symlink(g_host_services->context, target, target_size,
                                                              directory.host_handle, path, path_size)
                                               .status);
+            if (result == 0) bound_evict_relative(directory.host_handle, path);
             G_RET(c) = (uint64_t)result;
             return 1;
         }
@@ -1924,6 +1936,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                              ->rename_relative(g_host_services->context, source.host_handle, old_path,
                                                                old_size, destination.host_handle, new_path, new_size)
                                              .status);
+            }
+            if (result == 0) {
+                bound_evict_relative(source.host_handle, old_path);
+                bound_evict_relative(destination.host_handle, new_path);
             }
             G_RET(c) = (uint64_t)result;
             return 1;
@@ -1995,6 +2011,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             g_host_services->file
                 ->make_fifo(g_host_services->context, source.host_handle, path, path_size, (uint32_t)a2 & 07777u)
                 .status);
+        if (result == 0) bound_evict_relative(source.host_handle, path);
         break;
     }
     case 34: {
@@ -2011,6 +2028,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             g_host_services->file
                 ->make_directory(g_host_services->context, source.host_handle, path, path_size, (uint32_t)a2 & 07777u)
                 .status);
+        if (result == 0) bound_evict_relative(source.host_handle, path);
         break;
     }
     case 35: {
@@ -2039,6 +2057,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 g_host_services->file->unlink_relative(g_host_services->context, source.host_handle, path, path_size)
                     .status);
         }
+        if (result == 0) bound_evict_relative(source.host_handle, path);
         break;
     }
     case 53:
