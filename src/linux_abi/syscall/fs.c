@@ -26,6 +26,7 @@ static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, 
 static int bound_handle_dirfd_error(int fd);
 static int64_t bound_relocate_lowest(int64_t opened);
 static int bound_handle_host_path(hl_host_handle file, char *path, size_t size);
+static int bound_handle_chdir(int fd, int *result);
 
 static uint32_t typed_open_flags(uint64_t guest) {
 #if G_O_DIRECTORY == 0x4000
@@ -33,7 +34,12 @@ static uint32_t typed_open_flags(uint64_t guest) {
 #else
     const uint32_t largefile = 0x8000u;
 #endif
-    uint32_t flags = (uint32_t)guest & ~(largefile | (uint32_t)G_O_DIRECTORY | (uint32_t)G_O_NOFOLLOW);
+    /* O_NOCTTY is meaningful only when opening a terminal. Typed relative regular/directory opens
+     * cannot acquire the host controlling terminal, so accept and erase it rather than rejecting a
+     * standard glibc/fts directory traversal flag with EINVAL. */
+    const uint32_t no_controlling_terminal = 0x100u;
+    uint32_t flags =
+        (uint32_t)guest & ~(largefile | no_controlling_terminal | (uint32_t)G_O_DIRECTORY | (uint32_t)G_O_NOFOLLOW);
     if (guest & G_O_DIRECTORY) flags |= HL_LINUX_O_DIRECTORY;
     if (guest & G_O_NOFOLLOW) flags |= HL_LINUX_O_NOFOLLOW;
     return flags;
@@ -41,7 +47,12 @@ static uint32_t typed_open_flags(uint64_t guest) {
 
 static uint32_t typed_host_access(uint64_t guest, int path_only) {
     uint32_t access;
-    if (path_only)
+    if (path_only && (guest & G_O_DIRECTORY))
+        /* Linux O_PATH directory descriptors remain valid for fchdir and as *at dirfds. macOS
+         * path-only/O_EVTONLY handles reject fchdir with EINVAL, so back directories with a readable
+         * descriptor and retain O_PATH's I/O rejection in the Linux fd metadata. */
+        access = HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY;
+    else if (path_only)
         access = HL_HOST_FILE_PATH_ONLY;
     else if ((guest & 3u) == 2u)
         access = HL_HOST_FILE_READ | HL_HOST_FILE_WRITE;
@@ -1911,8 +1922,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         break;
     }
     case 50: {
-        if (fchdir((int)a0) < 0) {
-            G_RET(c) = (uint64_t)(-errno);
+        int changed;
+        if (!bound_handle_chdir((int)a0, &changed)) changed = fchdir((int)a0) == 0 ? 0 : -errno;
+        if (changed < 0) {
+            G_RET(c) = (uint64_t)(int64_t)changed;
             break;
             // fchdir (tracks guest cwd)
         }
@@ -2510,9 +2523,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int nf_new = nf_want && access(host, F_OK) != 0;
             // Gate the new fd against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (host table larger).
             int r = nofile_gate(open(host, mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), (mode_t)a3));
-            if (strstr(gp, "/opt/couchdb") != NULL)
-                fprintf(stderr, "couch-open gp=%s host=%s lf=%#x mf=%#x r=%d errno=%d\n", gp, host, lf,
-                        mf | ((lf & G_O_NOFOLLOW) ? O_NOFOLLOW : 0), r, errno);
             if (r >= 0 && nf_new) newfile_stamp_fd(r);
             if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
             if (r >= 0) {
