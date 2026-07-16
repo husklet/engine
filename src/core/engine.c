@@ -625,8 +625,16 @@ hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *dat
     hl_host_handle process;
     hl_status status;
     if (engine == NULL || (data_size != 0 && data == NULL)) return HL_STATUS_INVALID_ARGUMENT;
-    if (data_size != 0) return HL_STATUS_INVALID_ARGUMENT;
-    if (request == HL_ENGINE_REQUEST_INTERRUPT)
+    if (request == HL_ENGINE_REQUEST_SIGNAL) {
+        uint32_t signal_number;
+        if (data == NULL || data_size != sizeof(signal_number)) return HL_STATUS_INVALID_ARGUMENT;
+        memcpy(&signal_number, data, sizeof(signal_number));
+        if (signal_number == 0 || signal_number > 64 || signal_number == 9 || signal_number == 19)
+            return HL_STATUS_INVALID_ARGUMENT;
+        reason = HL_HOST_PROCESS_TERMINATE_SIGNAL + signal_number;
+    } else if (data_size != 0) {
+        return HL_STATUS_INVALID_ARGUMENT;
+    } else if (request == HL_ENGINE_REQUEST_INTERRUPT)
         reason = HL_HOST_PROCESS_TERMINATE_INTERRUPT;
     else if (request == HL_ENGINE_REQUEST_FORCE_STOP)
         reason = HL_HOST_PROCESS_TERMINATE_FORCE;

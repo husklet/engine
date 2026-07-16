@@ -1,10 +1,41 @@
 #include "hl/activation.h"
+#include "hl/config.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static int config(const char *guest, char path[64]) {
+    hl_launch_config launch = {0};
+    char pool[4096] = {0};
+    size_t guest_size = strlen(guest) + 1;
+    int descriptor;
+    if (guest_size + 2 > sizeof(pool)) return -1;
+    strcpy(path, "/tmp/hl-activation.XXXXXX");
+    descriptor = mkstemp(path);
+    if (descriptor < 0) return -1;
+    memcpy(pool + 1, guest, guest_size);
+    launch.magic = HL_CONFIG_MAGIC;
+    launch.abi = HL_CONFIG_ABI;
+    launch.header_size = sizeof(launch);
+    launch.pool_size = (uint32_t)(guest_size + 2);
+    launch.uid = -1;
+    launch.gid = -1;
+    launch.arguments_offset = 1;
+    if (write(descriptor, &launch, sizeof(launch)) != sizeof(launch) ||
+        write(descriptor, pool, launch.pool_size) != launch.pool_size || close(descriptor) != 0) {
+        close(descriptor);
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
 
 static int force_stop_descendants(const char *self, const char *guest) {
     hl_activation_process *process = NULL;
@@ -43,6 +74,52 @@ static int force_stop_descendants(const char *self, const char *guest) {
                : 5;
 }
 
+static int forward_term(const char *self, const char *guest) {
+    hl_activation_process *process = NULL;
+    hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
+    hl_activation_stdio stdio;
+    uint64_t process_id = 0;
+    char output[13];
+    size_t used = 0;
+    int descriptors[2];
+    hl_status status;
+    char config_path[64];
+    if (config(guest, config_path) != 0) return 6;
+    if (pipe(descriptors) != 0) return 6;
+    stdio = (hl_activation_stdio){.input = -1, .output = descriptors[1], .error = descriptors[1]};
+    status = hl_activation_start_with_stdio(self, HL_GUEST_ISA_AARCH64, config_path, &stdio, &process);
+    close(descriptors[1]);
+    if (status != HL_STATUS_OK || hl_activation_process_id(process, &process_id) != HL_STATUS_OK) {
+        close(descriptors[0]);
+        hl_activation_process_destroy(process);
+        return 7;
+    }
+    while (used < 5) {
+        ssize_t count = read(descriptors[0], output + used, 5 - used);
+        if (count <= 0) { close(descriptors[0]); hl_activation_process_destroy(process); return 8; }
+        used += (size_t)count;
+    }
+    if (memcmp(output, "READY", 5) != 0) {
+        close(descriptors[0]); hl_activation_process_destroy(process); return 9;
+    }
+    if (kill((pid_t)process_id, SIGTERM) != 0) {
+        close(descriptors[0]); hl_activation_process_destroy(process); return 11;
+    }
+    while (used < sizeof(output)) {
+        ssize_t count = read(descriptors[0], output + used, sizeof(output) - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    status = hl_activation_wait(process, &result);
+    hl_activation_process_destroy(process);
+    close(descriptors[0]);
+    return status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 0 &&
+                   used == sizeof(output) && memcmp(output, "READYGOT_TERM", sizeof(output)) == 0
+               ? 0
+               : 10;
+}
+
 int main(int argc, char **argv) {
     hl_activation_process *process = NULL;
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
@@ -62,9 +139,13 @@ int main(int argc, char **argv) {
         hl_activation_spawn(NULL, HL_GUEST_ISA_AARCH64, NULL, NULL) != HL_STATUS_INVALID_ARGUMENT)
         return 1;
     hl_activation_process_destroy(NULL);
-    if (argc == 2) {
+    if (argc >= 2) {
         int stopped = force_stop_descendants(argv[0], argv[1]);
         if (stopped != 0) return stopped;
+    }
+    if (argc >= 3) {
+        int forwarded = forward_term(argv[0], argv[2]);
+        if (forwarded != 0) return forwarded;
     }
     puts("installed hl-engine activation package: ok");
     return 0;

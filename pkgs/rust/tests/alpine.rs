@@ -84,6 +84,34 @@ fn output_drains_large_stdout_and_stderr_concurrently() {
 }
 
 #[test]
+fn external_term_reaches_the_guest_handler() {
+    let mut child = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()))
+        .args([
+            "-c",
+            "trap 'printf GOT_TERM; exit 0' TERM; printf READY; while :; do :; done",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let id = child.id().to_string();
+    let mut stdout = child.take_stdout().unwrap();
+    let mut output = [0_u8; 5];
+    stdout.read_exact(&mut output).unwrap();
+    assert_eq!(&output, b"READY");
+    assert!(Command::new("kill")
+        .args(["-TERM", &id])
+        .status()
+        .unwrap()
+        .success());
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert_eq!(child.wait().unwrap(), Exit::Code(0));
+    assert_eq!(rest, b"GOT_TERM");
+}
+
+#[test]
 fn piped_streams_enforce_their_direction() {
     let engine = Engine::new();
     let mut child = engine

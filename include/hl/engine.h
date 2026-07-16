@@ -25,7 +25,8 @@ typedef enum hl_engine_exit_kind {
 
 typedef enum hl_engine_request_kind {
     HL_ENGINE_REQUEST_INTERRUPT = 1,
-    HL_ENGINE_REQUEST_FORCE_STOP = 2
+    HL_ENGINE_REQUEST_FORCE_STOP = 2,
+    HL_ENGINE_REQUEST_SIGNAL = 3
 } hl_engine_request_kind;
 
 typedef enum hl_engine_fd_ownership {

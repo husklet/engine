@@ -14,6 +14,7 @@ typedef hl_host_linux hl_activation_host;
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -113,6 +114,74 @@ static hl_host_services *activation_services;
 static uint32_t activation_guest_isa;
 static hl_engine_exit *activation_result;
 static hl_status activation_status;
+static hl_engine *activation_engine;
+static pthread_mutex_t activation_engine_lock = PTHREAD_MUTEX_INITIALIZER;
+static int activation_signal_pipe[2] = {-1, -1};
+static uint32_t activation_pending_signal;
+
+static int activation_guest_signal(int host_signal) {
+#if defined(__linux__)
+    return host_signal;
+#else
+    static const unsigned char macos_to_linux[32] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 7, 11, 31, 13, 14, 15,
+        23, 19, 20, 18, 17, 21, 22, 29, 24, 25, 26, 27, 28, 29, 10, 12};
+    return host_signal > 0 && host_signal < 32 ? macos_to_linux[host_signal] : host_signal;
+#endif
+}
+
+static void activation_signal_handler(int signal_number) {
+    unsigned char guest = (unsigned char)activation_guest_signal(signal_number);
+    if (activation_signal_pipe[1] >= 0) {
+        ssize_t ignored = write(activation_signal_pipe[1], &guest, sizeof(guest));
+        (void)ignored;
+    }
+}
+
+static void *activation_signal_relay(void *unused) {
+    unsigned char signal_number;
+    (void)unused;
+    while (read(activation_signal_pipe[0], &signal_number, sizeof(signal_number)) == sizeof(signal_number)) {
+        uint32_t guest_signal = signal_number;
+        if (signal_number == 0) break;
+        pthread_mutex_lock(&activation_engine_lock);
+        if (activation_engine != NULL)
+            (void)hl_engine_request(activation_engine, HL_ENGINE_REQUEST_SIGNAL, &guest_signal,
+                                    sizeof(guest_signal));
+        else
+            activation_pending_signal = signal_number;
+        pthread_mutex_unlock(&activation_engine_lock);
+    }
+    return NULL;
+}
+
+static int activation_signal_relay_start(pthread_t *thread) {
+    static const int forwarded[] = {SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+    struct sigaction action;
+    size_t index;
+    int flags;
+    if (pipe(activation_signal_pipe) != 0) return -1;
+    flags = fcntl(activation_signal_pipe[1], F_GETFL);
+    if (flags < 0 || fcntl(activation_signal_pipe[1], F_SETFL, flags | O_NONBLOCK) != 0) return -1;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = activation_signal_handler;
+    action.sa_flags = SA_RESTART;
+    sigfillset(&action.sa_mask);
+    for (index = 0; index < sizeof(forwarded) / sizeof(forwarded[0]); ++index)
+        if (sigaction(forwarded[index], &action, NULL) != 0) return -1;
+    return pthread_create(thread, NULL, activation_signal_relay, NULL);
+}
+
+static void activation_signal_relay_stop(pthread_t thread) {
+    unsigned char stop = 0;
+    ssize_t ignored = write(activation_signal_pipe[1], &stop, sizeof(stop));
+    (void)ignored;
+    (void)pthread_join(thread, NULL);
+    close(activation_signal_pipe[0]);
+    close(activation_signal_pipe[1]);
+    activation_signal_pipe[0] = -1;
+    activation_signal_pipe[1] = -1;
+}
 
 static int activation_run_config(const char *rootfs, uint32_t argc, char *const argv[],
                                  const hl_options *options, const char *result_path) {
@@ -146,8 +215,20 @@ static int activation_run_config(const char *rootfs, uint32_t argc, char *const 
     config.fd_bindings = bindings;
     config.fd_binding_count = count;
     activation_status = hl_engine_create_with_options(&config, activation_services, options, &engine);
-    if (activation_status == HL_STATUS_OK)
+    if (activation_status == HL_STATUS_OK) {
+        uint32_t pending;
+        pthread_mutex_lock(&activation_engine_lock);
+        activation_engine = engine;
+        pending = activation_pending_signal;
+        activation_pending_signal = 0;
+        if (pending != 0)
+            (void)hl_engine_request(engine, HL_ENGINE_REQUEST_SIGNAL, &pending, sizeof(pending));
+        pthread_mutex_unlock(&activation_engine_lock);
         activation_status = hl_engine_run(engine, (int)argc, (const char *const *)argv, activation_result);
+        pthread_mutex_lock(&activation_engine_lock);
+        activation_engine = NULL;
+        pthread_mutex_unlock(&activation_engine_lock);
+    }
     hl_engine_destroy(engine);
     return activation_status == HL_STATUS_OK ? 0 : 78;
 }
@@ -162,6 +243,8 @@ static void hl_activation_child(void) {
     long descriptor;
     hl_status status = HL_STATUS_CORRUPT;
     unsigned char commit;
+    pthread_t signal_thread;
+    int signal_relay = 0;
     if (value == NULL) return;
     descriptor = strtol(value, &end, 10);
     (void)unsetenv("HL_ACTIVATION_FD");
@@ -191,6 +274,13 @@ static void hl_activation_child(void) {
         activation_guest_isa = request.guest_isa;
         activation_result = &reply.result;
         activation_status = status;
+        if (status == HL_STATUS_OK) {
+            if (activation_signal_relay_start(&signal_thread) != 0) {
+                status = HL_STATUS_PLATFORM_FAILURE;
+                activation_status = status;
+            } else
+                signal_relay = 1;
+        }
         if (status == HL_STATUS_OK && hl_run_config_file_with(request.path, activation_run_config) != 0 &&
             activation_status == HL_STATUS_OK) activation_status = HL_STATUS_CORRUPT;
         status = activation_status;
@@ -201,6 +291,7 @@ static void hl_activation_child(void) {
     reply.status = (int32_t)status;
     if (request.test_flags == 5) reply.nonce[0] ^= UINT64_C(1);
     (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
+    if (signal_relay) activation_signal_relay_stop(signal_thread);
     activation_host_destroy(host);
     (void)close((int)descriptor);
     _exit(status == HL_STATUS_OK ? 0 : 127);

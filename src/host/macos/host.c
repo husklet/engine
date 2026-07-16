@@ -4159,14 +4159,27 @@ static hl_host_result hl_macos_process_terminate(void *context, hl_host_handle h
     hl_host_macos *host = context;
     hl_macos_process *process;
     pid_t pid;
-    if (reason != HL_HOST_PROCESS_TERMINATE_INTERRUPT && reason != HL_HOST_PROCESS_TERMINATE_FORCE)
+    if (reason != HL_HOST_PROCESS_TERMINATE_INTERRUPT && reason != HL_HOST_PROCESS_TERMINATE_FORCE &&
+        (reason <= HL_HOST_PROCESS_TERMINATE_SIGNAL || reason > HL_HOST_PROCESS_TERMINATE_SIGNAL + 64))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     process = hl_macos_process_lookup(host, handle);
     pid = process != NULL && !process->reaped && !host->destroying ? process->pid : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (kill(pid, reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT : SIGKILL) != 0) return hl_macos_errno();
+    int signal_number;
+    if (reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT)
+        signal_number = SIGINT;
+    else if (reason == HL_HOST_PROCESS_TERMINATE_FORCE)
+        signal_number = SIGKILL;
+    else {
+        static const unsigned char linux_to_macos[32] = {
+            0, 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15,
+            16, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 30, 12};
+        uint32_t guest = reason - HL_HOST_PROCESS_TERMINATE_SIGNAL;
+        signal_number = guest < 32 ? linux_to_macos[guest] : (int)guest;
+    }
+    if (kill(pid, signal_number) != 0) return hl_macos_errno();
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
