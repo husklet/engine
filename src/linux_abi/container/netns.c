@@ -2038,7 +2038,11 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
         hpath[i] = u->sun_path[i];
     hpath[i] = 0;
     char gpath[256];
-    if (hpath[0] == '/' && g_rootfs)
+    int guest_backing = g_rootfs != NULL;
+    for (int volume = 0; !guest_backing && volume < g_nvols; ++volume)
+        guest_backing = !strncmp(hpath, g_vols[volume].hcanon, g_vols[volume].hlen) &&
+                        (hpath[g_vols[volume].hlen] == '/' || hpath[g_vols[volume].hlen] == 0);
+    if (hpath[0] == '/' && guest_backing)
         guest_from_host(hpath, gpath, sizeof gpath); // overlay host path -> guest-visible path
     else
         snprintf(gpath, sizeof gpath, "%s", hpath); // unnamed/autobind (empty) or non-jail: pass through
