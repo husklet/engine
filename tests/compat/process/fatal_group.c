@@ -17,10 +17,15 @@ static void *blocker(void *unused) {
     _exit(received == 1 ? 91 : 95);
 }
 
+static void reraise(int signal_number) {
+    signal(signal_number, SIG_DFL);
+    raise(signal_number);
+}
+
 static void *fault(void *unused) {
     (void)unused;
-    signal(SIGSEGV, SIG_DFL);
-    raise(SIGSEGV);
+    signal(SIGSEGV, reraise);
+    *(volatile int *)0 = 1;
     _exit(92);
 }
 
