@@ -16,6 +16,7 @@ int main(void) {
     int alias;
     int output;
     int absolute;
+    int nofollow;
     struct iovec vectors[2];
     input = openat(DIRECTORY_FD, "input", O_RDONLY | O_CLOEXEC);
     if (input < 0 || (fcntl(input, F_GETFD) & FD_CLOEXEC) == 0) return 10;
@@ -57,8 +58,12 @@ int main(void) {
     if (fsync(output) != -1 || errno != EBADF) return 31;
     errno = 0;
     if (openat(DIRECTORY_FD, "missing", O_RDONLY) != -1 || errno != ENOENT) return 17;
+    nofollow = openat(DIRECTORY_FD, "input", O_RDONLY | O_NOFOLLOW);
+    if (nofollow < 0 || close(nofollow) != 0) return 18;
+    if (symlinkat("input", DIRECTORY_FD, "input-link") != 0) return 32;
     errno = 0;
-    if (openat(DIRECTORY_FD, "input", O_RDONLY | O_NOFOLLOW) != -1 || errno != EINVAL) return 18;
+    if (openat(DIRECTORY_FD, "input-link", O_RDONLY | O_NOFOLLOW) != -1 || errno != ELOOP) return 33;
+    if (unlinkat(DIRECTORY_FD, "input-link", 0) != 0) return 34;
     errno = 0;
     if (openat(DIRECTORY_FD, "", O_RDONLY) != -1 || errno != ENOENT) return 19;
     absolute = openat(DIRECTORY_FD, "/dev/null", O_RDONLY);
