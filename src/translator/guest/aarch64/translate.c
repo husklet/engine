@@ -274,7 +274,7 @@ static void emit_bf16_bfdot(uint32_t in) {
 // instruction, store back. Sampled attribution on the CPython eval loop showed the mscratch dance +
 // cpu->x[] traffic at ~20% of total run time (PLT stubs -- adrp x16/ldr x17/add x16/br x17, all-stolen --
 // alone were 19% of samples), so this is the single biggest engine tax on call-heavy aarch64 guests.
-static int stealfast_on(void) { return 0; }
+static int stealfast_on(void) { return g_steal1617; }
 
 // Emit a guest insn that references stolen reg(s): for each, a scratch S = cpu->x[stolen]; run the
 // insn with the stolen field(s) replaced by scratch(es); store back. Real x28 = cpu is the base;
