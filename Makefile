@@ -197,7 +197,9 @@ BINDING_AUX_OBJECTS := $(BUILD)/mac/binding/aarch64-runner.o $(BUILD)/mac/bindin
 	$(BUILD)/mac/stdio/aarch64-runner.o $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(BUILD)/mac/dir/aarch64-runner.o $(BUILD)/mac/dir/x86_64-runner.o
 DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJECTS:.o=.d) \
-	$(BINDING_AUX_OBJECTS:.o=.d)
+	$(BINDING_AUX_OBJECTS:.o=.d) $(EMBEDDED_MAC_OBJECTS:.o=.d) \
+	$(LINUX_AARCH64_EMBEDDED_OBJECTS:.o=.d) \
+	$(wildcard $(BUILD)/mac/dual/*.d $(BUILD)/linux-aarch64/dual/*.d)
 
 UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
 
