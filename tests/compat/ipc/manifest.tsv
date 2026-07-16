@@ -23,6 +23,7 @@ poslk-xproc	lock	ipc_poslk_xproc.c	ext_ipc/ipc_poslk_xproc.c	aarch64,x86_64	-sta
 lockf-fork	lock	ipc_lockf.c	ext_ipc/ipc_lockf.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_lockf.out	linux-libc,threads,ipc	active	byte-preserving transfer
 sysv-edge	sysv	ipc_sysv_edge.c	ext_ipc/ipc_sysv_edge.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_sysv_edge.out	linux-libc,threads,ipc	active	legacy oracle replaced by exact golden
 sysv-ctl	sysv	sysv_ctl.c	ext_ipc/sysv_ctl.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/sysv_ctl.out	linux-libc,threads,ipc	active	legacy oracle replaced by exact golden
+sysv-owner	sysv	sysv_owner.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/sysv_owner.out	linux-libc,ipc	active	post-drop creator owns private IPC objects
 mq-edge	mqueue	ipc_mq_edge.c	ext_ipc/ipc_mq_edge.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_mq_edge.out	linux-libc,threads,ipc	active	legacy oracle replaced by exact golden
 mq-notify	mqueue	ipc_mq_notify.c	ext_ipc/ipc_mq_notify.c	aarch64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_mq_notify.out	linux-libc,threads,ipc	active	legacy registration is AArch64-only
 mq	mqueue	ipc_mq.c	ext_ipc/ipc_mq.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_mq.out	linux-libc,threads,ipc	active	legacy oracle replaced by exact golden

@@ -504,9 +504,10 @@ static void hl_perm_to_guest(struct ipc64_perm_guest *g, const struct hl_ipc_per
 }
 
 static void hl_perm_init(struct hl_ipc_perm *p, int32_t key, int flag) {
+    cred_init();
     p->key = key;
-    p->uid = p->cuid = (uint32_t)cuid();
-    p->gid = p->cgid = (uint32_t)cgid();
+    p->uid = p->cuid = (uint32_t)cred_euid();
+    p->gid = p->cgid = (uint32_t)cred_egid();
     p->mode = (uint32_t)(flag & 0777);
     // seq is preserved across free/realloc by the caller.
 }
