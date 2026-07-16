@@ -393,6 +393,7 @@ static int sentry_forwarded(uint64_t nr) {
     case 66:  // writev      (flatten guest iovec -> ring)
     case 67:  // pread64      (read + a3 offset)
     case 68:  // pwrite64     (write + a3 offset)
+    case 71:  // sendfile     (two sentry-owned file descriptors)
     case 79:  // newfstatat   (in-path a1 + out-struct a2, two-buffer)
     case 80:  // fstat        (out-struct a1)
     case 291: // statx        (in-path a1 + out-struct a4, two-buffer)
@@ -509,6 +510,7 @@ struct sentry_proc {
     int real[SENTRY_VFD_MAX];         // virtual fd -> real sentry fd (-1 = unused slot)
     uint8_t borrowed[SENTRY_VFD_MAX]; // 1 = inherited/borrowed real fd (stdio): never close() it on drop
     uint8_t cloexec[SENTRY_VFD_MAX];  // 1 = FD_CLOEXEC set (O_CLOEXEC open / F_SETFD): swept on guest execve
+    uint8_t typed[SENTRY_VFD_MAX];    // 1 = real[] names an opaque ABI descriptor shadow, not a native fd
 };
 static struct sentry_proc g_proc[SENTRY_NPROC];
 static pthread_mutex_t g_fd_lock = PTHREAD_MUTEX_INITIALIZER; // guards g_proc[] (alloc / lookup / map)
@@ -521,6 +523,7 @@ static void proc_init_table(struct sentry_proc *p, pid_t wpid) {
         p->real[i] = -1;
         p->borrowed[i] = 0;
         p->cloexec[i] = 0;
+        p->typed[i] = 0;
     }
     for (int i = 0; i < 3; i++) {
         p->real[i] = i;
@@ -554,10 +557,12 @@ static struct sentry_proc *proc_find_locked(pid_t wpid) {
 // Allocate the lowest free virtual fd >= minv, map it to (owned, closeable) real fd `rfd`. Returns vfd, or -1
 // if the table is full (caller closes `rfd` and returns -EMFILE -- never leaks the real fd to the guest).
 static int vfd_alloc(struct sentry_proc *p, int rfd, uint32_t minv) {
+    hl_linux_fd_snapshot snapshot;
     for (uint32_t v = minv; v < SENTRY_VFD_MAX; v++)
         if (p->real[v] < 0) {
             p->real[v] = rfd;
             p->borrowed[v] = 0;
+            p->typed[v] = bound_snapshot((uint64_t)(uint32_t)rfd, &snapshot) != 0;
             return (int)v;
         }
     return -1;
@@ -577,6 +582,7 @@ static int vfd_drop(struct sentry_proc *p, int vfd) {
     p->real[vfd] = -1;
     p->borrowed[vfd] = 0;
     p->cloexec[vfd] = 0;
+    p->typed[vfd] = 0;
     return rfd;
 }
 
@@ -604,12 +610,13 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
         for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++) {
             if (pp->real[v] < 0) continue;
             cp->cloexec[v] = pp->cloexec[v]; // FD_CLOEXEC is inherited across fork (Linux fd semantics)
+            cp->typed[v] = pp->typed[v];
             if (pp->borrowed[v]) {
                 cp->real[v] = pp->real[v];
                 cp->borrowed[v] = 1;
             } else {
                 hl_linux_fd_snapshot typed;
-                int d = bound_snapshot((uint64_t)(uint32_t)pp->real[v], &typed)
+                int d = pp->typed[v] && bound_snapshot((uint64_t)(uint32_t)pp->real[v], &typed)
                             ? (int)bound_dup_at_least(typed.fd, 0,
                                                       cp->cloexec[v] ? HL_LINUX_FD_CLOEXEC : 0)
                             : dup(pp->real[v]);
@@ -723,6 +730,7 @@ static int fd_in_a0(uint64_t nr) {
     case 66:
     case 67:
     case 68:
+    case 71:
     case 80: // fs r/w/seek/stat
     case 200:
     case 201:
@@ -1053,7 +1061,29 @@ static void sentry_service_one(struct sentry_ring *R) {
         pthread_mutex_lock(&g_fd_lock);
         struct sentry_proc *p = proc_find_locked((pid_t)R->wpid);
         int eb = (p == NULL);
+        g_bound_source_native = 0;
+        g_bound_second_native = 0;
+        if (p && (fd_in_a0(snr) || snr == 56 || snr == 79 || snr == 291)) {
+            int v = (int)(int64_t)G_A0(&tmp);
+            if (v >= 0 && (uint32_t)v < SENTRY_VFD_MAX && p->real[v] >= 0 && !p->typed[v])
+                g_bound_source_native = 1;
+        }
         if (p) switch (snr) {
+            case 71: { // sendfile: a0=output, a1=input; both are virtual descriptors
+                int output = (int)(int64_t)G_A0(&tmp);
+                int input = (int)(int64_t)G_A1(&tmp);
+                int real_output = vfd_real(p, output);
+                int real_input = vfd_real(p, input);
+                if (real_output < 0 || real_input < 0) {
+                    eb = 1;
+                } else {
+                    g_bound_source_native = !p->typed[output];
+                    g_bound_second_native = !p->typed[input];
+                    G_A0(&tmp) = (uint64_t)(int64_t)real_output;
+                    G_A1(&tmp) = (uint64_t)(int64_t)real_input;
+                }
+                break;
+            }
             case 56:
             case 79:
             case 291: { // openat/newfstatat/statx: a0 = dirfd; AT_FDCWD (<0) passes through
@@ -1101,7 +1131,11 @@ static void sentry_service_one(struct sentry_ring *R) {
                     local_ret = -EBADF;
                     break;
                 }
-                int rnew = fcntl(rold, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+                hl_linux_fd_snapshot typed;
+                int rnew = p->typed[oldv] && bound_snapshot((uint64_t)(uint32_t)rold, &typed)
+                               ? (int)bound_dup_at_least(typed.fd, 0,
+                                                         (flags & LX_O_CLOEXEC) ? HL_LINUX_FD_CLOEXEC : 0)
+                               : fcntl(rold, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
                 if (rnew < 0) {
                     local_ret = -errno;
                     break;
@@ -1110,6 +1144,7 @@ static void sentry_service_one(struct sentry_ring *R) {
                 if (prev >= 0) close(prev);
                 p->real[newv] = rnew;
                 p->borrowed[newv] = 0;
+                p->typed[newv] = p->typed[oldv];
                 p->cloexec[newv] = (flags & LX_O_CLOEXEC) != 0; // dup3 sets FD_CLOEXEC iff LX_O_CLOEXEC given
                 local_ret = newv;
                 break;
@@ -1396,9 +1431,9 @@ static void sentry_init(void) {
     g_guest_children = 0;
     // The authoritative ABI box and the host implementation both own process-local locks and handles.
     // Bracket the sentry helper fork exactly like a guest fork so the parent releases the speculative
-    // child handles and the helper repairs its inherited host state.  The helper deliberately drops its
-    // box pointer afterwards: sentry virtual descriptors belong to g_proc and must never be mistaken for
-    // worker-side typed descriptors merely because their small integer values overlap.
+    // child handles and the helper repairs its inherited host state. The helper retains its forked ABI box:
+    // sentry virtual descriptors map to owned native shadows, and typed lookup happens only after that mapping,
+    // so post-fork opens can keep opaque host handles without confusing virtual and logical fd numbers.
     bound_status = bound_fork_prepare(&bound_fork);
     if (bound_status != 0) {
         fprintf(stderr, "[sentry] host fork prepare failed: %d\n", bound_status);
@@ -1423,7 +1458,6 @@ static void sentry_init(void) {
         _exit(71);
     }
     if (pid == 0) {
-        g_linux_box = NULL;
         sentry_loop(); // child: spawns the per-ring servicer threads; never returns
         _exit(0);
     }
@@ -1616,6 +1650,12 @@ static void syscall_route(struct cpu *c) {
         R->a[2] = n; // ship exactly n bytes; a short (p)write is legal -> guest loops
         break;
     }
+    case 71: // sendfile(out, in, offset*, count): optional in/out offset
+        if (G_A2(c)) {
+            memcpy(R->buf, (const void *)G_A2(c), sizeof(int64_t));
+            R->redir[2] = 0;
+        }
+        break;
     case 63:   // read(fd, a1=buf, a2=len)
     case 67:   // pread64(fd, a1=buf, a2=len, a3=off)
     case 61: { // getdents64(fd, a1=buf, a2=count): reserve the out window; cap to BUFSZ
@@ -1924,6 +1964,9 @@ static void syscall_route(struct cpu *c) {
         break;
     case 291: // statx: struct landed at buf[SENTRY_PATHCAP]
         if (ret == 0) memcpy((void *)G_A4(c), R->buf + SENTRY_PATHCAP, SENTRY_STATXSZ);
+        break;
+    case 71:
+        if (ret >= 0 && G_A2(c)) memcpy((void *)G_A2(c), R->buf, sizeof(int64_t));
         break;
     case 65: // readv: scatter the ret bytes the sentry fetched back into the guest iovecs
         if (ret > 0) {

@@ -2584,7 +2584,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE | HL_OPEN_APPEND);
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
             int pfd = jail_open_plan((int)a0, (const char *)a1, intent, typed_host_access(a2, is_opath),
-                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3, !g_untrusted && !nf_want,
+                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3, !nf_want,
                                      bound_handle_reserve, &typed_slot, bound_handle_dirfd_error, &typed_created, fin,
                                      sizeof fin, &plan);
             if (pfd < 0) {
@@ -2599,8 +2599,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             abs_guest((int)a0, (const char *)a1, typed_guest_path, sizeof typed_guest_path);
             int typed_directory = plan.target_type == HL_HOST_FILE_TYPE_DIRECTORY && (lf & G_O_DIRECTORY) &&
                                   (!g_nlower || jail_is_vol(typed_guest_path));
-            /* The sentry wire still transports native descriptors; typed publication is safe only locally. */
-            if (!g_untrusted && plan.directory == HL_HOST_HANDLE_INVALID && plan.target != HL_HOST_HANDLE_INVALID &&
+            /* The sentry owns newly opened descriptors and virtualizes their numbers before returning to the
+             * worker, so opaque host handles remain typed across the boundary without lending a native fd. */
+            if (plan.directory == HL_HOST_HANDLE_INVALID && plan.target != HL_HOST_HANDLE_INVALID &&
                 ((plan.target_type == HL_HOST_FILE_TYPE_REGULAR && !(lf & G_O_DIRECTORY)) || typed_directory)) {
                 int64_t opened;
                 char typed_host_path[HL_LINUX_PATH_MAX + 1];

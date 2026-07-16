@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,26 +46,33 @@ int main(void) {
     if (kid == 0) {
         // CHILD: fresh worker process -> sentry_fork_child() drops the inherited lane, mints a new token.
         // Every fs syscall below is forwarded on the child's freshly CAS-claimed lane.
-        char path[64];
+        char path[64], copy[64];
         snprintf(path, sizeof path, "/tmp/sentry_fork.%d", (int)getpid());
+        snprintf(copy, sizeof copy, "/tmp/sentry_fork_copy.%d", (int)getpid());
         int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
         if (fd < 0) _exit(11);
         unsigned char buf[256];
         fill(buf);
         if (write_all(fd, buf, sizeof buf) != 0) _exit(12);
         if (close(fd) != 0) _exit(13);
+        int input = open(path, O_RDONLY);
+        int output = open(copy, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (input < 0 || output < 0) _exit(14);
+        if (sendfile(output, input, NULL, sizeof buf) != (ssize_t)sizeof buf) _exit(15);
+        if (close(input) != 0 || close(output) != 0) _exit(16);
         _exit(7); // distinct golden exit code the parent verifies
     }
 
     // PARENT: reap the child first (this synchronizes -- the child's write+close are complete before we
     // read), then read the SAME file back on the parent's own lane and verify the bytes.
-    char path[64];
+    char path[64], copy[64];
     snprintf(path, sizeof path, "/tmp/sentry_fork.%d", (int)kid);
+    snprintf(copy, sizeof copy, "/tmp/sentry_fork_copy.%d", (int)kid);
     int st = 0;
     int child_exit = -1;
     if (waitpid(kid, &st, 0) == kid && WIFEXITED(st)) child_exit = WEXITSTATUS(st);
 
-    int fd = open(path, O_RDONLY);
+    int fd = open(copy, O_RDONLY);
     unsigned long sum = 0;
     int ok = 0;
     if (fd >= 0) {
@@ -83,6 +91,7 @@ int main(void) {
         close(fd);
     }
     unlink(path); // cleanup (unlinkat stays worker-local; harmless with HL_JIT_SANDBOX off)
+    unlink(copy);
 
     printf("sentry_fork child_exit=%d readback=%s sum=%lu\n", child_exit, ok ? "ok" : "bad", sum);
     return 0;

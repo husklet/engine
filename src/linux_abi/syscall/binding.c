@@ -6,6 +6,11 @@
 #include "../bus.h"
 
 static int g_bound_sentinel = -1;
+/* The sentry translates virtual descriptors before dispatch. A native descriptor may share an integer
+ * with a logical typed descriptor in the sentry's forked ABI box; this per-servicer marker prevents that
+ * native argument from being mistaken for typed authority. */
+static _Thread_local int g_bound_source_native;
+static _Thread_local int g_bound_second_native;
 
 typedef struct bound_watch_source {
     uint64_t token;
@@ -1742,7 +1747,7 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     hl_linux_fd_snapshot source;
     int64_t result;
-    int source_bound = bound_snapshot(a0, &source);
+    int source_bound = !g_bound_source_native && bound_snapshot(a0, &source);
     if (nr == 26 && g_linux_box != NULL) {
         bound_inotify_provider *provider;
         if ((a0 & ~(UINT64_C(0x800) | UINT64_C(0x80000))) != 0) {
@@ -1852,7 +1857,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (nr == 71) {
         hl_linux_fd_snapshot second;
-        int second_bound = bound_snapshot(a1, &second);
+        int second_bound = !g_bound_second_native && bound_snapshot(a1, &second);
         if (source_bound || second_bound) {
             G_RET(c) = (uint64_t)bound_sendfile(source_bound ? &source : NULL, (int)a0, second_bound ? &second : NULL,
                                                 (int)a1, a2, a3);
