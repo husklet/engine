@@ -1927,8 +1927,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 52: {
         struct stat status;
         mode_t host_mode = (mode_t)a1 & 0777;
-        if (cred_euid() == 0 && fstat((int)a0, &status) == 0)
-            host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
+        if (cred_euid() == 0 && fstat((int)a0, &status) == 0) host_mode |= S_ISDIR(status.st_mode) ? 0700 : 0600;
         int r = fchmod((int)a0, host_mode);
         if (r == 0) mode_xattr_set_fd((int)a0, (mode_t)a1);
         if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
@@ -2078,8 +2077,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         hl_owner_set_fd((int)a0, (int)(int32_t)(uint32_t)a1, (int)(int32_t)(uint32_t)a2);
         // the guest-owner xattr just changed -> drop this path's cached stat so a later stat reports it
-        if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
-            hl_fdcache_evict_path(g_fdpath[(int)a0]);
+        if ((int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0]) hl_fdcache_evict_path(g_fdpath[(int)a0]);
         G_RET(c) = 0;
         break;
     }
@@ -2603,10 +2601,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 intent &=
                     ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE | HL_OPEN_APPEND);
             // resolve following the final symlink unless the guest asked O_NOFOLLOW (per-arch bit)
-            int pfd = jail_open_plan((int)a0, (const char *)a1, intent, typed_host_access(a2, is_opath),
-                                     is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3, !nf_want,
-                                     bound_handle_reserve, &typed_slot, bound_handle_dirfd_error, &typed_created, fin,
-                                     sizeof fin, &plan);
+            int pfd =
+                jail_open_plan((int)a0, (const char *)a1, intent, typed_host_access(a2, is_opath),
+                               is_opath ? 0 : typed_host_creation(a2), (uint32_t)a3, !nf_want, bound_handle_reserve,
+                               &typed_slot, bound_handle_dirfd_error, &typed_created, fin, sizeof fin, &plan);
             if (pfd < 0) {
                 bound_handle_cancel(&typed_slot);
                 G_RET(c) = (uint64_t)(int64_t)pfd;
@@ -2631,7 +2629,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));
                 if (opened < 0) (void)g_host_services->file->close(g_host_services->context, plan.target);
                 opened = bound_relocate_lowest(opened);
-                if (opened >= 0 && have_typed_host_path) hl_fdcache_fd_setpath((int)opened, typed_host_path);
+                if (opened >= 0 && have_typed_host_path) {
+                    hl_fdcache_fd_setpath((int)opened, typed_host_path);
+                    if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
+                        hl_fdcache_metadata_evict(typed_host_path);
+                        hl_fdcache_readlink_evict(typed_host_path);
+                        hl_fdcache_access_evict(typed_host_path);
+                    }
+                }
                 G_RET(c) = (uint64_t)opened;
                 break;
             }

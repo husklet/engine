@@ -1,4 +1,5 @@
 # case	group	source	legacy_source	isas	cflags	defines	env	exit	stdout	dependencies	disposition	note
+typed-create-cache	metadata	create_cache.c	focused-production-regression	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/create_cache.out	linux-libc,open,stat,unlink	active	negative stat cache invalidates after typed create; unlink-open-file and same-name recreation remain independent
 permissions	storage	permissions.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	HL_UID=0;HL_GID=0	0	expected/shared/permissions.out	linux-libc,filesystem	active	Linux root DAC override and virtual mode semantics
 fs-statfs-type	storage	statfs_type.c	ext_fs/statfs_type.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/shared/statfs_type.out	alpine-rootfs,overlay,linux-libc	active	exact source; legacy alpine overlay contract
 fs-mounttab	storage	mounttab.c	ext_fs/mounttab.c	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/shared/mounttab.out	alpine-rootfs,overlay,linux-libc	active	exact source; legacy alpine overlay contract
