@@ -343,12 +343,45 @@ static int domain_birth(const char *directory, pid_t pid, uint64_t *birth) {
     return 1;
 }
 
+static void domain_record_remove(const char *directory, pid_t pid) {
+    static const char prefixes[] = {'\0', 'b', 'x'};
+    char path[160];
+    size_t index;
+    for (index = 0; index < sizeof prefixes; ++index) {
+        if (prefixes[index] == 0)
+            snprintf(path, sizeof path, "%s/%d", directory, (int)pid);
+        else
+            snprintf(path, sizeof path, "%s/%c%d", directory, prefixes[index], (int)pid);
+        (void)unlink(path);
+    }
+}
+
+static void domain_directory_remove(const char *directory) {
+    DIR *entries = opendir(directory);
+    struct dirent *entry;
+    if (entries == NULL) return;
+    while ((entry = readdir(entries)) != NULL) {
+        const char *name = entry->d_name;
+        char *end;
+        long raw;
+        if (name[0] == 'b' || name[0] == 'x') ++name;
+        if (name[0] < '1' || name[0] > '9') continue;
+        errno = 0;
+        raw = strtol(name, &end, 10);
+        if (errno == 0 && *end == 0 && raw > 0 && raw <= INT32_MAX)
+            domain_record_remove(directory, (pid_t)raw);
+    }
+    (void)closedir(entries);
+    (void)rmdir(directory);
+}
+
 hl_status hl_activation_domain_terminate(hl_process_domain domain) {
     char directory[96];
     unsigned round;
+    unsigned empty = 0;
     if ((domain.identity[0] | domain.identity[1]) == 0) return HL_STATUS_INVALID_ARGUMENT;
     domain_path(domain, directory, sizeof directory);
-    for (round = 0; round < 8; ++round) {
+    for (round = 0; round < 200; ++round) {
         DIR *entries = opendir(directory);
         struct dirent *entry;
         unsigned live = 0;
@@ -362,8 +395,11 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
             errno = 0;
             raw = strtol(entry->d_name, &end, 10);
             if (errno != 0 || *end != 0 || raw <= 0 || raw > INT32_MAX) continue;
-            if (!domain_birth(directory, (pid_t)raw, &expected)) continue;
-            if (!hl_host_process_read(raw, &process) || process.start_time_ns != expected) continue;
+            if (!domain_birth(directory, (pid_t)raw, &expected) || !hl_host_process_read(raw, &process) ||
+                process.start_time_ns != expected) {
+                domain_record_remove(directory, (pid_t)raw);
+                continue;
+            }
             ++live;
             if (kill((pid_t)raw, SIGKILL) != 0 && errno != ESRCH) {
                 (void)closedir(entries);
@@ -371,8 +407,15 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
             }
         }
         (void)closedir(entries);
-        if (live == 0) return HL_STATUS_OK;
-        (void)poll(NULL, 0, 2);
+        if (live == 0) {
+            if (++empty >= 2) {
+                domain_directory_remove(directory);
+                return HL_STATUS_OK;
+            }
+        } else {
+            empty = 0;
+        }
+        (void)poll(NULL, 0, 10);
     }
     return HL_STATUS_BUSY;
 }

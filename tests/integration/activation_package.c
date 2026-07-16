@@ -81,6 +81,7 @@ static int process_domain(const char *self, const char *guest, uint32_t isa) {
     hl_process_domain domain = {{(uint64_t)getpid(), ((uint64_t)time(NULL) << 32) ^ isa}};
     hl_activation_stdio stdio;
     char config_path[64], text[64] = {0}, *end;
+    char registry[96];
     int output[2], status;
     long daemon;
     pid_t sibling;
@@ -121,7 +122,11 @@ static int process_domain(const char *self, const char *guest, uint32_t isa) {
     }
     kill(sibling, SIGKILL);
     waitpid(sibling, NULL, 0);
-    return hl_activation_domain_terminate(domain) == HL_STATUS_OK ? 0 : 33;
+    snprintf(registry, sizeof registry, "/tmp/.hl-domain.%016llx%016llx",
+             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+    return hl_activation_domain_terminate(domain) == HL_STATUS_OK && access(registry, F_OK) != 0 && errno == ENOENT
+               ? 0
+               : 33;
 }
 
 static int force_stop_descendants(const char *self, const char *guest) {
