@@ -509,16 +509,6 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     // fallback — the same graceful degradation as before this fix.
     if (sig_default_terminates(sig)) {
         sig_diag_raise_default(c, sig);
-#if defined(__linux__)
-        // Linux uses the same signal numbering and wait-status encoding as the guest. Let the host kernel
-        // terminate this forked guest process so its parent observes a genuine WIFSIGNALED status. The
-        // shared relay below is also required for SIGSYS: the engine reserves the host SIGSYS disposition
-        // while translated code is active, so reusing it here is not a faithful process-termination path.
-        if (sig != 31) {
-            signal(sig, SIG_DFL);
-            raise(sig);
-        }
-#endif
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
         c->exited = 1;
@@ -781,17 +771,6 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     // the container init just exits 128+signo (what `docker run` reports for a crash). This is hl's standard
     // fatal-signal relay -- the same mechanism as a fatal-default signal in maybe_deliver_signal.
     if (container_pid() != 1) {
-#if defined(__linux__)
-        // On a Linux host, preserve the kernel's native WIFSIGNALED status. The synchronous signal is
-        // blocked while this handler runs, so restore its default disposition and unblock it before
-        // re-sending it to this process. If delivery unexpectedly returns, retain the relay fallback.
-        signal(hostsig, SIG_DFL);
-        sigset_t unblocked;
-        sigemptyset(&unblocked);
-        sigaddset(&unblocked, hostsig);
-        sigprocmask(SIG_UNBLOCK, &unblocked, NULL);
-        kill(getpid(), hostsig);
-#endif
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
     }
