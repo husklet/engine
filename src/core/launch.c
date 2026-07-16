@@ -67,6 +67,7 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->restore_directory_offset,
         config->result_path_offset,
         config->network_interfaces_offset,
+        config->file_owners_offset,
     };
     size_t i;
     for (i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
@@ -206,6 +207,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     if (s[0]) APPLY_OPTION("HL_IP", s);
     s = launch_string(&cfg, pool, cfg.network_interfaces_offset);
     if (s[0]) APPLY_OPTION("HL_NETIFS", s);
+    s = launch_string(&cfg, pool, cfg.file_owners_offset);
+    if (s[0]) APPLY_OPTION("HL_FILE_OWNERS", s);
     s = launch_string(&cfg, pool, cfg.filesystem_generation_offset);
     if (s[0]) APPLY_OPTION("HL_FSGEN_FILE", s);
     // Per-workspace VPN egress: netns.c reads HL_EGRESS_SOCKS to funnel the
@@ -237,7 +240,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // mode additionally confines the worker. Value 1 retains the ABI4 public behavior, while value 2 selects
     // sentry-only routing without applying a Seatbelt profile to paths supplied by a developer harness.
     if (cfg.sandbox) {
-        APPLY_OPTION("HL_UNTRUSTED", "1");
+    APPLY_OPTION("HL_UNTRUSTED", "1");
         if (cfg.sandbox == HL_CONFIG_SANDBOX_ENABLED) APPLY_OPTION("HL_SANDBOX", "1");
     }
 

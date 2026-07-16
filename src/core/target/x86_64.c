@@ -103,6 +103,7 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/container/state.c" // SHARED: container globals (rootfs/cwd/netns/ids/fd tables)
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
+#include "../../linux_abi/container/owner.h"
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 #include "../../translator/guest/x86_64/avx.h"
 static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonpie_bias};
@@ -384,6 +385,7 @@ static int container_init(const char *rootfs) {
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
         if (root_handle_bind(g_rootfs) != 0) return -1;
+        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS")) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
@@ -394,7 +396,7 @@ static int container_init(const char *rootfs) {
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
     }
-    if (!rootfs && root_handle_bind("/") != 0) return -1;
+    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL) != 0)) return -1;
     {
         // HL_NETNS is a short key (not a path) used to derive abstract-socket and IPC identities.
         // The daemon and both guest ISAs share it across exec; the private-loopback directory is derived from it.

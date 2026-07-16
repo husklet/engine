@@ -37,7 +37,7 @@ struct hl_engine {
     char *owned_working_directory;
     char *owned_hostname;
     char *owned_environment;
-    char *owned_box_strings[12];
+    char *owned_box_strings[13];
     hl_engine_publish_rule *owned_publish;
 };
 
@@ -255,7 +255,8 @@ static int hl_engine_proxy_valid(const char *value) {
     X(lower_layers, "HL_LOWER") X(volumes, "HL_VOLUMES") X(limits, "HL_ULIMITS")                               \
     X(network_namespace, "HL_NETNS") X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR")         \
     X(ip, "HL_IP") X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                  \
-    X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")
+    X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")             \
+    X(file_owners, "HL_FILE_OWNERS")
 
 static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
     char number[32];
@@ -263,10 +264,12 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX |
                            HL_ENGINE_BOX_NETWORK_ISOLATED;
     const size_t abi1_size = offsetof(hl_engine_box_config, lower_layers);
+    const size_t abi3_size = offsetof(hl_engine_box_config, file_owners);
     int has_v2;
     if (box == NULL) return HL_STATUS_OK;
-    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI) ||
+    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI) ||
         (box->abi == HL_ENGINE_BOX_ABI_1 && box->size != abi1_size) ||
+        (box->abi == HL_ENGINE_BOX_ABI_3 && box->size < abi3_size) ||
         (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box))) return HL_STATUS_ABI_MISMATCH;
     has_v2 = box->abi >= HL_ENGINE_BOX_ABI;
     if (has_v2) known_flags |= HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED |
@@ -310,7 +313,8 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         (box->environment != NULL && engine->owned_environment == NULL))
         return HL_STATUS_OUT_OF_MEMORY;
     memset(&engine->box_config, 0, sizeof(engine->box_config));
-    memcpy(&engine->box_config, box, has_v2 ? sizeof(*box) : abi1_size);
+    memcpy(&engine->box_config, box,
+           box->abi == HL_ENGINE_BOX_ABI_1 ? abi1_size : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size : sizeof(*box));
     engine->box_config.working_directory = engine->owned_working_directory;
     engine->box_config.hostname = engine->owned_hostname;
     engine->box_config.environment = engine->owned_environment;

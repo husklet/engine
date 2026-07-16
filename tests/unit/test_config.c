@@ -20,7 +20,6 @@ int main(void) {
     hl_engine_publish_rule rule = {UINT32_C(0x0100007f), 8080, 80};
     const hl_engine_publish_rule *rules;
 
-    HL_CHECK(sizeof(hl_launch_config) == 144);
     HL_CHECK(sizeof(hl_engine_publish_rule) == 8);
     HL_CHECK(offsetof(hl_engine_publish_rule, host_ipv4_be) == 0);
     HL_CHECK(offsetof(hl_engine_publish_rule, host_port) == 4);
@@ -33,6 +32,8 @@ int main(void) {
     HL_CHECK(offsetof(hl_launch_config, result_path_offset) == 132);
     HL_CHECK(offsetof(hl_launch_config, publish_count) == 136);
     HL_CHECK(offsetof(hl_launch_config, network_interfaces_offset) == 140);
+    HL_CHECK(offsetof(hl_launch_config, file_owners_offset) == 144);
+    HL_CHECK(sizeof(hl_launch_config) == 152);
     HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));

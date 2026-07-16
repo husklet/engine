@@ -14,9 +14,9 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 7;
-const HEADER_SIZE: usize = 144;
-const HEADER_SIZE_U32: u32 = 144;
+const ABI: u32 = 8;
+const HEADER_SIZE: usize = 152;
+const HEADER_SIZE_U32: u32 = 152;
 const MAGIC_OFFSET: usize = 0;
 const POOL_SIZE_OFFSET: usize = 4;
 const HEADER_SIZE_OFFSET: usize = 8;
@@ -45,10 +45,11 @@ const ARGUMENTS_OFFSET: usize = 108;
 const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
 const INTERFACES_OFFSET: usize = 140;
+const FILE_OWNERS_OFFSET: usize = 144;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
-const _: () = assert!(INTERFACES_OFFSET + 4 == HEADER_SIZE);
+const _: () = assert!(FILE_OWNERS_OFFSET + 8 == HEADER_SIZE);
 
 struct Pool(Vec<u8>);
 
@@ -139,6 +140,41 @@ fn environment(config: &Config) -> Result<Option<OsString>, Error> {
         output.extend_from_slice(name);
         output.push(b'=');
         output.extend_from_slice(value);
+    }
+    Ok(Some(OsString::from_vec(output)))
+}
+
+fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    if config.file_owners.is_empty() {
+        return Ok(None);
+    }
+    let mut entries = config.file_owners.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut output = Vec::new();
+    for (index, (path, uid, gid)) in entries.into_iter().enumerate() {
+        let bytes = path.as_os_str().as_bytes();
+        if path.is_absolute()
+            || bytes.is_empty()
+            || bytes.contains(&0)
+            || bytes.contains(&b'\n')
+            || bytes.contains(&b'\t')
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "file owner paths must be normalized and relative",
+            ));
+        }
+        if index != 0 {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(bytes);
+        output.push(b'\t');
+        output.extend_from_slice(uid.to_string().as_bytes());
+        output.push(b'\t');
+        output.extend_from_slice(gid.to_string().as_bytes());
     }
     Ok(Some(OsString::from_vec(output)))
 }
@@ -272,6 +308,8 @@ pub(crate) fn encode(
     let ipv4 = pool.string(ipv4.as_deref())?;
     let interfaces = interfaces(config);
     let interfaces = pool.string(interfaces.as_deref())?;
+    let file_owners = file_owners(config)?;
+    let file_owners = pool.string(file_owners.as_deref())?;
     let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
@@ -317,6 +355,7 @@ pub(crate) fn encode(
     header.u32(RESULT_OFFSET, result);
     header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
     header.u32(INTERFACES_OFFSET, interfaces);
+    header.u32(FILE_OWNERS_OFFSET, file_owners);
 
     let mut wire = Vec::with_capacity(HEADER_SIZE + pool.0.len());
     wire.extend_from_slice(&header.0);
@@ -486,5 +525,27 @@ mod tests {
             config = config.publish(Rule::new(port, port).unwrap());
         }
         assert!(encode(&config, &arguments, None).is_err());
+    }
+
+    #[test]
+    fn file_owners_are_sorted_validated_records() {
+        let config = Config::new()
+            .owner("z/file", 12, 34)
+            .owner("a/file", 56, 78);
+        let wire = encode(&config, &["/bin/true".into()], None).unwrap();
+        let offset = u32::from_le_bytes(
+            wire[FILE_OWNERS_OFFSET..FILE_OWNERS_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let pool = &wire[HEADER_SIZE..];
+        let end = pool[offset..].iter().position(|byte| *byte == 0).unwrap() + offset;
+        assert_eq!(&pool[offset..end], b"a/file\t56\t78\nz/file\t12\t34");
+        assert!(encode(
+            &Config::new().owner("../escape", 1, 2),
+            &["/bin/true".into()],
+            None
+        )
+        .is_err());
     }
 }

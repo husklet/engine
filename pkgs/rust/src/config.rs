@@ -27,6 +27,7 @@ pub struct Config {
     pub(crate) translation_cache: Option<PathBuf>,
     pub(crate) filesystem_generation: Option<PathBuf>,
     pub(crate) mounts: Vec<Mount>,
+    pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
 }
 
 impl Config {
@@ -151,6 +152,15 @@ impl Config {
     #[must_use]
     pub fn filesystem_generation(mut self, path: impl Into<PathBuf>) -> Self {
         self.filesystem_generation = Some(path.into());
+        self
+    }
+
+    /// Set the initial Linux-visible owner for one rootfs-relative path.
+    #[must_use]
+    pub fn owner(mut self, path: impl Into<PathBuf>, uid: u32, gid: u32) -> Self {
+        let path = path.into();
+        self.file_owners.retain(|(current, _, _)| current != &path);
+        self.file_owners.push((path, uid, gid));
         self
     }
 }

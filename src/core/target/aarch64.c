@@ -86,6 +86,7 @@ static uint64_t g_host_launch_monotonic_ns;
 #include "../../linux_abi/container/state.c"
 #include "../../linux_abi/fdcache.h"
 #include "../../linux_abi/container/vfs/gmap.h"
+#include "../../linux_abi/container/owner.h"
 
 // code cache + block map + chaining
 #include "../../translator/cache.c"
@@ -683,6 +684,7 @@ static int container_init(const char *rootfs) {
     if (rootfs && rootfs[0]) {
         g_rootfs = (char *)rootfs;
         if (root_handle_bind(g_rootfs) != 0) return -1;
+        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS")) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         if (g_uid < 0) g_uid = 0;
@@ -693,7 +695,7 @@ static int container_init(const char *rootfs) {
         const char *icwd = hl_option_get("HL_CWD");
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     }
-    if (!rootfs && root_handle_bind("/") != 0) return -1;
+    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL) != 0)) return -1;
     // bind-mount volumes: "[ro:]guestpath:hostdir,..." -- delegate to add_vol() (the shared vfs.c parser)
     // so the optional `ro:` read-only marker is handled in ONE place for both engines. Ingested regardless
     // of whether a rootfs is set (matching linux_x86_64.c): add_vol opens the HOST dir directly and the
