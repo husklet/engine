@@ -1634,7 +1634,9 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
 e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time \
-	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner $(E2E_NATIVE_ORACLE_RUNS)
+	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner \
+	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
+	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 $(E2E_NATIVE_ORACLE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
