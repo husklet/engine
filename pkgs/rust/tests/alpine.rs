@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 fn rootfs() -> &'static PathBuf {
     static ROOTFS: OnceLock<PathBuf> = OnceLock::new();
@@ -23,6 +24,53 @@ fn rootfs() -> &'static PathBuf {
         assert!(status.success(), "cannot extract pinned Alpine fixture");
         path
     })
+}
+
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[test]
+fn process_domain_stops_double_forked_new_session_without_touching_siblings() {
+    let pid_file = rootfs().join("tmp/domain-daemon.pid");
+    let _ = fs::remove_file(&pid_file);
+    let mut sibling = Command::new("sleep").arg("30").spawn().unwrap();
+    let child = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()))
+        .args([
+            "-c",
+            "( setsid sh -c 'sleep 30 </dev/null >/dev/null 2>&1 & echo $! >/tmp/domain-daemon.pid' </dev/null >/dev/null 2>&1 ) & exit 0",
+        ])
+        .spawn()
+        .unwrap();
+    let domain = child.domain();
+    assert_eq!(child.wait().unwrap(), Exit::Code(0));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let daemon = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                if alive(pid) {
+                    break pid;
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "daemon did not publish its pid");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    domain.terminate().unwrap();
+    domain.terminate().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while alive(daemon) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!alive(daemon), "domain member survived termination");
+    assert!(alive(sibling.id()), "unrelated sibling was terminated");
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
 }
 
 #[test]

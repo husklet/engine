@@ -468,13 +468,15 @@ package-test:
 	rm -rf '$(BUILD)/package-root'
 
 .PHONY: package-activation-installed-test
-package-activation-installed-test: $(BUILD)/e2e/guest-descendant-aarch64 $(BUILD)/e2e/guest-external-term-aarch64
+package-activation-installed-test: $(BUILD)/e2e/guest-descendant-aarch64 $(BUILD)/e2e/guest-external-term-aarch64 \
+	$(BUILD)/e2e/guest-domain-aarch64 $(BUILD)/e2e/guest-domain-x86_64
 	$(CC) -I'$(abspath $(BUILD)/package-root)/usr/include' tests/integration/activation_package.c \
 		$(ACTIVATION_CONSUMER_LIBS) -o '$(BUILD)/package-consumer/activation-package'
 	$(if $(filter macos,$(HOST)),$(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f '$(BUILD)/package-consumer/activation-package')
 	'$(BUILD)/package-consumer/activation-package'
 	'$(abspath $(BUILD)/package-consumer/activation-package)' '$(abspath $(BUILD)/e2e/guest-descendant-aarch64)' \
-		'$(abspath $(BUILD)/e2e/guest-external-term-aarch64)'
+		'$(abspath $(BUILD)/e2e/guest-external-term-aarch64)' '$(abspath $(BUILD)/e2e/guest-domain-aarch64)' \
+		'$(abspath $(BUILD)/e2e/guest-domain-x86_64)'
 
 .PHONY: package-activation-macos-test
 package-activation-macos-test: HOST = macos
@@ -482,7 +484,8 @@ package-activation-macos-test: HOST_ARCH = aarch64
 package-activation-macos-test: ACTIVATION_LIBS = -Wl,-force_load,$${libdir}/libhl-engine-activation.a
 package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
 	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-descendant-aarch64 \
-	$(BUILD)/e2e/guest-external-term-aarch64
+	$(BUILD)/e2e/guest-external-term-aarch64 $(BUILD)/e2e/guest-domain-aarch64 \
+	$(BUILD)/e2e/guest-domain-x86_64
 	rm -rf '$(BUILD)/activation-package-root' '$(BUILD)/activation-package-consumer'
 	$(INSTALL) -d '$(BUILD)/activation-package-root/include/hl' \
 		'$(BUILD)/activation-package-root/lib/pkgconfig' '$(BUILD)/activation-package-consumer'
@@ -498,7 +501,8 @@ package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
 		'$(BUILD)/activation-package-consumer/activation-package'
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package)
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package) \
-		$(abspath $(BUILD)/e2e/guest-descendant-aarch64) $(abspath $(BUILD)/e2e/guest-external-term-aarch64)
+		$(abspath $(BUILD)/e2e/guest-descendant-aarch64) $(abspath $(BUILD)/e2e/guest-external-term-aarch64) \
+		$(abspath $(BUILD)/e2e/guest-domain-aarch64) $(abspath $(BUILD)/e2e/guest-domain-x86_64)
 
 FORCE:
 
@@ -711,6 +715,14 @@ $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 $(BUILD)/e2e/guest-descendant-aarch64: tests/e2e/guest_descendant.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
+$(BUILD)/e2e/guest-domain-aarch64: tests/e2e/guest_domain.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
+$(BUILD)/e2e/guest-domain-x86_64: tests/e2e/guest_domain.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
 $(BUILD)/e2e/guest-external-term-aarch64: tests/e2e/guest_external_term.c
 	@mkdir -p $(@D)
