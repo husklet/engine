@@ -525,6 +525,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 memcpy(buf, sa, L);
                 // publish on :H instead of :C (port @2)
                 *(uint16_t *)(buf + 2) = htons(hp);
+                if (pm_address(cp) != 0) *(uint32_t *)(buf + 4) = pm_address(cp);
                 // Linux->macOS sockaddr translation (sin_len/family) before the real host bind.
                 struct sockaddr_storage ss;
                 socklen_t hl = sa_l2m(buf, L, &ss);

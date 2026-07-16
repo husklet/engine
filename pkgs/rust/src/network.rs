@@ -1,4 +1,5 @@
 use crate::Error;
+use std::net::Ipv4Addr;
 
 /// Identity shared by guest processes in one virtual network namespace.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -40,12 +41,13 @@ impl Bridge {
 
 /// One host-to-guest TCP/UDP port publication understood by the engine ABI.
 ///
-/// The current ABI maps a numeric host port to the same virtual network's numeric guest port. It
-/// does not encode a host address or protocol selector.
+/// The ABI maps a host address and numeric host port to the virtual network's numeric guest port.
+/// Protocol selection remains outside this rule.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Rule {
     host: u16,
     guest: u16,
+    address: Ipv4Addr,
 }
 
 impl Rule {
@@ -59,8 +61,19 @@ impl Rule {
                 "published host and guest ports must be nonzero",
             ))
         } else {
-            Ok(Self { host, guest })
+            Ok(Self {
+                host,
+                guest,
+                address: Ipv4Addr::UNSPECIFIED,
+            })
         }
+    }
+
+    /// Bind the publication to one exact host IPv4 address.
+    #[must_use]
+    pub const fn address(mut self, value: Ipv4Addr) -> Self {
+        self.address = value;
+        self
     }
 
     #[must_use]
@@ -71,6 +84,11 @@ impl Rule {
     #[must_use]
     pub const fn guest(self) -> u16 {
         self.guest
+    }
+
+    #[must_use]
+    pub const fn host_address(self) -> Ipv4Addr {
+        self.address
     }
 }
 
@@ -109,6 +127,11 @@ mod tests {
     fn publication_ports_are_nonzero() {
         let rule = Rule::new(8_080, 80).unwrap();
         assert_eq!((rule.host(), rule.guest()), (8_080, 80));
+        assert_eq!(rule.host_address(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            rule.address(Ipv4Addr::LOCALHOST).host_address(),
+            Ipv4Addr::LOCALHOST
+        );
         assert!(Rule::new(0, 80).is_err());
         assert!(Rule::new(8_080, 0).is_err());
     }

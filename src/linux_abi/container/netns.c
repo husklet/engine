@@ -1261,6 +1261,7 @@ static int switch_dial(const char *path); // defined below; gap-tolerant AF_UNIX
 
 struct fwd_listen {
     uint16_t hport;
+    uint32_t address;
     char upath[200]; // full switch path; truncated into sun_path exactly as the guest's bind did
 };
 
@@ -1275,7 +1276,7 @@ static void *fwd_listen_thread(void *p) {
     memset(&sin, 0, sizeof sin);
     sin.sin_family = AF_INET;
     sin.sin_port = htons(fl.hport);
-    sin.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0:HOST_PORT (docker's default publish address)
+    sin.sin_addr.s_addr = fl.address;
     if (bind(ls, (struct sockaddr *)&sin, sizeof sin) < 0 || listen(ls, 128) < 0) {
         close(ls); // host port busy (e.g. another container already published it) -> no forwarding
         fwd_unmark(g_fwd_started, &g_nfwd, fl.hport); // transient busy: allow a later listen() to retry (F7)
@@ -1409,6 +1410,7 @@ static void fwd_maybe_start(int fd) {
     struct fwd_listen *fl = malloc(sizeof *fl);
     if (!fl) return;
     fl->hport = hport;
+    fl->address = pm_address(cport);
     snprintf(fl->upath, sizeof fl->upath, "%s", upath);
     g_fwd_started[g_nfwd++] = hport; // mark BEFORE create (closes the dedup window); thread unmarks on bind fail
     pthread_t t;
@@ -1467,9 +1469,10 @@ struct udp_peer {
 
 struct udp_fwd {
     uint16_t hport;
+    uint32_t address;
     char upath[200]; // guest switch datagram socket path (br_/lo_path, as the guest bound)
     char pdir[80];   // dir holding this forwarder's synthetic per-client socket paths
-    int hs;          // host AF_INET/SOCK_DGRAM socket on 0.0.0.0:hport
+    int hs;          // host AF_INET/SOCK_DGRAM socket on the published address and port
     struct udp_peer peers[UDP_FWD_MAXPEERS];
     int npeers;
     unsigned pseq; // monotonic id for unique synthetic peer paths (+ ring eviction)
@@ -1548,7 +1551,7 @@ static void *udp_fwd_thread(void *p) {
     memset(&sin, 0, sizeof sin);
     sin.sin_family = AF_INET;
     sin.sin_port = htons(f->hport);
-    sin.sin_addr.s_addr = htonl(INADDR_ANY);                 // 0.0.0.0:HOST_PORT (docker's default publish address)
+    sin.sin_addr.s_addr = f->address;
     if (bind(hs, (struct sockaddr *)&sin, sizeof sin) < 0) { // host port busy -> no forwarding
         close(hs);
         fwd_unmark(g_udp_fwd_started, &g_nudpfwd, f->hport); // transient busy: allow a later bind() to retry (F7)
@@ -1632,6 +1635,7 @@ static void udp_fwd_maybe_start(int fd) {
     struct udp_fwd *f = (struct udp_fwd *)calloc(1, sizeof *f);
     if (!f) return;
     f->hport = hport;
+    f->address = pm_address(cport);
     snprintf(f->upath, sizeof f->upath, "%s", upath);
     g_udp_fwd_started[g_nudpfwd++] = hport; // mark BEFORE create; thread unmarks on bind fail (F7)
     pthread_t t;

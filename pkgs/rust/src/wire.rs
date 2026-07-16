@@ -170,7 +170,13 @@ fn publish(config: &Config) -> Result<Option<OsString>, Error> {
     let value = config
         .publish
         .iter()
-        .map(|rule| format!("{}:{}", rule.host(), rule.guest()))
+        .map(|rule| {
+            if rule.host_address().is_unspecified() {
+                format!("{}:{}", rule.host(), rule.guest())
+            } else {
+                format!("{}:{}:{}", rule.host_address(), rule.host(), rule.guest())
+            }
+        })
         .collect::<Vec<_>>()
         .join(",");
     Ok(Some(OsString::from(value)))
@@ -313,7 +319,7 @@ mod tests {
             .network_namespace(Namespace::new("container-alpha").unwrap())
             .network_bridge(Bridge::new("bridge-alpha").unwrap())
             .network_ipv4(Ipv4Addr::new(172, 18, 0, 2))
-            .publish(Rule::new(8_080, 80).unwrap())
+            .publish(Rule::new(8_080, 80).unwrap().address(Ipv4Addr::LOCALHOST))
             .publish(Rule::new(8_443, 443).unwrap())
             .publish_external(true);
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
@@ -327,7 +333,10 @@ mod tests {
             string(&wire, NETWORK_NAMESPACE_OFFSET),
             Some("container-alpha")
         );
-        assert_eq!(string(&wire, PUBLISH_OFFSET), Some("8080:80,8443:443"));
+        assert_eq!(
+            string(&wire, PUBLISH_OFFSET),
+            Some("127.0.0.1:8080:80,8443:443")
+        );
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), Some("bridge-alpha"));
         assert_eq!(string(&wire, IP_OFFSET), Some("172.18.0.2"));
         assert_eq!(word(&wire, RESERVED_OFFSET), 0);

@@ -716,8 +716,32 @@ static hl_linux_ports g_ports;
 static uint16_t g_fd_cport[HL_NFD];
 
 static uint16_t pm_host(uint16_t c) { return hl_linux_ports_host(&g_ports, c); }
+static uint32_t pm_address(uint16_t c) { return hl_linux_ports_address(&g_ports, c); }
 
-// "H:C,H:C,..." (docker -p order: host:container). Ports are strictly validated (1..65535);
+static uint32_t parse_publish_address(const char *begin, const char *end) {
+    uint32_t address = 0;
+    int field;
+
+    for (field = 0; field < 4; ++field) {
+        const char *stop = field == 3 ? end : memchr(begin, '.', (size_t)(end - begin));
+        unsigned value = 0;
+        if (stop == NULL || begin == stop) goto invalid;
+        while (begin < stop) {
+            if (*begin < '0' || *begin > '9' || value > (255u - (unsigned)(*begin - '0')) / 10u) goto invalid;
+            value = value * 10u + (unsigned)(*begin++ - '0');
+        }
+        address = (address << 8) | value;
+        begin = stop < end ? stop + 1 : end;
+    }
+    if (begin != end) goto invalid;
+    return htonl(address);
+
+invalid:
+    fprintf(stderr, "hl: invalid HL_PUBLISH host address\n");
+    exit(2);
+}
+
+// "[IP:]H:C,..." (docker -p order: host:container). Ports are strictly validated (1..65535);
 // a bad field or more than the cap of entries is an error, not a silent drop.
 static void parse_publish(const char *s) {
     while (s && *s) {
@@ -727,13 +751,18 @@ static void parse_publish(const char *s) {
         }
         const char *colon = strchr(s, ':');
         const char *comma = strchr(s, ',');
+        const char *end = comma ? comma : s + strlen(s);
+        const char *second = colon ? memchr(colon + 1, ':', (size_t)(end - colon - 1)) : NULL;
         if (!colon || (comma && colon > comma)) {
-            fprintf(stderr, "hl: invalid HL_PUBLISH '%s': expected HOST:CONTAINER\n", s);
+            fprintf(stderr, "hl: invalid HL_PUBLISH '%s': expected [IP:]HOST:CONTAINER\n", s);
             exit(2);
         }
-        unsigned h = hl_parse_port_field("HL_PUBLISH host port", s, colon);
-        unsigned cc = hl_parse_port_field("HL_PUBLISH container port", colon + 1, comma);
-        if (hl_linux_ports_add(&g_ports, (uint16_t)h, (uint16_t)cc) != 0) exit(2);
+        uint32_t address = second ? parse_publish_address(s, colon) : 0;
+        const char *host = second ? colon + 1 : s;
+        const char *guest = second ? second + 1 : colon + 1;
+        unsigned h = hl_parse_port_field("HL_PUBLISH host port", host, second ? second : colon);
+        unsigned cc = hl_parse_port_field("HL_PUBLISH container port", guest, comma);
+        if (hl_linux_ports_add_address(&g_ports, address, (uint16_t)h, (uint16_t)cc) != 0) exit(2);
         if (!comma) break;
         s = comma + 1;
     }

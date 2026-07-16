@@ -148,6 +148,25 @@ static int hl_engine_uint_range(const char *begin, const char *end, unsigned max
     return value != 0 && value <= maximum;
 }
 
+static int hl_engine_ipv4_valid(const char *begin, const char *end) {
+    unsigned part;
+    int fields = 0;
+
+    while (begin < end) {
+        const char *stop = memchr(begin, '.', (size_t)(end - begin));
+        if (stop == NULL) stop = end;
+        part = 0;
+        if (begin == stop) return 0;
+        while (begin < stop) {
+            if (*begin < '0' || *begin > '9' || part > (255u - (unsigned)(*begin - '0')) / 10u) return 0;
+            part = part * 10u + (unsigned)(*begin++ - '0');
+        }
+        ++fields;
+        begin = stop < end ? stop + 1 : end;
+    }
+    return fields == 4;
+}
+
 static int hl_engine_publish_valid(const char *spec) {
     unsigned count = 0;
     const char *entry = spec;
@@ -158,8 +177,14 @@ static int hl_engine_publish_valid(const char *spec) {
         const char *comma = strchr(entry, ',');
         const char *end = comma == NULL ? entry + strlen(entry) : comma;
         second = colon == NULL ? NULL : memchr(colon + 1, ':', (size_t)(end - colon - 1));
-        if (++count > 32 || colon == NULL || colon >= end || second != NULL ||
-            !hl_engine_uint_range(entry, colon, 65535) || !hl_engine_uint_range(colon + 1, end, 65535)) return 0;
+        if (++count > 32 || colon == NULL || colon >= end) return 0;
+        if (second == NULL) {
+            if (!hl_engine_uint_range(entry, colon, 65535) || !hl_engine_uint_range(colon + 1, end, 65535))
+                return 0;
+        } else if (!hl_engine_ipv4_valid(entry, colon) || !hl_engine_uint_range(colon + 1, second, 65535) ||
+                   !hl_engine_uint_range(second + 1, end, 65535)) {
+            return 0;
+        }
         if (comma == NULL) return 1;
         entry = comma + 1;
     }

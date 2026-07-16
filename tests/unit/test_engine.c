@@ -487,7 +487,15 @@ int main(void) {
     box.lower_layers = "relative:/lower";
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.lower_layers = NULL;
+    box.publish = "127.0.0.1:8080:80";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
+    hl_engine_destroy(engine);
+    engine = NULL;
     box.publish = "0:80";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.publish = "127.0.0:8080:80";
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.publish = "127.0.0.256:8080:80";
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.publish = NULL;
     box.volumes = "guest:/host";
