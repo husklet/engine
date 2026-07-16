@@ -14,6 +14,7 @@ mod container;
 mod engine;
 mod error;
 mod ffi;
+pub mod network;
 mod result;
 mod runtime;
 mod types;

@@ -1,5 +1,6 @@
-use crate::{Mount, Sandbox};
+use crate::{network, Mount, Sandbox};
 use std::ffi::{OsStr, OsString};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 /// Configuration for one Linux launch and its initial process.
@@ -16,6 +17,11 @@ pub struct Config {
     pub(crate) gid: Option<i32>,
     pub(crate) rootfs_read_only: bool,
     pub(crate) network_isolated: bool,
+    pub(crate) network_namespace: Option<network::Namespace>,
+    pub(crate) network_bridge: Option<network::Bridge>,
+    pub(crate) network_ipv4: Option<Ipv4Addr>,
+    pub(crate) publish: Vec<network::Rule>,
+    pub(crate) publish_external: bool,
     pub(crate) sandbox: Sandbox,
     pub(crate) translation_cache: Option<PathBuf>,
     pub(crate) mounts: Vec<Mount>,
@@ -89,6 +95,38 @@ impl Config {
     #[must_use]
     pub const fn network(mut self, value: bool) -> Self {
         self.network_isolated = value;
+        self
+    }
+    /// Select the virtual network namespace shared by related engine instances.
+    #[must_use]
+    pub fn network_namespace(mut self, value: network::Namespace) -> Self {
+        self.network_namespace = Some(value);
+        self
+    }
+    /// Attach the guest to one engine virtual bridge.
+    #[must_use]
+    pub fn network_bridge(mut self, value: network::Bridge) -> Self {
+        self.network_bridge = Some(value);
+        self
+    }
+    /// Assign the guest's IPv4 identity on its selected virtual bridge.
+    #[must_use]
+    pub const fn network_ipv4(mut self, value: Ipv4Addr) -> Self {
+        self.network_ipv4 = Some(value);
+        self
+    }
+    /// Add one host-to-guest publication rule.
+    #[must_use]
+    pub fn publish(mut self, value: network::Rule) -> Self {
+        self.publish.push(value);
+        self
+    }
+    /// Delegate external host listeners to the embedding daemon.
+    ///
+    /// This requires at least one publication rule.
+    #[must_use]
+    pub const fn publish_external(mut self, value: bool) -> Self {
+        self.publish_external = value;
         self
     }
     #[must_use]

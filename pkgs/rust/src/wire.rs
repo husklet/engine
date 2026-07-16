@@ -29,12 +29,17 @@ const GID_OFFSET: usize = 36;
 const ROOT_READ_ONLY_OFFSET: usize = 40;
 const SANDBOX_OFFSET: usize = 44;
 const NETWORK_ISOLATED_OFFSET: usize = 48;
+const PUBLISH_EXTERNAL_OFFSET: usize = 52;
 const ROOTFS_OFFSET: usize = 56;
 const HOSTNAME_OFFSET: usize = 64;
+const NETWORK_NAMESPACE_OFFSET: usize = 68;
+const PUBLISH_OFFSET: usize = 72;
 const VOLUMES_OFFSET: usize = 76;
 const WORKDIR_OFFSET: usize = 84;
 const ENVIRONMENT_OFFSET: usize = 88;
 const CACHE_OFFSET: usize = 92;
+const NETWORK_BRIDGE_OFFSET: usize = 96;
+const IP_OFFSET: usize = 100;
 const ARGUMENTS_OFFSET: usize = 108;
 const RESULT_OFFSET: usize = 132;
 const RESERVED_OFFSET: usize = 136;
@@ -153,11 +158,53 @@ fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
     Ok(Some(OsString::from_vec(output)))
 }
 
+fn publish(config: &Config) -> Result<Option<OsString>, Error> {
+    if config.publish.len() > 32 {
+        return Err(Error::InvalidConfig(
+            "at most 32 port publication rules are supported",
+        ));
+    }
+    if config.publish.is_empty() {
+        return Ok(None);
+    }
+    let value = config
+        .publish
+        .iter()
+        .map(|rule| format!("{}:{}", rule.host(), rule.guest()))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Some(OsString::from(value)))
+}
+
+fn validate_network(config: &Config) -> Result<(), Error> {
+    let configured = config.network_bridge.is_some()
+        || config.network_ipv4.is_some()
+        || !config.publish.is_empty()
+        || config.publish_external;
+    if config.network_isolated && configured {
+        return Err(Error::InvalidConfig(
+            "isolated networking cannot use bridge, IPv4, or publication settings",
+        ));
+    }
+    if config.network_ipv4.is_some() && config.network_bridge.is_none() {
+        return Err(Error::InvalidConfig(
+            "a network IPv4 address requires a virtual bridge",
+        ));
+    }
+    if config.publish_external && config.publish.is_empty() {
+        return Err(Error::InvalidConfig(
+            "external publication requires at least one port rule",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode(
     config: &Config,
     arguments: &[OsString],
     result: Option<&Path>,
 ) -> Result<Vec<u8>, Error> {
+    validate_network(config)?;
     let mut pool = Pool::new();
     let rootfs = pool.path(config.rootfs.as_deref())?;
     let hostname = pool.string(config.hostname.as_deref())?;
@@ -165,6 +212,24 @@ pub(crate) fn encode(
     let environment = environment(config)?;
     let environment = pool.string(environment.as_deref())?;
     let cache = pool.path(config.translation_cache.as_deref())?;
+    let namespace = pool.string(
+        config
+            .network_namespace
+            .as_ref()
+            .map(|value| OsStr::new(value.as_str())),
+    )?;
+    let bridge = pool.string(
+        config
+            .network_bridge
+            .as_ref()
+            .map(|value| OsStr::new(value.as_str())),
+    )?;
+    let ipv4 = config
+        .network_ipv4
+        .map(|value| OsString::from(value.to_string()));
+    let ipv4 = pool.string(ipv4.as_deref())?;
+    let publish = publish(config)?;
+    let publish = pool.string(publish.as_deref())?;
     let volumes = volumes(config)?;
     let volumes = pool.string(volumes.as_deref())?;
     let result = pool.path(result)?;
@@ -192,12 +257,17 @@ pub(crate) fn encode(
         },
     );
     header.u32(NETWORK_ISOLATED_OFFSET, u32::from(config.network_isolated));
+    header.u32(PUBLISH_EXTERNAL_OFFSET, u32::from(config.publish_external));
     header.u32(ROOTFS_OFFSET, rootfs);
     header.u32(HOSTNAME_OFFSET, hostname);
+    header.u32(NETWORK_NAMESPACE_OFFSET, namespace);
+    header.u32(PUBLISH_OFFSET, publish);
     header.u32(VOLUMES_OFFSET, volumes);
     header.u32(WORKDIR_OFFSET, workdir);
     header.u32(ENVIRONMENT_OFFSET, environment);
     header.u32(CACHE_OFFSET, cache);
+    header.u32(NETWORK_BRIDGE_OFFSET, bridge);
+    header.u32(IP_OFFSET, ipv4);
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(RESULT_OFFSET, result);
     header.u32(RESERVED_OFFSET, 0);
@@ -208,4 +278,106 @@ pub(crate) fn encode(
     wire.extend_from_slice(&pool.0);
     debug_assert_eq!(wire.len(), HEADER_SIZE + pool_size as usize);
     Ok(wire)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::net::Ipv4Addr;
+
+    use crate::network::{Bridge, Namespace, Rule};
+
+    use super::*;
+
+    fn word(wire: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn string(wire: &[u8], field: usize) -> Option<&str> {
+        let offset = word(wire, field) as usize;
+        if offset == 0 {
+            return None;
+        }
+        let pool = &wire[HEADER_SIZE..];
+        let end = pool[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|length| offset + length)
+            .unwrap();
+        Some(std::str::from_utf8(&pool[offset..end]).unwrap())
+    }
+
+    #[test]
+    fn network_fields_use_the_exact_launch_abi_five_offsets() {
+        let config = Config::new()
+            .network_namespace(Namespace::new("container-alpha").unwrap())
+            .network_bridge(Bridge::new("bridge-alpha").unwrap())
+            .network_ipv4(Ipv4Addr::new(172, 18, 0, 2))
+            .publish(Rule::new(8_080, 80).unwrap())
+            .publish(Rule::new(8_443, 443).unwrap())
+            .publish_external(true);
+        let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
+
+        assert_eq!(word(&wire, MAGIC_OFFSET), MAGIC);
+        assert_eq!(word(&wire, HEADER_SIZE_OFFSET), HEADER_SIZE_U32);
+        assert_eq!(word(&wire, ABI_OFFSET), ABI);
+        assert_eq!(word(&wire, NETWORK_ISOLATED_OFFSET), 0);
+        assert_eq!(word(&wire, PUBLISH_EXTERNAL_OFFSET), 1);
+        assert_eq!(
+            string(&wire, NETWORK_NAMESPACE_OFFSET),
+            Some("container-alpha")
+        );
+        assert_eq!(string(&wire, PUBLISH_OFFSET), Some("8080:80,8443:443"));
+        assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), Some("bridge-alpha"));
+        assert_eq!(string(&wire, IP_OFFSET), Some("172.18.0.2"));
+        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
+        assert_eq!(word(&wire, TAIL_PADDING_OFFSET), 0);
+    }
+
+    #[test]
+    fn existing_network_isolation_encoding_is_preserved() {
+        let wire = encode(
+            &Config::new()
+                .network(true)
+                .network_namespace(Namespace::new("isolated-namespace").unwrap()),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(word(&wire, NETWORK_ISOLATED_OFFSET), 1);
+        assert_eq!(word(&wire, PUBLISH_EXTERNAL_OFFSET), 0);
+        assert_eq!(
+            string(&wire, NETWORK_NAMESPACE_OFFSET),
+            Some("isolated-namespace")
+        );
+        assert_eq!(string(&wire, PUBLISH_OFFSET), None);
+        assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), None);
+        assert_eq!(string(&wire, IP_OFFSET), None);
+    }
+
+    #[test]
+    fn invalid_network_combinations_fail_before_launch() {
+        let arguments = [OsString::from("/bin/true")];
+        assert!(encode(
+            &Config::new()
+                .network(true)
+                .network_bridge(Bridge::new("isolated").unwrap()),
+            &arguments,
+            None,
+        )
+        .is_err());
+        assert!(encode(
+            &Config::new().network_ipv4(Ipv4Addr::LOCALHOST),
+            &arguments,
+            None,
+        )
+        .is_err());
+        assert!(encode(&Config::new().publish_external(true), &arguments, None,).is_err());
+
+        let mut config = Config::new();
+        for port in 1..=33 {
+            config = config.publish(Rule::new(port, port).unwrap());
+        }
+        assert!(encode(&config, &arguments, None).is_err());
+    }
 }
