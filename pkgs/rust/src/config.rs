@@ -1,4 +1,4 @@
-use crate::{network, Mount, Sandbox};
+use crate::{network, Domain, Mount, Sandbox};
 use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ pub struct Config {
     pub(crate) filesystem_generation: Option<PathBuf>,
     pub(crate) mounts: Vec<Mount>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
+    pub(crate) process_domain: Option<Domain>,
 }
 
 impl Config {
@@ -152,6 +153,13 @@ impl Config {
     #[must_use]
     pub fn filesystem_generation(mut self, path: impl Into<PathBuf>) -> Self {
         self.filesystem_generation = Some(path.into());
+        self
+    }
+
+    /// Join this launch to an existing container process domain.
+    #[must_use]
+    pub const fn domain(mut self, domain: Domain) -> Self {
+        self.process_domain = Some(domain);
         self
     }
 

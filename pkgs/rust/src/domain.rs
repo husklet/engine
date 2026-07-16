@@ -8,8 +8,27 @@ use crate::{ffi, Error};
 pub struct Domain([u64; 2]);
 
 impl Domain {
-    pub(crate) const fn new(identity: [u64; 2]) -> Self {
+    pub(crate) const fn from_identity(identity: [u64; 2]) -> Self {
         Self(identity)
+    }
+
+    pub(crate) fn create() -> Result<Self, Error> {
+        use std::io::Read as _;
+        loop {
+            let mut bytes = [0_u8; 16];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            let identity = [
+                u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+            ];
+            if identity != [0, 0] {
+                return Ok(Self(identity));
+            }
+        }
+    }
+
+    pub(crate) const fn identity(self) -> [u64; 2] {
+        self.0
     }
 
     /// Force-stops all live members. Calling this repeatedly is safe.

@@ -168,7 +168,11 @@ pub(crate) fn kill(process: &Handle) -> Result<(), i32> {
 }
 pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
     let status = unsafe { hl_activation_domain_terminate(ProcessDomain { identity }) };
-    if status == 0 { Ok(()) } else { Err(status) }
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 #[allow(clippy::needless_pass_by_value)] // Consumption enforces exactly-once destruction.
 pub(crate) fn destroy(process: Handle) {

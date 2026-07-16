@@ -357,7 +357,7 @@ pub(crate) fn encode(
     header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
     header.u32(INTERFACES_OFFSET, interfaces);
     header.u32(FILE_OWNERS_OFFSET, file_owners);
-    let process_domain = process_domain()?;
+    let process_domain = config.process_domain.unwrap_or(crate::Domain::create()?).identity();
     header.u64(PROCESS_DOMAIN_OFFSET, process_domain[0]);
     header.u64(PROCESS_DOMAIN_OFFSET + 8, process_domain[1]);
 
@@ -366,20 +366,6 @@ pub(crate) fn encode(
     wire.extend_from_slice(&pool.0);
     debug_assert_eq!(wire.len(), HEADER_SIZE + pool_size as usize);
     Ok(wire)
-}
-
-fn process_domain() -> Result<[u64; 2], Error> {
-    use std::io::Read as _;
-    let mut bytes = [0_u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let domain = [
-        u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
-        u64::from_ne_bytes(bytes[8..].try_into().unwrap()),
-    ];
-    if domain == [0, 0] {
-        return process_domain();
-    }
-    Ok(domain)
 }
 
 pub(crate) fn domain(wire: &[u8]) -> [u64; 2] {

@@ -42,7 +42,7 @@ impl Engine {
             return Err(Error::InvalidConfig("program must not be empty"));
         }
         let encoded = wire::encode(config, &argv, None)?;
-        let domain = crate::Domain::new(wire::domain(&encoded));
+        let domain = crate::Domain::from_identity(wire::domain(&encoded));
         let config = ConfigFile::create(&encoded)?;
         let executable = EXECUTABLE
             .get_or_init(|| {
