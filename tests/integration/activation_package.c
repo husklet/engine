@@ -57,7 +57,10 @@ int main(int argc, char **argv) {
         hl_activation_spawn(NULL, HL_GUEST_ISA_AARCH64, NULL, NULL) != HL_STATUS_INVALID_ARGUMENT)
         return 1;
     hl_activation_process_destroy(NULL);
-    if (argc == 2 && force_stop_descendants(argv[0], argv[1]) != 0) return 2;
+    if (argc == 2) {
+        int stopped = force_stop_descendants(argv[0], argv[1]);
+        if (stopped != 0) return stopped;
+    }
     puts("installed hl-engine activation package: ok");
     return 0;
 }

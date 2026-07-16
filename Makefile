@@ -471,7 +471,7 @@ package-activation-installed-test: $(BUILD)/e2e/guest-descendant-aarch64
 		$(ACTIVATION_CONSUMER_LIBS) -o '$(BUILD)/package-consumer/activation-package'
 	$(if $(filter macos,$(HOST)),$(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f '$(BUILD)/package-consumer/activation-package')
 	'$(BUILD)/package-consumer/activation-package'
-	'$(BUILD)/package-consumer/activation-package' '$(abspath $(BUILD)/e2e/guest-descendant-aarch64)'
+	'$(abspath $(BUILD)/package-consumer/activation-package)' '$(abspath $(BUILD)/e2e/guest-descendant-aarch64)'
 
 .PHONY: package-activation-macos-test
 package-activation-macos-test: HOST = macos
