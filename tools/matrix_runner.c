@@ -407,6 +407,16 @@ static int config_option(config_wire *wire, const char *name, const char *value)
         parsed = strtoull(value, &end, 10);
         if (errno != 0 || *value == 0 || *end != 0 || parsed == 0) return 1;
         wire->config.memory_limit = (uint64_t)parsed;
+    } else if (strcmp(name, "HL_UID") == 0 || strcmp(name, "HL_GID") == 0) {
+        char *end;
+        unsigned long parsed;
+        errno = 0;
+        parsed = strtoul(value, &end, 10);
+        if (errno != 0 || *value == 0 || *end != 0 || parsed > INT32_MAX) return 1;
+        if (name[3] == 'U')
+            wire->config.uid = (int32_t)parsed;
+        else
+            wire->config.gid = (int32_t)parsed;
     } else if (strcmp(name, "HL_ROOTFS_RO") == 0) {
         if (strcmp(value, "1") != 0) return 1;
         wire->config.rootfs_read_only = 1;
