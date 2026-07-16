@@ -2106,16 +2106,38 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
      * a peer address created through /tmp -> /private/tmp escapes reverse mapping and cannot be echoed. */
     if (hpath[0] == '/' && canonicalize_path(hpath, canonical, sizeof canonical) == 0) backing = canonical;
     char gpath[256];
-    int guest_backing = g_rootfs != NULL;
-    for (int volume = 0; !guest_backing && volume < g_nvols; ++volume)
-        guest_backing = !strncmp(backing, g_vols[volume].hcanon, g_vols[volume].hlen) &&
-                        (backing[g_vols[volume].hlen] == '/' || backing[g_vols[volume].hlen] == 0);
-    if (hpath[0] == '/' && guest_backing)
+    int guest_backing = hpath[0] == '/' && g_rootfs != NULL;
+    int matched_volume = -1;
+    /* unix_sock_at binds from the socket's parent directory when the complete host path exceeds sun_path.
+     * The kernel then reports only the leaf name to recvfrom. Recover an exact volume-root peer before
+     * translating it; this is the common /tmp datagram shape and remains unambiguous across mounted roots. */
+    if (hpath[0] != 0 && hpath[0] != '/')
+        for (int volume = 0; volume < g_nvols; ++volume) {
+            struct stat status;
+            if (g_vols[volume].dead || g_vols[volume].isfile ||
+                snprintf(canonical, sizeof canonical, "%s/%s", g_vols[volume].hcanon, hpath) >=
+                    (int)sizeof canonical)
+                continue;
+            if (lstat(canonical, &status) != 0 || !S_ISSOCK(status.st_mode)) continue;
+            backing = canonical;
+            guest_backing = 1;
+            matched_volume = volume;
+            break;
+        }
+    for (int volume = 0; volume < g_nvols; ++volume)
+        if (!g_vols[volume].dead && !strncmp(backing, g_vols[volume].hcanon, g_vols[volume].hlen) &&
+            (backing[g_vols[volume].hlen] == '/' || backing[g_vols[volume].hlen] == 0) &&
+            (matched_volume < 0 || g_vols[volume].hlen > g_vols[matched_volume].hlen)) {
+            guest_backing = 1;
+            matched_volume = volume;
+        }
+    if (matched_volume >= 0)
+        snprintf(gpath, sizeof gpath, "%s%s", g_vols[matched_volume].guest,
+                 backing + g_vols[matched_volume].hlen);
+    else if (guest_backing)
         guest_from_host(backing, gpath, sizeof gpath); // overlay host path -> guest-visible path
     else
         snprintf(gpath, sizeof gpath, "%s", hpath); // unnamed/autobind (empty) or non-jail: pass through
-    fprintf(stderr, "[unix-map] host=%s backing=%s guest=%s matched=%d vols=%d\n", hpath, backing, gpath,
-            guest_backing, g_nvols);
     uint8_t t[2 + sizeof gpath];
     *(uint16_t *)t = AF_UNIX;
     size_t pl = strlen(gpath);

@@ -1034,6 +1034,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } else if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
+            if (ll < 0)
+                ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a4, gcap);
             if (ll < 0) {
                 socklen_t n = hsl < gcap ? hsl : gcap;
                 if (gcap) memcpy((void *)a4, &hss, n);
