@@ -24,6 +24,7 @@ pub struct Config {
     pub(crate) publish_external: bool,
     pub(crate) sandbox: Sandbox,
     pub(crate) translation_cache: Option<PathBuf>,
+    pub(crate) filesystem_generation: Option<PathBuf>,
     pub(crate) mounts: Vec<Mount>,
 }
 
@@ -137,6 +138,12 @@ impl Config {
     #[must_use]
     pub fn translation_cache(mut self, path: impl Into<PathBuf>) -> Self {
         self.translation_cache = Some(path.into());
+        self
+    }
+    /// Select the shared filesystem-generation file used to invalidate path caches.
+    #[must_use]
+    pub fn filesystem_generation(mut self, path: impl Into<PathBuf>) -> Self {
+        self.filesystem_generation = Some(path.into());
         self
     }
 }

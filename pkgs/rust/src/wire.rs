@@ -40,6 +40,7 @@ const ENVIRONMENT_OFFSET: usize = 88;
 const CACHE_OFFSET: usize = 92;
 const NETWORK_BRIDGE_OFFSET: usize = 96;
 const IP_OFFSET: usize = 100;
+const FILESYSTEM_GENERATION_OFFSET: usize = 104;
 const ARGUMENTS_OFFSET: usize = 108;
 const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
@@ -237,6 +238,7 @@ pub(crate) fn encode(
         .network_ipv4
         .map(|value| OsString::from(value.to_string()));
     let ipv4 = pool.string(ipv4.as_deref())?;
+    let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
     let volumes = pool.string(volumes.as_deref())?;
@@ -276,6 +278,7 @@ pub(crate) fn encode(
     header.u32(CACHE_OFFSET, cache);
     header.u32(NETWORK_BRIDGE_OFFSET, bridge);
     header.u32(IP_OFFSET, ipv4);
+    header.u32(FILESYSTEM_GENERATION_OFFSET, filesystem_generation);
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(RESULT_OFFSET, result);
     header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
@@ -371,6 +374,29 @@ mod tests {
         assert_eq!(word(&wire, PUBLISH_COUNT_OFFSET), 0);
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), None);
         assert_eq!(string(&wire, IP_OFFSET), None);
+    }
+
+    #[test]
+    fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
+        let wire = encode(
+            &Config::new().filesystem_generation("/run/hl/filesystem-generation"),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            string(&wire, FILESYSTEM_GENERATION_OFFSET),
+            Some("/run/hl/filesystem-generation")
+        );
+
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = std::path::PathBuf::from(OsString::from_vec(b"/run/bad\0path".to_vec()));
+        assert!(encode(
+            &Config::new().filesystem_generation(invalid),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .is_err());
     }
 
     #[test]
