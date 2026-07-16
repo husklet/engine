@@ -44,12 +44,24 @@ impl Bridge {
 pub struct Interface {
     bridge: Bridge,
     address: Ipv4Addr,
+    prefix: u8,
 }
 
 impl Interface {
-    #[must_use]
-    pub const fn new(bridge: Bridge, address: Ipv4Addr) -> Self {
-        Self { bridge, address }
+    /// Creates an IPv4 interface and its directly connected route.
+    ///
+    /// # Errors
+    /// Returns an error when `prefix` is not a valid IPv4 prefix length.
+    pub fn new(bridge: Bridge, address: Ipv4Addr, prefix: u8) -> Result<Self, Error> {
+        if prefix > 32 {
+            Err(Error::InvalidConfig("IPv4 interface prefix exceeds 32"))
+        } else {
+            Ok(Self {
+                bridge,
+                address,
+                prefix,
+            })
+        }
     }
 
     #[must_use]
@@ -60,6 +72,11 @@ impl Interface {
     #[must_use]
     pub const fn address(&self) -> Ipv4Addr {
         self.address
+    }
+
+    #[must_use]
+    pub const fn prefix(&self) -> u8 {
+        self.prefix
     }
 }
 

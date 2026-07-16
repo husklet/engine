@@ -1003,6 +1003,7 @@ enum { HL_NETIF_MAX = 8 };
 struct br_interface {
     char path[64];
     uint32_t ip;
+    uint8_t prefix;
 };
 static struct br_interface g_netif[HL_NETIF_MAX];
 static uint8_t g_netif_count;
@@ -1112,8 +1113,11 @@ static void br_init(void) {
             const char *end = strchr(line, '\n');
             const char *equal = strchr(line, '=');
             size_t bridge_size;
-            char ip[16];
+            char ip[20];
             size_t ip_size;
+            char *slash;
+            char *prefix_end;
+            unsigned long prefix;
             if (!end) end = line + strlen(line);
             if (!equal || equal >= end) break;
             bridge_size = (size_t)(equal - line);
@@ -1123,8 +1127,15 @@ static void br_init(void) {
                      "/tmp/.hl-bridge-%.*s", (int)bridge_size, line);
             memcpy(ip, equal + 1, ip_size);
             ip[ip_size] = 0;
+            slash = strchr(ip, '/');
+            if (!slash) break;
+            *slash++ = 0;
+            errno = 0;
+            prefix = strtoul(slash, &prefix_end, 10);
+            if (errno || prefix_end == slash || *prefix_end || prefix > 32) break;
             g_netif[g_netif_count].ip = br_parse_ip(ip);
             if (!g_netif[g_netif_count].ip) break;
+            g_netif[g_netif_count].prefix = (uint8_t)prefix;
             mkdir(g_netif[g_netif_count].path, 0700);
             g_netif_count++;
             line = *end ? end + 1 : end;
@@ -1136,6 +1147,7 @@ static void br_init(void) {
             snprintf(g_netif[0].path, sizeof g_netif[0].path, "/tmp/.hl-bridge-%.40s", nbr);
             g_netif[0].ip = br_parse_ip(dip);
             if (g_netif[0].ip) {
+                g_netif[0].prefix = 16;
                 mkdir(g_netif[0].path, 0700);
                 g_netif_count = 1;
             }
@@ -1149,8 +1161,11 @@ static int br_on(void) {
 }
 
 static int br_for_ip(uint32_t ip_be) {
-    for (uint8_t i = 0; i < g_netif_count; i++)
-        if ((ip_be & 0x0000ffffu) == (g_netif[i].ip & 0x0000ffffu)) return (int)i;
+    for (uint8_t i = 0; i < g_netif_count; i++) {
+        uint8_t prefix = g_netif[i].prefix;
+        uint32_t mask = prefix ? UINT32_MAX << (32u - prefix) : 0;
+        if ((ntohl(ip_be) & mask) == (ntohl(g_netif[i].ip) & mask)) return (int)i;
+    }
     return -1;
 }
 

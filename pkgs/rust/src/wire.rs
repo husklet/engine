@@ -234,6 +234,8 @@ fn interfaces(config: &Config) -> Option<OsString> {
         bytes.extend_from_slice(interface.bridge().as_str().as_bytes());
         bytes.push(b'=');
         bytes.extend_from_slice(interface.address().to_string().as_bytes());
+        bytes.push(b'/');
+        bytes.extend_from_slice(interface.prefix().to_string().as_bytes());
     }
     Some(OsString::from_vec(bytes))
 }
@@ -390,18 +392,26 @@ mod tests {
     fn multiple_interfaces_are_one_validated_launch_record() {
         let config = Config::new()
             .network_namespace(Namespace::new("container-multi").unwrap())
-            .interface(Interface::new(
-                Bridge::new("front").unwrap(),
-                Ipv4Addr::new(172, 29, 0, 2),
-            ))
-            .interface(Interface::new(
-                Bridge::new("back").unwrap(),
-                Ipv4Addr::new(172, 29, 1, 2),
-            ));
+            .interface(
+                Interface::new(
+                    Bridge::new("front").unwrap(),
+                    Ipv4Addr::new(172, 29, 0, 2),
+                    24,
+                )
+                .unwrap(),
+            )
+            .interface(
+                Interface::new(
+                    Bridge::new("back").unwrap(),
+                    Ipv4Addr::new(172, 29, 1, 2),
+                    24,
+                )
+                .unwrap(),
+            );
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
         assert_eq!(
             string(&wire, INTERFACES_OFFSET),
-            Some("front=172.29.0.2\nback=172.29.1.2")
+            Some("front=172.29.0.2/24\nback=172.29.1.2/24")
         );
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), None);
         assert_eq!(string(&wire, IP_OFFSET), None);
