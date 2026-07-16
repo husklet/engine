@@ -27,6 +27,11 @@ static int run(char **arguments, time_t deadline, int *status) {
         command = fork();
         if (command < 0) _exit(125);
         if (command == 0) {
+            long maximum = sysconf(_SC_OPEN_MAX);
+            (void)unsetenv("MAKEFLAGS");
+            (void)unsetenv("MFLAGS");
+            if (maximum < 0 || maximum > 4096) maximum = 4096;
+            for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
             execvp(arguments[0], arguments);
             _exit(127);
         }

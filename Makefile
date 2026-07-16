@@ -1621,6 +1621,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
 	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
 	$(BUILD)/tools/bridge-runner \
+	$(BUILD)/tools/bridge-jobserver-test \
 	$(foreach scenario,exit signal clock force,$(foreach isa,aarch64 x86_64,$(BUILD)/tools/lifecycle-$(scenario)-$(isa))) \
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
@@ -1646,6 +1647,9 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 		$(abspath $(BUILD)/e2e/guest-exit-aarch64) 42
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit-x86_64) 42
+	$(BUILD)/tools/bridge-jobserver-test $(abspath $(BUILD)/tools/bridge-runner) $(MAC) \
+		$(abspath $(BUILD)/tools/lifecycle-signal-aarch64) --expect-signal 11 \
+		$(abspath $(BUILD)/e2e/guest-fault-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-exit-aarch64) --expect-exit 139 \
 		$(abspath $(BUILD)/e2e/guest-exit139-aarch64)
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-exit-x86_64) --expect-exit 139 \
@@ -1689,6 +1693,10 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
 $(BUILD)/tools/bridge-runner: tools/bridge_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/bridge-jobserver-test: tests/integration/bridge_jobserver.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
