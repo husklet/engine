@@ -20,6 +20,7 @@ pub struct Config {
     pub(crate) network_namespace: Option<network::Namespace>,
     pub(crate) network_bridge: Option<network::Bridge>,
     pub(crate) network_ipv4: Option<Ipv4Addr>,
+    pub(crate) network_interfaces: Vec<network::Interface>,
     pub(crate) publish: Vec<network::Rule>,
     pub(crate) publish_external: bool,
     pub(crate) sandbox: Sandbox,
@@ -114,6 +115,12 @@ impl Config {
     #[must_use]
     pub const fn network_ipv4(mut self, value: Ipv4Addr) -> Self {
         self.network_ipv4 = Some(value);
+        self
+    }
+    /// Attach one independently routed virtual IPv4 interface.
+    #[must_use]
+    pub fn interface(mut self, value: network::Interface) -> Self {
+        self.network_interfaces.push(value);
         self
     }
     /// Add one host-to-guest publication rule.

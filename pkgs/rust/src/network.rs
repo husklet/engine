@@ -39,6 +39,30 @@ impl Bridge {
     }
 }
 
+/// One virtual IPv4 interface attached to an engine bridge.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Interface {
+    bridge: Bridge,
+    address: Ipv4Addr,
+}
+
+impl Interface {
+    #[must_use]
+    pub const fn new(bridge: Bridge, address: Ipv4Addr) -> Self {
+        Self { bridge, address }
+    }
+
+    #[must_use]
+    pub fn bridge(&self) -> &Bridge {
+        &self.bridge
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> Ipv4Addr {
+        self.address
+    }
+}
+
 /// One host-to-guest TCP/UDP port publication understood by the engine ABI.
 ///
 /// The ABI maps a host address and numeric host port to the virtual network's numeric guest port.

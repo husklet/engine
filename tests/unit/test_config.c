@@ -32,6 +32,7 @@ int main(void) {
     HL_CHECK(offsetof(hl_launch_config, restore_directory_offset) == 128);
     HL_CHECK(offsetof(hl_launch_config, result_path_offset) == 132);
     HL_CHECK(offsetof(hl_launch_config, publish_count) == 136);
+    HL_CHECK(offsetof(hl_launch_config, network_interfaces_offset) == 140);
     HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));

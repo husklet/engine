@@ -999,10 +999,16 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // is keyed by <netid> (mode 0700, the guest is path-jailed) so other networks never share sockets. The
 // 127/8 loopback path (g_netns / lo_*) is untouched and stays per-container; only non-127 in-subnet
 // AF_INET is bridged. Off when g_netbr[0]==0 || g_myip==0.
-static char g_netbr[64];           // shared per-network rendezvous dir ("" = bridge off)
-static uint32_t g_myip;            // this endpoint's IP, network byte order (0 = unset)
+enum { HL_NETIF_MAX = 8 };
+struct br_interface {
+    char path[64];
+    uint32_t ip;
+};
+static struct br_interface g_netif[HL_NETIF_MAX];
+static uint8_t g_netif_count;
 static uint16_t g_br_port[HL_NFD]; // fd -> virtual port of a bridge socket (0 = not a bridge socket)
 static uint32_t g_br_ip[HL_NFD];   // fd -> virtual IP (network order) reported via getsockname/getpeername
+static uint8_t g_br_interface[HL_NFD]; // fd -> interface index + 1
 static int g_br_init;
 
 // Carry the per-fd socket-emulation metadata (SOCK_STREAM-ness, loopback/bridge port + ip) from `src`
@@ -1025,6 +1031,7 @@ static void fd_carry_sock(int dst, int src) {
     g_lo_v6[dst] = g_lo_v6[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];
+    g_br_interface[dst] = g_br_interface[src];
     g_tcp_lport[dst] = g_tcp_lport[src];
     g_tcp_laddr[dst] = g_tcp_laddr[src];
     g_tcp_l6[dst] = g_tcp_l6[src];
@@ -1098,36 +1105,69 @@ static uint32_t br_parse_ip(const char *s) {
 static void br_init(void) {
     if (g_br_init) return;
     g_br_init = 1;
-    const char *nbr = hl_option_get("HL_NETBR");
-    if (nbr && nbr[0]) {
-        snprintf(g_netbr, sizeof g_netbr, "/tmp/.hl-bridge-%.40s", nbr);
-        mkdir(g_netbr, 0700); // shared per-network dir; EEXIST is fine (peers share it)
+    const char *interfaces = hl_option_get("HL_NETIFS");
+    if (interfaces && interfaces[0]) {
+        const char *line = interfaces;
+        while (*line && g_netif_count < HL_NETIF_MAX) {
+            const char *end = strchr(line, '\n');
+            const char *equal = strchr(line, '=');
+            size_t bridge_size;
+            char ip[16];
+            size_t ip_size;
+            if (!end) end = line + strlen(line);
+            if (!equal || equal >= end) break;
+            bridge_size = (size_t)(equal - line);
+            ip_size = (size_t)(end - equal - 1);
+            if (bridge_size == 0 || bridge_size > 40 || ip_size == 0 || ip_size >= sizeof ip) break;
+            snprintf(g_netif[g_netif_count].path, sizeof g_netif[g_netif_count].path,
+                     "/tmp/.hl-bridge-%.*s", (int)bridge_size, line);
+            memcpy(ip, equal + 1, ip_size);
+            ip[ip_size] = 0;
+            g_netif[g_netif_count].ip = br_parse_ip(ip);
+            if (!g_netif[g_netif_count].ip) break;
+            mkdir(g_netif[g_netif_count].path, 0700);
+            g_netif_count++;
+            line = *end ? end + 1 : end;
+        }
+    } else {
+        const char *nbr = hl_option_get("HL_NETBR");
+        const char *dip = hl_option_get("HL_IP");
+        if (nbr && nbr[0] && dip && dip[0]) {
+            snprintf(g_netif[0].path, sizeof g_netif[0].path, "/tmp/.hl-bridge-%.40s", nbr);
+            g_netif[0].ip = br_parse_ip(dip);
+            if (g_netif[0].ip) {
+                mkdir(g_netif[0].path, 0700);
+                g_netif_count = 1;
+            }
+        }
     }
-    const char *dip = hl_option_get("HL_IP");
-    if (dip && dip[0]) g_myip = br_parse_ip(dip);
 }
 
 static int br_on(void) {
     if (!g_br_init) br_init();
-    return g_netbr[0] != 0 && g_myip != 0;
+    return g_netif_count != 0;
 }
 
-// dest IP is on our user network (same /16 as g_myip == first two octets a.b)
-static int br_in_subnet(uint32_t ip_be) {
-    return (ip_be & 0x0000ffffu) == (g_myip & 0x0000ffffu);
+static int br_for_ip(uint32_t ip_be) {
+    for (uint8_t i = 0; i < g_netif_count; i++)
+        if ((ip_be & 0x0000ffffu) == (g_netif[i].ip & 0x0000ffffu)) return (int)i;
+    return -1;
 }
 
 // connect(dest): bridge if AF_INET, non-127, in our subnet
-static int br_connect_is(const uint8_t *sa, socklen_t l) {
-    if (!sa || l < 8 || *(uint16_t *)sa != AF_INET || sa[4] == 127) return 0;
-    return br_in_subnet(*(uint32_t *)(sa + 4));
+static int br_connect_interface(const uint8_t *sa, socklen_t l) {
+    if (!sa || l < 8 || *(uint16_t *)sa != AF_INET || sa[4] == 127) return -1;
+    return br_for_ip(*(uint32_t *)(sa + 4));
 }
 
 // bind(addr): bridge if AF_INET, non-127, and 0.0.0.0 (ANY) / our own IP / in-subnet
-static int br_bind_is(const uint8_t *sa, socklen_t l) {
-    if (!sa || l < 8 || *(uint16_t *)sa != AF_INET || sa[4] == 127) return 0;
+static int br_bind_interface(const uint8_t *sa, socklen_t l) {
+    if (!sa || l < 8 || *(uint16_t *)sa != AF_INET || sa[4] == 127) return -1;
     uint32_t ip = *(uint32_t *)(sa + 4);
-    return ip == 0 || ip == g_myip || br_in_subnet(ip);
+    if (ip == 0) return g_netif_count ? 0 : -1;
+    for (uint8_t i = 0; i < g_netif_count; i++)
+        if (ip == g_netif[i].ip) return (int)i;
+    return br_for_ip(ip);
 }
 
 // A STREAM bind the private loopback should own. Explicit 127/8 always; INADDR_ANY (0.0.0.0) too when the
@@ -1142,13 +1182,13 @@ static int lo_any_is(const uint8_t *sa, socklen_t l) {
 }
 
 // rendezvous path for <ip_be>:<port> under the shared per-network dir
-static void br_path(uint32_t ip_be, uint16_t port, char *out, size_t n) {
+static void br_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
     const uint8_t *b = (const uint8_t *)&ip_be;
-    snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netbr, b[0], b[1], b[2], b[3], (unsigned)port);
+    snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netif[interface].path, b[0], b[1], b[2], b[3], (unsigned)port);
 }
 
 // bind(:0) on the bridge -> a free, round-trippable ephemeral port keyed by OUR ip (cf. lo_alloc_ephemeral)
-static uint16_t br_alloc_ephemeral(void) {
+static uint16_t br_alloc_ephemeral(int interface) {
     static uint16_t next;
     if (next < 1024) next = (uint16_t)(20000 + (getpid() & 0x3fff));
     for (int tries = 0; tries < 45000; tries++) {
@@ -1156,7 +1196,7 @@ static uint16_t br_alloc_ephemeral(void) {
         if (next < 1024) next = 1024;
         if (cand < 1024) continue;
         char path[200];
-        br_path(g_myip, cand, path, sizeof path);
+        br_path(interface, g_netif[interface].ip, cand, path, sizeof path);
         if (access(path, F_OK) != 0) return cand;
     }
     return 0;
@@ -1396,7 +1436,7 @@ static void fwd_maybe_start(int fd) {
     char upath[200];
     if (g_br_port[fd]) {
         cport = g_br_port[fd];
-        br_path(g_br_ip[fd], cport, upath, sizeof upath);
+        br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
         lo_path(cport, upath, sizeof upath);
@@ -1621,7 +1661,7 @@ static void udp_fwd_maybe_start(int fd) {
     char upath[200];
     if (g_br_port[fd]) {
         cport = g_br_port[fd];
-        br_path(g_br_ip[fd], cport, upath, sizeof upath);
+        br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
         lo_path(cport, upath, sizeof upath);
@@ -1656,11 +1696,12 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
     uint16_t cport;
     char up[200];
     uint32_t myip = 0;
-    if (br_on() && br_bind_is(sa, l)) {
+    int interface = br_bind_interface(sa, l);
+    if (br_on() && interface >= 0) {
         cport = ntohs(*(const uint16_t *)(sa + 2));
         if (cport == 0 || !pm_published(cport)) return 0; // only explicit, published ports get switched
-        myip = g_myip;
-        br_path(myip, cport, up, sizeof up); // we always listen on OUR endpoint IP
+        myip = g_netif[interface].ip;
+        br_path(interface, myip, cport, up, sizeof up); // we always listen on OUR endpoint IP
     } else if (lo_on() && lo_is(sa, l)) {
         cport = ntohs(*(const uint16_t *)(sa + 2));
         if (cport == 0 || !pm_published(cport)) return 0;
@@ -1687,6 +1728,7 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
         if (myip) {
             g_br_port[fd] = cport;
             g_br_ip[fd] = myip;
+            g_br_interface[fd] = (uint8_t)(interface + 1);
         } else {
             g_lo_port[fd] = cport;
         }
@@ -2830,33 +2872,33 @@ static int dns_answer_ptr(const char *qname, uint8_t *a, int ao, int cap, int *p
 // Returns 1 + fills *ip_be (network byte order) on a case-insensitive name match; 0 otherwise.
 static int dns_local_lookup(const char *qname, uint32_t *ip_be) {
     if (!qname || !qname[0]) return 0;
-    br_init(); // ensure g_netbr is populated from HL_NETBR (idempotent)
-    if (!g_netbr[0]) return 0;
-    char path[256];
-    snprintf(path, sizeof path, "%s/.names", g_netbr);
-    FILE *f = fopen(path, "re");
-    if (!f) return 0;
-    char line[512];
-    int found = 0;
-    while (fgets(line, sizeof line, f)) {
-        char *tab = strchr(line, '\t');
-        if (!tab) continue;
-        *tab = 0;
-        char *name = tab + 1;
-        size_t nl = strlen(name);
-        while (nl && (name[nl - 1] == '\n' || name[nl - 1] == '\r' || name[nl - 1] == ' ' || name[nl - 1] == '\t'))
-            name[--nl] = 0;
-        if (strcasecmp(name, qname) == 0) {
-            uint32_t ip = br_parse_ip(line);
-            if (ip) {
-                if (ip_be) *ip_be = ip;
-                found = 1;
-                break;
+    br_init();
+    for (uint8_t interface = 0; interface < g_netif_count; interface++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/.names", g_netif[interface].path);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char *tab = strchr(line, '\t');
+            if (!tab) continue;
+            *tab = 0;
+            char *name = tab + 1;
+            size_t nl = strlen(name);
+            while (nl && (name[nl - 1] == '\n' || name[nl - 1] == '\r' || name[nl - 1] == ' ' || name[nl - 1] == '\t'))
+                name[--nl] = 0;
+            if (strcasecmp(name, qname) == 0) {
+                uint32_t ip = br_parse_ip(line);
+                if (ip) {
+                    if (ip_be) *ip_be = ip;
+                    fclose(f);
+                    return 1;
+                }
             }
         }
+        fclose(f);
     }
-    fclose(f);
-    return found;
+    return 0;
 }
 
 // Build a wire-format response for a wire-format query. Returns the response length, or -1 if the query is

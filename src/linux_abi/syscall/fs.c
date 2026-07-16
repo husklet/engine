@@ -295,6 +295,7 @@ static void fd_reset_emul(int fd) {
         g_sock_passcred[fd] = 0;
         g_br_port[fd] = 0;
         g_br_ip[fd] = 0;
+        g_br_interface[fd] = 0;
         g_tcp_lport[fd] = 0; // drop a reused fd's stale listener so /proc/net/tcp doesn't show a ghost
         g_tcp_listen[fd] = 0;
         if (g_dns_sock[fd]) { // container DNS: close the engine-held socketpair peer

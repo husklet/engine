@@ -54,6 +54,8 @@ static int write_launch(const char *path) {
     config.volumes_offset = add_string(pool, &cursor, "/host:/guest:ro");
     config.lower_layers_offset = add_string(pool, &cursor, "/lower/one:/lower/two");
     config.network_namespace_offset = add_string(pool, &cursor, "box-network");
+    config.network_interfaces_offset =
+        add_string(pool, &cursor, "front=172.29.0.2\nback=172.29.1.2");
     config.pool_size = (uint32_t)cursor;
     fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0) return -1;
@@ -75,6 +77,8 @@ static int inspect_launch(const char *rootfs, uint32_t argc, char *const argv[],
     HL_CHECK(strcmp(hl_options_get(options, "HL_VOLUMES"), "/host:/guest:ro") == 0);
     HL_CHECK(strcmp(hl_options_get(options, "HL_LOWER"), "/lower/one:/lower/two") == 0);
     HL_CHECK(strcmp(hl_options_get(options, "HL_NETNS"), "box-network") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_NETIFS"),
+                    "front=172.29.0.2\nback=172.29.1.2") == 0);
     return 37;
 }
 

@@ -264,6 +264,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_lo_v6[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
+                g_br_interface[r] = 0;
                 g_tcp_lport[r] = 0;
                 g_tcp_listen[r] = 0;
                 g_dns_sock[r] = 0;
@@ -433,12 +434,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // A dual-stack listener that binds `::` (busybox nc's default, and many servers') is the IPv6 analogue
         // of 0.0.0.0 and takes the same path (br6_any_is), so it's reachable by peer containers over the switch
         // instead of landing on the isolated per-container loopback (which broke cross-container reach-by-name).
+        int bridge_interface = br_bind_interface(sa, (socklen_t)a2);
+        if (br6_any_is(sa, (socklen_t)a2)) bridge_interface = br_on() ? 0 : -1;
         if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
-            (br_bind_is(sa, (socklen_t)a2) || br6_any_is(sa, (socklen_t)a2))) {
+            bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
-            if (p == 0) p = br_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
+            if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
             char up[200];
-            br_path(g_myip, p, up, sizeof up); // we always listen on OUR endpoint IP
+            br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -452,7 +455,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_br_port[(int)a0] = p ? p : 1;
-                g_br_ip[(int)a0] = g_myip;
+                g_br_ip[(int)a0] = g_netif[bridge_interface].ip;
+                g_br_interface[(int)a0] = (uint8_t)(bridge_interface + 1);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -689,7 +693,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0 || errno == EINPROGRESS) {
                 g_lo_port[(int)a0] = p ? p : 1;
                 g_lo_v6[(int)a0] = (uint8_t)c_lo6;
-            } else if ((errno == ENOENT || errno == ECONNREFUSED) && br_on() && g_myip) {
+            } else if ((errno == ENOENT || errno == ECONNREFUSED) && br_on()) {
                 // Same-container localhost dial of a server that bound INADDR_ANY on the bridge (br_path,
                 // keyed by OUR own IP -- not lo_path): retry there so 127.0.0.1 still reaches a 0.0.0.0
                 // listener in bridge mode. The first connect() already POISONED this AF_UNIX socket (a
@@ -697,7 +701,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // is why a 0.0.0.0 server was unreachable via 127.0.0.1 with a user network attached),
                 // so swap in a FRESH AF_UNIX fd before the retry -- exactly as the br_connect loop does.
                 char bp[200];
-                br_path(g_myip, p, bp, sizeof bp);
+                br_path(0, g_netif[0].ip, p, bp, sizeof bp);
                 struct sockaddr_un bu;
                 if (unix_addr_set(&bu, bp) < 0 || lo_swap((int)a0) < 0) {
                     r = -1;
@@ -705,7 +709,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     r = connect((int)a0, (struct sockaddr *)&bu, sizeof bu);
                     if (r == 0 || errno == EINPROGRESS) {
                         g_br_port[(int)a0] = p ? p : 1;
-                        g_br_ip[(int)a0] = g_myip;
+                        g_br_ip[(int)a0] = g_netif[0].ip;
+                        g_br_interface[(int)a0] = 1;
                     }
                 }
             }
@@ -717,11 +722,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
-        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && br_connect_is(sa, (socklen_t)a2)) {
+        int connect_interface = br_connect_interface(sa, (socklen_t)a2);
+        if (br_on() && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && connect_interface >= 0) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
-            br_path(dip, p, up, sizeof up);
+            br_path(connect_interface, dip, p, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -757,6 +763,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0 || errno == EINPROGRESS) {
                 g_br_port[(int)a0] = p ? p : 1;
                 g_br_ip[(int)a0] = dip; // peer ip for getpeername
+                g_br_interface[(int)a0] = (uint8_t)(connect_interface + 1);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected

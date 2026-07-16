@@ -35,6 +35,7 @@ static const hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_LOWER", "ordered root filesystem lower layers", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_MEM_MAX", "guest memory limit", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_NETBR", "shared virtual-network bridge identity", HL_OPTION_TEXT),
+    HL_LAUNCH_OPTION("HL_NETIFS", "serialized virtual-network interfaces", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_NETNS", "guest network and IPC namespace identity", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_NET_ISOLATE", "disable guest external networking", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_PCACHE", "enable persistent translated-code caching", HL_OPTION_FLAG),

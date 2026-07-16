@@ -14,7 +14,7 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 6;
+const ABI: u32 = 7;
 const HEADER_SIZE: usize = 144;
 const HEADER_SIZE_U32: u32 = 144;
 const MAGIC_OFFSET: usize = 0;
@@ -44,11 +44,11 @@ const FILESYSTEM_GENERATION_OFFSET: usize = 104;
 const ARGUMENTS_OFFSET: usize = 108;
 const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
-const TAIL_PADDING_OFFSET: usize = 140;
+const INTERFACES_OFFSET: usize = 140;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
-const _: () = assert!(TAIL_PADDING_OFFSET + 4 == HEADER_SIZE);
+const _: () = assert!(INTERFACES_OFFSET + 4 == HEADER_SIZE);
 
 struct Pool(Vec<u8>);
 
@@ -189,7 +189,8 @@ fn validate_network(config: &Config) -> Result<(), Error> {
     let configured = config.network_bridge.is_some()
         || config.network_ipv4.is_some()
         || !config.publish.is_empty()
-        || config.publish_external;
+        || config.publish_external
+        || !config.network_interfaces.is_empty();
     if config.network_isolated && configured {
         return Err(Error::InvalidConfig(
             "isolated networking cannot use bridge, IPv4, or publication settings",
@@ -200,12 +201,41 @@ fn validate_network(config: &Config) -> Result<(), Error> {
             "a network IPv4 address requires a virtual bridge",
         ));
     }
+    if !config.network_interfaces.is_empty()
+        && (config.network_bridge.is_some() || config.network_ipv4.is_some())
+    {
+        return Err(Error::InvalidConfig(
+            "legacy bridge fields cannot be mixed with virtual interfaces",
+        ));
+    }
+    if config.network_interfaces.len() > 8 {
+        return Err(Error::InvalidConfig(
+            "at most eight virtual network interfaces are supported",
+        ));
+    }
     if config.publish_external && config.publish.is_empty() {
         return Err(Error::InvalidConfig(
             "external publication requires at least one port rule",
         ));
     }
     Ok(())
+}
+
+fn interfaces(config: &Config) -> Option<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    if config.network_interfaces.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for (index, interface) in config.network_interfaces.iter().enumerate() {
+        if index != 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(interface.bridge().as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(interface.address().to_string().as_bytes());
+    }
+    Some(OsString::from_vec(bytes))
 }
 
 pub(crate) fn encode(
@@ -238,6 +268,8 @@ pub(crate) fn encode(
         .network_ipv4
         .map(|value| OsString::from(value.to_string()));
     let ipv4 = pool.string(ipv4.as_deref())?;
+    let interfaces = interfaces(config);
+    let interfaces = pool.string(interfaces.as_deref())?;
     let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
@@ -282,7 +314,7 @@ pub(crate) fn encode(
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(RESULT_OFFSET, result);
     header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
-    header.u32(TAIL_PADDING_OFFSET, 0);
+    header.u32(INTERFACES_OFFSET, interfaces);
 
     let mut wire = Vec::with_capacity(HEADER_SIZE + pool.0.len());
     wire.extend_from_slice(&header.0);
@@ -296,7 +328,7 @@ mod tests {
     use std::ffi::OsString;
     use std::net::Ipv4Addr;
 
-    use crate::network::{Bridge, Namespace, Rule};
+    use crate::network::{Bridge, Interface, Namespace, Rule};
 
     use super::*;
 
@@ -351,7 +383,28 @@ mod tests {
         assert_eq!(word(&wire, PUBLISH_COUNT_OFFSET), 2);
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), Some("bridge-alpha"));
         assert_eq!(string(&wire, IP_OFFSET), Some("172.18.0.2"));
-        assert_eq!(word(&wire, TAIL_PADDING_OFFSET), 0);
+        assert_eq!(word(&wire, INTERFACES_OFFSET), 0);
+    }
+
+    #[test]
+    fn multiple_interfaces_are_one_validated_launch_record() {
+        let config = Config::new()
+            .network_namespace(Namespace::new("container-multi").unwrap())
+            .interface(Interface::new(
+                Bridge::new("front").unwrap(),
+                Ipv4Addr::new(172, 29, 0, 2),
+            ))
+            .interface(Interface::new(
+                Bridge::new("back").unwrap(),
+                Ipv4Addr::new(172, 29, 1, 2),
+            ));
+        let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
+        assert_eq!(
+            string(&wire, INTERFACES_OFFSET),
+            Some("front=172.29.0.2\nback=172.29.1.2")
+        );
+        assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), None);
+        assert_eq!(string(&wire, IP_OFFSET), None);
     }
 
     #[test]
