@@ -469,28 +469,43 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        // The act/oldact structs are read/written DIRECTLY by the engine (24 bytes: handler,flags,mask), so
+        // The kernel rt_sigaction layout is 24 bytes on aarch64 and 32 bytes on x86_64, whose ABI carries
+        // sa_restorer between flags and mask. Read/write the target layout rather than interpreting the
+        // x86 restorer trampoline pointer as its signal mask.
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+        const uint64_t action_size = 32, mask_offset = 24;
+#else
+        const uint64_t action_size = 24, mask_offset = 16;
+#endif
+        // The act/oldact structs are read/written DIRECTLY by the engine, so
         // a bad/unmapped pointer must return -EFAULT rather than fault the engine. Validate in Linux
         // order -- copyin `act` (a1) before copyout `oldact` (a2) -- so no oldact is written when act faults.
-        if (a1 && !host_range_mapped((uintptr_t)a1, 24)) {
+        if (a1 && !host_range_mapped((uintptr_t)a1, (size_t)action_size)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a2 && !host_range_mapped((uintptr_t)a2, 24)) {
+        if (a2 && !host_range_mapped((uintptr_t)a2, (size_t)action_size)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         if (a2) {
             *(uint64_t *)(a2 + 0) = g_sigact[sig].handler;
             *(uint64_t *)(a2 + 8) = g_sigact[sig].flags;
-            *(uint64_t *)(a2 + 16) = g_sigact[sig].mask;
-            // aarch64: handler,flags,mask
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+            *(uint64_t *)(a2 + 16) = g_sigact[sig].restorer;
+#endif
+            *(uint64_t *)(a2 + mask_offset) = g_sigact[sig].mask;
         }
         if (a1) {
             uint64_t h = *(uint64_t *)(a1 + 0);
             g_sigact[sig].handler = h;
             g_sigact[sig].flags = *(uint64_t *)(a1 + 8);
-            g_sigact[sig].mask = *(uint64_t *)(a1 + 16);
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+            g_sigact[sig].restorer = *(uint64_t *)(a1 + 16);
+#else
+            g_sigact[sig].restorer = 0;
+#endif
+            g_sigact[sig].mask = *(uint64_t *)(a1 + mask_offset);
             // Synchronous CPU faults (SIGILL/FPE/TRAP/SEGV/BUS) ALWAYS stay on the engine's own host guard
             // (installed at startup): it intercepts the hardware fault and either delivers it to the guest
             // handler recorded in g_sigact above (deliver_guest_fault) or applies the default action
@@ -648,5 +663,12 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         break;
     default: return 0;
     }
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+    /* x86 self-signal syscalls can resume inside their translated block. At
+       this point their architectural return value has been committed, so an
+       unblocked pending signal can build its frame with the correct saved
+       RAX and SA_NODEFER recursion nests before the handler continues. */
+    if (nr != 139) maybe_deliver_signal(c);
+#endif
     return 1;
 }

@@ -244,6 +244,7 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
+#define HL_GUEST_SIGACTION_HAS_RESTORER 1
 #include "../../linux_abi/signal.c"                  // SHARED: signal delivery driver + translation
 
 static int x86_signal_cache_contains(void *context, uint64_t pc) {

@@ -16,7 +16,7 @@ static int ptrace_intercept_signal(struct cpu *c, int sig, int *out_sig);
 // Async signals set a pending bit from a tiny host handler; the dispatcher then
 // builds a Linux rt_sigframe on the guest stack and redirects to the handler.
 static struct {
-    uint64_t handler, flags, mask;
+    uint64_t handler, flags, restorer, mask;
 } g_sigact[65];
 
 // ---------------- Go async-preempt SIGURG suppression for iscgo aarch64 images (#423) ----------------
@@ -512,9 +512,12 @@ static void raise_guest_signal(struct cpu *c, int sig) {
 #if defined(__linux__)
         // Linux uses the same signal numbering and wait-status encoding as the guest. Let the host kernel
         // terminate this forked guest process so its parent observes a genuine WIFSIGNALED status. The
-        // shared relay below is only needed on hosts whose signal namespace cannot represent Linux exactly.
-        signal(sig, SIG_DFL);
-        raise(sig);
+        // shared relay below is also required for SIGSYS: the engine reserves the host SIGSYS disposition
+        // while translated code is active, so reusing it here is not a faithful process-termination path.
+        if (sig != 31) {
+            signal(sig, SIG_DFL);
+            raise(sig);
+        }
 #endif
         int core = sig_coredumps(sig) && svc_core_rlimit_cur() > 0;
         sigexit_record(sig, core);
