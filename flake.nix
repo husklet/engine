@@ -16,7 +16,9 @@
         let
           system = pkgs.stdenv.hostPlatform.system;
           runtimeHost = system == "aarch64-darwin" || system == "aarch64-linux";
+          linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
           linuxX86 = pkgs.pkgsCross.gnu64;
+          linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
           linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
         in {
           default = pkgs.stdenv.mkDerivation {
@@ -25,8 +27,12 @@
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
-              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools ]
+              ++ pkgs.lib.optionals (system == "aarch64-darwin") [ pkgs.darwin.cctools linuxArm.stdenv.cc ]
               ++ pkgs.lib.optionals (system == "aarch64-linux") [ linuxX86.stdenv.cc ];
+            AARCH64_LINUX_CC = if system == "aarch64-darwin" then linuxArmCompiler else "${pkgs.stdenv.cc}/bin/cc";
+            AARCH64_LINUX_STATIC_CC = if system == "aarch64-darwin"
+              then "${linuxArmCompiler} -L${linuxArm.glibc.static}/lib"
+              else "${pkgs.stdenv.cc}/bin/cc -L${pkgs.glibc.static}/lib";
             X86_64_LINUX_CC = if system == "aarch64-linux" then linuxX86Compiler else "x86_64-linux-gnu-gcc";
             enableParallelBuilding = true;
 
