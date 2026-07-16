@@ -239,9 +239,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int ty = (int)a1;
+        int virtual_icmp = (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP &&
+                           (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)) && br_on();
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged). Gate the new fd
         // against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the host table is far larger).
-        int r = nofile_gate(socket(af_l2m((int)a0), ty & 0xf, (int)a2));
+        // Bridge ICMP is synthesized below and must not depend on the host's privileged ping-socket policy.
+        int r = nofile_gate(virtual_icmp ? socket(AF_UNIX, SOCK_DGRAM, 0)
+                                        : socket(af_l2m((int)a0), ty & 0xf, (int)a2));
         if (r >= 0) {
             // SIGPIPE suppression: Linux delivers EPIPE (not a fatal signal) to a guest that has
             // SIG_IGN'd SIGPIPE or passes MSG_NOSIGNAL; macOS has no per-call MSG_NOSIGNAL, so make the

@@ -1665,6 +1665,10 @@ $(BUILD)/tools/forkserver-runner: tests/compat/process/integration/forkserver_ru
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
+$(BUILD)/tests/deny-icmp: tests/integration/deny_icmp.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
 $(BUILD)/tools/matrix-runner: tools/matrix_runner.c include/hl/config.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) \
@@ -1680,7 +1684,7 @@ $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 .PHONY: test-linux-production-typed
 test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/linux-production/hl-remote-supervisor \
-	$(BUILD)/tools/matrix-runner $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS) \
+	$(BUILD)/tools/matrix-runner $(BUILD)/tests/deny-icmp $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS) \
 	$(PROCFS_CASE_BINS) $(PROCESS_CASE_BINS) $(MEMORY_CASE_BINS) $(SYSCALL_CASE_BINS) \
 	$(SYSCALL_EDGE_CASE_BINS) $(ABI_CASE_BINS) $(COMPLETENESS_BINS) $(IPC_CASE_BINS) \
 	$(LIBC_CASE_BINS) $(POSIX_CASE_BINS) $(SIGNALS_CASE_BINS) $(THREAD_CASE_BINS) $(TIME_CASE_BINS)
@@ -1696,6 +1700,11 @@ test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
 		$(abspath $(BUILD)/compat/network/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network)
+	$(BUILD)/tests/deny-icmp $(BUILD)/tools/matrix-runner env \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/network/aarch64) \
+		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network) icmp-bridge
 	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/procfs/aarch64) \
 		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
