@@ -55,6 +55,18 @@ impl Terminal {
         Self { file }
     }
 
+    /// Duplicates this terminal master for independent blocking I/O.
+    ///
+    /// Both values refer to the same controlling terminal. A blocking reader may
+    /// own one value while another thread retains the other for input and resize.
+    /// The terminal remains open until every duplicate is dropped.
+    ///
+    /// # Errors
+    /// Returns an I/O error when the host cannot duplicate the terminal handle.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        self.file.try_clone().map(Self::new)
+    }
+
     /// Changes the terminal window size and notifies the foreground process group.
     ///
     /// # Errors

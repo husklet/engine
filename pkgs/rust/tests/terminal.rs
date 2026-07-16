@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::Command,
-    sync::OnceLock,
+    sync::{mpsc, OnceLock},
 };
 
 fn rootfs() -> &'static PathBuf {
@@ -25,17 +25,6 @@ fn rootfs() -> &'static PathBuf {
             .success());
         path
     })
-}
-
-fn read_until(terminal: &mut hl_engine::Terminal, marker: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 512];
-    while !output.windows(marker.len()).any(|window| window == marker) {
-        let count = terminal.read(&mut buffer).unwrap();
-        assert_ne!(count, 0, "terminal closed before marker");
-        output.extend_from_slice(&buffer[..count]);
-    }
-    output
 }
 
 fn open_files() -> usize {
@@ -64,11 +53,31 @@ fn terminal_is_controlling_merged_resizable_and_reaped() {
     assert!(child.take_stdin().is_none());
     assert!(child.take_stdout().is_none());
     assert!(child.take_stderr().is_none());
-    let mut output = read_until(&mut terminal, b"READY");
+
+    let mut reader = terminal.try_clone().unwrap();
+    let (ready, waiting) = mpsc::channel();
+    let output = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 512];
+        let mut announced = false;
+        loop {
+            let count = reader.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+            if !announced && output.windows(5).any(|window| window == b"READY") {
+                ready.send(()).unwrap();
+                announced = true;
+            }
+        }
+        output
+    });
+    waiting.recv().unwrap();
     terminal.resize(Size::new(41, 109).unwrap()).unwrap();
     terminal.write_all(b"hello\n").unwrap();
-    terminal.read_to_end(&mut output).unwrap();
     assert_eq!(child.wait().unwrap(), Exit::Code(23));
+    let output = output.join().unwrap();
     let text = String::from_utf8_lossy(&output).replace('\r', "");
     assert!(text.contains("TTY=111 TERM=xterm"), "{text}");
     assert!(text.contains("24 80"), "{text}");
@@ -76,7 +85,11 @@ fn terminal_is_controlling_merged_resizable_and_reaped() {
     assert!(text.contains("41 109"), "{text}");
     assert!(text.contains("LINE=hello"), "{text}");
     drop(terminal);
-    assert_eq!(open_files(), files, "terminal launch leaked a host descriptor");
+    assert_eq!(
+        open_files(),
+        files,
+        "terminal launch leaked a host descriptor"
+    );
 }
 
 #[test]
