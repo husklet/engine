@@ -3,11 +3,12 @@
 
 #include "hl/base.h"
 #include "hl/host_services.h"
+#include "hl/network.h"
 
 HL_EXTERN_C_BEGIN
 
 #define HL_ENGINE_ABI 4u
-#define HL_ENGINE_BOX_ABI 2u
+#define HL_ENGINE_BOX_ABI 3u
 #define HL_ENGINE_BOX_ABI_1 1u
 
 typedef struct hl_engine hl_engine;
@@ -68,9 +69,10 @@ typedef struct hl_engine_box_config {
     const char *hostname;
     /* Newline-separated [A-Za-z_][A-Za-z0-9_]*=VALUE records; NULL selects engine defaults. */
     const char *environment;
-    /* ABI 2: owned launcher settings. NULL means unspecified; non-NULL strings must be nonempty. */
+    /* Owned launcher settings. NULL means unspecified; non-NULL strings must be nonempty. */
     const char *lower_layers;
-    const char *publish;
+    const hl_engine_publish_rule *publish;
+    uint32_t publish_count;
     const char *volumes;
     const char *limits;
     const char *network_namespace;

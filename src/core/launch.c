@@ -53,7 +53,6 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->lower_layers_offset,
         config->hostname_offset,
         config->network_namespace_offset,
-        config->publish_offset,
         config->volumes_offset,
         config->limits_offset,
         config->working_directory_offset,
@@ -73,6 +72,30 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         if (offsets[i] != 0 && hl_launch_config_string(config, pool, offsets[i], NULL, NULL) != HL_STATUS_OK) return 0;
     }
     return 1;
+}
+
+static int launch_publish(const hl_launch_config *config, const char *pool, char *output, size_t capacity) {
+    const hl_engine_publish_rule *rules;
+    size_t used = 0;
+    uint32_t index;
+    if (config->publish_count == 0) {
+        output[0] = 0;
+        return 0;
+    }
+    if (hl_launch_config_publish(config, pool, &rules) != HL_STATUS_OK) return -1;
+    for (index = 0; index < config->publish_count; ++index) {
+        const uint8_t *address = (const uint8_t *)&rules[index].host_ipv4_be;
+        int written = rules[index].host_ipv4_be == 0
+                          ? snprintf(output + used, capacity - used, "%s%u:%u", index ? "," : "",
+                                     (unsigned)rules[index].host_port, (unsigned)rules[index].guest_port)
+                          : snprintf(output + used, capacity - used, "%s%u.%u.%u.%u:%u:%u", index ? "," : "",
+                                     (unsigned)address[0], (unsigned)address[1], (unsigned)address[2],
+                                     (unsigned)address[3], (unsigned)rules[index].host_port,
+                                     (unsigned)rules[index].guest_port);
+        if (written < 0 || (size_t)written >= capacity - used) return -1;
+        used += (size_t)written;
+    }
+    return 0;
 }
 
 // Read an hl launch config from an already-open file, populate launch state, rebuild the guest argv, and
@@ -114,6 +137,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         return 78;
     }
     if (hl_launch_config_validate(wire, wire_size, &cfg, &pool) != HL_STATUS_OK || !launch_strings_valid(&cfg, pool) ||
+        (cfg.publish_count != 0 && hl_launch_config_publish(&cfg, pool, NULL) != HL_STATUS_OK) ||
         hl_launch_config_arguments_validate(&cfg, pool, NULL) != HL_STATUS_OK) {
         fprintf(stderr, "hl-engine: launch config is malformed\n");
         free(wire);
@@ -122,6 +146,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
 
     hl_options options;
     char num[32];
+    char publish[1024];
     const char *s;
     if (hl_options_init(&options) != 0) {
         free(wire);
@@ -162,8 +187,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     if (s[0]) APPLY_OPTION("HL_HOSTNAME", s);
     s = launch_string(&cfg, pool, cfg.limits_offset);
     if (s[0]) APPLY_OPTION("HL_ULIMITS", s);
-    s = launch_string(&cfg, pool, cfg.publish_offset);
-    if (s[0]) APPLY_OPTION("HL_PUBLISH", s);
+    if (launch_publish(&cfg, pool, publish, sizeof publish) != 0) goto option_failure;
+    if (publish[0]) APPLY_OPTION("HL_PUBLISH", publish);
     s = launch_string(&cfg, pool, cfg.lower_layers_offset);
     if (s[0]) APPLY_OPTION("HL_LOWER", s);
     s = launch_string(&cfg, pool, cfg.network_namespace_offset);

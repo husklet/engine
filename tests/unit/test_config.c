@@ -17,14 +17,21 @@ int main(void) {
     const char *value;
     size_t value_size;
     size_t argument_count;
+    hl_engine_publish_rule rule = {UINT32_C(0x0100007f), 8080, 80};
+    const hl_engine_publish_rule *rules;
 
     HL_CHECK(sizeof(hl_launch_config) == 144);
+    HL_CHECK(sizeof(hl_engine_publish_rule) == 8);
+    HL_CHECK(offsetof(hl_engine_publish_rule, host_ipv4_be) == 0);
+    HL_CHECK(offsetof(hl_engine_publish_rule, host_port) == 4);
+    HL_CHECK(offsetof(hl_engine_publish_rule, guest_port) == 6);
     HL_CHECK(offsetof(hl_launch_config, magic) == 0);
     HL_CHECK(offsetof(hl_launch_config, pool_size) == 4);
     HL_CHECK(offsetof(hl_launch_config, header_size) == 8);
     HL_CHECK(offsetof(hl_launch_config, abi) == 12);
     HL_CHECK(offsetof(hl_launch_config, restore_directory_offset) == 128);
     HL_CHECK(offsetof(hl_launch_config, result_path_offset) == 132);
+    HL_CHECK(offsetof(hl_launch_config, publish_count) == 136);
     HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));
@@ -58,7 +65,14 @@ int main(void) {
     wire.pool[0] = 'x';
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
     wire.pool[0] = '\0';
-    wire.config.reserved = 1;
+    wire.config.publish_offset = 16;
+    wire.config.publish_count = 1;
+    memcpy(wire.pool + 16, &rule, sizeof rule);
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), &config, &pool) == HL_STATUS_OK);
+    HL_CHECK(hl_launch_config_publish(&config, pool, &rules) == HL_STATUS_OK);
+    HL_CHECK(rules[0].host_ipv4_be == rule.host_ipv4_be && rules[0].host_port == 8080 && rules[0].guest_port == 80);
+    wire.config.publish_offset = 0;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
+    wire.config.publish_count = 0;
     return EXIT_SUCCESS;
 }

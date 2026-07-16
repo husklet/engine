@@ -12,13 +12,33 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
     memcpy(&config, wire, sizeof(config));
     if (config.magic != HL_CONFIG_MAGIC) return HL_STATUS_CORRUPT;
     if (config.abi != HL_CONFIG_ABI) return HL_STATUS_ABI_MISMATCH;
-    if (config.reserved != 0) return HL_STATUS_CORRUPT;
     if (config.header_size < sizeof(config) || config.header_size > wire_size) return HL_STATUS_CORRUPT;
     complete_size = (size_t)config.header_size + config.pool_size;
     if (complete_size < config.header_size || complete_size != wire_size) return HL_STATUS_CORRUPT;
     if (config.pool_size == 0 || ((const char *)wire)[config.header_size] != '\0') return HL_STATUS_CORRUPT;
+    if ((config.publish_count == 0) != (config.publish_offset == 0)) return HL_STATUS_CORRUPT;
+    if (config.publish_count != 0) {
+        size_t bytes = (size_t)config.publish_count * sizeof(hl_engine_publish_rule);
+        if (bytes / sizeof(hl_engine_publish_rule) != config.publish_count || config.publish_offset % 4u != 0 ||
+            config.publish_offset >= config.pool_size || bytes > config.pool_size - config.publish_offset)
+            return HL_STATUS_CORRUPT;
+    }
     if (out_config != NULL) *out_config = config;
     if (out_pool != NULL) *out_pool = (const char *)wire + config.header_size;
+    return HL_STATUS_OK;
+}
+
+hl_status hl_launch_config_publish(const hl_launch_config *config, const char *pool,
+                                   const hl_engine_publish_rule **out_rules) {
+    const hl_engine_publish_rule *rules;
+    uint32_t index;
+    if (out_rules != NULL) *out_rules = NULL;
+    if (config == NULL || pool == NULL || config->publish_count == 0 || config->publish_offset == 0)
+        return HL_STATUS_INVALID_ARGUMENT;
+    rules = (const hl_engine_publish_rule *)(const void *)(pool + config->publish_offset);
+    for (index = 0; index < config->publish_count; ++index)
+        if (rules[index].host_port == 0 || rules[index].guest_port == 0) return HL_STATUS_CORRUPT;
+    if (out_rules != NULL) *out_rules = rules;
     return HL_STATUS_OK;
 }
 

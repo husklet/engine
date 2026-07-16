@@ -2,11 +2,12 @@
 #define HL_CONFIG_H
 
 #include "hl/base.h"
+#include "hl/network.h"
 
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 5u
+#define HL_CONFIG_ABI 6u
 #define HL_LAUNCH_RESULT_MAGIC UINT32_C(0x484c5253)
 #define HL_LAUNCH_RESULT_ABI 1u
 #define HL_CONFIG_SANDBOX_ENABLED 1u
@@ -47,7 +48,7 @@ typedef struct hl_launch_config {
     uint32_t restore_directory_offset;
     /* Existing 0600 result leaf created by the launcher; zero preserves direct CLI exit semantics. */
     uint32_t result_path_offset;
-    uint32_t reserved;
+    uint32_t publish_count;
 } hl_launch_config;
 
 typedef enum hl_launch_result_kind {
@@ -75,6 +76,8 @@ HL_API hl_status hl_launch_config_arguments_validate(const hl_launch_config *con
                                                      size_t *out_count);
 HL_API hl_status hl_launch_config_argument(const hl_launch_config *config, const char *pool, size_t index,
                                            const char **out_argument, size_t *out_size);
+HL_API hl_status hl_launch_config_publish(const hl_launch_config *config, const char *pool,
+                                          const hl_engine_publish_rule **out_rules);
 
 HL_EXTERN_C_END
 

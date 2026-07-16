@@ -14,7 +14,7 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 5;
+const ABI: u32 = 6;
 const HEADER_SIZE: usize = 144;
 const HEADER_SIZE_U32: u32 = 144;
 const MAGIC_OFFSET: usize = 0;
@@ -42,7 +42,7 @@ const NETWORK_BRIDGE_OFFSET: usize = 96;
 const IP_OFFSET: usize = 100;
 const ARGUMENTS_OFFSET: usize = 108;
 const RESULT_OFFSET: usize = 132;
-const RESERVED_OFFSET: usize = 136;
+const PUBLISH_COUNT_OFFSET: usize = 136;
 const TAIL_PADDING_OFFSET: usize = 140;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
@@ -78,6 +78,23 @@ impl Pool {
             self.0.push(0);
         }
         self.0.push(0);
+        Ok(offset)
+    }
+
+    fn publish(&mut self, rules: &[crate::network::Rule]) -> Result<u32, Error> {
+        if rules.is_empty() {
+            return Ok(0);
+        }
+        while self.0.len() % 4 != 0 {
+            self.0.push(0);
+        }
+        let offset = u32::try_from(self.0.len())
+            .map_err(|_| Error::InvalidConfig("launch configuration is too large"))?;
+        for rule in rules {
+            self.0.extend_from_slice(&rule.host_address().octets());
+            self.0.extend_from_slice(&rule.host().to_le_bytes());
+            self.0.extend_from_slice(&rule.guest().to_le_bytes());
+        }
         Ok(offset)
     }
 }
@@ -158,28 +175,13 @@ fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
     Ok(Some(OsString::from_vec(output)))
 }
 
-fn publish(config: &Config) -> Result<Option<OsString>, Error> {
+fn validate_publish(config: &Config) -> Result<(), Error> {
     if config.publish.len() > 32 {
         return Err(Error::InvalidConfig(
             "at most 32 port publication rules are supported",
         ));
     }
-    if config.publish.is_empty() {
-        return Ok(None);
-    }
-    let value = config
-        .publish
-        .iter()
-        .map(|rule| {
-            if rule.host_address().is_unspecified() {
-                format!("{}:{}", rule.host(), rule.guest())
-            } else {
-                format!("{}:{}:{}", rule.host_address(), rule.host(), rule.guest())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    Ok(Some(OsString::from(value)))
+    Ok(())
 }
 
 fn validate_network(config: &Config) -> Result<(), Error> {
@@ -211,6 +213,7 @@ pub(crate) fn encode(
     result: Option<&Path>,
 ) -> Result<Vec<u8>, Error> {
     validate_network(config)?;
+    validate_publish(config)?;
     let mut pool = Pool::new();
     let rootfs = pool.path(config.rootfs.as_deref())?;
     let hostname = pool.string(config.hostname.as_deref())?;
@@ -234,8 +237,7 @@ pub(crate) fn encode(
         .network_ipv4
         .map(|value| OsString::from(value.to_string()));
     let ipv4 = pool.string(ipv4.as_deref())?;
-    let publish = publish(config)?;
-    let publish = pool.string(publish.as_deref())?;
+    let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
     let volumes = pool.string(volumes.as_deref())?;
     let result = pool.path(result)?;
@@ -276,7 +278,7 @@ pub(crate) fn encode(
     header.u32(IP_OFFSET, ipv4);
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(RESULT_OFFSET, result);
-    header.u32(RESERVED_OFFSET, 0);
+    header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
     header.u32(TAIL_PADDING_OFFSET, 0);
 
     let mut wire = Vec::with_capacity(HEADER_SIZE + pool.0.len());
@@ -333,13 +335,19 @@ mod tests {
             string(&wire, NETWORK_NAMESPACE_OFFSET),
             Some("container-alpha")
         );
+        let offset = word(&wire, PUBLISH_OFFSET) as usize;
+        let pool = &wire[HEADER_SIZE..];
         assert_eq!(
-            string(&wire, PUBLISH_OFFSET),
-            Some("127.0.0.1:8080:80,8443:443")
+            &pool[offset..offset + 8],
+            &[127, 0, 0, 1, 0x90, 0x1f, 80, 0]
         );
+        assert_eq!(
+            &pool[offset + 8..offset + 16],
+            &[0, 0, 0, 0, 0xfb, 0x20, 0xbb, 1]
+        );
+        assert_eq!(word(&wire, PUBLISH_COUNT_OFFSET), 2);
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), Some("bridge-alpha"));
         assert_eq!(string(&wire, IP_OFFSET), Some("172.18.0.2"));
-        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
         assert_eq!(word(&wire, TAIL_PADDING_OFFSET), 0);
     }
 
@@ -360,6 +368,7 @@ mod tests {
             Some("isolated-namespace")
         );
         assert_eq!(string(&wire, PUBLISH_OFFSET), None);
+        assert_eq!(word(&wire, PUBLISH_COUNT_OFFSET), 0);
         assert_eq!(string(&wire, NETWORK_BRIDGE_OFFSET), None);
         assert_eq!(string(&wire, IP_OFFSET), None);
     }
