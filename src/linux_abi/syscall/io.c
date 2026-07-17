@@ -592,19 +592,36 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                  * overdue EV_ONESHOT. Linux timerfd one-shots have exactly one expiration; only a
                  * periodic timer accumulates multiple expirations.
                  */
-                *(uint64_t *)a1 = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
+                uint64_t expirations = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
+                /*
+                 * A distinct first deadline is represented by an EV_ONESHOT.  kqueue can therefore
+                 * only report the first expiry, while Linux accumulates every interval that elapsed
+                 * before read(2).  Derive that count from the original deadline and keep the next
+                 * deadline phase-aligned instead of restarting the period at read time.
+                 */
+                if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0 && g_tfd_deadline[rfd] > 0) {
+                    struct timespec tnow;
+                    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
+                    int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
+                    if (now_ns >= g_tfd_deadline[rfd])
+                        expirations = 1 + (uint64_t)((now_ns - g_tfd_deadline[rfd]) / g_tfd_interval[rfd]);
+                }
+                *(uint64_t *)a1 = expirations;
             }
             // A periodic timerfd whose first expiry (it_value) differed from its interval was armed as a
             // one-shot for that first tick (event.c case 86). Now that the first tick has been consumed,
             // re-arm the recurring periodic at the interval so subsequent expiries fire every it_interval.
             if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0) {
                 struct kevent rkv;
-                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD, NOTE_NSECONDS, g_tfd_interval[rfd], NULL);
-                kevent(rfd, &rkv, 1, NULL, 0, NULL);
-                g_tfd_first_oneshot[rfd] = 0;
                 struct timespec tnow;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
-                g_tfd_deadline[rfd] = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec + g_tfd_interval[rfd];
+                int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
+                int64_t next = g_tfd_deadline[rfd];
+                if (next <= now_ns) next += ((now_ns - next) / g_tfd_interval[rfd] + 1) * g_tfd_interval[rfd];
+                int64_t delay = next - now_ns;
+                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                kevent(rfd, &rkv, 1, NULL, 0, NULL);
+                g_tfd_deadline[rfd] = next;
             }
             G_RET(c) = 8;
             break;
