@@ -41,6 +41,7 @@ static void run_guest(struct cpu *c);
 // `imprecise` (WAKE falls back to the bucket-aggregate `waiters`) until it fully drains -- a bounded,
 // wake-count-only degradation that never drops a wakeup (the broadcast still wakes everyone).
 #define FUTEX_ASLOTS 16
+#define FUTEX_WSLOTS 128
 
 struct futex_bucket {
     pthread_mutex_t m;
@@ -49,8 +50,48 @@ struct futex_bucket {
     uintptr_t saddr[FUTEX_ASLOTS]; // distinct uaddrs with >=1 parked waiter (0 == free slot)
     uint32_t scnt[FUTEX_ASLOTS];   // parked-waiter count for saddr[i]
     uint32_t sbits[FUTEX_ASLOTS];  // OR of the FUTEX_WAIT_BITSET masks parked on saddr[i] (plain WAIT = ~0)
+    uintptr_t waddr[FUTEX_WSLOTS]; // individual waiters, for exact FUTEX_WAKE(n) selection
+    uint32_t wbits[FUTEX_WSLOTS];  // this waiter's FUTEX_WAIT_BITSET mask
+    uint8_t wgrant[FUTEX_WSLOTS];  // selected by a wake; consumed by that waiter
     int imprecise;                 // slots overflowed while waiters were parked -> WAKE count approximate
 };
+
+// pthread_cond_broadcast is only the transport that gets sleepers runnable;
+// Linux FUTEX_WAKE(n) selects at most n waiters.  Keep that selection in the
+// shared bucket so non-selected sleepers re-park instead of spuriously
+// returning success.  Fixed slots are process-shared and therefore work for
+// futexes inherited across a real host fork (unlike linked host pointers).
+static int fbk_wait_register(struct futex_bucket *b, uintptr_t address, uint32_t bits) {
+    for (int i = 0; i < FUTEX_WSLOTS; ++i)
+        if (!b->waddr[i]) {
+            b->waddr[i] = address;
+            b->wbits[i] = bits;
+            b->wgrant[i] = 0;
+            return i;
+        }
+    return -1;
+}
+
+static void fbk_wait_unregister(struct futex_bucket *b, int slot) {
+    if (slot < 0) return;
+    b->wgrant[slot] = 0;
+    b->wbits[slot] = 0;
+    b->waddr[slot] = 0;
+}
+
+static int fbk_wait_grant(struct futex_bucket *b, uintptr_t address, int count, uint32_t mask,
+                          int *has_registered) {
+    int granted = 0;
+    *has_registered = 0;
+    for (int i = 0; i < FUTEX_WSLOTS; ++i) {
+        if (b->waddr[i] != address) continue;
+        *has_registered = 1;
+        if (b->wgrant[i] || !(b->wbits[i] & mask) || granted >= count) continue;
+        b->wgrant[i] = 1;
+        granted++;
+    }
+    return granted;
+}
 
 // Called under b->m. Register/unregister one parked waiter on `a`, and report the parked count for `a`.
 // `bits` is the waiter's FUTEX_WAIT_BITSET mask (~0u for a plain FUTEX_WAIT); it is OR'd into the address's
@@ -1121,11 +1162,55 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     } else {
         g_hrm_lo = lo;
         g_hrm_hi = end;
-        for (uintptr_t p = lo; p < end; p += 0x1000)
+        for (uintptr_t p = lo; p < end; p += 0x1000) {
             (void)*(volatile const uint8_t *)p;
+            /* A file mapping can end in the middle of a guest page.  Darwin's
+               VM region query and a probe at the page start both succeed, but
+               bytes after EOF raise SIGBUS.  Probe the last covered byte too;
+               mapped ranges cannot contain an interior hole, so the pair
+               proves the complete page fragment is readable. */
+            uintptr_t q = p + 0xfff;
+            if (q >= end) q = end - 1;
+            if (q != p) (void)*(volatile const uint8_t *)q;
+        }
     }
     g_hrm_lo = 0;
     g_hrm_hi = 0; // probe window closed (hook inert again)
+    return ok;
+}
+
+/* Prove that every guest-page fragment in a range accepts stores without
+   changing its contents.  A Darwin file mapping can be readable while writes
+   to its EOF tail raise SIGBUS; VM-region protection alone cannot detect that
+   state.  The same guarded fault window used by host_range_mapped keeps this
+   suitable for reconciling Linux MAP_FIXED sub-host-page mappings. */
+static int host_range_writable(uintptr_t a, size_t len) {
+    if (!len) return 1;
+    uintptr_t end = a + len;
+    if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
+    uintptr_t lo = a & ~(uintptr_t)0xfff;
+    volatile int ok = 1;
+    if (sigsetjmp(g_hrm_jb, 0)) {
+        ok = 0;
+    } else {
+        g_hrm_lo = lo;
+        g_hrm_hi = end;
+        for (uintptr_t p = lo; p < end; p += 0x1000) {
+            uintptr_t begin = p < a ? a : p;
+            volatile uint8_t *first = (volatile uint8_t *)begin;
+            uint8_t value = *first;
+            *first = value;
+            uintptr_t q = p + 0xfff;
+            if (q >= end) q = end - 1;
+            if (q != begin) {
+                volatile uint8_t *last = (volatile uint8_t *)q;
+                value = *last;
+                *last = value;
+            }
+        }
+    }
+    g_hrm_lo = 0;
+    g_hrm_hi = 0;
     return ok;
 }
 
@@ -1236,8 +1321,15 @@ static int futex_wake_bucket(const int *uaddr, int n, uint32_t match) {
         pthread_mutex_unlock(&b->m);
         return 0;
     }
-    int woke = fbk_parked(b, futex_key(uaddr));
-    if (woke > n) woke = n;
+    int registered = 0;
+    int woke = fbk_wait_grant(b, futex_key(uaddr), n, match, &registered);
+    // PI and overflow fallback waiters do not occupy ordinary-wait slots;
+    // their loops re-check ownership/value after a broadcast, so the old
+    // bounded parked count remains correct for that exceptional path.
+    if (!registered) {
+        woke = fbk_parked(b, futex_key(uaddr));
+        if (woke > n) woke = n;
+    }
     pthread_cond_broadcast(&b->c); // waiters re-check their own word; spurious wakes are legal
     pthread_mutex_unlock(&b->m);
     return woke;
@@ -1559,18 +1651,20 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // bucket, so a cross-fork waker sees it. Carry the wait bitset (op 9 = FUTEX_WAIT_BITSET's val3;
         // plain FUTEX_WAIT matches any) so FUTEX_WAKE_BITSET can skip a non-overlapping wake.
         fbk_park(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
+        int wait_slot = fbk_wait_register(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
         ts_wait_enter(); // 'S' (sleeping) while parked in FUTEX_WAIT; peer /proc/<pid>/stat|status must not show 'R'
         int rc = 0;
+        struct timespec abs;
         if (ts) {
-            struct timespec abs, rel;
+            struct timespec rel;
             // op 9 (FUTEX_WAIT_BITSET): ts is an absolute deadline; op 0: it is relative.
             if (op == 9) futex_rel_from_abs(&rel, ts);
             abs_from_rel(&abs, op == 9 ? &rel : ts);
-            rc = pthread_cond_timedwait(&b->c, &b->m, &abs);
-        } else
-            pthread_cond_wait(&b->c, &b->m);
+        }
+        rc = ts ? pthread_cond_timedwait(&b->c, &b->m, &abs) : pthread_cond_wait(&b->c, &b->m);
         ts_wait_leave();
         thread_wait_clear();
+        fbk_wait_unregister(b, wait_slot);
         fbk_unpark(b, futex_key(uaddr));
         int intr = cpu_wait_interrupted(c);
         // fetch_sub returns the PREVIOUS value; == 1 means the bucket just fully drained -> a stale
@@ -1639,15 +1733,21 @@ static void futex_wake_addr(uint64_t uaddr) {
         pthread_mutex_unlock(&g_futex_m);
         return;
     }
-    // Linux's kernel-driven clear-child-tid wake uses shared futex semantics; glibc's lll_wait_tid joins on
-    // that same key class. Do not route it through whichever table this thread's last syscall selected.
-    g_fbk_active = g_fbk;
-    // Always lock+broadcast (same reasoning as futex_op's WAKE): the joiner's FUTEX_WAIT re-checks
-    // *ctid under this bucket's mutex, so the zero store above is ordered ahead of its check.
-    struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
-    pthread_mutex_lock(&b->m);
-    pthread_cond_broadcast(&b->c);
-    pthread_mutex_unlock(&b->m);
+    // libc implementations use both private and shared futex operations for
+    // thread joins.  The kernel-generated clear-child-tid wake is not tagged
+    // by the exiting guest syscall, so notify both key spaces.  The word is
+    // already zero and waiters re-check it, making the second notification a
+    // harmless spurious wake while avoiding a permanently parked exact waiter.
+    struct futex_bucket *tables[] = {g_fbk_private, g_fbk};
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; ++i) {
+        g_fbk_active = tables[i];
+        struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
+        pthread_mutex_lock(&b->m);
+        int registered = 0;
+        (void)fbk_wait_grant(b, futex_key((const void *)(uintptr_t)uaddr), INT_MAX, ~0u, &registered);
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+    }
 }
 
 static volatile int g_next_tid = 1000;
@@ -2016,6 +2116,20 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     G_THREAD_RESUME(child, parent);
     // §B: child starts with an EMPTY shadow stack (no parent frames)
     G_SHADOW_RESET(child);
+    G_SMC_QUEUE_RESET(child);
+    /* clone() inherits architectural register state and the signal mask, but
+       these fields describe an in-flight engine operation on the parent host
+       thread.  Copying them can deliver the parent's synchronous fault to the
+       child or resume a BUS/service handoff with stale scratch state. */
+    child->irq = 0;
+    child->tpending = 0;
+    child->sync_signal = 0;
+    child->sync_code = 0;
+    child->sync_address = 0;
+    child->vdirty = 0;
+    child->fault_addr = 0;
+    child->bus_ea = 0;
+    child->in_service = 0;
     child->exited = 0;
     child->redirect = 0;
     // CLONE_SETTLS
@@ -2032,6 +2146,11 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     // robust list is per-thread and NOT inherited: a new thread starts empty and re-registers via
     // set_robust_list itself (otherwise the copied parent head would be walked twice on exit).
     child->robust_list = 0;
+    // A new CLONE_VM thread starts with no alternate signal stack (Linux
+    // sigaltstack(2)); it installs its own stack after startup when needed.
+    child->alt_sp = 0;
+    child->alt_size = 0;
+    child->alt_flags = 2; /* SS_DISABLE */
     g_threaded = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, thread_trampoline, child) != 0) {
