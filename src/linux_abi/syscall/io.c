@@ -748,6 +748,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
+        {
+            struct iovec vector = {(void *)a1, (size_t)a2};
+            int64_t result;
+            if (udp_switch_write(wfd, &vector, 1, &result)) {
+                G_RET(c) = (uint64_t)result;
+                break;
+            }
+        }
         // RAM-backed scratch file: serve the write from memory (spill to the host file past the cap).
         // Copies straight from the guest buffer, so validate it (a host-fd write's kernel copyin would fault
         // a bad pointer to EFAULT; this engine memcpy would instead crash) --, access_ok.
@@ -879,6 +887,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             size_t size = dns_gather((const struct iovec *)a1, (int)a2, tmp, sizeof tmp);
             int64_t result;
             if (icmp_try_send((int)a0, tmp, size, NULL, 0, &result)) {
+                G_RET(c) = (uint64_t)result;
+                break;
+            }
+        }
+        {
+            int64_t result;
+            if (udp_switch_write((int)a0, (const struct iovec *)a1, (int)a2, &result)) {
                 G_RET(c) = (uint64_t)result;
                 break;
             }

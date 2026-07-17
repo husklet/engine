@@ -718,6 +718,14 @@ static uint8_t g_sock_stream[HL_NFD];
 static uint8_t g_sock_conn[HL_NFD];
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
+static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];
+static uint32_t g_udp_local_ip[HL_NFD], g_udp_peer_ip[HL_NFD];
+static uint8_t g_udp_local_interface[HL_NFD], g_udp_peer_interface[HL_NFD];
+static uint8_t g_udp_local_v6[HL_NFD], g_udp_peer_v6[HL_NFD];
+#define UDP_REF_N 4096
+struct udp_ref { volatile uint32_t used, refs; char path[200]; };
+static struct udp_ref *g_udp_refs;
+static uint16_t g_udp_ref[HL_NFD];
 // fd -> the socket's guest (Linux) address family, recorded at socket()/accept() so connect(203)/bind(200)
 // can validate the guest sockaddr's sa_family against it (EAFNOSUPPORT) without a getsockname() probe --
 // which is unreliable after a prior failed connect on the same fd. 0 = untracked (best-effort fallback).
@@ -734,9 +742,43 @@ static uint8_t g_sock_seqpacket[HL_NFD];
 // recycled only after both endpoint reference counts reach zero.
 static void seq_ref_arena_init(const hl_host_services *host) {
     void *arena = NULL;
-    if (g_seq_refs != NULL) return;
-    if (hl_linux_shared_create(host, sizeof(struct seq_ref) * SEQ_REF_N, &arena) == HL_STATUS_OK)
+    if (g_seq_refs != NULL && g_udp_refs != NULL) return;
+    if (g_seq_refs == NULL && hl_linux_shared_create(host, sizeof(struct seq_ref) * SEQ_REF_N, &arena) == HL_STATUS_OK)
         g_seq_refs = (struct seq_ref *)arena;
+    arena = NULL;
+    if (g_udp_refs == NULL && hl_linux_shared_create(host, sizeof(struct udp_ref) * UDP_REF_N, &arena) == HL_STATUS_OK)
+        g_udp_refs = (struct udp_ref *)arena;
+}
+
+static int udp_ref_create(int fd, const char *path) {
+    if (!g_udp_refs || fd < 0 || fd >= HL_NFD) return 0;
+    for (uint32_t i = 0; i < UDP_REF_N; i++) {
+        if (!__sync_bool_compare_and_swap(&g_udp_refs[i].used, 0, 1)) continue;
+        snprintf(g_udp_refs[i].path, sizeof g_udp_refs[i].path, "%s", path);
+        __atomic_store_n(&g_udp_refs[i].refs, 1, __ATOMIC_RELEASE);
+        g_udp_ref[fd] = (uint16_t)(i + 1);
+        return 0;
+    }
+    errno = ENFILE;
+    return -1;
+}
+
+static void udp_ref_dup(int dst, int src) {
+    if (!g_udp_refs || src < 0 || src >= HL_NFD || dst < 0 || dst >= HL_NFD || !g_udp_ref[src]) return;
+    uint32_t slot = g_udp_ref[src] - 1;
+    __atomic_add_fetch(&g_udp_refs[slot].refs, 1, __ATOMIC_ACQ_REL);
+    g_udp_ref[dst] = g_udp_ref[src];
+}
+
+static void udp_ref_drop(int fd) {
+    if (!g_udp_refs || fd < 0 || fd >= HL_NFD || !g_udp_ref[fd]) return;
+    uint32_t slot = g_udp_ref[fd] - 1;
+    g_udp_ref[fd] = 0;
+    if (__atomic_sub_fetch(&g_udp_refs[slot].refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        unlink(g_udp_refs[slot].path);
+        g_udp_refs[slot].path[0] = 0;
+        __atomic_store_n(&g_udp_refs[slot].used, 0, __ATOMIC_RELEASE);
+    }
 }
 
 static int seq_ref_pair(int first, int second) {
@@ -788,6 +830,9 @@ static void seq_ref_fork_prepare(void) {
         uint32_t slot = g_seq_ref[fd] - 1;
         __atomic_add_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
     }
+    if (g_udp_refs)
+        for (int fd = 0; fd < HL_NFD; fd++)
+            if (g_udp_ref[fd]) __atomic_add_fetch(&g_udp_refs[g_udp_ref[fd] - 1].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 static void seq_ref_fork_cancel(void) {
@@ -797,6 +842,9 @@ static void seq_ref_fork_cancel(void) {
         uint32_t slot = g_seq_ref[fd] - 1;
         __atomic_sub_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
     }
+    if (g_udp_refs)
+        for (int fd = 0; fd < HL_NFD; fd++)
+            if (g_udp_ref[fd]) __atomic_sub_fetch(&g_udp_refs[g_udp_ref[fd] - 1].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 // fd -> (its socketpair/O_DIRECT-pipe PARTNER fd + 1); 0 = no known partner. Recorded for both ends at
@@ -1024,6 +1072,15 @@ static void fd_carry_sock(int dst, int src) {
     if (dst < 0 || dst >= HL_NFD || src < 0 || src >= HL_NFD) return;
     g_sock_stream[dst] = g_sock_stream[src];
     g_sock_dgram[dst] = g_sock_dgram[src];
+    udp_ref_dup(dst, src);
+    g_udp_local_port[dst] = g_udp_local_port[src];
+    g_udp_peer_port[dst] = g_udp_peer_port[src];
+    g_udp_local_ip[dst] = g_udp_local_ip[src];
+    g_udp_peer_ip[dst] = g_udp_peer_ip[src];
+    g_udp_local_interface[dst] = g_udp_local_interface[src];
+    g_udp_peer_interface[dst] = g_udp_peer_interface[src];
+    g_udp_local_v6[dst] = g_udp_local_v6[src];
+    g_udp_peer_v6[dst] = g_udp_peer_v6[src];
     g_sock_seqpacket[dst] = g_sock_seqpacket[src];
     seq_ref_dup(dst, src);
     g_sock_pair_peer[dst] = g_sock_pair_peer[src]; // dup aliases the same end -> same partner
@@ -1514,6 +1571,131 @@ static int udp_swap(int fd) {
     }
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+// Route every private-network IPv4 datagram through the same AF_UNIX rendezvous namespace as streams.
+// The pathname is also the sender identity returned by recvfrom/recvmsg, so replies need no side table.
+static int udp_switch_bind(int fd, int interface, uint32_t ip, uint16_t port) {
+    char path[200];
+    if (!port) port = interface >= 0 ? br_alloc_ephemeral(interface) : lo_alloc_ephemeral();
+    if (!port) { errno = EADDRINUSE; return -1; }
+    if (interface >= 0) br_path(interface, ip, port, path, sizeof path);
+    else lo_path(port, path, sizeof path);
+    struct sockaddr_un un;
+    if (unix_addr_set(&un, path) < 0) return -1;
+    if (!g_udp_local_port[fd] && udp_swap(fd) < 0) return -1;
+    unlink(path);
+    if (bind(fd, (struct sockaddr *)&un, sizeof un) < 0) return -1;
+    if (udp_ref_create(fd, path) < 0) {
+        int saved = errno;
+        unlink(path);
+        errno = saved;
+        return -1;
+    }
+    g_udp_local_port[fd] = port;
+    g_udp_local_ip[fd] = ip;
+    g_udp_local_interface[fd] = (uint8_t)(interface + 1);
+    return 0;
+}
+
+static int udp_switch_ensure_source(int fd, int interface) {
+    if (g_udp_local_port[fd]) return 0;
+    return udp_switch_bind(fd, interface, interface >= 0 ? g_netif[interface].ip : 0, 0);
+}
+
+static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interface, uint32_t *ip,
+                                  uint16_t *port, char *path, size_t capacity) {
+    if (lo_on() && lo6_is(sa, len)) {
+        *ip = 0;
+        *port = ntohs(*(const uint16_t *)(sa + 2));
+        *interface = -1;
+        lo_path(*port, path, capacity);
+        return 1;
+    }
+    if (!sa || len < 8 || *(const uint16_t *)sa != AF_INET) return 0;
+    *ip = *(const uint32_t *)(sa + 4);
+    *port = ntohs(*(const uint16_t *)(sa + 2));
+    if (lo_on() && sa[4] == 127) {
+        *interface = -1;
+        lo_path(*port, path, capacity);
+        return 1;
+    }
+    *interface = br_on() ? br_for_ip(*ip) : -1;
+    if (*interface >= 0) {
+        br_path(*interface, *ip, *port, path, capacity);
+        return 1;
+    }
+    return 0;
+}
+
+// Materialize the rendezvous address for a logically-connected switch-backed UDP socket. UDP connect
+// records a default peer but deliberately leaves the AF_UNIX transport unconnected: unlike AF_UNIX,
+// Linux UDP connect succeeds when no process is listening and reports refusal on later I/O.
+static int udp_switch_peer_path(int fd, char *path, size_t capacity) {
+    if (fd < 0 || fd >= HL_NFD || !g_udp_peer_port[fd]) return 0;
+    int interface = (int)g_udp_peer_interface[fd] - 1;
+    if (interface >= 0)
+        br_path(interface, g_udp_peer_ip[fd], g_udp_peer_port[fd], path, capacity);
+    else
+        lo_path(g_udp_peer_port[fd], path, capacity);
+    return 1;
+}
+
+// write(2)/writev(2) are valid send operations on a connected datagram socket. The private UDP
+// transport deliberately keeps its AF_UNIX backing unconnected so Linux connect() can succeed before
+// a peer binds; route descriptor writes to the recorded logical peer explicitly instead of writing the
+// unconnected host socket and leaking EDESTADDRREQ to applications such as BusyBox nc.
+static int udp_switch_write(int fd, const struct iovec *iov, int iov_count, int64_t *result) {
+    char path[200];
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd] ||
+        !udp_switch_peer_path(fd, path, sizeof path))
+        return 0;
+    int interface = (int)g_udp_peer_interface[fd] - 1;
+    if (udp_switch_ensure_source(fd, interface) < 0) {
+        *result = -errno;
+        return 1;
+    }
+    struct sockaddr_un address;
+    if (unix_addr_set(&address, path) < 0) {
+        *result = -errno;
+        return 1;
+    }
+    struct msghdr message;
+    memset(&message, 0, sizeof message);
+    message.msg_name = &address;
+    message.msg_namelen = sizeof address;
+    message.msg_iov = (struct iovec *)iov;
+    message.msg_iovlen = iov_count;
+    ssize_t sent = sendmsg(fd, &message, 0);
+    *result = sent < 0 ? -errno : sent;
+    return 1;
+}
+
+static int udp_switch_source(const struct sockaddr_storage *source, socklen_t length, uint8_t *guest,
+                             socklen_t *guest_length) {
+    if (!source || source->ss_family != AF_UNIX || length < offsetof(struct sockaddr_un, sun_path) + 2)
+        return 0;
+    const char *path = ((const struct sockaddr_un *)source)->sun_path;
+    unsigned port;
+    if (g_netns[0] && !strncmp(path, g_netns, strlen(g_netns)) &&
+        sscanf(path + strlen(g_netns), "/p%u", &port) == 1) {
+        fill_inet_lo(guest, guest_length, (uint16_t)port);
+        return 1;
+    }
+    for (int i = 0; i < g_netif_count; i++) {
+        size_t prefix = strlen(g_netif[i].path);
+        unsigned a, b, c, d;
+        if (!strncmp(path, g_netif[i].path, prefix) &&
+            sscanf(path + prefix, "/%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 &&
+            a < 256 && b < 256 && c < 256 && d < 256 && port < 65536) {
+            uint8_t bytes[4] = {(uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d};
+            uint32_t address;
+            memcpy(&address, bytes, sizeof address);
+            fill_inet_br(guest, guest_length, address, (uint16_t)port);
+            return 1;
+        }
+    }
     return 0;
 }
 
