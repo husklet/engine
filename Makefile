@@ -324,7 +324,7 @@ THREAD_CASE_BINS := $(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/aarch64/%) \
 PURPOSE_ABI_PIE := atomics_builtins cpuid_features rflags_id tls tlsmodels
 PURPOSE_FILESYSTEM_PIE := dup2redir fcntlflags ltp_aterr ltp_dupfcntl ltp_linkstat mkfifo scratch_exec sentry_fs
 PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpoint ltp_procmisc \
-	pipeproc procreap sentry_fork sysinfo thrfork waitcore
+	pipeproc procreap sentry_exec_proc sentry_fork sysinfo thrfork waitcore
 PURPOSE_NETWORK_PIE := ltp_neterr net_nonblock net_sendmsg net_sockopt net_tcp net_udp net_unix sentry_net
 PURPOSE_IPC_PIE := msg neonshm sem shm shmposix sysvshm
 PURPOSE_THREADS_PIE := threads_basic threads_many threads_mutex_queue

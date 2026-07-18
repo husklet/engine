@@ -133,6 +133,12 @@ static int g_sentry_sandbox = 0; // HL_SANDBOX: wrap the worker in a deny-defaul
 #define SENTRY_OP_FORK 0xFFFFFFFDu // a[0]=parent wpid, a[1]=child wpid -> clone the parent's virtual->real map
 #define SENTRY_OP_EXIT 0xFFFFFFFCu // R->wpid -> free that worker process's fd table
 #define SENTRY_OP_EXEC 0xFFFFFFFBu // R->wpid -> close+drop every FD_CLOEXEC virtual fd (guest execve sweep)
+#define SENTRY_OP_REAP 0xFFFFFFFAu // a[0]=reaped child wpid -> release a child killed before guest exit cleanup
+// Reverse fd adoption (the FDPASS lend, worker->sentry): the worker opened a real fd LOCALLY (a
+// per-process synthetic /proc file whose truth lives only in the worker -- see sentry_worker_proc_leaf)
+// and hands it over SCM_RIGHTS on this ring's control socketpair; the sentry installs it into the
+// worker's virtual fd table so every later read/lseek/close forwards exactly like a sentry-opened fd.
+#define SENTRY_OP_ADOPT 0xFFFFFFF9u // a[0]=cloexec; ctl-socket carries the fd -> ret = the new virtual fd
 
 // The guest passes LINUX flag values, but this engine is a macOS binary whose <fcntl.h> O_CLOEXEC differs
 // (0x1000000 vs Linux 0x80000). Match the guest's own O_CLOEXEC / SOCK_CLOEXEC / EFD_CLOEXEC /
@@ -153,7 +159,15 @@ static int g_sentry_sandbox = 0; // HL_SANDBOX: wrap the worker in a deny-defaul
 // contention); beyond N, overflow threads serialize on a per-ring producer lock (`busy`) -- still
 // correct, just sharing a lane. (Follow-up: size the pool / hash by tid; wire execve/clone(fork) so a
 // forked guest PROCESS gets its own worker registered with the sentry.)
-#define SENTRY_NRINGS 8
+// 8 lanes deadlocked a real .NET SDK build: a forwarded BLOCKING wait (epoll_pwait/ppoll/read on a quiet
+// descriptor) parks its servicer thread for as long as the guest thread would block, so every lane can be
+// legitimately pinned by one parked waiter. dotnet/MSBuild runs several guest processes x threadpools of
+// parked waiters against the ONE shared sentry; once all lanes were pinned, every additional thread fell
+// to the shared-lane fallback and spun on a lane whose current request never completes -> whole-container
+// hang. 64 lanes keeps every simultaneously-blocked guest thread on its OWN lane for real SDK workloads;
+// the shared-lane fallback remains only as an extreme overflow. The idle cost stays bounded because the
+// servicer loop backs off to a real sleep once a lane has been quiet for a while (see sentry_ring_loop).
+#define SENTRY_NRINGS 64
 
 // The shared-memory mailbox. `turn` is the ownership token: 0 => worker fills a request, 1 => sentry
 // executes it. Strict ping-pong (no third state) => deadlock-free and, with release/acquire on turn,
@@ -394,6 +408,14 @@ static int sentry_forwarded(uint64_t nr) {
     case 67:  // pread64      (read + a3 offset)
     case 68:  // pwrite64     (write + a3 offset)
     case 71:  // sendfile     (two sentry-owned file descriptors)
+    case 76:  // splice       (two sentry-owned fds + optional in/out offsets; Rust coreutils cat/cp fast path)
+    case 285: // copy_file_range (same two-fd + optional offsets shape as splice)
+    case 46:  // ftruncate    (operates on a sentry-owned file descriptor)
+    case 47:  // fallocate    (same fd-in-a0 shape as ftruncate)
+    case 279: // memfd_create (in-name a0; returns a sentry-owned anonymous file, virtual to the worker)
+    case 48:  // faccessat    (in-path a1)
+    case 439: // faccessat2   (in-path a1)
+    case 78:  // readlinkat   (in-path a1 + out-buffer a2)
     case 79:  // newfstatat   (in-path a1 + out-struct a2, two-buffer)
     case 80:  // fstat        (out-struct a1)
     case 291: // statx        (in-path a1 + out-struct a4, two-buffer)
@@ -722,6 +744,8 @@ static void sentry_cmsg_translate_in(struct sentry_proc *p, uint8_t *ctl, size_t
 // pselect fd containers) are handled explicitly in sentry_service_one.
 static int fd_in_a0(uint64_t nr) {
     switch (nr) {
+    case 46:
+    case 47: // ftruncate/fallocate
     case 61:
     case 62:
     case 63:
@@ -782,6 +806,31 @@ static void sentry_service_one(struct sentry_ring *R) {
         } else {
             sentry_send_fd(g_ctl[idx][1], -1); // empty datagram: keep the worker recv in lockstep
             R->ret = -EBADF;
+        }
+        R->nserved++;
+        return;
+    }
+    // Reverse adoption (SENTRY_OP_ADOPT): receive a worker-opened real fd from the ring's control
+    // socketpair and install it into the calling worker's virtual fd table. The datagram was queued by
+    // the worker BEFORE it handed the turn over, so this recv never blocks on a missing message.
+    if (R->rawnr == SENTRY_OP_ADOPT) {
+        int idx = (int)(R - g_shm->ring);
+        int rfd = (idx >= 0 && g_ctl[idx][1] >= 0) ? sentry_recv_fd(g_ctl[idx][1]) : -1;
+        if (rfd < 0) {
+            R->ret = -EIO;
+            R->nserved++;
+            return;
+        }
+        pthread_mutex_lock(&g_fd_lock);
+        struct sentry_proc *p = proc_find_locked((pid_t)R->wpid);
+        int v = p ? vfd_alloc(p, rfd, 0) : -1;
+        if (v >= 0) p->cloexec[v] = (uint8_t)(R->a[0] != 0);
+        pthread_mutex_unlock(&g_fd_lock);
+        if (v < 0) {
+            close(rfd);
+            R->ret = -EMFILE;
+        } else {
+            R->ret = v;
         }
         R->nserved++;
         return;
@@ -1145,8 +1194,21 @@ static void sentry_service_one(struct sentry_ring *R) {
                 p->real[newv] = rnew;
                 p->borrowed[newv] = 0;
                 p->typed[newv] = p->typed[oldv];
+                p->procfd_dir[newv] = p->procfd_dir[oldv];
                 p->cloexec[newv] = (flags & LX_O_CLOEXEC) != 0; // dup3 sets FD_CLOEXEC iff LX_O_CLOEXEC given
                 local_ret = newv;
+                break;
+            }
+            case 76:
+            case 285: { // splice/copy_file_range(fd_in=a0, fd_out=a2): translate BOTH virtual descriptors
+                int r0 = vfd_real(p, (int)(int64_t)G_A0(&tmp));
+                int r2 = vfd_real(p, (int)(int64_t)G_A2(&tmp));
+                if (r0 < 0 || r2 < 0)
+                    eb = 1;
+                else {
+                    G_A0(&tmp) = (uint64_t)(int64_t)r0;
+                    G_A2(&tmp) = (uint64_t)(int64_t)r2;
+                }
                 break;
             }
             case 21: { // epoll_ctl(epfd, op, fd, ev): translate BOTH the epoll fd (a0) and the target fd (a2)
@@ -1254,7 +1316,8 @@ static void sentry_service_one(struct sentry_ring *R) {
             case 242:
             case 19:
             case 23:
-            case 20: // openat/socket/accept*/dup/eventfd2/epoll_create1
+            case 279: // memfd_create: an anonymous sentry-owned file enters the virtual table like an open
+            case 20:  // openat/socket/accept*/dup/eventfd2/epoll_create1
                 if (ret >= 0) {
                     int v = vfd_alloc(p, (int)ret, 0);
                     if (v < 0) {
@@ -1271,9 +1334,14 @@ static void sentry_service_one(struct sentry_ring *R) {
                         case 242: cx = (R->a[3] & LX_O_CLOEXEC) != 0; break; // accept4 flags
                         case 19: cx = (R->a[1] & LX_O_CLOEXEC) != 0; break;  // eventfd2 flags
                         case 20: cx = (R->a[0] & LX_O_CLOEXEC) != 0; break;  // epoll_create1 flags
+                        case 279: cx = (R->a[1] & 1u) != 0; break;           // memfd_create MFD_CLOEXEC
                         default: cx = 0; break;                              // dup(23) / accept(202)
                         }
                         p->cloexec[v] = (uint8_t)cx;
+                        if (snr == 56) {
+                            const char *opened = (const char *)G_A1(&tmp);
+                            p->procfd_dir[v] = opened != NULL && !strcmp(opened, "/proc/self/fd");
+                        }
                         R->ret = v;
                     }
                 }
@@ -1371,11 +1439,21 @@ static void sentry_service_one(struct sentry_ring *R) {
 static void sentry_ring_loop(struct sentry_ring *R) {
     for (;;) {
         uint32_t spins = 0;
+        uint32_t idle_rounds = 0; // yield rounds since the last serviced request (resets per request)
         while (atomic_load_explicit(&R->turn, memory_order_acquire) != 1) {
             if (atomic_load_explicit(&g_shm->quit, memory_order_acquire)) _exit(0);
             if (++spins > 256) {
                 if (getppid() == 1) _exit(0); // orphan-guard: worker died/crashed -> don't spin forever
-                sched_yield();
+                // A quiet lane must not burn a core forever: with a 64-lane pool most lanes are idle most
+                // of the time, so after ~1k yield rounds fall back to a real sleep. A newly armed turn is
+                // still observed within ~100us -- negligible against a forwarded syscall's round-trip --
+                // and a BUSY lane (request in flight or back-to-back traffic) never reaches the sleep.
+                if (++idle_rounds > 1024) {
+                    struct timespec nap = {0, 100000}; // 100us
+                    nanosleep(&nap, NULL);
+                } else {
+                    sched_yield();
+                }
                 spins = 0;
             }
         }
@@ -1483,6 +1561,71 @@ static void sentry_shutdown(void) {
     g_sentry_pid = 0; // idempotent: the exit-path shutdown + the post-run_guest teardown must not double-reap
 }
 
+// Per-process guest-state /proc files must be served by THIS worker, never the sentry. The sentry is a
+// fork of the ORIGINAL worker image, so its copy of the per-process guest identity (serialized auxv,
+// exe path, mapping registry, argv/environ, stack bounds) goes stale the moment any worker fork+execs a
+// new image -- execve stays worker-LOCAL and the sentry never re-learns it. A guest that then reads,
+// e.g., /proc/self/auxv gets the INITIAL image's AT_EXECFN/AT_PLATFORM pointers, which name memory the
+// exec teardown already unmapped -> a wild dereference in the fresh image (Rust coreutils `cat` parses
+// auxv at startup; HotSpot sizes its initial stack from /proc/self/stat). Match the absolute
+// "/proc/self/<leaf>" and "/proc/<own container pid>/<leaf>" spellings for the leaves whose content is
+// derived purely from worker-process state. The descriptor table (fd, fdinfo) IS sentry state and must
+// keep forwarding.
+static int sentry_worker_proc_leaf(const char *path) {
+    static const char *const leaves[] = {"auxv",    "maps",    "smaps", "stat",      "status", "statm",
+                                         "environ", "cmdline", "comm",  "exe",       "limits", "mountinfo",
+                                         "pagemap", "task/1/maps", NULL};
+    if (path == NULL || strncmp(path, "/proc/", 6) != 0) return 0;
+    const char *rest = path + 6;
+    // "/proc/self" itself: glibc realpath("/proc/self/exe") readlinks every component, and the pid this
+    // magic link names must be the WORKER's container pid, not the sentry's identity.
+    if (strcmp(rest, "self") == 0) return 1;
+    if (strncmp(rest, "self/", 5) == 0) {
+        rest += 5;
+    } else {
+        int pid = 0;
+        const char *s = rest;
+        while (*s >= '0' && *s <= '9')
+            pid = pid * 10 + (*s++ - '0');
+        if (s == rest || *s != '/' || pid != container_pid()) return 0;
+        rest = s + 1;
+    }
+    for (int i = 0; leaves[i]; i++)
+        if (strcmp(rest, leaves[i]) == 0) return 1;
+    return 0;
+}
+
+// Hand a worker-opened real fd to the sentry for adoption into this process's virtual fd table
+// (SENTRY_OP_ADOPT). The fd datagram is queued on the control socketpair BEFORE the turn flips so the
+// sentry's recv never blocks. Returns the new virtual fd, or a negated errno.
+static int64_t sentry_adopt_fd(int rfd, int cloexec) {
+    struct sentry_ring *R = ring_for_thread();
+    while (atomic_exchange_explicit(&R->busy, 1, memory_order_acquire))
+        sched_yield();
+    int idx = t_ring;
+    if (idx < 0 || g_ctl[idx][0] < 0) {
+        atomic_store_explicit(&R->busy, 0, memory_order_release);
+        return -EIO;
+    }
+    R->wpid = (uint32_t)g_worker_pid;
+    R->rawnr = SENTRY_OP_ADOPT;
+    R->a[0] = (uint64_t)(cloexec != 0);
+    R->iovn = 0;
+    for (int i = 0; i < 6; i++)
+        R->redir[i] = -1;
+    sentry_send_fd(g_ctl[idx][0], rfd);
+    atomic_store_explicit(&R->turn, 1, memory_order_release);
+    uint32_t sp = 0;
+    while (atomic_load_explicit(&R->turn, memory_order_acquire) != 0)
+        if (++sp > 256) {
+            sched_yield();
+            sp = 0;
+        }
+    int64_t ret = R->ret;
+    atomic_store_explicit(&R->busy, 0, memory_order_release);
+    return ret;
+}
+
 // ------------------------------------------------------------------ the routed trust boundary
 // Replaces the direct service_local(c) call for untrusted guests. When g_untrusted is off this is a
 // transparent pass-through (trusted path byte-identical to baseline -- and service() already gated us
@@ -1548,6 +1691,22 @@ static void syscall_route(struct cpu *c) {
         // execve (ENOENT/EACCES/…) leaves redirect clear and returns -errno, in which case the fds must
         // survive. Only on success sweep this worker's cloexec virtual fds sentry-side.
         if (c->redirect) sentry_ctl_op(SENTRY_OP_EXEC, (uint64_t)(uint32_t)g_worker_pid, 0);
+        return;
+    }
+    // openat(56)/readlinkat(78) of a per-process guest-state /proc file: serve it LOCALLY -- only this
+    // worker holds the current image's identity (the sentry's copy is the pre-fork/pre-exec one; see
+    // sentry_worker_proc_leaf). readlinkat is pure state (bytes into a guest buffer). openat yields a real
+    // worker-local fd, which must not leak into the guest's (fully virtual) descriptor space -- hand it to
+    // the sentry for adoption so read/lseek/close forward exactly like any sentry-opened descriptor.
+    if ((nr == 56 || nr == 78) && G_A1(c) && host_addr_mapped((uintptr_t)G_A1(c)) &&
+        sentry_worker_proc_leaf((const char *)G_A1(c))) {
+        service_local(c);
+        if (nr == 56 && (int64_t)G_RET(c) >= 0) {
+            int rfd = (int)G_RET(c);
+            int64_t v = sentry_adopt_fd(rfd, (G_A2(c) & LX_O_CLOEXEC) != 0);
+            close(rfd);
+            G_RET(c) = (uint64_t)v;
+        }
         return;
     }
     // wait4(260): reap the guest's child WORKER processes locally. The sentry is ALSO a child of the owner,
@@ -1629,7 +1788,34 @@ static void syscall_route(struct cpu *c) {
     R->inlen = 0;
 
     switch (nr) {
-    case 56: { // openat(dfd, a1=path, ...): in-path
+    case 48:  // faccessat
+    case 56:  // openat
+    case 439: // faccessat2
+    {         // dfd, a1=path: in-path
+        const char *p = (const char *)G_A1(c);
+        uint32_t n = 0;
+        if (p)
+            while (n < SENTRY_PATHCAP - 1 && p[n])
+                n++;
+        if (p) memcpy(R->buf, p, n);
+        R->buf[n] = 0;
+        R->inlen = n + 1;
+        R->redir[1] = 0;
+        break;
+    }
+    case 279: { // memfd_create(a0=name, a1=flags): in-name
+        const char *p = (const char *)G_A0(c);
+        uint32_t n = 0;
+        if (p)
+            while (n < SENTRY_PATHCAP - 1 && p[n])
+                n++;
+        if (p) memcpy(R->buf, p, n);
+        R->buf[n] = 0;
+        R->inlen = n + 1;
+        R->redir[0] = 0;
+        break;
+    }
+    case 78: { // readlinkat(dfd, a1=path, a2=buf, a3=size): in-path + bounded out-buffer
         const char *p = (const char *)G_A1(c);
         uint32_t n = 0;
         if (p)
@@ -1656,6 +1842,18 @@ static void syscall_route(struct cpu *c) {
             R->redir[2] = 0;
         }
         break;
+    case 76:    // splice(fd_in, off_in*, fd_out, off_out*, len, flags)
+    case 285: { // copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags): both offsets optional in/out
+        if (G_A1(c)) {
+            memcpy(R->buf, (const void *)G_A1(c), sizeof(int64_t));
+            R->redir[1] = 0;
+        }
+        if (G_A3(c)) {
+            memcpy(R->buf + sizeof(int64_t), (const void *)G_A3(c), sizeof(int64_t));
+            R->redir[3] = (int32_t)sizeof(int64_t);
+        }
+        break;
+    }
     case 63:   // read(fd, a1=buf, a2=len)
     case 67:   // pread64(fd, a1=buf, a2=len, a3=off)
     case 61: { // getdents64(fd, a1=buf, a2=count): reserve the out window; cap to BUFSZ
@@ -1967,6 +2165,13 @@ static void syscall_route(struct cpu *c) {
         break;
     case 71:
         if (ret >= 0 && G_A2(c)) memcpy((void *)G_A2(c), R->buf, sizeof(int64_t));
+        break;
+    case 76:  // splice: advanced in/out offsets land back in the guest's off_in/off_out
+    case 285: // copy_file_range: same offset writeback shape
+        if (ret >= 0) {
+            if (G_A1(c)) memcpy((void *)G_A1(c), R->buf, sizeof(int64_t));
+            if (G_A3(c)) memcpy((void *)G_A3(c), R->buf + sizeof(int64_t), sizeof(int64_t));
+        }
         break;
     case 65: // readv: scatter the ret bytes the sentry fetched back into the guest iovecs
         if (ret > 0) {
