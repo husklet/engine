@@ -986,6 +986,32 @@ static void anon_untrack(uint64_t addr, uint64_t len) {
     }
 }
 
+// A successful guest mprotect changes the CURRENT protection of tracked private-anon pages, and a
+// later MADV_DONTNEED must re-establish the range with THAT protection -- re-mapping with the stale
+// mmap-time prot (PROT_NONE for a reserve-then-commit arena, the mozjs/V8 GC-chunk pattern) turns the
+// committed pages back into an inaccessible reservation and the guest's next store faults. Split any
+// tracked record around [addr,addr+len) so the subrange records the new prot while the head/tail keep
+// theirs. Same lock-free discipline as the registry: a racing reader can only miss an entry (safe
+// no-op fallback to the advisory passthrough).
+static void anon_update_prot(uint64_t addr, uint64_t len, int prot) {
+    uint64_t end = addr + len;
+    if (!addr || end <= addr) return;
+    int n = g_nanonmap;
+    for (int i = 0; i < n; i++) {
+        uint64_t a = g_anonmap[i].addr, e = a + g_anonmap[i].len;
+        int old = g_anonmap[i].prot;
+        if (a >= end || addr >= e || old == prot) continue;
+        uint64_t lo = addr > a ? addr : a, hi = end < e ? end : e;
+        // Rewrite this record to the updated subrange, then append head/tail remainders with the old
+        // prot. anon_prot_if_contained scans first-match, so the record itself must carry the new prot.
+        g_anonmap[i].addr = lo;
+        g_anonmap[i].len = hi - lo;
+        g_anonmap[i].prot = prot;
+        if (a < lo) anon_track(a, lo - a, old);
+        if (hi < e) anon_track(hi, e - hi, old);
+    }
+}
+
 // prot of the tracked private-anon region fully containing [addr,addr+len), else -1 (unknown -> do
 // not remap). Full containment guarantees the range is anon, so the remap cannot corrupt a file map.
 static int anon_prot_if_contained(uint64_t addr, uint64_t len) {

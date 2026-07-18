@@ -777,6 +777,11 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(int64_t)(-errno);
                 break;
             }
+            // Keep the private-anon registry's CURRENT protection in sync: MADV_DONTNEED re-establishes
+            // a tracked range with the recorded prot, so a committed (mprotect'd RW) subrange of a
+            // PROT_NONE reservation must not be remapped back to PROT_NONE (mozjs/V8 GC chunks:
+            // reserve NONE -> commit RW -> DONTNEED -> store faulted).
+            anon_update_prot(physical_a0 & ~(uint64_t)0xfff, ((physical_a0 + a1 + 0xfff) & ~(uint64_t)0xfff) - (physical_a0 & ~(uint64_t)0xfff), host_protection);
 #endif
             // Guest permissions remain logical. Translated guest bytes are host data, and a physical
             // mprotect would turn ordinary guest guard/safepoint accesses into Darwin faults before the
