@@ -275,7 +275,7 @@ FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aar
 SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
-	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt,$(SIGNALS_CASE_NAMES)))
+	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt sigurg_go_preempt,$(SIGNALS_CASE_NAMES)))
 PROCESS_CASE_SOURCES := $(filter-out tests/compat/process/integration/%.c,$(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c)))
 PROCESS_CASE_NAMES := $(patsubst tests/compat/process/%.c,%,$(PROCESS_CASE_SOURCES))
 PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
