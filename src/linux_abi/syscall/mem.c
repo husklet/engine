@@ -438,7 +438,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // mprotect (case 226) is a no-op (the JIT never executes guest pages), so a later PROT_READ ->
         // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
         // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
+#if defined(__linux__)
+        // Linux host pages have the same granularity as this Linux ABI, so preserve the requested mapping
+        // protection.  In particular, a PROT_NONE reservation must stay inaccessible until mprotect commits
+        // it; the mprotect path below performs the real host transition on this platform.
+        int prot = (int)a2;
+#else
         int prot = (a3 & 0x20) ? ((int)a2 | PROT_READ | PROT_WRITE) : (int)a2;
+#endif
         // W6A item 3: guest RWX / PROT_EXEC mmaps (JVM/V8/LuaJIT/.NET/PyPy JIT arenas). On macOS a
         // non-MAP_JIT mmap that requests PROT_EXEC fails with EPERM under the hardened W^X policy, so
         // these guests can't allocate their code arena. But this is a DBT: the host NEVER executes guest
@@ -757,27 +764,24 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // the store silent. This also covers 4K guest subpages where a 16K host mprotect is unsafe: the
             // later lazy write fault may open the host page, but the stale translation is already gone.
             if ((int)a2 & PROT_WRITE) G_SMC_UNMAP(physical_a0, physical_a0 + a1);
-            // Enforce protections physically when the requested guest range starts at an independently
-            // tracked mmap and host-page rounding stays inside that mapping's private guard allocation.
-            // This is the safe 4K-guest/16K-host case: rounding a standalone 4K mmap to one 16K host page
-            // cannot clobber a neighbouring guest mapping because mmap reserved a 64K guard tail. Never
-            // round an interior subrange (ELF segments and adjacent 4K guest pages may share that host page).
-            // PROT_EXEC is intentionally omitted: translated guest bytes are data to the host, not executed.
-            {
-                size_t hp = (size_t)getpagesize();
-                uint64_t tracked = hl_gmap_find_length(physical_a0);
-                uint64_t host_len = (a1 + hp - 1) & ~((uint64_t)hp - 1);
-                // A Linux 4 KiB subpage may start inside one 16 KiB macOS VM page. In that case physical
-                // mprotect would be EINVAL (or, after rounding down, alter adjacent guest subpages), so the
-                // logical gna/gro registries above provide the precise Linux permission model instead.
-                if (tracked && !(physical_a0 & (uint64_t)(hp - 1)) && host_len <= tracked) {
-                    int host_prot = (int)a2 & (PROT_READ | PROT_WRITE);
-                    if (mprotect((void *)(uintptr_t)physical_a0, (size_t)host_len, host_prot) != 0) {
-                        G_RET(c) = (uint64_t)(-errno);
-                        break;
-                    }
-                }
+#if defined(__linux__)
+            // On a Linux host the guest and host VM page granularities match.  Apply the transition for
+            // real: managed runtimes reserve file-backed PROT_NONE arenas (commonly /dev/zero) and commit
+            // individual pages with mprotect before their first store.  Merely clearing gna returned success
+            // while leaving the host page PROT_NONE, so CoreCLR faulted on that first committed write.
+            // Guest EXEC is data to this DBT; keep it host-readable for translation and omit host execution.
+            int host_protection = (int)a2;
+            if (host_protection & PROT_EXEC)
+                host_protection = (host_protection | PROT_READ) & ~PROT_EXEC;
+            if (mprotect((void *)(uintptr_t)physical_a0, (size_t)a1, host_protection) != 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-errno);
+                break;
             }
+#endif
+            // Guest permissions remain logical. Translated guest bytes are host data, and a physical
+            // mprotect would turn ordinary guest guard/safepoint accesses into Darwin faults before the
+            // Linux permission model can classify them. The SMC machinery independently protects translated
+            // source pages when it needs a write trap.
             // #423 / H9: a guest that mprotect()s a page to add PROT_EXEC is a JIT toggling an
             // already-written page executable -- the mmap(RW) -> write code -> mprotect(RX) pattern that
             // .NET/Wasm/managed runtimes use (as opposed to the RWX mmap case 222 already covers). It MUST
