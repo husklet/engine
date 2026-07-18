@@ -681,9 +681,17 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // DONTNEED anon registry: record PRIVATE-ANON ranges (incl. the guard tail); for any other
             // (file-backed/shared) mapping, forget overlapping anon coverage -- a MAP_FIXED file map may
             // now sit where anon used to, and we must never anon-remap over it.
-            if ((a3 & 0x20) && (a3 & 0x02))
+            if ((a3 & 0x20) && (a3 & 0x02)) {
+                // Keep the private-anon registry's CURRENT protection in sync: anon_prot_if_contained
+                // scans first-match, so a MAP_FIXED re-commit inside an EXISTING tracked reservation
+                // (Go's sysReserve(PROT_NONE) -> sysMap(MAP_FIXED, RW) heap pattern) must rewrite the
+                // overlapped subrange in place -- appending alone leaves the stale PROT_NONE record
+                // shadowing it, and a later MADV_DONTNEED re-establishes the live heap as an
+                // inaccessible reservation (the Go memclr SIGSEGV class). Mirrors the mprotect-commit
+                // path above (mozjs/V8 GC chunks).
+                anon_update_prot((uint64_t)r, (uint64_t)a1 + guard, prot);
                 anon_track((uint64_t)r, (uint64_t)a1 + guard, prot);
-            else
+            } else
                 anon_untrack((uint64_t)r, (uint64_t)a1 + guard);
             // A fresh mapping resets any prior MADV_WIPEONFORK marking on this address range (advice does
             // not survive the region being remapped) -- drop stale wipe coverage so a reused address is
