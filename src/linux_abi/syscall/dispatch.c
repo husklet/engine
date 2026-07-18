@@ -543,6 +543,11 @@ static void service(struct cpu *c) {
         g_in_service = 0;
         return;
     }
+    // Preserve the guest's first syscall-argument register so a transparent SA_RESTART restart (see
+    // syscall_should_restart) can re-execute the SVC with the ORIGINAL arg. On aarch64 arg0 and the return
+    // value share x0, so a handler-then-restart would otherwise feed the just-written result back as arg0.
+    uint64_t _svc_arg0 = G_A0(c);
+    g_syscall_restart = 0;
     uint64_t _rnr = g_systrace ? G_NR(c) : 0; // JTS: capture nr to pair the return log below
     // seccomp gate: run the guest's installed cBPF filter(s) / STRICT policy against this syscall BEFORE it
     // is routed anywhere. On an intercepted syscall (ERRNO/TRAP/TRACE/KILL/strict-violation) the result is
@@ -567,6 +572,10 @@ static void service(struct cpu *c) {
         service_local(c); // trusted: byte-identical path
     }
     filemap_replay();
+    // A restart-redirect was requested (SA_RESTART handler pending on an interrupted blocking syscall): the
+    // syscall re-executes at the same SVC once the handler returns, so restore the arg0/return-aliased
+    // register the dispatch overwrote with the (discarded) EINTR result.
+    if (g_syscall_restart && c->redirect) G_A0(c) = _svc_arg0;
     if (g_systrace)
         fprintf(stderr, "[ret pid=%d] %llu -> %lld\n", (int)getpid(), (unsigned long long)_rnr,
                 (long long)(int64_t)G_RET(c));

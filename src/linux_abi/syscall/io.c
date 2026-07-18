@@ -840,6 +840,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             r = write(wfd, (void *)a1, (size_t)a2);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // write(2) to a broken pipe/socket -> guest SIGPIPE
         break;
     }
     case 65: {
@@ -939,6 +940,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             r = writev((int)a0, (void *)a1, (int)a2);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // writev(2) to a broken pipe/socket -> guest SIGPIPE
         break;
         // writev
     }

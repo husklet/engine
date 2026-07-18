@@ -21,14 +21,32 @@ static int syscall_should_restart(struct cpu *c) {
     // a thread blocked in read/accept/recv must be interrupted by a thread-directed signal too, not only a
     // process one. For each deliverable-now signal whose guest handler lacks SA_RESTART, return 0 (EINTR).
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+    int deliverable = 0;    // at least one runnable guest handler is pending
+    int all_sa_restart = 1; // ...and every such handler asked for SA_RESTART
     for (int s = 1; s <= 64; s++) {
         uint64_t bit = 1ull << s;
         if (!(p & bit)) continue;
         if (c->sigmask & (1ull << (s - 1))) continue; // blocked -> not delivered now
         if (g_sigact[s].handler <= 1) continue;       // SIG_DFL/IGN -> no guest handler runs
-        if (!(g_sigact[s].flags & SA_RESTART_L)) return 0;
+        deliverable = 1;
+        if (!(g_sigact[s].flags & SA_RESTART_L)) all_sa_restart = 0;
     }
-    return 1;
+    // Nothing runnable pending: a spurious/host-actioned EINTR a real kernel would not surface -> re-block the
+    // host call transparently in place (the old restart-in-loop behaviour, kept for this case only).
+    if (!deliverable) return 1;
+    // A runnable guest handler MUST run before the interrupted call proceeds -- Linux runs the handler on EVERY
+    // interrupted slow syscall, THEN (for SA_RESTART) restarts it. Restarting in place here never returns to the
+    // dispatcher, so maybe_deliver_signal never fires and the handler is stranded until the call finally
+    // completes on its own (e.g. `timeout 1 sleep 5`: the SIGALRM handler that must kill the child only ran when
+    // the child already exited). So STOP looping and return to the dispatcher. When every runnable handler is
+    // SA_RESTART, leave the guest PC on the SVC (c->redirect) so the syscall re-executes AFTER the handler runs
+    // (transparent restart); otherwise advance past it and let the guest observe EINTR. Either way the pending
+    // handler is delivered by the dispatcher's maybe_deliver_signal at the next block boundary.
+    if (all_sa_restart) {
+        c->redirect = 1;
+        g_syscall_restart = 1; // service() restores the arg0/return-aliased register before re-executing
+    }
+    return 0;
 }
 
 // An interruptible host syscall failed: should the caller retry it? True iff it was interrupted (EINTR)

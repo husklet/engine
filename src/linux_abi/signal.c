@@ -61,6 +61,12 @@ static volatile uint64_t g_pending;
 // kill-delivered SIGSEGV/ILL/FPE carries si_pid==0 and an si_addr just like a hardware fault), so we key
 // off this instead: in a syscall => async guest delivery; otherwise => the real fault path / re-raise.
 static __thread int g_in_service;
+// Set by syscall_should_restart when an interrupted blocking syscall must be transparently RESTARTED after
+// its pending SA_RESTART handler runs (it also sets c->redirect so the dispatcher re-executes the SVC).
+// service() consumes it to restore the syscall's first argument register before returning: on aarch64 the
+// arg0 and return registers alias (x0), so the result the handler code just wrote would otherwise be the
+// "fd" the re-executed syscall sees. Distinct from the execve/sigreturn redirect (which sets a final x0).
+static __thread int g_syscall_restart;
 // rt_sigqueueinfo extras carried to the handler's siginfo: si_code + si_value (consumed on delivery)
 static int g_sigcode[65];
 static uint64_t g_sigval[65];
@@ -523,6 +529,20 @@ static void raise_guest_signal(struct cpu *c, int sig) {
     c->exit_code = 128 + sig; // fallback if raise returns / signo invalid on host
 }
 
+// Linux delivers SIGPIPE to a guest thread whose write(2)/writev(2)/send(2)-without-MSG_NOSIGNAL hit a
+// pipe or socket whose reader is gone -- the write returns EPIPE AND, unless SIGPIPE is ignored or blocked,
+// a SIGPIPE is raised (default action: terminate, so `cmd | head` stops the writer). The host layer either
+// delivers host SIGPIPE itself or (the container primary-channel path) blocks it and returns EPIPE, so a
+// guest whose write returned EPIPE could otherwise never see SIGPIPE: it kept looping / printed "Broken
+// pipe" and pipelines like `yes | head` hung. Own the delivery here, keyed off the guest disposition:
+// SIG_IGN / blocked -> raise_guest_signal is a no-op and the EPIPE the caller already set stands; a handler
+// -> it runs and the guest still gets EPIPE; SIG_DFL -> the writer is terminated. `ret` is the syscall
+// result already computed by the caller (-EPIPE on the broken-pipe case). Idempotent if the host handler
+// also marked SIGPIPE pending (same non-realtime bit coalesces into one delivery).
+static void svc_sigpipe_on_epipe(struct cpu *c, int64_t ret) {
+    if (c && ret == -(int64_t)EPIPE) raise_guest_signal(c, 13); // Linux SIGPIPE
+}
+
 // A synchronous CPU fault (SIGSEGV/SIGBUS) taken inside translated code is the GUEST's own fault. If the
 // guest installed a handler for it, reconstruct the guest register state from the host fault context,
 // synthesize the Linux siginfo (si_addr = the guest fault address), queue the signal, and steer the host
@@ -721,23 +741,23 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
-    return;
-    char b[384];
-    int n = 0;
-    n = sig_diag_put(b, n, "[HLRAISE]");
-    n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
-    n = sig_diag_put_hex(b, n, " cpid=", (uint64_t)container_pid());
-    n = sig_diag_put_hex(b, n, " tid=", c ? (uint64_t)cpu_tid(c) : 0);
-    n = sig_diag_put_hex(b, n, " sig=", (uint64_t)sig);
-    n = sig_diag_put_hex(b, n, " pc=", c ? G_PC(c) : 0);
-    n = sig_diag_put_hex(b, n, " sp=", c ? G_SP(c) : 0);
+    // An engine-internal diagnostic for a guest taking a fatal-default signal. It must NEVER reach the
+    // guest's own stderr fd, so route it through the engine's tagged logging facility (HL_LOG_TAG_SIGNAL)
+    // exactly like every other engine diagnostic -- gated on the HL_LOG selector and compiled out entirely
+    // in a production (HL_ENABLE_LOGGING=0) build. A raw write(STDERR_FILENO) here leaked "[HLRAISE] ..."
+    // into the guest's captured stderr on any uncaught fatal signal (e.g. `kill -TERM $$`).
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL,
+            "raise-default pid=%#llx cpid=%#llx tid=%#llx sig=%#llx pc=%#llx sp=%#llx lr=%#llx handler=%#llx mask=%#llx",
+            (unsigned long long)getpid(), (unsigned long long)container_pid(),
+            (unsigned long long)(c ? (uint64_t)cpu_tid(c) : 0), (unsigned long long)sig,
+            (unsigned long long)(c ? G_PC(c) : 0), (unsigned long long)(c ? G_SP(c) : 0),
 #if G_GPC_HASH_SHIFT == 2
-    n = sig_diag_put_hex(b, n, " lr=", c ? c->x[30] : 0);
+            (unsigned long long)(c ? c->x[30] : 0),
+#else
+            0ull,
 #endif
-    n = sig_diag_put_hex(b, n, " handler=", (sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0);
-    n = sig_diag_put_hex(b, n, " mask=", c ? c->sigmask : 0);
-    b[n++] = '\n';
-    sig_diag_write(b, (size_t)n);
+            (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
+            (unsigned long long)(c ? c->sigmask : 0));
 }
 
 // a GENUINE synchronous CPU fault (SIGSEGV/SIGBUS/...) taken in translated code for which the guest

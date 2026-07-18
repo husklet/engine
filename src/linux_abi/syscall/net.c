@@ -1001,6 +1001,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        // send/sendto to a peer-closed socket -> guest SIGPIPE (Linux), unless MSG_NOSIGNAL was requested.
+        if (!((int)a3 & 0x4000)) svc_sigpipe_on_epipe(c, (int64_t)G_RET(c));
         break;
     }
     case 207: {
@@ -1454,6 +1456,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (hctl != hstack) free(hctl);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        // sendmsg to a peer-closed socket -> guest SIGPIPE (Linux), unless MSG_NOSIGNAL was requested.
+        if (nr == 211 && !((int)a2 & 0x4000)) svc_sigpipe_on_epipe(c, (int64_t)G_RET(c));
         break;
     }
     case 269:
