@@ -15,6 +15,10 @@ int main(void) {
     int mono = res_ok(CLOCK_MONOTONIC);
     int pcpu = res_ok(CLOCK_PROCESS_CPUTIME_ID);
     int tcpu = res_ok(CLOCK_THREAD_CPUTIME_ID);
-    printf("clockres real=%d mono=%d pcpu=%d tcpu=%d\n", real, mono, pcpu, tcpu);
+    struct timespec coarse;
+    int coarse_ms = clock_getres(CLOCK_MONOTONIC_COARSE, &coarse) == 0 &&
+                    coarse.tv_sec == 0 && coarse.tv_nsec == 1000000;
+    printf("clockres real=%d mono=%d pcpu=%d tcpu=%d coarse_ms=%d\n",
+           real, mono, pcpu, tcpu, coarse_ms);
     return 0;
 }
