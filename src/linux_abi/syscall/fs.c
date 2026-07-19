@@ -1427,8 +1427,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                  * straight through AT_EMPTY_PATH; the create-then-unlink emulation
                  * of O_TMPFILE cannot, so fall back to publishing a fresh file with
                  * the descriptor's (now materialized) contents. */
-                int r = linkat(pfn, "", npfd, nname, AT_EMPTY_PATH);
-                int e = errno;
+                int r, e;
+#if defined(AT_EMPTY_PATH)
+                r = linkat(pfn, "", npfd, nname, AT_EMPTY_PATH);
+                e = errno;
+#else
+                r = -1;
+                e = ENOTSUP;
+#endif
                 if (r < 0) {
                     int out = openat(npfd, nname, O_WRONLY | O_CREAT | O_EXCL, 0600);
                     if (out < 0) {
