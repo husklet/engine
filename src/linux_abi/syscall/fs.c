@@ -965,8 +965,39 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = fcntl(fd, F_SETFL, fl) < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        // FIONREAD
-        case 0x541b: G_RET(c) = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0; break;
+        // FIONREAD (SIOCINQ): bytes available to read. A guest AF_INET/AF_INET6 STREAM socket
+        // (g_sock_stream) is backed by an AF_UNIX socket on the private loopback/bridge (see lo_swap).
+        // The host AF_UNIX SIOCINQ does NOT subtract the bytes already consumed from the partially-read
+        // head skb (a kernel quirk), so after a short read it over-reports -- a guest that expects TCP
+        // SIOCINQ (nginx, redis, anything polling queued bytes) gets the wrong count. Recompute the true
+        // readable count with a non-consuming MSG_PEEK bounded by SO_RCVBUF; this is also exactly correct
+        // for a genuinely-AF_INET stream socket, so it applies uniformly to guest INET streams.
+        case 0x541b:
+            if (arg && fd >= 0 && fd < HL_NFD && g_sock_stream[fd]) {
+                int rcvbuf = 0;
+                socklen_t rl = sizeof rcvbuf;
+                if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &rl) == 0 && rcvbuf > 0) {
+                    if (rcvbuf > (16 << 20)) rcvbuf = 16 << 20; // cap the transient peek buffer at 16MB
+                    char *scratch = malloc((size_t)rcvbuf);
+                    if (scratch) {
+                        ssize_t pk = recv(fd, scratch, (size_t)rcvbuf, MSG_PEEK | MSG_DONTWAIT);
+                        free(scratch);
+                        if (pk >= 0) {
+                            *(int *)arg = (int)pk;
+                            G_RET(c) = 0;
+                            break;
+                        }
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            *(int *)arg = 0; // nothing queued (no readable bytes) -> 0, like TCP SIOCINQ
+                            G_RET(c) = 0;
+                            break;
+                        }
+                        // Any other error (ENOTCONN on a listening socket, etc.): fall back to the host ioctl.
+                    }
+                }
+            }
+            G_RET(c) = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0;
+            break;
         // FIOCLEX
         case 0x5451: G_RET(c) = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break;
         case 0x5450: {
