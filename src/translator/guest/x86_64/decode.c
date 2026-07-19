@@ -37,6 +37,7 @@ static int op_has_modrm(int two, uint8_t op) {
     if (op == 0xA8 || op == 0xA9) return 0;                      // test al/eax, imm
     if (op == 0x68 || op == 0x6A) return 0;                      // push imm
     if (op == 0xCC || op == 0xF1) return 0;
+    if (op == 0xD7) return 0; // XLATB: implicit operands (AL, DS:RBX), no ModRM
     // ALU group, mov, lea, test, group1/2/3, etc. all have modrm
     return 1;
 }

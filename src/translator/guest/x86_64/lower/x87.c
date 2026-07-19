@@ -180,10 +180,27 @@ void hl_x86_x87_extract(void) {
     hl_x86_x87_push(18);                    // push significand -> ST0 = significand, ST1 = exponent
 }
 
-// FRNDINT: round ST0 to an integral value using the current rounding mode.
+// FRNDINT: round ST0 to an integral value using the CURRENT x87 rounding control (cpu->fpcw bits[11:10]).
+// x87 has its OWN rounding domain, separate from SSE MXCSR (both share ARM FPCR.RMode), so a bare frintx
+// under the live (SSE, default-nearest) FPCR ignored fldcw's RC -- floorl/ceill/truncl (glibc sets RC via
+// fldcw around frndint) then all rounded to nearest, diverging from a real FPU. Round under a saved/restored
+// FPCR whose RMode is derived from the x87 RC (the same two-bit swap as ldmxcsr / emit_x87_round_st0), so
+// SSE rounding is untouched. Scratch x20/x21/x22/x23 (guest xmm is v0..v15; x20+ are free here).
 void hl_x86_x87_round(void) {
     hl_x86_x87_load(16, 0);
-    emit32(0x1E674000u | (16 << 5) | 16); // frintx d16, d16
+    e_ldr(20, 28, OFF_FPCW);                                          // w20 = cpu->fpcw
+    emit32(0x53000000u | (10u << 16) | (11u << 10) | (20 << 5) | 20); // ubfx w20,w20,#10,#2 -> RC (0..3)
+    e_movconst(21, 1);
+    e_rrr(A_AND, 22, 20, 21, 0, 0);       // w22 = RC & 1
+    e_lsr_i(21, 20, 1, 0);                // w21 = RC >> 1
+    e_rrr(A_ORR, 22, 21, 22, 0, 1);       // w22 = (RC>>1) | (RC&1)<<1 = ARM RMode (x87 RC bits swapped)
+    emit32(0xD53B4400u | 23);             // mrs x23, fpcr  (save the live -- SSE -- rounding mode)
+    e_movconst(21, 3u << 22);             // RMode mask
+    e_rrr(A_BIC, 20, 23, 21, 1, 0);       // x20 = fpcr & ~RMode
+    e_rrr(A_ORR, 20, 20, 22, 1, 22);      // x20 = | (ARM RMode << 22)
+    emit32(0xD51B4400u | 20);             // msr fpcr, x20  (x87 rounding mode)
+    emit32(0x1E67C000u | (16 << 5) | 16); // frinti d16, d16 (round to integral per FPCR.RMode)
+    emit32(0xD51B4400u | 23);             // msr fpcr, x23  (restore SSE rounding mode)
     hl_x86_x87_store(16, 0);
 }
 

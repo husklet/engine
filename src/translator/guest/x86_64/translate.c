@@ -2490,6 +2490,29 @@ static void *translate_block(uint64_t gpc) {
                 gpc = next;
                 continue;
             }
+            // ---- XLATB (D7): AL = [ (seg:) RBX + zero-extended AL ]. The table index is the *8-bit*
+            // AL (bits 63:8 of RAX never participate), so it cannot ride the ModRM index path. Build
+            // the base (RBX, with segment base + non-PIE bias + addr-size applied) through the shared
+            // EA emitter, add the zero-extended AL, then load one byte back into AL (bits 63:8 kept).
+            if (op == 0xD7) {
+                e_uxt(19, RAX, 1); // x19 = zero-extended AL (callee-saved; survives emit_ea's x16 clobber)
+                struct insn base = I;
+                base.is_mem = 1;
+                base.m_hasbase = 1;
+                base.m_base = RBX;
+                base.m_hasindex = 0;
+                base.rip_rel = 0;
+                base.disp = 0;
+                base.imm = 0;
+                emit_ea(&base, next);              // x17 = base address (seg base + bias + addr32 applied)
+                e_rrr(A_ADD, 17, 17, 19, 1, 0);    // x17 += zero-extended AL
+                if (I.addr32) e_uxt(17, 17, 4);    // 0x67: effective address wraps at 32 bits
+                emit_bus_guard(17, 1, next - (uint64_t)I.len);
+                e_load(1, 16, 17);
+                byte_wb(&I, RAX, 16); // AL = [table + AL]
+                gpc = next;
+                continue;
+            }
         } else {
             // ===== two-byte (0F xx) =====
             if (op == 0x05) {
