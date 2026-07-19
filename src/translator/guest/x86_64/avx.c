@@ -201,6 +201,25 @@ static double avx_dnan_f64(double r, double x, double y) {
     return r;
 }
 
+// FMA generates a default NaN (inf*0, or an inf-inf in the fused add) with the x86 indefinite
+// sign SET whenever the result is NaN and none of the three operands is NaN; a NaN propagated
+// from any operand keeps that operand's sign on both ISAs. Three-operand analogue of avx_dnan_*.
+static float fma_dnan_f32(float r, float x, float y, float z) {
+    if (r != r && x == x && y == y && z == z) {
+        uint32_t u = 0xFFC00000u;
+        memcpy(&r, &u, 4);
+    }
+    return r;
+}
+
+static double fma_dnan_f64(double r, double x, double y, double z) {
+    if (r != r && x == x && y == y && z == z) {
+        uint64_t u = 0xFFF8000000000000ull;
+        memcpy(&r, &u, 8);
+    }
+    return r;
+}
+
 static float avx_fp_arith_f32(int op, float x, float y) {
     switch (op) {
     case 0x58: return avx_dnan_f32(x + y, x, y);
@@ -1871,14 +1890,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = __builtin_fma(x, y, sub ? -z : z);
+                    double res = fma_dnan_f64(__builtin_fma(x, y, sub ? -z : z), x, y, z);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = __builtin_fmaf(x, y, sub ? -z : z);
+                    float res = fma_dnan_f32(__builtin_fmaf(x, y, sub ? -z : z), x, y, z);
                     memcpy(d + i, &res, 4);
                 }
             }
@@ -1932,14 +1951,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = __builtin_fma(sneg_mul * x, y, sneg_add * z);
+                    double res = fma_dnan_f64(__builtin_fma(sneg_mul * x, y, sneg_add * z), x, y, z);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = __builtin_fmaf(sneg_mul * x, y, sneg_add * z);
+                    float res = fma_dnan_f32(__builtin_fmaf(sneg_mul * x, y, sneg_add * z), x, y, z);
                     memcpy(d + i, &res, 4);
                 }
             }
