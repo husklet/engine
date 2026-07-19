@@ -60,6 +60,10 @@ static int gpr_field_mask(uint32_t in) {
         if (!v) m |= 1;
         //   register offset: Rm[20:16]
         if ((in & 0x3B200C00u) == 0x38200800u) m |= 4;
+        //   LSE atomic memory ops (LDADD/LDCLR/LDEOR/LDSET/LDSMAX.../SWP): value operand Rs[20:16].
+        //   Same encoding box as register-offset but bits[11:10]==00; without this a stolen Rs (x16/x17)
+        //   would be emitted verbatim on the generic decode path and read the engine-private host reg.
+        if ((in & 0x3B200C00u) == 0x38200000u) m |= 4;
         //   load/store pair: Rt2[14:10] (GP only)
         if ((in & 0x3A000000u) == 0x28000000u && !v) m |= 8;
         //   exclusive: Rs[20:16], Rt2[14:10]
