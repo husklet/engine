@@ -4137,7 +4137,8 @@ static int synth_misc_dir_open(const char *gp) {
     if (!strcmp(gp, "/proc/net") || !strcmp(gp, "/proc/net/")) {
         static const char *const net[] = {"tcp",     "tcp6",     "udp",       "udp6",       "unix",
                                           "dev",     "route",    "if_inet6",  "snmp",       "snmp6",
-                                          "netstat", "sockstat", "sockstat6", "ipv6_route", 0};
+                                          "netstat", "sockstat", "sockstat6", "ipv6_route", "arp",
+                                          "igmp",    0};
         return synth_names_dir_open("/proc/net", net, 0);
     }
     // /proc/tty: tty discovery tools (agetty, `ls /proc/tty`) walk this before reading drivers.
@@ -5237,6 +5238,33 @@ static int proc_open(const char *rp) {
                      "Udp6RcvbufErrors                \t0\nUdp6SndbufErrors                \t0\n"
                      "Udp6InCsumErrors                \t0\nUdp6IgnoredMulti                \t0\n"
                      "Udp6MemErrors                   \t0\n");
+    } else if (!strcmp(rp, "/proc/net/arp")) {
+        // Neighbour table (`arp -a`, `ip neigh`). The container is its own net namespace: it must NOT expose
+        // the HOST's ARP cache (gateway/neighbour MACs) that the raw host /proc/net/arp passthrough leaked.
+        // A freshly-started bridge container has resolved no neighbours yet, so the correct, container-safe
+        // view is the header with an empty table -- well-formed for any parser.
+        n = snprintf(buf, sizeof buf,
+                     "IP address       HW type     Flags       HW address            Mask     Device\n");
+    } else if (!strcmp(rp, "/proc/net/igmp")) {
+        // Multicast group memberships per interface. Must reflect the SAME container interface set as
+        // /proc/net/dev (lo [+ eth0]) -- the host passthrough leaked the host's docker0/host-iface rows,
+        // an isolation break and an iface-set inconsistency vs the synthesized /proc/net/dev. Every up
+        // multicast interface joins the all-hosts group 224.0.0.1 (010000E0, little-endian hex).
+        n = snprintf(buf, sizeof buf,
+                     "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n"
+                     "1\tlo        :     1      V3\n\t\t\t\t010000E0     1 0:00000000\t\t0\n");
+        if (!net_isolate())
+            n += snprintf(buf + n, sizeof buf - (size_t)n,
+                          "2\teth0      :     1      V3\n\t\t\t\t010000E0     1 0:00000000\t\t0\n");
+    } else if (!strncmp(rp, "/proc/net/", 10)) {
+        // Isolation backstop: every /proc/net leaf the container legitimately exposes is synthesized above
+        // (a container view). Any remaining /proc/net/<leaf> -- fib_trie, rt_cache, netlink, packet,
+        // softnet_stat, protocols, dev_mcast, icmp, raw, xfrm_stat, ... -- would otherwise fall through to a
+        // raw host open and leak the HOST network stack (host routes/subnets, host processes' sockets, host
+        // CPU count, host-wide socket counts). Serve a well-formed EMPTY table instead of the host file: the
+        // namespaced file exists (open succeeds) but carries no host data.
+        n = 0;
+        buf[0] = 0;
     } else if (!strcmp(rp, "/proc/pressure/cpu")) {
         n = snprintf(buf, sizeof buf, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n");
     } else if (!strcmp(rp, "/proc/pressure/memory") || !strcmp(rp, "/proc/pressure/io")) {
