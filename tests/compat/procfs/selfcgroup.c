@@ -4,8 +4,11 @@
 // three colon-separated fields with the fixed "0" and "" and a leading '/'), not the host-variant path
 // text. A v1-style multi-line or malformed cgroup file breaks container detection. Derived structural.
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "pf.h"
 
 int main(void) {
@@ -23,7 +26,10 @@ int main(void) {
         const char *hier = b, *ctrl = c1 + 1, *path = c2 + 1;
         shape_ok = strcmp(hier, "0") == 0 && ctrl[0] == 0 && path[0] == '/';
     }
-    int ok = n > 0 && shape_ok;
+    struct stat st;
+    int path_ok = stat("/proc/self/cgroup", &st) == 0 && S_ISREG(st.st_mode) &&
+                  faccessat(AT_FDCWD, "/proc/self/cgroup", F_OK, 0) == 0;
+    int ok = n > 0 && shape_ok && path_ok;
     printf("selfcgroup ok=%d\n", ok);
     return 0;
 }
