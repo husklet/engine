@@ -491,6 +491,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_lo_port[(int)a0] = p ? p : 1;
                 g_lo_v6[(int)a0] = (uint8_t)is_lo6; // remember family for getsockname/accept
                 g_lo_v6only[(int)a0] = (uint8_t)(is_lo6 && v6only);
+                netns_tcp_port_note((int)a0, p); // surface the resolved (ephemeral) port in /proc/net/tcp
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -535,6 +536,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_br_port[(int)a0] = p ? p : 1;
                 g_br_ip[(int)a0] = g_netif[bridge_interface].ip;
                 g_br_interface[(int)a0] = (uint8_t)(bridge_interface + 1);
+                netns_tcp_port_note((int)a0, p); // surface the resolved (ephemeral) port in /proc/net/tcp
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
