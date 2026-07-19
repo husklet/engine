@@ -379,7 +379,11 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         } else {
             continue;
         }
-        event.events = (entry->read ? EPOLLIN : 0u) | (entry->write ? EPOLLOUT : 0u);
+        // Always request EPOLLRDHUP on the read side so a peer half-close (shutdown SHUT_WR) surfaces as
+        // EV_EOF, matching macOS kqueue's native EVFILT_READ EV_EOF-on-half-close. Without it Linux epoll
+        // reports a half-close only as a plain EPOLLIN (readable-at-EOF) and never sets EV_EOF, so the engine
+        // could not deliver EPOLLRDHUP to a guest that registered it.
+        event.events = (entry->read ? (EPOLLIN | EPOLLRDHUP) : 0u) | (entry->write ? EPOLLOUT : 0u);
         if ((entry->flags & EV_CLEAR) != 0) event.events |= EPOLLET;
         if ((entry->flags & EV_ONESHOT) != 0) event.events |= EPOLLONESHOT;
         event.data.u64 = entry->token;

@@ -229,6 +229,21 @@ static void ep_flush(int ep, int wake) {
     kevent(ep, &trig, 1, NULL, 0, NULL);
 }
 
+// Submit an epoll instance's deferred W3E changelist to the kernel now, unconditionally. The W3E fast path
+// (case 21) batches an instance's knote registrations and only submits them at the NEXT epoll_wait on that
+// SAME instance. A NESTED inner epoll defeats that: a guest that registers an inner epoll fd into an outer
+// one never epoll_waits the inner directly, so the inner's member knotes stay stranded in its changelist and
+// the inner kqueue never becomes readable -- the outer wait sees no nested readiness. Flushing the inner's
+// changelist here arms its member knotes so its kqueue reports readiness up to the outer. Caller holds
+// g_ep_mtx when threaded.
+static void ep_submit_changes(int ep) {
+    if (ep < 0 || ep >= HL_NFD) return;
+    if (g_ep_chgn[ep] > 0) {
+        kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL);
+        g_ep_chgn[ep] = 0;
+    }
+}
+
 // macOS does NOT inherit kqueue() descriptors across fork(2) (unlike Linux epoll/timer/inotify fds, which
 // are), so every epoll/timerfd/inotify fd the engine emulates with a kqueue is DEAD in a freshly forked
 // child. A guest that then closes or re-arms it sees EBADF -- e.g. Ruby's post-fork timer-thread reset
@@ -362,6 +377,26 @@ static void poll_sigmask_leave(struct cpu *c, uint64_t saved) {
     c->sigmask = saved;
 }
 
+// An eventfd is emulated by a pipe whose READ end is the guest's descriptor, so a host poll on it never
+// reports POLLOUT (a pipe read end is not writable). Linux, however, reports an eventfd writable whenever its
+// counter can still accept a value -- i.e. count < ULLONG_MAX-1 (0xfffffffffffffffe). Synthesize that
+// write-side readiness after the host poll/select so a guest waiting for an eventfd to become writable is not
+// stranded. POLLIN is already carried by the backing pipe's readable byte, so it is left untouched. Returns
+// the (possibly incremented) ready-fd count.
+static int eventfd_poll_writable_fixup(struct pollfd *fds, nfds_t n, int r) {
+    if (!fds || r < 0 || !g_eventfd_count) return r;
+    for (nfds_t i = 0; i < n; i++) {
+        int fd = fds[i].fd;
+        if (fd < 0 || fd >= HL_NFD || !g_eventfd_peer[fd]) continue;
+        if (!(fds[i].events & POLLOUT) || (fds[i].revents & POLLOUT)) continue;
+        if (g_eventfd_count[eventfd_counter_slot(fd)] < 0xfffffffffffffffeULL) {
+            if (fds[i].revents == 0) r++; // a previously-idle fd now reports readiness
+            fds[i].revents |= POLLOUT;
+        }
+    }
+    return r;
+}
+
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                      uint64_t a5) {
     switch (nr) {
@@ -490,6 +525,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             memcpy(&data, (void *)(a3 + G_EPEV_DOFF), 8);
             // struct epoll_event {u32 events; [pad;] u64 data} -- layout per guest arch (see G_EPEV_*)
         }
+        // EPOLLEXCLUSIVE (1<<28) may be specified only at EPOLL_CTL_ADD. Linux (fs/eventpoll.c) rejects it in
+        // an EPOLL_CTL_MOD event, and rejects any EPOLL_CTL_MOD of a registration that was ADDed exclusive,
+        // both with EINVAL. Checked before the membership ENOENT probe to match the kernel's error order.
+        if (op == 3 && ((ev & 0x10000000u) ||
+                        (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD &&
+                         (g_ep_events[fd] & 0x10000000u)))) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a engine-tracked epoll
         // instance (membership bitmap). Confined to fd < HL_NFD, matching the readiness path below.
         if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
@@ -546,6 +590,12 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 g_ep_wr[fd] = 0;
             }
             g_ep_os[fd] = (op != 2 && (ev & 0x40000000u)) ? 1 : 0;
+            // Nested epoll: arm member knotes eagerly instead of deferring, since a nested inner epoll is
+            // never epoll_wait'd by the guest to consume its changelist. Case A: we just added an inner epoll
+            // fd into this outer -> flush the inner (fd) so it starts reporting its members' readiness. Case B:
+            // this instance is itself watched by an outer (g_ep_owner) -> flush its own members now.
+            if (op != 2 && fd != ep && fd >= 0 && fd < HL_NFD && g_epoll[fd]) ep_submit_changes(fd);
+            if (g_ep_owner[ep]) ep_submit_changes(ep);
             // Multi-threaded guest: a peer M may be blocked in epoll_wait on this instance right now, so the
             // deferred registration/prime must reach it -- flush the changelist to the kernel and (when we
             // added/modified interest) wake the peer to re-scan primes. No-op single-threaded, where the same
@@ -695,8 +745,20 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 // event. With correct armed-state tracking these do not occur; skip them if they do.
                 if (opt && (kv[i].flags & EV_ERROR)) continue;
                 uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
-                // EPOLLHUP
-                if (kv[i].flags & EV_EOF) ev |= 0x10u;
+                if (kv[i].flags & EV_EOF) {
+                    // kqueue raises EV_EOF for BOTH a peer half-close (shutdown SHUT_WR: the read side hits
+                    // EOF but the socket is still writable) and a full hangup. Linux distinguishes them:
+                    // EPOLLRDHUP on a half-close, EPOLLHUP only on a full disconnect. poll() reports POLLHUP
+                    // only for a full hangup, so use it to tell the two apart. EPOLLRDHUP is edge-reported
+                    // only when the guest actually registered interest in it (unlike EPOLLHUP/EPOLLERR).
+                    int hup = 1;
+                    if (kv[i].filter == EVFILT_READ) {
+                        struct pollfd pf = {.fd = (int)kv[i].ident, .events = POLLIN, .revents = 0};
+                        if (poll(&pf, 1, 0) >= 0) hup = (pf.revents & POLLHUP) != 0;
+                    }
+                    if (hup) ev |= 0x10u; // EPOLLHUP
+                    if (kv[i].ident < HL_NFD && (g_ep_events[kv[i].ident] & 0x2000u)) ev |= 0x2000u; // EPOLLRDHUP
+                }
                 // EPOLLERR (immediate-path semantics preserved when opt is off)
                 if (!opt && (kv[i].flags & EV_ERROR)) ev |= 0x8u;
                 *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
@@ -1072,6 +1134,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (r < 0 && svc_poll_retry(c)) continue;
             break;
         }
+        r = eventfd_poll_writable_fixup(fds, (nfds_t)a1, r);
         if (sm_on) poll_sigmask_leave(c, sm_saved);
         // Linux ppoll(2) writes the leftover time back into the timespec (glibc's ppoll wrapper hides it via
         // a local copy, so this is invisible to POSIX callers but correct for the raw syscall).
