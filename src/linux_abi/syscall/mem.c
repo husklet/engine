@@ -949,6 +949,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        filemap_refresh_emulated(a0, a0 + a1);
         G_RET(c) = 0;
         break;
     // mlock(addr,len): wire+fault via macOS mlock so the range is RESIDENT (LTP mincore03), AND track the

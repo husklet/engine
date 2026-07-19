@@ -1,8 +1,21 @@
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+static int publish(void *address, size_t length) {
+#if defined(__aarch64__)
+    uintptr_t cursor = (uintptr_t)address;
+    uintptr_t end = cursor + length;
+    for (; cursor < end; cursor += 64)
+        __asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0\n\tdsb ish\n\tisb" : : "r"(cursor) : "memory");
+    return 0;
+#else
+    return msync(address, length, MS_SYNC);
+#endif
+}
 
 int main(void) {
     const size_t page = 4096;
@@ -21,10 +34,10 @@ int main(void) {
     if (fixed == MAP_FAILED ||
         mmap(fixed, page, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, (off_t)page) != fixed)
         return 4;
+    int protected = mprotect(fixed, page, PROT_READ | PROT_EXEC) == 0;
     writable[1] = 0x36;
     writable[page - 2] = 0x9a;
-    int protected = mprotect(fixed, page, PROT_READ) == 0;
-    int fixed_coherent = protected && fixed[1] == 0x36 && fixed[page - 2] == 0x9a;
+    int fixed_coherent = protected && publish(fixed, page) == 0 && fixed[1] == 0x36 && fixed[page - 2] == 0x9a;
 
     int unmapped = munmap(readable, page) == 0 && munmap(writable, page) == 0 && munmap(fixed, page) == 0;
     close(fd);

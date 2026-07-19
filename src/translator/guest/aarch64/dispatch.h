@@ -103,8 +103,15 @@ static uint64_t g_smc_flushes;
         if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
         break;                                                                                                         \
     } else if ((c)->reason == R_ICFLUSH) {                                                                             \
+        uint64_t _line = (c)->smc_va & ~UINT64_C(0xfff);                                                              \
+        filemap_refresh_emulated(_line, _line + UINT64_C(0x1000));                                                     \
         smc_icflush((c), (c)->smc_va); /* queue dirty line until the architecturally-visible ISB */                    \
     } else if ((c)->reason == R_ICCOMMIT) {                                                                            \
+        if ((c)->smc_range_overflow)                                                                                   \
+            filemap_refresh_emulated(0, UINT64_MAX);                                                                   \
+        else                                                                                                           \
+            for (uint32_t _index = 0; _index < (c)->smc_range_count; ++_index)                                         \
+                filemap_refresh_emulated((c)->smc_ranges[_index][0], (c)->smc_ranges[_index][1]);                      \
         if (smc_commit(c)) g_smc_flushes++;                                                                            \
     } else if ((c)->reason == R_SYSCALL) {                                                                             \
         if (g_prof) g_prof_sys++;                                                                                      \

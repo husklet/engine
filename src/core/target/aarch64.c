@@ -68,6 +68,7 @@ hl_status hl_run_linux_guest_status(void) {
 }
 
 static uint64_t g_host_launch_monotonic_ns;
+static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 #include "../../translator/guest/aarch64/cpu.h"
 #include "../../translator/guest/aarch64/signal.h"
