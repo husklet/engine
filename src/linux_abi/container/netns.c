@@ -1314,6 +1314,14 @@ static void netns_tcp_listen_note(int fd) {
     if (fd >= 0 && fd < HL_NFD && g_tcp_lport[fd]) g_tcp_listen[fd] = 1;
 }
 
+// Update just the recorded local port after the initial bind_note. bind(:0) on the loopback/bridge switch
+// records port 0 at bind time (the guest-requested port), then allocates a real ephemeral port -- without
+// this write-back the /proc/net/tcp[6] row would carry :0000 AND be suppressed entirely (listen_note gates
+// on a nonzero port). The address/family recorded by the earlier bind_note stay correct.
+static void netns_tcp_port_note(int fd, uint16_t port_host) {
+    if (fd >= 0 && fd < HL_NFD) g_tcp_lport[fd] = port_host;
+}
+
 // Emit the LISTEN rows for the v4 (v6==0) or v6 (v6==1) table into `out` (<=cap). Returns bytes written.
 // Row layout mirrors the kernel's tcp4_seq/tcp6_seq: sl, local_address:port, rem 0, st 0A, queues 0,
 // uid 0, a synthetic-but-stable inode, refcount 1. Values a real ss/netstat parses positionally.
