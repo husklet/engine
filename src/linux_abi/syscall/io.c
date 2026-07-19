@@ -1537,6 +1537,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-EPERM);
                 break;
             } // already F_SEAL_SEAL'd
+            // F_SEAL_WRITE (0x8) is refused with EBUSY while an outstanding MAP_SHARED mapping of this memfd
+            // is live (Linux mm/shmem.c writable-mapping guard). F_SEAL_FUTURE_WRITE (0x10) only blocks new
+            // writable maps, so it is unaffected.
+            if (((int)a2 & 0x8) && !(g_memfd_seal[fd] & 0x8) && filemap_has_shared_mapping(fd)) {
+                G_RET(c) = (uint64_t)(-EBUSY);
+                break;
+            }
             g_memfd_seal[fd] |= (int)a2 & 0x1f; // SEAL|SHRINK|GROW|WRITE|FUTURE_WRITE
             memfd_reg_set_fd(fd, g_memfd_seal[fd]);
             G_RET(c) = 0;

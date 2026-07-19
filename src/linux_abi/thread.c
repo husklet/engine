@@ -612,6 +612,27 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
+// memfd F_SEAL_WRITE (io.c fcntl) must fail EBUSY while an outstanding MAP_SHARED mapping of the same object
+// is live (Linux mm/shmem.c gates the seal on the address_space's writable-mapping count). A memfd is always
+// opened read-write, so every shared mapping of it carries VM_MAYWRITE and counts regardless of the
+// mapping's current PROT (a PROT_READ shared map, or a shared map later mprotect'd read-only, still blocks);
+// only MAP_PRIVATE (COW) mappings are exempt. Scan the file-mapping registry for a live shared mapping of
+// this fd's (device, inode).
+static int filemap_has_shared_mapping(int fd) {
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int i = 0; i < g_nfilemap; ++i)
+        if (g_filemap[i].shared && g_filemap[i].device == (uint64_t)st.st_dev &&
+            g_filemap[i].inode == (uint64_t)st.st_ino) {
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_filemap_lock);
+    return found;
+}
+
 static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t old_size, uint64_t new_size) {
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
