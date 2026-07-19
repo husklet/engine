@@ -56,6 +56,7 @@ static int write_launch(const char *path) {
     config.arguments_offset = (uint32_t)cursor;
     memcpy(pool + cursor, "guest", 6);
     cursor += 7; // argument terminator plus list terminator
+    config.executable_host_offset = add_string(pool, &cursor, "/authorized/guest");
     config.hostname_offset = add_string(pool, &cursor, "typed-host");
     config.volumes_offset = add_string(pool, &cursor, "/host:/guest:ro");
     config.lower_layers_offset = add_string(pool, &cursor, "/lower/one");
@@ -78,7 +79,7 @@ static int write_launch(const char *path) {
 static int inspect_launch(const char *rootfs, const char *executable_host, uint32_t argc,
                           char *const argv[], const hl_options *options, const char *result_path) {
     (void)rootfs;
-    (void)executable_host;
+    HL_CHECK(strcmp(executable_host, "/authorized/guest") == 0);
     HL_CHECK(result_path == NULL);
     HL_CHECK(argc == 1 && strcmp(argv[0], "guest") == 0);
     HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "typed-host") == 0);

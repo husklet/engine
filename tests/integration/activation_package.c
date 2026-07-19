@@ -30,6 +30,7 @@ static int config(const char *guest, char path[64]) {
     launch.uid = -1;
     launch.gid = -1;
     launch.arguments_offset = 1;
+    launch.executable_host_offset = 1;
     if (write(descriptor, &launch, sizeof(launch)) != sizeof(launch) ||
         write(descriptor, pool, launch.pool_size) != launch.pool_size || close(descriptor) != 0) {
         close(descriptor);
@@ -143,13 +144,14 @@ static int force_stop_descendants(const char *self, const char *guest) {
     int output[2];
     hl_activation_stdio stdio;
     hl_status status;
+    char config_path[64];
     struct pollfd drained;
     char byte;
     int attempt;
 
-    if (pipe(output) != 0) return 2;
+    if (config(guest, config_path) != 0 || pipe(output) != 0) return 2;
     stdio = (hl_activation_stdio){.input = -1, .output = output[1], .error = output[1]};
-    status = hl_activation_start_with_stdio(self, HL_GUEST_ISA_AARCH64, guest, &stdio, &process);
+    status = hl_activation_start_with_stdio(self, HL_GUEST_ISA_AARCH64, config_path, &stdio, &process);
     close(output[1]);
     if (status != HL_STATUS_OK) { close(output[0]); return 3; }
     if (hl_activation_kill(process) != HL_STATUS_OK) { close(output[0]); return 4; }
