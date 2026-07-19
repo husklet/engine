@@ -1352,7 +1352,10 @@ static inline void ts_wait_leave(void);
 // WAKE block exactly: PROF fast/slow split, lock+broadcast (the lock orders the guest's pre-syscall store
 // to *uaddr ahead of an arriving waiter's under-lock value-check, so no wakeup is lost), and a count taken
 // from the per-address slot (the number of waiters that will re-check their word and leave).
-static int futex_wake_bucket(const int *uaddr, int n, uint32_t match) {
+// `grant_all` selects EVERY matching waiter (returning only the first `n` as the woken count) for the
+// REQUEUE family, whose parked peers have no secondary queue to be woken from later, so this
+// approximation moves them by waking them all; plain FUTEX_WAKE(n) passes 0 and grants exactly `n`.
+static int futex_wake_bucket(const int *uaddr, int n, uint32_t match, int grant_all) {
     struct futex_bucket *b = fbk_of(uaddr);
     if (g_prof) {
         if (atomic_load_explicit(&b->waiters, memory_order_relaxed))
@@ -1369,6 +1372,10 @@ static int futex_wake_bucket(const int *uaddr, int n, uint32_t match) {
     }
     int registered = 0;
     int woke = fbk_wait_grant(b, futex_key(uaddr), n, match, &registered);
+    if (grant_all && registered) { // REQUEUE approximation: also release the peers left behind
+        int r2 = 0;
+        (void)fbk_wait_grant(b, futex_key(uaddr), INT_MAX, match, &r2);
+    }
     // PI and overflow fallback waiters do not occupy ordinary-wait slots;
     // their loops re-check ownership/value after a broadcast, so the old
     // bounded parked count remains correct for that exceptional path.
@@ -1609,7 +1616,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // Wake up to `val` signalled + `nr_wake2` requeue-budget waiters in one broadcast; each self-acquires
         // uaddr2, so the physical requeue is unnecessary. (A single broadcast wakes all parked in the bucket.)
         long budget = (long)(val < 1 ? 1 : val) + (nr_wake2 > 0 ? nr_wake2 : 0);
-        return futex_wake_bucket(uaddr, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u);
+        return futex_wake_bucket(uaddr, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u, 1);
     }
     if (!g_futexq) {
         // ---- legacy single global queue ----
@@ -1707,12 +1714,24 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
             if (op == 9) futex_rel_from_abs(&rel, ts);
             abs_from_rel(&abs, op == 9 ? &rel : ts);
         }
-        rc = ts ? pthread_cond_timedwait(&b->c, &b->m, &abs) : pthread_cond_wait(&b->c, &b->m);
+        // FUTEX_WAKE(n) selects EXACTLY n waiters by setting their wgrant slot (fbk_wait_grant); the
+        // pthread_cond_broadcast is only the transport that makes sleepers runnable. An unselected peer
+        // that wakes must therefore re-park rather than return success -- otherwise a WAKE(1) releases
+        // every waiter in the bucket. Loop until we are granted, time out, or a signal interrupts us. A
+        // waiter that overflowed the exact-selection slots (wait_slot < 0) keeps the legacy re-check-word
+        // wake so it can never be stranded.
+        int intr = 0;
+        for (;;) {
+            rc = ts ? pthread_cond_timedwait(&b->c, &b->m, &abs) : pthread_cond_wait(&b->c, &b->m);
+            if (cpu_wait_interrupted(c)) { intr = 1; break; }
+            if (rc == ETIMEDOUT) break;
+            if (wait_slot < 0) break;
+            if (b->wgrant[wait_slot]) { b->wgrant[wait_slot] = 0; break; }
+        }
         ts_wait_leave();
         thread_wait_clear();
         fbk_wait_unregister(b, wait_slot);
         fbk_unpark(b, futex_key(uaddr));
-        int intr = cpu_wait_interrupted(c);
         // fetch_sub returns the PREVIOUS value; == 1 means the bucket just fully drained -> a stale
         // `imprecise` flag (set by a past slot overflow) can be cleared so exact counting resumes.
         if (atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed) == 1) b->imprecise = 0;
@@ -1738,7 +1757,9 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // parked on THIS uaddr: each re-checks its word, sees the store, and leaves -- exactly the woken
         // count. (Returning `val` broke LTP tst_checkpoint_wake's `waked += WAKE(INT_MAX)` -> fork04.)
         // FUTEX_WAKE_BITSET (op 10) wakes only waiters whose bitset overlaps val3; the others match any.
-        int woke = futex_wake_bucket(uaddr, val, op == 10 ? val3 : ~0u);
+        // REQUEUE(3)/CMP_REQUEUE(4) have no modelled secondary queue, so wake every parked peer (grant_all);
+        // plain WAKE(1)/WAKE_BITSET(10) must release EXACTLY `val` -- unselected peers re-park (see WAIT loop).
+        int woke = futex_wake_bucket(uaddr, val, op == 10 ? val3 : ~0u, op == 3 || op == 4);
         return woke;
     }
     if (op == 5) { // FUTEX_WAKE_OP: atomically mutate *uaddr2, wake uaddr waiters, conditionally uaddr2's.
@@ -1749,8 +1770,8 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         int do_wake2 = 0;
         int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
         if (rc < 0) return rc; // -EFAULT (bad uaddr2) / -ENOSYS (unknown op|cmp): report to the guest as-is
-        int woke = futex_wake_bucket(uaddr, val, ~0u);
-        if (do_wake2) woke += futex_wake_bucket(uaddr2, nr_wake2, ~0u);
+        int woke = futex_wake_bucket(uaddr, val, ~0u, 0);
+        if (do_wake2) woke += futex_wake_bucket(uaddr2, nr_wake2, ~0u, 0);
         return woke;
     }
     // A genuinely undefined command (the removed FUTEX_FD=2, or any value >= 14 that names no futex op) is
@@ -2117,7 +2138,7 @@ static void robust_handle_death(uint64_t futex_addr, int mytid) {
         if (((uint32_t)v & HL_FUTEX_TID_MASK) != (uint32_t)mytid) return; // not (or no longer) ours
         int nv = (int)(((uint32_t)v & HL_FUTEX_WAITERS) | HL_FUTEX_OWNER_DIED);
         if (__atomic_compare_exchange_n(w, &v, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-            if ((uint32_t)v & HL_FUTEX_WAITERS) futex_wake_bucket(w, 1, ~0u); // one waiter -> EOWNERDEAD
+            if ((uint32_t)v & HL_FUTEX_WAITERS) futex_wake_bucket(w, 1, ~0u, 0); // one waiter -> EOWNERDEAD
             return;
         }
         // v was reloaded with the current word by the failed cmpxchg -> re-check ownership and retry
