@@ -329,6 +329,22 @@ static int64_t fsize_gate(struct cpu *c, int fd, off_t pos, uint64_t count) {
     return count > room ? (int64_t)room : (int64_t)count; // clamp a straddling write to the limit
 }
 
+// RLIMIT_FSIZE gate for a RAM-backed (memf) write. A memf file is an unlinked-while-open regular file, so
+// Linux enforces the file-size limit on it exactly as for an on-disk file -- but the memf write paths serve
+// the write from RAM and never reach fsize_gate (which fstat's a host fd). Mirror the same contract off the
+// memf write position `pos`: at/beyond the limit -> raise SIGXFSZ and return -EFBIG; a straddling write is
+// clamped to what fits. Infinite limit (the common case) is a pass-through.
+static int64_t memf_fsize_gate(struct cpu *c, off_t pos, uint64_t count) {
+    uint64_t limit = guest_fsize_cur();
+    if (limit == ~UINT64_C(0) || count == 0 || pos < 0) return (int64_t)count;
+    if ((uint64_t)pos >= limit) {
+        raise_guest_signal(c, 25); // SIGXFSZ
+        return -EFBIG;
+    }
+    uint64_t room = limit - (uint64_t)pos;
+    return count > room ? (int64_t)room : (int64_t)count;
+}
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
@@ -863,7 +879,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)a2);
+            int64_t allowed = memf_fsize_gate(c, (off_t)g_memf[wfd]->pos, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+            if (allowed < 0) {
+                G_RET(c) = (uint64_t)allowed;
+                break;
+            }
+            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)allowed);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -1014,9 +1035,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             const struct iovec *iv = (const struct iovec *)a1;
-            off_t end = g_memf[(int)a0]->pos;
+            off_t start = g_memf[(int)a0]->pos;
+            off_t end = start;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, start, (uint64_t)(end - start)) < 0) { // RLIMIT_FSIZE at/beyond limit
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, -1, 1);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
@@ -1054,7 +1080,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a3 + (off_t)a2)) {
-            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)a2, (off_t)a3);
+            int64_t allowed = memf_fsize_gate(c, (off_t)a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
+            if (allowed < 0) {
+                G_RET(c) = (uint64_t)allowed;
+                break;
+            }
+            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)allowed, (off_t)a3);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -1832,6 +1863,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE at/beyond limit
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;

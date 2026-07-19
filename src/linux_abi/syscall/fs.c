@@ -1842,6 +1842,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         break;
     }
     case 46: {
+        // RLIMIT_FSIZE: Linux (do_sys_ftruncate) rejects a truncation whose target length exceeds the soft
+        // file-size limit -- it raises SIGXFSZ and returns -EFBIG -- before the filesystem is touched. The
+        // generic check runs first (ahead of the memfd seal check below), so mirror that order here. No-op
+        // when the limit is infinite (the common case) or the length fits.
+        {
+            uint64_t fslim = guest_fsize_cur();
+            if (fslim != ~UINT64_C(0) && a1 > fslim) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
+        }
         // memfd sealing: F_SEAL_SHRINK(0x2) blocks a size-reducing ftruncate, F_SEAL_GROW(0x4) blocks a
         // size-increasing one -> EPERM (matching the write/pwrite F_SEAL_WRITE guards). A sealed shared
         // buffer must not be resized under a receiver (SIGBUS/OOB). Compare against the CURRENT size.
@@ -1931,6 +1943,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (off > (off_t)0x7fffffffffffffffLL - len) {
             G_RET(c) = (uint64_t)(-EFBIG);
             break;
+        }
+        // RLIMIT_FSIZE: an allocation whose end offset (off+len) passes the soft file-size limit raises
+        // SIGXFSZ and returns -EFBIG (Linux gates fallocate on the limit just like write/truncate, even with
+        // FALLOC_FL_KEEP_SIZE). The purely-reducing modes -- PUNCH_HOLE(0x02) and COLLAPSE_RANGE(0x08) -- do
+        // not grow allocation past the limit, so they are exempt. No-op for an infinite limit.
+        if (!(mode & (0x02 | 0x08))) {
+            uint64_t fslim = guest_fsize_cur();
+            if (fslim != ~UINT64_C(0) && (uint64_t)(off + len) > fslim) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
         }
         int seal = (fd >= 0 && fd < HL_NFD) ? memfd_seals_fd(fd) : 0;
         memf_materialize(fd); // flush any RAM cache; every branch below works on the real host fd

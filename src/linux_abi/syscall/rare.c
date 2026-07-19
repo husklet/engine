@@ -740,6 +740,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
@@ -878,6 +882,18 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         char pb[4200];
         const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
+        // RLIMIT_FSIZE: a truncate whose target length exceeds the soft file-size limit raises SIGXFSZ and
+        // returns -EFBIG. Linux resolves the path FIRST (a missing file is ENOENT with no signal), so only
+        // gate once the target is known to exist. No-op for an infinite limit (the common case).
+        {
+            uint64_t fslim = guest_fsize_cur();
+            struct stat tst;
+            if (fslim != ~UINT64_C(0) && a1 > fslim && stat(p, &tst) == 0) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
+        }
         int r = truncate(p, (off_t)a1);
         if (r >= 0) hl_fdcache_metadata_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
