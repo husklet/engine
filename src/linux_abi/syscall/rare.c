@@ -726,9 +726,64 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
         break;
     }
-    case 274:
+    // sched_setattr(pid, attr, flags): validate exactly like the kernel and RECORD the requested
+    // policy/priority so sched_getattr (case 275) and sched_getscheduler (proc.c case 120) round-trip it.
+    // The old handler blanket-returned success, so sched_getattr kept reporting SCHED_OTHER after a policy
+    // change and a real-time policy was "accepted" here even though sched_setscheduler (case 119) rejects it
+    // -- the two entry points disagreed. flags (a2) must be 0 (no sched_setattr flags are defined).
+    case 274: {
+        if (!a1 || a2) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        if (guest_bad_ptr(a1, sizeof(uint32_t))) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        uint32_t size = *(uint32_t *)a1;
+        if (size == 0) size = 48;    // 0 selects the VER0 struct size, as in the kernel
+        if (size < 48) {             // struct sched_attr is 48 bytes; a smaller one is malformed
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        if (guest_bad_ptr(a1, 48)) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        uint32_t policy = *(uint32_t *)(a1 + 4);
+        uint64_t sflags = *(uint64_t *)(a1 + 8);
+        int base = (int)policy & ~HL_SCHED_RESET_ON_FORK, lo, hi;
+        if (sched_prio_band(base, &lo, &hi) < 0) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        int prio = *(int32_t *)(a1 + 20); // sched_priority
+        if (prio < lo || prio > hi) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // Real-time classes need a privilege the container's host process lacks -- reject them the same way
+        // sched_setscheduler does, so a latency probe never believes RT scheduling was installed via setattr.
+        if (base == 1 || base == 2) {
+            G_RET(c) = (uint64_t)(-EPERM);
+            break;
+        }
+        g_sched_policy = base;
+        g_sched_prio = prio;
+        // sched_nice at +16 (unless SCHED_FLAG_KEEP_PARAMS 0x10). Best-effort apply like setpriority
+        // (proc.c case 140): the root container may lower niceness, so clamp to Linux [-20,19] without a
+        // can_nice EPERM. This keeps sched_getattr's reported nice in sync with getpriority.
+        if (!(sflags & 0x10)) {
+            int nice = *(int32_t *)(a1 + 16);
+            if (nice > 19)
+                nice = 19;
+            else if (nice < -20)
+                nice = -20;
+            setpriority(PRIO_PROCESS, 0, nice);
+        }
         G_RET(c) = 0;
-        break; // sched_setattr -> ok (ignored)
+        break;
+    }
     // preadv2/pwritev2: offset in a3 (pos_high a4 is 0 on LP64), RWF_* flags in a5. The flags are
     // semantic requirements (RWF_APPEND/DSYNC/SYNC/NOWAIT/HIPRI), not hints: silently dropping them
     // makes RWF_APPEND write at the supplied offset instead of the end. Honor them via the host
@@ -984,15 +1039,24 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;
     }
-    // sched_getattr(pid, attr, size, flags): report a SCHED_OTHER profile. Zero the caller's struct, then
-    // fill size + sched_policy=SCHED_OTHER(0); nice/priority stay 0. (sched_setattr is case 274, ignored.)
+    // sched_getattr(pid, attr, size, flags): report the task's LIVE scheduling profile so it agrees with
+    // sched_getscheduler/sched_getparam. The old handler hardcoded SCHED_OTHER + nice 0, so sched_getattr
+    // disagreed with sched_getscheduler after any policy change (and ignored the process nice). Zero the
+    // caller's struct, then fill size + the recorded policy, the live nice, and the recorded priority.
     case 275: {
         if (a1) {
             size_t sz = (size_t)a2;
             if (sz == 0 || sz > 48) sz = 48; // kernel struct sched_attr is 48+ bytes; cap to a sane size
             memset((void *)a1, 0, sz);
-            *(uint32_t *)(a1 + 0) = (uint32_t)sz; // sched_attr.size
-            *(uint32_t *)(a1 + 4) = 0;            // sched_attr.sched_policy = SCHED_OTHER
+            if (sz >= 4) *(uint32_t *)(a1 + 0) = (uint32_t)sz;                  // sched_attr.size
+            if (sz >= 8) *(uint32_t *)(a1 + 4) = (uint32_t)g_sched_policy;      // sched_policy (live)
+            if (sz >= 20) {
+                errno = 0;
+                int nv = getpriority(PRIO_PROCESS, 0); // sched_nice = the live process nice value
+                if (nv == -1 && errno) nv = 0;
+                *(int32_t *)(a1 + 16) = nv;
+            }
+            if (sz >= 24) *(uint32_t *)(a1 + 20) = (uint32_t)g_sched_prio; // sched_priority (recorded)
         }
         G_RET(c) = 0;
         break;

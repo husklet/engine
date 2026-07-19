@@ -1069,6 +1069,7 @@ static void service_local(struct cpu *c) {
             break;             //   below g_nonpie_lo, so nonpie_p leaves it unchanged).
         case 163:              // getrlimit(res, RLIM) -- rlim written
         case 164:              // setrlimit(res, RLIM) -- rlim read
+        case 274:              // sched_setattr(pid, ATTR, flags)        -- attr read directly
         case 275:              // sched_getattr(pid, ATTR, size, flags) -- attr zeroed+written directly
             a1 = nonpie_p(a1);
             break;
