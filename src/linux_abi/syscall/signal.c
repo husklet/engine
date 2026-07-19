@@ -87,8 +87,26 @@ static int svc_poll_retry(struct cpu *c) {
 // default/ignore disposition, or an unknown/dead tid -- fall back to the existing process-directed path on
 // the caller (raise_guest_signal applies the default/ignore action or coalesces into g_pending as before).
 static void thread_kill(struct cpu *c, int tid, int sig) {
-    if (sig >= 1 && sig <= 64 && tid != cpu_tid(c) && g_sigact[sig].handler > 1 && thread_target_signal(tid, sig))
-        return;
+    // Route to exactly the addressed thread's cpu->tpending when it names ANOTHER live thread and the signal
+    // is either handled by a guest handler OR blocked by that target (destined for its sigwait / held
+    // pending). A process-wide g_pending would let any thread consume it, breaking Go's stop-the-world
+    // preemption and thread-directed sigwait alike. Otherwise -- self-signal, default/ignore on an unblocked
+    // signal, or an unknown/dead tid -- fall back to the process-directed path on the caller.
+    if (sig >= 1 && sig <= 64 && tid != cpu_tid(c) &&
+        (g_sigact[sig].handler > 1 || thread_tid_blocks_signal(tid, sig))) {
+        // Stamp the tkill/tgkill siginfo the target thread's handler reads: Linux sets si_code == SI_TKILL
+        // and si_pid == the sender's thread-group (== this guest pid). glibc's SIGCANCEL handler (used by
+        // pthread_cancel) IGNORES any signal whose si_code != SI_TKILL or si_pid != getpid(), so without
+        // this an asynchronous pthread_cancel of a compute-bound thread was silently dropped and pthread_join
+        // hung forever. Written to the single-slot g_sig* (never g_pending) so only the addressed thread's
+        // tpending delivery consumes it; the values are constant for any thread-directed signal.
+        enum { HL_SI_TKILL = -6 };
+        g_sigcode[sig] = HL_SI_TKILL;
+        g_sigval[sig] = 0;
+        g_sigpid[sig] = container_pid();
+        g_siguid[sig] = 0;
+        if (thread_target_signal(tid, sig)) return;
+    }
     raise_guest_signal(c, sig);
 }
 

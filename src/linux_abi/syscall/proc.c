@@ -1291,6 +1291,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             g_pdeathsig = (int)a1;
+            // Forward to the host prctl on Linux: each guest process is a real host process whose parent is
+            // the guest parent's host process, so the host kernel delivers the parent-death signal when that
+            // parent dies -- exactly like the PR_SET_CHILD_SUBREAPER forward below. Without this the guest's
+            // pdeathsig never fired and a child blocked in sigwait() hung forever.
+#if defined(__linux__) && defined(PR_SET_PDEATHSIG)
+            (void)prctl(PR_SET_PDEATHSIG, (unsigned long)(int)a1, 0UL, 0UL, 0UL);
+#endif
             G_RET(c) = 0;
             break;
         }
