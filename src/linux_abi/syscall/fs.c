@@ -586,6 +586,19 @@ static const char *fs_operation_name(uint64_t nr) {
 // have no native descriptor at the guest number; native fstat keeps legacy descriptors working.
 static int bound_source_is_native(void);
 
+// Synthetic procfd links are resolved from the guest descriptor table, not by walking the rootfs
+// symlink. Identify both absolute and dirfd-relative spellings before atpath() follows the final link;
+// otherwise /dev/fd -> /proc/self/fd can be mistaken for an on-disk symlink loop before the descriptor
+// handler gets a chance to supply Linux's magic-link semantics.
+static int procfd_num_at(int dirfd, const char *path) {
+    if (!path) return -1;
+    int fd = procfd_num(path);
+    if (fd >= 0) return fd;
+    char guest[4200];
+    guest_abspath_at(dirfd, path, guest, sizeof guest);
+    return procfd_num(guest);
+}
+
 static int procfd_follow_stat(const char *path, struct stat *status) {
     int fd = procfd_num(path);
     if (fd < 0) return 0;
@@ -3323,7 +3336,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        const char *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
+        int procfd = procfd_num_at((int)a0, raw) >= 0;
+        const char *p = procfd ? raw : atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         if (resolve_loop_detected()) { // a followed self/cyclic symlink chain past the traversal limit -> ELOOP
             G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
             break;
@@ -3613,7 +3627,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        const char *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
+        int procfd = procfd_num_at((int)a0, raw) >= 0;
+        const char *p = procfd ? raw : atpath((int)a0, raw, pb, sizeof pb, nofollow);
         if (resolve_loop_detected()) { // followed symlink chain past the traversal limit -> ELOOP
             G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
             break;
