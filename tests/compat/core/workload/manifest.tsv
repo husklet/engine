@@ -1,5 +1,6 @@
 # case	group	source	legacy_source	isas	cflags	defines/env-argv	env	exit	stdout	dependencies	disposition	note
 busyloop	heavy	busyloop.c	busyloop.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/busyloop.out	compute,heavy	active	exact registered golden
+luajit-trace	regression	luajit_trace.c	luajit_trace.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/luajit_trace.out	aarch64-smc,jit-in-jit,regression	active	LuaJIT-shaped generated trace calls its modulo helper across fixed guest code addresses
 ibtc-dispatch	heavy	ibtc_dispatch.c	ibtc_dispatch.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/ibtc_dispatch.out	ibtc,computed-goto	active	second exact workload.rs registration; source owned by sibling ABI directory
 bigmem	heavy	bigmem.c	bigmem.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/bigmem.out	mmap,512MiB,heavy	active	exact registered golden
 bigarr	heavy	bigarr.c	bigarr.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/bigarr.out	memory,indexing,heavy	active	exact source; deterministic replacement for native oracle
