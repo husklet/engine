@@ -3126,10 +3126,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
+            int einval = 0;
             while (g_ovldents[fd].pos < g_ovldents[fd].n) {
                 const char *nm = g_ovldents[fd].nm[g_ovldents[fd].pos];
                 size_t nl = strlen(nm), lr = (19 + nl + 1 + 7) & ~7ull;
-                if (o + lr > (size_t)a2) break;
+                if (o + lr > (size_t)a2) {
+                    // buffer too small for even the first pending entry -> EINVAL (see case 61 below)
+                    if (o == 0) einval = 1;
+                    break;
+                }
                 uint8_t *ld = out + o;
                 // REAL inode: stat the merged entry (its host backing across upper/lowers), so `ls -i`,
                 // `find -inum`, and hardlink detection work on a layered image. The old `pos+1` fabricated a
@@ -3155,8 +3160,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 g_ovldents[fd].pos++;
             }
             // exhausted -> free the snapshot (releases the heap arrays too)
-            if (o == 0) ovldents_free(fd);
-            G_RET(c) = (uint64_t)o;
+            if (o == 0 && !einval) ovldents_free(fd);
+            G_RET(c) = einval ? (uint64_t)(int64_t)(-EINVAL) : (uint64_t)o;
             break;
         }
         DIR *dir = NULL;
@@ -3181,10 +3186,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         size_t o = 0;
         struct dirent *de;
         long pos = telldir(dir);
+        int einval = 0;
         while ((de = readdir(dir))) {
             size_t nl = strlen(de->d_name), lr = (19 + nl + 1 + 7) & ~7ull;
             if (o + lr > (size_t)a2) {
                 seekdir(dir, pos);
+                // Linux getdents64: a result buffer too small to hold even the first pending entry
+                // is EINVAL, not a silent end-of-directory. Only report it when nothing was emitted.
+                if (o == 0) einval = 1;
                 break;
             }
             uint8_t *ld = out + o;
@@ -3197,7 +3206,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             o += lr;
             pos = telldir(dir);
         }
-        G_RET(c) = o;
+        G_RET(c) = einval ? (uint64_t)(int64_t)(-EINVAL) : (uint64_t)o;
         break;
     }
     // readlinkat(dirfd, path, buf, bufsiz)
