@@ -50,12 +50,28 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
             break;
         }
         memset(output, 0, 112);
-        total = context->memory_limit ? context->memory_limit : UINT64_C(8) << 30;
-        free_memory = total > context->memory_used ? total - context->memory_used : total / 4;
-        memcpy(output + 0, &(uint64_t){3600}, sizeof(uint64_t));
+        // totalram MUST agree with /proc/meminfo MemTotal and /sys/fs/cgroup/memory.max: a cgroup memory cap
+        // wins; otherwise report the host RAM total (the same figure vfs.c serves to MemTotal). The old
+        // hardcoded 8 GiB disagreed with /proc/meminfo whenever the container was unconstrained, so a runtime
+        // that sizes its heap off sysinfo (glibc get_phys_pages, some JVMs) and one that reads /proc/meminfo
+        // saw two different machine sizes.
+        total = context->memory_limit ? context->memory_limit :
+                (context->host_memory_total ? context->host_memory_total : UINT64_C(8) << 30);
+        if (context->memory_limit)
+            free_memory = total > context->memory_used ? total - context->memory_used : 0;
+        else
+            free_memory = context->host_memory_free ? context->host_memory_free : total / 4;
+        // uptime is monotonic seconds since boot (matches /proc/uptime); the old constant 3600 never advanced
+        // and disagreed with /proc/uptime.
+        uint64_t uptime = context->uptime_seconds ? context->uptime_seconds : 3600;
+        uint32_t procs = context->process_count ? context->process_count : 1;
+        memcpy(output + 0, &uptime, sizeof(uptime));
+        memcpy(output + 8, &context->loads[0], sizeof(uint64_t));
+        memcpy(output + 16, &context->loads[1], sizeof(uint64_t));
+        memcpy(output + 24, &context->loads[2], sizeof(uint64_t));
         memcpy(output + 32, &total, sizeof(total));
         memcpy(output + 40, &free_memory, sizeof(free_memory));
-        memcpy(output + 80, &(uint16_t){64}, sizeof(uint16_t));
+        memcpy(output + 80, &procs, sizeof(uint16_t));
         memcpy(output + 104, &(uint32_t){1}, sizeof(uint32_t));
         *guest_result = 0;
         break;

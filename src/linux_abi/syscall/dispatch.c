@@ -23,9 +23,11 @@ int g_rwx_guest;
 #include <stdlib.h>
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
+#include <time.h>      // sysinfo(2) uptime = now - host boot time
 #include "../errno.h"
 #include "../../host/directory.h"
 #include "../../host/process.h"
+#include "../../host/system.h" // host memory/boot snapshot feeding sysinfo(2), consistent with /proc/meminfo
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
@@ -1163,11 +1165,28 @@ static void service_local(struct cpu *c) {
     {
         const uint64_t arguments[6] = {a0, a1, a2, a3, a4, a5};
         int64_t result = 0;
+        // Host memory/uptime/load snapshot for sysinfo(2). Read from the SAME host backend vfs.c feeds
+        // /proc/meminfo and /proc/uptime from, so the three sources report the same machine size and uptime.
+        hl_host_system_info hsi;
+        uint64_t host_total = 0, host_free = 0, uptime_s = 0, loads[3] = {0, 0, 0};
+        if (hl_host_system_read(&hsi, NULL, 0)) {
+            host_total = hsi.memory_total;
+            host_free = hsi.memory_free;
+            time_t now = time(NULL);
+            if ((uint64_t)now > hsi.boot_time_seconds) uptime_s = (uint64_t)now - hsi.boot_time_seconds;
+        }
+        double la[3] = {0, 0, 0};
+        if (getloadavg(la, 3) == 3)
+            for (int li = 0; li < 3; li++) loads[li] = (uint64_t)(la[li] * 65536.0);
         hl_linux_misc_context misc = {
             .hostname = g_hostname,
             .hostname_capacity = sizeof(g_hostname),
             .memory_limit = g_mem_max,
             .memory_used = atomic_load(&g_mem_charged),
+            .host_memory_total = host_total,
+            .host_memory_free = host_free,
+            .uptime_seconds = uptime_s,
+            .loads = {loads[0], loads[1], loads[2]},
             .machine = G_UNAME_MACHINE,
             .mapped = misc_mapped,
             .random = misc_random,
