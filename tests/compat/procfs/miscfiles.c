@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include "pf.h"
 
 int main(void) {
@@ -30,13 +31,20 @@ int main(void) {
     ok &= pf_read("/proc/cmdline", b, sizeof b) > 0 && b[0];         // kernel cmdline nonempty
     ok &= pf_read("/proc/self/comm", b, sizeof b) > 0 && b[0] != '\n'; // our command name
 
-    // /proc/self/limits: docker container default soft/hard RLIMIT_NOFILE (oracle 20480/1048576, must
-    // agree with getrlimit/svc_fill_rlimit). Old hl reported soft 1024.
+    // /proc/self/limits RLIMIT_NOFILE row MUST agree with getrlimit(RLIMIT_NOFILE): a guest reads the
+    // soft/hard ceiling from both surfaces (glibc/JVM/systemd) and they must never disagree. The engine
+    // presents the docker container view (soft 20480, hard = the enforceable guest fd ceiling, which is
+    // derived from the host RLIMIT_NOFILE and capped at HL_LINUX_FD_LIMIT), so assert the RELATIONSHIP
+    // against the live getrlimit value rather than a hard-coded number that drifts with the host limit.
+    // Old hl reported soft 1024 and a /proc hard (1048576) that diverged from getrlimit (65536).
     pf_read("/proc/self/limits", b, sizeof b);
     {
+        struct rlimit rl = {0, 0};
+        long want_soft = getrlimit(RLIMIT_NOFILE, &rl) == 0 ? (long)rl.rlim_cur : -1;
+        long want_hard = rl.rlim_max == RLIM_INFINITY ? -1 : (long)rl.rlim_max;
         char *ln = strstr(b, "Max open files");
         long soft = 0, hard = 0;
-        ok &= ln && sscanf(ln + 14, "%ld %ld", &soft, &hard) == 2 && soft == 20480 && hard == 1048576;
+        ok &= ln && sscanf(ln + 14, "%ld %ld", &soft, &hard) == 2 && soft == want_soft && hard == want_hard;
     }
 
     printf("miscfiles ok=%d\n", ok);
