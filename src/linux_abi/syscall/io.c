@@ -1564,13 +1564,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         else if (lcmd == 1030)
             mcmd = F_DUPFD_CLOEXEC;
         // memfd sealing: F_ADD_SEALS(1033) / F_GET_SEALS(1034) are honoured on an anonymous memfd (macOS has
-        // no native seals, so the state + the F_SEAL_WRITE write-guard are emulated). On a non-memfd both
-        // return EINVAL, as on Linux.
+        // no native seals, so the state + the F_SEAL_WRITE write-guard are emulated). For a NON-memfd the
+        // guest fd is a real host fd, so on Linux forward the command to the host kernel, which knows whether
+        // the underlying filesystem supports sealing: a regular tmpfs/shmem file reports its real seal state
+        // (born F_SEAL_SEAL, so F_GET_SEALS -> 1 and a further F_ADD_SEALS -> EPERM) while a non-sealing fs
+        // (ext4/overlay) answers EINVAL -- exactly like native. The old unconditional EINVAL shadowed that,
+        // returning EINVAL where native tmpfs returns the real seal set. macOS keeps EINVAL (no host seals).
         else if (lcmd == 1033) { // F_ADD_SEALS(fd, seals)
             int fd = (int)a0;
             memfd_ensure_fd(fd);
             if (fd < 0 || fd >= HL_NFD || !g_memfd_is[fd]) {
+#if defined(__linux__) && defined(F_ADD_SEALS)
+                int r = fcntl(fd, F_ADD_SEALS, (int)a2);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+#else
                 G_RET(c) = (uint64_t)(-EINVAL);
+#endif
                 break;
             }
             if (g_memfd_seal[fd] & 0x1) {
@@ -1592,7 +1601,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int fd = (int)a0;
             memfd_ensure_fd(fd);
             if (fd < 0 || fd >= HL_NFD || !g_memfd_is[fd]) {
+#if defined(__linux__) && defined(F_GET_SEALS)
+                int r = fcntl(fd, F_GET_SEALS);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)(unsigned)r;
+#else
                 G_RET(c) = (uint64_t)(-EINVAL);
+#endif
                 break;
             }
             G_RET(c) = (uint64_t)(unsigned)g_memfd_seal[fd];
