@@ -1,0 +1,23 @@
+[package]
+name = "hl-engine-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Private runtime mechanisms for the HL Linux guest engine"
+license = "MIT"
+repository = "https://github.com/husklet/engine"
+readme = "README.md"
+publish = false
+include = ["Cargo.toml", "README.md", "src/**"]
+
+[dependencies]
+hl-engine-api = { version = "0.1.0", path = "../api" }
+hl-engine-provider = { version = "0.1.0", path = "../provider" }
+hl-engine-protocol = { version = "0.1.0", path = "../protocol" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

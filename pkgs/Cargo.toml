@@ -1,3 +1,3 @@
 [workspace]
-members = ["api", "provider", "protocol", "rust"]
+members = ["api", "provider", "protocol", "runtime", "rust"]
 resolver = "2"

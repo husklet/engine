@@ -9,6 +9,7 @@ dependencies = [
  "hl-engine-api",
  "hl-engine-protocol",
  "hl-engine-provider",
+ "hl-engine-runtime",
 ]
 
 [[package]]
@@ -28,4 +29,13 @@ name = "hl-engine-provider"
 version = "0.1.0"
 dependencies = [
  "hl-engine-api",
+]
+
+[[package]]
+name = "hl-engine-runtime"
+version = "0.1.0"
+dependencies = [
+ "hl-engine-api",
+ "hl-engine-protocol",
+ "hl-engine-provider",
 ]
