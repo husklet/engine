@@ -10,19 +10,7 @@ use crate::{
     extension::ExtensionCapability, extension::ExtensionSpec, network, Domain, Guest, Sandbox,
     Size, Stdio,
 };
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Version {
-    pub major: u16,
-    pub minor: u16,
-}
-
-impl Version {
-    #[must_use]
-    pub const fn new(major: u16, minor: u16) -> Self {
-        Self { major, minor }
-    }
-}
+pub use hl_engine_api::Version;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineCapabilities {

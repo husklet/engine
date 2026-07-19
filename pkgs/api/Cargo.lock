@@ -3,12 +3,5 @@
 version = 3
 
 [[package]]
-name = "hl-engine"
-version = "0.1.10"
-dependencies = [
- "hl-engine-api",
-]
-
-[[package]]
 name = "hl-engine-api"
 version = "0.1.0"

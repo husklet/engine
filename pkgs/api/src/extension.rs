@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::spec::Version;
+use crate::Version;
 
 /// Stable provider identity. Names are compared byte-for-byte and are not interpreted by the engine.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -259,7 +259,9 @@ impl HandlesAuthority {
         Ok(())
     }
 
-    pub(crate) fn get(&self, provider: &ProviderId) -> Option<&Arc<dyn Handles>> {
+    /// Returns the authority granted for a provider, when present.
+    #[must_use]
+    pub fn handles(&self, provider: &ProviderId) -> Option<&Arc<dyn Handles>> {
         self.providers.get(provider)
     }
 }

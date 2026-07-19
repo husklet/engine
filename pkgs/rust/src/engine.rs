@@ -290,7 +290,7 @@ fn start_services(
     authority: &HandlesAuthority,
 ) -> Result<ffi::Handle, Error> {
     let handles = authority
-        .get(&launch.provider)
+        .handles(&launch.provider)
         .cloned()
         .ok_or(Error::InvalidConfig("missing provider handle authority"))?;
     let maximum_request = launch
@@ -891,7 +891,8 @@ fn validate_authority(spec: &MachineSpec, authority: &HandlesAuthority) -> Resul
         ));
     }
     for extension in &spec.extensions {
-        if extension.provider == handles_provider() && authority.get(&extension.provider).is_none()
+        if extension.provider == handles_provider()
+            && authority.handles(&extension.provider).is_none()
         {
             return Err(resource_error(
                 SpecErrorCategory::Invalid,

@@ -23,6 +23,9 @@ include = [
 [lib]
 name = "hl_engine"
 
+[dependencies]
+hl-engine-api = { version = "0.1.0", path = "../api" }
+
 [lints.rust]
 unsafe_code = "deny"
 
