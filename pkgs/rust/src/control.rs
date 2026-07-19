@@ -1,13 +1,12 @@
 //! Typed live-control models for a running machine.
 
-use std::{collections::BTreeSet, sync::MutexGuard};
+use std::sync::MutexGuard;
 
-use crate::{extension::ProviderId, Machine, Terminal};
+use crate::{Machine, Terminal};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignalTarget {
-    InitialProcess,
-}
+pub use hl_engine_api::control::{
+    AttachRequest, AttachmentKind, ExtensionHandle, ProcessInfo, ResourceUpdate, SignalTarget,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Signal {
@@ -41,22 +40,9 @@ impl Signal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessInfo {
-    pub host_id: u64,
-    pub initial: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownPolicy {
     Signal(Signal),
     Force,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResourceUpdate {
-    pub memory_bytes: Option<u64>,
-    pub process_limit: Option<u32>,
-    pub cpu_limit: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,29 +50,11 @@ pub struct NetworkUpdate {
     pub replacement: crate::spec::NetworkSpec,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AttachRequest {
-    pub streams: BTreeSet<AttachmentKind>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum AttachmentKind {
-    Stdin,
-    Stdout,
-    Stderr,
-    Terminal,
-}
-
 pub struct Attachment {
     pub stdin: Option<std::fs::File>,
     pub stdout: Option<std::fs::File>,
     pub stderr: Option<std::fs::File>,
     pub terminal: Option<Terminal>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtensionHandle {
-    pub provider: ProviderId,
 }
 
 #[derive(Debug)]

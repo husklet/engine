@@ -2,8 +2,10 @@
 #![deny(unsafe_code)]
 
 pub mod checkpoint;
+pub mod control;
 pub mod extension;
 pub mod observability;
+pub mod spec;
 mod types;
 
 pub use types::{Access, Guest, Mount, Sandbox, Stdio};
