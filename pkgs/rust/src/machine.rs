@@ -65,10 +65,20 @@ impl Machine {
     /// Returns a typed finished error once the initial guest process has left
     /// the process-domain inventory, or an engine error if inventory fails.
     pub fn initial_process(&self) -> Result<ProcessInfo, ControlError> {
-        self.processes()?
-            .into_iter()
-            .find(|process| process.initial)
-            .ok_or_else(|| ControlError::finished("initial_process"))
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(process) = self
+                .processes()?
+                .into_iter()
+                .find(|process| process.initial)
+            {
+                return Ok(process);
+            }
+            if self.child.completed() || std::time::Instant::now() >= deadline {
+                return Err(ControlError::finished("initial_process"));
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Delivers a typed signal to the selected process.

@@ -70,7 +70,6 @@ pub(super) fn capabilities() -> EngineCapabilities {
         control: crate::spec::ControlCapabilities {
             operations: BTreeSet::from([
                 crate::spec::ControlOperation::ProcessInventory,
-                crate::spec::ControlOperation::Signal,
                 crate::spec::ControlOperation::Pause,
                 crate::spec::ControlOperation::Attach,
             ]),

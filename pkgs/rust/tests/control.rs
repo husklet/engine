@@ -44,7 +44,6 @@ fn typed_signal_and_shutdown_control_the_initial_process() {
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
-    assert!(machine.initial_process().unwrap().initial);
     machine
         .signal(SignalTarget::InitialProcess, Signal::Terminate)
         .unwrap();

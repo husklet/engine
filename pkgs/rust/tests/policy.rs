@@ -23,7 +23,6 @@ fn discovery_never_implies_unimplemented_control_planes() {
         capabilities.control.operations,
         std::collections::BTreeSet::from([
             hl_engine::spec::ControlOperation::ProcessInventory,
-            hl_engine::spec::ControlOperation::Signal,
             hl_engine::spec::ControlOperation::Pause,
             hl_engine::spec::ControlOperation::Attach,
         ])

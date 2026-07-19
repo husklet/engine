@@ -7,8 +7,8 @@ archive remains the target-specific archive shipped with this crate revision.
 
 | Host target | Build target | SHA-256 |
 |---|---|---|
-| `aarch64-apple-darwin` | `build-cap-mac/package/macos-aarch64/libhl-engine.a` | `05998a9f8f5c270be914f010fe3ed2ee74794a23b7085e9093bd83d5e98c3424` |
-| `aarch64-unknown-linux-gnu` | `build-cap-linux/package/linux-aarch64/libhl-engine.a` | `5367434e27610bc40fbb17fd96f6cb0eb6762c1007dbfa0956024947b41d1257` |
+| `aarch64-apple-darwin` | `build-cap-mac/package/macos-aarch64/libhl-engine.a` | `1b7675aa207de7513517e73db59dd1e8b771b001bb218244cab46867f3f4159a` |
+| `aarch64-unknown-linux-gnu` | `build-cap-linux/package/linux-aarch64/libhl-engine.a` | `49a0910f92254cc8e147842ec49e80f40ff9f34b64df24a37cbaa5bd5c199c50` |
 
 Cargo links the selected archive with whole-archive semantics so the private
 pre-main activation constructor is retained in downstream executables. A
