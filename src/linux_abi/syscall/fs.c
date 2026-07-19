@@ -309,6 +309,7 @@ static void fd_reset_emul(int fd) {
         g_lo_v6only[fd] = 0;
         g_sock_stream[fd] = 0;
         tcp_shadow_clear(fd);
+        ipopt_shadow_clear(fd);
         g_sock_conn[fd] = 0;
         g_sock_fam[fd] = 0;
         g_sock_dgram[fd] = 0;

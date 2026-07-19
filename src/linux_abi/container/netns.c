@@ -816,6 +816,65 @@ static void tcp_shadow_clear(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
     for (int i = 0; i < TCP_SHADOW_N; i++) g_tcp_optset[fd][i] = 0;
 }
+// fd -> shadowed IPPROTO_IP(level 0) / IPPROTO_IPV6(level 41) integer options. Same class as the TCP shadow
+// above: once a private-loopback/bridge guest INET socket is bound/connected, its host backing becomes an
+// AF_UNIX switch socket (see lo_swap), which rejects every setsockopt/getsockopt at IPPROTO_IP/IPPROTO_IPV6
+// with ENOPROTOOPT. Native Linux round-trips these on a real IP socket -- DNS servers set IP_PKTINFO/
+// IP_RECVTTL to reply from the right address, QUIC/HTTP3 and dual-stack servers set IP_TOS/IPV6_TCLASS and
+// read IPV6_V6ONLY back, and code sets them *after* bind/connect -- so a get-after-set (or plain set) must
+// survive the switch. Only options native actually accepts on a connected/bound unicast stream socket are
+// shadowed here; options native itself rejects on such a socket (IP_HDRINCL raw-only -> ENOPROTOOPT,
+// IP_MULTICAST_HOPS/IPV6_MULTICAST_HOPS on a unicast socket -> ENOPROTOOPT, IP_TRANSPARENT unprivileged ->
+// EPERM) are deliberately left OUT so they fall through to the real setsockopt and surface the true errno.
+// Slots 0-7 are IPPROTO_IP, 8-13 IPPROTO_IPV6. Cleared at socket()/accept()/close re-init.
+#define IPOPT_SHADOW_N 14
+static int g_ipopt_val[HL_NFD][IPOPT_SHADOW_N];
+static uint8_t g_ipopt_set[HL_NFD][IPOPT_SHADOW_N];
+// Map a Linux IPPROTO_IP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
+// option at this level (unknown, struct-valued, or one native rejects on a unicast stream socket).
+static int ip_shadow_slot(int optname) {
+    switch (optname) {
+        case 1: return 0;  // IP_TOS
+        case 2: return 1;  // IP_TTL
+        case 8: return 2;  // IP_PKTINFO
+        case 10: return 3; // IP_MTU_DISCOVER
+        case 11: return 4; // IP_RECVERR
+        case 12: return 5; // IP_RECVTTL
+        case 13: return 6; // IP_RECVTOS
+        case 15: return 7; // IP_FREEBIND
+        default: return -1;
+    }
+}
+// Map a Linux IPPROTO_IPV6 integer optname to a shadow slot, or -1. IPV6_V6ONLY(26) uses slot 13 but its
+// setsockopt is handled specially (native rejects a change after bind with EINVAL), so it is excluded here
+// and matched directly on the optname in the setsockopt/getsockopt paths.
+static int ip6_shadow_slot(int optname) {
+    switch (optname) {
+        case 67: return 8;  // IPV6_TCLASS
+        case 16: return 9;  // IPV6_UNICAST_HOPS
+        case 49: return 10; // IPV6_RECVPKTINFO
+        case 51: return 11; // IPV6_RECVHOPLIMIT
+        case 66: return 12; // IPV6_RECVTCLASS
+        default: return -1;
+    }
+}
+#define IPOPT_V6ONLY_SLOT 13
+// A get on a slot the guest never set reports the Linux default so code that reads an option it did not set
+// still sees a plausible value over the switch instead of ENOPROTOOPT (only reached when the real host
+// getsockopt is also rejected, i.e. the AF_UNIX switch backing). IP_TTL and IPV6_UNICAST_HOPS default to 64;
+// the boolean recv-flags and TOS/TCLASS default to 0.
+static int ipopt_shadow_default(int slot) {
+    switch (slot) {
+        case 1: return 64; // IP_TTL
+        case 9: return 64; // IPV6_UNICAST_HOPS
+        default: return 0;
+    }
+}
+// Drop any shadowed IP/IPV6 options for a reused fd number (socket()/accept()/close re-init).
+static void ipopt_shadow_clear(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (int i = 0; i < IPOPT_SHADOW_N; i++) g_ipopt_set[fd][i] = 0;
+}
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
 static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];

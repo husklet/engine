@@ -284,6 +284,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_so_error[r] = 0;            // no pending async socket error on a fresh fd
                 g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
                 tcp_shadow_clear(r);          // no shadowed IPPROTO_TCP options on a fresh fd
+                ipopt_shadow_clear(r);        // ...nor shadowed IPPROTO_IP/IPV6 options
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
@@ -696,6 +697,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_so_error[r] = 0;  // fresh accepted fd carries no pending async error
                 g_so_reuseport[r] = 0;
                 tcp_shadow_clear(r); // no shadowed IPPROTO_TCP options on a fresh accepted fd
+                ipopt_shadow_clear(r);
                 g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
@@ -1334,6 +1336,51 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        // IPPROTO_IP integer options on a tracked AF_INET socket: same story as TCP -- the AF_UNIX switch
+        // backing rejects them with ENOPROTOOPT while native round-trips them. Record + best-effort apply to
+        // the host fd (an unswapped socket still honors it). Only options native accepts on a connected
+        // socket are shadow-slotted; the rest fall through to the real setsockopt (true ENOPROTOOPT/EPERM).
+        if (lvl == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_fam[(int)a0] == AF_INET) {
+            int slot = ip_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_ipopt_val[(int)a0][slot] = val;
+                g_ipopt_set[(int)a0][slot] = 1;
+                int mo = ip_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_IP, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IPV6 integer options on a tracked AF_INET6 socket. IPV6_V6ONLY(26) is special: native
+        // rejects a change once the socket is bound/connected (EINVAL), so try the real setsockopt first --
+        // it succeeds pre-bind (unswapped) and its success/failure decides the shadow update and the errno.
+        if (lvl == 41 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_fam[(int)a0] == LX_AF_INET6_FAM) {
+            if ((int)a2 == 26) { // IPV6_V6ONLY
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                int mo = ip6_opt_l2m(26);
+                int r = (mo >= 0) ? setsockopt((int)a0, IPPROTO_IPV6, mo, &val, sizeof val) : -1;
+                if (r == 0) { // pre-bind, host honored it -> record and report the new value
+                    g_ipopt_val[(int)a0][IPOPT_V6ONLY_SLOT] = val ? 1 : 0;
+                    g_ipopt_set[(int)a0][IPOPT_V6ONLY_SLOT] = 1;
+                    G_RET(c) = 0;
+                } else {
+                    // Swapped backing rejected it: native cannot change V6ONLY after bind/connect -> EINVAL.
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                }
+                break;
+            }
+            int slot = ip6_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_ipopt_val[(int)a0][slot] = val;
+                g_ipopt_set[(int)a0][slot] = 1;
+                int mo = ip6_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_IPV6, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (lvl == 1) {
             lvl = SOL_SOCKET;
             opt = so_opt_l2m((int)a2);
@@ -1544,6 +1591,53 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 memset((void *)a3, 0, n);
                 if (n >= 1) *(uint8_t *)a3 = g_sock_conn[gfd] ? 1 /*TCP_ESTABLISHED*/ : 7 /*TCP_CLOSE*/;
                 *(socklen_t *)a4 = n;
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IP integer options on a tracked AF_INET socket: report the shadowed value the guest set.
+        // If unset, prefer the real host value (a still-genuine AF_INET socket answers it), falling back to
+        // the Linux default only when the AF_UNIX switch backing rejects the query.
+        if (lvl == 0 && gfd >= 0 && gfd < HL_NFD && g_sock_fam[gfd] == AF_INET) {
+            int slot = ip_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_ipopt_set[gfd][slot]) {
+                    val = g_ipopt_val[gfd][slot];
+                } else {
+                    val = ipopt_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = ip_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_IP, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IPV6 integer options on a tracked AF_INET6 socket, including IPV6_V6ONLY(26) whose readback
+        // must survive bind (dual-stack servers set it v6-only then read it back).
+        if (lvl == 41 && gfd >= 0 && gfd < HL_NFD && g_sock_fam[gfd] == LX_AF_INET6_FAM) {
+            int slot = ((int)a2 == 26) ? IPOPT_V6ONLY_SLOT : ip6_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_ipopt_set[gfd][slot]) {
+                    val = g_ipopt_val[gfd][slot];
+                } else {
+                    val = ipopt_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = ip6_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_IPV6, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
                 G_RET(c) = 0;
                 break;
             }
