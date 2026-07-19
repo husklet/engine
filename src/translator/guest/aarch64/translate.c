@@ -361,6 +361,91 @@ static void emit_mangled_x18(uint32_t in, int mask) {
         e_ldr(sc[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
 }
 
+// ---- CASP/CASPA/CASPL/CASPAL: paired compare-and-swap (DWCAS / __int128 lock-free) ----
+// The Rs pair (Xs,Xs+1) is expected-value IN / old-value OUT; the Rt pair (Xt,Xt+1) is new-value IN;
+// base is [Xn]. gpr_field_mask flags the NAMED Rs/Rt fields, but emit_mangled_x18 only substitutes the
+// named field -- it does NOT relocate the IMPLICIT pair partner (Xs+1 / Xt+1). So when a pair member is a
+// stolen reg (x16/x17 -- the default steal pair -- or x18/x28/x30), that partner reads/writes the
+// engine-private host register instead of the guest value, silently corrupting the atomic (a stolen Xs
+// makes the compare see garbage in the high half -> the swap spuriously fails, or a stolen Xs writeback
+// loses the observed old value). Relocate each guest pair into a free even/odd host pair, run the CASP,
+// and write the Rs pair result back. Encoding: (in & 0xBFA07C00) == 0x08207C00 (bit23==0 excludes CAS).
+static int is_casp(uint32_t in) { return (in & 0xBFA07C00u) == 0x08207C00u; }
+
+static int casp_uses_stolen(uint32_t in) {
+    int Rs = (in >> 16) & 31, Rt = in & 31, Rn = (in >> 5) & 31;
+    return is_stolen(Rs) || is_stolen((Rs + 1) & 31) || is_stolen(Rt) || is_stolen((Rt + 1) & 31) ||
+           is_stolen(Rn);
+}
+
+static void emit_casp_mangled(uint32_t in) {
+    int Rs = (in >> 16) & 31, Rt = in & 31, Rn = (in >> 5) & 31;
+    int touch[5] = {Rs, (Rs + 1) & 31, Rt, (Rt + 1) & 31, Rn};
+    // Two DISTINCT free even host pairs (P = Rs role, Q = Rt role): neither member stolen, neither a guest
+    // reg the op names. Register 31 in a CASP field means xzr (not SP), so it is safe to leave in place.
+    int P = -1, Q = -1, Nr = -1;
+    for (int r = 0; r <= 26; r += 2) {
+        int bad = is_stolen(r) || is_stolen(r + 1);
+        for (int k = 0; k < 5; k++)
+            if (touch[k] == r || touch[k] == r + 1) bad = 1;
+        if (bad) continue;
+        if (P < 0)
+            P = r;
+        else {
+            Q = r;
+            break;
+        }
+    }
+    // Base scratch only when Xn itself is stolen (a non-stolen Xn -- including SP=31 -- stays in the op).
+    if (is_stolen(Rn))
+        for (int r = 0; r <= 27; r++) {
+            if (is_stolen(r) || r == P || r == P + 1 || r == Q || r == Q + 1) continue;
+            int bad = 0;
+            for (int k = 0; k < 5; k++)
+                if (touch[k] == r) bad = 1;
+            if (!bad) {
+                Nr = r;
+                break;
+            }
+        }
+    // Spill the host scratch originals (live guest values) to cpu->mscratch[0..].
+    int spill[5], nsp = 0;
+    spill[nsp++] = P;
+    spill[nsp++] = P + 1;
+    spill[nsp++] = Q;
+    spill[nsp++] = Q + 1;
+    if (Nr >= 0) spill[nsp++] = Nr;
+    for (int i = 0; i < nsp; i++) e_str(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
+    // Load guest pair values (a stolen member lives in its cpu slot; else in the live host reg).
+#define CASP_LOADG(dst, g)                                                                                 \
+    do {                                                                                                   \
+        if (is_stolen(g))                                                                                  \
+            e_ldr((dst), CPUREG, (g) * 8);                                                                 \
+        else                                                                                               \
+            e_movr((dst), (g));                                                                            \
+    } while (0)
+    CASP_LOADG(P, Rs);
+    CASP_LOADG(P + 1, (Rs + 1) & 31);
+    CASP_LOADG(Q, Rt);
+    CASP_LOADG(Q + 1, (Rt + 1) & 31);
+#undef CASP_LOADG
+    if (Nr >= 0) e_ldr(Nr, CPUREG, Rn * 8);
+    int base = (Nr >= 0) ? Nr : Rn;
+    uint32_t m = (in & ~((0x1Fu << 16) | (0x1Fu << 5) | 0x1Fu)) | ((uint32_t)P << 16) |
+                 ((uint32_t)base << 5) | (uint32_t)Q;
+    emit32(m);
+    // CASP wrote the old memory pair into P,P+1 (the Rs pair) -> store back to guest Rs,Rs+1.
+    if (is_stolen(Rs))
+        e_str(P, CPUREG, Rs * 8);
+    else
+        e_movr(Rs, P);
+    if (is_stolen((Rs + 1) & 31))
+        e_str(P + 1, CPUREG, ((Rs + 1) & 31) * 8);
+    else
+        e_movr((Rs + 1) & 31, P + 1);
+    for (int i = 0; i < nsp; i++) e_ldr(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
+}
+
 // ---- guest_base bias-fold (non-PIE ET_EXEC; see docs/design/nonpie-pagezero.md) ----
 // A non-PIE image maps HIGH (+g_nonpie_bias) but its baked absolute pointers stay LOW (link vaddr); a
 // guest load/store through such a pointer would hit the unmapped low address and trap (one SIGSEGV per
@@ -2498,6 +2583,17 @@ static void *translate_block(uint64_t gpc) {
                 if ((in >> 21) & 1) bytes *= 2;
                 emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
             }
+        }
+        // CASP paired compare-and-swap: the mangle machinery only substitutes NAMED register fields, so a
+        // stolen pair partner (Xs+1 / Xt+1) would slip through verbatim. Relocate both pairs when any member
+        // is stolen; otherwise (the common case) emit verbatim -- byte-identical to before.
+        if (is_casp(in)) {
+            if (casp_uses_stolen(in))
+                emit_casp_mangled(in);
+            else
+                emit32(in);
+            gpc += 4;
+            continue;
         }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
