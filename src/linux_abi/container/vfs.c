@@ -3376,28 +3376,47 @@ static int proc_pid_member(int gp, int *hostout) {
     return kill(host, 0) == 0 && getsid(host) == getsid(0); // registry may lag; accept a live session peer
 }
 
-// The container's namespace magic-link target for <name> ("net" -> "net:[4026531840]"), or -1 if <name>
+// The container's namespace magic-link target for <name> ("net" -> "net:[<inode>]"), or -1 if <name>
 // is not a known namespace. A container is a SINGLE namespace set, so self and every peer process share
-// these initial-namespace inode constants (exactly what lsns/nsenter compare across pids). Writes the
-// "<name>:[<inode>]" string into `out` and returns its length.
+// one inode per namespace. The inode MUST equal the one a stat() of the same ns file reports (synth_stat
+// follows the magic link to the engine's REAL host nsfs node), or lsns/nsenter -- which compare the
+// readlink text against the st_ino -- see the link and the file as different namespaces. On a Linux host
+// the engine process already lives in the guest's namespace set, so its own /proc/self/ns/<name> readlink
+// IS that authoritative, stable "<name>:[<inode>]" string (and correctly renders pid_for_children ->
+// "pid:[...]"). Read it directly; fall back to the initial-namespace constants only when the host does not
+// expose it (e.g. the macOS build), keeping a well-formed link. Writes the string into `out`, returns len.
 static int ns_link_target(const char *name, char *out, size_t cap) {
     static const struct {
-        const char *nm;
-        unsigned ino;
-    } NS[] = {{"cgroup", 4026531835u},
-              {"ipc", 4026531839u},
-              {"mnt", 4026531841u},
-              {"net", 4026531840u},
-              {"pid", 4026531836u},
-              {"pid_for_children", 4026531836u},
-              {"time", 4026531834u},
-              {"time_for_children", 4026531834u},
-              {"user", 4026531837u},
-              {"uts", 4026531838u},
-              {0, 0}};
+        const char *nm;   // guest ns-dir entry name
+        const char *tgt;  // link target namespace name (pid_for_children -> "pid")
+        unsigned ino;     // initial-namespace fallback inode
+    } NS[] = {{"cgroup", "cgroup", 4026531835u},
+              {"ipc", "ipc", 4026531839u},
+              {"mnt", "mnt", 4026531841u},
+              {"net", "net", 4026531840u},
+              {"pid", "pid", 4026531836u},
+              {"pid_for_children", "pid", 4026531836u},
+              {"time", "time", 4026531834u},
+              {"time_for_children", "time", 4026531834u},
+              {"user", "user", 4026531837u},
+              {"uts", "uts", 4026531838u},
+              {0, 0, 0}};
 
-    for (int i = 0; NS[i].nm; i++)
-        if (!strcmp(name, NS[i].nm)) return snprintf(out, cap, "%s:[%u]", NS[i].nm, NS[i].ino);
+    for (int i = 0; NS[i].nm; i++) {
+        if (strcmp(name, NS[i].nm)) continue;
+        char hp[64], link[64];
+        snprintf(hp, sizeof hp, "/proc/self/ns/%s", NS[i].nm);
+        ssize_t r = readlink(hp, link, sizeof link - 1);
+        // Accept only a well-formed "<tgt>:[<digits>]" host answer; anything else uses the fallback so a
+        // partial/odd host read never yields a malformed link.
+        if (r > 0 && (size_t)r < sizeof link) {
+            link[r] = 0;
+            size_t tl = strlen(NS[i].tgt);
+            if (!strncmp(link, NS[i].tgt, tl) && link[tl] == ':' && link[tl + 1] == '[' && link[r - 1] == ']')
+                return snprintf(out, cap, "%s", link);
+        }
+        return snprintf(out, cap, "%s:[%u]", NS[i].tgt, NS[i].ino);
+    }
     return -1;
 }
 
