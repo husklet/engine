@@ -154,7 +154,35 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (maxfd <= 0 || maxfd > 65536) maxfd = 65536;
         if (last >= (unsigned)maxfd) last = (unsigned)maxfd - 1;
         if (!(flags & 4)) engine_fd_vacate_range(first, last); // relocate engine fds out of the actual-close range
-        for (unsigned fd = first; fd <= last; fd++) {
+        size_t open_count = 0;
+        hl_host_process_fd *open_fds = NULL;
+        int enumerated = hl_host_process_fds((int64_t)getpid(), NULL, 0, &open_count);
+        if (enumerated && open_count != 0) {
+            size_t capacity = open_count;
+            open_fds = calloc(capacity, sizeof *open_fds);
+            if (open_fds == NULL ||
+                !hl_host_process_fds((int64_t)getpid(), open_fds, capacity, &open_count)) {
+                free(open_fds);
+                open_fds = NULL;
+                enumerated = 0;
+            } else if (open_count > capacity) {
+                capacity = open_count;
+                hl_host_process_fd *larger = realloc(open_fds, capacity * sizeof *open_fds);
+                if (larger == NULL ||
+                    !hl_host_process_fds((int64_t)getpid(), larger, capacity, &open_count)) {
+                    free(larger == NULL ? open_fds : larger);
+                    open_fds = NULL;
+                    enumerated = 0;
+                } else {
+                    open_fds = larger;
+                    if (open_count > capacity) open_count = capacity;
+                }
+            }
+        }
+        size_t visits = enumerated ? open_count : (size_t)last - first + 1;
+        for (size_t index = 0; index < visits; ++index) {
+            unsigned fd = enumerated ? (unsigned)open_fds[index].descriptor : first + (unsigned)index;
+            if (fd < first || fd > last) continue;
             hl_linux_fd_snapshot bound;
             if (g_linux_box != NULL && hl_linux_fd_snapshot_get(g_linux_box, fd, &bound) == HL_STATUS_OK) {
                 if (flags & 4) {
@@ -177,6 +205,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 close((int)fd);
             }
         }
+        free(open_fds);
         G_RET(c) = 0;
         break;
     }
