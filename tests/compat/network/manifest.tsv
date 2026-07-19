@@ -42,6 +42,7 @@ sentry_net	network	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pth
 sentry-net-untrusted	sandbox	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_net.out	linux-libc	active	exact typed untrusted registration
 ipv6-loopback	network	net_ipv6_loopback.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_ipv6_loopback.out	linux-libc	active	IPv6 ::1 TCP echo and loopback getsockname
 ipv6-v6only	network	net_ipv6_v6only.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_ipv6_v6only.out	linux-libc	active	IPV6_V6ONLY get-after-set toggling
+dual-wildcard-v6only	network	net_dual_wildcard_v6only.c	focused-production-regression	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_dual_wildcard_v6only.out	linux-libc,sockets,ipv6,loopback	active	IPv6-only and IPv4 wildcard listeners can bind the same port, as used by Redis and Valkey
 socketpair	network	net_socketpair.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_socketpair.out	linux-libc	active	socketpair full-duplex round-trip and SO_TYPE
 scm-rights	network	net_scm_rights.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_scm_rights.out	linux-libc	active	SCM_RIGHTS fd passing and read through received fd
 epoll-readiness	network	net_epoll.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_epoll.out	linux-libc	active	epoll_wait readiness edge on socketpair
