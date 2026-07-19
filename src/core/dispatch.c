@@ -185,6 +185,17 @@ static void run_guest(struct cpu *c) {
 #endif
         if (G_PC(c) == SIGRETURN_PC) {
             do_sigreturn(c);
+            // A handler just returned: release exactly ITS deferred set (the signals that were pending when it
+            // was entered) so they become deliverable again, then immediately deliver the next still-pending
+            // signal BEFORE resuming the interrupted context -- a batch of signals unblocked together runs
+            // back-to-back in priority order like the kernel drains them at one return point, rather than
+            // letting the main code make progress between handlers. (maybe_deliver_signal's SP-unwind check is
+            // the backstop for a handler that leaves via siglongjmp instead of rt_sigreturn.)
+            if (c->sig_depth > 0) {
+                c->sig_depth--;
+                c->sig_defer = c->sig_depth > 0 ? c->sig_defer_stack[c->sig_depth] : 0;
+            }
+            maybe_deliver_signal(c);
             continue;
             // handler returned -> restore context
         }

@@ -576,6 +576,10 @@ static void service(struct cpu *c) {
     // syscall_should_restart) can re-execute the SVC with the ORIGINAL arg. On aarch64 arg0 and the return
     // value share x0, so a handler-then-restart would otherwise feed the just-written result back as arg0.
     uint64_t _svc_arg0 = G_A0(c);
+    // On x86-64 the syscall NUMBER and the return value share RAX (G_RET), so once the interrupted call wrote
+    // its -EINTR result the number is gone -- a transparent restart would re-issue `syscall` with -EINTR as
+    // the number. Preserve the entry number register so the SA_RESTART restart re-executes the SAME syscall.
+    uint64_t _svc_nrreg = G_RET(c);
     g_syscall_restart = 0;
     uint64_t _rnr = g_systrace ? G_NR(c) : 0;
     // seccomp gate: run the guest's installed cBPF filter(s) / STRICT policy against this syscall BEFORE it
@@ -626,7 +630,20 @@ static void service(struct cpu *c) {
     // syscall re-executes at the same SVC once the handler returns, so restore the arg0/return-aliased
     // register the dispatch overwrote with the (discarded) EINTR result. The negative EINTR already made the
     // fd-publish block above a no-op, so this runs strictly after it.
-    if (g_syscall_restart && c->redirect) G_A0(c) = _svc_arg0;
+    if (g_syscall_restart && c->redirect) {
+        G_A0(c) = _svc_arg0;
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+        // x86 pre-advances rip past the `syscall` instruction (0F 05, 2 bytes) at emit time, so `redirect`
+        // alone -- which only suppresses aarch64's post-service pc+=4 -- cannot re-execute it. Rewind rip to
+        // the syscall instruction so the pending SA_RESTART handler's sigframe saves that pc and sigreturn
+        // resumes ON it, transparently restarting the interrupted read()/waitpid() (eintr_restart_read/wait,
+        // sarestart). aarch64 needs no rewind: leaving pc on the SVC is exactly what skipping the +4 does.
+        G_PC(c) -= 2;
+        // Restore RAX to the original syscall number (it shares the register with the just-written -EINTR
+        // return), so the re-executed `syscall` re-issues the same call rather than a garbage number.
+        G_RET(c) = _svc_nrreg;
+#endif
+    }
 #if HL_ENABLE_LOGGING
     if (g_systrace)
         fprintf(stderr, "[ret pid=%d] %llu -> %lld\n", (int)getpid(), (unsigned long long)_rnr,

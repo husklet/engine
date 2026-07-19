@@ -209,13 +209,19 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         G_RET(c) = 0;
         break;
     }
-    case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value to the handler's siginfo
+    case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value + sender identity, and
+                // QUEUE every instance for a realtime signal (glibc sigqueue). The user siginfo already
+                // holds si_code (SI_QUEUE), si_pid/si_uid (the sender), and si_value.
         int sig = (int)a1;
         if (sig >= 1 && sig <= 64 && a2) {
-            g_sigcode[sig] = *(int *)(a2 + 8);      // siginfo.si_code
-            g_sigval[sig] = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+            int code = *(int *)(a2 + 8);            // siginfo.si_code
+            int pid = *(int *)(a2 + 16);            // siginfo.si_pid
+            int uid = *(int *)(a2 + 20);            // siginfo.si_uid
+            uint64_t value = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+            raise_guest_signal_si(c, sig, code, value, pid ? pid : container_pid(), uid);
+        } else {
+            raise_guest_signal(c, sig);
         }
-        raise_guest_signal(c, sig);
         G_RET(c) = 0;
         break;
     }
@@ -242,9 +248,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             }
         }
         if (a1) {
-            // report current (or SS_DISABLE=2 if none)
+            // report current (or SS_DISABLE=2 if none). When the querying thread's SP currently lies within
+            // the configured alt stack -- i.e. sigaltstack(NULL,&old) is called from inside an SA_ONSTACK
+            // handler running on it -- Linux ORs in SS_ONSTACK(1); the engine reported a bare 0 before.
+            uint32_t flags = c->alt_sp ? c->alt_flags : 2;
+            uint64_t sp = G_SP(c);
+            if (c->alt_sp && !(flags & 2u) && sp >= c->alt_sp && sp < c->alt_sp + c->alt_size)
+                flags |= 1u; // SS_ONSTACK
             *(uint64_t *)(a1 + 0) = c->alt_sp;
-            *(uint32_t *)(a1 + 8) = c->alt_sp ? c->alt_flags : 2;
+            *(uint32_t *)(a1 + 8) = flags;
             *(uint64_t *)(a1 + 16) = c->alt_size;
         }
         if (a0) {
@@ -413,21 +425,31 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                     break;
                 }
             if (got) {
-                __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST); // dequeue from both
+                // Synchronously dequeue ONE instance. The ascending scan picks the lowest signo (sigwaitinfo
+                // priority order); sigq_pop takes the oldest queued instance of that signo (FIFO within a
+                // signo) and carries its si_value/pid/code -- a realtime signal keeps its pending bit while
+                // more instances remain. If nothing was queued (host async path), fall back to the
+                // single-slot g_sig* the host handler wrote and clear the bit.
+                struct sigq_ent ent;
+                int popped = sigq_pop(got, &ent);
                 __atomic_and_fetch(&c->tpending, ~(1ull << got), __ATOMIC_SEQ_CST);
+                if (!popped) __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST);
                 if (a1) { // fill siginfo_t whenever info != NULL (a3 is the sigsetsize, not a size threshold)
                     memset((void *)a1, 0, 128);
-                    *(int *)(a1 + 0) = got;            // si_signo
-                    *(int *)(a1 + 8) = g_sigcode[got]; // si_code
-                    if (g_sigpid[got]) {
-                        *(int *)(a1 + 16) = g_sigpid[got];
-                        *(int *)(a1 + 20) = g_siguid[got];
+                    *(int *)(a1 + 0) = got;                                       // si_signo
+                    *(int *)(a1 + 8) = popped ? ent.code : g_sigcode[got];        // si_code
+                    int spid = popped ? ent.pid : g_sigpid[got];
+                    if (spid) {
+                        *(int *)(a1 + 16) = spid;
+                        *(int *)(a1 + 20) = popped ? ent.uid : g_siguid[got];
                     }
-                    *(uint64_t *)(a1 + 24) = g_sigval[got];
-                    g_sigcode[got] = 0;
-                    g_sigval[got] = 0;
-                    g_sigpid[got] = 0;
-                    g_siguid[got] = 0;
+                    *(uint64_t *)(a1 + 24) = popped ? ent.value : g_sigval[got]; // si_value
+                    if (!popped) {
+                        g_sigcode[got] = 0;
+                        g_sigval[got] = 0;
+                        g_sigpid[got] = 0;
+                        g_siguid[got] = 0;
+                    }
                 }
                 G_RET(c) = (uint64_t)got;
                 break;
@@ -494,14 +516,12 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        // The kernel rt_sigaction layout is 24 bytes on aarch64 and 32 bytes on x86_64, whose ABI carries
-        // sa_restorer between flags and mask. Read/write the target layout rather than interpreting the
-        // x86 restorer trampoline pointer as its signal mask.
-#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+        // glibc's kernel_sigaction on BOTH aarch64 and x86_64 carries an sa_restorer slot between sa_flags
+        // and sa_mask, so the ABI struct is 32 bytes with the mask at offset 24. (The aarch64 leg previously
+        // used 24/16, which read a zero where sa_mask actually sits -- so a handler's sa_mask members were
+        // dropped from the in-handler signal mask; mask_in_handler.) x86 additionally consults the restorer
+        // trampoline pointer (guarded by HL_GUEST_SIGACTION_HAS_RESTORER below).
         const uint64_t action_size = 32, mask_offset = 24;
-#else
-        const uint64_t action_size = 24, mask_offset = 16;
-#endif
         // The act/oldact structs are read/written DIRECTLY by the engine, so
         // a bad/unmapped pointer must return -EFAULT rather than fault the engine. Validate in Linux
         // order -- copyin `act` (a1) before copyout `oldact` (a2) -- so no oldact is written when act faults.
@@ -531,6 +551,13 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             g_sigact[sig].restorer = 0;
 #endif
             g_sigact[sig].mask = *(uint64_t *)(a1 + mask_offset);
+            // Setting SIG_IGN (or SIG_DFL on a default-ignore signal) DISCARDS any pending instance --
+            // Linux flushes the pending queue on an ignore transition. Without this a signal raised while
+            // blocked, then set to SIG_IGN, stayed pending (ignore_discards_pending: sigpending must clear).
+            if (h == 1 || (h == 0 && !sig_default_terminates(sig))) {
+                sigq_flush(sig);
+                __atomic_and_fetch(&c->tpending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+            }
             // Synchronous CPU faults (SIGILL/FPE/TRAP/SEGV/BUS) ALWAYS stay on the engine's own host guard
             // (installed at startup): it intercepts the hardware fault and either delivers it to the guest
             // handler recorded in g_sigact above (deliver_guest_fault) or applies the default action
@@ -548,6 +575,18 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 // g_sigact; never replace their host handlers.
                 if (sig_host_is_engine_control(ms)) {
                     // no host disposition change
+                } else if (h == 0 && sig == 17 && (g_sigact[sig].flags & 0x2)) {
+                    // SA_NOCLDWAIT with the DEFAULT SIGCHLD disposition still auto-reaps children (Linux
+                    // leaves no zombie -> a later wait() gives ECHILD). SIG_DFL for SIGCHLD would install no
+                    // host handler, so the auto-reap in host_sigh_si never ran and zombies lingered. Install
+                    // our SIGCHLD handler so the reap path runs; the guest disposition is still SIG_DFL
+                    // (h==0) so maybe_deliver_signal takes SIGCHLD's ignore default -- no guest handler fires.
+                    struct sigaction sa;
+                    memset(&sa, 0, sizeof sa);
+                    sa.sa_sigaction = host_sigh_si;
+                    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+                    sigfillset(&sa.sa_mask);
+                    sigaction(ms, &sa, NULL);
                 } else if (h == 0)
                     signal(ms, SIG_DFL);
                 else if (h == 1)
@@ -684,7 +723,8 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     case 139:
         do_sigreturn(c);
         c->redirect = 1;
-        // rt_sigreturn (restorer path)
+        // rt_sigreturn (restorer path). The handler-return defer-pop + serial next-signal delivery happen in
+        // the shared dispatcher's SIGRETURN_PC path (core/dispatch.c), which is where glibc's restorer lands.
         break;
     default: return 0;
     }
