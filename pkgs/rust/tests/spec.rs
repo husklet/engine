@@ -10,10 +10,10 @@ use std::{
 
 use hl_engine::{
     extension::{
-        AllocationRequest, Authorities, BindAccess, Coherency, DirectoryEntry, ExtensionConfig,
-        DeviceEntry, DeviceKind, ExtensionSpec, Feature, FileEntry, FileSource, HandleOperation,
-        Handles, HostBindEntry, HostResource, Inheritance, Interest, LinuxError, Memory,
-        MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
+        AllocationRequest, Authorities, BindAccess, Coherency, DeviceEntry, DeviceKind,
+        DirectoryEntry, ExtensionConfig, ExtensionSpec, Feature, FileEntry, FileSource,
+        HandleOperation, Handles, HostBindEntry, HostResource, Inheritance, Interest, LinuxError,
+        Memory, MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
         ProviderAuthority, ProviderId, ReadRequest, Readiness, ReadyState, Region,
         ResourceDescriptor, ResourceError, ResourceId, ServiceEntry, ServiceId,
         ServiceRegistration, Sharing, SocketEntry, SymlinkEntry, WriteRequest,
