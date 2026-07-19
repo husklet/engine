@@ -305,6 +305,7 @@ static void fd_reset_emul(int fd) {
         g_devtty[fd] = 0;
         unix_bind_clear(fd);
         g_lo_port[fd] = 0;
+        g_lo_v6only[fd] = 0;
         g_sock_stream[fd] = 0;
         g_sock_conn[fd] = 0;
         g_sock_fam[fd] = 0;

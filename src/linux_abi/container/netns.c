@@ -739,10 +739,13 @@ static char g_netns[64];
 // fd -> the loopback port it's bound/connected to (0 = not a private-lo socket)
 static uint16_t g_lo_port[HL_NFD];
 // fd -> 1 if this private-lo socket is AF_INET6 (so getsockname/getpeername/accept report a sockaddr_in6
-// with ::1 instead of an AF_INET 127.0.0.1). The unix-socket switch is keyed by port only, so a v6 server
-// and a v4 client on the same loopback port still rendezvous (dual-stack); this only picks the address
-// family reported back to the guest.
+// with ::1 instead of an AF_INET 127.0.0.1). Dual-stack listeners use the common port rendezvous; a
+// v6-only wildcard listener uses a separate path so IPv4 may bind the same port. This flag picks the
+// address family reported back to the guest.
 static uint8_t g_lo_v6[HL_NFD];
+// fd -> 1 when an AF_INET6 wildcard bind requested IPV6_V6ONLY. Such a
+// listener owns a rendezvous distinct from an IPv4 listener on the same port.
+static uint8_t g_lo_v6only[HL_NFD];
 // fd -> 1 if created SOCK_STREAM (only those get loopback isolation)
 static uint8_t g_sock_stream[HL_NFD];
 // fd -> 1 once a stream connect() SUCCEEDED on it. Linux keeps a connected stream socket in SS_CONNECTED
@@ -1021,6 +1024,16 @@ static void lo_path(uint16_t port, char *out, size_t n) {
     snprintf(out, n, "%s/p%u", g_netns, (unsigned)port);
 }
 
+// A v6-only wildcard listener and an IPv4 wildcard listener may own the same
+// numeric port at once. Keep the v6-only rendezvous distinct; dual-stack IPv6
+// listeners retain the historical path so IPv4 and IPv6 clients share it.
+static void lo_tcp_path(uint16_t port, int v6only, char *out, size_t n) {
+    if (v6only)
+        snprintf(out, n, "%s/p6-%u", g_netns, (unsigned)port);
+    else
+        lo_path(port, out, n);
+}
+
 // Allocate an ephemeral loopback port for a bind(127.0.0.1:0). The kernel would assign a real port;
 // under the unix-socket emulation we instead pick a port whose `p<port>` path is still free so that a
 // later getsockname()/connect() round-trips to the same socket. (Without this, port 0 collapsed to a
@@ -1153,6 +1166,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_fam[dst] = g_sock_fam[src];
     g_lo_port[dst] = g_lo_port[src];
     g_lo_v6[dst] = g_lo_v6[src];
+    g_lo_v6only[dst] = g_lo_v6only[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];
     g_br_interface[dst] = g_br_interface[src];
@@ -1579,7 +1593,7 @@ static void fwd_maybe_start(int fd) {
         br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
-        lo_path(cport, upath, sizeof upath);
+        lo_tcp_path(cport, g_lo_v6only[fd], upath, sizeof upath);
     } else
         return; // real host bind (no switch redirect) -> already natively reachable, nothing to do
     if (!pm_published(cport)) return; // not a published port

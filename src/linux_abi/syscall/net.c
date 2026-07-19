@@ -275,6 +275,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
                 g_lo_v6[r] = 0;
+                g_lo_v6only[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
                 g_br_interface[r] = 0;
@@ -429,8 +430,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             (lo_any_is(sa, (socklen_t)a2) || is_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
+            int v6only = 0;
+            if (is_lo6) {
+                socklen_t ol = sizeof v6only;
+                if (getsockopt((int)a0, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &ol) != 0) v6only = 0;
+            }
             char up[200];
-            lo_path(p, up, sizeof up);
+            lo_tcp_path(p, is_lo6 && v6only, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -444,6 +450,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r == 0) {
                 g_lo_port[(int)a0] = p ? p : 1;
                 g_lo_v6[(int)a0] = (uint8_t)is_lo6; // remember family for getsockname/accept
+                g_lo_v6only[(int)a0] = (uint8_t)(is_lo6 && v6only);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -714,7 +721,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             (lo_is(sa, (socklen_t)a2) || c_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
-            lo_path(p, up, sizeof up);
+            lo_tcp_path(p, c_lo6, up, sizeof up);
+            if (c_lo6 && access(up, F_OK) != 0) lo_tcp_path(p, 0, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
