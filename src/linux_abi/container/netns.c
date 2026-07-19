@@ -32,6 +32,28 @@ static const int CC_L2M[17] = {VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, -
                                // Linux c_cc index -> macOS index
                                VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT, VEOL2};
 
+// Linux termios baud CODE (Bxxx in c_cflag CBAUD/CIBAUD) <-> numeric bits/s (the macOS speed_t form,
+// and what cf{set,get}speed operate on). Standard rates only; custom BOTHER rates are not modeled here.
+// Linux CBAUD mask is 0x100f (CBAUDEX 0x1000 | 0x000f); the input speed lives in CIBAUD (that field << 16).
+#define TIO_CBAUD 0x100fu
+#define TIO_CIBAUD_SHIFT 16
+static const uint32_t TIO_BAUD[][2] = {
+    {0, 0},           {1, 50},          {2, 75},          {3, 110},         {4, 134},
+    {5, 150},         {6, 200},         {7, 300},         {8, 600},         {9, 1200},
+    {0xa, 1800},      {0xb, 2400},      {0xc, 4800},      {0xd, 9600},      {0xe, 19200},
+    {0xf, 38400},     {0x1001, 57600},  {0x1002, 115200}, {0x1003, 230400}, {0x1004, 460800},
+    {0x1005, 500000}, {0x1006, 576000}, {0x1007, 921600}, {0x1008, 1000000}};
+static uint32_t baud_code_to_num(uint32_t code) {
+    for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
+        if (TIO_BAUD[i][0] == code) return TIO_BAUD[i][1];
+    return 0;
+}
+static uint32_t baud_num_to_code(uint32_t num) {
+    for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
+        if (TIO_BAUD[i][1] == num) return TIO_BAUD[i][0];
+    return 0;
+}
+
 // bind()/connect() an AF_UNIX socket at host path `host`. macOS sun_path is only 104 bytes, but a container
 // overlay upper socket path ($HOME/.hl/containers/<64-hex>/upper/.../.s.PGSQL.5432) can exceed that -- a
 // plain snprintf into sun_path SILENTLY TRUNCATES, so bind creates the inode at the wrong (short) path and
@@ -157,6 +179,14 @@ static void termios_l2m(const uint8_t *L, struct termios *M) {
     const uint8_t *lcc = L + 17;
     for (int i = 0; i < 17; i++)
         if (CC_L2M[i] >= 0) M->c_cc[CC_L2M[i]] = lcc[i];
+    // Carry the line speed: map the Linux CBAUD (output) / CIBAUD (input) codes to numeric bits/s so the
+    // host termios keeps the requested rate. map_bits above ignores the baud field, so without this the
+    // speed collapses to B0 (a cfgetispeed/cfgetospeed round-trip then reads 0). An input code of 0 means
+    // "same as output" on Linux.
+    uint32_t ocode = lc & TIO_CBAUD, icode = (lc >> TIO_CIBAUD_SHIFT) & TIO_CBAUD;
+    if (icode == 0) icode = ocode;
+    cfsetospeed(M, baud_code_to_num(ocode));
+    cfsetispeed(M, baud_code_to_num(icode));
 }
 
 static void termios_m2l(const struct termios *M, uint8_t *L) {
@@ -165,6 +195,10 @@ static void termios_m2l(const struct termios *M, uint8_t *L) {
     uint32_t lc = map_bits((uint32_t)M->c_cflag, TIO_C, 6, 0), ll = map_bits((uint32_t)M->c_lflag, TIO_L, 9, 0);
     int csz = M->c_cflag & CSIZE;
     lc |= (csz == CS8 ? 0x30 : csz == CS7 ? 0x20 : csz == CS6 ? 0x10 : 0);
+    // Encode the host line speed back into the Linux CBAUD (output) / CIBAUD (input) fields.
+    uint32_t ocode = baud_num_to_code((uint32_t)cfgetospeed(M)), icode = baud_num_to_code((uint32_t)cfgetispeed(M));
+    lc = (lc & ~TIO_CBAUD) | (ocode & TIO_CBAUD);
+    lc = (lc & ~(TIO_CBAUD << TIO_CIBAUD_SHIFT)) | ((icode & TIO_CBAUD) << TIO_CIBAUD_SHIFT);
     *(uint32_t *)(L + 0) = li;
     *(uint32_t *)(L + 4) = lo;
     *(uint32_t *)(L + 8) = lc;

@@ -721,6 +721,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 0x402c542b:
         case 0x402c542c:
         case 0x402c542d: // TCGETS2 / TCSETS2{,W,F}
+        case 0x5409:     // TCSBRK  (tcdrain / tcsendbreak)
+        case 0x540a:     // TCXONC  (tcflow)
+        case 0x540b:     // TCFLSH  (tcflush)
+        case 0x5425:     // TCSBRKP (tcsendbreak with duration)
         {
             // "Is fd a pty master?" -- apt/dpkg StartPtyMagic does TIOCSWINSZ + tcsetattr(TCSANOW) on the
             // master WITHOUT ever opening the slave, and a macOS master ENOTTYs every termios/winsize ioctl,
@@ -828,6 +832,37 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = 0;
             } else
                 G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
+        // TCSBRK -- tcdrain (arg != 0) / tcsendbreak (arg == 0). The third argument is passed by value, not
+        // through a pointer, so it arrives in a2 directly. A master retargets to its transient slave above.
+        case 0x5409: {
+            int r = (int)a2 == 0 ? tcsendbreak(tfd, 0) : tcdrain(tfd);
+            G_RET(c) = is_master ? 0 : (r < 0 ? (uint64_t)(-errno) : 0);
+            break;
+        }
+        // TCSBRKP -- always send a break of the given duration (by-value arg).
+        case 0x5425: {
+            int r = tcsendbreak(tfd, (int)a2);
+            G_RET(c) = is_master ? 0 : (r < 0 ? (uint64_t)(-errno) : 0);
+            break;
+        }
+        // TCFLSH -- discard queued I/O. Linux queue selector (0=TCIFLUSH,1=TCOFLUSH,2=TCIOFLUSH) maps to the
+        // host's symbolic tcflush() constants (their raw values differ on macOS).
+        case 0x540b: {
+            int q = (int)a2;
+            int hq = q == 0 ? TCIFLUSH : q == 1 ? TCOFLUSH : TCIOFLUSH;
+            int r = tcflush(tfd, hq);
+            G_RET(c) = is_master ? 0 : (r < 0 ? (uint64_t)(-errno) : 0);
+            break;
+        }
+        // TCXONC -- suspend/restart transmission (tcflow). Linux action (0=TCOOFF..3=TCION) maps to the host's
+        // symbolic tcflow() constants.
+        case 0x540a: {
+            int act = (int)a2;
+            int hact = act == 0 ? TCOOFF : act == 1 ? TCOON : act == 2 ? TCIOFF : TCION;
+            int r = tcflow(tfd, hact);
+            G_RET(c) = is_master ? 0 : (r < 0 ? (uint64_t)(-errno) : 0);
             break;
         }
         case 0x80045430: {
