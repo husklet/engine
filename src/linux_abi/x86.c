@@ -963,7 +963,18 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
         // growth/over-read and draws on the large grow budget; an isolated fault is a candidate wild
         // pointer on the small budget. NOLAZYFIX=1 forces the legacy single small monotonic budget.
         int adjacent = !lazy_nofix() && lazy_neighbor_mapped(pg);
+#if defined(__linux__)
+        // On a Linux host an ISOLATED fault (no mapped neighbor) is a genuine wild pointer: the kernel raises
+        // it exactly like hardware, and the aarch64 guest path (which has no lazy grower at all) already
+        // faults on it. Silently satisfying it with a zero page is an isolation/correctness hole -- a guest
+        // could read unmapped high-VA memory and see 0 instead of SIGSEGV(SEGV_MAPERR). Keep only the ADJACENT
+        // grow cushion (a legitimate stack-grow / SSE over-read one page past a live mapping); let an isolated
+        // fault fall through to a faithful guest SIGSEGV. The Darwin-only zero-map-and-retry crutch (for
+        // over-reads that raise host SIGBUS on macOS) still applies on the non-Linux build below.
+        int ok = adjacent && (g_growmaps < (256 << 10)); /* 1GB of grow pages */
+#else
         int ok = adjacent ? (g_growmaps < (256 << 10)) /* 1GB of grow pages */ : (g_lazymaps < lazy_budget());
+#endif
         if (ok) {
             static int hooked;
             if (!hooked) {
