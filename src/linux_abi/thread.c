@@ -198,6 +198,9 @@ static void futex_private_table_after_fork(void) {
         memset(b->saddr, 0, sizeof b->saddr);
         memset(b->scnt, 0, sizeof b->scnt);
         memset(b->sbits, 0, sizeof b->sbits);
+        memset(b->waddr, 0, sizeof b->waddr);
+        memset(b->wbits, 0, sizeof b->wbits);
+        memset(b->wgrant, 0, sizeof b->wgrant);
         b->imprecise = 0;
     }
     g_fbk_active = g_fbk_private;
