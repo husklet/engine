@@ -2886,9 +2886,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 !strncmp(gpb, "/dev/std", 8))
                 gp = gpb;
         }
-        // /proc/self (and /proc/thread-self) are magic symlinks to the caller's own pid -- readlink returns
-        // the decimal pid. `ls -l /proc` readlinks it now that /proc lists a "self" entry.
-        if (p && (!strcmp(gp, "/proc/self") || !strcmp(gp, "/proc/thread-self"))) {
+        // /proc/self is a magic symlink to the caller's own pid; /proc/thread-self resolves to the calling
+        // thread's per-task dir "<pid>/task/<tid>" (glibc/tcmalloc/profilers readlink it to reach the current
+        // thread's files without a gettid syscall). On the main thread tid==pid. `ls -l /proc` readlinks
+        // "self" now that /proc lists it.
+        if (p && !strcmp(gp, "/proc/self")) {
             char num[16];
             int l = snprintf(num, sizeof num, "%d", container_pid());
             if ((size_t)l > bs) l = (int)bs;
