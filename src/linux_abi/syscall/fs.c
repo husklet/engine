@@ -3803,8 +3803,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
     }
-    // umask -> old mask
-    case 166: G_RET(c) = (uint64_t)umask((mode_t)a0); break;
+    // umask -> old mask. Forward to the host so real inode creation honours the guest's mask, and mirror it
+    // into g_umask so /proc/self/status `Umask:` reflects the current value (returns the tracked previous mask,
+    // which the host call keeps in lockstep).
+    case 166: {
+        int old = g_umask;
+        g_umask = (int)a0 & 0777;
+        (void)umask((mode_t)a0);
+        G_RET(c) = (uint64_t)(unsigned)old;
+        break;
+    }
     // fadvise64 -- advisory no-op
     case 223: G_RET(c) = 0; break;
     case 291: {

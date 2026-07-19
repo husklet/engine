@@ -2391,7 +2391,7 @@ static int proc_status_text(char *b, size_t n) {
     int threads = thread_live_count(); // live pthreads (Threads: hid concurrency at a hardcoded 1)
     return snprintf(
         b, n,
-        "Name:\t%s\nUmask:\t0022\nState:\tR (running)\nTgid:\t%d\nNgid:\t0\nPid:\t%d\nPPid:\t%d\n"
+        "Name:\t%s\nUmask:\t%04o\nState:\tR (running)\nTgid:\t%d\nNgid:\t0\nPid:\t%d\nPPid:\t%d\n"
         "TracerPid:\t0\nUid:\t%d\t%d\t%d\t%d\nGid:\t%d\t%d\t%d\t%d\nFDSize:\t256\nGroups:\t%s\n"
         "VmPeak:\t%8lu kB\nVmSize:\t%8lu kB\nVmLck:\t%8lu kB\nVmHWM:\t%8lu kB\nVmRSS:\t%8lu kB\n"
         "VmData:\t%8lu kB\nVmStk:\t     132 kB\nVmExe:\t     512 kB\nVmLib:\t    2048 kB\nVmPTE:\t      32 kB\n"
@@ -2407,7 +2407,8 @@ static int proc_status_text(char *b, size_t n) {
         "Speculation_Store_Bypass:\tvulnerable\nSpeculationIndirectBranch:\tunknown\n"
         "Cpus_allowed:\t%s\nCpus_allowed_list:\t%s\nvoluntary_ctxt_switches:\t1\n"
         "nonvoluntary_ctxt_switches:\t0\n",
-        comm, pid, pid, ppid, uid_r, uid_e, uid_s, uid_fs, gid_r, gid_e, gid_s, gid_fs, groups, vsz, vsz, vmlck, rss,
+        comm, (unsigned)g_umask, pid, pid, ppid, uid_r, uid_e, uid_s, uid_fs, gid_r, gid_e, gid_s, gid_fs, groups, vsz,
+        vsz, vmlck, rss,
         rss, rss, threads, (unsigned long long)HL_CAP_DEFAULT, (unsigned long long)g_cap_eff,
         (unsigned long long)g_cap_bnd, g_nnp, cpumask, cpulist);
 }

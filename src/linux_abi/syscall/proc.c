@@ -1495,7 +1495,16 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(-EPERM);
                 break;
             }
-            G_RET(c) = 0; // securebits accepted (we don't enforce them, but the value round-trips as 0)
+            g_securebits = (int)a1; // we don't enforce securebits, but the value round-trips via PR_GET_SECUREBITS
+            G_RET(c) = 0;
+            break;
+        }
+        // PR_GET_SECUREBITS(27): report the current securebits flags (0 in a default container). The kernel
+        // ignores arg2..5 here, so no argument validation -- capsh/libcap read this and it must agree with what
+        // PR_SET_SECUREBITS stored. Previously fell through to the generic switch -> -EINVAL (a query that
+        // always succeeds on real Linux).
+        if ((int)a0 == 27) {
+            G_RET(c) = (uint64_t)(unsigned)g_securebits;
             break;
         }
         if ((int)a0 == 24) {

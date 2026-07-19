@@ -570,6 +570,11 @@ static int gid_permitted(int id) {
 static uint64_t g_cap_eff = HL_CAP_DEFAULT; // process EFFECTIVE cap set (capset(2) may narrow it)
 static uint64_t g_cap_bnd = HL_CAP_DEFAULT; // process BOUNDING cap set (PR_CAPBSET_DROP clears bits)
 static int g_nnp;                           // PR_SET/GET_NO_NEW_PRIVS: sticky; /proc/self/status NoNewPrivs
+static int g_securebits;                     // PR_SET/GET_SECUREBITS: the per-process securebits flags (0 default)
+// The file-mode creation mask. Forwarded to the host on umask(2) so real inode creation honours it, but ALSO
+// tracked here so /proc/self/status `Umask:` reflects the guest's current value (it was hardcoded 0022, so a
+// guest umask(2) changed real file modes yet the status line stayed 0022 -- a syscall-vs-/proc disagreement).
+static int g_umask = 022;
 // ---- image-derived supplementary groups (runc additionalGids) --------------------------------
 // A default `docker run` gives the container's run user (default root, uid 0) the supplementary GID set
 // runc DERIVES FROM THE IMAGE ROOTFS -- not a fixed constant. runc reads /etc/passwd for the run user's
