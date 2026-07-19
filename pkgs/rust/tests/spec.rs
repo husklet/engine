@@ -159,6 +159,40 @@ int main(void) {
     "/tmp/descriptor-pressure-probe"
 }
 
+fn bound_xattr_errno_probe(guest: Guest) -> &'static str {
+    static PROBES: OnceLock<()> = OnceLock::new();
+    PROBES.get_or_init(|| {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        for isa in ["aarch64", "x86_64"] {
+            fs::copy(
+                fixtures.join(format!("fgetxattr-errno-{isa}")),
+                rootfs().join(format!("tmp/fgetxattr-bound-errno-{isa}")),
+            )
+            .unwrap();
+        }
+    });
+    match guest {
+        Guest::Aarch64 => "/tmp/fgetxattr-bound-errno-aarch64",
+        Guest::X86_64 => "/tmp/fgetxattr-bound-errno-x86_64",
+    }
+}
+
+#[test]
+fn bound_descriptor_xattr_errors_use_linux_errno_values() {
+    for guest in [Guest::Aarch64, Guest::X86_64] {
+        let mut spec = MachineSpec::new(guest, bound_xattr_errno_probe(guest));
+        spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+        assert_eq!(
+            Engine::new()
+                .spawn(spec, ProcessIo::default())
+                .unwrap()
+                .wait()
+                .unwrap(),
+            Exit::Code(0)
+        );
+    }
+}
+
 fn projected_socket_probe() -> &'static str {
     static PROBE: OnceLock<()> = OnceLock::new();
     PROBE.get_or_init(|| {
