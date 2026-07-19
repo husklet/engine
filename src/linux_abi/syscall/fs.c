@@ -3247,9 +3247,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)l;
                 break;
             }
-            // map the host path back into the guest's view (strip the rootfs prefix if jailed)
-            const char *gpath =
-                (g_rootfs && !strncmp(gp, g_rootfs_canon, g_rootfs_canon_len)) ? gp + g_rootfs_canon_len : gp;
+            // Map the host path back into the guest's view: strip the rootfs prefix if jailed AND rebase a
+            // bound volume (e.g. /tmp -> a host scratch dir) through the volume table, so the guest never
+            // sees the raw host path -- the old rootfs-only strip leaked the macOS /private/tmp path for a
+            // fd on a mapped volume. proc_fd_rebase is a no-op for a host path under no known mount.
+            proc_fd_rebase(gp, sizeof gp);
+            const char *gpath = gp;
             if (!gpath[0]) gpath = "/";
             size_t l = strlen(gpath);
             if (l > bs) l = bs;
