@@ -1011,5 +1011,16 @@ static int mmap_flags(int lf) {
     if (lf & 0x02) f |= MAP_PRIVATE;
     if (lf & 0x10) f |= MAP_FIXED;
     if (lf & 0x20) f |= MAP_ANON;
+#if defined(__linux__)
+    // On a Linux host the guest's Linux MAP_* bits ARE the host's bits, so the placement/behavior flags
+    // above the type bits can be forwarded verbatim and enforced by the kernel itself instead of being
+    // silently dropped (which turned MAP_FIXED_NOREPLACE into a plain hint that CLOBBERED an existing
+    // mapping, made MAP_HUGETLB fake-succeed as ordinary pages, and ignored MAP_POPULATE/LOCKED/NORESERVE).
+    // Forward the exact bits the kernel would honor; the type bits (0x01/0x02/0x10/0x20) are already set,
+    // and MAP_32BIT (0x40) is x86-guest-specific and meaningless on this aarch64 host, so both are excluded.
+    //   GROWSDOWN 0x100, LOCKED 0x2000, NORESERVE 0x4000, POPULATE 0x8000, NONBLOCK 0x10000,
+    //   STACK 0x20000, HUGETLB 0x40000, FIXED_NOREPLACE 0x100000, MAP_HUGE_* size (0x3f << 26).
+    f |= lf & (0x100 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x100000 | (0x3f << 26));
+#endif
     return f;
 }

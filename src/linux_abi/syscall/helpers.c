@@ -1092,6 +1092,51 @@ static void wipefork_apply_child(void) {
         memset((void *)g_wipefork[i].addr, 0, (size_t)g_wipefork[i].len);
 }
 
+// MADV_DONTFORK(14) ranges: PRIVATE-ANON regions the guest asked NOT to be inherited by a fork(2) child
+// (Linux VM_DONTCOPY). Tracked here (mirrors g_wipefork); fork_child_hooks() unmaps each range in the
+// child so a child access FAULTS exactly as Linux would, while the parent keeps its mapping.
+// MADV_DOFORK(15) undoes it by dropping the range. The registry is inherited across fork.
+static struct {
+    uint64_t addr, len;
+} g_dontfork[256];
+
+static int g_ndontfork;
+
+static void dontfork_add(uint64_t addr, uint64_t len) {
+    if (!addr || !len) return;
+    for (int i = 0; i < g_ndontfork; i++)
+        if (g_dontfork[i].addr == addr && g_dontfork[i].len == len) return; // already tracked
+    if (g_ndontfork >= (int)(sizeof g_dontfork / sizeof g_dontfork[0])) return;
+    g_dontfork[g_ndontfork].addr = addr;
+    g_dontfork[g_ndontfork].len = len;
+    g_ndontfork++;
+}
+
+static void dontfork_del(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (int i = 0; i < g_ndontfork;) {
+        uint64_t a = g_dontfork[i].addr, e = a + g_dontfork[i].len;
+        if (a < end && addr < e)
+            g_dontfork[i] = g_dontfork[--g_ndontfork]; // overlaps the DOFORK/unmapped range -> forget it
+        else
+            i++;
+    }
+}
+
+// Called in the fork CHILD (from fork_child_hooks): drop each MADV_DONTFORK range so the child faults on
+// access (Linux presents the range as unmapped in the child).
+static void dontfork_apply_child(void) {
+    for (int i = 0; i < g_ndontfork; i++) {
+        uint64_t a = g_dontfork[i].addr, l = g_dontfork[i].len;
+        munmap((void *)a, (size_t)l);
+        // Retire the range from the private-anon registry and mark it PROT_NONE so a child access faults
+        // (SIGSEGV) exactly as Linux VM_DONTCOPY presents it -- otherwise the x86 lazy anon-page grower,
+        // seeing the address still inside a tracked anon region, would silently re-serve a zero page.
+        anon_untrack(a, l);
+        gna_add(a & ~(uint64_t)0xfff, (a + l + 0xfff) & ~(uint64_t)0xfff);
+    }
+}
+
 // /proc/self/fd/N (and /proc/<pid>/fd/N for our own pid -- host pid, container pid, or init's "1")
 // names an already-open fd. macOS has no /proc, so detect this form and recover the fd number; the
 // caller then resolves it via F_GETPATH (readlinkat) or dup()/reopen (openat). Returns N>=0 on an

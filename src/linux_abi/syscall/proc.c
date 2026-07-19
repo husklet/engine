@@ -295,6 +295,7 @@ static void fork_child_hooks(struct cpu *c) {
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
+    dontfork_apply_child();      // MADV_DONTFORK: unmap the ranges the guest marked not-inherited-on-fork
     hl_gmap_lock_reset();        // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
 }
 

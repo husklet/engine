@@ -266,6 +266,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             filemap_unmap(u_lo, u_hi);
             futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
             wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
+            dontfork_del(u_lo, u_hi - u_lo); // ...nor does a dont-fork marking on the released range
             hl_gmap_lock_remove(u_lo, u_hi - u_lo); // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
             // (SIGSEGV). Without this the JIT's lazy zero-page grower (jit86_lazyguard) would re-serve the
@@ -391,6 +392,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
                         hl_gmap_lock_remove(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
+                        dontfork_del(a0, (uint64_t)a1);
                     }
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
                     hl_gmap_set_guest_length(a4, (uint64_t)a2);
@@ -426,6 +428,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     filemap_unmap(nend, oend);
                     futex_shared_unmap(nend, oend);
                     wipefork_del(nend, oend - nend);
+                    dontfork_del(nend, oend - nend);
                     hl_gmap_lock_remove(nend, oend - nend);
                     gbus_clear(nend, oend);
                     // The released tail is genuinely unmapped now -> a guest access must fault. Record it in
@@ -535,7 +538,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // glibc's vectorized string ops over-read up to 16 bytes past a buffer's logical end; on Darwin
         // that hits an unmapped page -> SIGBUS. Map a 64KB guard tail on non-fixed anon maps so the
         // over-read lands in mapped zero memory (x86 glibc relies on this; harmless for aarch64).
-        size_t guard = (!(a3 & 0x10) && (a3 & 0x20)) ? 0x10000 : 0;
+        // MAP_FIXED_NOREPLACE (0x100000) forwards to the host, whose EEXIST verdict must reflect ONLY the
+        // guest's requested range -- a guard tail would let a collision in the extra pages spuriously fail
+        // (or a free-space map succeed where the tail overlaps), so keep NOREPLACE maps exact-length.
+        size_t guard = (!(a3 & 0x10) && (a3 & 0x20) && !(a3 & 0x100000)) ? 0x10000 : 0;
         // mprotect (case 226) is a no-op (the JIT never executes guest pages), so a later PROT_READ ->
         // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
         // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
@@ -824,6 +830,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // not survive the region being remapped) -- drop stale wipe coverage so a reused address is
             // never wrongly zeroed in a child.
             wipefork_del((uint64_t)r, (uint64_t)a1 + guard);
+            dontfork_del((uint64_t)r, (uint64_t)a1 + guard); // reused address drops stale dont-fork marking
             // PROT_NONE registry (g_gna, thread.c; read INSIDE host_range_mapped). hl force-maps this region
             // host-RW, so a guest PROT_NONE mmap is really RW -- record the guest's REQUESTED prot so a
             // syscall buffer landing in it still EFAULTs (LTP read02); an accessible map clears stale coverage.
@@ -958,6 +965,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // Linux values: MS_ASYNC=1, MS_INVALIDATE=2, MS_SYNC=4.
         if (((int)a2 & ~(0x1 | 0x2 | 0x4)) || (((int)a2 & 0x1) && ((int)a2 & 0x4))) {
             G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // Linux (mm/msync.c) walks the VMAs after the flag check and returns -ENOMEM if the range contains
+        // an unmapped hole -- msync of a stale/never-mapped range must NOT read as a fake success. Reject a
+        // range that is neither a tracked guest mapping nor physically mapped host-side, using the same
+        // hole-detection idiom as mprotect (case 226). len 0 is a Linux no-op success.
+        if (a1 && !hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
             break;
         }
         filemap_refresh_emulated(a0, a0 + a1);
@@ -1181,6 +1196,26 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 }
                 // could not satisfy exactly -> never fail the guest; fall through to advisory
             }
+        }
+        // MADV_DONTFORK(10) / MADV_DOFORK(11): the marked range must NOT be inherited by a fork child (a
+        // child touch faults), DOFORK undoes it. A guest fork re-establishes the child's guest memory
+        // itself rather than relying on host VMA inheritance, so forwarding the advice to the host kernel
+        // is inert; instead track the range (like MADV_WIPEONFORK) and unmap it in the fork child, so the
+        // child faults exactly as Linux's VM_DONTCOPY would make it. Valid on private-anon ranges here;
+        // other mappings keep the advisory no-op. A zero length is a no-op success.
+        if (adv == 10 || adv == 11) {
+            if (a1 == 0) {
+                G_RET(c) = 0;
+                break;
+            }
+            if (anon_prot_if_contained(a0, (size_t)a1) >= 0) {
+                if (adv == 10)
+                    dontfork_add(a0, (size_t)a1);
+                else
+                    dontfork_del(a0, (size_t)a1);
+            }
+            G_RET(c) = 0;
+            break;
         }
         if (adv >= 0 && adv <= 4)
             hadv = adv;
