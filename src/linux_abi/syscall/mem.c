@@ -578,9 +578,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         uint64_t bus_accessible = a1;
         int bus_prepared = 0;
         int mapping_prepared = 0;
+        // The past-EOF SIGBUS ledger + tail zero-fill below are keyed off st_size, which only bounds the
+        // readable data of a REGULAR file. A character device (/dev/zero, /dev/full backed by /dev/zero,
+        // /dev/mem) reports st_size 0 yet mmaps to an unlimited zero page on Linux -- treating it as a
+        // 0-length file armed the whole mapping for guest SIGBUS, so a plain read of an mmap'd /dev/zero
+        // page terminated the guest (SIGBUS) where Linux returns zero. Restrict the emulation to S_ISREG.
         if (!(a3 & 0x20) && (a3 & 0x02) && (int)a4 >= 0) {
             struct stat metadata;
-            if (fstat((int)a4, &metadata) == 0) {
+            if (fstat((int)a4, &metadata) == 0 && S_ISREG(metadata.st_mode)) {
                 uint64_t available = (uint64_t)metadata.st_size > a5 ? (uint64_t)metadata.st_size - a5 : 0;
                 bus_accessible = available > UINT64_MAX - UINT64_C(4095)
                                      ? UINT64_MAX
@@ -687,7 +692,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // must stay the real shared mapping; ld.so's .so segments are all MAP_PRIVATE, so julia is covered.
         if (r != MAP_FAILED && !off_emul && !fixed286 && (a3 & 0x02) && !(a3 & 0x20) && (int)a4 >= 0 && a1) {
             struct stat st;
-            if (fstat((int)a4, &st) == 0) {
+            if (fstat((int)a4, &st) == 0 && S_ISREG(st.st_mode)) {
                 uint64_t avail = (uint64_t)st.st_size > a5 ? (uint64_t)st.st_size - (uint64_t)a5 : 0;
                 uint64_t valid_end = (avail + hp - 1) & ~(uint64_t)(hp - 1); // first host page wholly past EOF
                 if (valid_end < a1)
