@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
+    io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
     process::Command,
@@ -504,7 +504,6 @@ fn typed_overlay_executes_a_final_symlink_from_the_merged_namespace() {
         )
         .unwrap();
     let mut output = String::new();
-    use std::io::Read;
     machine
         .take_stdout()
         .unwrap()

@@ -52,7 +52,7 @@ fn typed_terminal_preserves_explicit_environment() {
     spec.process.terminal = Some(Size::new(24, 80).unwrap());
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     let mut machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
-    let mut terminal = machine.take_terminal().unwrap();
+    let terminal = machine.take_terminal().unwrap();
     let mut reader = terminal.try_clone().unwrap();
     let output = std::thread::spawn(move || {
         let mut output = Vec::new();
