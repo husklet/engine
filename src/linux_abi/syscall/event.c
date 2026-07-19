@@ -481,6 +481,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // (close() doesn't clear ours -- this is how an epoll fd's per-instance state is reset on reuse)
         if (r >= 0 && r < HL_NFD) {
             g_ep_provider_generations[r] = ep_provider_next(g_ep_provider_generations[r]);
+            ep_object_retire_endpoint(r);
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
@@ -731,6 +732,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 ts.tv_nsec = 0;
                 tp = &ts;
             }
+            // Object-backed watches (inotify) have no host descriptor on this kqueue, so a blocking wait would
+            // never surface their readiness. Like poll()/select() over the same objects, cap the sleep to a
+            // bounded tick and re-sample readiness below; a non-blocking (tmo==0) wait keeps its zero timeout.
+            if (tmo != 0 && ep >= 0 && ep < HL_NFD && g_ep_object_count[ep] > 0 &&
+                (tp == NULL || ts.tv_sec > 0 || ts.tv_nsec > 1000000L)) {
+                ts.tv_sec = 0;
+                ts.tv_nsec = 1000000L; // 1ms, matching the poll/select object cadence
+                tp = &ts;
+            }
             // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall (single-threaded);
             // threaded already flushed it above and waits with no changelist.
             struct kevent *chg = (opt && !lk) ? g_ep_chg[ep] : NULL;
@@ -856,6 +866,36 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 g_ep_primen[ep] = kept;
             }
             ep_unlock(lk);
+            // Object-backed watches (inotify): no host fd feeds the kqueue, so sample the object's readiness
+            // on this bounded tick and format the event here, exactly as poll()/select() observe the same
+            // typed objects. Runs after ep_unlock so the object mutex is never taken under the epoll lock.
+            if (ep >= 0 && ep < HL_NFD && g_ep_object_count[ep] > 0) {
+                uint32_t obj_ep_generation = g_ep_provider_generations[ep];
+                for (uint32_t oidx = 0; oidx < EP_OBJECT_WATCH_LIMIT && oi < maxev; ++oidx) {
+                    ep_object_watch *ow = &g_ep_object_watches[oidx];
+                    if (atomic_load_explicit(&ow->active, memory_order_acquire) == 0 || ow->epoll != ep ||
+                        ow->epoll_generation != obj_ep_generation)
+                        continue;
+                    hl_linux_fd_snapshot osnap;
+                    hl_linux_object_pin opin;
+                    if (g_linux_box == NULL ||
+                        hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)ow->descriptor, &osnap) != HL_STATUS_OK ||
+                        osnap.descriptor_generation != ow->descriptor_generation) {
+                        ep_object_free(ow); // the watched fd was closed or reused
+                        continue;
+                    }
+                    if (hl_linux_object_pin_fd(g_linux_box, (hl_linux_fd)ow->descriptor, &opin) != HL_STATUS_OK)
+                        continue;
+                    uint32_t readiness = hl_linux_object_ready(&opin, ow->interests);
+                    hl_linux_object_unpin(&opin);
+                    uint32_t oev = ep_provider_linux_events(readiness);
+                    if (oev == 0) continue;
+                    *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = oev;
+                    memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &ow->data, sizeof(ow->data));
+                    oi++;
+                    if (ow->events & 0x40000000u) ep_object_free(ow); // EPOLLONESHOT: one delivery only
+                }
+            }
             // Re-block instead of returning a spurious 0. A bare cross-thread wake (or a changelist that only
             // produced EV_ERROR echoes) leaves oi==0 while the guest still asked to block. tmo<0: always loop
             // (epoll_wait(-1) must never return 0). tmo>0: loop until the monotonic deadline elapses, at which

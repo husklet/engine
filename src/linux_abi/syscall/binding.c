@@ -2273,6 +2273,60 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 G_RET(c) = (uint64_t)epoll_result;
                 return 1;
             }
+            /* Typed box objects (an inotify watch is the canonical case) own host
+               observation and expose readiness only through their object adapter,
+               never as a host descriptor -- watched.host_handle is INVALID.  Route
+               them through the object-sampling epoll registry, the same way
+               poll()/select() observe these objects (hl_linux_object_poll). */
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD && (int)a2 >= 0 && (int)a2 < HL_NFD) {
+                hl_linux_object_pin pin;
+                int object_epollable = 0;
+                if (hl_linux_object_pin_fd(g_linux_box, (hl_linux_fd)a2, &pin) == HL_STATUS_OK) {
+                    object_epollable = pin.ops != NULL && pin.ops->readiness != NULL;
+                    hl_linux_object_unpin(&pin);
+                }
+                if (object_epollable) {
+                    uint32_t epoll_generation = g_ep_provider_generations[(int)a0];
+                    ep_object_watch *watch = ep_object_find((int)a0, epoll_generation, (int)a2,
+                                                            watched.descriptor_generation);
+                    if (a1 == HL_LINUX_EPOLL_DELETE) {
+                        if (watch == NULL) epoll_result = -ENOENT;
+                        else {
+                            ep_object_free(watch);
+                            epoll_result = 0;
+                        }
+                    } else if ((a1 == HL_LINUX_EPOLL_ADD || a1 == HL_LINUX_EPOLL_MODIFY) && a3 != 0) {
+                        uint32_t events = *(uint32_t *)(uintptr_t)a3;
+                        uint64_t data;
+                        memcpy(&data, (const void *)((uintptr_t)a3 + G_EPEV_DOFF), sizeof(data));
+                        if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL) epoll_result = -EEXIST;
+                        else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL) epoll_result = -ENOENT;
+                        else {
+                            uint32_t interests = ((events & 0x1u) ? HL_LINUX_READY_READ : 0u) |
+                                                 ((events & 0x4u) ? HL_LINUX_READY_WRITE : 0u);
+                            if (watch == NULL) {
+                                watch = ep_object_alloc();
+                                if (watch == NULL) {
+                                    G_RET(c) = (uint64_t)(int64_t)-ENOSPC;
+                                    return 1;
+                                }
+                                watch->epoll = (int)a0;
+                                watch->epoll_generation = epoll_generation;
+                                watch->descriptor = (int)a2;
+                                watch->descriptor_generation = watched.descriptor_generation;
+                                g_ep_object_count[(int)a0]++;
+                            }
+                            watch->events = events;
+                            watch->interests = interests;
+                            watch->data = data;
+                            ep_wake_arm((int)a0);
+                            epoll_result = 0;
+                        }
+                    } else epoll_result = -EINVAL;
+                    G_RET(c) = (uint64_t)epoll_result;
+                    return 1;
+                }
+            }
             if (a1 == HL_LINUX_EPOLL_ADD && g_host_services != NULL && g_host_services->file != NULL &&
                 g_host_services->file->metadata != NULL) {
                 hl_host_file_metadata metadata;
@@ -2622,6 +2676,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     case 57: /* close */
         ep_provider_retire_endpoint((int)source.fd);
+        ep_object_retire_endpoint((int)source.fd);
         flock_broker_detach(&source);
         if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
             hl_host_file_metadata metadata;

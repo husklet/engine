@@ -1232,6 +1232,7 @@ static void ep_fd_reset(int fd) {
     // ep_close_rehome has already moved a surviving dup and cleared this bit, so this is idempotent there.
     if (g_ep_owner[fd]) ep_mem_close(g_ep_owner[fd] - 1, fd);
     ep_provider_retire_endpoint(fd);
+    ep_object_retire_endpoint(fd);
     g_ep_provider_generations[fd] = ep_provider_next(g_ep_provider_generations[fd]);
     g_ep_rd[fd] = g_ep_wr[fd] = g_ep_os[fd] = 0;
     if (g_ep_chg[fd]) {

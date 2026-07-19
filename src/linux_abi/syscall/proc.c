@@ -164,6 +164,7 @@ static void exec_close_cloexec_scan(int maxfd) {
 static void exec_bound_closed(void *context, hl_linux_fd fd) {
     (void)context;
     ep_provider_retire_endpoint((int)fd);
+    ep_object_retire_endpoint((int)fd);
     proc_fdvis_close((int)fd);
     /* Every typed guest descriptor has a same-number native shadow used only by legacy syscall paths. */
     close((int)fd);

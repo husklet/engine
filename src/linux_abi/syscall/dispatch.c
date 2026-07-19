@@ -107,6 +107,7 @@ static void mq_fd_close(int fd);
 static void mq_fd_duplicate(int newfd, int oldfd);
 
 #include "../../core/provider/files.h"
+#include "../object.h"
 #include "provider_epoll_registry.h"
 static ep_provider_watch g_ep_provider_watches[EP_PROVIDER_WATCH_LIMIT];
 static uint32_t g_ep_provider_generations[HL_NFD];
@@ -128,6 +129,67 @@ static void ep_provider_retire_endpoint(int fd) {
             ((watch->epoll == fd && watch->epoll_generation == epoll_generation) || watch->descriptor == fd))
             ep_provider_retire(watch);
     }
+}
+
+/* Object-backed epoll watches.  A typed box object (an inotify watch is the
+ * canonical case) exposes readiness only through its object adapter -- it owns
+ * host observation and never surfaces a host descriptor the guest epoll kqueue
+ * could wait on.  poll()/select() already observe such objects by sampling their
+ * readiness on a bounded tick (hl_linux_object_poll); epoll mirrors that exact
+ * pattern here so an armed inotify fd is epollable as it is on native Linux.
+ * epoll_generation reuses g_ep_provider_generations, which is bumped whenever an
+ * epoll or watched fd number is closed, so a reused number never matches. */
+#define EP_OBJECT_WATCH_LIMIT 1024u
+typedef struct ep_object_watch {
+    _Atomic uint32_t active;
+    int epoll;
+    uint32_t epoll_generation;
+    int descriptor;
+    uint32_t descriptor_generation;
+    uint32_t events;   /* raw guest epoll event mask (EPOLLONESHOT etc.) */
+    uint32_t interests;
+    uint64_t data;
+} ep_object_watch;
+static ep_object_watch g_ep_object_watches[EP_OBJECT_WATCH_LIMIT];
+static uint16_t g_ep_object_count[HL_NFD];
+
+static ep_object_watch *ep_object_find(int epoll, uint32_t epoll_generation, int descriptor,
+                                       uint32_t descriptor_generation) {
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        ep_object_watch *watch = &g_ep_object_watches[index];
+        if (atomic_load_explicit(&watch->active, memory_order_acquire) != 0 && watch->epoll == epoll &&
+            watch->epoll_generation == epoll_generation && watch->descriptor == descriptor &&
+            watch->descriptor_generation == descriptor_generation)
+            return watch;
+    }
+    return NULL;
+}
+
+static ep_object_watch *ep_object_alloc(void) {
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        uint32_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&g_ep_object_watches[index].active, &expected, 1u,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return &g_ep_object_watches[index];
+    }
+    return NULL;
+}
+
+static void ep_object_free(ep_object_watch *watch) {
+    if (watch->epoll >= 0 && watch->epoll < HL_NFD && g_ep_object_count[watch->epoll] > 0)
+        g_ep_object_count[watch->epoll]--;
+    atomic_store_explicit(&watch->active, 0u, memory_order_release);
+}
+
+static void ep_object_retire_endpoint(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        ep_object_watch *watch = &g_ep_object_watches[index];
+        if (atomic_load_explicit(&watch->active, memory_order_acquire) != 0 &&
+            (watch->epoll == fd || watch->descriptor == fd))
+            ep_object_free(watch);
+    }
+    g_ep_object_count[fd] = 0;
 }
 
 #include "helpers.c"
