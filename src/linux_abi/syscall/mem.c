@@ -292,6 +292,38 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         const uint64_t guard = 0x10000;
         uint64_t tracked = hl_gmap_find_length(a0);       // full mapped extent at a0 (incl. guard), 0 if untracked
         uint64_t phys = tracked ? tracked : (uint64_t)a1; // bytes we can assume are mapped at a0
+        // MREMAP_DONTUNMAP(4): duplicate the mapping to a new address while the OLD range STAYS mapped as
+        // fresh zero-filled anonymous memory (Linux mm/mremap.c). Requires MREMAP_MAYMOVE, an unchanged
+        // length, and a private-anon source (the only case Linux accepts); anything else is EINVAL. Place a
+        // fresh private-anon copy (+guard) at a kernel-chosen address, copy the bytes, then re-establish the
+        // source range as zero anon so it remains readable/writable. Handled before the FIXED/shrink/grow
+        // paths, which all assume the source is released.
+        if (a3 & 4) {
+            if (!(a3 & 1) || (uint64_t)a2 != (uint64_t)a1 || anon_prot_if_contained(a0, (size_t)a1) < 0) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            void *r = mmap(0, (size_t)a2 + guard, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (r == MAP_FAILED) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            memcpy(r, (void *)a0, (size_t)a1);
+            // Re-zero the source in place (DONTUNMAP leaves it mapped as fresh anon zero pages).
+            mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);
+            hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);
+            anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
+            anon_update_prot(a0, (uint64_t)a1, PROT_READ | PROT_WRITE); // source is writable zero anon again
+            gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+            gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+            gna_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            gro_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
+            G_SMC_UNMAP((uint64_t)r, (uint64_t)r + (uint64_t)a2);
+            G_RET(c) = (uint64_t)r;
+            break;
+        }
         // MREMAP_FIXED(2): relocate the mapping to EXACTLY new_addr (a4), the way mremap(MREMAP_FIXED) does.
         // Linux (mm/mremap.c) requires MREMAP_MAYMOVE to also be set, a page-aligned new_addr, and that the
         // new range not overlap the old -- otherwise -EINVAL. It then unmaps whatever sat at the destination
@@ -352,7 +384,37 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             // file-backed source (or anon placement failed): fall through -- do NOT break.
         }
-        // Shrink, or a grow that still fits within the already-mapped extent: stay in place, touch nothing.
+        // Genuine shrink: Linux mremap(new_len < old_len) unmaps the released tail [a0+new_len, a0+old_len)
+        // in place (the base and surviving prefix are unchanged). Merely returning a0 -- as an earlier
+        // "grow that fits the extent" fast path did -- left those pages mapped, so a guest access to the
+        // released tail wrongly succeeded instead of faulting. Round new_len up to a guest page (Linux
+        // rounds the length) and release everything from there to the end of the tracked extent (which
+        // also drops the internal guard tail), then retire every registry over the freed range exactly as
+        // munmap does so /proc, the anon/file/futex/lock maps, and the PROT_NONE fault registry all agree.
+        {
+            size_t gpg = guest_pagesz();
+            uint64_t nlen = ((uint64_t)a2 + gpg - 1) & ~((uint64_t)gpg - 1);
+            if (nlen < (uint64_t)a1) {
+                uint64_t nend = a0 + nlen, oend = a0 + phys;
+                if (oend > nend) {
+                    munmap((void *)nend, (size_t)(oend - nend));
+                    hl_gmap_unmap_range(nend, oend); // trim the tracked mapping, keep [a0, nend)
+                    anon_split_unmap(nend, oend);
+                    filemap_unmap(nend, oend);
+                    futex_shared_unmap(nend, oend);
+                    wipefork_del(nend, oend - nend);
+                    hl_gmap_lock_remove(nend, oend - nend);
+                    gbus_clear(nend, oend);
+                    // The released tail is genuinely unmapped now -> a guest access must fault. Record it in
+                    // the PROT_NONE fault registry so the lazy zero-page grower does not silently re-serve it.
+                    gna_add(nend, (oend + 0xfff) & ~(uint64_t)0xfff);
+                    G_SMC_UNMAP(nend, oend);
+                }
+                G_RET(c) = a0;
+                break;
+            }
+        }
+        // A grow that still fits within the already-mapped extent: stay in place, touch nothing.
         if ((uint64_t)a2 <= phys) {
             G_RET(c) = a0;
             break;
@@ -414,6 +476,22 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // a nonzero region and wrongly succeed). LTP mmap08 companion / general POSIX contract.
         if (a1 == 0) {
             G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // MAP_FIXED requires a page-aligned address: Linux mmap validates this up front (mm/mmap.c
+        // addr & ~PAGE_MASK -> EINVAL) BEFORE reserving anything. Reject a misaligned fixed address here so
+        // it never reaches the MAP_FIXED reconciliation below, whose neighbour-preserving memcpy would
+        // otherwise dereference the misaligned low page (a bogus (void*)(ps+1) target) and fault the engine.
+        if ((a3 & 0x10) && (a0 & (uint64_t)(guest_pagesz() - 1))) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // memfd write seal: a MAP_SHARED mapping that carries write permission over a file sealed with
+        // F_SEAL_WRITE (0x8) is refused with EPERM (Linux mm/shmem.c seal check). A PROT_READ shared map
+        // (no write) and a MAP_PRIVATE copy-on-write map are unaffected, so gate strictly on shared+write.
+        if (!(a3 & 0x20) && (a3 & 0x01) && ((int)a2 & PROT_WRITE) && (int)a4 >= 0 && (int)a4 < HL_NFD &&
+            (memfd_seals_fd((int)a4) & 0x8)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EPERM);
             break;
         }
         // File-backed mmap of a RAM-backed scratch fd: flush the cache so the mapping sees the real bytes.
@@ -706,7 +784,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     gna_add(glo, ghi);
                 else
                     gna_clear(glo, ghi);
-                gro_clear(glo, ghi);
+                // Read-only registry (g_gro): a store into a read-only mapping must be delivered as a guest
+                // SIGSEGV, but the x86 write-fault path treats an unrecorded faulting page as a lazy/SMC
+                // page and silently re-opens it. mprotect records this; a MAP_FIXED PROT_READ overmap must
+                // too, or the newly read-only page stays writable (map_over_existing ro_write_faults).
+                if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
+                    gro_add(glo, ghi);
+                else
+                    gro_clear(glo, ghi);
             }
         }
         /* Keep registry publication inside the same serialized mapping
@@ -978,6 +1063,21 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             else
                 wipefork_del(a0, (size_t)a1);
             G_RET(c) = 0;
+            break;
+        }
+        // MADV_REMOVE(9): punch a hole (zero the backing store) in a SHARED file-backed mapping -- the
+        // zeros show through the mapping and via pread -- and EINVAL on a mapping that is not shmem/shared
+        // file backed (a private or anonymous range). hl force-maps the guest region with the SAME kind of
+        // real host mapping (a genuine MAP_SHARED file map, or a MAP_PRIVATE|ANON reservation), and the host
+        // and guest page granularities match here, so the host kernel's own MADV_REMOVE gives exactly the
+        // Linux verdict: it punches the shared file map and returns EINVAL for private/anon. Forward it and
+        // surface the real errno instead of the advisory no-op the generic tail would return.
+        if (adv == 9) {
+            if (a1 == 0) {
+                G_RET(c) = 0;
+                break;
+            }
+            G_RET(c) = madvise((void *)a0, (size_t)a1, MADV_REMOVE) == 0 ? 0 : (uint64_t)(int64_t)(-errno);
             break;
         }
         // MADV_DONTNEED(4): Linux drops the pages so the NEXT access faults in fresh ZERO pages. macOS

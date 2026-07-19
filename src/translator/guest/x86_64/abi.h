@@ -58,9 +58,16 @@
 // uname(2) `machine` field — per guest ISA, so an x86-64 guest reports "x86_64" (not the host "aarch64").
 #define G_UNAME_MACHINE "x86_64"
 
-// brk policy: x86 reports a fixed break so glibc uses its mmap allocator -- a brk heap the guest then
-// mmap/mprotects cannot be split on the macOS VM. (jit86 learned this the hard way.)
+// brk policy: on the macOS VM x86 reports a fixed break so glibc uses its mmap allocator -- a brk heap the
+// guest then mmap/mprotects cannot be split under the 16 KB host page (jit86 learned this the hard way). A
+// native Linux host has matching page granularity and the pre-reserved brk arena grows purely logically
+// (brk_cur bump into already-mapped RW memory), so a guest that calls brk/sbrk directly -- rather than
+// through glibc's mmap fallback -- must observe real growth exactly like the aarch64 guest does.
+#if defined(__linux__)
+#define G_BRK_GROWABLE 1
+#else
 #define G_BRK_GROWABLE 0
+#endif
 
 // Open-flag bits that DIFFER by guest arch (the high O_* group): x86-64 has its own values for the
 // O_DIRECTORY/O_NOFOLLOW group, distinct from aarch64's asm-generic ones (see frontend/aarch64/abi.h).

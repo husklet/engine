@@ -1,0 +1,1 @@
+lock_range=1 unlock_range=1 mlockall=0 munlockall=1 badflag=EINVAL hole=ENOMEM
