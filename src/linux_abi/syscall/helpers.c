@@ -963,17 +963,30 @@ static int resolve_shebang_chain(char **argv, int argc, int cap, const char *hos
 // give real Linux semantics -- re-mmap fresh zero pages over the range -- WITHOUT ever disturbing a
 // file-backed or shared mapping (re-mmapping those with MAP_ANON would discard file data / break
 // sharing). DONTNEED only acts when the advised range is fully contained in a tracked private-anon
-// region; otherwise it falls back to the safe advisory passthrough. Lock-free like g_gmap; a race can
-// only forget an entry (-> safe no-op), and the containment check gates every destructive remap.
-static struct {
+// region; otherwise it falls back to the safe advisory passthrough. Capacity grows with the mapping
+// population like g_gmap so ordinary valid mappings never silently lose their Linux policy metadata.
+struct anon_mapping {
     uint64_t addr, len;
     int prot;
-} g_anonmap[2048];
+};
 
+static struct anon_mapping *g_anonmap;
 static int g_nanonmap;
+static int g_anonmap_capacity;
+
+static void anon_reserve_one(void) {
+    if (g_nanonmap < g_anonmap_capacity) return;
+    int capacity = g_anonmap_capacity ? g_anonmap_capacity * 2 : 256;
+    if (capacity < g_anonmap_capacity || (size_t)capacity > SIZE_MAX / sizeof(*g_anonmap)) abort();
+    struct anon_mapping *mappings = realloc(g_anonmap, (size_t)capacity * sizeof(*mappings));
+    if (!mappings) abort();
+    g_anonmap = mappings;
+    g_anonmap_capacity = capacity;
+}
 
 static void anon_track(uint64_t addr, uint64_t len, int prot) {
-    if (!addr || g_nanonmap >= (int)(sizeof g_anonmap / sizeof g_anonmap[0])) return;
+    if (!addr) return;
+    anon_reserve_one();
     g_anonmap[g_nanonmap].addr = addr;
     g_anonmap[g_nanonmap].len = len;
     g_anonmap[g_nanonmap].prot = prot;
