@@ -2384,13 +2384,22 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDB) {
                     if (reg == 4 && rm == 3) {
+                        // FNINIT: reset TOP=0, FCW=0x037f (all exceptions masked, round-nearest, 64-bit),
+                        // clear FSW (condition codes) and the host FPSR sticky exception flags.
                         e_movconst(16, 0);
                         e_str(16, 28, OFF_FPTOP);
+                        e_str(16, 28, OFF_FPSW);
+                        e_movconst(16, 0x037f);
+                        e_str(16, 28, OFF_FPCW);
+                        hl_x86_x87_clear_exceptions();
                         if (hl_x86_x87_optimized()) { // anchor the translate-time shadow: top is now statically 0
                             hl_x86_x87_anchor(0); // memory and shadow agree
                         }
                     } // finit -> top=0
-                    else if (reg == 4) { /* fclex/etc */
+                    else if (reg == 4 && rm == 2) {
+                        hl_x86_x87_clear_exceptions();
+                    } // fnclex: clear sticky exception flags
+                    else if (reg == 4) { /* fneni/fndisi/fnsetpm: no-op */
                     } else if (reg == 5 || reg == 6) {
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);

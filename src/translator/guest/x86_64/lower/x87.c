@@ -212,15 +212,56 @@ void hl_x86_x87_test(void) {
     e_fcom_setfpsw(18, 16); // ST0 : 0.0 -> C0/C2/C3
 }
 
+// x87 FSW exception flags (bits IE0/DE1/ZE2/OE3/UE4/PE5) mirror the SSE MXCSR exception bits and, like
+// them, are projected lazily from the host FPSR cumulative flags at read time (the x87 arithmetic ops
+// execute as host NEON just like SSE, so the real exceptions already accumulate in the host FPSR). The
+// per-bit map (FSW bit i <- FPSR bit) is IE<-IOC(0) DE<-IDC(7) ZE<-DZC(1) OE<-OFC(2) UE<-UFC(3) PE<-IXC(4),
+// identical to the MXCSR projection in translate.c. fnclex/finit clear the host FPSR sticky flags.
+static const int g_fsw_fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
+
+// OR the host FPSR sticky exception flags into x16 (the in-progress FSW) at bits 0..5, then set ES(7)
+// and B(15) if any raised exception is UNMASKED per the current FCW mask bits (FCW[0..5], 1 = masked).
+// Scratch: x17/x20/x21/x22 -- deliberately NOT x19, which holds the store EA at the fnstenv/fnstsw-m16
+// call sites (x16 also survives as the running FSW word the callers store afterward).
+static void fp_project_exceptions(void) {
+    emit32(0xD53B4420u | 22); // mrs x22, fpsr
+    e_movconst(21, 0);        // exception accumulator (FSW bits 0..5)
+    e_movconst(20, 1);
+    for (int i = 0; i < 6; i++) {
+        e_lsr_i(17, 22, g_fsw_fpsr_bit[i], 0);
+        e_rrr(A_AND, 17, 17, 20, 0, 0);
+        e_rrr(A_ORR, 21, 21, 17, 0, i); // x21 |= bit << i
+    }
+    e_rrr(A_ORR, 16, 16, 21, 0, 0);  // FSW |= exceptions (sticky, bits 0..5)
+    e_ldr(17, 28, OFF_FPCW);         // w17 = FCW (bits 0..5 are the exception masks)
+    e_rrr(A_BIC, 17, 21, 17, 0, 0);  // x17 = raised & ~masked = unmasked exceptions
+    e_movconst(20, 0x3f);
+    e_rrr(A_AND, 17, 17, 20, 0, 0);  // keep only bits 0..5
+    e_subi_s(31, 17, 0, 1);          // cmp x17, #0
+    e_cset(17, 1 /*NE*/, 1);         // x17 = (any unmasked exception)
+    e_bfi(16, 17, 7, 1, 1);          // ES (error summary, bit 7)
+    e_bfi(16, 17, 15, 1, 1);         // B  (busy, bit 15, mirrors ES)
+}
+
 // FNSTSW / FSTSW: the x87 status word reports TOP-of-stack (cpu->fptop) in bits 11-13 ORed with the
-// condition codes held in cpu->fpsw -- qemu does the same, and code that follows FNSTSW with SAHF
-// relies on it. Result -> x16 (clobbers x17). The shadow top is materialized first so cpu->fptop is
-// current under the static-top optimization.
+// condition codes held in cpu->fpsw and the exception flags projected from the host FPSR -- qemu does the
+// same, and code that follows FNSTSW with SAHF relies on it. Result -> x16 (clobbers x17/x19..x22). The
+// shadow top is materialized first so cpu->fptop is current under the static-top optimization.
 void hl_x86_x87_status(void) {
     hl_x86_x87_materialize();
     e_ldr(16, 28, OFF_FPSW);
     e_ldr(17, 28, OFF_FPTOP);
     e_bfi(16, 17, 11, 3, 1); // status[13:11] = TOP
+    fp_project_exceptions();
+}
+
+// FNCLEX: clear the sticky exception flags (host FPSR IOC/DZC/OFC/UFC/IXC/IDC + the projected FSW/ES/B),
+// leaving the condition codes and TOP intact. Clobbers x16/x17.
+void hl_x86_x87_clear_exceptions(void) {
+    emit32(0xD53B4420u | 16);       // mrs x16, fpsr
+    e_movconst(17, 0x9f);           // IOC|DZC|OFC|UFC|IXC|IDC (bits 0-4,7)
+    e_rrr(A_BIC, 16, 16, 17, 0, 0); // clear the host sticky flags
+    emit32(0xD51B4420u | 16);       // msr fpsr, x16
 }
 
 // FXAM: classify ST0 and set the FPSW condition codes (C1 = sign, {C3,C2,C0} = class), per the x87
