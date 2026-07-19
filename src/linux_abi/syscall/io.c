@@ -1484,12 +1484,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
             break;
         }
-        // F_SETPIPE_SZ(1031)/F_GETPIPE_SZ(1032): macOS can't resize a pipe, so emulate -- record the
-        // requested size (rounded up to a page, >= requested) and report it back on GET. Linux's pipe_fcntl
-        // first rejects a non-pipe object with EBADF (and an invalid fd faults out even earlier), so validate
-        // the fd is a real FIFO before fabricating a size -- otherwise a regular file/socket or bad fd was
-        // reported as a pipe with a plausible size.
+        // F_SETPIPE_SZ(1031)/F_GETPIPE_SZ(1032). The guest's non-O_DIRECT pipe fd is a REAL host pipe
+        // (case 59 pipe()), so on a Linux host the kernel already implements these with exact Linux
+        // semantics: power-of-two rounding (roundup_pow_of_two, NOT page rounding), a real capacity change
+        // that the subsequent fill/EAGAIN reflects, EBUSY when shrinking below the currently buffered data,
+        // and EBADF on a non-pipe fd (incl. an O_DIRECT pipe backed by a socketpair). Forward straight
+        // through. The macOS build keeps the size emulation below (Darwin has no pipe-size fcntl), which
+        // only records a number and never resizes the buffer, so it must stay guarded to that host.
         if (lcmd == 1031 || lcmd == 1032) {
+#if defined(__linux__)
+            long r = (lcmd == 1032) ? fcntl((int)a0, F_GETPIPE_SZ) : fcntl((int)a0, F_SETPIPE_SZ, (int)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)errno) : (uint64_t)(unsigned)r;
+            break;
+#else
+            // Linux's pipe_fcntl first rejects a non-pipe object with EBADF, so validate the fd is a real
+            // FIFO before fabricating a size -- otherwise a regular file/socket or bad fd was reported as a
+            // pipe with a plausible size.
             struct stat pst;
             if (fstat((int)a0, &pst) < 0) {
                 G_RET(c) = (uint64_t)(int64_t)(-EBADF);
@@ -1499,21 +1509,23 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(int64_t)(-EBADF);
                 break;
             }
-        }
-        if (lcmd == 1031) {
-            int want = (int)a2;
-            long pg = sysconf(_SC_PAGESIZE);
-            if (pg <= 0) pg = 4096;
-            int rounded = (int)(((want + pg - 1) / pg) * pg);
-            if (rounded < (int)pg) rounded = (int)pg;
-            if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_pipesz[(int)a0] = rounded;
-            G_RET(c) = (uint64_t)(unsigned)rounded;
-            break;
-        }
-        if (lcmd == 1032) {
-            int sz = ((int)a0 >= 0 && (int)a0 < HL_NFD && g_pipesz[(int)a0]) ? g_pipesz[(int)a0] : 65536;
-            G_RET(c) = (uint64_t)(unsigned)sz;
-            break;
+            if (lcmd == 1031) {
+                int want = (int)a2;
+                long pg = sysconf(_SC_PAGESIZE);
+                if (pg <= 0) pg = 4096;
+                int rounded = (int)(((want + pg - 1) / pg) * pg);
+                if (rounded < (int)pg) rounded = (int)pg;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_pipesz[(int)a0] = rounded;
+                G_RET(c) = (uint64_t)(unsigned)rounded;
+                break;
+            }
+            // lcmd == 1032
+            {
+                int sz = ((int)a0 >= 0 && (int)a0 < HL_NFD && g_pipesz[(int)a0]) ? g_pipesz[(int)a0] : 65536;
+                G_RET(c) = (uint64_t)(unsigned)sz;
+                break;
+            }
+#endif
         }
         int mcmd = lcmd;
         if (lcmd == 8)
