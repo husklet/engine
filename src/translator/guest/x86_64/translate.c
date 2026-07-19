@@ -2482,8 +2482,9 @@ static void *translate_block(uint64_t gpc) {
                 if (sf)
                     e_asr_i(RDX, RAX, 63, 1); // cqo: rdx = rax>>63 (arith)
                 else if (I.p66) {
-                    e_asr_i(19, RAX, 15, 0);
-                    e_bfi(RDX, 19, 0, 16, 1);
+                    e_sxt(19, RAX, 2);       // x19 = sext16(AX): bits 63:16 replicate AX bit 15
+                    e_asr_i(19, 19, 15, 0);  // w19 = all-ones if AX<0 else 0
+                    e_bfi(RDX, 19, 0, 16, 1); // DX = 0xFFFF/0x0000, preserve RDX 63:16
                 } // cwd: dx=sign(ax)
                 else
                     e_asr_i(RDX, RAX, 31, 0); // cdq: edx = eax>>31 (arith)
@@ -2632,6 +2633,14 @@ static void *translate_block(uint64_t gpc) {
                         else
                             emit32(0x6E080400u | (vm << 5) | vd);
                     } // ins .d[0]
+                } else if (op == 0x12 && I.repne) { // movddup: dst[0]=dst[1]=src low 64-bit double
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_d(16, 17); // low 64-bit -> v16.d[0]
+                        s = 16;
+                    }
+                    emit32(0x4E080400u | (s << 5) | vd); // dup vd.2d, vs.d[0]  (broadcast low lane)
                 } else if (op == 0x12 || op == 0x16) { // movlps/movhps (load) or movhlps/movlhps (reg)
                     int lane = (op == 0x16) ? 1 : 0;   // 12->low lane(d[0]), 16->high lane(d[1])
                     if (I.is_mem) {
@@ -3320,6 +3329,37 @@ static void *translate_block(uint64_t gpc) {
                 emit_ea(&I, next);
                 emit_bus_guard(17, (uint64_t)I.opsize, gpc);
                 e_store(I.opsize, I.reg, 17);
+                gpc = next;
+                continue;
+            }
+            if (op == 0xC7 && (I.reg & 7) == 1 && I.is_mem && I.opsize != 8) { // cmpxchg8b: 0F C7 /1 (64-bit compare+swap)
+                // Compare EDX:EAX with the 64-bit memory operand. If equal, store ECX:EBX and set ZF;
+                // else load memory into EDX:EAX and clear ZF. A LOCK prefix makes it atomic; CASAL (a
+                // single 64-bit atomic compare-exchange) is replay-immune and correct for both.
+                // CMPXCHG8B affects ONLY ZF (unlike 32-bit CMPXCHG), so materialize lazy flags first and
+                // edit ZF alone in the stored NZCV.
+                if (g_fl_pending) flags_materialize();
+                emit_ea(&I, next); // x17 = EA
+                emit_bus_guard(17, 8, gpc);
+                e_uxt(19, RAX, 4);
+                e_bfi(19, RDX, 32, 32, 1); // x19 = EDX:EAX (expected)
+                e_uxt(20, RBX, 4);
+                e_bfi(20, RCX, 32, 32, 1); // x20 = ECX:EBX (new value)
+                e_mov_rr(22, 19, 1);       // x22 = expected (CASAL clobbers Rs with the old value)
+                e_cas(8, 19, 20, 17);      // x19 = old; if old==x22 then [m] = x20
+                e_uxt(24, 19, 4);          // old low 32  (EAX candidate, zero-extended)
+                e_lsr_i(25, 19, 32, 1);    // old high 32 (EDX candidate, zero-extended)
+                e_rrr(A_SUBS, 31, 19, 22, 1, 0); // host flags: Z = (old == expected)
+                e_csel(RAX, RAX, 24, 0, 1);      // mismatch -> EAX = old low  (equal keeps RAX)
+                e_csel(RDX, RDX, 25, 0, 1);      // mismatch -> EDX = old high (equal keeps RDX)
+                e_ldr(21, 28, OFF_NZCV);
+                e_movconst(23, 0x40000000u);
+                e_rrr(A_BIC, 21, 21, 23, 1, 0); // clear stored Z (bit 30)
+                e_cset(23, 0, 1);               // x23 = equal (EQ from the SUBS above)
+                e_lsl_i(23, 23, 30, 1);
+                e_rrr(A_ORR, 21, 21, 23, 1, 0); // set ZF from equality; other flags untouched
+                e_str(21, 28, OFF_NZCV);
+                emit32(0xD51B4200u | 21); // sync live ARM nzcv
                 gpc = next;
                 continue;
             }
