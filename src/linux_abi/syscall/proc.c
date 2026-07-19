@@ -225,6 +225,22 @@ static void exec_close_cloexec(void) {
 
 #include "../../core/engine_result.h"
 
+// CLONE_VFORK suspends the calling parent thread until the child either
+// commits an exec or exits. The engine implements process clones with host
+// fork(), so use a private one-byte rendezvous to preserve that ordering.
+// Without it, glibc may free the temporary child stack as soon as clone
+// returns in the parent while the child is still using that stack to enter
+// execve, producing an intermittent pre-exec SIGILL under compiler load.
+static int g_vfork_release_fd = -1;
+
+static void vfork_release_parent(void) {
+    if (g_vfork_release_fd < 0) return;
+    unsigned char committed = 1;
+    while (write(g_vfork_release_fd, &committed, sizeof committed) < 0 && errno == EINTR) {}
+    close(g_vfork_release_fd);
+    g_vfork_release_fd = -1;
+}
+
 // ---- fork child-side engine hooks (shared by clone/case-220 and clone3/case-435) -----------------
 // Everything the CHILD must reset before it re-enters guest code. Factored so the two fork sites can
 // never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop).
@@ -1561,8 +1577,27 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)bound_status;
             break;
         }
+        int vfork_pipe[2] = {-1, -1};
+        int is_vfork = (a0 & 0x4000) != 0;
+        if (is_vfork && pipe(vfork_pipe) != 0) {
+            bound_fork_complete(&bound_fork, 0, -1);
+            G_RET(c) = (uint64_t)(int64_t)(-errno);
+            break;
+        }
+        if (is_vfork) {
+            (void)fcntl(vfork_pipe[0], F_SETFD, FD_CLOEXEC);
+            (void)fcntl(vfork_pipe[1], F_SETFD, FD_CLOEXEC);
+        }
         pid_t pid = fork();
         int fork_error = errno;
+        if (is_vfork) {
+            if (pid == 0) {
+                close(vfork_pipe[0]);
+                g_vfork_release_fd = vfork_pipe[1];
+            } else {
+                close(vfork_pipe[1]);
+            }
+        }
         bound_status = bound_fork_complete(&bound_fork, pid == 0, pid == 0 ? (int)getpid() : (int)pid);
         if (bound_status != 0) {
             if (pid == 0) _exit(127);
@@ -1571,6 +1606,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 kill(pid, SIGKILL);
                 while (waitpid(pid, &failed_status, 0) < 0 && errno == EINTR) {}
             }
+            if (is_vfork && vfork_pipe[0] >= 0) close(vfork_pipe[0]);
             G_RET(c) = (uint64_t)(int64_t)bound_status;
             break;
         }
@@ -1604,6 +1640,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                                            // free) so a kill/pidfd membership check can never ESRCH it before
                                            // it runs its own proc_reg_after_fork publish
             acct_child_born((int)pid);     // register the child's OWN task slot (container-wide pids.current)
+        }
+        if (pid > 0 && is_vfork) {
+            unsigned char committed;
+            while (read(vfork_pipe[0], &committed, sizeof committed) < 0 && errno == EINTR) {}
+            close(vfork_pipe[0]);
+        } else if (pid < 0 && is_vfork) {
+            close(vfork_pipe[0]);
         }
         // CLONE_PARENT_SETTID(0x00100000): store the child's tid (its pid) into the PARENT's *ptid (a2).
         // Mutually exclusive with CLONE_PIDFD (which also uses the ptid slot), so it never clobbers a pidfd.
@@ -1843,6 +1886,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // e.g. gosu/su-exec, leaves netpoller/idle Ms live; a surviving M would run the old image against the
         // freed state). Blocks until all peers have left run_guest, so the teardown below is race-free.
         thread_exit_others(c);
+        // All failure returns are behind us: Linux releases a vfork parent
+        // when exec commits, before the new image begins executing.
+        vfork_release_parent();
         set_guest_comm(comm_src); // comm := basename of the exec'd NAME (captured pre-rewrite above)
         cred_after_exec();        // exec recomputes caps (non-root loses them) + clears KEEPCAPS; ids persist
 #ifdef PCACHE_SAVE_HOOK
