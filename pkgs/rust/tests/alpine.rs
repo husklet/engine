@@ -1,5 +1,5 @@
-use hl_engine::{Config, Engine, Exit, Guest, Stdio};
 use hl_engine::network::Namespace;
+use hl_engine::{Config, Engine, Exit, Guest, Stdio};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -73,7 +73,10 @@ fn private_udp_loopback_is_shared_by_independent_launches() {
     let mut server = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
         .config(config())
-        .args(["-c", "echo UDP_LAUNCH_OK | nc -u -l -s 127.0.0.1 -p 19232 -w 3"])
+        .args([
+            "-c",
+            "echo UDP_LAUNCH_OK | nc -u -l -s 127.0.0.1 -p 19232 -w 3",
+        ])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -86,11 +89,19 @@ fn private_udp_loopback_is_shared_by_independent_launches() {
         .spawn()
         .unwrap();
     let mut reply = String::new();
-    client.take_stdout().unwrap().read_to_string(&mut reply).unwrap();
+    client
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut reply)
+        .unwrap();
     assert_eq!(client.wait().unwrap(), Exit::Code(0));
     assert_eq!(reply.trim(), "UDP_LAUNCH_OK");
     let mut request = String::new();
-    server.take_stdout().unwrap().read_to_string(&mut request).unwrap();
+    server
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut request)
+        .unwrap();
     assert_eq!(server.wait().unwrap(), Exit::Code(0));
     assert_eq!(request.trim(), "request");
 }
@@ -196,8 +207,16 @@ fn production_true_has_empty_stdout_and_stderr() {
         .output()
         .unwrap();
     assert_eq!(output.exit, Exit::Code(0));
-    assert!(output.stdout.is_empty(), "unexpected stdout: {:?}", output.stdout);
-    assert!(output.stderr.is_empty(), "unexpected stderr: {:?}", output.stderr);
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {:?}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        output.stderr
+    );
 }
 
 #[test]
