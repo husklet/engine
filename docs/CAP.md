@@ -178,12 +178,12 @@ update it whenever lowering and conformance change.
 
 | Area | Already modeled | Usable in the active backend | Gap |
 | --- | --- | --- | --- |
-| Guest/process | architecture, executable, argv, environment, cwd, umask, PTY, domain | arm64/x86-64 Linux launch, stdio, PTY, domain identity | true exec within an existing machine; PTY together with provider services |
+| Guest/process | architecture, executable, argv, environment, cwd, umask, PTY, domain | arm64/x86-64 Linux launch, stdio, PTY, domain identity; PTY and provider services may be activated together | true exec within an existing machine |
 | Identity | uid, gid, supplementary groups, hostname, domain name | uid/gid and hostname subset | complete group/domain behavior and namespace-visible identity |
 | Root/storage | host tree, image layer, overlay, ownership, read-only root, coherence | host tree, overlay, binds, ownership, generation-file coherence | provider roots, fully abstract coherence authority, complete Linux VFS semantics |
 | Namespaces | private/host/shared mount, PID, UTS, IPC, network, user, cgroup | backend-selected subset | shared handles and truthful per-namespace discovery/lowering |
-| Projected namespace | directory, file sources, symlink, device, bind, socket, service | directory, immutable/mutable file, symlink, read-only host bind | devices, sockets, services as nodes, shared/generated files, writable binds |
-| Provider handles | open, read/write, positioned I/O, seek, truncate, metadata, ioctl, map, poll, transfer | authority plus read/write/poll-selected service transport | complete operations, mappings, transfer, cancellation, PTY coexistence |
+| Projected namespace | directory, file sources, symlink, device, bind, socket, service | directory, immutable/mutable file, symlink, read-only host bind, Unix socket, service-backed character/block device | shared/generated files, writable binds, and complete device operations |
+| Provider handles | open, read/write, positioned I/O, seek, truncate, metadata, ioctl, map, poll, transfer | authority plus read/write/poll-selected service transport, including launches with a PTY | complete operations, mappings, transfer, and cancellation |
 | Provider framework | manifest, negotiation, prepare, namespace, handles, memory, events, lifecycle | two hardwired built-in provider IDs; bounded launch allocation with validated resources and release/rollback | runtime provider registry and preparation; guest mappings, import/transfer, events, and full lifecycle |
 | Network | host/none/virtual, namespace, interfaces, forwarding, listeners | basic launch modes/interfaces/forwards | routes, DNS, egress authority, UDP completeness, live updates, accounting |
 | Resources | memory, processes, threads, CPU, rlimits, I/O, provider budgets, accounting | memory limit, process limit, CPU count at launch | remaining limits, live updates, effective values, accounting/events |
@@ -198,10 +198,10 @@ the modeled generic contract and finish its lowering, or add the missing generic
 
 | Priority | Capability | Current state | Required result |
 | --- | --- | --- | --- |
-| P0 | Unix socket projection | `NamespaceEntry::Socket` exists but runtime rejects it | Project Wayland, GPU, and Docker sockets with normal Unix connect, credentials, poll, shutdown, and `SCM_RIGHTS` semantics |
+| P0 | Unix socket completeness | `NamespaceEntry::Socket` validates and connects to an explicitly granted host Unix socket | Complete credentials, ancillary `SCM_RIGHTS`, shutdown, peer-close, and all poll semantics |
 | P0 | Provider devices | `DeviceEntry`, ioctl, map, transfer, memory, and events are modeled; handles v1 implements only read/write/poll | Implement character devices backed by provider handles, including ioctl, mmap, descriptor transfer, readiness, and lifecycle |
 | P0 | Provider activation | Extension manifests, negotiation, preparation, and lifecycle traits exist but are not wired into engine construction/spawn | Register providers with the engine; negotiate, validate, prepare, activate, roll back, and stop them transactionally |
-| P0 | Terminal plus providers | `engine.handles` is rejected when a PTY is requested | One launch must support a controlling terminal and provider transport simultaneously |
+| P0 | Terminal plus providers | Validation and execution support a controlling terminal together with projected provider services | Extend conformance to provider memory, device mapping, lifecycle failure, and teardown while the PTY is active |
 | P0 | Writable projections | Extension host binds accept only read-only regular files/directories | Implement `BindAccess::ReadWrite` and coherent writable files/directories; keep host authority explicit |
 | P0 | Network egress | `NetworkSpec` has no egress field; legacy SOCKS behavior remains outside the typed API | Add typed route/DNS/egress policy and launch-scoped transport authority |
 | P0 | Domain-scoped exec | Containers respawn with a domain identity and repeat device extensions | Add typed exec on an existing machine/domain so namespace, network, devices, and authorities are inherited once |
