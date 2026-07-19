@@ -339,29 +339,18 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if (dynamic == 0) {
-            // Reject unknown clock ids FIRST -- an id past the POSIX range is -EINVAL on Linux, exactly as
-            // clock_getres (case 114) already rejects it. The old code silently aliased any unknown id to
-            // CLOCK_MONOTONIC and returned success.
-            if ((int)a0 > 11) {
-                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
-                break;
-            }
             switch ((int)a0) {
             case 0:
-            // REALTIME(_COARSE)/REALTIME_ALARM/TAI all read the host wall clock. The engine has no separate
-            // TAI timeline, so CLOCK_TAI(11) tracks REALTIME (offset 0) rather than the monotonic clock.
-            case 5:
-            case 8:
-            case 11: mc = CLOCK_REALTIME; break;
+            // REALTIME(_COARSE)
+            case 5: mc = CLOCK_REALTIME; break;
             case 1:
             case 6:
-            // MONOTONIC(_COARSE)/BOOTTIME/BOOTTIME_ALARM
-            case 7:
-            case 9: mc = CLOCK_MONOTONIC; break;
+            // MONOTONIC(_COARSE)/BOOTTIME
+            case 7: mc = CLOCK_MONOTONIC; break;
             case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
             case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
             case 4: mc = CLOCK_MONOTONIC_RAW; break;
-            default: mc = CLOCK_MONOTONIC; break; // 10 (SGI_CYCLE): valid id, monotonic-backed fallback
+            default: mc = CLOCK_MONOTONIC; break;
             }
         }
         struct timespec ts;
@@ -373,13 +362,11 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // which are legal no-ops that return 0. The kernel unconditionally copies the result out, so a NULL
         // or otherwise-bad buffer faults. Validate the full 16 bytes; host_range_mapped(NULL,16) probes addr
         // 0 -> unmapped -> EFAULT, so the NULL case falls out here too (the old `if (g)` wrongly returned 0).
-        // Static non-PIE guests legitimately place this result in .bss at a
-        // low guest address. The host mapping probe cannot classify every
-        // translated x86 image mapping and used to reject those valid buffers,
-        // making every LTP result acquire TWARN/exit 4. The guest no-access
-        // registry is the authoritative EFAULT model (fed by mmap/mprotect/
-        // munmap), and NULL remains an unconditional fault.
-        if (!a1 || gna_hit(a1, 16)) {
+        // Static non-PIE guests legitimately place this result in .bss at a low guest address; case 113 is
+        // rebased in dispatch.c (alongside clock_getres) so host_range_mapped classifies it correctly. Use
+        // the same guest_bad_ptr the sibling copyout syscalls (gettimeofday/times/getrusage/newfstatat) use,
+        // so a NULL *or* a wild/unmapped pointer faults EFAULT instead of crashing the engine mid-copyout.
+        if (guest_bad_ptr((uintptr_t)a1, 16)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }

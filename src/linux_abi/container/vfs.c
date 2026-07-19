@@ -6,6 +6,15 @@
 #include "../../host/file.h"
 #include "../../host/resolve.h"
 
+// Set when a followed path resolution exceeds the symlink-traversal limit (Linux caps at 40 -> ELOOP). The
+// jail resolvers return a host-path string with no errno channel, so a self-referential / cyclic symlink
+// would otherwise degrade into a host stat of a mis-followed path (ENOENT) instead of ELOOP. atpath() clears
+// this at entry; the path syscalls consult resolve_loop_detected() after resolving and surface -ELOOP.
+static _Thread_local int g_symloop_hit;
+static void resolve_loop_mark(void) { g_symloop_hit = 1; }
+static void resolve_loop_clear(void) { g_symloop_hit = 0; }
+static int resolve_loop_detected(void) { return g_symloop_hit; }
+
 static int path_copy(char *out, size_t capacity, const char *value) {
     size_t length;
     if (!out || capacity == 0 || !value) {
@@ -1715,6 +1724,7 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
             // relative to its dir
         }
     }
+    resolve_loop_mark(); // >40 symlink hops -> ELOOP (the guest-absolute self-loop the fallback can't follow)
     secure_resolve(cur, buf, n, 0);
     // fallback: realpath-confine the last hop
     return buf;

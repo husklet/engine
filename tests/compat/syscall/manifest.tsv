@@ -50,3 +50,12 @@ getrandom-len	misc	getrandom_len.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthr
 sysinfo-uname	misc	sysinfo_uname.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/sysinfo_uname.out	linux-libc	active	sysinfo/uname/times coherent Linux facts (arch-neutral)
 sendfile-splice	filesystem	sendfile_splice.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/sendfile_splice.out	linux-libc	active	sendfile and splice zero-copy byte counts and content
 umask-open	filesystem	umask_open.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/umask_open.out	linux-libc	active	umask affects create mode and returns prior mask
+eloop-stat	filesystem	eloop_stat.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/eloop_stat.out	linux-libc	active	self-referential symlink terminates path resolution with ELOOP (symlink-depth cap)
+clock-gettime-efault	misc	clock_gettime_efault.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/clock_gettime_efault.out	linux-libc	active	clock_gettime with a bad user pointer returns EFAULT instead of faulting the guest
+rlimit-nofile-emfile	filesystem	rlimit_nofile.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/rlimit_nofile.out	linux-libc	active	open past the soft RLIMIT_NOFILE returns EMFILE
+rlimit-fsize	filesystem	rlimit_fsize.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/rlimit_fsize.out	linux-libc	active	write past RLIMIT_FSIZE raises SIGXFSZ
+pipe2-badflag	events	pipe2_badflag.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/pipe2_badflag.out	linux-libc	active	pipe2 rejects an invalid flag bit with EINVAL
+sigaction-sigsetsize	process	sigaction_sigsetsize.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/sigaction_sigsetsize.out	linux-libc	active	rt_sigaction validates sigsetsize (EINVAL for size != 8)
+faccessat-badmode	filesystem	faccessat_badmode.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/faccessat_badmode.out	linux-libc	active	faccessat rejects an invalid mode bit with EINVAL
+getrandom-badflag	misc	getrandom_badflag.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/getrandom_badflag.out	linux-libc	active	getrandom rejects an invalid flag bit with EINVAL
+prctl-timerslack	process	prctl_timerslack.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/prctl_timerslack.out	linux-libc	active	prctl PR_SET/GET_TIMERSLACK round-trips

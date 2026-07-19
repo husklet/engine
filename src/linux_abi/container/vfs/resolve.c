@@ -95,7 +95,10 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
         chroot_apply(guest, gbuf, sizeof gbuf);
     else
         snprintf(gbuf, sizeof gbuf, "%s", guest);
-    int xings = 0; // bounded volume-boundary crossings -- guards against a pathological mount stack
+    int xings = 0;   // bounded volume-boundary crossings -- guards against a pathological mount stack
+    int follows = 0; // total symlinks followed across restarts -- the per-walk `budget` below is reset on
+                     // every `goto restart`, so an ABSOLUTE self-referential symlink (loop -> /path/loop)
+                     // would restart forever; this persistent cap turns that into ELOOP like Linux (40).
 restart:;
     const char *rel;
     int volidx;
@@ -226,6 +229,7 @@ restart:;
         struct stat st;
         if (fstatat(fds[nf - 1], comp, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode)) {
             if (--budget < 0) {
+                resolve_loop_mark();
                 ret = -ELOOP;
                 goto out;
             }
@@ -240,6 +244,11 @@ restart:;
                 // Absolute link targets restart namespace routing at the guest root.  In particular, a
                 // link inside a bind volume may point outside that mount; bare mode's outer namespace is
                 // the host root, while container mode selects the configured rootfs.
+                if (++follows > 40) { // Linux caps symlink traversal at 40 (an absolute self-loop else spins)
+                    resolve_loop_mark();
+                    ret = -ELOOP;
+                    goto out;
+                }
                 if (path_concat(gbuf, sizeof gbuf, lk, tail) != 0) {
                     ret = -ENAMETOOLONG;
                     goto out;

@@ -1773,6 +1773,25 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     return write_count;
 }
 
+// Enforce the guest soft RLIMIT_FSIZE on a bound-descriptor write of `count` bytes starting at absolute
+// offset `pos`. Mirrors the native fsize_gate (io.c): a regular-file write at/beyond the limit raises SIGXFSZ
+// and returns -EFBIG; a straddling write is clamped to the limit. Zero cost when the limit is infinite.
+static int64_t bound_fsize_gate(struct cpu *c, const hl_linux_fd_snapshot *source, uint64_t pos, uint64_t count) {
+    uint64_t limit = guest_fsize_cur();
+    if (limit == ~UINT64_C(0) || count == 0) return (int64_t)count;
+    if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
+        return (int64_t)count;
+    hl_host_file_metadata metadata;
+    hl_host_result status = g_host_services->file->metadata(g_host_services->context, source->host_handle, &metadata);
+    if (status.status != HL_STATUS_OK || metadata.type != HL_HOST_FILE_TYPE_REGULAR) return (int64_t)count;
+    if (pos >= limit) {
+        raise_guest_signal(c, 25); // SIGXFSZ
+        return -EFBIG;
+    }
+    uint64_t room = limit - pos;
+    return count > room ? (int64_t)room : (int64_t)count;
+}
+
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     hl_linux_fd_snapshot source;
     int64_t result;
@@ -2322,8 +2341,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 64:
         if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
             result = -EFAULT;
-        else
-            result = hl_linux_write(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)a2);
+        else {
+            int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+            result = allowed < 0 ? allowed
+                                 : hl_linux_write(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed);
+        }
         break;
     case 67:
         if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
@@ -2334,8 +2356,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 68:
         if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
             result = -EFAULT;
-        else
-            result = hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)a2, a3);
+        else {
+            int64_t allowed = bound_fsize_gate(c, &source, a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
+            result = allowed < 0
+                         ? allowed
+                         : hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed, a3);
+        }
         if (result > 0) bound_mapping_file_written(&source, a3, (uint64_t)result);
         break;
     case 65:

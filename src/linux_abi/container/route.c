@@ -34,6 +34,7 @@ static int logical_fd_path(int descriptor, char *path, size_t capacity) {
 // nofollow=1 leaves the FINAL component unresolved (lstat/AT_SYMLINK_NOFOLLOW unlink), so a
 // symlink is stat'd/removed as the link itself rather than its target.
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int nofollow) {
+    resolve_loop_clear(); // reset the per-resolution symlink-loop flag; a followed resolver sets it on ELOOP
     if (!raw) return raw;
     // POSIX shm + named semaphores: glibc backs both with files under /dev/shm (shm_open -> /dev/shm/<name>,
     // sem_open -> /dev/shm/sem.<name>). Route EVERY op (open/link/unlink/stat/rename) at the SAME host

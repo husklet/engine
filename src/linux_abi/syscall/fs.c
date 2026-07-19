@@ -2382,7 +2382,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (rp && !strncmp(rp, "/dev/", 5)) {
                 const char *hd = dev_node_hostpath(rp);
                 if (hd) {
-                    int d = open(hd, mf);
+                    // Gate the new fd against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap, exactly
+                    // like every other open path (the /dev/* device open used to skip this and let the guest
+                    // exceed its own soft limit -- opening /dev/null in a loop never hit EMFILE).
+                    int d = nofile_gate(open(hd, mf));
                     // /dev/full is backed by /dev/zero for reads; flag the fd so its writes fail ENOSPC.
                     if (d >= 0 && d < HL_NFD) g_devfull[d] = !strcmp(rp, "/dev/full");
                     // /dev/tty (and /dev/console, backed by /dev/null): tty read semantics -- a nonblocking
@@ -3092,6 +3095,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
         }
         const char *p = atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
+        if (resolve_loop_detected()) { // a followed self/cyclic symlink chain past the traversal limit -> ELOOP
+            G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
+            break;
+        }
         {
             const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
             // A dirfd-RELATIVE name (fstatat(pid_dirfd, "exe")) that lands in /proc must hit the same
@@ -3363,6 +3370,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         const char *p = atpath((int)a0, raw, pb, sizeof pb, nofollow);
+        if (resolve_loop_detected()) { // followed symlink chain past the traversal limit -> ELOOP
+            G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
+            break;
+        }
         int rc, empty = (raw && !raw[0] && (a2 & 0x1000));
         const char *gp = (g_rootfs && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
         // Track the host backing file so ownership virtualization reads the SAME guest-chown xattr that
@@ -3518,6 +3529,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 439:
     case 48: {
         char pb[4200];
+        // Linux validates the mode up front: only F_OK(0) | R_OK(4) | W_OK(2) | X_OK(1) are defined, so any
+        // other bit (e.g. 0x8) is -EINVAL (do_faccessat rejects it before touching the path).
+        if ((int)a2 & ~(R_OK | W_OK | X_OK)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // Linux: an empty pathname is ENOENT for faccessat(48), and for faccessat2(439) unless
         // AT_EMPTY_PATH(0x1000) is set. hl used to resolve "" to the rootfs root (a searchable dir) and
         // report it executable, so `[ -x "$(command -v missing)" ]` (dash's `command -v` yields "" for a

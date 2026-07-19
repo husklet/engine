@@ -305,6 +305,28 @@ static void engine_fd_vacate_range(unsigned first, unsigned last) {
             engine_fd_vacate(g_vols[i].fd);
 }
 
+// Enforce the guest soft RLIMIT_FSIZE on a write to a regular file at absolute offset `pos` (SEEK_CUR for
+// pos < 0). Linux (generic_write_check_limits): if the limit is finite and the start position is already
+// at/beyond it, the write raises SIGXFSZ and returns -EFBIG; if the write would straddle the limit it is
+// clamped to what fits. Returns the number of bytes the write is allowed to proceed with (0..count), or a
+// negative -errno after queuing the signal. No cost when the limit is infinite (the common case).
+static int64_t fsize_gate(struct cpu *c, int fd, off_t pos, uint64_t count) {
+    uint64_t limit = guest_fsize_cur();
+    if (limit == ~UINT64_C(0) || count == 0) return (int64_t)count;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return (int64_t)count; // only regular files are bounded
+    if (pos < 0) {
+        pos = lseek(fd, 0, SEEK_CUR);
+        if (pos < 0) return (int64_t)count; // non-seekable: let the host write proceed
+    }
+    if ((uint64_t)pos >= limit) {
+        raise_guest_signal(c, 25); // SIGXFSZ
+        return -EFBIG;
+    }
+    uint64_t room = limit - (uint64_t)pos;
+    return count > room ? (int64_t)room : (int64_t)count; // clamp a straddling write to the limit
+}
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
@@ -835,9 +857,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         hl_fdcache_fd_evict(wfd);
+        // RLIMIT_FSIZE: a write past the soft file-size limit raises SIGXFSZ (and returns EFBIG); a straddling
+        // write is clamped to the limit. No-op unless the guest set a finite limit on a regular file.
+        int64_t allowed = fsize_gate(c, wfd, -1, a2);
+        if (allowed < 0) {
+            G_RET(c) = (uint64_t)allowed;
+            break;
+        }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking write in place (see case 63)
         do {
-            r = write(wfd, (void *)a1, (size_t)a2);
+            r = write(wfd, (void *)a1, (size_t)allowed);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // write(2) to a broken pipe/socket -> guest SIGPIPE
@@ -970,9 +999,15 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         hl_fdcache_fd_evict((int)a0);
+        // RLIMIT_FSIZE: enforce at the explicit pwrite offset (a3), raising SIGXFSZ/EFBIG past the limit.
+        int64_t pw_allowed = fsize_gate(c, (int)a0, (off_t)a3, a2);
+        if (pw_allowed < 0) {
+            G_RET(c) = (uint64_t)pw_allowed;
+            break;
+        }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking pwrite in place (see case 63)
         do {
-            r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
+            r = pwrite((int)a0, (void *)a1, (size_t)pw_allowed, (off_t)a3);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r > 0) filemap_written((int)a0, a3, (uint64_t)r);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -1565,6 +1600,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // preserves message boundaries exactly, so back an O_DIRECT pipe with one (SOCK_SEQPACKET would be
         // closer but macOS PF_LOCAL doesn't support it). A plain pipe is fine for the non-O_DIRECT case.
         int fds[2], fl = (int)a1;
+        // Validate flags exactly as Linux (fs/pipe.c): only O_CLOEXEC | O_NONBLOCK | O_DIRECT |
+        // O_NOTIFICATION_PIPE are defined; any other bit -> EINVAL (mirrors eventfd2, case 19). A bogus flag
+        // (e.g. 0x4) previously slipped through and pipe2 wrongly succeeded.
+        if ((unsigned)fl & ~(unsigned)(0x800u | 0x80000u | (unsigned)G_O_DIRECT | 0x800000u)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // a0 receives the two result fds (8 bytes). Validate it BEFORE creating the pipe so a bad pointer
         // returns -EFAULT without leaking the freshly-opened fds (and without faulting the engine).
         if (!host_range_mapped((uintptr_t)a0, 2 * sizeof(int))) {

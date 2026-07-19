@@ -319,7 +319,8 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
             if (path_copy(cur, sizeof cur, j) != 0) return 0;
         }
     }
-    return 0; // chain too deep -> ENOENT (host holds the last upper path)
+    resolve_loop_mark(); // chain deeper than the symlink-traversal limit -> ELOOP
+    return 0;             // chain too deep (host holds the last upper path)
 }
 
 // Resolve an executable/interpreter path through the FULL overlay (upper THEN lowers), returning the host

@@ -473,6 +473,13 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     // rt_sigaction(sig, *act, *old)
     case 134: {
         int sig = (int)a0;
+        // Linux validates the ABI sigsetsize (a3) up front: it must equal sizeof(kernel sigset)=8, exactly
+        // as rt_sigprocmask (case 135) does. The kernel checks this before copy_from_user of act, so a
+        // wrong size is -EINVAL regardless of sig/act/oldact.
+        if ((size_t)a3 != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (sig < 1 || sig > 64) {
             G_RET(c) = (uint64_t)(-22);
             break;

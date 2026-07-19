@@ -17,6 +17,14 @@ static int guest_nofile_cur(void) {
     return cur > 0x7fffffff ? 0x7fffffff : (int)cur;
 }
 
+// Guest soft RLIMIT_FSIZE (max file size, bytes). ~0 (RLIM_INFINITY) means no limit -- the common case,
+// where the write path pays nothing. Set by the guest via setrlimit/prlimit64 (stored in g_limits, res 1).
+static uint64_t guest_fsize_cur(void) {
+    uint64_t cur = ~UINT64_C(0);
+    hl_limit_table_get(&g_limits, 1, &cur, NULL); // RLIMIT_FSIZE
+    return cur;
+}
+
 // Gate a freshly-allocated host fd (from a lowest-free allocator: dup, open, pipe, socket, ...) against the
 // guest cap. A number at/above the cap is one Linux would never have handed out -> close it and report
 // EMFILE. Returns r unchanged when in range (or already an error). Pass-through when no cap applies.

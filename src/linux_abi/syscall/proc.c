@@ -394,8 +394,9 @@ static int bound_fork_complete(bound_fork_state *state, int child, int child_pid
 // prctl per-process flags the kernel tracks and reports back on the matching GET (lsys-prctl-*):
 // no-new-privs is sticky (once set it can never clear), dumpable defaults to 1, pdeathsig defaults to 0.
 // (g_nnp lives in container/state.c so the /proc/self/status builder can report NoNewPrivs consistently.)
-static int g_dumpable = 1; // PR_SET/GET_DUMPABLE
-static int g_pdeathsig;    // PR_SET/GET_PDEATHSIG
+static int g_dumpable = 1;              // PR_SET/GET_DUMPABLE
+static int g_pdeathsig;                  // PR_SET/GET_PDEATHSIG
+static unsigned long g_timerslack = 50000; // PR_SET/GET_TIMERSLACK (ns); Linux default is 50us
 static int g_thp_disable;  // PR_SET/GET_THP_DISABLE (per-process transparent-hugepage opt-out)
 static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reaper for orphans)
 // The process EFFECTIVE capability set. The container starts as full root (all caps); we don't model
@@ -1238,6 +1239,19 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
             break;
         } // PR_GET_NAME
+        // PR_SET_TIMERSLACK(29)/PR_GET_TIMERSLACK(30): the per-process timer slack (ns) round-trips. SET with
+        // arg2==0 resets to the default (Linux copies the process's default_timer_slack_ns); GET returns the
+        // current value as the syscall return. Previously both fell through to the generic no-op/EINVAL
+        // switch, so GET never reported what SET stored.
+        if ((int)a0 == 29) {
+            g_timerslack = a1 ? (unsigned long)a1 : 50000UL;
+            G_RET(c) = 0;
+            break;
+        }
+        if ((int)a0 == 30) {
+            G_RET(c) = (uint64_t)g_timerslack;
+            break;
+        }
         // PR_SET_KEEPCAPS(8)/PR_GET_KEEPCAPS(7) drive the CAP_SETID retention model -- setpriv arms
         // KEEPCAPS so its post-uid-drop capset can re-raise CAP_SETGID (see cred_uid_changed/capset).
         if ((int)a0 == 8) {
