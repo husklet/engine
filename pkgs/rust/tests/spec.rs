@@ -461,6 +461,51 @@ fn device_projection_requires_and_accepts_a_registered_service() {
 }
 
 #[test]
+fn facade_accepts_projected_endpoints_memory_terminal_and_live_signal_together() {
+    use std::os::unix::net::UnixListener;
+
+    let directory = host_fixture("combined-capabilities");
+    let socket = directory.join("provider.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+
+    let mut namespace = namespace_extension(b"unused");
+    namespace.required_features = BTreeSet::from([Feature::new("unix-sockets").unwrap()]);
+    namespace.namespace = vec![NamespaceEntry::Socket(SocketEntry {
+        path: "/run/provider.sock".into(),
+        host: socket,
+    })];
+
+    let mut handles = handles_extension();
+    handles
+        .required_features
+        .extend([Feature::new("devices").unwrap(), Feature::new("memory-allocation").unwrap()]);
+    handles.namespace.push(NamespaceEntry::Device(DeviceEntry {
+        path: "/dev/provider".into(),
+        metadata: Metadata {
+            mode: 0o660,
+            uid: 0,
+            gid: 0,
+        },
+        kind: DeviceKind::Character,
+        major: 226,
+        minor: 128,
+        service: Some(ServiceId(77)),
+    }));
+    handles.memory = memory_extension().memory;
+
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
+    spec.process.terminal = Some(hl_engine::Size::new(24, 80).unwrap());
+    spec.extensions.extend([namespace, handles]);
+
+    assert!(Engine::new().validate(&spec).is_ok());
+    assert!(Engine::new()
+        .capabilities()
+        .control
+        .operations
+        .contains(&hl_engine::spec::ControlOperation::Signal));
+}
+
+#[test]
 fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
     let capabilities = Engine::new().capabilities();
     assert!(capabilities
