@@ -283,6 +283,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_sock_seqpacket[r] = 0;
                 g_so_error[r] = 0;            // no pending async socket error on a fresh fd
                 g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
+                tcp_shadow_clear(r);          // no shadowed IPPROTO_TCP options on a fresh fd
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
@@ -694,6 +695,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r >= 0 && r < HL_NFD) {
                 g_so_error[r] = 0;  // fresh accepted fd carries no pending async error
                 g_so_reuseport[r] = 0;
+                tcp_shadow_clear(r); // no shadowed IPPROTO_TCP options on a fresh accepted fd
                 g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
@@ -1315,6 +1317,23 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // IPPROTO_TCP integer options on a tracked guest INET stream socket: once bind/connect swaps its host
+        // backing to an AF_UNIX switch socket, the host rejects IPPROTO_TCP setsockopt with ENOPROTOOPT, but
+        // Linux round-trips these on a real TCP socket and apps set TCP_NODELAY *after* connect(). Record the
+        // guest's value so a later getsockopt reports it, and best-effort apply it to the host fd (a genuine
+        // unswapped AF_INET socket still honors it). Never fail the guest.
+        if (lvl == 6 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0]) {
+            int slot = tcp_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_tcp_optval[(int)a0][slot] = val;
+                g_tcp_optset[(int)a0][slot] = 1;
+                int mo = tcp_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_TCP, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (lvl == 1) {
             lvl = SOL_SOCKET;
             opt = so_opt_l2m((int)a2);
@@ -1484,6 +1503,50 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             G_RET(c) = 0;
             break;
+        }
+        // IPPROTO_TCP integer options on a tracked guest INET stream socket: report the shadowed value the
+        // guest set (see case 208). If unset, prefer the real host value for a still-genuine AF_INET socket,
+        // falling back to a stable default only when the AF_UNIX switch backing rejects the query.
+        if (lvl == 6 && gfd >= 0 && gfd < HL_NFD && g_sock_stream[gfd]) {
+            int slot = tcp_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_tcp_optset[gfd][slot]) {
+                    val = g_tcp_optval[gfd][slot];
+                } else {
+                    val = tcp_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = tcp_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_TCP, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+            // TCP_INFO(11): a struct the AF_UNIX switch backing cannot answer. Try the host first (an unswapped
+            // AF_INET socket returns the real thing); on rejection synthesize a minimal record whose only stable
+            // fact is tcpi_state (byte 0) = ESTABLISHED for a connected socket, so diagnostic code sees a live
+            // connection instead of ENOPROTOOPT. The rest is zero-filled.
+            if ((int)a2 == 11 && a3 && a4) {
+                socklen_t cap = *(socklen_t *)a4;
+#if defined(__linux__)
+                // Linux TCP_INFO == 11; an unswapped AF_INET socket answers it authoritatively.
+                if (getsockopt(gfd, IPPROTO_TCP, 11, (void *)a3, (socklen_t *)a4) == 0) {
+                    G_RET(c) = 0;
+                    break;
+                }
+#endif
+                socklen_t n = cap < 512 ? cap : 512;
+                memset((void *)a3, 0, n);
+                if (n >= 1) *(uint8_t *)a3 = g_sock_conn[gfd] ? 1 /*TCP_ESTABLISHED*/ : 7 /*TCP_CLOSE*/;
+                *(socklen_t *)a4 = n;
+                G_RET(c) = 0;
+                break;
+            }
         }
         if (lvl == 1) {
             lvl = SOL_SOCKET;

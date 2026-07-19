@@ -783,6 +783,39 @@ static int g_so_error[HL_NFD];
 // (unlike SO_REUSEADDR), so the guest's get-after-set would wrongly report 0. Record the guest's intent
 // here and report it on getsockopt. Cleared at socket()/accept() re-init.
 static uint8_t g_so_reuseport[HL_NFD];
+// fd -> shadowed IPPROTO_TCP integer options. A private-loopback/bridge guest INET stream socket is backed
+// on the host by an AF_UNIX switch socket (see lo_swap), which rejects every setsockopt/getsockopt at
+// IPPROTO_TCP with ENOPROTOOPT. Linux round-trips these options on a real TCP socket, and applications
+// routinely set TCP_NODELAY *after* connect(), so a get-after-set (or a plain set) must not fail across the
+// switch. Record the guest's value here and report it back, matching native. Slots: 0 NODELAY, 1 CORK,
+// 2 KEEPIDLE, 3 KEEPINTVL, 4 KEEPCNT, 5 QUICKACK, 6 MAXSEG. Cleared at socket()/accept() re-init.
+#define TCP_SHADOW_N 7
+static int g_tcp_optval[HL_NFD][TCP_SHADOW_N];
+static uint8_t g_tcp_optset[HL_NFD][TCP_SHADOW_N];
+// Map a Linux IPPROTO_TCP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
+// option (e.g. TCP_INFO, which is a struct handled separately). MAXSEG is get-mostly but Linux lets a guest
+// lower the clamp, so it round-trips through a slot too.
+static int tcp_shadow_slot(int optname) {
+    switch (optname) {
+        case 1: return 0;  // TCP_NODELAY
+        case 3: return 1;  // TCP_CORK
+        case 4: return 2;  // TCP_KEEPIDLE
+        case 5: return 3;  // TCP_KEEPINTVL
+        case 6: return 4;  // TCP_KEEPCNT
+        case 12: return 5; // TCP_QUICKACK
+        case 2: return 6;  // TCP_MAXSEG
+        default: return -1;
+    }
+}
+// A get on a MAXSEG slot never set by the guest reports a plausible loopback MSS so diagnostic code that
+// requires a nonzero segment size keeps working over the switch (the exact value is host-variable on native
+// and therefore not a stable fact); every other slot defaults to 0, the Linux default for the booleans.
+static int tcp_shadow_default(int slot) { return slot == 6 ? 65483 : 0; }
+// Drop any shadowed TCP options for a reused fd number (socket()/accept()/close re-init).
+static void tcp_shadow_clear(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (int i = 0; i < TCP_SHADOW_N; i++) g_tcp_optset[fd][i] = 0;
+}
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
 static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];

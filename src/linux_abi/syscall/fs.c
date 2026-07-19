@@ -308,6 +308,7 @@ static void fd_reset_emul(int fd) {
         g_lo_port[fd] = 0;
         g_lo_v6only[fd] = 0;
         g_sock_stream[fd] = 0;
+        tcp_shadow_clear(fd);
         g_sock_conn[fd] = 0;
         g_sock_fam[fd] = 0;
         g_sock_dgram[fd] = 0;
@@ -999,6 +1000,24 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 }
             }
             G_RET(c) = ioctl(fd, FIONREAD, arg) < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        // SIOCOUTQ (TIOCOUTQ, 0x5411): bytes still queued in the send buffer. Linux answers it on any TCP
+        // socket, but a guest INET stream socket backed by the AF_UNIX switch has its host ioctl rejected
+        // as ENOTTY. Forward to the host (a real AF_UNIX/AF_INET socket does answer it); if the host still
+        // rejects it for a tracked stream socket, report 0 (a drained switch socket holds no unsent bytes).
+        case 0x5411:
+            if (fd >= 0 && fd < HL_NFD && g_sock_stream[fd]) {
+#if defined(__linux__)
+                if (ioctl(fd, 0x5411, arg) == 0) {
+                    G_RET(c) = 0;
+                    break;
+                }
+#endif
+                if (arg) *(int *)arg = 0;
+                G_RET(c) = 0;
+                break;
+            }
+            G_RET(c) = ioctl(fd, 0x5411, arg) < 0 ? (uint64_t)(-errno) : 0;
             break;
         // FIOCLEX
         case 0x5451: G_RET(c) = fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? (uint64_t)(-errno) : 0; break;
