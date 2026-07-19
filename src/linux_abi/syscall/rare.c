@@ -664,7 +664,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) =
             setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
-    case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
+    // clock_settime: validate the clock id BEFORE the privilege check, as Linux does. An unknown or
+    // non-settable clock id (e.g. CLOCK_MONOTONIC) is -EINVAL; only the settable wall clocks
+    // CLOCK_REALTIME(0)/CLOCK_TAI(11) reach the CAP_SYS_TIME gate the container lacks -> -EPERM.
+    case 112:
+        G_RET(c) = ((int)a0 == 0 || (int)a0 == 11) ? (uint64_t)(int64_t)(-EPERM) : (uint64_t)(int64_t)(-EINVAL);
+        break;
     case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
     case 152:
@@ -870,6 +875,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
 
     // adjtimex(2)/clock_adjtime(2): read-only query fills struct timex + TIME_OK; setting -> EPERM.
     case 266: { // clock_adjtime(clk_id, timex)
+        // Validate the clock id first: an unknown/dynamic id is -EINVAL on Linux, not a silent read.
+        if ((int)a0 < 0 || (int)a0 > 11) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         int r = svc_adjtimex((uint8_t *)a1);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;

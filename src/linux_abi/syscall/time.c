@@ -339,18 +339,29 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if (dynamic == 0) {
+            // Reject unknown clock ids FIRST -- an id past the POSIX range is -EINVAL on Linux, exactly as
+            // clock_getres (case 114) already rejects it. The old code silently aliased any unknown id to
+            // CLOCK_MONOTONIC and returned success.
+            if ((int)a0 > 11) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
             switch ((int)a0) {
             case 0:
-            // REALTIME(_COARSE)
-            case 5: mc = CLOCK_REALTIME; break;
+            // REALTIME(_COARSE)/REALTIME_ALARM/TAI all read the host wall clock. The engine has no separate
+            // TAI timeline, so CLOCK_TAI(11) tracks REALTIME (offset 0) rather than the monotonic clock.
+            case 5:
+            case 8:
+            case 11: mc = CLOCK_REALTIME; break;
             case 1:
             case 6:
-            // MONOTONIC(_COARSE)/BOOTTIME
-            case 7: mc = CLOCK_MONOTONIC; break;
+            // MONOTONIC(_COARSE)/BOOTTIME/BOOTTIME_ALARM
+            case 7:
+            case 9: mc = CLOCK_MONOTONIC; break;
             case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
             case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
             case 4: mc = CLOCK_MONOTONIC_RAW; break;
-            default: mc = CLOCK_MONOTONIC; break;
+            default: mc = CLOCK_MONOTONIC; break; // 10 (SGI_CYCLE): valid id, monotonic-backed fallback
             }
         }
         struct timespec ts;
