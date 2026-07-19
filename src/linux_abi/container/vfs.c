@@ -234,6 +234,40 @@ static void unix_bind_clear(int fd) {
     if (fd >= 0 && fd < HL_NFD) g_unix_bind[fd][0] = 0;
 }
 
+// Guest-visible peer name of a connected AF_UNIX socket, recorded on connect so getpeername can echo the
+// guest abstract/pathname address instead of the engine's backing host fs path. Same "@name" convention as
+// g_unix_bind. Empty slot = no recorded peer name.
+static char g_unix_peer[HL_NFD][108];
+
+static void unix_peer_note(int fd, const char *guestname) {
+    if (fd >= 0 && fd < HL_NFD && guestname) snprintf(g_unix_peer[fd], sizeof g_unix_peer[fd], "%s", guestname);
+}
+
+// Fill a guest sockaddr_un from a recorded "@name" (abstract) or pathname guest name. Returns the Linux
+// addrlen, or -1 if the name slot is empty. Abstract: family + NUL + name (no trailing NUL). Pathname:
+// family + path + trailing NUL.
+static int unix_name_fill(const char *name, uint8_t *g, socklen_t gcap, socklen_t *glen) {
+    if (!name || !name[0]) return -1;
+    uint8_t t[2 + 108];
+    memset(t, 0, sizeof t);
+    *(uint16_t *)t = AF_UNIX;
+    int llen;
+    if (name[0] == '@') {
+        size_t nl = strlen(name + 1);
+        if (nl > sizeof t - 3) nl = sizeof t - 3;
+        memcpy(t + 3, name + 1, nl); // t[2] stays NUL (abstract), name follows
+        llen = (int)(2 + 1 + nl);
+    } else {
+        size_t nl = strlen(name);
+        if (nl > sizeof t - 3) nl = sizeof t - 3;
+        memcpy(t + 2, name, nl);
+        llen = (int)(2 + nl + 1); // include the trailing NUL
+    }
+    if (g && gcap) memcpy(g, t, (size_t)gcap < (size_t)llen ? gcap : (size_t)llen);
+    if (glen) *glen = (socklen_t)llen;
+    return llen;
+}
+
 // Overlay merged-getdents snapshot cursor reset (rewinddir/seekdir on an overlay dir). Defined in fs.c
 // where g_ovldents lives, but the lseek handler (io.c) is included before fs.c, so forward-declare it.
 static void ovldents_rewind(int fd, int pos);

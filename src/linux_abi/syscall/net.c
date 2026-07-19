@@ -520,6 +520,36 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // AF_UNIX autobind: bind() with only the family (no name) -> Linux assigns a unique abstract-namespace
+        // address. Route it through the same HL_NETNS-keyed fs backing as an explicit abstract bind so the
+        // assigned name is both reported by getsockname and reachable by a connecting peer.
+        if (sa && a2 >= 2 && *(uint16_t *)sa == AF_UNIX &&
+            (socklen_t)a2 <= (socklen_t)offsetof(struct sockaddr_un, sun_path)) {
+            static uint32_t g_autobind_seq;
+            uint8_t syn[3 + 16];
+            *(uint16_t *)syn = AF_UNIX;
+            syn[2] = 0; // abstract (leading NUL)
+            int nl = snprintf((char *)syn + 3, 13, "%05x",
+                              (unsigned)(((uint32_t)getpid() << 12) ^ ++g_autobind_seq) & 0xfffffu);
+            char up[200];
+            abs_path(syn, (socklen_t)(3 + nl), up, sizeof up);
+            struct sockaddr_un un;
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            unlink(up);
+            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
+            if (r == 0) {
+                char an[108];
+                an[0] = '@';
+                memcpy(an + 1, syn + 3, (size_t)nl);
+                an[nl + 1] = 0;
+                unix_bind_note((int)a0, an);
+            }
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         // AF_UNIX pathname bind: materialize the socket inode in the overlay (writable upper), jail-confined,
         // so the guest can stat/chmod/connect it through the SAME resolver. A raw host bind created the inode
         // OUTSIDE the jail (at the literal guest path on the host fs), so the guest's overlay-routed stat()
@@ -869,8 +899,22 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
-            G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            int ce = errno;
+            // An abstract name is not a filesystem object: a missing backing socket means no bound listener,
+            // which Linux reports as ECONNREFUSED (the host fs backing yields ENOENT).
+            if (r < 0 && ce == ENOENT) ce = ECONNREFUSED;
+            G_RET(c) = (r < 0 && ce != EINPROGRESS) ? (uint64_t)(-ce) : 0;
+            if ((r == 0 || ce == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+                g_sock_conn[(int)a0] = 1; // sticky-connected
+                char an[108];
+                int L = (int)a2 - 3; // sun_path[0]==0, name follows; addrlen = 2 (family) + 1 (nul) + name
+                if (L < 0) L = 0;
+                if (L > (int)sizeof an - 2) L = (int)sizeof an - 2;
+                an[0] = '@';
+                memcpy(an + 1, sa + 3, (size_t)L);
+                an[L + 1] = 0;
+                unix_peer_note((int)a0, an); // guest-visible peer name for getpeername
+            }
             break;
         }
         // AF_UNIX pathname connect: resolve through the overlay (same resolver as stat/open) so we dial the
@@ -925,6 +969,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 204: {
         // getsockname
         int fd = (int)a0;
+        // Abstract-namespace local name: echo the guest name, not the engine's HL_NETNS-keyed backing fs path.
+        if (fd >= 0 && fd < HL_NFD && g_unix_bind[fd][0] == '@' && a1) {
+            socklen_t gl = 0;
+            int ll = unix_name_fill(g_unix_bind[fd], (uint8_t *)a1, a2 ? *(socklen_t *)a2 : 0, &gl);
+            if (ll >= 0) {
+                if (a2) *(socklen_t *)a2 = gl;
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (fd >= 0 && fd < HL_NFD && g_udp_local_port[fd]) {
             if (g_udp_local_v6[fd])
                 fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_local_port[fd]);
@@ -985,6 +1039,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
+        // Abstract-namespace peer name: echo the guest name recorded on connect, not the backing fs path.
+        if (fd >= 0 && fd < HL_NFD && g_unix_peer[fd][0] == '@' && a1) {
+            socklen_t gl = 0;
+            int ll = unix_name_fill(g_unix_peer[fd], (uint8_t *)a1, a2 ? *(socklen_t *)a2 : 0, &gl);
+            if (ll >= 0) {
+                if (a2) *(socklen_t *)a2 = gl;
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (fd >= 0 && fd < HL_NFD && g_udp_peer_port[fd]) {
             if (g_udp_peer_v6[fd])
                 fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_port[fd]);

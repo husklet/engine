@@ -74,3 +74,5 @@ passcred-scm	network	net_passcred.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	
 unix-seqpacket	network	net_unix_seqpacket.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_seqpacket.out	linux-libc	active	AF_UNIX SOCK_SEQPACKET message boundaries
 mmsg	network	net_mmsg.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_mmsg.out	linux-libc	excluded-known-bug	sendmmsg/recvmmsg over connected private-loopback UDP switch hangs (batched send/recv not routed through switch peer path); demonstrating test, deferred
 oob	network	net_oob.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_oob.out	linux-libc	active	TCP MSG_OOB urgent data + POLLPRI
+unix-autobind	network	net_unix_autobind.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_autobind.out	linux-libc	active	AF_UNIX autobind assigns a reachable abstract address reported by getsockname
+unix-abstract-name	network	net_unix_abstract_name.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_abstract_name.out	linux-libc	active	abstract AF_UNIX name round-trips through getsockname/getpeername; unbound connect ECONNREFUSED

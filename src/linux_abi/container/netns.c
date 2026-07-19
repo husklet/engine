@@ -623,6 +623,26 @@ static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t 
         size_t need = LX_CMSG_ALIGN(LX_CMSGHDR + dlen);
         if (go + LX_CMSGHDR + dlen > cap) {
             if (truncp) *truncp = 1;
+            // Linux delivers a partial SCM_RIGHTS record with as many whole fds as fit in the
+            // remaining control space and closes the fds that did not fit -- it does not drop the
+            // whole record. Match that (and never leak the undelivered host fds).
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                int *fds = (int *)CMSG_DATA(c);
+                int total = (int)(dlen / sizeof(int));
+                size_t room = (go + LX_CMSGHDR <= cap) ? cap - go - LX_CMSGHDR : 0;
+                int keep = (int)(room / sizeof(int));
+                if (keep > total) keep = total;
+                for (int i = keep; i < total; i++)
+                    if (fds[i] >= 0) close(fds[i]);
+                if (keep > 0) {
+                    size_t kb = (size_t)keep * sizeof(int);
+                    *(uint64_t *)(g + go) = (uint64_t)(LX_CMSGHDR + kb);
+                    *(int *)(g + go + 8) = cmsg_level_m2l(c->cmsg_level);
+                    *(int *)(g + go + 12) = c->cmsg_type;
+                    memcpy(g + go + LX_CMSGHDR, CMSG_DATA(c), kb);
+                    go += LX_CMSG_ALIGN(LX_CMSGHDR + kb);
+                }
+            }
             break;
         }
         *(uint64_t *)(g + go) = (uint64_t)(LX_CMSGHDR + dlen); // Linux cmsg_len
@@ -2358,6 +2378,18 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
     if (!saxl_on() || !m || m->sa_family != AF_UNIX) return -1;
     const struct sockaddr_un *u = (const struct sockaddr_un *)m;
     size_t off = offsetof(struct sockaddr_un, sun_path);
+    // Abstract-namespace name (leading NUL), including a kernel autobind address: an opaque binary blob,
+    // not a filesystem path -- echo it to the guest verbatim (no volume/path translation, no NUL scan).
+    if ((size_t)mlen > off && u->sun_path[0] == 0) {
+        size_t alen = (size_t)mlen - off;
+        uint8_t t[2 + sizeof u->sun_path];
+        if (alen > sizeof u->sun_path) alen = sizeof u->sun_path;
+        *(uint16_t *)t = AF_UNIX;
+        memcpy(t + 2, u->sun_path, alen);
+        int llen = (int)(2 + alen);
+        if (g && gcap) memcpy(g, t, (size_t)gcap < (size_t)llen ? gcap : (size_t)llen);
+        return llen;
+    }
     size_t hplen = (size_t)mlen > off ? (size_t)mlen - off : 0; // path bytes the host reported (no NUL guarantee)
     char hpath[256];
     size_t i = 0;
