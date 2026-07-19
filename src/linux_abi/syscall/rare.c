@@ -378,6 +378,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         g_mqq[qi].refs++;
+        g_mqfd_amode[fd] = (uint8_t)(oflag & O_ACCMODE); // remember O_RDONLY/O_WRONLY/O_RDWR for send/recv EBADF
         mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0); // O_NONBLOCK is a per-descriptor mq_flag
         G_RET(c) = (uint64_t)fd;
         break;
@@ -415,6 +416,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         int qi = mq_qof((int)a0);
         if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        if (!mq_fd_canwrite((int)a0)) { // send on a descriptor opened O_RDONLY -> EBADF (before EMSGSIZE)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
             break;
         }
@@ -488,6 +493,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         int qi = mq_qof((int)a0);
         if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        if (!mq_fd_canread((int)a0)) { // receive on a descriptor opened O_WRONLY -> EBADF (before EMSGSIZE)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
             break;
         }

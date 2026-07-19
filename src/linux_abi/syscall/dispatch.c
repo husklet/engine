@@ -409,6 +409,7 @@ static struct mq_queue g_mqq[MQ_MAXQ];
 
 static int8_t g_mqfd_queue[HL_NFD]; /* queue index + 1; zero means this fd is not an mqueue descriptor */
 static uint16_t g_mqfd_flags[HL_NFD];
+static uint8_t g_mqfd_amode[HL_NFD]; /* O_ACCMODE of the open: O_RDONLY(0)/O_WRONLY(1)/O_RDWR(2) */
 static uint32_t g_mqfd_group[HL_NFD];
 static uint32_t g_mqfd_next_group = 1;
 static void mq_maybe_free(int qi);
@@ -436,6 +437,7 @@ static void mq_fd_duplicate(int newfd, int oldfd) {
     if (qi < 0 || newfd < 0 || newfd >= HL_NFD || g_mqfd_queue[newfd] != 0) return;
     g_mqfd_queue[newfd] = (int8_t)(qi + 1);
     g_mqfd_flags[newfd] = g_mqfd_flags[oldfd];
+    g_mqfd_amode[newfd] = g_mqfd_amode[oldfd]; // a dup shares the open file description's access mode
     g_mqfd_group[newfd] = g_mqfd_group[oldfd];
     g_mqq[qi].refs++;
 }
@@ -445,6 +447,7 @@ static void mq_fd_close(int fd) {
     if (qi < 0) return;
     g_mqfd_queue[fd] = 0;
     g_mqfd_flags[fd] = 0;
+    g_mqfd_amode[fd] = 0;
     g_mqfd_group[fd] = 0;
     g_mqq[qi].refs--;
     mq_maybe_free(qi);
@@ -463,6 +466,16 @@ static void mq_fd_setnb(int fd, int on) {
     group = g_mqfd_group[fd];
     for (int i = 0; i < HL_NFD; ++i)
         if (g_mqfd_group[i] == group) g_mqfd_flags[i] = on ? MQ_O_NONBLOCK : 0;
+}
+
+// Access-mode enforcement: the kernel checks FMODE_WRITE/FMODE_READ on the descriptor right after the fd
+// lookup (before EMSGSIZE), so a send on an O_RDONLY descriptor or a receive on an O_WRONLY one is EBADF.
+// O_RDONLY(0)/O_WRONLY(1)/O_RDWR(2) are identical on aarch64 and x86_64.
+static int mq_fd_canwrite(int fd) {
+    return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_RDONLY; // O_WRONLY or O_RDWR
+}
+static int mq_fd_canread(int fd) {
+    return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_WRONLY; // O_RDONLY or O_RDWR
 }
 
 static void mq_maybe_free(int qi) {
