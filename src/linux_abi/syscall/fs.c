@@ -4043,6 +4043,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = 0;
         break;
     }
+    // open_by_handle_at(mount_fd, file_handle*, flags): reopening a file from an opaque handle requires
+    // CAP_DAC_READ_SEARCH, which an unprivileged task never holds, so the kernel rejects it with EPERM
+    // before it ever looks at the handle. hl cannot reconstruct a file from the synthetic dev+ino handle
+    // minted by name_to_handle_at anyway, so report the same EPERM the host kernel returns (an unhandled
+    // fall-through would answer ENOSYS, which wrongly tells NFS/backup tools the syscall is unavailable).
+    case 265:
+        G_RET(c) = (uint64_t)(int64_t)(-EPERM);
+        break;
     // faccessat2(dirfd,path,mode,flags) -- glibc access() uses it; same path/confinement, flags ignored
     case 439:
     case 48: {
