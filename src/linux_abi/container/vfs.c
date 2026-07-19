@@ -4294,9 +4294,20 @@ static int proc_limits_text(char *buf, size_t cap) {
         {"Max realtime timeout", "unlimited", "unlimited", "us"},
     };
 
+    // NOFILE hard cap is the enforceable guest fd ceiling (hl_engine_guest_fd_limit, derived from the host
+    // RLIMIT_NOFILE and HL_LINUX_FD_LIMIT). getrlimit/prlimit64 report exactly this value (svc_fill_rlimit),
+    // so the /proc row must render the same number rather than a stale hard-coded 1048576 -- otherwise the
+    // syscall surface and /proc/self/limits disagree (glibc/JVM/systemd read both).
+    char nofile_hard[24];
+    {
+        uint32_t guest_limit = hl_engine_guest_fd_limit();
+        snprintf(nofile_hard, sizeof nofile_hard, "%u", guest_limit > 0 ? guest_limit : 20480u);
+    }
+
     int n = snprintf(buf, cap, "%-25s %-20s %-20s %-10s\n", "Limit", "Soft Limit", "Hard Limit", "Units");
     for (size_t i = 0; i < sizeof L / sizeof *L; i++) {
         const char *soft = L[i].soft, *hard = L[i].hard;
+        if (i == 7) hard = nofile_hard; // RLIMIT_NOFILE: mirror getrlimit's enforceable hard cap
         // docker --ulimit override (g_limits, resource number == table index): render the requested values
         // so /proc/self/limits agrees with getrlimit (svc_fill_rlimit). RLIM_INFINITY -> "unlimited".
         char sb[24], hb[24];
