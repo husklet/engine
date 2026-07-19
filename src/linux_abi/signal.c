@@ -680,11 +680,18 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
         return;
     }
     // Non-terminating default reaching here = a stop signal (STOP/TSTP/TTIN/TTOU): mirror it onto the host so
-    // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask).
-    signal(sig_l2m(sig), SIG_DFL);
-    raise(sig_l2m(sig));
+    // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask). A stop is NOT a
+    // termination: the host process stops, the parent's waitpid(WUNTRACED) reaps the stop, and when a later
+    // SIGCONT resumes it raise() returns 0 -- the guest must then RESUME execution from the stop point, not
+    // exit. Setting c->exited here unconditionally forced the guest to terminate with 128+stopsig (e.g. 147
+    // for SIGSTOP) the instant it was continued, so the parent's next wait saw a bogus WIFEXITED(0x9300)
+    // instead of the child's real exit status. Only fall back to termination when raise() could not deliver
+    // the stop (an invalid host signo returns nonzero).
+    int host_stop = sig_l2m(sig);
+    signal(host_stop, SIG_DFL);
+    if (raise(host_stop) == 0) return; // stopped, then continued by SIGCONT -> resume guest execution
     c->exited = 1;
-    c->exit_code = 128 + sig; // fallback if raise returns / signo invalid on host
+    c->exit_code = 128 + sig; // fallback: raise failed (signo invalid on host)
 }
 
 // Convenience: a self-directed signal with no explicit sender info (raise/abort/kill-self/pthread_kill).
