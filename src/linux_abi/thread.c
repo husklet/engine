@@ -53,6 +53,7 @@ struct futex_bucket {
     uintptr_t waddr[FUTEX_WSLOTS]; // individual waiters, for exact FUTEX_WAKE(n) selection
     uint32_t wbits[FUTEX_WSLOTS];  // this waiter's FUTEX_WAIT_BITSET mask
     uint8_t wgrant[FUTEX_WSLOTS];  // selected by a wake; consumed by that waiter
+    uint16_t wcursor;              // next waiter slot considered by FUTEX_WAKE (queue progress)
     int imprecise;                 // slots overflowed while waiters were parked -> WAKE count approximate
 };
 
@@ -83,11 +84,14 @@ static int fbk_wait_grant(struct futex_bucket *b, uintptr_t address, int count, 
                           int *has_registered) {
     int granted = 0;
     *has_registered = 0;
-    for (int i = 0; i < FUTEX_WSLOTS; ++i) {
+    int start = b->wcursor % FUTEX_WSLOTS;
+    for (int offset = 0; offset < FUTEX_WSLOTS; ++offset) {
+        int i = (start + offset) % FUTEX_WSLOTS;
         if (b->waddr[i] != address) continue;
         *has_registered = 1;
         if (b->wgrant[i] || !(b->wbits[i] & mask) || granted >= count) continue;
         b->wgrant[i] = 1;
+        b->wcursor = (uint16_t)((i + 1) % FUTEX_WSLOTS);
         granted++;
     }
     return granted;
@@ -175,6 +179,7 @@ static struct futex_bucket *futex_table_alloc(const hl_host_services *host, int 
         pthread_mutex_init(&t[i].m, &ma);
         pthread_cond_init(&t[i].c, &ca);
         atomic_store_explicit(&t[i].waiters, 0, memory_order_relaxed);
+        t[i].wcursor = 0;
     }
     pthread_mutexattr_destroy(&ma);
     pthread_condattr_destroy(&ca);
@@ -201,6 +206,7 @@ static void futex_private_table_after_fork(void) {
         memset(b->waddr, 0, sizeof b->waddr);
         memset(b->wbits, 0, sizeof b->wbits);
         memset(b->wgrant, 0, sizeof b->wgrant);
+        b->wcursor = 0;
         b->imprecise = 0;
     }
     g_fbk_active = g_fbk_private;
