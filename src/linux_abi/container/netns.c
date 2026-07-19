@@ -2681,18 +2681,34 @@ static void nl_done(uint8_t *b, size_t *o, uint32_t seq) {
     *o += 16;
 }
 
+// One RTM_NEWLINK for a modelled interface slot (0=lo, 1=eth0). Shared by the dump and the
+// single-interface (non-dump) query paths so both stay byte-identical.
+static void nl_link_slot(uint8_t *b, size_t *o, uint32_t seq, int slot) {
+    uint8_t zero6[6] = {0}, ff6[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, mac[6];
+    if (slot == 0)
+        nl_link(b, o, seq, "lo", 1, 772 /*ARPHRD_LOOPBACK*/, 0x10049u /*UP|LOOP|RUN|LOWER_UP*/, zero6, 65536, zero6);
+    else {
+        netif_eth0_mac(mac);
+        nl_link(b, o, seq, "eth0", 2, 1 /*ARPHRD_ETHER*/, 0x11043u /*UP|BCAST|RUN|MCAST|LOWER_UP*/, mac, 1500, ff6);
+    }
+}
+
+// Resolve a non-dump RTM_GETLINK target (ifi_index and/or IFLA_IFNAME) to a modelled slot, or -1 if
+// no such interface exists (eth0 is absent under --network none). Mirrors the dump's lo(+eth0) set.
+static int nl_link_slot_for(int32_t idx, const char *name) {
+    if (idx == 1 || (name && strcmp(name, "lo") == 0)) return 0;
+    if (!net_isolate() && (idx == 2 || (name && strcmp(name, "eth0") == 0))) return 1;
+    return -1;
+}
+
 // Build + queue (one datagram to `peer`) the dump for request `type` with echoed `seq`.
 static void nl_emit_dump(int peer, uint16_t type, uint32_t seq) {
     uint8_t out[4096];
     size_t o = 0;
     if (type == NL_RTM_GETLINK) {
-        uint8_t zero6[6] = {0}, ff6[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, mac[6];
-        netif_eth0_mac(mac);
-        nl_link(out, &o, seq, "lo", 1, 772 /*ARPHRD_LOOPBACK*/, 0x10049u /*UP|LOOP|RUN|LOWER_UP*/, zero6, 65536, zero6);
+        nl_link_slot(out, &o, seq, 0); // lo
         // --network none: loopback-only, so eth0 is absent from the link dump (`ip link` sees just lo).
-        if (!net_isolate())
-            nl_link(out, &o, seq, "eth0", 2, 1 /*ARPHRD_ETHER*/, 0x11043u /*UP|BCAST|RUN|MCAST|LOWER_UP*/, mac, 1500,
-                    ff6);
+        if (!net_isolate()) nl_link_slot(out, &o, seq, 1); // eth0
     } else if (type == NL_RTM_GETADDR) {
         uint32_t lo4 = 0x0100007fu; // 127.0.0.1
         uint8_t lo6[16] = {0};
@@ -2788,6 +2804,44 @@ static void nl_error(int peer, const uint8_t *req_hdr, int err) {
     (void)w;
 }
 
+// NLM_F_DUMP = NLM_F_ROOT(0x100)|NLM_F_MATCH(0x200); the kernel routes a request to the dump handler
+// when either bit is set, otherwise to the single-object (.doit) handler.
+#define NL_NLM_F_DUMP 0x300
+
+// A non-dump RTM_GETLINK targets one interface by ifi_index or IFLA_IFNAME. Emit its single
+// RTM_NEWLINK (no NLM_F_MULTI, no trailing NLMSG_DONE), or NLMSG_ERROR -ENODEV if it does not exist --
+// matching the kernel's rtnl_getlink, where the old code wrongly replied with the whole link dump.
+static void nl_getlink_one(int peer, const uint8_t *req, uint32_t nlen, uint32_t seq) {
+    int32_t idx = 0;
+    const char *name = NULL;
+    char nbuf[64];
+    if (nlen >= 16 + 16) idx = *(const int32_t *)(req + 16 + 4); // ifinfomsg.ifi_index
+    // Optional IFLA_IFNAME attribute after the ifinfomsg.
+    for (uint32_t ao = 16 + 16; ao + 4 <= nlen;) {
+        uint16_t rlen = *(const uint16_t *)(req + ao), rtype = *(const uint16_t *)(req + ao + 2);
+        if (rlen < 4 || ao + rlen > nlen) break;
+        if (rtype == 3 /*IFLA_IFNAME*/) {
+            uint16_t dl = rlen - 4;
+            if (dl >= sizeof nbuf) dl = sizeof nbuf - 1;
+            memcpy(nbuf, req + ao + 4, dl);
+            nbuf[dl] = 0;
+            name = nbuf;
+        }
+        ao += (rlen + 3u) & ~3u;
+    }
+    int slot = nl_link_slot_for(idx, name);
+    if (slot < 0) {
+        nl_error(peer, req, -ENODEV);
+        return;
+    }
+    uint8_t out[1024];
+    size_t o = 0;
+    nl_link_slot(out, &o, seq, slot);
+    *(uint16_t *)(out + 6) = 0; // clear NLM_F_MULTI: a single .doit reply carries no NLMSG_DONE
+    ssize_t w = send(peer, out, o, 0);
+    (void)w;
+}
+
 // A send on a netlink fd: walk the request's nlmsghdr(s) and queue each one's reply. Returns bytes
 // consumed (== len; requests are tiny) so the guest's send returns success.
 static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
@@ -2796,6 +2850,7 @@ static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
     while (off + 16 <= len) {
         uint32_t nlen = *(const uint32_t *)(buf + off);
         uint16_t ntype = *(const uint16_t *)(buf + off + 4);
+        uint16_t nflags = *(const uint16_t *)(buf + off + 6);
         uint32_t nseq = *(const uint32_t *)(buf + off + 8);
         // RTM message groups run base+0=NEW, +1=DEL, +2=GET, +3=SET. A GET (type%4==2) is a read the dump
         // responder answers; a NEW/DEL/SET (type%4!=2) is a MODIFICATION hl has no writable netlink stack to
@@ -2803,6 +2858,9 @@ static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
         // NLMSG_DONE, so `ip addr/route add`/SETLINK fail loudly rather than silently succeeding unchanged.
         if (ntype >= 16 && (ntype % 4) != 2)
             nl_error(peer, buf + off, -EPERM);
+        else if (ntype == NL_RTM_GETLINK && !(nflags & NL_NLM_F_DUMP))
+            // `ip link show dev X`: a single-interface query, not a dump -> one reply or -ENODEV.
+            nl_getlink_one(peer, buf + off, nlen < len - off ? nlen : (uint32_t)(len - off), nseq);
         else
             nl_emit_dump(peer, ntype, nseq);
         if (nlen < 16 || off + ((nlen + 3) & ~3u) <= off) break; // malformed -> stop

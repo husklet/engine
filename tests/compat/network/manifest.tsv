@@ -76,3 +76,4 @@ mmsg	network	net_mmsg.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/n
 oob	network	net_oob.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_oob.out	linux-libc	active	TCP MSG_OOB urgent data + POLLPRI
 unix-autobind	network	net_unix_autobind.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_autobind.out	linux-libc	active	AF_UNIX autobind assigns a reachable abstract address reported by getsockname
 unix-abstract-name	network	net_unix_abstract_name.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_abstract_name.out	linux-libc	active	abstract AF_UNIX name round-trips through getsockname/getpeername; unbound connect ECONNREFUSED
+netlink-edges	network	net_netlink_edges.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_netlink_edges.out	linux-libc	active	RTM_GETLINK single-interface query returns one link or NLMSG_ERROR/-ENODEV (not a spurious dump); netlink/ioctl/if_nameindex cross-consistency for lo+eth0
