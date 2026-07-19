@@ -1125,6 +1125,17 @@ $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD
 # First native-Linux production lane: AArch64 host executing an x86-64 Linux
 # guest through the production JIT. This target is smoke-scoped until the
 # remaining event/path personality seams have native Linux implementations.
+# Provider/bound subsystem + engine environment: each compiled as its own TU (they carry
+# file-local put32/get32 helpers that collide if folded into the unity target object).
+PRODUCTION_PROVIDER_OBJECTS := $(BUILD)/linux-production/core/environment.o \
+	$(BUILD)/linux-production/core/provider_client.o $(BUILD)/linux-production/core/provider_demux.o \
+	$(BUILD)/linux-production/core/provider_files.o $(BUILD)/linux-production/core/provider_handles.o \
+	$(BUILD)/linux-production/core/provider_namespace.o
+
+$(BUILD)/linux-production/core/%.o: src/core/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/linux-production/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
@@ -1192,13 +1203,13 @@ test-linux-lifecycle: $(BUILD)/tools/lifecycle-linux-aarch64 $(BUILD)/tools/life
 	$(BUILD)/tools/lifecycle-linux-x86_64 --force-stop $(abspath $(BUILD)/e2e/guest-spin-x86_64)
 
 $(BUILD)/linux-production/hl-engine-linux-aarch64: $(BUILD)/linux-production/target/aarch64.o \
-	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(PRODUCTION_PROVIDER_OBJECTS) $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) -o $@ $^ -pthread -lm -ldl -latomic
 
 $(BUILD)/linux-production/hl-engine-linux-x86_64: $(BUILD)/linux-production/target/x86_64.o \
-	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(PRODUCTION_PROVIDER_OBJECTS) $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) -o $@ $^ -pthread -lm
