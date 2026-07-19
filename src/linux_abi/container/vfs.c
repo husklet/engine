@@ -1760,7 +1760,8 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
     char cur[4200];
     snprintf(cur, sizeof cur, "%s", p);
     // bounded symlink chain
-    for (int i = 0; i < 40; i++) {
+    int hop;
+    for (hop = 0; hop < 40; hop++) {
         char hb[4200];
         // host path, final component NOT followed
         secure_resolve(cur, hb, sizeof hb, 1);
@@ -1793,7 +1794,8 @@ static const char *xresolve_exec(const char *p, char *buf, size_t n) {
             // relative to its dir
         }
     }
-    resolve_loop_mark(); // >40 symlink hops -> ELOOP (the guest-absolute self-loop the fallback can't follow)
+    if (hop == 40)
+        resolve_loop_mark(); // >40 symlink hops -> ELOOP (the guest-absolute self-loop the fallback can't follow)
     secure_resolve(cur, buf, n, 0);
     // fallback: realpath-confine the last hop
     return buf;
