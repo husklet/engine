@@ -1105,7 +1105,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = 0;
                 break;
             }
+#if defined(MADV_REMOVE)
             G_RET(c) = madvise((void *)a0, (size_t)a1, MADV_REMOVE) == 0 ? 0 : (uint64_t)(int64_t)(-errno);
+#else
+            /* Darwin has no MADV_REMOVE equivalent. In particular, passing
+             * Linux's numeric value through would select an unrelated host
+             * advice. Fail closed until the mapping layer can punch the
+             * backing file through its owned descriptor. */
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+#endif
             break;
         }
         // MADV_DONTNEED(4): Linux drops the pages so the NEXT access faults in fresh ZERO pages. macOS
