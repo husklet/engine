@@ -574,6 +574,18 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, 16);
             goto done;
         }
+        case 0xF0: { // vlddqu (F2): unaligned load of W bytes from memory into the register
+            avx_get_rm(state, c, &I, next, W, b);
+            avx_put(c, rd, b, W);
+            goto done;
+        }
+        case 0x13:   // vmovlps/vmovlpd (store): m64 <- low 64 bits of xmm(ModRM.reg)
+        case 0x17: { // vmovhps/vmovhpd (store): m64 <- high 64 bits of xmm(ModRM.reg)
+            avx_get(c, rd, a);
+            uint64_t ea = avx_ea(state, c, &I, next, 8);
+            memcpy((void *)ea, a + (op == 0x17 ? 8 : 0), 8);
+            goto done;
+        }
         case 0x16: { // F3: vmovshdup (dup odd dwords)
             if (pp == 2) {
                 avx_get_rm(state, c, &I, next, W, b);
@@ -772,6 +784,31 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                         float z = avx_dnan_f32(__builtin_sqrtf(y), y, y);
                         memcpy(d + i, &z, 4);
                     }
+                }
+                avx_put(c, rd, d, W);
+            }
+            goto done;
+        }
+        case 0x52:   // vrsqrtps(NP)/ss(F3): approximate reciprocal square root
+        case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal. Modeled at full float precision to
+            // match the reference x86 oracle (qemu) and the native-aarch64 golden, both of which use the
+            // full-precision 1/x rather than the hardware's ~12-bit table.
+            int rsqrt = (op == 0x52), scalar = (pp == 2);
+            avx_get_rm(state, c, &I, next, scalar ? 4 : W, b);
+            if (scalar) {
+                avx_get(c, vv, a);
+                memcpy(d, a, 16);
+                float x;
+                memcpy(&x, b, 4);
+                float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                memcpy(d, &y, 4);
+                avx_put(c, rd, d, 16);
+            } else {
+                for (int i = 0; i < W; i += 4) {
+                    float x;
+                    memcpy(&x, b + i, 4);
+                    float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                    memcpy(d + i, &y, 4);
                 }
                 avx_put(c, rd, d, W);
             }
@@ -1205,6 +1242,34 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 }
             }
             avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0xE6: { // vcvttpd2dq(66)/vcvtdq2pd(F3)/vcvtpd2dq(F2): packed double<->int32
+            if (pp == 2) { // F3 cvtdq2pd: W/2 bytes int32 -> W bytes double
+                avx_get_rm(state, c, &I, next, W / 2, b);
+                int n = W / 8;
+                for (int i = 0; i < n; i++) {
+                    int32_t v;
+                    memcpy(&v, b + 4 * i, 4);
+                    double y = (double)v;
+                    memcpy(d + 8 * i, &y, 8);
+                }
+                avx_put(c, rd, d, W);
+            } else { // 66 cvttpd2dq(truncate) / F2 cvtpd2dq(round): W bytes double -> W/2 bytes int32
+                avx_get_rm(state, c, &I, next, W, b);
+                int n = W / 8;
+                for (int i = 0; i < n; i++) {
+                    double f;
+                    memcpy(&f, b + 8 * i, 8);
+                    int32_t r;
+                    if (!(f == f) || f >= 2147483648.0 || f < -2147483648.0)
+                        r = (int32_t)0x80000000; // integer indefinite
+                    else
+                        r = (int32_t)(pp == 1 ? __builtin_trunc(f) : __builtin_rint(f));
+                    memcpy(d + 4 * i, &r, 4);
+                }
+                avx_put(c, rd, d, W / 2);
+            }
             goto done;
         }
         case 0xF4: { // vpmuludq: dst.u64[i] = (u32)src1.even32[i] * (u32)rm.even32[i]
@@ -1781,6 +1846,45 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             goto done;
         }
         // ---- FMA (VEX 0F38 0x98..0xBF): fused multiply-add. reg=dst, vvvv, rm. W=0 ps, W=1 pd; odd op=scalar.
+        case 0x96: // vfmaddsub132 ps/pd: even lanes m1*m2 - add, odd lanes m1*m2 + add
+        case 0x97: // vfmsubadd132 ps/pd: even lanes m1*m2 + add, odd lanes m1*m2 - add
+        case 0xA6: // vfmaddsub213 / vfmsubadd213
+        case 0xA7:
+        case 0xB6: // vfmaddsub231 / vfmsubadd231
+        case 0xB7: {
+            int form = (op >> 4) - 9; // 0=132, 1=213, 2=231
+            int subadd = op & 1;      // 0=maddsub (even sub), 1=msubadd (even add)
+            int dbl = I.vex_w;
+            int es = dbl ? 8 : 4;
+            uint8_t dst[64];
+            avx_get(c, rd, dst);
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            uint8_t *m1 = (form == 0) ? dst : a;
+            uint8_t *m2 = (form == 0) ? b : (form == 1) ? dst : b;
+            uint8_t *ad = (form == 0) ? a : (form == 1) ? b : dst;
+            for (int i = 0; i < W; i += es) {
+                int even = ((i / es) & 1) == 0;
+                int sub = subadd ? !even : even; // maddsub subtracts on even; msubadd subtracts on odd
+                if (dbl) {
+                    double x, y, z;
+                    memcpy(&x, m1 + i, 8);
+                    memcpy(&y, m2 + i, 8);
+                    memcpy(&z, ad + i, 8);
+                    double res = __builtin_fma(x, y, sub ? -z : z);
+                    memcpy(d + i, &res, 8);
+                } else {
+                    float x, y, z;
+                    memcpy(&x, m1 + i, 4);
+                    memcpy(&y, m2 + i, 4);
+                    memcpy(&z, ad + i, 4);
+                    float res = __builtin_fmaf(x, y, sub ? -z : z);
+                    memcpy(d + i, &res, 4);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
         case 0x98:
         case 0x99:
         case 0x9A:
@@ -1885,6 +1989,26 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
+        case 0x0A:   // vroundss: low dword = round(rm low), rest of low-128 from src1(vvvv)
+        case 0x0B: { // vroundsd: low qword = round(rm low)
+            int use = (imm & 4) != 0, mode = imm & 3;
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, op == 0x0A ? 4 : 8, b);
+            memcpy(d, a, 16);
+            if (op == 0x0A) {
+                float x;
+                memcpy(&x, b, 4);
+                float y = sse_round_f(x, mode, use);
+                memcpy(d, &y, 4);
+            } else {
+                double x;
+                memcpy(&x, b, 8);
+                double y = sse_round_d(x, mode, use);
+                memcpy(d, &y, 8);
+            }
+            avx_put(c, rd, d, 16);
+            goto done;
+        }
         case 0x0C: { // vblendps: imm bit per dword across W; src1=vvvv, src2=rm
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, W, b);
@@ -1917,6 +2041,22 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 }
             }
             avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x41: { // vdppd: 128-bit only 2-wide double dot product; src1=vvvv, src2=rm
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, 16, b);
+            double av[2], bv[2];
+            memcpy(av, a, 16);
+            memcpy(bv, b, 16);
+            double sum = 0;
+            for (int i = 0; i < 2; i++)
+                if (imm & (0x10 << i)) sum += av[i] * bv[i];
+            for (int i = 0; i < 2; i++) {
+                double o = (imm & (1 << i)) ? sum : 0.0;
+                memcpy(d + 8 * i, &o, 8);
+            }
+            avx_put(c, rd, d, 16);
             goto done;
         }
         case 0x14:   // vpextrb
