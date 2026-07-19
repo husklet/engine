@@ -145,12 +145,24 @@ impl Machine {
         }
     }
 
-    /// Full process enumeration requires the forthcoming native control channel.
+    /// Returns a bounded snapshot of verified live process-domain members.
     ///
     /// # Errors
-    /// Returns [`crate::ControlErrorCategory::Unsupported`] with the current backend.
+    /// Returns a typed engine error if the native process registry cannot be read.
     pub fn processes(&self) -> Result<Vec<ProcessInfo>, ControlError> {
-        Err(ControlError::unsupported("processes"))
+        crate::ffi::domain_processes(self.domain().identity(), self.id(), 65_536)
+            .map(|processes| {
+                processes
+                    .into_iter()
+                    .map(|process| ProcessInfo {
+                        host_id: process.host_id,
+                        initial: process.initial != 0,
+                    })
+                    .collect()
+            })
+            .map_err(|status| {
+                ControlError::engine("processes", &Error::Engine { status, detail: 0 })
+            })
     }
 
     /// Transfers selected initial-process streams into one attachment.

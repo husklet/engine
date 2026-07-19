@@ -17,8 +17,22 @@ pub struct EngineCapabilities {
     pub observability: ObservabilityCapabilities,
     pub debugging: DebugCapabilities,
     pub checkpoint: CheckpointCapabilities,
+    pub control: ControlCapabilities,
     pub extensions: Vec<ExtensionCapability>,
     pub limits: EngineLimits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlCapabilities {
+    pub operations: BTreeSet<ControlOperation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ControlOperation {
+    ProcessInventory,
+    Signal,
+    Pause,
+    Attach,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -157,4 +171,5 @@ pub struct EngineLimits {
     pub mapped_bytes: u64,
     pub request_bytes: u32,
     pub queued_events: u32,
+    pub processes: u32,
 }

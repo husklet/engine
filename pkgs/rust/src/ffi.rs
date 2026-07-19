@@ -32,6 +32,13 @@ pub(crate) struct ProcessDomain {
     pub identity: [u64; 2],
 }
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProcessInfo {
+    pub host_id: u64,
+    pub initial: u32,
+    pub reserved: u32,
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct EngineExit {
     pub abi: u32,
@@ -95,6 +102,13 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn hl_activation_kill(process: *mut Process) -> i32;
     pub(crate) fn hl_activation_domain_terminate(domain: ProcessDomain) -> i32;
+    pub(crate) fn hl_activation_domain_processes(
+        domain: ProcessDomain,
+        initial_process_id: u64,
+        processes: *mut ProcessInfo,
+        capacity: u32,
+        count: *mut u32,
+    ) -> i32;
     pub(crate) fn hl_activation_process_destroy(process: *mut Process);
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
     fn pipe(descriptors: *mut c_int) -> c_int;
@@ -251,6 +265,49 @@ pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
     } else {
         Err(status)
     }
+}
+pub(crate) fn domain_processes(
+    identity: [u64; 2],
+    initial_process_id: u64,
+    maximum: u32,
+) -> Result<Vec<ProcessInfo>, i32> {
+    let mut count = 0;
+    let status = unsafe {
+        hl_activation_domain_processes(
+            ProcessDomain { identity },
+            initial_process_id,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    if status != 0 && status != 5 {
+        return Err(status);
+    }
+    if count > maximum {
+        return Err(5);
+    }
+    for _ in 0..4 {
+        let capacity = count;
+        let mut processes = vec![ProcessInfo::default(); capacity as usize];
+        let status = unsafe {
+            hl_activation_domain_processes(
+                ProcessDomain { identity },
+                initial_process_id,
+                processes.as_mut_ptr(),
+                capacity,
+                &mut count,
+            )
+        };
+        if status == 0 {
+            processes.truncate(count as usize);
+            return Ok(processes);
+        }
+        if status != 5 || count > maximum {
+            return Err(status);
+        }
+    }
+    Err(5)
 }
 #[allow(clippy::needless_pass_by_value)] // Consumption enforces exactly-once destruction.
 pub(crate) fn destroy(process: Handle) {

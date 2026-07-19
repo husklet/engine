@@ -19,6 +19,16 @@ fn discovery_never_implies_unimplemented_control_planes() {
     assert!(!capabilities.time.virtual_time);
     assert!(!capabilities.time.deterministic_entropy);
     assert!(capabilities.resources.live_updates.is_empty());
+    assert_eq!(
+        capabilities.control.operations,
+        std::collections::BTreeSet::from([
+            hl_engine::spec::ControlOperation::ProcessInventory,
+            hl_engine::spec::ControlOperation::Signal,
+            hl_engine::spec::ControlOperation::Pause,
+            hl_engine::spec::ControlOperation::Attach,
+        ])
+    );
+    assert_eq!(capabilities.limits.processes, 65_536);
 }
 
 #[test]

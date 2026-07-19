@@ -67,6 +67,14 @@ pub(super) fn capabilities() -> EngineCapabilities {
             supported: false,
             format: None,
         },
+        control: crate::spec::ControlCapabilities {
+            operations: BTreeSet::from([
+                crate::spec::ControlOperation::ProcessInventory,
+                crate::spec::ControlOperation::Signal,
+                crate::spec::ControlOperation::Pause,
+                crate::spec::ControlOperation::Attach,
+            ]),
+        },
         extensions: vec![
             ExtensionCapability {
                 provider: namespace_provider(),
@@ -107,6 +115,7 @@ pub(super) fn capabilities() -> EngineCapabilities {
             mapped_bytes: 1 << 40,
             request_bytes: 1024 * 1024,
             queued_events: 4096,
+            processes: 65_536,
         },
     }
 }

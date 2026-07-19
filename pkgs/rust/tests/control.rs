@@ -99,7 +99,7 @@ fn attachment_transfers_only_requested_streams() {
 }
 
 #[test]
-fn unavailable_live_mutations_fail_with_typed_unsupported_errors() {
+fn unavailable_resource_mutations_fail_with_typed_unsupported_errors() {
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let mut machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -107,9 +107,69 @@ fn unavailable_live_mutations_fail_with_typed_unsupported_errors() {
         .update_resources(ResourceUpdate::default())
         .unwrap_err();
     assert_eq!(error.category, ControlErrorCategory::Unsupported);
-    assert_eq!(machine.processes().unwrap_err().operation, "processes");
     machine.shutdown(ShutdownPolicy::Force).unwrap();
     let _ = machine.wait().unwrap();
+}
+
+#[test]
+fn process_inventory_tracks_initial_descendants_and_finished_lifecycle() {
+    let mut spec = launch_spec("/bin/sh");
+    spec.process
+        .argv
+        .extend(["-c".into(), "sleep 30 & wait".into()]);
+    let mut machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
+    let processes = wait_for_process_count(&machine, 2);
+    assert_eq!(
+        processes.iter().filter(|process| process.initial).count(),
+        1
+    );
+    assert_eq!(
+        processes
+            .iter()
+            .find(|process| process.initial)
+            .unwrap()
+            .host_id,
+        machine.id()
+    );
+    assert!(processes
+        .windows(2)
+        .all(|pair| pair[0].host_id < pair[1].host_id));
+    machine.shutdown(ShutdownPolicy::Force).unwrap();
+    let _ = machine.wait().unwrap();
+
+    let mut machine = Engine::new()
+        .spawn(launch_spec("/bin/true"), ProcessIo::default())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while machine.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "initial process did not finish");
+        std::thread::yield_now();
+    }
+    while !machine.processes().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "finished process remained in live inventory"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_for_process_count(
+    machine: &hl_engine::Machine,
+    minimum: usize,
+) -> Vec<hl_engine::ProcessInfo> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let processes = machine.processes().unwrap();
+        if processes.len() >= minimum {
+            return processes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process inventory did not converge"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn wait_for_state(process: u64, wanted: char) -> bool {

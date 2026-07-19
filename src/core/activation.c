@@ -486,6 +486,61 @@ static void domain_network_remove(hl_process_domain domain) {
     (void)rmdir(directory);
 }
 
+static int process_info_compare(const void *left, const void *right) {
+    const hl_activation_process_info *a = left;
+    const hl_activation_process_info *b = right;
+    return a->host_id < b->host_id ? -1 : a->host_id > b->host_id ? 1 : 0;
+}
+
+hl_status hl_activation_domain_processes(hl_process_domain domain, uint64_t initial_process_id,
+                                         hl_activation_process_info *processes, uint32_t capacity,
+                                         uint32_t *out_count) {
+    char directory[96];
+    DIR *entries;
+    struct dirent *entry;
+    uint32_t count = 0;
+    if ((domain.identity[0] | domain.identity[1]) == 0 || initial_process_id == 0 || out_count == NULL ||
+        (capacity != 0 && processes == NULL))
+        return HL_STATUS_INVALID_ARGUMENT;
+    domain_path(domain, directory, sizeof directory);
+    entries = opendir(directory);
+    if (entries == NULL) {
+        if (errno != ENOENT) return HL_STATUS_PLATFORM_FAILURE;
+        *out_count = 0;
+        return HL_STATUS_OK;
+    }
+    while ((entry = readdir(entries)) != NULL) {
+        char *end;
+        long raw;
+        uint64_t expected;
+        hl_host_process_info process;
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        errno = 0;
+        raw = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || *end != 0 || raw <= 0 || raw > INT32_MAX) continue;
+        if (!domain_birth(directory, (pid_t)raw, &expected) || !hl_host_process_read(raw, &process) ||
+            process.start_time_ns != expected) {
+            domain_record_remove(directory, (pid_t)raw);
+            continue;
+        }
+        if (count < capacity) {
+            processes[count].host_id = (uint64_t)raw;
+            processes[count].initial = (uint64_t)raw == initial_process_id ? 1u : 0u;
+            processes[count].reserved = 0;
+        }
+        if (count == UINT32_MAX) {
+            (void)closedir(entries);
+            return HL_STATUS_RESOURCE_LIMIT;
+        }
+        ++count;
+    }
+    (void)closedir(entries);
+    *out_count = count;
+    if (count > capacity) return HL_STATUS_RESOURCE_LIMIT;
+    if (count > 1) qsort(processes, count, sizeof(*processes), process_info_compare);
+    return HL_STATUS_OK;
+}
+
 hl_status hl_activation_domain_terminate(hl_process_domain domain) {
     char directory[96];
     unsigned round;
