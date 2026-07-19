@@ -1879,6 +1879,10 @@ static void emit_cpu_model_value(int rd, uint64_t value) {
 
 static void *translate_block(uint64_t gpc) {
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 guest_pc=%#llx", (unsigned long long)gpc);
+    /* Observe writes made through another MAP_SHARED alias before decoding
+       an executable view backed by an emulated host-page snapshot. */
+    uint64_t source_page = gpc & ~UINT64_C(0xfff);
+    filemap_refresh_emulated(source_page, source_page + UINT64_C(0x1000));
     // W4E tier-2: read NOTIER2 / TIER2_THRESHOLD once (idempotent) before any self-loop detection.
     tier2_env_init();
     // gpc is mutated by the decode loop; key the cache by START

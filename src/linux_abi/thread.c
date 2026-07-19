@@ -518,15 +518,34 @@ static int filemap_source_fd(struct guest_file_mapping *mapping);
 static void filemap_refresh_emulated(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     pthread_mutex_lock(&g_filemap_lock);
-    for (int index = 0; index < g_nfilemap; ++index) {
-        struct guest_file_mapping *mapping = &g_filemap[index];
-        if (!mapping->shared || !mapping->emulated || hi <= mapping->lo || lo >= mapping->hi) continue;
-        uint64_t first = lo > mapping->lo ? lo : mapping->lo;
-        uint64_t last = hi < mapping->hi ? hi : mapping->hi;
-        int fd = filemap_source_fd(mapping);
-        if (fd >= 0)
-            (void)filemap_pread(fd, (void *)(uintptr_t)first, (size_t)(last - first),
-                                (off_t)(mapping->offset + first - mapping->lo));
+    /* Host-page emulation creates a private snapshot.  Refresh every
+       registered snapshot of the same shared file extent, not merely the
+       virtual range named by the caller: MAP_SHARED coherence is defined by
+       backing identity and offset.  Provider memory is not registered here
+       and remains owned by its explicit provider coherence contract. */
+    for (int source_index = 0; source_index < g_nfilemap; ++source_index) {
+        struct guest_file_mapping *source = &g_filemap[source_index];
+        if (!source->shared || hi <= source->lo || lo >= source->hi) continue;
+        uint64_t source_first = lo > source->lo ? lo : source->lo;
+        uint64_t source_last = hi < source->hi ? hi : source->hi;
+        uint64_t file_first = source->offset + source_first - source->lo;
+        uint64_t file_last = source->offset + source_last - source->lo;
+        int fd = filemap_source_fd(source);
+        if (fd < 0) continue;
+
+        for (int target_index = 0; target_index < g_nfilemap; ++target_index) {
+            struct guest_file_mapping *target = &g_filemap[target_index];
+            uint64_t target_size = target->hi - target->lo;
+            if (!target->shared || !target->emulated || target->device != source->device ||
+                target->inode != source->inode || target->offset > UINT64_MAX - target_size)
+                continue;
+            uint64_t target_last = target->offset + target_size;
+            uint64_t overlap_first = file_first > target->offset ? file_first : target->offset;
+            uint64_t overlap_last = file_last < target_last ? file_last : target_last;
+            if (overlap_last <= overlap_first) continue;
+            (void)filemap_pread(fd, (void *)(uintptr_t)(target->lo + overlap_first - target->offset),
+                                (size_t)(overlap_last - overlap_first), (off_t)overlap_first);
+        }
     }
     pthread_mutex_unlock(&g_filemap_lock);
 }

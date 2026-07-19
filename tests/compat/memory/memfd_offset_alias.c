@@ -39,9 +39,14 @@ int main(void) {
     writable[page - 2] = 0x9a;
     int fixed_coherent = protected && publish(fixed, page) == 0 && fixed[1] == 0x36 && fixed[page - 2] == 0x9a;
 
+    writable[2] = 0x47;
+    writable[page - 3] = 0xa5;
+    int writable_publish_coherent = publish(writable, page) == 0 && fixed[2] == 0x47 && fixed[page - 3] == 0xa5;
+
     int unmapped = munmap(readable, page) == 0 && munmap(writable, page) == 0 && munmap(fixed, page) == 0;
     close(fd);
 
-    printf("memfd-offset-alias alias=%d fixed=%d unmapped=%d\n", alias_coherent, fixed_coherent, unmapped);
-    return alias_coherent && fixed_coherent && unmapped ? 0 : 1;
+    printf("memfd-offset-alias alias=%d fixed=%d writable-publish=%d unmapped=%d\n", alias_coherent, fixed_coherent,
+           writable_publish_coherent, unmapped);
+    return alias_coherent && fixed_coherent && writable_publish_coherent && unmapped ? 0 : 1;
 }

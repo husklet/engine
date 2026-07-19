@@ -1116,6 +1116,10 @@ static void emit_irq_check(uint64_t rip) {
 
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
+    /* Observe writes made through another MAP_SHARED alias before decoding
+       an executable view backed by an emulated host-page snapshot. */
+    uint64_t source_page = gpc & ~UINT64_C(0xfff);
+    filemap_refresh_emulated(source_page, source_page + UINT64_C(0x1000));
     hl_x86_crypto_state crypto_state = {.optimize = !nosseopt()};
     hl_x86_trace_state trace_state = {
         .pending_flags = &g_fl_pending,
