@@ -86,6 +86,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         } else if (op == HL_LINUX_SECCOMP_SET_MODE_STRICT) {
             // strict takes no flags/args (SECCOMP_SET_MODE_STRICT): both must be zero, else -EINVAL.
             G_RET(c) = (a1 || a2) ? (uint64_t)(-EINVAL) : (uint64_t)(int64_t)seccomp_set_strict();
+        } else if (op == 2 /*SECCOMP_GET_ACTION_AVAIL*/) {
+            G_RET(c) = (uint64_t)(int64_t)seccomp_get_action_avail(a1, a2);
+        } else if (op == 3 /*SECCOMP_GET_NOTIF_SIZES*/) {
+            G_RET(c) = (uint64_t)(int64_t)seccomp_get_notif_sizes(a1, a2);
         } else {
             G_RET(c) = (uint64_t)(-EINVAL);
         }

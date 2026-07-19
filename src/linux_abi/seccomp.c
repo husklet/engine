@@ -206,3 +206,42 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
     g_seccomp_active = 1;
     return 0;
 }
+
+// SECCOMP_GET_ACTION_AVAIL (op 2): probe whether a filter return action is one the kernel recognises.
+// libseccomp/runc call this before installing the docker profile to learn which actions (KILL_PROCESS, LOG,
+// ...) they may use. `flags` must be 0; `act_ptr` points to a u32 action word that must exactly equal one of
+// the defined SECCOMP_RET_* constants (any data bits set -> the action is "unavailable"). Returns 0 for a
+// recognised action, -EOPNOTSUPP for anything else -- matching native, which reports every canonical action
+// (including USER_NOTIF) available. Previously this op fell through to -EINVAL, so a runtime that probes
+// action support saw the whole seccomp facility as broken.
+static long seccomp_get_action_avail(uint64_t flags, uint64_t act_ptr) {
+    if (flags) return -EINVAL;
+    if (!act_ptr || !host_range_mapped((uintptr_t)act_ptr, sizeof(uint32_t))) return -EFAULT;
+    uint32_t action;
+    memcpy(&action, (const void *)(uintptr_t)act_ptr, sizeof action);
+    switch (action) {
+    case HL_LINUX_SECCOMP_RET_KILL_PROCESS:
+    case HL_LINUX_SECCOMP_RET_KILL_THREAD:
+    case HL_LINUX_SECCOMP_RET_TRAP:
+    case HL_LINUX_SECCOMP_RET_ERRNO:
+    case HL_LINUX_SECCOMP_RET_USER_NOTIF:
+    case HL_LINUX_SECCOMP_RET_TRACE:
+    case HL_LINUX_SECCOMP_RET_LOG:
+    case HL_LINUX_SECCOMP_RET_ALLOW: return 0;
+    default: return -EOPNOTSUPP; // recognised action words carry no data bits
+    }
+}
+
+// SECCOMP_GET_NOTIF_SIZES (op 3): report the sizes of the user-notification ABI structs so a supervisor can
+// size its buffers. `flags` must be 0; `sz_ptr` points to a `struct seccomp_notif_sizes { u16 seccomp_notif;
+// u16 seccomp_notif_resp; u16 seccomp_data; }`. We report the current canonical sizes (matching native) even
+// though NEW_LISTENER is rejected at install: the sizes are a stable query, and a probe must succeed as on
+// Linux rather than see -EINVAL. seccomp_data is our own 64-byte struct; notif/resp mirror the kernel ABI.
+static long seccomp_get_notif_sizes(uint64_t flags, uint64_t sz_ptr) {
+    if (flags) return -EINVAL;
+    if (!sz_ptr || !host_range_mapped((uintptr_t)sz_ptr, 3 * sizeof(uint16_t))) return -EFAULT;
+    uint16_t sizes[3] = {80 /*seccomp_notif*/, 24 /*seccomp_notif_resp*/,
+                         (uint16_t)sizeof(struct hl_linux_seccomp_data) /*seccomp_data = 64*/};
+    memcpy((void *)(uintptr_t)sz_ptr, sizes, sizeof sizes);
+    return 0;
+}
