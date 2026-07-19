@@ -68,6 +68,15 @@ struct cpu {
     int sync_signal;
     int sync_code;
     uint64_t sync_address;
+    // Non-nested signal delivery (matches native serialization): the set of signals that were already
+    // pending when the CURRENT handler was entered is deferred until that handler returns, so a batch of
+    // signals unblocked together runs one-after-another (priority order) rather than nesting. A signal that
+    // becomes pending DURING a handler is not in this set and still nests (raise-in-handler / async fault).
+    // sig_defer is the innermost level's deferred set; sig_defer_stack saves the enclosing levels.
+    uint64_t sig_defer;
+    uint64_t sig_defer_stack[32];
+    uint64_t sig_frame_sp[32]; // guest SP of each active handler frame (to detect siglongjmp unwinds)
+    int sig_depth;
     // x86 RFLAGS.ID (bit 21) substrate. There is no ARM-NZCV equivalent, so popfq(9D) stashes the popped
     // bit 21 here and pushfq(9C) reads it back -- a software toggle of ID round-trips, which is exactly the
     // CPUID-availability probe 32-bit code uses (flip ID via pushf/popf and check it changed). 0/1 valued.

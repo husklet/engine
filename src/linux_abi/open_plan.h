@@ -37,7 +37,9 @@ enum {
     HL_OPEN_PATH_ONLY = 1u << 5,
     HL_OPEN_NOFOLLOW = 1u << 6,
     HL_OPEN_DIRECTORY = 1u << 7,
-    HL_OPEN_TEMPORARY = 1u << 8
+    HL_OPEN_TEMPORARY = 1u << 8,
+    /* openat2(RESOLVE_NO_SYMLINKS): reject a symlink in any path component. */
+    HL_OPEN_NO_SYMLINKS = 1u << 9
 };
 
 typedef struct hl_open_request {

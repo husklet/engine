@@ -343,7 +343,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 67:
         case 68:
         case 69:
-        case 70: G_RET(c) = (uint64_t)(int64_t)(-EBADF); return svc_done(c);
+        case 70:
+        case 82: /* fsync */
+        case 83: /* fdatasync */
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            return svc_done(c);
         default: break;
         }
     }
@@ -488,17 +492,31 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             char b;
-            // drain one wake byte
+            // drain one wake byte (one byte was written per queued instance -> keeps readability accurate)
             ssize_t pr = read(rfd, &b, 1);
             if (pr <= 0) {
                 G_RET(c) = (uint64_t)(int64_t)(pr < 0 ? -errno : -EAGAIN);
                 break;
             }
-            // Each wake byte IS the queued signal number (host_sigh / raise_guest_signal write (char)signo),
-            // so realtime signals delivered N times read back as N siginfo records each carrying the right
-            // ssi_signo -- unlike the single-bit g_pending, which cannot represent a queue of the same signo.
-            int sig = (unsigned char)b;
-            if (sig > 0 && sig < 64) __atomic_and_fetch(&g_pending, ~(1ull << (unsigned)sig), __ATOMIC_SEQ_CST);
+            // The self-pipe only preserves INSERTION order, but signalfd drains in priority order (lowest
+            // signo first, FIFO within a signo) carrying the queued siginfo (ssi_int / ssi_pid / ssi_code).
+            // So ignore the byte's signo for SELECTION: scan this OFD's mask ascending for the lowest signo
+            // with a queued instance and pop it. Only if nothing is queued (a host async-path wake that set
+            // the bit with an empty queue) do we fall back to the byte's signo and the single-slot g_sig*.
+            int sslot = g_sigfd_slot[rfd] - 1;
+            uint64_t omask = g_sfd[sslot].mask;
+            struct sigq_ent ent;
+            int sig = 0, popped = 0;
+            for (int s = 1; s < 64; s++)
+                if ((omask & (1ull << s)) && sigq_pop(s, &ent)) {
+                    sig = s;
+                    popped = 1;
+                    break;
+                }
+            if (!popped) {
+                sig = (unsigned char)b;
+                if (sig > 0 && sig < 64) __atomic_and_fetch(&g_pending, ~(1ull << (unsigned)sig), __ATOMIC_SEQ_CST);
+            }
             if (a1 && a2 >= 128) {
                 // a1 is a raw guest buffer we write directly -> EFAULT a bad pointer instead of faulting the engine
                 if (!host_range_mapped((uintptr_t)a1, 128)) {
@@ -506,8 +524,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
                 memset((void *)a1, 0, 128);
-                *(uint32_t *)a1 = (uint32_t)sig;
-                // ssi_signo
+                *(uint32_t *)(a1 + 0) = (uint32_t)sig;                              // ssi_signo
+                *(int32_t *)(a1 + 8) = popped ? ent.code : g_sigcode[sig];          // ssi_code
+                *(uint32_t *)(a1 + 12) = (uint32_t)(popped ? ent.pid : g_sigpid[sig]); // ssi_pid
+                *(uint32_t *)(a1 + 16) = (uint32_t)(popped ? ent.uid : g_siguid[sig]); // ssi_uid
+                uint64_t val = popped ? ent.value : g_sigval[sig];
+                *(int32_t *)(a1 + 44) = (int32_t)val;  // ssi_int (sigqueue value)
+                *(uint64_t *)(a1 + 48) = val;          // ssi_ptr
+                if (!popped) {
+                    g_sigcode[sig] = 0;
+                    g_sigval[sig] = 0;
+                    g_sigpid[sig] = 0;
+                    g_siguid[sig] = 0;
+                }
             }
             G_RET(c) = 128;
             break;

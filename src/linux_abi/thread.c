@@ -1937,6 +1937,24 @@ static int thread_target_signal(int tid, int sig) {
     return found;
 }
 
+// Does the live guest thread `tid` currently BLOCK signal `sig`? A thread-directed tkill/tgkill of a signal
+// the target has blocked must be held pending on THAT specific thread -- so the thread's own sigwait/
+// sigtimedwait dequeues it (or it is delivered when the thread unblocks) -- rather than being dropped into
+// the process-wide g_pending, where any thread (often the sender) could consume it. That misrouting is what
+// left a pthread_kill()+sigwait target hung / a peer thread waking instead of the addressed one.
+static int thread_tid_blocks_signal(int tid, int sig) {
+    if (sig < 1 || sig > 64) return 0;
+    int blocked = 0;
+    pthread_mutex_lock(&g_threg_m);
+    for (int i = 0; i < THREAD_REG_MAX; i++)
+        if (g_threg[i].c && cpu_tid(g_threg[i].c) == tid) {
+            blocked = (g_threg[i].c->sigmask & (1ull << (sig - 1))) != 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_threg_m);
+    return blocked;
+}
+
 // Is `tid` a LIVE guest thread of this process? tkill/tgkill (syscall/signal.c) use it to return ESRCH for
 // a tid no thread carries -- e.g. a joined/exited thread whose id LTP tgkill03 reuses ("defunct tid"). The
 // process shares one thread-group, so a tid absent from the registry is gone. (The caller's own tid is
