@@ -64,6 +64,12 @@ static int gpr_field_mask(uint32_t in) {
         //   Same encoding box as register-offset but bits[11:10]==00; without this a stolen Rs (x16/x17)
         //   would be emitted verbatim on the generic decode path and read the engine-private host reg.
         if ((in & 0x3B200C00u) == 0x38200000u) m |= 4;
+        //   AdvSIMD load/store STRUCTURE, register post-index: the increment operand Rm[20:16] is a GPR
+        //   (immediate post-index sets Rm==31/xzr, harmless to flag). Rt here is a vector list (bit26 keeps
+        //   it unflagged) so only the base was marked; without this a stolen Rm stride (e.g. the generic
+        //   decode path for `ld1 {v0.16b},[sp],x16`, where emit_fold_advsimd_struct is skipped on an SP base)
+        //   would be emitted verbatim and advance the base by the engine-private host x16/x17.
+        if ((in & 0xBE800000u) == 0x0C800000u) m |= 4;
         //   load/store pair: Rt2[14:10] (GP only)
         if ((in & 0x3A000000u) == 0x28000000u && !v) m |= 8;
         //   exclusive: Rs[20:16], Rt2[14:10]
