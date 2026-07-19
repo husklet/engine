@@ -130,7 +130,7 @@ fn start_services_terminal(
     config: &std::ffi::CStr,
     size: Size,
     launch: ServiceLaunch,
-    authority: &HandlesAuthority,
+    authority: &crate::extension::Authorities,
 ) -> Result<(ffi::Handle, File), Error> {
     let (child, _server) = prepare_services(launch, authority)?;
     ffi::start_terminal_with_transport(executable, guest, config, size.native(), &child)
@@ -139,7 +139,7 @@ fn start_services_terminal(
 
 fn prepare_services(
     launch: ServiceLaunch,
-    authority: &HandlesAuthority,
+    authority: &crate::extension::Authorities,
 ) -> Result<(std::os::unix::net::UnixStream, std::thread::JoinHandle<()>), Error> {
     let handles = authority
         .provider(&launch.provider)

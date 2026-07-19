@@ -3315,7 +3315,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 provider_stat.st_uid = (uid_t)service->uid;
                 provider_stat.st_gid = (gid_t)service->gid;
                 if (service->kind == HL_PROVIDER_NODE_CHARACTER || service->kind == HL_PROVIDER_NODE_BLOCK)
-                    provider_stat.st_rdev = makedev(service->major, service->minor);
+                    provider_stat.st_rdev = (dev_t)hl_linux_device_make(service->major, service->minor);
                 provider_stat.st_size = (off_t)metadata.size;
                 provider_stat.st_nlink = 1;
                 fill_linux_stat((uint8_t *)a2, &provider_stat, NULL, -1);
