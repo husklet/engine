@@ -440,7 +440,6 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_lo_port[(int)a0] = p ? p : 1;
@@ -471,7 +470,6 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_br_port[(int)a0] = p ? p : 1;
