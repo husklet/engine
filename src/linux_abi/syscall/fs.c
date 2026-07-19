@@ -4,6 +4,77 @@
 // cpu_range_str it calls) and before service() -- same TU scope.
 #include "../device.h"
 
+#if defined(__linux__)
+#include <linux/stat.h>
+#include <sys/syscall.h>
+#endif
+
+// statx(2) creation time. A plain Linux struct stat carries no birth time, so the engine must consult
+// a host statx to answer it -- AND to answer HONESTLY: a caller trusts stx_mask before reading
+// stx_btime, so STATX_BTIME must be advertised only when the backing filesystem actually reports it
+// (tmpfs/ext4/devtmpfs do; procfs/virtiofs do not). Mirroring the host's own mask bit keeps the guest
+// byte-identical to a native statx for every filesystem. Returns 1 and fills sec/nsec when the host
+// reported a birth time, 0 (with sec/nsec cleared) otherwise; synthetic entries pass fd<0 && path==NULL.
+static int hl_statx_host_btime(const char *path, int fd, int nofollow, int64_t *sec, uint32_t *nsec) {
+    *sec = 0;
+    *nsec = 0;
+#if defined(__linux__) && defined(SYS_statx)
+    struct statx status;
+    int flags = fd >= 0 ? AT_EMPTY_PATH : (nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+    const char *name = fd >= 0 ? "" : path;
+    int directory = fd >= 0 ? fd : AT_FDCWD;
+    if (fd < 0 && path == NULL) return 0;
+    memset(&status, 0, sizeof status);
+    if (syscall(SYS_statx, directory, name, flags, STATX_BTIME, &status) == 0 &&
+        (status.stx_mask & STATX_BTIME) != 0) {
+        *sec = (int64_t)status.stx_btime.tv_sec;
+        *nsec = (uint32_t)status.stx_btime.tv_nsec;
+        return 1;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    struct stat s;
+    if (fd < 0 && path == NULL) return 0;
+    if ((fd >= 0 ? fstat(fd, &s) : (nofollow ? lstat(path, &s) : stat(path, &s))) == 0) {
+        *sec = (int64_t)s.st_birthtimespec.tv_sec;
+        *nsec = (uint32_t)s.st_birthtimespec.tv_nsec;
+        return 1;
+    }
+    return 0;
+#else
+    (void)path;
+    (void)fd;
+    (void)nofollow;
+    return 0;
+#endif
+}
+
+// statx(2) mount id: filled only when the caller requests STATX_MNT_ID (not part of STATX_BASIC_STATS
+// or STATX_ALL). Mirror the host's answer so the mask bit + value match a native statx; a synthetic
+// entry (fd<0 && path==NULL) has no host mount to report. Returns 1 and fills id when available.
+static int hl_statx_host_mnt_id(const char *path, int fd, int nofollow, uint64_t *id) {
+    *id = 0;
+#if defined(__linux__) && defined(SYS_statx) && defined(STATX_MNT_ID)
+    struct statx status;
+    int flags = fd >= 0 ? AT_EMPTY_PATH : (nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+    const char *name = fd >= 0 ? "" : path;
+    int directory = fd >= 0 ? fd : AT_FDCWD;
+    if (fd < 0 && path == NULL) return 0;
+    memset(&status, 0, sizeof status);
+    if (syscall(SYS_statx, directory, name, flags, STATX_MNT_ID, &status) == 0 &&
+        (status.stx_mask & STATX_MNT_ID) != 0) {
+        *id = (uint64_t)status.stx_mnt_id;
+        return 1;
+    }
+    return 0;
+#else
+    (void)path;
+    (void)fd;
+    (void)nofollow;
+    return 0;
+#endif
+}
+
 /* Resolve intent (HL_OPEN_NO_SYMLINKS) carried from an openat2 fall-through into
  * the shared openat handler.  Set on the openat2 (437) path and consumed once on
  * entry to the openat (56) case; a direct openat always observes it cleared. */
@@ -3960,10 +4031,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         uint32_t vuid, vgid;
         stat_virt_ids(&s, xpath, xfd, &vuid, &vgid);
         uint8_t *d = (uint8_t *)a4;
-        // struct statx (Linux uapi offsets). We fill STATX_BASIC_STATS | STATX_BTIME.
+        // Birth time is mirrored from the host filesystem so the mask bit is honest per-fs (see
+        // hl_statx_host_btime). Synthetic entries have no backing file (xpath==NULL && xfd<0) and so
+        // never advertise btime -- matching native procfs/sysfs, which do not report it.
+        int64_t btime_sec;
+        uint32_t btime_nsec;
+        int have_btime = hl_statx_host_btime(xpath, xfd, nofollow, &btime_sec, &btime_nsec);
+        // struct statx (Linux uapi offsets). We fill STATX_BASIC_STATS (+ STATX_BTIME when supported).
         memset(d, 0, 256);
-        // stx_mask @0 = basic(0x7ff) | btime(0x800); stx_blksize @4
-        *(uint32_t *)(d + 0) = 0x7ff | 0x800;
+        // stx_mask @0 = basic(0x7ff) | btime(0x800 only when the host filesystem reports it); stx_blksize @4
+        *(uint32_t *)(d + 0) = 0x7ff | (have_btime ? 0x800u : 0u);
         *(uint32_t *)(d + 4) = 4096;
         // stx_nlink @16 (raw, matching fill_linux_stat)
         *(uint32_t *)(d + 16) = (uint32_t)s.st_nlink;
@@ -3981,13 +4058,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // stx_{atime,btime,ctime,mtime} @64/80/96/112: {s64 tv_sec; u32 tv_nsec} each 16 bytes
         *(int64_t *)(d + 64) = (int64_t)s.st_atimespec.tv_sec;
         *(uint32_t *)(d + 72) = (uint32_t)s.st_atimespec.tv_nsec;
-#if defined(__linux__)
-        *(int64_t *)(d + 80) = 0;
-        *(uint32_t *)(d + 88) = 0;
-#else
-        *(int64_t *)(d + 80) = (int64_t)s.st_birthtimespec.tv_sec;
-        *(uint32_t *)(d + 88) = (uint32_t)s.st_birthtimespec.tv_nsec;
-#endif
+        *(int64_t *)(d + 80) = have_btime ? btime_sec : 0;
+        *(uint32_t *)(d + 88) = have_btime ? btime_nsec : 0;
         *(int64_t *)(d + 96) = (int64_t)s.st_ctimespec.tv_sec;
         *(uint32_t *)(d + 104) = (uint32_t)s.st_ctimespec.tv_nsec;
         *(int64_t *)(d + 112) = (int64_t)s.st_mtimespec.tv_sec;
@@ -3998,6 +4070,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         *(uint32_t *)(d + 132) = hl_linux_device_minor((uint64_t)s.st_rdev);
         *(uint32_t *)(d + 136) = hl_linux_device_major((uint64_t)s.st_dev);
         *(uint32_t *)(d + 140) = hl_linux_device_minor((uint64_t)s.st_dev);
+        // stx_mnt_id @144 -- modern kernels fill it opportunistically regardless of the requested mask,
+        // so mirror the host: set the value and the STATX_MNT_ID bit whenever the host reports it.
+        {
+            uint64_t mnt_id;
+            if (hl_statx_host_mnt_id(xpath, xfd, nofollow, &mnt_id)) {
+                *(uint64_t *)(d + 144) = mnt_id;
+                *(uint32_t *)(d + 0) |= 0x1000u;
+            }
+        }
         G_RET(c) = 0;
         break;
     }

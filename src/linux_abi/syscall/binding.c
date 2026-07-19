@@ -475,7 +475,10 @@ static void bound_fill_statfs(uint8_t *output, const hl_host_filesystem_metadata
 
 static void bound_fill_statx(uint8_t *output, const hl_linux_file_status *status) {
     memset(output, 0, 256);
-    *(uint32_t *)(output + 0) = 0x7ffu | 0x800u;
+    // Advertise STATX_BTIME only when the host actually reported a creation time. A caller trusts
+    // stx_mask before reading stx_btime, so claiming the bit with a zero btime (a filesystem that
+    // does not track it) would lie -- native leaves the bit clear there. See hl_statx_host_btime.
+    *(uint32_t *)(output + 0) = 0x7ffu | (status->created_ns != 0 ? 0x800u : 0u);
     *(uint32_t *)(output + 4) = 4096;
     *(uint32_t *)(output + 16) = (uint32_t)status->link_count;
     *(uint32_t *)(output + 20) = status->user;
