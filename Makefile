@@ -2229,7 +2229,15 @@ $(BUILD)/tests/dns-fork-macos: tests/unit/test_dns_fork_macos.c src/linux_abi/dn
 	@mkdir -p $(@D)
 	$(MAC) clang -O2 -std=c11 -Wall -Wextra -Werror $^ -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos $(BUILD)/tests/dns-fork-macos
+$(BUILD)/tests/dns-objc-fork-macos: tests/unit/test_dns_objc_fork_macos.m src/linux_abi/dns.c
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -std=c11 -Wall -Wextra -Werror -framework Foundation $^ -o $@
+
+.PHONY: test-dns-objc-fork-macos
+test-dns-objc-fork-macos: $(BUILD)/tests/dns-objc-fork-macos
+	$(MAC) $(abspath $<)
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos $(BUILD)/tests/dns-fork-macos $(BUILD)/tests/dns-objc-fork-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
@@ -2242,6 +2250,7 @@ test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/direc
 	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
 	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
 	$(MAC) $(abspath $(BUILD)/tests/dns-fork-macos)
+	$(MAC) $(abspath $(BUILD)/tests/dns-objc-fork-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)
