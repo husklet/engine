@@ -1945,13 +1945,15 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             _exit(127);
         brk_lo = brk_cur = heap;
         brk_hi = brk_lo + (256u << 20);
+        // Publish the new image's exec path BEFORE build_stack: build_stack points AT_EXECFN at
+        // g_exe_path (the canonical guest exec pathname), and /proc/self/exe reads it too.
+        snprintf(g_exe_path_store, sizeof g_exe_path_store, "%s", gexe); // /proc/self/exe -> the new image
+        g_exe_path = g_exe_path_store;
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
         proc_reg_publish(gexe, ac, argv); // republish the process table entry (comm/argv changed on exec)
         free(xpath);
         for (int i = 0; i < ac && i < 255; i++)
             free(xargv[i]);
-        snprintf(g_exe_path_store, sizeof g_exe_path_store, "%s", gexe); // /proc/self/exe -> the new image
-        g_exe_path = g_exe_path_store;
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;

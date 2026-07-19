@@ -580,6 +580,15 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, estr[i], l);
         envp_[i] = (uint64_t)top;
     }
+    // AT_EXECFN string: Linux copies the execve PATHNAME (not argv[0]) near the stack top and points
+    // AT_EXECFN at it. Rust std / uutils' multicall read it; a relative argv[0] (fork+exec'd `./x` or
+    // execve("/proc/self/exe")) diverged from the native absolute path. g_exe_path holds the canonical
+    // guest exec path (set by the loader and by execve before this call); fall back to argv[0].
+    const char *execfn_str = (g_exe_path && g_exe_path[0]) ? g_exe_path : (argc ? argv[0] : "");
+    size_t execfn_len = strlen(execfn_str) + 1;
+    top -= execfn_len;
+    memcpy(top, execfn_str, execfn_len);
+    uint64_t execfn = (uint64_t)top;
     top -= 8;
     memcpy(top, "x86_64", 7);
     uint64_t plat = (uint64_t)top;
@@ -605,8 +614,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {23, 0},       // AT_SECURE 0
         {17, 100},     // AT_CLKTCK
         {26, 0},       // AT_HWCAP2
-        {31, argp[0]}, // AT_EXECFN -> argv[0] path string. Rust std / uutils' multicall read this to pick the
-                       // applet name; missing it made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
+        {31, execfn}, // AT_EXECFN -> execve pathname string (glibc/Rust/uutils multicall read it). Missing it
+                      // made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
         {0, 0},        // AT_NULL terminator
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);

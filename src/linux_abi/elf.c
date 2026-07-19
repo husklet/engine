@@ -989,6 +989,16 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         argp[i] = (uint64_t)top;
     }
     free(gecopy); // the HL_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
+    // AT_EXECFN string: Linux copies the execve PATHNAME (not argv[0]) near the stack top and points
+    // AT_EXECFN at it. glibc dl-support, Rust std, and uutils' multicall dereference it; pointing it at
+    // a relative argv[0] (e.g. a fork+exec'd `./x` or execve("/proc/self/exe")) diverged from the native
+    // absolute path. g_exe_path holds the canonical guest exec path (set by the loader and by execve
+    // before this call); fall back to argv[0] only if it is somehow unset.
+    const char *execfn_str = (g_exe_path && g_exe_path[0]) ? g_exe_path : (argc ? argv[0] : "");
+    size_t execfn_len = strlen(execfn_str) + 1;
+    top -= execfn_len;
+    memcpy(top, execfn_str, execfn_len);
+    uint64_t execfn = (uint64_t)top;
     top -= 8;
     memcpy(top, "aarch64", 8);
     uint64_t plat = (uint64_t)top;
@@ -1016,7 +1026,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {15, plat},
         {25, rnd},
         {23, 0},
-        {31, argc ? argp[0] : 0},
+        {31, execfn},
         {0, 0},
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);
