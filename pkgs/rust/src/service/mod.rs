@@ -22,8 +22,8 @@ mod server;
 #[cfg(test)]
 use descriptor::Descriptors;
 #[cfg(test)]
-use hl_engine_protocol::{decode_reply, encode_request};
-pub(crate) use hl_engine_protocol::{
+use crate::protocol::{decode_reply, encode_request};
+pub(crate) use crate::protocol::{
     decode_request, encode_namespace_install, encode_reply, ProjectionKind, Reply, Request,
     SeekWhence, ServiceFailure, ServiceProjection, ServiceStat,
 };

@@ -20,23 +20,8 @@ include = [
     "tests/**",
 ]
 
-[workspace]
-members = [
-    "crates/api",
-    "crates/provider",
-    "crates/protocol",
-    "crates/runtime",
-]
-resolver = "2"
-
 [lib]
 name = "hl_engine"
-
-[dependencies]
-hl-engine-api = { version = "0.1.0", path = "crates/api" }
-hl-engine-provider = { version = "0.1.0", path = "crates/provider" }
-hl-engine-protocol = { version = "0.1.0", path = "crates/protocol" }
-hl-engine-runtime = { version = "0.1.0", path = "crates/runtime" }
 
 [lints.rust]
 unsafe_code = "deny"

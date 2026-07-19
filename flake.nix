@@ -91,9 +91,9 @@
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
             version = "0.1.10";
-            # The publishable `hl-engine` crate is the workspace root at
-            # pkgs/rust; its member crates (api/provider/protocol/runtime) live
-            # under pkgs/rust/crates, so the whole pkgs/rust tree is the sandbox.
+            # The publishable `hl-engine` crate lives at pkgs/rust; its former
+            # api/provider/protocol/runtime member crates are now internal
+            # modules, so the whole pkgs/rust tree is the sandbox.
             src = pkgs.lib.cleanSourceWith {
               src = ./pkgs/rust;
               filter = path: type:
@@ -102,12 +102,11 @@
             };
             cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
-            # Build every workspace crate (lib + bins). Native-linking test
-            # binaries are skipped: they link the frozen `libhl-engine.a`
-            # activation archive, whose refresh is a separately gated
-            # frozen-asset publication (see pkgs/rust/assets/PROVENANCE.md),
-            # not part of the structural workspace build this check guards.
-            cargoBuildFlags = [ "--workspace" ];
+            # Build the crate (lib + bins). Native-linking test binaries are
+            # skipped: they link the frozen `libhl-engine.a` activation archive,
+            # whose refresh is a separately gated frozen-asset publication (see
+            # pkgs/rust/assets/PROVENANCE.md), not part of the structural build
+            # this check guards.
             doCheck = false;
           };
         });

@@ -1,7 +1,7 @@
 use crate::{
     extension::{Authorities, BindAccess, ExtensionCapability, HandlesAuthority, ProviderId},
     ffi,
-    runtime::ConfigFile,
+    configfile::ConfigFile,
     spec::{
         CheckpointCapabilities, CpuCapabilities, EngineCapabilities, EngineLimits,
         FilesystemCapabilities, GuestPlatform, LinuxCapabilities, MachineSpec, NetworkCapabilities,

@@ -4,7 +4,7 @@ use std::sync::MutexGuard;
 
 use crate::{Machine, Terminal};
 
-pub use hl_engine_api::control::{
+pub use crate::api::control::{
     AttachRequest, AttachmentKind, ExtensionHandle, ProcessInfo, ResourceUpdate, SignalTarget,
 };
 
