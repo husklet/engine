@@ -1227,6 +1227,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1);
+            set_guest_comm_name(g_procname); // keep /proc/self/{comm,status,stat} in sync with the new name
             G_RET(c) = 0;
             break;
         } // PR_SET_NAME

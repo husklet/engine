@@ -1858,6 +1858,13 @@ static void set_guest_comm(const char *execpath) {
     snprintf(g_comm_store, sizeof g_comm_store, "%.15s", b[0] ? b : "init");
 }
 
+// Set the task comm verbatim (not a basename): prctl(PR_SET_NAME) renames the running task, and Linux
+// exposes that exact name through /proc/self/{comm,status:Name,stat:field2}. Keeps the procfs comm surface
+// in sync with the prctl name so a rename after boot/exec is reflected everywhere.
+static void set_guest_comm_name(const char *name) {
+    snprintf(g_comm_store, sizeof g_comm_store, "%.15s", (name && name[0]) ? name : "init");
+}
+
 // Normalize a guest path LEXICALLY: collapse "//" and "." components and fold ".." (clamped at "/").
 // No fs access and no symlink resolution (exe_canon below adds that); always emits an absolute path.
 static void path_norm_lex(const char *in, char *out, size_t n) {
