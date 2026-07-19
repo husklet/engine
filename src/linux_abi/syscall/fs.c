@@ -1058,6 +1058,28 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (isatty(fd)) (void)ioctl(fd, TIOCSCTTY, 0);
             G_RET(c) = 0;
             break;
+        // TIOCGSID -- session id of the terminal (tcgetsid(3) drives this). The guest's children are real
+        // host processes in the engine's session, so the kernel's own tty->session binding is authoritative:
+        // forward to the real fd and translate only the INIT's identity (its real host session id -> guest 1),
+        // matching the TIOCGPGRP virtualization above so getsid(0) and TIOCGSID agree. A non-tty / non-ctty
+        // fd faithfully surfaces the host ENOTTY.
+        case 0x5429: {
+            pid_t sid = 0;
+            if (ioctl(fd, TIOCGSID, &sid) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-errno);
+                break;
+            }
+            if (g_init_hostpid && sid == g_init_hostpid) sid = 1; // init's real session -> guest sid 1
+            if (arg) *(int *)arg = (int)sid;
+            G_RET(c) = 0;
+            break;
+        }
+        // TIOCPKT -- packet mode on a pty master (script(1), expect, sshd, tmux use it to observe slave-side
+        // flush/flow/termios changes). The master is a real host pty fd, so the kernel frames the control byte
+        // into subsequent master reads once enabled; just forward the enable/disable to the real fd.
+        case 0x5420:
+            G_RET(c) = ioctl(fd, TIOCPKT, arg) < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+            break;
         default: {
             // Socket ioctls (SIOCGIF*): answer from the shared lo+eth0 model (netns.c) when `fd`
             // is a socket; otherwise ENOTTY.
