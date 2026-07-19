@@ -705,7 +705,11 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
 // Linux stamps si_code == SI_USER(0) and si_pid == the sending (== this) process; stamp the guest pid so
 // an SA_SIGINFO handler / sigwaitinfo sees the correct sender (sigqueue_value's kill(2) leg).
 static void raise_guest_signal(struct cpu *c, int sig) {
-    raise_guest_signal_si(c, sig, 0 /*SI_USER*/, 0, container_pid(), 0);
+    // Linux stamps si_uid == the REAL uid of the sending process (getuid()), not a hardcoded 0. Use the
+    // guest's modeled real uid (g_ruid: 0 for a root container, the launcher's uid in bare mode) so an
+    // SA_SIGINFO handler / sigwaitinfo / signalfd all read the correct sender credential.
+    cred_init();
+    raise_guest_signal_si(c, sig, 0 /*SI_USER*/, 0, container_pid(), g_ruid);
 }
 
 // Linux delivers SIGPIPE to a guest thread whose write(2)/writev(2)/send(2)-without-MSG_NOSIGNAL hit a
