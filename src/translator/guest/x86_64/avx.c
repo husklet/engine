@@ -279,6 +279,14 @@ static float avx_f16_to_f32(uint16_t bits) {
 static double sse_round_d(double x, int mode, int use_mxcsr);
 static float sse_round_f(float x, int mode, int use_mxcsr);
 
+// AES round primitives (defined with the legacy do_sse3b block below) reused by the VEX AES forms.
+static const uint8_t k_aes_sbox[256];
+static const uint8_t k_aes_isbox[256];
+static void aes_subbytes(uint8_t s[16], const uint8_t box[256]);
+static void aes_shiftrows(const uint8_t in[16], uint8_t out[16], int inv);
+static void aes_mixcolumns(uint8_t s[16], int inv);
+static inline int sat_s16(int v);
+
 void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
@@ -732,6 +740,43 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             }
             goto done;
         }
+        case 0x51: { // vsqrtps(NP)/pd(66)/ss(F3)/sd(F2): packed source = rm only; scalar low = sqrt(rm), rest = vvvv
+            int dbl = (pp == 1 || pp == 3), scalar = (pp == 2 || pp == 3);
+            int es = dbl ? 8 : 4;
+            avx_get_rm(state, c, &I, next, scalar ? es : W, b);
+            if (scalar) {
+                avx_get(c, vv, a);
+                memcpy(d, a, 16);
+                if (dbl) {
+                    double y;
+                    memcpy(&y, b, 8);
+                    double z = avx_dnan_f64(__builtin_sqrt(y), y, y);
+                    memcpy(d, &z, 8);
+                } else {
+                    float y;
+                    memcpy(&y, b, 4);
+                    float z = avx_dnan_f32(__builtin_sqrtf(y), y, y);
+                    memcpy(d, &z, 4);
+                }
+                avx_put(c, rd, d, 16);
+            } else {
+                for (int i = 0; i < W; i += es) {
+                    if (dbl) {
+                        double y;
+                        memcpy(&y, b + i, 8);
+                        double z = avx_dnan_f64(__builtin_sqrt(y), y, y);
+                        memcpy(d + i, &z, 8);
+                    } else {
+                        float y;
+                        memcpy(&y, b + i, 4);
+                        float z = avx_dnan_f32(__builtin_sqrtf(y), y, y);
+                        memcpy(d + i, &z, 4);
+                    }
+                }
+                avx_put(c, rd, d, W);
+            }
+            goto done;
+        }
         // logical: dst = src1 OP src2  (src1=vvvv, src2=rm). byte-wise over W.
         case 0xEF: // vpxor
         case 0xEB: // vpor
@@ -777,6 +822,222 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(&y, b + i, es);
                 uint64_t r = sub ? (x - y) : (x + y);
                 memcpy(d + i, &r, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // SSE3 horizontal FP + addsub: 7C haddps/pd, 7D hsubps/pd, D0 addsubps/pd. pp==1 => double,
+        // pp==3 => single. src1=vvvv, src2=rm; horizontal ops pair within each 128-bit lane.
+        case 0x7C:
+        case 0x7D:
+        case 0xD0: {
+            int dbl = (pp == 1);
+            int sub = (op == 0x7D);
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                if (!dbl) {
+                    float x[4], y[4], o[4];
+                    memcpy(x, a + lane, 16);
+                    memcpy(y, b + lane, 16);
+                    if (op == 0xD0) { // addsub: even lanes subtract, odd lanes add
+                        for (int i = 0; i < 4; i++)
+                            o[i] = (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i])
+                                           : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
+                    } else { // hadd/hsub
+                        o[0] = sub ? avx_dnan_f32(x[0] - x[1], x[0], x[1]) : avx_dnan_f32(x[0] + x[1], x[0], x[1]);
+                        o[1] = sub ? avx_dnan_f32(x[2] - x[3], x[2], x[3]) : avx_dnan_f32(x[2] + x[3], x[2], x[3]);
+                        o[2] = sub ? avx_dnan_f32(y[0] - y[1], y[0], y[1]) : avx_dnan_f32(y[0] + y[1], y[0], y[1]);
+                        o[3] = sub ? avx_dnan_f32(y[2] - y[3], y[2], y[3]) : avx_dnan_f32(y[2] + y[3], y[2], y[3]);
+                    }
+                    memcpy(d + lane, o, 16);
+                } else {
+                    double x[2], y[2], o[2];
+                    memcpy(x, a + lane, 16);
+                    memcpy(y, b + lane, 16);
+                    if (op == 0xD0) {
+                        o[0] = avx_dnan_f64(x[0] - y[0], x[0], y[0]);
+                        o[1] = avx_dnan_f64(x[1] + y[1], x[1], y[1]);
+                    } else {
+                        o[0] = sub ? avx_dnan_f64(x[0] - x[1], x[0], x[1]) : avx_dnan_f64(x[0] + x[1], x[0], x[1]);
+                        o[1] = sub ? avx_dnan_f64(y[0] - y[1], y[0], y[1]) : avx_dnan_f64(y[0] + y[1], y[0], y[1]);
+                    }
+                    memcpy(d + lane, o, 16);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // saturating integer add/sub, signed (EC/ED add, E8/E9 sub) and unsigned (DC/DD add, D8/D9 sub)
+        case 0xEC:
+        case 0xED:
+        case 0xE8:
+        case 0xE9:
+        case 0xDC:
+        case 0xDD:
+        case 0xD8:
+        case 0xD9: {
+            int word = (op == 0xED || op == 0xE9 || op == 0xDD || op == 0xD9);
+            int uns = (op == 0xDC || op == 0xDD || op == 0xD8 || op == 0xD9);
+            int sub = (op == 0xE8 || op == 0xE9 || op == 0xD8 || op == 0xD9);
+            int es = word ? 2 : 1;
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += es) {
+                uint64_t x = 0, y = 0;
+                memcpy(&x, a + i, es);
+                memcpy(&y, b + i, es);
+                int64_t o;
+                if (uns) {
+                    int64_t v = sub ? (int64_t)x - (int64_t)y : (int64_t)x + (int64_t)y;
+                    int64_t hi = word ? 65535 : 255;
+                    o = v < 0 ? 0 : v > hi ? hi : v;
+                } else {
+                    int sh = 64 - es * 8;
+                    int64_t sx = ((int64_t)x << sh) >> sh, sy = ((int64_t)y << sh) >> sh;
+                    int64_t v = sub ? sx - sy : sx + sy;
+                    int64_t lo = word ? -32768 : -128, hi = word ? 32767 : 127;
+                    o = v < lo ? lo : v > hi ? hi : v;
+                }
+                memcpy(d + i, &o, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // integer min/max: DA pminub, DE pmaxub, EA pminsw, EE pmaxsw
+        case 0xDA:
+        case 0xDE:
+        case 0xEA:
+        case 0xEE: {
+            int word = (op == 0xEA || op == 0xEE);
+            int is_max = (op == 0xDE || op == 0xEE);
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            if (word) { // signed word min/max
+                for (int i = 0; i < W; i += 2) {
+                    int16_t x, y;
+                    memcpy(&x, a + i, 2);
+                    memcpy(&y, b + i, 2);
+                    int16_t v = is_max ? (x > y ? x : y) : (x < y ? x : y);
+                    memcpy(d + i, &v, 2);
+                }
+            } else { // unsigned byte min/max
+                for (int i = 0; i < W; i++) {
+                    uint8_t x = a[i], y = b[i];
+                    d[i] = is_max ? (x > y ? x : y) : (x < y ? x : y);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // unsigned average, rounded: E0 pavgb, E3 pavgw
+        case 0xE0:
+        case 0xE3: {
+            int es = (op == 0xE0) ? 1 : 2;
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += es) {
+                uint64_t x = 0, y = 0;
+                memcpy(&x, a + i, es);
+                memcpy(&y, b + i, es);
+                uint64_t o = (x + y + 1) >> 1;
+                memcpy(d + i, &o, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // word multiply: D5 pmullw (low), E5 pmulhw (signed high), E4 pmulhuw (unsigned high)
+        case 0xD5:
+        case 0xE5:
+        case 0xE4: {
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 2) {
+                uint16_t xu, yu;
+                memcpy(&xu, a + i, 2);
+                memcpy(&yu, b + i, 2);
+                uint16_t o;
+                if (op == 0xD5)
+                    o = (uint16_t)(xu * yu);
+                else if (op == 0xE4)
+                    o = (uint16_t)(((uint32_t)xu * (uint32_t)yu) >> 16);
+                else
+                    o = (uint16_t)(((int32_t)(int16_t)xu * (int32_t)(int16_t)yu) >> 16);
+                memcpy(d + i, &o, 2);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0xF5: { // vpmaddwd: dword = a.word[2i]*b.word[2i] + a.word[2i+1]*b.word[2i+1] (signed)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 4) {
+                int16_t x0, x1, y0, y1;
+                memcpy(&x0, a + i, 2);
+                memcpy(&x1, a + i + 2, 2);
+                memcpy(&y0, b + i, 2);
+                memcpy(&y1, b + i + 2, 2);
+                int32_t o = (int32_t)x0 * (int32_t)y0 + (int32_t)x1 * (int32_t)y1;
+                memcpy(d + i, &o, 4);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0xF6: { // vpsadbw: per 8-byte block, sum of |a-b| -> low word of each qword, rest zero
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            memset(d, 0, 64);
+            for (int q = 0; q < W; q += 8) {
+                int sum = 0;
+                for (int k = 0; k < 8; k++) {
+                    int diff = (int)a[q + k] - (int)b[q + k];
+                    sum += diff < 0 ? -diff : diff;
+                }
+                uint16_t o = (uint16_t)sum;
+                memcpy(d + q, &o, 2);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        // variable (scalar-count) shifts: count = low 64 bits of rm applied to every element.
+        case 0xD1:
+        case 0xD2:
+        case 0xD3: // vpsrlw/d/q (logical right)
+        case 0xE1:
+        case 0xE2: // vpsraw/d (arithmetic right)
+        case 0xF1:
+        case 0xF2:
+        case 0xF3: { // vpsllw/d/q (logical left)
+            int es = (op == 0xD1 || op == 0xE1 || op == 0xF1)   ? 2
+                     : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4
+                                                                : 8;
+            int arith = (op == 0xE1 || op == 0xE2);
+            int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, 16, b); // count is the low 64 bits of the r/m 128-bit operand
+            uint64_t cnt;
+            memcpy(&cnt, b, 8);
+            int bits = es * 8;
+            for (int i = 0; i < W; i += es) {
+                uint64_t x = 0;
+                memcpy(&x, a + i, es);
+                uint64_t o;
+                if (cnt >= (uint64_t)bits) {
+                    if (arith) {
+                        int64_t sh = 64 - bits;
+                        o = (uint64_t)(((int64_t)(x << sh) >> sh) < 0 ? ~0ull : 0ull);
+                    } else
+                        o = 0;
+                } else if (left) {
+                    o = x << cnt;
+                } else if (arith) {
+                    int64_t sh = 64 - bits;
+                    int64_t sx = ((int64_t)(x << sh)) >> sh;
+                    o = (uint64_t)(sx >> cnt);
+                } else {
+                    o = x >> cnt;
+                }
+                memcpy(d + i, &o, es);
             }
             avx_put(c, rd, d, W);
             goto done;
@@ -1014,6 +1275,241 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
+        case 0x01: // vphaddw    per-128-lane horizontal add/sub of adjacent pairs; src1=vvvv, src2=rm.
+        case 0x02: // vphaddd    (03/07 saturate the 16-bit results)
+        case 0x03: // vphaddsw
+        case 0x05: // vphsubw
+        case 0x06: // vphsubd
+        case 0x07: { // vphsubsw
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            int sub = (op >= 0x05), sat = (op == 0x03 || op == 0x07), dword = (op == 0x02 || op == 0x06);
+            for (int lane = 0; lane < W; lane += 16) {
+                if (dword) {
+                    int32_t x[4], y[4], o[4];
+                    memcpy(x, a + lane, 16);
+                    memcpy(y, b + lane, 16);
+                    o[0] = sub ? x[0] - x[1] : x[0] + x[1];
+                    o[1] = sub ? x[2] - x[3] : x[2] + x[3];
+                    o[2] = sub ? y[0] - y[1] : y[0] + y[1];
+                    o[3] = sub ? y[2] - y[3] : y[2] + y[3];
+                    memcpy(d + lane, o, 16);
+                } else {
+                    int16_t x[8], y[8], o[8];
+                    memcpy(x, a + lane, 16);
+                    memcpy(y, b + lane, 16);
+                    for (int i = 0; i < 4; i++) {
+                        int va = sub ? x[2 * i] - x[2 * i + 1] : x[2 * i] + x[2 * i + 1];
+                        int vb = sub ? y[2 * i] - y[2 * i + 1] : y[2 * i] + y[2 * i + 1];
+                        o[i] = sat ? (int16_t)sat_s16(va) : (int16_t)va;
+                        o[i + 4] = sat ? (int16_t)sat_s16(vb) : (int16_t)vb;
+                    }
+                    memcpy(d + lane, o, 16);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x04: { // vpmaddubsw: word = sat16(uD[2k]*sB[2k] + uD[2k+1]*sB[2k+1]); src1 unsigned, src2 signed
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                int16_t o[8];
+                for (int k = 0; k < 8; k++) {
+                    int p = (int)(uint8_t)a[lane + 2 * k] * (int)(int8_t)b[lane + 2 * k] +
+                            (int)(uint8_t)a[lane + 2 * k + 1] * (int)(int8_t)b[lane + 2 * k + 1];
+                    o[k] = (int16_t)sat_s16(p);
+                }
+                memcpy(d + lane, o, 16);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x08:   // vpsignb: dst = (src2<0)?-src1 : (src2==0)?0 : src1  (per element width)
+        case 0x09:   // vpsignw
+        case 0x0A: { // vpsignd
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            int es = (op == 0x08) ? 1 : (op == 0x09) ? 2 : 4;
+            for (int i = 0; i < W; i += es) {
+                int64_t x = 0, y = 0;
+                memcpy(&x, a + i, es);
+                memcpy(&y, b + i, es);
+                int sh = 64 - es * 8;
+                x = (x << sh) >> sh;
+                y = (y << sh) >> sh; // sign-extend both
+                int64_t o = (y < 0) ? -x : (y == 0) ? 0 : x;
+                memcpy(d + i, &o, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x0B: { // vpmulhrsw: o = (((a*b)>>14)+1)>>1 signed words; src1=vvvv, src2=rm
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 2) {
+                int16_t x, y;
+                memcpy(&x, a + i, 2);
+                memcpy(&y, b + i, 2);
+                int16_t o = (int16_t)((((x * y) >> 14) + 1) >> 1);
+                memcpy(d + i, &o, 2);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x1C:   // vpabsb: dst = |src| (single source r/m), per element width
+        case 0x1D:   // vpabsw
+        case 0x1E: { // vpabsd
+            avx_get_rm(state, c, &I, next, W, b);
+            int es = (op == 0x1C) ? 1 : (op == 0x1D) ? 2 : 4;
+            for (int i = 0; i < W; i += es) {
+                int64_t x = 0;
+                memcpy(&x, b + i, es);
+                int sh = 64 - es * 8;
+                x = (x << sh) >> sh;
+                int64_t o = x < 0 ? -x : x;
+                memcpy(d + i, &o, es);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x28: { // vpmuldq: signed even-dword products -> qwords, per-128-lane
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                int32_t x[4], y[4];
+                int64_t o[2];
+                memcpy(x, a + lane, 16);
+                memcpy(y, b + lane, 16);
+                o[0] = (int64_t)x[0] * (int64_t)y[0];
+                o[1] = (int64_t)x[2] * (int64_t)y[2];
+                memcpy(d + lane, o, 16);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x29: { // vpcmpeqq: per-qword equality -> all-ones/zero
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 8) {
+                uint64_t x, y;
+                memcpy(&x, a + i, 8);
+                memcpy(&y, b + i, 8);
+                uint64_t o = (x == y) ? ~0ull : 0;
+                memcpy(d + i, &o, 8);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x2A: { // vmovntdqa: streaming aligned load m128/m256 -> reg
+            avx_get_rm(state, c, &I, next, W, b);
+            avx_put(c, rd, b, W);
+            goto done;
+        }
+        case 0x37: { // vpcmpgtq: per-qword signed greater-than -> all-ones/zero
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 8) {
+                int64_t x, y;
+                memcpy(&x, a + i, 8);
+                memcpy(&y, b + i, 8);
+                uint64_t o = (x > y) ? ~0ull : 0;
+                memcpy(d + i, &o, 8);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x38:   // vpminsb/vpmaxsb (byte), vpminsd/vpmaxsd (dword),
+        case 0x39:   // vpminuw/vpmaxuw (word), vpminud/vpmaxud (dword) -- src1=vvvv, src2=rm
+        case 0x3A:
+        case 0x3B:
+        case 0x3C:
+        case 0x3D:
+        case 0x3E:
+        case 0x3F: {
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            int is_max = (op >= 0x3C);
+            if (op == 0x38 || op == 0x3C) { // signed byte
+                for (int i = 0; i < W; i++) {
+                    int8_t x = (int8_t)a[i], y = (int8_t)b[i];
+                    d[i] = (uint8_t)(is_max ? (x > y ? x : y) : (x < y ? x : y));
+                }
+            } else if (op == 0x3A || op == 0x3E) { // unsigned word
+                for (int i = 0; i < W; i += 2) {
+                    uint16_t x, y;
+                    memcpy(&x, a + i, 2);
+                    memcpy(&y, b + i, 2);
+                    uint16_t o = is_max ? (x > y ? x : y) : (x < y ? x : y);
+                    memcpy(d + i, &o, 2);
+                }
+            } else if (op == 0x39 || op == 0x3D) { // signed dword
+                for (int i = 0; i < W; i += 4) {
+                    int32_t x, y;
+                    memcpy(&x, a + i, 4);
+                    memcpy(&y, b + i, 4);
+                    int32_t o = is_max ? (x > y ? x : y) : (x < y ? x : y);
+                    memcpy(d + i, &o, 4);
+                }
+            } else { // 0x3B/0x3F unsigned dword
+                for (int i = 0; i < W; i += 4) {
+                    uint32_t x, y;
+                    memcpy(&x, a + i, 4);
+                    memcpy(&y, b + i, 4);
+                    uint32_t o = is_max ? (x > y ? x : y) : (x < y ? x : y);
+                    memcpy(d + i, &o, 4);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x41: { // vphminposuw: 128-bit only; word0=min unsigned word of rm, word1=its index, rest 0
+            avx_get_rm(state, c, &I, next, 16, b);
+            uint16_t w[8];
+            memcpy(w, b, 16);
+            uint16_t best = w[0];
+            int idx = 0;
+            for (int i = 1; i < 8; i++)
+                if (w[i] < best) {
+                    best = w[i];
+                    idx = i;
+                }
+            uint16_t o[8] = {best, (uint16_t)idx, 0, 0, 0, 0, 0, 0};
+            avx_put(c, rd, (uint8_t *)o, 16);
+            goto done;
+        }
+        case 0x0E:   // vtestps: like vptest but tests only the per-dword sign bits
+        case 0x0F:   // vtestpd: per-qword sign bits
+        case 0x17: { // vptest: ZF=(op1 & op2)==0, CF=(op2 & ~op1)==0 over the full width; op1=reg, op2=rm
+            avx_get(c, rd, a); // op1 (ModRM.reg); VPTEST/VTEST take no vvvv
+            avx_get_rm(state, c, &I, next, W, b);
+            uint64_t zacc = 0, cacc = 0;
+            if (op == 0x17) { // full-width bitwise
+                for (int i = 0; i < W; i += 8) {
+                    uint64_t x, y;
+                    memcpy(&x, a + i, 8);
+                    memcpy(&y, b + i, 8);
+                    zacc |= (x & y);
+                    cacc |= (y & ~x);
+                }
+            } else { // sign-bit only, per dword (ps) / qword (pd)
+                int es = (op == 0x0E) ? 4 : 8;
+                uint64_t smask = 1ull << (es * 8 - 1);
+                for (int i = 0; i < W; i += es) {
+                    uint64_t x = 0, y = 0;
+                    memcpy(&x, a + i, es);
+                    memcpy(&y, b + i, es);
+                    zacc |= (x & y & smask);
+                    cacc |= (y & ~x & smask);
+                }
+            }
+            int zf = (zacc == 0), cf = (cacc == 0);
+            c->nzcv = ((uint64_t)zf << 30) | ((uint64_t)(!cf) << 29);
+            c->pf = 1;
+            c->af = 0;
+            c->rip = next;
+            return;
+        }
         case 0x78:
         case 0x79:
         case 0x58:
@@ -1032,6 +1528,78 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             for (int i = 0; i < W; i += es)
                 memcpy(d + i, b, es);
             avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x1A:   // vbroadcastf128: m128 -> both 128-bit lanes of ymm (256-bit only)
+        case 0x5A: { // vbroadcasti128: same m128 -> both lanes broadcast
+            avx_get_rm(state, c, &I, next, 16, b); // low m128 source
+            memcpy(d, b, 16);
+            memcpy(d + 16, b, 16);
+            avx_put(c, rd, d, 32);
+            goto done;
+        }
+        case 0x2C:   // vmaskmovps (load): per-dword mask in vvvv, data from mem, masked-off lanes = 0
+        case 0x2D: { // vmaskmovpd (load): per-qword mask
+            int es = (op == 0x2C) ? 4 : 8;
+            avx_get(c, vv, a); // mask register (VEX.vvvv)
+            memset(d, 0, 64);
+            uint64_t ea = avx_ea(state, c, &I, next, W);
+            for (int i = 0; i < W; i += es)
+                if (a[i + es - 1] & 0x80) memcpy(d + i, (void *)(ea + i), es);
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x2E:   // vmaskmovps (store): mask in vvvv, source reg = ModRM.reg, dest = mem
+        case 0x2F: { // vmaskmovpd (store)
+            int es = (op == 0x2E) ? 4 : 8;
+            avx_get(c, vv, a); // mask
+            avx_get(c, rd, b); // source data (ModRM.reg is the src for the store form)
+            uint64_t ea = avx_ea(state, c, &I, next, W);
+            for (int i = 0; i < W; i += es)
+                if (a[i + es - 1] & 0x80) memcpy((void *)(ea + i), b + i, es);
+            goto done;
+        }
+        case 0x8C: { // vpmaskmovd/q (load): VEX.W selects dword/qword element; mask in vvvv
+            int es = I.vex_w ? 8 : 4;
+            avx_get(c, vv, a);
+            memset(d, 0, 64);
+            uint64_t ea = avx_ea(state, c, &I, next, W);
+            for (int i = 0; i < W; i += es)
+                if (a[i + es - 1] & 0x80) memcpy(d + i, (void *)(ea + i), es);
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x8E: { // vpmaskmovd/q (store)
+            int es = I.vex_w ? 8 : 4;
+            avx_get(c, vv, a);
+            avx_get(c, rd, b);
+            uint64_t ea = avx_ea(state, c, &I, next, W);
+            for (int i = 0; i < W; i += es)
+                if (a[i + es - 1] & 0x80) memcpy((void *)(ea + i), b + i, es);
+            goto done;
+        }
+        case 0xDB: { // vaesimc xmm, xmm/m128: dst = InvMixColumns(src) (2-operand, no vvvv)
+            avx_get_rm(state, c, &I, next, 16, b);
+            memcpy(d, b, 16);
+            aes_mixcolumns(d, 1);
+            avx_put(c, rd, d, 16);
+            goto done;
+        }
+        case 0xDC:   // vaesenc     dst = MixColumns(SubBytes(ShiftRows(src1))) ^ src2(key)
+        case 0xDD:   // vaesenclast dst = SubBytes(ShiftRows(src1)) ^ key (no MixColumns)
+        case 0xDE:   // vaesdec     inverse round with MixColumns
+        case 0xDF: { // vaesdeclast inverse round, no InvMixColumns
+            avx_get(c, vv, a);                     // src1 (state)
+            avx_get_rm(state, c, &I, next, 16, b); // src2 (round key)
+            uint8_t t[16];
+            int dec = (op == 0xDE || op == 0xDF);
+            aes_shiftrows(a, t, dec);
+            aes_subbytes(t, dec ? k_aes_isbox : k_aes_sbox);
+            if (op == 0xDC) aes_mixcolumns(t, 0);
+            if (op == 0xDE) aes_mixcolumns(t, 1);
+            for (int i = 0; i < 16; i++)
+                d[i] = t[i] ^ b[i];
+            avx_put(c, rd, d, 16);
             goto done;
         }
         case 0x20: // vpmovsxbw   vpmov{s,z}x{b,w,d}{w,d,q}: widen a smaller source element with
@@ -1077,7 +1645,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x36: {           // vpermd: dst.dword[i] = rm.dword[ vvvv.dword[i] & 7 ] (across full 256)
+        case 0x16:   // vpermps: identical to vpermd but float lanes -- ctrl=vvvv, data=rm, full-256 dword select
+        case 0x36: { // vpermd: dst.dword[i] = rm.dword[ vvvv.dword[i] & 7 ] (across full 256)
             avx_get(c, vv, a); // control indices
             avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += 4) {
@@ -1085,6 +1654,30 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(&idx, a + i, 4);
                 memcpy(d + i, b + 4 * (idx & 7), 4);
             }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x0C: { // vpermilps (variable): per-128-lane dword select; data=vvvv, control=rm (imm[1:0] per dword)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16)
+                for (int j = 0; j < 4; j++) {
+                    uint32_t ctl;
+                    memcpy(&ctl, b + lane + 4 * j, 4);
+                    memcpy(d + lane + 4 * j, a + lane + 4 * (ctl & 3), 4);
+                }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x0D: { // vpermilpd (variable): per-128-lane qword select; data=vvvv, control=rm (bit 1 per qword)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16)
+                for (int k = 0; k < 2; k++) {
+                    uint64_t ctl;
+                    memcpy(&ctl, b + lane + 8 * k, 8);
+                    memcpy(d + lane + 8 * k, a + lane + 8 * ((ctl >> 1) & 1), 8);
+                }
             avx_put(c, rd, d, W);
             goto done;
         }
@@ -1489,6 +2082,63 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     d[lane + i] = (sh + i < 32) ? t[sh + i] : 0;
             }
             avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x42: { // vmpsadbw imm8: per-128-lane SAD windows; src1=vvvv, src2=rm.
+            // Low lane uses imm[2:0] (imm[1:0]=src2 block, imm[2]=src1 block); the high 128-bit
+            // lane (256-bit form) uses imm[5:3] the same way.
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                int ctl = (I.imm >> ((lane / 16) * 3)) & 7;
+                int boff = (ctl & 3) * 4;
+                int aoff = ((ctl >> 2) & 1) * 4;
+                uint16_t o[8];
+                for (int i = 0; i < 8; i++) {
+                    int sum = 0;
+                    for (int k = 0; k < 4; k++) {
+                        int diff = (int)a[lane + aoff + i + k] - (int)b[lane + boff + k];
+                        sum += diff < 0 ? -diff : diff;
+                    }
+                    o[i] = (uint16_t)sum;
+                }
+                memcpy(d + lane, o, 16);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x44: { // vpclmulqdq imm8: per-128-lane carryless multiply of selected 64-bit halves.
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                uint64_t a64, b64;
+                memcpy(&a64, a + lane + 8 * (I.imm & 1), 8);
+                memcpy(&b64, b + lane + 8 * ((I.imm >> 4) & 1), 8);
+                unsigned __int128 prod = 0;
+                for (int i = 0; i < 64; i++)
+                    if ((b64 >> i) & 1) prod ^= (unsigned __int128)a64 << i;
+                memcpy(d + lane, &prod, 16);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0xDF: { // vaeskeygenassist xmm, xmm/m128, imm8 (2-operand: SubWord+RotWord+RCON on dw1/dw3)
+            avx_get_rm(state, c, &I, next, 16, b);
+            uint32_t x[4];
+            memcpy(x, b, 16);
+            uint32_t rcon = (uint32_t)(I.imm & 0xff);
+            uint32_t o[4];
+            for (int j = 1; j <= 3; j += 2) {
+                uint32_t X = x[j];
+                uint32_t sub = (uint32_t)k_aes_sbox[X & 0xff] | ((uint32_t)k_aes_sbox[(X >> 8) & 0xff] << 8) |
+                               ((uint32_t)k_aes_sbox[(X >> 16) & 0xff] << 16) |
+                               ((uint32_t)k_aes_sbox[(X >> 24) & 0xff] << 24);
+                uint32_t ror = (sub >> 8) | (sub << 24); // ROTWORD (rotr by one byte)
+                o[j - 1] = sub;
+                o[j] = ror ^ rcon;
+            }
+            memcpy(d, o, 16);
+            avx_put(c, rd, d, 16);
             goto done;
         }
         }
