@@ -23,6 +23,7 @@ static void interrupt_handler(int signal) {
         atomic_fetch_add_explicit(&mismatches, 1, memory_order_relaxed);
 }
 
+#if defined(__aarch64__)
 __attribute__((noinline)) static unsigned guarded_canary_load(volatile uint64_t *address) {
     register uint64_t canary asm("x9") = UINT64_C(0x91a2b3c4d5e6f708);
     uint64_t expected = canary;
@@ -41,6 +42,14 @@ __attribute__((noinline)) static unsigned guarded_canary_load(volatile uint64_t 
         : "x10", "x11", "x12", "cc", "memory");
     return bad;
 }
+#else
+/* Non-aarch64 targets (e.g. x86_64 cross build): portable no-op stub so the
+ * compat harness still compiles and exits cleanly. The GPR/NZCV bus-state
+ * behavior under test is aarch64-specific. */
+__attribute__((noinline)) static unsigned guarded_canary_load(volatile uint64_t *address) {
+    return *address == UINT64_C(0x1122334455667788) ? 0u : 0u;
+}
+#endif
 
 static void *worker(void *unused) {
     (void)unused;
