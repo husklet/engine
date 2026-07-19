@@ -82,3 +82,6 @@ mkstempt	portable	mkstempt.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expec
 flockfilet	portable	flockfilet.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/flockfilet.out	linux-libc	active	flockfile + getc_unlocked/putc_unlocked stream atomicity
 freopent	portable	freopent.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/freopent.out	linux-libc	active	fdopen + freopen stream redirection
 rusaget	portable	rusaget.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/rusaget.out	linux-libc	active	getrusage SELF/CHILDREN/THREAD accounting
+pthread-cancel-async	portable	pthcancelasync.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/pthcancelasync.out	linux-libc,pthreads	excluded-known-bug	PTHREAD_CANCEL_ASYNCHRONOUS cancellation of a busy-looping thread is honored (engine never cancels, join hangs)
+mq-notify-thread	portable	mqnotify.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/mqnotify.out	linux-libc,mqueue	excluded-known-bug	mq_notify SIGEV_THREAD fires the notification callback on message arrival (engine never fires it)
+termios-raw	portable	termraw.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/termraw.out	linux-libc,termios	excluded-known-bug	termios raw-mode speed/tcflush/tcdrain/tcsendbreak operations fail in the engine
