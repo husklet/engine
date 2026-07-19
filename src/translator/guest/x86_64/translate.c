@@ -3253,7 +3253,12 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_s(16, 17);
                         s = 16;
                     }
-                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (s << 16) | (vd << 5)); // FCMP Dvd, Ds  (Rd=0)
+                    // COMISS/COMISD (0x2F) is the SIGNALING ordered compare: it raises Invalid (IE)
+                    // on ANY NaN operand, including qNaN. UCOMISS/UCOMISD (0x2E) is quiet: IE only for
+                    // sNaN. Map 0x2F -> FCMPE (bit4 set) and 0x2E -> FCMP. EFLAGS result is identical
+                    // for both (unordered -> N0 Z0 C1 V1), so the fixup below is unchanged.
+                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (op == 0x2F ? 0x10u : 0u) |
+                           (s << 16) | (vd << 5)); // FCMP/FCMPE Dvd, Ds  (Rd=0)
                     e_nzcv_save_fcmp();  // unordered fixup: x86 ZF=PF=CF=1, SF=0 (ARM FCMP gives N0 Z0 C1 V1)
                 } else if (op == 0xF4) { // pmuludq: vd.u64[i] = (u32)vd.even32[i] * (u32)src.even32[i]
                     // W3b: was UNIMPL -> blocked glibc strchr/strrchr (byte-broadcast via pmuludq).
@@ -3604,6 +3609,18 @@ static void *translate_block(uint64_t gpc) {
                         e_movconst(21, 3u << 22);
                         e_rrr(A_BIC, 19, 19, 21, 1, 0);  // clear RMode
                         e_rrr(A_ORR, 19, 19, 20, 1, 22); // FPCR.RMode = ARM RMode
+                        // MXCSR.FTZ(15)|DAZ(6) -> host FPCR.FZ(24). ARM FPCR.FZ flushes both
+                        // denormal inputs and outputs, so the common FTZ+DAZ pair maps exactly;
+                        // a lone FTZ/DAZ over-flushes the other direction (documented approximation)
+                        // -- strictly better than the prior behavior of never flushing at all.
+                        e_lsr_i(16, 23, 15, 0);          // x16 = MXCSR>>15 (FTZ -> bit0)
+                        e_lsr_i(20, 23, 6, 0);           // x20 = MXCSR>>6  (DAZ -> bit0)
+                        e_rrr(A_ORR, 16, 16, 20, 0, 0);  // x16 = FTZ|DAZ (junk in high bits)
+                        e_movconst(20, 1);
+                        e_rrr(A_AND, 16, 16, 20, 0, 0);  // x16 = (FTZ|DAZ)&1
+                        e_movconst(20, 1u << 24);
+                        e_rrr(A_BIC, 19, 19, 20, 1, 0);  // clear FPCR.FZ
+                        e_rrr(A_ORR, 19, 19, 16, 1, 24); // FPCR.FZ = (FTZ|DAZ)
                         emit32(0xD51B4400u | 19);        // msr fpcr, x19
                         emit_mxcsr_to_fpsr(23);          // MXCSR sticky flags -> host FPSR (so feclearexcept clears)
                     }
@@ -3624,6 +3641,14 @@ static void *translate_block(uint64_t gpc) {
                         e_movconst(16, 0x1f80);          // default MXCSR (all exceptions masked, RC=00)
                         e_rrr(A_ORR, 16, 16, 19, 0, 13); // MXCSR |= RC << 13
                         emit_fpsr_to_mxcsr(16);          // + live sticky exception flags (IE/DE/ZE/OE/UE/PE)
+                        // reflect host FPCR.FZ(24) back to MXCSR FTZ(15)+DAZ(6) so a guest that
+                        // saves/restores the control word preserves flush-to-zero mode.
+                        emit32(0xD53B4400u | 19);        // mrs x19, fpcr
+                        e_lsr_i(19, 19, 24, 0);          // x19 = FPCR>>24 (FZ -> bit0)
+                        e_movconst(20, 1);
+                        e_rrr(A_AND, 19, 19, 20, 0, 0);  // x19 = FZ&1
+                        e_rrr(A_ORR, 16, 16, 19, 0, 15); // MXCSR |= FZ<<15 (FTZ)
+                        e_rrr(A_ORR, 16, 16, 19, 0, 6);  // MXCSR |= FZ<<6  (DAZ)
                         e_store(4, 16, 17);
                     }
                     gpc = next;
