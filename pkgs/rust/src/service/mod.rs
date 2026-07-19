@@ -16,17 +16,58 @@ use std::{
 };
 
 mod descriptor;
-mod projection;
-mod protocol;
 mod provider;
 mod server;
 
 #[cfg(test)]
 use descriptor::Descriptors;
-pub(crate) use projection::*;
-pub(crate) use protocol::*;
+#[cfg(test)]
+use hl_engine_protocol::{decode_reply, encode_request};
+pub(crate) use hl_engine_protocol::{
+    decode_request, encode_namespace_install, encode_reply, Reply, Request, SeekWhence,
+    ServiceFailure, ServiceProjection, ServiceStat,
+};
 pub(crate) use provider::*;
 pub(crate) use server::*;
+
+pub(crate) trait ServiceTransport: Send + Sync {
+    fn request(
+        &self,
+        id: u64,
+        request: Request,
+        deadline: Instant,
+    ) -> Result<Reply, ServiceFailure>;
+    fn cancel(&self, id: u64);
+}
+
+fn system_deadline(deadline: Instant) -> SystemTime {
+    SystemTime::now() + deadline.saturating_duration_since(Instant::now())
+}
+
+fn linux(errno: i32, context: &str) -> ServiceFailure {
+    ServiceFailure::Linux(LinuxError {
+        errno,
+        context: context.into(),
+    })
+}
+
+fn require(
+    operations: &std::collections::BTreeSet<HandleOperation>,
+    operation: HandleOperation,
+) -> Result<(), ServiceFailure> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(linux(
+            95,
+            "service operation was not granted for this launch",
+        ))
+    }
+}
+
+fn protocol() -> ServiceFailure {
+    ServiceFailure::Transport(TransportError::Malformed)
+}
 
 #[cfg(test)]
 mod tests {
@@ -236,121 +277,6 @@ mod tests {
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(1)
     }
-
-    #[test]
-    fn frozen_codec_roundtrips_owned_requests_replies_and_errno() {
-        let request = Request::Write {
-            handle: 7,
-            offset: 11,
-            bytes: b"owned".to_vec(),
-        };
-        let encoded = encode_request(&request, 16).unwrap();
-        assert_eq!(
-            encoded,
-            [
-                vec![WRITE],
-                7_u64.to_le_bytes().to_vec(),
-                11_u64.to_le_bytes().to_vec(),
-                5_u32.to_le_bytes().to_vec(),
-                b"owned".to_vec()
-            ]
-            .concat()
-        );
-        assert_eq!(decode_request(&encoded, 16).unwrap(), request);
-
-        let expected = Reply::Ready(Readiness {
-            states: [ReadyState::Readable, ReadyState::Hangup]
-                .into_iter()
-                .collect(),
-        });
-        let reply = Ok(expected.clone());
-        let encoded = encode_reply(&reply, 16).unwrap();
-        assert_eq!(decode_reply(&encoded, 16).unwrap(), expected);
-
-        let expected = ServiceFailure::Linux(LinuxError {
-            errno: 19,
-            context: "provider unavailable".into(),
-        });
-        let error = Err(expected.clone());
-        let encoded = encode_reply(&error, 64).unwrap();
-        assert_eq!(decode_reply(&encoded, 64).unwrap_err(), expected);
-    }
-
-    #[test]
-
-    fn frozen_codec_rejects_trailing_invalid_and_oversized_payloads() {
-        let mut request = encode_request(&Request::Close { handle: 1 }, 8).unwrap();
-        request.push(0);
-        assert_eq!(decode_request(&request, 8).unwrap_err(), protocol());
-        assert!(matches!(
-            decode_request(&[WRITE], 8),
-            Err(ServiceFailure::Transport(TransportError::Malformed))
-        ));
-        assert!(matches!(
-            encode_request(
-                &Request::Write {
-                    handle: 1,
-                    offset: 0,
-                    bytes: vec![0; 9]
-                },
-                8
-            ),
-            Err(ServiceFailure::Linux(LinuxError { errno: 22, .. }))
-        ));
-    }
-
-    #[test]
-
-    fn namespace_install_is_bounded_transactional_and_normalized() {
-        let entries = vec![ServiceProjection {
-            path: "/run/provider".into(),
-            service: ServiceId(9),
-            mode: 0o660,
-            uid: 10,
-            gid: 20,
-        }];
-        let wire = encode_namespace_install(&entries, 4, 128).unwrap();
-        assert_eq!(decode_namespace_install(&wire, 4, 128).unwrap(), entries);
-        let conflicts = vec![
-            ServiceProjection {
-                path: "/run/provider".into(),
-                service: ServiceId(1),
-                mode: 0o600,
-                uid: 0,
-                gid: 0,
-            },
-            ServiceProjection {
-                path: "/run/provider/child".into(),
-                service: ServiceId(2),
-                mode: 0o600,
-                uid: 0,
-                gid: 0,
-            },
-        ];
-        assert!(matches!(
-            encode_namespace_install(&conflicts, 4, 128),
-            Err(ServiceFailure::Linux(LinuxError { errno: 20, .. }))
-        ));
-        let escaped = vec![ServiceProjection {
-            path: "/run/../escape".into(),
-            service: ServiceId(1),
-            mode: 0o600,
-            uid: 0,
-            gid: 0,
-        }];
-        assert!(matches!(
-            encode_namespace_install(&escaped, 4, 128),
-            Err(ServiceFailure::Linux(LinuxError { errno: 22, .. }))
-        ));
-        let mut trailing = wire;
-        trailing.push(0);
-        assert_eq!(
-            decode_namespace_install(&trailing, 4, 128).unwrap_err(),
-            protocol()
-        );
-    }
-
-    #[test]
 
     fn parent_dispatcher_owns_handles_enforces_quota_and_cleans_up() {
         let bytes = Arc::new(Mutex::new(b"abc".to_vec()));

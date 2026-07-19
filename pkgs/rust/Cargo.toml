@@ -26,6 +26,7 @@ name = "hl_engine"
 [dependencies]
 hl-engine-api = { version = "0.1.0", path = "../api" }
 hl-engine-provider = { version = "0.1.0", path = "../provider" }
+hl-engine-protocol = { version = "0.1.0", path = "../protocol" }
 
 [lints.rust]
 unsafe_code = "deny"

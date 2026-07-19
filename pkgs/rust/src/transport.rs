@@ -12,55 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAGIC: u32 = 0x484c_5052;
-const VERSION: u16 = 1;
-const HEADER_BYTES: usize = 32;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum MessageType {
-    Hello = 1,
-    Ready = 2,
-    Request = 3,
-    Reply = 4,
-    Cancel = 5,
-    Close = 6,
-    NamespaceInstall = 7,
-    NamespaceReady = 8,
-    Subscribe = 9,
-    Unsubscribe = 10,
-    ReadinessEvent = 11,
-}
-
-impl TryFrom<u16> for MessageType {
-    type Error = TransportError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Hello),
-            2 => Ok(Self::Ready),
-            3 => Ok(Self::Request),
-            4 => Ok(Self::Reply),
-            5 => Ok(Self::Cancel),
-            6 => Ok(Self::Close),
-            7 => Ok(Self::NamespaceInstall),
-            8 => Ok(Self::NamespaceReady),
-            9 => Ok(Self::Subscribe),
-            10 => Ok(Self::Unsubscribe),
-            11 => Ok(Self::ReadinessEvent),
-            _ => Err(TransportError::Malformed),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-
-pub struct Frame {
-    pub kind: MessageType,
-    pub request_id: u64,
-    pub features: u64,
-    pub payload: Vec<u8>,
-}
+use hl_engine_protocol::{decode_header, encode_header, HEADER_BYTES};
+pub use hl_engine_protocol::{Frame, MessageType, TransportError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportLimits {
@@ -75,19 +28,6 @@ impl Default for TransportLimits {
             providers: 64,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-
-pub enum TransportError {
-    Malformed,
-    Version,
-    Oversized,
-    Timeout,
-    PeerClosed,
-    Io,
-    DuplicateProvider,
-    Quota,
 }
 
 /// One bounded full-duplex provider channel. The owner decides how its socket is inherited.
@@ -171,7 +111,7 @@ impl Channel {
         stream
             .set_write_timeout(Some(remaining(deadline)?))
             .map_err(io_error)?;
-        let header = encode(frame)?;
+        let header = encode_header(frame)?;
         write_all(&mut stream, &header)?;
         write_all(&mut stream, &frame.payload)
     }
@@ -187,7 +127,7 @@ impl Channel {
             .map_err(io_error)?;
         let mut header = [0_u8; HEADER_BYTES];
         read_exact(&mut stream, &mut header)?;
-        let (kind, request_id, features, length) = decode(&header)?;
+        let (kind, request_id, features, length) = decode_header(&header)?;
         if length > self.limits.payload_bytes {
             return Err(TransportError::Oversized);
         }
@@ -336,61 +276,6 @@ impl ProviderRegistry {
     }
 }
 
-fn encode(frame: &Frame) -> Result<[u8; HEADER_BYTES], TransportError> {
-    let length = u32::try_from(frame.payload.len()).map_err(|_| TransportError::Oversized)?;
-    let mut bytes = [0_u8; HEADER_BYTES];
-    bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    bytes[6..8].copy_from_slice(&(frame.kind as u16).to_le_bytes());
-    bytes[8..12].copy_from_slice(&length.to_le_bytes());
-    bytes[12..20].copy_from_slice(&frame.request_id.to_le_bytes());
-    bytes[20..28].copy_from_slice(&frame.features.to_le_bytes());
-    Ok(bytes)
-}
-
-fn decode(bytes: &[u8; HEADER_BYTES]) -> Result<(MessageType, u64, u64, u32), TransportError> {
-    if u32::from_le_bytes(
-        bytes[0..4]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ) != MAGIC
-    {
-        return Err(TransportError::Malformed);
-    }
-    if u16::from_le_bytes(
-        bytes[4..6]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ) != VERSION
-    {
-        return Err(TransportError::Version);
-    }
-    let kind = MessageType::try_from(u16::from_le_bytes(
-        bytes[6..8]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ))?;
-    let length = u32::from_le_bytes(
-        bytes[8..12]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    let request_id = u64::from_le_bytes(
-        bytes[12..20]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    let features = u64::from_le_bytes(
-        bytes[20..28]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    if bytes[28..32] != [0; 4] {
-        return Err(TransportError::Malformed);
-    }
-    Ok((kind, request_id, features, length))
-}
-
 fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -457,32 +342,6 @@ mod tests {
         );
         right.cancel(42, deadline()).unwrap();
         assert_eq!(left.receive(deadline()).unwrap().kind, MessageType::Cancel);
-    }
-
-    #[test]
-    fn malformed_version_and_oversize_are_distinct() {
-        fn receive(header: [u8; HEADER_BYTES], limit: u32) -> TransportError {
-            let (channel, mut peer) = Channel::pair(TransportLimits {
-                payload_bytes: limit,
-                providers: 1,
-            })
-            .unwrap();
-            peer.writer.get_mut().unwrap().write_all(&header).unwrap();
-            channel.receive(deadline()).unwrap_err()
-        }
-        let mut malformed = [0_u8; HEADER_BYTES];
-        assert_eq!(receive(malformed, 1), TransportError::Malformed);
-        malformed[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        malformed[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        assert_eq!(receive(malformed, 1), TransportError::Version);
-        let frame = Frame {
-            kind: MessageType::Request,
-            request_id: 1,
-            features: 0,
-            payload: vec![0; 2],
-        };
-        let header = encode(&frame).unwrap();
-        assert_eq!(receive(header, 1), TransportError::Oversized);
     }
 
     #[test]
