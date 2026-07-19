@@ -1,5 +1,6 @@
 use crate::TransportError;
-use hl_engine_api::extension::{Interest, LinuxError, Readiness, ReadyState, ServiceId};
+use hl_engine_api::extension::ServiceId;
+use hl_engine_provider::{Interest, LinuxError, Readiness, ReadyState};
 #[derive(Clone, Debug, Eq, PartialEq)]
 
 pub enum Request {
