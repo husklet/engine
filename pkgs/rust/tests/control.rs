@@ -44,7 +44,7 @@ fn typed_signal_and_shutdown_control_the_initial_process() {
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
-    assert!(machine.initial_process().initial);
+    assert!(machine.initial_process().unwrap().initial);
     machine
         .signal(SignalTarget::InitialProcess, Signal::Terminate)
         .unwrap();
@@ -124,12 +124,8 @@ fn process_inventory_tracks_initial_descendants_and_finished_lifecycle() {
         1
     );
     assert_eq!(
-        processes
-            .iter()
-            .find(|process| process.initial)
-            .unwrap()
-            .host_id,
-        machine.id()
+        machine.initial_process().unwrap(),
+        *processes.iter().find(|process| process.initial).unwrap()
     );
     assert!(processes
         .windows(2)

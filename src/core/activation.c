@@ -514,18 +514,26 @@ hl_status hl_activation_domain_processes(hl_process_domain domain, uint64_t init
         long raw;
         uint64_t expected;
         hl_host_process_info process;
-        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        if (entry->d_name[0] != 'b' || entry->d_name[1] < '1' || entry->d_name[1] > '9') continue;
         errno = 0;
-        raw = strtol(entry->d_name, &end, 10);
+        raw = strtol(entry->d_name + 1, &end, 10);
         if (errno != 0 || *end != 0 || raw <= 0 || raw > INT32_MAX) continue;
         if (!domain_birth(directory, (pid_t)raw, &expected) || !hl_host_process_read(raw, &process) ||
             process.start_time_ns != expected) {
-            domain_record_remove(directory, (pid_t)raw);
+            /* Publication writes the membership and birth records in separate
+             * steps. A snapshot racing that sequence must skip the incomplete
+             * member without revoking it; a later snapshot will validate it.
+             * Domain teardown owns stale-record reclamation. */
             continue;
         }
         if (count < capacity) {
             processes[count].host_id = (uint64_t)raw;
-            processes[count].initial = (uint64_t)raw == initial_process_id ? 1u : 0u;
+            /* The opaque activation handle owns a short-lived supervisor. The
+             * initial guest process is its direct child; later guest forks are
+             * descendants of that child. Direct launches that do not need the
+             * supervisor retain the identity equality case. */
+            processes[count].initial =
+                (uint64_t)raw == initial_process_id || (uint64_t)process.parent_pid == initial_process_id ? 1u : 0u;
             processes[count].reserved = 0;
         }
         if (count == UINT32_MAX) {
@@ -561,9 +569,9 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
             long raw;
             uint64_t expected;
             hl_host_process_info process;
-            if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+            if (entry->d_name[0] != 'b' || entry->d_name[1] < '1' || entry->d_name[1] > '9') continue;
             errno = 0;
-            raw = strtol(entry->d_name, &end, 10);
+            raw = strtol(entry->d_name + 1, &end, 10);
             if (errno != 0 || *end != 0 || raw <= 0 || raw > INT32_MAX) continue;
             if (!domain_birth(directory, (pid_t)raw, &expected) || !hl_host_process_read(raw, &process) ||
                 process.start_time_ns != expected) {

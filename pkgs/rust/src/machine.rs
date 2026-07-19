@@ -59,13 +59,16 @@ impl Machine {
         self.child.try_wait()
     }
 
-    /// Returns information for the initial process owned by this control handle.
-    #[must_use]
-    pub fn initial_process(&self) -> ProcessInfo {
-        ProcessInfo {
-            host_id: self.id(),
-            initial: true,
-        }
+    /// Returns the verified live initial guest process.
+    ///
+    /// # Errors
+    /// Returns a typed finished error once the initial guest process has left
+    /// the process-domain inventory, or an engine error if inventory fails.
+    pub fn initial_process(&self) -> Result<ProcessInfo, ControlError> {
+        self.processes()?
+            .into_iter()
+            .find(|process| process.initial)
+            .ok_or_else(|| ControlError::finished("initial_process"))
     }
 
     /// Delivers a typed signal to the selected process.
