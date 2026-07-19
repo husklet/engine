@@ -432,6 +432,7 @@ static int g_pdeathsig;                  // PR_SET/GET_PDEATHSIG
 static unsigned long g_timerslack = 50000; // PR_SET/GET_TIMERSLACK (ns); Linux default is 50us
 static int g_thp_disable;  // PR_SET/GET_THP_DISABLE (per-process transparent-hugepage opt-out)
 static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reaper for orphans)
+static int g_mce_kill = 2;  // PR_MCE_KILL/PR_MCE_KILL_GET machine-check policy: LATE=0, EARLY=1, DEFAULT=2
 // The process EFFECTIVE capability set. The container starts as full root (all caps); we don't model
 // per-capability ENFORCEMENT in general, but we DO track what capset(2) leaves in the effective set so the
 // few prctl options the kernel gates on a specific capability (PR_SET_SECUREBITS / PR_CAPBSET_DROP need
@@ -440,6 +441,7 @@ static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reap
 // container/state.c (default = the 14-cap docker set HL_CAP_DEFAULT, which INCLUDES CAP_SETPCAP) so the
 // /proc/self/status builder and these handlers share one source of truth. capset() narrows the effective set.
 #define CAP_SETPCAP 8
+#define CAP_SYS_RESOURCE 24
 // personality(2) persona (lsys-personality): query with 0xffffffff, set returns the previous value.
 static unsigned g_persona;
 
@@ -1520,10 +1522,63 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
             break;
         }
+        // PR_TASK_PERF_EVENTS_DISABLE(31)/PR_TASK_PERF_EVENTS_ENABLE(32): toggle this task's perf events.
+        // Always succeeds on real Linux (the remaining args are ignored, no capability required); with no perf
+        // subsystem to gate there is nothing to enforce, so mirror the kernel's unconditional success rather
+        // than the old blanket -EINVAL, which made a benign query look like an unsupported operation.
+        if ((int)a0 == 31 || (int)a0 == 32) {
+            G_RET(c) = 0;
+            break;
+        }
+        // PR_MCE_KILL(33)/PR_MCE_KILL_GET(34): the per-process machine-check early/late kill policy. GET (34)
+        // returns the stored policy (LATE=0 / EARLY=1 / DEFAULT=2) and rejects any nonzero arg2..5. SET (33)
+        // takes a sub-op in arg2: PR_MCE_KILL_CLEAR(0) resets to DEFAULT (arg3..5 must be 0);
+        // PR_MCE_KILL_SET(1) takes a policy in arg3 (EARLY=1 / LATE=0 / DEFAULT=2, arg4/5 must be 0). Any other
+        // shape is -EINVAL (LTP prctl02). The policy is advisory (there is no guest-visible MCE delivery here)
+        // but round-tripping it makes the feature probe succeed exactly as on Linux instead of -EINVAL.
+        if ((int)a0 == 34) {
+            if (a1 || a2 || a3 || a4) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            G_RET(c) = (uint64_t)(unsigned)g_mce_kill;
+            break;
+        }
+        if ((int)a0 == 33) {
+            if (a1 == 0 /*PR_MCE_KILL_CLEAR*/) {
+                if (a2 || a3 || a4) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+                g_mce_kill = 2; // reset to DEFAULT
+                G_RET(c) = 0;
+                break;
+            }
+            if (a1 == 1 /*PR_MCE_KILL_SET*/) {
+                if (a3 || a4 || a2 > 2 /* EARLY(1)/LATE(0)/DEFAULT(2) only */) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+                g_mce_kill = (int)a2;
+                G_RET(c) = 0;
+                break;
+            }
+            G_RET(c) = (uint64_t)(-EINVAL); // unknown MCE sub-op
+            break;
+        }
+        // PR_SET_MM(35): rewrite fields of this task's mm layout (start_brk, brk, arg/env bounds, ...). The
+        // kernel gates the WHOLE option on CAP_SYS_RESOURCE and returns -EPERM before validating the sub-op
+        // when it is absent. The container's default cap set (HL_CAP_DEFAULT) does NOT include
+        // CAP_SYS_RESOURCE, so every PR_SET_MM here is -EPERM -- matching native (both an unprivileged task
+        // and a container root without the cap). Previously this fell into the no-op list and returned 0,
+        // silently claiming to relayout the mm while doing nothing.
+        if ((int)a0 == 35) {
+            G_RET(c) = (g_cap_eff & (1ull << CAP_SYS_RESOURCE)) ? (uint64_t)(-EINVAL) : (uint64_t)(-EPERM);
+            break;
+        }
         // 0 for known no-ops; EINVAL for unknown (kernel does)
         switch ((int)a0) {
         case 15:
-        case 35:
         case 53:
         case 55:
         // NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
