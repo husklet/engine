@@ -1,0 +1,31 @@
+[package]
+name = "hl-engine"
+version = "0.1.10"
+edition = "2021"
+rust-version = "1.81"
+description = "Safe Rust lifecycle API for the standalone HL Linux guest engine"
+license = "MIT"
+repository = "https://github.com/husklet/engine"
+readme = "README.md"
+keywords = ["linux", "emulation", "jit", "sandbox"]
+categories = ["emulators", "api-bindings"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "assets/**",
+    "examples/**",
+    "src/**",
+    "testdata/**",
+    "tests/**",
+]
+
+[lib]
+name = "hl_engine"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

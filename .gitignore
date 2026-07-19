@@ -13,3 +13,7 @@ compile_commands.json
 /result
 hl-arm-image-fixed.a
 *.o
+
+pkgs/*/assets/lib/
+pkgs/*/assets/**/*.tar.gz
+pkgs/*/assets/**/*.a
