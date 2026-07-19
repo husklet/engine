@@ -1726,7 +1726,7 @@ static const char *guest_symlink_target(const char *path, char *out, size_t capa
                 return path;
         }
     }
-    confine(current, out, capacity);
+    if (path_copy(out, capacity, current) != 0) return path;
     return out;
 }
 

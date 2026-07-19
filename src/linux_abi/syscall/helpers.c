@@ -1116,6 +1116,11 @@ static const char *procfd_namespace_path(const char *path, char *storage, size_t
     return storage;
 }
 
+static int procfd_directory_path(const char *path) {
+    return path && (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/") ||
+                    !strcmp(path, "/proc/thread-self/fd") || !strcmp(path, "/proc/thread-self/fd/"));
+}
+
 // The /dev/std{in,out,err} aliases -> fd 0/1/2 for the OPEN path only (readlink keeps its on-disk
 // symlink text, so `ls -l /dev` doesn't F_GETPATH a pipe fd and get EBADF). Returns the fd, else -1.
 static int dev_std_fd(const char *p) {

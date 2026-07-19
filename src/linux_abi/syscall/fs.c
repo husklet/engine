@@ -3336,7 +3336,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        int procfd = procfd_num_at((int)a0, raw) >= 0;
+        int procfd = procfd_num_at((int)a0, raw) >= 0 || procfd_directory_path(raw);
         const char *p = procfd ? raw : atpath((int)a0, raw, pb, sizeof pb, (a3 & 0x100) ? 1 : 0);
         if (resolve_loop_detected()) { // a followed self/cyclic symlink chain past the traversal limit -> ELOOP
             G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
@@ -3627,7 +3627,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        int procfd = procfd_num_at((int)a0, raw) >= 0;
+        int procfd = procfd_num_at((int)a0, raw) >= 0 || procfd_directory_path(raw);
         const char *p = procfd ? raw : atpath((int)a0, raw, pb, sizeof pb, nofollow);
         if (resolve_loop_detected()) { // followed symlink chain past the traversal limit -> ELOOP
             G_RET(c) = (uint64_t)(int64_t)(-ELOOP);
@@ -3639,7 +3639,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (raw && raw[0] && raw[0] != '/') {
             guest_abspath_at((int)a0, raw, gsyn291, sizeof gsyn291);
             if (!strncmp(gsyn291, "/proc/", 6) || !strncmp(gsyn291, "/dev/fd/", 8)) gp = gsyn291;
-        } else if (raw && !strncmp(raw, "/dev/fd/", 8)) {
+        } else if (raw && (!strncmp(raw, "/proc/", 6) || !strncmp(raw, "/dev/fd/", 8))) {
             gp = raw;
         }
         gp = procfd_namespace_path(gp, procfd_path291, sizeof procfd_path291);
@@ -3842,14 +3842,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
         }
         // faccessat
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
+        const char *p = procfd_directory_path(gp48)
+                            ? gp48
+                            : atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
         {
             const char *gp =
                 (g_rootfs && p && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
-            if (gp48 && gp48 != (const char *)a1 &&
-                (!strncmp(gp48, "/proc/", 6) || !strncmp(gp48, "/dev/fd/", 8)))
-                gp = gp48;
-            else if (gp48 && !strncmp(gp48, "/dev/fd/", 8))
+            if (gp48 && (!strncmp(gp48, "/proc/", 6) || !strncmp(gp48, "/dev/fd/", 8)))
                 gp = gp48;
             char procfd_path[64];
             gp = procfd_namespace_path(gp, procfd_path, sizeof procfd_path);
