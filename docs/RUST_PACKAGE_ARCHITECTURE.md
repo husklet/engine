@@ -3,9 +3,9 @@
 ## Status and scope
 
 The Rust package split described here is implemented. The workspace now separates reusable API
-values, live provider ports, frozen provider protocol, and the native-backed compatibility facade.
-This document records the current tree at commit `cde125b30`; it is no longer a proposal for
-`rust-api`, `rust-provider`, `rust-protocol`, or a separate `rust-runtime` directory.
+values, live provider ports, frozen provider protocol, live transport runtime, and the native-backed
+compatibility facade. This document records the implemented tree; it is no longer a package-split
+proposal.
 
 Structural completion does not mean the capability work in [`CAP.md`](CAP.md) is complete. The
 split clarifies ownership and dependency direction. Capability discovery and real guest conformance
@@ -18,7 +18,7 @@ The workspace manifest is [`pkgs/Cargo.toml`](../pkgs/Cargo.toml):
 
 ```text
 pkgs/
-  Cargo.toml                    # workspace: api, provider, protocol, rust
+  Cargo.toml                    # workspace: api, provider, protocol, runtime, rust
 
   api/                          # package hl-engine-api
     src/
@@ -27,6 +27,8 @@ pkgs/
       extension.rs              # declarative extension values and identities
       checkpoint.rs             # stable checkpoint schema and codec
       observability.rs          # stable event schema, queue, and codec
+      control.rs                # backend-independent control requests/results
+      spec/                     # discovery and launch-policy value domains
     tests/contracts.rs
 
   provider/                     # package hl-engine-provider
@@ -51,15 +53,20 @@ pkgs/
         input.rs                # little-endian cursor and error mapping
         namespace.rs            # namespace transaction codec/validation
 
+  runtime/                      # private package hl-engine-runtime
+    src/
+      lib.rs                    # live-runtime exports
+      transport.rs              # Unix channels and launch ProviderRegistry
+
   rust/                         # package hl-engine, crate hl_engine
     build.rs                    # selects and links one native archive
     assets/                     # native archives, fixture, provenance
     src/
       lib.rs                    # stable facade and compatibility reexports
-      spec.rs                   # current discovery and MachineSpec models
-      control.rs                # current live-control models
+      spec/                     # native MachineSpec/process/network composition
+      control.rs                # live Machine-bound control surfaces
       extension.rs              # API/provider compatibility reexports
-      transport.rs              # live Unix channel and registry
+      transport.rs              # compatibility reexport of runtime transport
       engine.rs                 # public Engine composition surface
       engine/
         discovery.rs            # truthful current-backend capabilities
@@ -96,10 +103,11 @@ hl-engine-api
 hl-engine-provider
     ^
     |
-hl-engine-protocol
-    ^
-    |
-hl-engine (facade + runtime)
+hl-engine-protocol     hl-engine-runtime
+          ^                    ^
+          +---------+----------+
+                    |
+           hl-engine (facade)
 ```
 
 The exact direct dependencies are:
@@ -107,13 +115,12 @@ The exact direct dependencies are:
 - `hl-engine-api`: standard library only;
 - `hl-engine-provider` -> `hl-engine-api`;
 - `hl-engine-protocol` -> `hl-engine-api`, `hl-engine-provider`;
-- `hl-engine` -> all three lower packages.
+- `hl-engine-runtime` -> `hl-engine-api`, `hl-engine-provider`, `hl-engine-protocol`;
+- `hl-engine` -> all four lower packages.
 
-There is currently no `hl-engine-runtime` package. Native lowering and live runtime ownership remain
-private modules inside `pkgs/rust`. This is intentional current state, not an omitted directory.
-Extracting another package is justified only if a real backend substitution or distribution seam
-appears; moving private files solely to mirror an old target diagram would add navigation without
-new ownership.
+`hl-engine-runtime` is private and non-publishable. It owns the acyclic live Unix provider transport
+and launch registry. Native lowering, FFI, process ownership, and service descriptor dispatch remain
+in the facade because moving them currently creates facade/model or native-link ownership cycles.
 
 No lower package imports `hl-engine`. This removed the former `spec <-> extension` ownership cycle:
 `Version`, declarative provider identities, extension selections, namespace entries, service
@@ -134,12 +141,14 @@ must be shared by callers and providers:
 - `Version` and foundational launch values;
 - provider IDs, features, extension specifications and capabilities;
 - namespace entries and service/memory requirements;
-- checkpoint manifest and observability schemas.
+- checkpoint manifest and observability schemas;
+- discovery/capability, filesystem, namespace, resource, security, time, validation, and pure
+  control request/result models.
 
 It owns no FFI, host process lifecycle, Unix streams, native asset, build script, provider
-implementation trait, or backend lowering. At present, the complete `MachineSpec`, discovery models,
-network values, and live-control request models still live in the facade. Moving those is possible
-future structural work, not something this document claims has happened.
+implementation trait, or backend lowering. Native `MachineSpec`, `ProcessSpec`, and `NetworkSpec`
+composition remains in the facade where it owns `Domain`, bridge operations, native errors, and
+live handles.
 
 ### `hl-engine-provider`
 
@@ -166,7 +175,15 @@ prove these ports are not tied to a graphics or Husklet domain name.
 
 It contains no socket creation, threads, provider calls, descriptor table, or live authority.
 Golden tests retain exact frame and service bytes and reject malformed, trailing, and oversized
-input. Live channels and dispatch remain runtime mechanisms in `hl-engine`.
+input. Live channels are runtime mechanisms in `hl-engine-runtime`; descriptor dispatch remains in
+the facade.
+
+### `hl-engine-runtime`
+
+`hl-engine-runtime` owns live Unix channel framing, handshake/cancellation behavior, and the
+launch-scoped `ProviderRegistry`. It is an internal substitution boundary and has no native archive,
+FFI, process ownership, backend lowering, or product policy. The facade reexports these types at the
+existing `hl_engine::transport` path.
 
 ### `hl-engine`
 
@@ -175,7 +192,7 @@ input. Live channels and dispatch remain runtime mechanisms in `hl-engine`.
 - reexports API/provider contracts at established `hl_engine::*` paths;
 - owns `Engine`, `Machine`, process I/O, PTYs, control, and legacy builders;
 - validates and lowers `MachineSpec` into the native launch ABI;
-- owns live provider channels, service dispatch, descriptor lifecycle, and projections;
+- composes live provider channels with service dispatch, descriptor lifecycle, and projections;
 - is the only package with native FFI, `build.rs`, or static engine assets.
 
 The 2,385-line engine orchestration file has been split by responsibility. The 1,907-line service
@@ -202,14 +219,14 @@ The facade reexports the exact lower-package types rather than maintaining copie
 - `hl_engine_provider::*` through `hl_engine::extension`;
 - protocol frame types through `hl_engine::transport`.
 
-`hl_engine::transport` also contains live `Channel`, `TransportLimits`, and `ProviderRegistry`; those
-are runtime types, not protocol crate responsibilities. Public-path compile tests guard the current
+`hl_engine::transport` reexports live `Channel`, `TransportLimits`, and `ProviderRegistry` from the
+runtime crate. Public-path compile tests guard the current
 compatibility surface. Any later removal or narrowing is a separate semver decision.
 
 ## Build, MSRV, and asset constraints
 
-- All four packages use edition 2021 and `rust-version = "1.81"`.
-- `pkgs/Cargo.toml` uses resolver 2 and explicitly lists `api`, `provider`, `protocol`, and `rust`.
+- All five packages use edition 2021 and `rust-version = "1.81"`.
+- `pkgs/Cargo.toml` uses resolver 2 and explicitly lists `api`, `provider`, `protocol`, `runtime`, and `rust`.
 - Every package denies unsafe Rust by default. The facade's private FFI module is the only narrow
   exception.
 - `pkgs/rust/assets` and `pkgs/rust/build.rs` have one owner: `hl-engine`. Lower packages contain no
@@ -239,6 +256,8 @@ The following architecture work is complete in the current tree:
 8. Live service runtime split into descriptor ownership, provider dispatch, and server lifecycle.
 9. Protocol service implementation split into model, codec, input/error, and namespace transaction
    modules.
+10. Pure discovery, launch-policy, validation, and control-data models extracted to `hl-engine-api`.
+11. Live Unix transport and provider registry extracted to private `hl-engine-runtime`.
 
 These changes preserve behavior. They do not make an undiscovered capability usable.
 
@@ -246,15 +265,15 @@ These changes preserve behavior. They do not make an undiscovered capability usa
 
 Potential structural work is intentionally smaller than the earlier proposal:
 
-- move more complete declarative launch/discovery/control values from `pkgs/rust` to `pkgs/api` when
-  that can be done without coupling API models to native `Error`, `Machine`, or `Terminal`;
+- move remaining native composition only if `Domain`, network, and error ownership can be separated
+  without weakening their domain contracts;
 - remove transitional facade aliases only after an explicit public API/semver review;
 - add Cargo-metadata dependency-direction enforcement in CI if the repository's CI surface supports
   it;
 - capture a pinned public-API diff in release gates.
 
-A separate runtime crate is not a pending requirement by itself. Introduce one only with a proven
-backend or packaging seam.
+Further runtime extraction must preserve the facade as sole native archive/build-script owner and
+must demonstrate an acyclic responsibility boundary.
 
 ## Remaining capability work from CAP.md
 
