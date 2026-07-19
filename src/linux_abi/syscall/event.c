@@ -26,7 +26,6 @@
 // already reports current readiness), so only EPOLLET arms reach here -- level semantics are untouched.
 static struct kevent *g_ep_prime[HL_NFD];
 static int g_ep_primen[HL_NFD], g_ep_primecap[HL_NFD];
-
 static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
     if (ep < 0 || ep >= HL_NFD) return;
     struct kevent *a = g_ep_prime[ep];
@@ -122,6 +121,10 @@ static void ep_mem_set(int ep, int fd, int on) {
         __atomic_fetch_or(&m[fd >> 3], bit, __ATOMIC_SEQ_CST);
     else
         __atomic_fetch_and(&m[fd >> 3], (uint8_t)~bit, __ATOMIC_SEQ_CST);
+}
+
+static void ep_mem_close(int ep, int fd) {
+    ep_mem_set(ep, fd, 0);
 }
 
 static void ep_mem_clear(int ep) {
@@ -224,6 +227,21 @@ static void ep_flush(int ep, int wake) {
     struct kevent trig;
     EV_SET(&trig, EP_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
     kevent(ep, &trig, 1, NULL, 0, NULL);
+}
+
+// Submit an epoll instance's deferred W3E changelist to the kernel now, unconditionally. The W3E fast path
+// (case 21) batches an instance's knote registrations and only submits them at the NEXT epoll_wait on that
+// SAME instance. A NESTED inner epoll defeats that: a guest that registers an inner epoll fd into an outer
+// one never epoll_waits the inner directly, so the inner's member knotes stay stranded in its changelist and
+// the inner kqueue never becomes readable -- the outer wait sees no nested readiness. Flushing the inner's
+// changelist here arms its member knotes so its kqueue reports readiness up to the outer. Caller holds
+// g_ep_mtx when threaded.
+static void ep_submit_changes(int ep) {
+    if (ep < 0 || ep >= HL_NFD) return;
+    if (g_ep_chgn[ep] > 0) {
+        kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL);
+        g_ep_chgn[ep] = 0;
+    }
 }
 
 // macOS does NOT inherit kqueue() descriptors across fork(2) (unlike Linux epoll/timer/inotify fds, which
@@ -359,6 +377,287 @@ static void poll_sigmask_leave(struct cpu *c, uint64_t saved) {
     c->sigmask = saved;
 }
 
+// An eventfd is emulated by a pipe whose READ end is the guest's descriptor, so a host poll on it never
+// reports POLLOUT (a pipe read end is not writable). Linux, however, reports an eventfd writable whenever its
+// counter can still accept a value -- i.e. count < ULLONG_MAX-1 (0xfffffffffffffffe). Synthesize that
+// write-side readiness after the host poll/select so a guest waiting for an eventfd to become writable is not
+// stranded. POLLIN is already carried by the backing pipe's readable byte, so it is left untouched. Returns
+// the (possibly incremented) ready-fd count.
+static int eventfd_poll_writable_fixup(struct pollfd *fds, nfds_t n, int r) {
+    if (!fds || r < 0 || !g_eventfd_count) return r;
+    for (nfds_t i = 0; i < n; i++) {
+        int fd = fds[i].fd;
+        if (fd < 0 || fd >= HL_NFD || !g_eventfd_peer[fd]) continue;
+        if (!(fds[i].events & POLLOUT) || (fds[i].revents & POLLOUT)) continue;
+        if (g_eventfd_count[eventfd_counter_slot(fd)] < 0xfffffffffffffffeULL) {
+            if (fds[i].revents == 0) r++; // a previously-idle fd now reports readiness
+            fds[i].revents |= POLLOUT;
+        }
+    }
+    return r;
+}
+
+// A private-loopback non-blocking connect has no host TCP stack behind it.  When its AF_UNIX rendezvous
+// rejects the dial synchronously, connect() still reports Linux EINPROGRESS and g_so_error carries the
+// deferred refusal.  macOS does not subsequently make that rejected AF_UNIX fd pollable, so publish the
+// completion ourselves: Linux poll reports POLLOUT|POLLERR and SO_ERROR returns ECONNREFUSED.
+static int socket_poll_error_fixup(struct pollfd *fds, nfds_t n, int r) {
+    if (!fds || r < 0) return r;
+    for (nfds_t index = 0; index < n; ++index) {
+        int fd = fds[index].fd;
+        if (fd < 0 || fd >= HL_NFD || !g_so_error[fd]) continue;
+        if (fds[index].revents == 0) ++r;
+        fds[index].revents |= POLLERR;
+        if (fds[index].events & POLLOUT) fds[index].revents |= POLLOUT;
+    }
+    return r;
+}
+
+// Shared epoll_wait core for epoll_pwait (case 22, int-ms timeout) and epoll_pwait2 (case 441,
+// struct timespec ns timeout). `ep` is the epoll fd, `out` the guest event out-array, `maxev` the
+// already-validated (>0, capped 256) maxevents, `timeout_ns` the wait budget in NANOSECONDS with the
+// Linux convention <0 = infinite (must NEVER return a spurious 0), 0 = non-blocking poll, >0 = finite,
+// and `sm_set` the guest sigset_t address (0 = no temporary mask). Sets G_RET(c) to the ready count
+// (>=0) or a negative errno. Extracted verbatim from case 22 so both entry points share one contract;
+// the only generalization is the ms->ns timeout so epoll_pwait2 honors sub-ms timespecs exactly.
+static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev, int64_t timeout_ns,
+                                  uint64_t sm_set) {
+    struct kevent kv[256];
+    uint64_t sm_saved = 0;
+    // A dup'd instance opts out of the deferred-changelist machinery (its interest was submitted straight
+    // to the shared kqueue), so it just blocks on the kqueue like the immediate path.
+    int opt = epopt_on() && ep >= 0 && ep < HL_NFD && !g_ep_dupd[ep];
+    // regression fix: a cross-thread epoll_ctl fires the internal EVFILT_USER wake knote, which
+    // returns us from kevent() with ONLY that nudge and no guest event -> oi==0. On real Linux epoll_wait
+    // with an infinite timeout NEVER returns 0 (libuv asserts timeout!=-1 on a 0-return and node aborts),
+    // and a finite wait must re-block for the REMAINING budget, not the full timeout again. So we loop:
+    // capture a monotonic deadline at entry and, whenever we produced no guest event but the guest still
+    // wants to block, re-enter kevent for the time that remains. Each re-block genuinely sleeps in kevent
+    // (the EVFILT_USER knote is EV_CLEAR, already consumed) -- no busy spin.
+    struct timespec deadline = {0, 0};
+    if (timeout_ns > 0) {
+        hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += (time_t)(timeout_ns / 1000000000LL);
+        deadline.tv_nsec += (long)(timeout_ns % 1000000000LL);
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+    int oi = 0;
+    int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
+    for (;;) {
+        struct timespec ts, *tp = NULL;
+        if (timeout_ns == 0) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 0;
+            tp = &ts; // non-blocking poll
+        } else if (timeout_ns > 0) {
+            struct timespec now;
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+            int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
+            if (rem < 0) rem = 0;
+            ts.tv_sec = (time_t)(rem / 1000000000LL);
+            ts.tv_nsec = (long)(rem % 1000000000LL);
+            tp = &ts;
+        } // timeout_ns < 0 -> tp stays NULL (block forever)
+        // Multi-threaded guest: serialize against peer Ms doing epoll_ctl on this instance. Arm the wake
+        // knote and push any deferred changelist to the kernel BEFORE we block, so a peer's registration is
+        // kernel-visible to us and its NOTE_TRIGGER can wake us. We then block on a pure wait (no changelist)
+        // with the lock released, so epoll_ctl on another M is never blocked behind our sleep. Single-threaded
+        // (lk == 0) keeps the classic one-syscall ctl+wait batching, unchanged.
+        int lk = opt ? ep_lock() : 0;
+        if (lk) {
+            ep_wake_arm(ep);
+            ep_flush(ep, 0);
+        }
+        // A pending edge-prime means some fd is ready *now*; don't sleep waiting for a fresh kqueue edge
+        // (a Go server's epoll_wait blocks with an infinite timeout) -- poll kqueue and merge the prime in.
+        if (opt && g_ep_primen[ep] > 0) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 0;
+            tp = &ts;
+        }
+        // Object-backed watches (inotify) have no host descriptor on this kqueue, so a blocking wait would
+        // never surface their readiness. Like poll()/select() over the same objects, cap the sleep to a
+        // bounded tick and re-sample readiness below; a non-blocking (timeout_ns==0) wait keeps its zero timeout.
+        if (timeout_ns != 0 && ep >= 0 && ep < HL_NFD && g_ep_object_count[ep] > 0 &&
+            (tp == NULL || ts.tv_sec > 0 || ts.tv_nsec > 1000000L)) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1000000L; // 1ms, matching the poll/select object cadence
+            tp = &ts;
+        }
+        // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall (single-threaded);
+        // threaded already flushed it above and waits with no changelist.
+        struct kevent *chg = (opt && !lk) ? g_ep_chg[ep] : NULL;
+        int nchg = (opt && !lk) ? g_ep_chgn[ep] : 0;
+        if (lk) ep_unlock(lk);
+        int r;
+        // epoll_wait is never restarted by a handler -- re-wait only on a SPURIOUS EINTR (nothing to
+        // deliver); the moment a guest handler is runnable we return -EINTR and let the dispatcher run it.
+        ts_wait_enter(); // 'S' while blocked in epoll_wait/epoll_pwait
+        do {
+            r = kevent(ep, chg, nchg, kv, maxev, tp);
+            chg = NULL;
+            nchg = 0;
+        } while (r < 0 && svc_poll_retry(c));
+        ts_wait_leave();
+        if (opt && !lk) g_ep_chgn[ep] = 0; // consumed (threaded flushed it under the lock already)
+        if (r < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        lk = opt ? ep_lock() : 0; // re-acquire to guard the armed-map updates + prime scan below
+        oi = 0;
+        for (int i = 0; i < r && oi < maxev; i++) {
+            // The EVFILT_USER self-wake knote is an internal cross-thread nudge, not a guest event -- drop it.
+            if (kv[i].filter == EVFILT_USER) continue;
+            // An EV_ERROR entry is a *changelist* processing result (errno in .data), NOT a readiness
+            // event. With correct armed-state tracking these do not occur; skip them if they do.
+            if (opt && (kv[i].flags & EV_ERROR)) continue;
+            uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
+            if (kv[i].flags & EV_EOF) {
+                // kqueue raises EV_EOF for BOTH a peer half-close (shutdown SHUT_WR: the read side hits
+                // EOF but the socket is still writable) and a full hangup. Linux distinguishes them:
+                // EPOLLRDHUP on a half-close, EPOLLHUP only on a full disconnect. poll() reports POLLHUP
+                // only for a full hangup, so use it to tell the two apart. EPOLLRDHUP is edge-reported
+                // only when the guest actually registered interest in it (unlike EPOLLHUP/EPOLLERR).
+                int hup = 1;
+                if (kv[i].filter == EVFILT_READ) {
+                    struct pollfd pf = {.fd = (int)kv[i].ident, .events = POLLIN, .revents = 0};
+                    if (poll(&pf, 1, 0) >= 0) hup = (pf.revents & POLLHUP) != 0;
+                }
+                if (hup) ev |= 0x10u; // EPOLLHUP
+                if (kv[i].ident < HL_NFD && (g_ep_events[kv[i].ident] & 0x2000u)) ev |= 0x2000u; // EPOLLRDHUP
+            }
+            // EPOLLERR (immediate-path semantics preserved when opt is off)
+            if (!opt && (kv[i].flags & EV_ERROR)) ev |= 0x8u;
+            *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
+            memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
+            // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
+            if (opt && kv[i].ident < HL_NFD && g_ep_os[kv[i].ident]) {
+                if (kv[i].filter == EVFILT_READ)
+                    g_ep_rd[kv[i].ident] = 0;
+                else if (kv[i].filter == EVFILT_WRITE)
+                    g_ep_wr[kv[i].ident] = 0;
+            }
+            oi++;
+        }
+        /* Provider pumps only publish an atomic readiness mark and trigger the
+         * EVFILT_USER wake.  The epoll owner consumes and formats it here, so
+         * callbacks never mutate epoll queues or acquire inherited locks. */
+        uint32_t provider_ep_generation =
+            ep >= 0 && ep < HL_NFD ? g_ep_provider_generations[ep] : 0;
+        for (uint32_t provider_index = 0; provider_index < EP_PROVIDER_WATCH_LIMIT && oi < maxev;
+             ++provider_index) {
+            ep_provider_watch *provider_watch = &g_ep_provider_watches[provider_index];
+            if (atomic_load_explicit(&provider_watch->state, memory_order_acquire) != EP_PROVIDER_ACTIVE ||
+                provider_watch->epoll != ep ||
+                provider_watch->epoll_generation != provider_ep_generation)
+                continue;
+            hl_linux_fd_snapshot provider_snapshot;
+            if (g_linux_box == NULL ||
+                hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)provider_watch->descriptor,
+                                         &provider_snapshot) != HL_STATUS_OK ||
+                provider_snapshot.descriptor_generation != provider_watch->descriptor_generation ||
+                provider_snapshot.host_handle != provider_watch->handle) {
+                ep_provider_retire(provider_watch);
+                continue;
+            }
+            uint32_t level = 0;
+            if (!(provider_watch->events & 0x80000000u) && !(provider_watch->events & 0x40000000u))
+                level = hl_provider_files_cached_readiness(provider_watch->handle,
+                                                           provider_watch->interests);
+            int unsubscribe = 0;
+            uint32_t provider_ready = ep_provider_take_ready(provider_watch, level, &unsubscribe);
+            if (provider_ready == 0) continue;
+            *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ep_provider_linux_events(provider_ready);
+            memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF,
+                   &provider_watch->data, sizeof(provider_watch->data));
+            if (unsubscribe) {
+                hl_provider_files_unsubscribe(provider_watch->handle, provider_watch,
+                                              atomic_load(&provider_watch->serial));
+            }
+            oi++;
+        }
+        // Deliver edge-triggered primes that kqueue didn't surface (fds already ready at registration).
+        // This is the cross-thread-readiness delivery: a peer M that registered an already-ready fd
+        // stashed a prime here, so a wake that carried no kqueue edge still hands the guest the ready fd.
+        if (ep >= 0 && ep < HL_NFD && g_ep_primen[ep] > 0) {
+            int kept = 0;
+            for (int i = 0; i < g_ep_primen[ep]; i++) {
+                struct kevent *pk = &g_ep_prime[ep][i];
+                uint32_t pev = (pk->filter == EVFILT_READ) ? 0x1u : 0x4u;
+                int dup = 0;
+                for (int j = 0; j < oi; j++) {
+                    uint32_t jev;
+                    uint64_t ju;
+                    memcpy(&jev, out + (size_t)j * G_EPEV_SZ, 4);
+                    memcpy(&ju, out + (size_t)j * G_EPEV_SZ + G_EPEV_DOFF, 8);
+                    if (ju == (uint64_t)pk->udata && (jev & pev)) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (dup) continue; // kqueue already reported it
+                if (oi >= maxev) {
+                    g_ep_prime[ep][kept++] = *pk;
+                    continue;
+                } // no room -> keep for next wait
+                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = pev;
+                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &pk->udata, 8);
+                oi++;
+            }
+            g_ep_primen[ep] = kept;
+        }
+        ep_unlock(lk);
+        // Object-backed watches (inotify): no host fd feeds the kqueue, so sample the object's readiness
+        // on this bounded tick and format the event here, exactly as poll()/select() observe the same
+        // typed objects. Runs after ep_unlock so the object mutex is never taken under the epoll lock.
+        if (ep >= 0 && ep < HL_NFD && g_ep_object_count[ep] > 0) {
+            uint32_t obj_ep_generation = g_ep_provider_generations[ep];
+            for (uint32_t oidx = 0; oidx < EP_OBJECT_WATCH_LIMIT && oi < maxev; ++oidx) {
+                ep_object_watch *ow = &g_ep_object_watches[oidx];
+                if (atomic_load_explicit(&ow->active, memory_order_acquire) == 0 || ow->epoll != ep ||
+                    ow->epoll_generation != obj_ep_generation)
+                    continue;
+                hl_linux_fd_snapshot osnap;
+                hl_linux_object_pin opin;
+                if (g_linux_box == NULL ||
+                    hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)ow->descriptor, &osnap) != HL_STATUS_OK ||
+                    osnap.descriptor_generation != ow->descriptor_generation) {
+                    ep_object_free(ow); // the watched fd was closed or reused
+                    continue;
+                }
+                if (hl_linux_object_pin_fd(g_linux_box, (hl_linux_fd)ow->descriptor, &opin) != HL_STATUS_OK)
+                    continue;
+                uint32_t readiness = hl_linux_object_ready(&opin, ow->interests);
+                hl_linux_object_unpin(&opin);
+                uint32_t oev = ep_provider_linux_events(readiness);
+                if (oev == 0) continue;
+                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = oev;
+                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &ow->data, sizeof(ow->data));
+                oi++;
+                if (ow->events & 0x40000000u) ep_object_free(ow); // EPOLLONESHOT: one delivery only
+            }
+        }
+        // Re-block instead of returning a spurious 0. A bare cross-thread wake (or a changelist that only
+        // produced EV_ERROR echoes) leaves oi==0 while the guest still asked to block. timeout_ns<0: always
+        // loop (epoll_wait(-1) must never return 0). timeout_ns>0: loop until the monotonic deadline elapses.
+        // timeout_ns==0: returning 0 is correct (non-blocking poll) -- never loop.
+        if (oi == 0 && timeout_ns != 0) {
+            if (timeout_ns < 0) continue;
+            struct timespec now;
+            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+            int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
+            if (rem > 0) continue;
+        }
+        G_RET(c) = (uint64_t)oi;
+        break;
+    }
+    if (sm_on) poll_sigmask_leave(c, sm_saved);
+}
+
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                      uint64_t a5) {
     switch (nr) {
@@ -426,6 +725,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // a reused fd number must start with an empty prime buffer + no stale wake knote + no stale membership
         // (close() doesn't clear ours -- this is how an epoll fd's per-instance state is reset on reuse)
         if (r >= 0 && r < HL_NFD) {
+            g_ep_provider_generations[r] = ep_provider_next(g_ep_provider_generations[r]);
+            ep_object_retire_endpoint(r);
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
@@ -486,6 +787,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             memcpy(&data, (void *)(a3 + G_EPEV_DOFF), 8);
             // struct epoll_event {u32 events; [pad;] u64 data} -- layout per guest arch (see G_EPEV_*)
         }
+        // EPOLLEXCLUSIVE (1<<28) may be specified only at EPOLL_CTL_ADD. Linux (fs/eventpoll.c) rejects it in
+        // an EPOLL_CTL_MOD event, and rejects any EPOLL_CTL_MOD of a registration that was ADDed exclusive,
+        // both with EINVAL. Checked before the membership ENOENT probe to match the kernel's error order.
+        if (op == 3 && ((ev & 0x10000000u) ||
+                        (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD &&
+                         (g_ep_events[fd] & 0x10000000u)))) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a engine-tracked epoll
         // instance (membership bitmap). Confined to fd < HL_NFD, matching the readiness path below.
         if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
@@ -542,6 +852,12 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 g_ep_wr[fd] = 0;
             }
             g_ep_os[fd] = (op != 2 && (ev & 0x40000000u)) ? 1 : 0;
+            // Nested epoll: arm member knotes eagerly instead of deferring, since a nested inner epoll is
+            // never epoll_wait'd by the guest to consume its changelist. Case A: we just added an inner epoll
+            // fd into this outer -> flush the inner (fd) so it starts reporting its members' readiness. Case B:
+            // this instance is itself watched by an outer (g_ep_owner) -> flush its own members now.
+            if (op != 2 && fd != ep && fd >= 0 && fd < HL_NFD && g_epoll[fd]) ep_submit_changes(fd);
+            if (g_ep_owner[ep]) ep_submit_changes(ep);
             // Multi-threaded guest: a peer M may be blocked in epoll_wait on this instance right now, so the
             // deferred registration/prime must reach it -- flush the changelist to the kernel and (when we
             // added/modified interest) wake the peer to re-scan primes. No-op single-threaded, where the same
@@ -588,7 +904,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (maxev > 256) maxev = 256;
         // epoll_pwait(epfd, events, max, tmo, sigmask, sigsetsize): a4 is the guest sigset_t pointer, a5 its
         // size. Apply the temporary signal mask for the wait (Linux swaps it atomically); NULL a4 = no mask.
-        uint64_t sm_set = 0, sm_saved = 0;
+        uint64_t sm_set = 0;
         if (a4) {
             if ((size_t)a5 != 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
@@ -600,159 +916,55 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             sm_set = a4;
         }
-        struct kevent kv[256];
-        uint8_t *out = (uint8_t *)a1;
-        int ep = (int)a0;
-        // A dup'd instance opts out of the deferred-changelist machinery (its interest was submitted straight
-        // to the shared kqueue), so it just blocks on the kqueue like the immediate path.
-        int opt = epopt_on() && ep >= 0 && ep < HL_NFD && !g_ep_dupd[ep];
-        int32_t tmo = (int32_t)a3; // guest timeout ms: <0 = infinite (must NEVER return 0), 0 = poll, >0 = finite
-        // regression fix: a cross-thread epoll_ctl fires the internal EVFILT_USER wake knote, which
-        // returns us from kevent() with ONLY that nudge and no guest event -> oi==0. On real Linux epoll_wait
-        // with an infinite timeout NEVER returns 0 (libuv asserts timeout!=-1 on a 0-return and node aborts),
-        // and a finite wait must re-block for the REMAINING budget, not the full timeout again. So we loop:
-        // capture a monotonic deadline at entry and, whenever we produced no guest event but the guest still
-        // wants to block, re-enter kevent for the time that remains. (The old "safety net" was gated on nchg>0,
-        // so a BARE cross-thread wake -- which carries no changelist on this thread -- fell through and returned
-        // 0.) Each re-block genuinely sleeps in kevent (the EVFILT_USER knote is EV_CLEAR, already consumed) --
-        // no busy spin. Single-threaded semantics are preserved: kevent(NULL) never returns 0, and a 0/finite
-        // poll behaves as before.
-        struct timespec deadline = {0, 0};
-        if (tmo > 0) {
-            hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
-            deadline.tv_sec += tmo / 1000;
-            deadline.tv_nsec += (long)(tmo % 1000) * 1000000L;
-            if (deadline.tv_nsec >= 1000000000L) {
-                deadline.tv_sec++;
-                deadline.tv_nsec -= 1000000000L;
-            }
-        }
-        int oi = 0;
-        int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
-        for (;;) {
-            struct timespec ts, *tp = NULL;
-            if (tmo == 0) {
-                ts.tv_sec = 0;
-                ts.tv_nsec = 0;
-                tp = &ts; // non-blocking poll
-            } else if (tmo > 0) {
-                struct timespec now;
-                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
-                if (rem < 0) rem = 0;
-                ts.tv_sec = (time_t)(rem / 1000000000LL);
-                ts.tv_nsec = (long)(rem % 1000000000LL);
-                tp = &ts;
-            } // tmo < 0 -> tp stays NULL (block forever)
-            // Multi-threaded guest: serialize against peer Ms doing epoll_ctl on this instance. Arm the wake
-            // knote and push any deferred changelist to the kernel BEFORE we block, so a peer's registration is
-            // kernel-visible to us and its NOTE_TRIGGER can wake us. We then block on a pure wait (no changelist)
-            // with the lock released, so epoll_ctl on another M is never blocked behind our sleep. Single-threaded
-            // (lk == 0) keeps the classic one-syscall ctl+wait batching, unchanged.
-            int lk = opt ? ep_lock() : 0;
-            if (lk) {
-                ep_wake_arm(ep);
-                ep_flush(ep, 0);
-            }
-            // A pending edge-prime means some fd is ready *now*; don't sleep waiting for a fresh kqueue edge
-            // (a Go server's epoll_wait blocks with an infinite timeout) -- poll kqueue and merge the prime in.
-            if (opt && g_ep_primen[ep] > 0) {
-                ts.tv_sec = 0;
-                ts.tv_nsec = 0;
-                tp = &ts;
-            }
-            // W3E: submit the deferred changelist together with the wait in ONE kevent() syscall (single-threaded);
-            // threaded already flushed it above and waits with no changelist.
-            struct kevent *chg = (opt && !lk) ? g_ep_chg[ep] : NULL;
-            int nchg = (opt && !lk) ? g_ep_chgn[ep] : 0;
-            if (lk) ep_unlock(lk);
-            int r;
-            // epoll_wait is never restarted by a handler -- re-wait only on a SPURIOUS EINTR (nothing to
-            // deliver); the moment a guest handler is runnable we return -EINTR and let the dispatcher run it.
-            // kevent applies the changelist before blocking, so a retry re-waits only (changes consumed -> none).
-            ts_wait_enter(); // 'S' while blocked in epoll_wait/epoll_pwait
-            do {
-                r = kevent(ep, chg, nchg, kv, maxev, tp);
-                chg = NULL;
-                nchg = 0;
-            } while (r < 0 && svc_poll_retry(c));
-            ts_wait_leave();
-            if (opt && !lk) g_ep_chgn[ep] = 0; // consumed (threaded flushed it under the lock already)
-            if (r < 0) {
-                G_RET(c) = (uint64_t)(-errno);
-                break;
-            }
-            lk = opt ? ep_lock() : 0; // re-acquire to guard the armed-map updates + prime scan below
-            oi = 0;
-            for (int i = 0; i < r && oi < maxev; i++) {
-                // The EVFILT_USER self-wake knote is an internal cross-thread nudge, not a guest event -- drop it.
-                if (kv[i].filter == EVFILT_USER) continue;
-                // An EV_ERROR entry is a *changelist* processing result (errno in .data), NOT a readiness
-                // event. With correct armed-state tracking these do not occur; skip them if they do.
-                if (opt && (kv[i].flags & EV_ERROR)) continue;
-                uint32_t ev = (kv[i].filter == EVFILT_READ) ? 0x1u : (kv[i].filter == EVFILT_WRITE) ? 0x4u : 0u;
-                // EPOLLHUP
-                if (kv[i].flags & EV_EOF) ev |= 0x10u;
-                // EPOLLERR (immediate-path semantics preserved when opt is off)
-                if (!opt && (kv[i].flags & EV_ERROR)) ev |= 0x8u;
-                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
-                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
-                // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
-                if (opt && kv[i].ident < HL_NFD && g_ep_os[kv[i].ident]) {
-                    if (kv[i].filter == EVFILT_READ)
-                        g_ep_rd[kv[i].ident] = 0;
-                    else if (kv[i].filter == EVFILT_WRITE)
-                        g_ep_wr[kv[i].ident] = 0;
-                }
-                oi++;
-            }
-            // Deliver edge-triggered primes that kqueue didn't surface (fds already ready at registration).
-            // This is the cross-thread-readiness delivery: a peer M that registered an already-ready fd
-            // stashed a prime here, so a wake that carried no kqueue edge still hands the guest the ready fd.
-            if (ep >= 0 && ep < HL_NFD && g_ep_primen[ep] > 0) {
-                int kept = 0;
-                for (int i = 0; i < g_ep_primen[ep]; i++) {
-                    struct kevent *pk = &g_ep_prime[ep][i];
-                    uint32_t pev = (pk->filter == EVFILT_READ) ? 0x1u : 0x4u;
-                    int dup = 0;
-                    for (int j = 0; j < oi; j++) {
-                        uint32_t jev;
-                        uint64_t ju;
-                        memcpy(&jev, out + (size_t)j * G_EPEV_SZ, 4);
-                        memcpy(&ju, out + (size_t)j * G_EPEV_SZ + G_EPEV_DOFF, 8);
-                        if (ju == (uint64_t)pk->udata && (jev & pev)) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    if (dup) continue; // kqueue already reported it
-                    if (oi >= maxev) {
-                        g_ep_prime[ep][kept++] = *pk;
-                        continue;
-                    } // no room -> keep for next wait
-                    *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = pev;
-                    memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &pk->udata, 8);
-                    oi++;
-                }
-                g_ep_primen[ep] = kept;
-            }
-            ep_unlock(lk);
-            // Re-block instead of returning a spurious 0. A bare cross-thread wake (or a changelist that only
-            // produced EV_ERROR echoes) leaves oi==0 while the guest still asked to block. tmo<0: always loop
-            // (epoll_wait(-1) must never return 0). tmo>0: loop until the monotonic deadline elapses, at which
-            // point the remaining-time recompute yields a 0 timeout and the next kevent returns a genuine 0.
-            // tmo==0: returning 0 is correct (non-blocking poll) -- never loop.
-            if (oi == 0 && tmo != 0) {
-                if (tmo < 0) continue;
-                struct timespec now;
-                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
-                if (rem > 0) continue;
-            }
-            G_RET(c) = (uint64_t)oi;
+        // guest timeout ms (a3): <0 = infinite, 0 = poll, >0 = finite. Widen to nanoseconds for the
+        // shared wait core (which epoll_pwait2 also drives with a sub-ms timespec).
+        int32_t tmo_ms = (int32_t)a3;
+        int64_t timeout_ns = tmo_ms < 0 ? -1 : (int64_t)tmo_ms * 1000000LL;
+        svc_epoll_wait_common(c, (int)a0, (uint8_t *)a1, maxev, timeout_ns, sm_set);
+        break;
+    }
+    // epoll_pwait2(epfd, events, max, timeout(const struct timespec*), sigmask, sigsetsize)
+    case 441: {
+        // Same as epoll_pwait (case 22) except the timeout is a NANOSECOND-resolution struct timespec at
+        // a3 (NULL = block forever) instead of an int millisecond count, so sub-ms waits are honored
+        // exactly. tokio/glibc>=2.35 issue this when the kernel supports it; unimplemented it read as
+        // ENOSYS and every wait failed. Argument order: a3=timeout*, a4=sigmask*, a5=sigsetsize.
+        int maxev = (int)a2;
+        // Linux rejects maxevents <= 0 with EINVAL before touching the timeout/sigmask.
+        if (maxev <= 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (sm_on) poll_sigmask_leave(c, sm_saved);
+        if (maxev > 256) maxev = 256;
+        // NULL timeout -> infinite; otherwise read + validate the timespec (tv_nsec in [0,1e9), tv_sec>=0)
+        // and fold it to a single nanosecond budget for the shared wait core.
+        int64_t timeout_ns = -1;
+        if (a3) {
+            if (guest_bad_ptr(a3, sizeof(struct timespec))) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            const struct timespec *to = (const struct timespec *)a3;
+            if (to->tv_sec < 0 || to->tv_nsec < 0 || to->tv_nsec >= 1000000000L) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            timeout_ns = (int64_t)to->tv_sec * 1000000000LL + to->tv_nsec;
+        }
+        // sigmask (a4) + sigsetsize (a5): identical contract to epoll_pwait -- size must be 8, mask readable.
+        uint64_t sm_set = 0;
+        if (a4) {
+            if ((size_t)a5 != 8) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            if (guest_bad_ptr(a4, 8)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            sm_set = a4;
+        }
+        svc_epoll_wait_common(c, (int)a0, (uint8_t *)a1, maxev, timeout_ns, sm_set);
         break;
     }
     case 26: {
@@ -951,7 +1163,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         // Linux rejects an out-of-range timeout nanoseconds field (tv_nsec < 0 or >= 1e9) with EINVAL.
-        if (ts && (ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
+        if (ts && (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -970,26 +1182,16 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             sm_set = a3;
         }
         int have_to = ts != NULL;
-        // Full requested budget in ms, clamped (see above).
-        int tmo_full;
-        if (!ts)
-            tmo_full = -1; // NULL timespec -> block forever
-        else if (ts->tv_sec < 0)
-            tmo_full = 0; // past/negative deadline -> don't block
-        else if (ts->tv_sec >= 0x7fffffff / 1000)
-            tmo_full = 0x7fffffff; // would overflow ms range -> cap (~24.8d)
-        else {
-            long long ms = (long long)ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
-            tmo_full = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
-        }
         // like pselect (case 72), a spurious EINTR must re-block only for the REMAINING time, not the
         // full budget again -- otherwise a repeating hooked-but-blocked signal restarts the timeout forever
-        // (the select02-class hang) and every finite wait overshoots. Capture the deadline once.
+        // (the select02-class hang) and every finite wait overshoots. Capture the exact nanosecond deadline;
+        // truncating ppoll's timeout to integer milliseconds made sub-ms waits return immediately and every
+        // non-integral-ms wait finish early.
         struct timespec deadline = {0, 0};
-        if (have_to && tmo_full > 0) {
+        if (have_to && ts->tv_sec >= 0) {
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
-            deadline.tv_sec += tmo_full / 1000;
-            deadline.tv_nsec += (long)(tmo_full % 1000) * 1000000L;
+            deadline.tv_sec += ts->tv_sec;
+            deadline.tv_nsec += ts->tv_nsec;
             if (deadline.tv_nsec >= 1000000000L) {
                 deadline.tv_sec++;
                 deadline.tv_nsec -= 1000000000L;
@@ -998,27 +1200,59 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
         int r;
         for (;;) {
-            int tmo = tmo_full;
-            if (have_to && tmo_full > 0) {
+            r = socket_poll_error_fixup(fds, (nfds_t)a1, 0);
+            if (r > 0) break;
+            struct timespec rem = {0, 0};
+            if (have_to && ts->tv_sec >= 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t ms =
-                    (int64_t)(deadline.tv_sec - now.tv_sec) * 1000LL + (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
-                tmo = ms < 0 ? 0 : (ms > 0x7fffffff ? 0x7fffffff : (int)ms);
+                int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
+                             (deadline.tv_nsec - now.tv_nsec);
+                if (ns > 0) {
+                    rem.tv_sec = (time_t)(ns / 1000000000LL);
+                    rem.tv_nsec = (long)(ns % 1000000000LL);
+                }
             }
             ts_wait_enter();
+#if defined(__linux__)
+            // Linux already provides the exact relative-timespec primitive.
+            // Hand it the complete remaining budget.  An earlier attempt to
+            // wake several milliseconds early and spin to the deadline burned
+            // a scheduler quantum on every call; repeated timer waits were
+            // consequently preempted for about 8ms and became much less
+            // accurate than the host ppoll they were trying to improve.
+            r = ppoll(fds, (nfds_t)a1, have_to ? &rem : NULL, NULL);
+#else
+            // poll(2) only accepts milliseconds. Round UP so a finite wait
+            // never returns before its Linux ppoll deadline.
+            int tmo = -1;
+            if (have_to) {
+                int64_t ns = (int64_t)rem.tv_sec * 1000000000LL + rem.tv_nsec;
+                int64_t ms = (ns + 999999LL) / 1000000LL;
+                tmo = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+            }
             r = poll(fds, (nfds_t)a1, tmo);
+#endif
             ts_wait_leave(); // S while blocked (glibc pause on aarch64 -> ppoll)
+            r = socket_poll_error_fixup(fds, (nfds_t)a1, r);
+            if (r == 0 && have_to) {
+                struct timespec now;
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                int64_t left = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
+                               (deadline.tv_nsec - now.tv_nsec);
+                if (left > 0) continue;
+            }
             // poll/ppoll is never restarted by a handler; loop only on a spurious EINTR (svc_poll_retry).
             if (r < 0 && svc_poll_retry(c)) continue;
             break;
         }
+        r = eventfd_poll_writable_fixup(fds, (nfds_t)a1, r);
         if (sm_on) poll_sigmask_leave(c, sm_saved);
         // Linux ppoll(2) writes the leftover time back into the timespec (glibc's ppoll wrapper hides it via
         // a local copy, so this is invisible to POSIX callers but correct for the raw syscall).
         if (r >= 0 && have_to) {
             struct timespec left = {0, 0};
-            if (tmo_full > 0) {
+            if (ts->tv_sec >= 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);

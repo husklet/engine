@@ -3,6 +3,8 @@ link2 nlink=3
 link shared content=Jello
 link EEXIST: ret=-1 ok=1
 link ENOENT: ret=-1 ok=1
+linkat ENOTDIR: ret=-1 ok=1
+linkat EBADF: ret=-1 ok=1
 lstat symlink: ok=1 islnk=1 size=1
 stat follows: reg=1 size=5
 lstat ENOENT: ret=-1 ok=1

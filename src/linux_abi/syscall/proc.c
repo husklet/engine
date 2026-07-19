@@ -80,7 +80,15 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
     // Docker --ulimit override wins (g_limits, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
     // requested value, not the hl default. `set` gates each resource so unspecified ones keep the defaults.
-    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) { return; }
+    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) {
+        if (resource == 7) {
+            uint32_t guest_limit = hl_engine_guest_fd_limit();
+            uint64_t ceiling = guest_limit > 0 ? guest_limit : 20480;
+            if (o[1] > ceiling) o[1] = ceiling;
+            if (o[0] > o[1]) o[0] = o[1];
+        }
+        return;
+    }
     switch (resource) {
     case 3: // RLIMIT_STACK
         o[0] = 8ull << 20;
@@ -88,7 +96,10 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
         break;
     case 7: // RLIMIT_NOFILE -- docker container default (oracle: soft 20480, hard 1048576; was 1024/1048576)
         o[0] = 20480;
-        o[1] = 1048576;
+        {
+            uint32_t guest_limit = hl_engine_guest_fd_limit();
+            o[1] = guest_limit > 0 ? guest_limit : 20480;
+        }
         break;
     case 4: // RLIMIT_CORE -- match the Linux/docker default: cores OFF via soft=0, hard unlimited. A guest that
             // wants cores (LTP, crash handlers) raises rlim_cur with setrlimit; that soft limit governs whether
@@ -152,6 +163,8 @@ static void exec_close_cloexec_scan(int maxfd) {
 
 static void exec_bound_closed(void *context, hl_linux_fd fd) {
     (void)context;
+    ep_provider_retire_endpoint((int)fd);
+    ep_object_retire_endpoint((int)fd);
     proc_fdvis_close((int)fd);
     /* Every typed guest descriptor has a same-number native shadow used only by legacy syscall paths. */
     close((int)fd);
@@ -163,6 +176,10 @@ static void exec_close_bound_cloexec_all(void) {
 }
 
 #include "../../host/system.h"
+
+#if defined(__linux__)
+#include <sys/prctl.h> // host PR_SET_CHILD_SUBREAPER: let the host kernel reparent orphaned guest tasks
+#endif
 
 static void exec_close_cloexec(void) {
     // Sweep only the fds that are actually OPEN, not the whole descriptor table. The daemon raises the
@@ -208,6 +225,22 @@ static void exec_close_cloexec(void) {
 }
 
 #include "../../core/engine_result.h"
+
+// CLONE_VFORK suspends the calling parent thread until the child either
+// commits an exec or exits. The engine implements process clones with host
+// fork(), so use a private one-byte rendezvous to preserve that ordering.
+// Without it, glibc may free the temporary child stack as soon as clone
+// returns in the parent while the child is still using that stack to enter
+// execve, producing an intermittent pre-exec SIGILL under compiler load.
+static int g_vfork_release_fd = -1;
+
+static void vfork_release_parent(void) {
+    if (g_vfork_release_fd < 0) return;
+    unsigned char committed = 1;
+    while (write(g_vfork_release_fd, &committed, sizeof committed) < 0 && errno == EINTR) {}
+    close(g_vfork_release_fd);
+    g_vfork_release_fd = -1;
+}
 
 // ---- fork child-side engine hooks (shared by clone/case-220 and clone3/case-435) -----------------
 // Everything the CHILD must reset before it re-enters guest code. Factored so the two fork sites can
@@ -262,6 +295,7 @@ static void fork_child_hooks(struct cpu *c) {
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
     acct_after_fork();           // claim this child's OWN cgroup accounting slot (new host pid, one task)
     wipefork_apply_child();      // MADV_WIPEONFORK: zero-fill the ranges the guest marked wipe-on-fork
+    dontfork_apply_child();      // MADV_DONTFORK: unmap the ranges the guest marked not-inherited-on-fork
     hl_gmap_lock_reset();        // mlock(2): memory locks are NOT inherited across fork -> child starts unlocked
 }
 
@@ -394,10 +428,12 @@ static int bound_fork_complete(bound_fork_state *state, int child, int child_pid
 // prctl per-process flags the kernel tracks and reports back on the matching GET (lsys-prctl-*):
 // no-new-privs is sticky (once set it can never clear), dumpable defaults to 1, pdeathsig defaults to 0.
 // (g_nnp lives in container/state.c so the /proc/self/status builder can report NoNewPrivs consistently.)
-static int g_dumpable = 1; // PR_SET/GET_DUMPABLE
-static int g_pdeathsig;    // PR_SET/GET_PDEATHSIG
+static int g_dumpable = 1;              // PR_SET/GET_DUMPABLE
+static int g_pdeathsig;                  // PR_SET/GET_PDEATHSIG
+static unsigned long g_timerslack = 50000; // PR_SET/GET_TIMERSLACK (ns); Linux default is 50us
 static int g_thp_disable;  // PR_SET/GET_THP_DISABLE (per-process transparent-hugepage opt-out)
 static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reaper for orphans)
+static int g_mce_kill = 2;  // PR_MCE_KILL/PR_MCE_KILL_GET machine-check policy: LATE=0, EARLY=1, DEFAULT=2
 // The process EFFECTIVE capability set. The container starts as full root (all caps); we don't model
 // per-capability ENFORCEMENT in general, but we DO track what capset(2) leaves in the effective set so the
 // few prctl options the kernel gates on a specific capability (PR_SET_SECUREBITS / PR_CAPBSET_DROP need
@@ -406,6 +442,7 @@ static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reap
 // container/state.c (default = the 14-cap docker set HL_CAP_DEFAULT, which INCLUDES CAP_SETPCAP) so the
 // /proc/self/status builder and these handlers share one source of truth. capset() narrows the effective set.
 #define CAP_SETPCAP 8
+#define CAP_SYS_RESOURCE 24
 // personality(2) persona (lsys-personality): query with 0xffffffff, set returns the previous value.
 static unsigned g_persona;
 
@@ -429,9 +466,10 @@ static int sched_prio_band(int policy, int *lo, int *hi) {
     case 0:
     case 3:
     case 5:
+    case 6:
         *lo = 0;
         *hi = 0;
-        return 0; // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE
+        return 0; // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE / SCHED_DEADLINE
     default: return -1;
     }
 }
@@ -616,6 +654,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // exit_group: end the whole process
     case 94:
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "exit_group pid=%d code=%d", (int)getpid(), (int)a0);
         if (0)
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
@@ -1226,6 +1265,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1);
+            set_guest_comm_name(g_procname); // keep /proc/self/{comm,status,stat} in sync with the new name
             G_RET(c) = 0;
             break;
         } // PR_SET_NAME
@@ -1238,6 +1278,19 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
             break;
         } // PR_GET_NAME
+        // PR_SET_TIMERSLACK(29)/PR_GET_TIMERSLACK(30): the per-process timer slack (ns) round-trips. SET with
+        // arg2==0 resets to the default (Linux copies the process's default_timer_slack_ns); GET returns the
+        // current value as the syscall return. Previously both fell through to the generic no-op/EINVAL
+        // switch, so GET never reported what SET stored.
+        if ((int)a0 == 29) {
+            g_timerslack = a1 ? (unsigned long)a1 : 50000UL;
+            G_RET(c) = 0;
+            break;
+        }
+        if ((int)a0 == 30) {
+            G_RET(c) = (uint64_t)g_timerslack;
+            break;
+        }
         // PR_SET_KEEPCAPS(8)/PR_GET_KEEPCAPS(7) drive the CAP_SETID retention model -- setpriv arms
         // KEEPCAPS so its post-uid-drop capset can re-raise CAP_SETGID (see cred_uid_changed/capset).
         if ((int)a0 == 8) {
@@ -1258,6 +1311,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             g_pdeathsig = (int)a1;
+            // Forward to the host prctl on Linux: each guest process is a real host process whose parent is
+            // the guest parent's host process, so the host kernel delivers the parent-death signal when that
+            // parent dies -- exactly like the PR_SET_CHILD_SUBREAPER forward below. Without this the guest's
+            // pdeathsig never fired and a child blocked in sigwait() hung forever.
+#if defined(__linux__) && defined(PR_SET_PDEATHSIG)
+            (void)prctl(PR_SET_PDEATHSIG, (unsigned long)(int)a1, 0UL, 0UL, 0UL);
+#endif
             G_RET(c) = 0;
             break;
         }
@@ -1312,6 +1372,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // SIGCHLD/wait subtests are a known process-model gap, out of this syscall layer's scope.
         if ((int)a0 == 36) {
             g_subreaper = (a1 != 0);
+            // hl runs each guest task as a real host process, so orphan reparenting is a host-kernel
+            // decision. Forward the flag to the host prctl on Linux: the host kernel then reparents an
+            // orphaned guest grandchild onto THIS engine process (the marked subreaper) instead of host
+            // init, so the guest's own waitpid(-1) harvests it -- matching PR_SET_CHILD_SUBREAPER. The
+            // guest-visible flag still round-trips via g_subreaper for PR_GET below.
+#if defined(__linux__) && defined(PR_SET_CHILD_SUBREAPER)
+            (void)prctl(PR_SET_CHILD_SUBREAPER, a1 != 0 ? 1UL : 0UL, 0UL, 0UL, 0UL);
+#endif
             G_RET(c) = 0;
             break;
         }
@@ -1430,7 +1498,16 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(-EPERM);
                 break;
             }
-            G_RET(c) = 0; // securebits accepted (we don't enforce them, but the value round-trips as 0)
+            g_securebits = (int)a1; // we don't enforce securebits, but the value round-trips via PR_GET_SECUREBITS
+            G_RET(c) = 0;
+            break;
+        }
+        // PR_GET_SECUREBITS(27): report the current securebits flags (0 in a default container). The kernel
+        // ignores arg2..5 here, so no argument validation -- capsh/libcap read this and it must agree with what
+        // PR_SET_SECUREBITS stored. Previously fell through to the generic switch -> -EINVAL (a query that
+        // always succeeds on real Linux).
+        if ((int)a0 == 27) {
+            G_RET(c) = (uint64_t)(unsigned)g_securebits;
             break;
         }
         if ((int)a0 == 24) {
@@ -1446,10 +1523,63 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
             break;
         }
+        // PR_TASK_PERF_EVENTS_DISABLE(31)/PR_TASK_PERF_EVENTS_ENABLE(32): toggle this task's perf events.
+        // Always succeeds on real Linux (the remaining args are ignored, no capability required); with no perf
+        // subsystem to gate there is nothing to enforce, so mirror the kernel's unconditional success rather
+        // than the old blanket -EINVAL, which made a benign query look like an unsupported operation.
+        if ((int)a0 == 31 || (int)a0 == 32) {
+            G_RET(c) = 0;
+            break;
+        }
+        // PR_MCE_KILL(33)/PR_MCE_KILL_GET(34): the per-process machine-check early/late kill policy. GET (34)
+        // returns the stored policy (LATE=0 / EARLY=1 / DEFAULT=2) and rejects any nonzero arg2..5. SET (33)
+        // takes a sub-op in arg2: PR_MCE_KILL_CLEAR(0) resets to DEFAULT (arg3..5 must be 0);
+        // PR_MCE_KILL_SET(1) takes a policy in arg3 (EARLY=1 / LATE=0 / DEFAULT=2, arg4/5 must be 0). Any other
+        // shape is -EINVAL (LTP prctl02). The policy is advisory (there is no guest-visible MCE delivery here)
+        // but round-tripping it makes the feature probe succeed exactly as on Linux instead of -EINVAL.
+        if ((int)a0 == 34) {
+            if (a1 || a2 || a3 || a4) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            G_RET(c) = (uint64_t)(unsigned)g_mce_kill;
+            break;
+        }
+        if ((int)a0 == 33) {
+            if (a1 == 0 /*PR_MCE_KILL_CLEAR*/) {
+                if (a2 || a3 || a4) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+                g_mce_kill = 2; // reset to DEFAULT
+                G_RET(c) = 0;
+                break;
+            }
+            if (a1 == 1 /*PR_MCE_KILL_SET*/) {
+                if (a3 || a4 || a2 > 2 /* EARLY(1)/LATE(0)/DEFAULT(2) only */) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+                g_mce_kill = (int)a2;
+                G_RET(c) = 0;
+                break;
+            }
+            G_RET(c) = (uint64_t)(-EINVAL); // unknown MCE sub-op
+            break;
+        }
+        // PR_SET_MM(35): rewrite fields of this task's mm layout (start_brk, brk, arg/env bounds, ...). The
+        // kernel gates the WHOLE option on CAP_SYS_RESOURCE and returns -EPERM before validating the sub-op
+        // when it is absent. The container's default cap set (HL_CAP_DEFAULT) does NOT include
+        // CAP_SYS_RESOURCE, so every PR_SET_MM here is -EPERM -- matching native (both an unprivileged task
+        // and a container root without the cap). Previously this fell into the no-op list and returned 0,
+        // silently claiming to relayout the mm while doing nothing.
+        if ((int)a0 == 35) {
+            G_RET(c) = (g_cap_eff & (1ull << CAP_SYS_RESOURCE)) ? (uint64_t)(-EINVAL) : (uint64_t)(-EPERM);
+            break;
+        }
         // 0 for known no-ops; EINVAL for unknown (kernel does)
         switch ((int)a0) {
         case 15:
-        case 35:
         case 53:
         case 55:
         // NAME/SECCOMP/TIMERSLACK/THP/SPECCTRL...
@@ -1513,8 +1643,27 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)bound_status;
             break;
         }
+        int vfork_pipe[2] = {-1, -1};
+        int is_vfork = (a0 & 0x4000) != 0;
+        if (is_vfork && pipe(vfork_pipe) != 0) {
+            bound_fork_complete(&bound_fork, 0, -1);
+            G_RET(c) = (uint64_t)(int64_t)(-errno);
+            break;
+        }
+        if (is_vfork) {
+            (void)fcntl(vfork_pipe[0], F_SETFD, FD_CLOEXEC);
+            (void)fcntl(vfork_pipe[1], F_SETFD, FD_CLOEXEC);
+        }
         pid_t pid = fork();
         int fork_error = errno;
+        if (is_vfork) {
+            if (pid == 0) {
+                close(vfork_pipe[0]);
+                g_vfork_release_fd = vfork_pipe[1];
+            } else {
+                close(vfork_pipe[1]);
+            }
+        }
         bound_status = bound_fork_complete(&bound_fork, pid == 0, pid == 0 ? (int)getpid() : (int)pid);
         if (bound_status != 0) {
             if (pid == 0) _exit(127);
@@ -1523,6 +1672,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 kill(pid, SIGKILL);
                 while (waitpid(pid, &failed_status, 0) < 0 && errno == EINTR) {}
             }
+            if (is_vfork && vfork_pipe[0] >= 0) close(vfork_pipe[0]);
             G_RET(c) = (uint64_t)(int64_t)bound_status;
             break;
         }
@@ -1556,6 +1706,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                                            // free) so a kill/pidfd membership check can never ESRCH it before
                                            // it runs its own proc_reg_after_fork publish
             acct_child_born((int)pid);     // register the child's OWN task slot (container-wide pids.current)
+        }
+        if (pid > 0 && is_vfork) {
+            unsigned char committed;
+            while (read(vfork_pipe[0], &committed, sizeof committed) < 0 && errno == EINTR) {}
+            close(vfork_pipe[0]);
+        } else if (pid < 0 && is_vfork) {
+            close(vfork_pipe[0]);
         }
         // CLONE_PARENT_SETTID(0x00100000): store the child's tid (its pid) into the PARENT's *ptid (a2).
         // Mutually exclusive with CLONE_PIDFD (which also uses the ptid slot), so it never clobbers a pidfd.
@@ -1679,6 +1836,46 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // not the host cwd. The old xresolve_overlay bailed on any non-'/' path and returned it raw,
             // so `./x` was access()'d against the host process cwd (never the mounted guest cwd) -> ENOENT.
             atpath(-100, (const char *)a0, pb, sizeof pb, 0);
+        // execve(2) error classification, matching Linux binfmt semantics, applied to the resolved target
+        // BEFORE the bare-mode authorized-executable gate below (which otherwise collapses every non-image
+        // target to a blanket ENOENT): a directory is EACCES, and a regular file that is neither an ELF nor
+        // a #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the existing paths.
+        // This only reclassifies the error the guest receives; it never authorizes running the target.
+        {
+            struct stat xst;
+            if (stat(p, &xst) == 0) {
+                if (S_ISDIR(xst.st_mode)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EACCES);
+                    break;
+                }
+                if (S_ISREG(xst.st_mode)) {
+                    FILE *xf = fopen(p, "rb");
+                    if (xf) {
+                        unsigned char mag[4] = {0};
+                        size_t got = fread(mag, 1, sizeof mag, xf);
+                        fclose(xf);
+                        int is_elf = got >= 4 && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F';
+                        int is_script = got >= 2 && mag[0] == '#' && mag[1] == '!';
+                        if (!is_elf && !is_script) {
+                            G_RET(c) = (uint64_t)(int64_t)(-ENOEXEC);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!g_rootfs) {
+            char candidate[4200];
+            int authorized = g_authorized_executable_path[0] && realpath(p, candidate) != NULL &&
+                             strcmp(candidate, g_authorized_executable_path) == 0;
+            if (!authorized && !g_untrusted) {
+                char interpreter[4200], option[256], canonical[4200];
+                authorized = parse_shebang(p, interpreter, sizeof interpreter, option, sizeof option) == 1 &&
+                             realpath(interpreter, canonical) != NULL &&
+                             strcmp(canonical, g_authorized_executable_path) == 0;
+            }
+            if (!authorized) { G_RET(c) = (uint64_t)(-2); break; }
+        }
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
             break;
@@ -1755,6 +1952,9 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // e.g. gosu/su-exec, leaves netpoller/idle Ms live; a surviving M would run the old image against the
         // freed state). Blocks until all peers have left run_guest, so the teardown below is race-free.
         thread_exit_others(c);
+        // All failure returns are behind us: Linux releases a vfork parent
+        // when exec commits, before the new image begins executing.
+        vfork_release_parent();
         set_guest_comm(comm_src); // comm := basename of the exec'd NAME (captured pre-rewrite above)
         cred_after_exec();        // exec recomputes caps (non-root loses them) + clears KEEPCAPS; ids persist
 #ifdef PCACHE_SAVE_HOOK
@@ -1789,7 +1989,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 // shared execve path still compiles into the aarch64 unity (R_REPSTR is x86 cpu.h-only)
         g_nonpie_blob_code = 0; // reset; load_elf re-sets it iff the new main image carries the V8 blob
 #endif
-        g_go_iscgo = 0; // reset; load_elf re-sets it iff the new main image is a cgo Go image
+        g_go_image = 0; // reset; load_elf re-sets it iff the new main image is a Go image
         p = xpath;
         for (int i = 0; i < ac && i < HL_MAXARGV - 1; i++)
             argv[i] = xargv[i];
@@ -1820,7 +2020,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             at_base = li.base;
         }
         g_cp = g_cache;
-        memset(g_map, 0, sizeof g_map);
+        /* Translation-map visibility is generation-tagged. Clearing only the
+           record payload leaves the old generation slots logically live and
+           lets the new exec image observe zero/stale translation records. */
+        map_clear();
         // flush old translations
         g_npend = 0;
         memset(g_ibtc, 0, sizeof g_ibtc);
@@ -1854,13 +2057,15 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             _exit(127);
         brk_lo = brk_cur = heap;
         brk_hi = brk_lo + (256u << 20);
+        // Publish the new image's exec path BEFORE build_stack: build_stack points AT_EXECFN at
+        // g_exe_path (the canonical guest exec pathname), and /proc/self/exe reads it too.
+        snprintf(g_exe_path_store, sizeof g_exe_path_store, "%s", gexe); // /proc/self/exe -> the new image
+        g_exe_path = g_exe_path_store;
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
         proc_reg_publish(gexe, ac, argv); // republish the process table entry (comm/argv changed on exec)
         free(xpath);
         for (int i = 0; i < ac && i < 255; i++)
             free(xargv[i]);
-        snprintf(g_exe_path_store, sizeof g_exe_path_store, "%s", gexe); // /proc/self/exe -> the new image
-        g_exe_path = g_exe_path_store;
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;
@@ -2041,6 +2246,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
+        if ((a2 && guest_bad_ptr((uintptr_t)a2, sizeof(uint64_t) * 2)) ||
+            (a3 && guest_bad_ptr((uintptr_t)a3, sizeof(uint64_t) * 2))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (a3) svc_fill_rlimit(res, (uint64_t *)a3);
         if (a2) {
             const uint64_t *nl = (const uint64_t *)a2;
@@ -2049,6 +2259,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (ncur != ~0ull && nmax != ~0ull && ncur > nmax) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
+            }
+            if (res == 7) {
+                uint32_t guest_limit = hl_engine_guest_fd_limit();
+                uint64_t ceiling = guest_limit > 0 ? guest_limit : 20480;
+                if (nmax == ~0ull || nmax > ceiling || ncur == ~0ull || ncur > ceiling) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EPERM);
+                    break;
+                }
             }
             hl_limit_table_set(&g_limits, res, ncur, nmax);
         }

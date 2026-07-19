@@ -1,3 +1,4 @@
+use hl_engine::network::Namespace;
 use hl_engine::{Config, Engine, Exit, Guest, Stdio};
 use std::fs;
 use std::io::{Read, Write};
@@ -31,6 +32,78 @@ fn alive(pid: u32) -> bool {
         .args(["-0", &pid.to_string()])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[test]
+fn private_udp_loopback_preserves_datagrams_and_readiness_across_fork() {
+    let mut child = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(
+            Config::new()
+                .root(rootfs())
+                .network(true)
+                .network_namespace(Namespace::new("rust-private-udp").unwrap()),
+        )
+        .args([
+            "-c",
+            "( echo UDP_PRIVATE_OK | nc -u -l -p 19231 -w 2 ) & sleep 0.2; echo request | nc -u -w 2 127.0.0.1 19231",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = String::new();
+    child
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(child.wait().unwrap(), Exit::Code(0));
+    assert!(output.lines().any(|line| line == "request"));
+    assert!(output.lines().any(|line| line == "UDP_PRIVATE_OK"));
+}
+
+#[test]
+fn private_udp_loopback_is_shared_by_independent_launches() {
+    let config = || {
+        Config::new()
+            .root(rootfs())
+            .network(true)
+            .network_namespace(Namespace::new("rust-private-udp-launches").unwrap())
+    };
+    let mut server = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(config())
+        .args([
+            "-c",
+            "echo UDP_LAUNCH_OK | nc -u -l -s 127.0.0.1 -p 19232 -w 3",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut client = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(config())
+        .args(["-c", "echo request | nc -u -w 2 127.0.0.1 19232"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reply = String::new();
+    client
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut reply)
+        .unwrap();
+    assert_eq!(client.wait().unwrap(), Exit::Code(0));
+    assert_eq!(reply.trim(), "UDP_LAUNCH_OK");
+    let mut request = String::new();
+    server
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut request)
+        .unwrap();
+    assert_eq!(server.wait().unwrap(), Exit::Code(0));
+    assert_eq!(request.trim(), "request");
 }
 
 #[test]
@@ -124,6 +197,26 @@ fn public_api_runs_real_alpine_shell_with_process_io() {
     assert_eq!(child.wait().unwrap(), Exit::Code(17));
     assert_eq!(stdout, "out:alpine:/tmp:input\n");
     assert_eq!(stderr, "err:argument\n");
+}
+
+#[test]
+fn production_true_has_empty_stdout_and_stderr() {
+    let output = Engine::new()
+        .command(Guest::Aarch64, "/bin/true")
+        .config(Config::new().root(rootfs()))
+        .output()
+        .unwrap();
+    assert_eq!(output.exit, Exit::Code(0));
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {:?}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        output.stderr
+    );
 }
 
 #[test]
@@ -222,4 +315,89 @@ fn guest_ownership_is_seeded_and_shared_by_inode() {
     assert!(output.stderr.is_empty());
     fs::remove_file(hard).unwrap();
     fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn guest_ownership_is_seeded_for_overlay_lower_entries() {
+    let name = format!("overlay-owner-{}", std::process::id());
+    let relative = PathBuf::from("tmp").join(&name);
+    let file = rootfs().join(&relative);
+    fs::write(&file, b"ownership\n").unwrap();
+    let overlay = std::env::temp_dir().join(format!("hl-{name}"));
+    let _ = fs::remove_dir_all(&overlay);
+    fs::create_dir(&overlay).unwrap();
+    let upper = overlay.join("upper");
+    let work = overlay.join("work");
+    fs::create_dir(&upper).unwrap();
+    fs::create_dir(&work).unwrap();
+
+    let output = Engine::new()
+        .command(Guest::Aarch64, "/bin/stat")
+        .config(
+            Config::new()
+                .overlay(vec![rootfs().clone()], upper, work)
+                .owner(&relative, 12, 34),
+        )
+        .args(["-c", "%u:%g", &format!("/{}", relative.display())])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.exit, Exit::Code(0));
+    assert_eq!(output.stdout, b"12:34\n");
+    assert!(output.stderr.is_empty());
+    fs::remove_dir_all(overlay).unwrap();
+    fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn image_symlink_chain_can_open_synthetic_standard_error() {
+    let name = format!("stderr-alias-{}", std::process::id());
+    let relative = PathBuf::from("tmp").join(&name);
+    let link = rootfs().join(&relative);
+    let _ = fs::remove_file(&link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/dev/stderr", &link).unwrap();
+
+    let command = format!(
+        "test -d /proc/self/fd/ && printf SYNTHETIC_STDERR_OK > /{}",
+        relative.display()
+    );
+    let output = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()))
+        .args(["-c", &command])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.exit, Exit::Code(0));
+    assert_eq!(output.stderr, b"SYNTHETIC_STDERR_OK");
+    fs::remove_file(link).unwrap();
+}
+
+#[test]
+fn overlay_image_symlink_chain_can_open_synthetic_standard_output() {
+    let name = format!("stdout-alias-{}", std::process::id());
+    let relative = PathBuf::from("tmp").join(&name);
+    let link = rootfs().join(&relative);
+    let _ = fs::remove_file(&link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/dev/stdout", &link).unwrap();
+    let overlay = std::env::temp_dir().join(format!("hl-{name}"));
+    let upper = overlay.join("upper");
+    let work = overlay.join("work");
+    fs::create_dir_all(&upper).unwrap();
+    fs::create_dir_all(&work).unwrap();
+
+    let command = format!("printf SYNTHETIC_STDOUT_OK > /{}", relative.display());
+    let output = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().overlay(vec![rootfs().clone()], upper, work))
+        .args(["-c", &command])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.exit, Exit::Code(0));
+    assert_eq!(output.stdout, b"SYNTHETIC_STDOUT_OK");
+    fs::remove_dir_all(overlay).unwrap();
+    fs::remove_file(link).unwrap();
 }

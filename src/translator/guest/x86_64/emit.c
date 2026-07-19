@@ -775,14 +775,14 @@ void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     emit32(0xB9400000u | (16 << 5) | 16); /* ldr w16,[x16] */
     uint32_t *inactive_fast = (uint32_t *)g_cp;
     emit32(0); /* tbz w16,#0,resume-inactive */
-    e_str(address_register, 28, OFF_FAULT_ADDR);
+    e_str(address_register, 28, OFF_BUS_EA);
     e_str(9, 28, OFF_BUS_SCRATCH);
     /* Flag-free monotonic page filter.  The transition force flag sends every
        access to the precise helper while a host mapping is being published;
        otherwise a definite filter miss skips the full architectural spill. */
     uint32_t *force_slow = (uint32_t *)g_cp;
     emit32(0); /* tbnz w16,#1,slow */
-    e_ldr(16, 28, OFF_FAULT_ADDR);
+    e_ldr(16, 28, OFF_BUS_EA);
     e_lsr_i(16, 16, 12, 1);
     e_mov_rr(17, 16, 1);
     emit32(0xD3400000u | (6u << 16) | (15u << 10) | (16u << 5) | 16u);
@@ -797,7 +797,7 @@ void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
                   (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
     e_ldr(9, 28, OFF_BUS_SCRATCH);
     emit_spill();
-    e_ldr(0, 28, OFF_FAULT_ADDR);
+    e_ldr(0, 28, OFF_BUS_EA);
     e_movconst(1, size);
     emit_host_ptr(16, (uint64_t)(uintptr_t)&jit_guest_bus_fault, PRELOC_HOSTGLOBAL);
     emit32(0xD63F0000u | (16 << 5));
@@ -820,7 +820,7 @@ void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     emit_reload_full();
     uint8_t *resume_fast = g_cp;
     e_ldr(9, 28, OFF_BUS_SCRATCH);
-    e_ldr(address_register, 28, OFF_FAULT_ADDR);
+    e_ldr(address_register, 28, OFF_BUS_EA);
     *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 9u;
     uint8_t *resume_inactive = g_cp;
     *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
@@ -980,6 +980,15 @@ static void emit_fast_syscall(uint64_t next) {
     e_subi_s(16, 0, 228, 1); // subs x16, x0,
     uint32_t *m1 = (uint32_t *)g_cp;
     e_bcond(1, 0);    // b.ne -> gettimeofday
+    if (g_nonpie_lo) {
+        // The inline path writes RSI directly, while an ET_EXEC image's static
+        // pointers name the low Linux link address and require nonpie_p()
+        // rebasing. Keep fixed-layout guests on the canonical syscall path;
+        // otherwise a perfectly valid static .bss timespec faults and returns
+        // EFAULT (the LTP harness-wide x86 teardown regression).
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(14, 0); // b.al -> slow
+    }
     if (!g_fastclk) { // time arm disabled (untrustworthy CNTVCT) -> real clock_gettime syscall
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(14, 0); // b.al -> slow
@@ -1036,6 +1045,10 @@ static void emit_fast_syscall(uint64_t next) {
     e_subi_s(16, 0, 96, 1);                 // subs x16, x0, #96
     uint32_t *gtod_miss = (uint32_t *)g_cp; // W4F: rax!=96 -> fall into the W4F arms (was straight to slow)
     e_bcond(1, 0);                          // b.ne -> W4F arms (or slow when g_siginline off)
+    if (g_nonpie_lo) {
+        to_slow[nsl++] = (uint32_t *)g_cp;
+        e_bcond(14, 0); // fixed-layout pointers require canonical rebasing
+    }
     if (!g_fastclk) {                       // time arm disabled -> real gettimeofday syscall
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(14, 0); // b.al -> slow

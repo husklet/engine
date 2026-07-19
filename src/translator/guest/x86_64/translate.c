@@ -1116,6 +1116,10 @@ static void emit_irq_check(uint64_t rip) {
 
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
+    /* Observe writes made through another MAP_SHARED alias before decoding
+       an executable view backed by an emulated host-page snapshot. */
+    uint64_t source_page = gpc & ~UINT64_C(0xfff);
+    filemap_refresh_emulated(source_page, source_page + UINT64_C(0x1000));
     hl_x86_crypto_state crypto_state = {.optimize = !nosseopt()};
     hl_x86_trace_state trace_state = {
         .pending_flags = &g_fl_pending,
@@ -1149,7 +1153,14 @@ static void *translate_block(uint64_t gpc) {
     uint64_t seen[HL_X86_TRACE_MAX_BLOCKS];
     int nseen = 0, trace_blk = 0;
     seen[nseen++] = start;
-#define STITCH_OK                                                                                                      \
+    // Exact fault-PC provenance: record, per memory-accessing guest instruction, the host code range it
+    // compiled to and its guest RIP, so a synchronous SIGSEGV/SIGBUS inside translated code recovers the
+    // EXACT faulting instruction (crash reporters / JIT null-check-elimination read gregs[REG_RIP]).
+    // Mirrors the aarch64 translator's provenance map. Deferred-by-one (close the previous insn's host
+    // range at the next loop top, once g_cp has advanced past its emitted code); flushed after the loop.
+    uint64_t prov_host = 0, prov_guest = 0;
+    int prov_mem = 0;
+#define STITCH_OK                                                                                                    \
     (stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < HL_X86_TRACE_MAX_BLOCKS - 1 &&                               \
      (size_t)((uint8_t *)g_cp - (uint8_t *)host) < HL_X86_TRACE_MAX_BYTES)
     for (;;) {
@@ -1163,6 +1174,10 @@ static void *translate_block(uint64_t gpc) {
         g_emit_gpc = gpc; // IRQSLIM: tag chain emission with the current branch's rip
         hl_x86_decode(gpc, &I);
         uint64_t next = gpc + I.len;
+        if (prov_mem) jit_instruction_map_put(prov_host, (uint64_t)g_cp, prov_guest); // close previous insn
+        prov_host = (uint64_t)g_cp;
+        prov_guest = gpc;
+        prov_mem = I.is_mem; // a memory operand -> this insn can raise a synchronous guest fault
         uint8_t op = I.op;
         int sf = I.opsize == 8;
         // VEX/EVEX (AVX/AVX2/AVX-512): not lowered to NEON. Exit the block and emulate this single insn in C
@@ -2380,13 +2395,22 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDB) {
                     if (reg == 4 && rm == 3) {
+                        // FNINIT: reset TOP=0, FCW=0x037f (all exceptions masked, round-nearest, 64-bit),
+                        // clear FSW (condition codes) and the host FPSR sticky exception flags.
                         e_movconst(16, 0);
                         e_str(16, 28, OFF_FPTOP);
+                        e_str(16, 28, OFF_FPSW);
+                        e_movconst(16, 0x037f);
+                        e_str(16, 28, OFF_FPCW);
+                        hl_x86_x87_clear_exceptions();
                         if (hl_x86_x87_optimized()) { // anchor the translate-time shadow: top is now statically 0
                             hl_x86_x87_anchor(0); // memory and shadow agree
                         }
                     } // finit -> top=0
-                    else if (reg == 4) { /* fclex/etc */
+                    else if (reg == 4 && rm == 2) {
+                        hl_x86_x87_clear_exceptions();
+                    } // fnclex: clear sticky exception flags
+                    else if (reg == 4) { /* fneni/fndisi/fnsetpm: no-op */
                     } else if (reg == 5 || reg == 6) {
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
@@ -2482,11 +2506,35 @@ static void *translate_block(uint64_t gpc) {
                 if (sf)
                     e_asr_i(RDX, RAX, 63, 1); // cqo: rdx = rax>>63 (arith)
                 else if (I.p66) {
-                    e_asr_i(19, RAX, 15, 0);
-                    e_bfi(RDX, 19, 0, 16, 1);
+                    e_sxt(19, RAX, 2);       // x19 = sext16(AX): bits 63:16 replicate AX bit 15
+                    e_asr_i(19, 19, 15, 0);  // w19 = all-ones if AX<0 else 0
+                    e_bfi(RDX, 19, 0, 16, 1); // DX = 0xFFFF/0x0000, preserve RDX 63:16
                 } // cwd: dx=sign(ax)
                 else
                     e_asr_i(RDX, RAX, 31, 0); // cdq: edx = eax>>31 (arith)
+                gpc = next;
+                continue;
+            }
+            // ---- XLATB (D7): AL = [ (seg:) RBX + zero-extended AL ]. The table index is the *8-bit*
+            // AL (bits 63:8 of RAX never participate), so it cannot ride the ModRM index path. Build
+            // the base (RBX, with segment base + non-PIE bias + addr-size applied) through the shared
+            // EA emitter, add the zero-extended AL, then load one byte back into AL (bits 63:8 kept).
+            if (op == 0xD7) {
+                e_uxt(19, RAX, 1); // x19 = zero-extended AL (callee-saved; survives emit_ea's x16 clobber)
+                struct insn base = I;
+                base.is_mem = 1;
+                base.m_hasbase = 1;
+                base.m_base = RBX;
+                base.m_hasindex = 0;
+                base.rip_rel = 0;
+                base.disp = 0;
+                base.imm = 0;
+                emit_ea(&base, next);              // x17 = base address (seg base + bias + addr32 applied)
+                e_rrr(A_ADD, 17, 17, 19, 1, 0);    // x17 += zero-extended AL
+                if (I.addr32) e_uxt(17, 17, 4);    // 0x67: effective address wraps at 32 bits
+                emit_bus_guard(17, 1, next - (uint64_t)I.len);
+                e_load(1, 16, 17);
+                byte_wb(&I, RAX, 16); // AL = [table + AL]
                 gpc = next;
                 continue;
             }
@@ -2609,6 +2657,58 @@ static void *translate_block(uint64_t gpc) {
                         else
                             emit32(0x6E080400u | (vm << 5) | vd);
                     } // ins .d[0]
+                } else if (op == 0x7C || op == 0x7D) { // SSE3 haddps/hsubps (F2) or haddpd/hsubpd (66)
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    uint32_t szb = I.p66 ? 0x00400000u : 0; // 66 -> double lanes (.2d), F2 -> single (.4s)
+                    if (op == 0x7C) {                       // HADD: FADDP vd, vd, s = [d0+d1, d2+d3, s0+s1, s2+s3]
+                        e_v3(0x6E20D400u | szb, vd, vd, s);
+                    } else { // HSUB: even/odd deinterleave (UZP1/UZP2) then FSUB even-odd
+                        e_v3(0x4E801800u | szb, 17, vd, s); // uzp1 v17 = even lanes
+                        e_v3(0x4E805800u | szb, 18, vd, s); // uzp2 v18 = odd lanes
+                        e_v3(0x4EA0D400u | szb, vd, 17, 18); // fsub vd = even - odd
+                    }
+                } else if (op == 0xD0) { // SSE3 addsubps (F2) / addsubpd (66): even lanes sub, odd lanes add
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    if (I.p66) { // addsubpd: negate only the low double lane, then add
+                        e_movconst(19, 0x8000000000000000ULL);
+                        emit32(0x9E670000u | (19 << 5) | 17); // fmov d17, x19 -> v17 = [sign, 0]
+                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate low double)
+                        e_v3(0x4E60D400u, vd, vd, 17);        // fadd vd.2d = vd + v17
+                    } else {                                  // addsubps: negate even single lanes (0,2), then add
+                        e_movconst(19, 0x0000000080000000ULL);
+                        emit32(0x4E080C00u | (19 << 5) | 17); // dup v17.2d, x19 -> [0x80000000,0,0x80000000,0]
+                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate even lanes)
+                        e_v3(0x4E20D400u, vd, vd, 17);        // fadd vd.4s = vd + v17
+                    }
+                } else if ((op == 0x12 || op == 0x16) && I.rep) { // SSE3 movsldup/movshdup: dup even/odd single lanes
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    if (op == 0x12)
+                        e_v3(0x4E802800u, vd, s, s); // movsldup: TRN1 vd.4s, s, s = [s0,s0,s2,s2]
+                    else
+                        e_v3(0x4E806800u, vd, s, s); // movshdup: TRN2 vd.4s, s, s = [s1,s1,s3,s3]
+                } else if (op == 0x12 && I.repne) { // movddup: dst[0]=dst[1]=src low 64-bit double
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_d(16, 17); // low 64-bit -> v16.d[0]
+                        s = 16;
+                    }
+                    emit32(0x4E080400u | (s << 5) | vd); // dup vd.2d, vs.d[0]  (broadcast low lane)
                 } else if (op == 0x12 || op == 0x16) { // movlps/movhps (load) or movhlps/movlhps (reg)
                     int lane = (op == 0x16) ? 1 : 0;   // 12->low lane(d[0]), 16->high lane(d[1])
                     if (I.is_mem) {
@@ -3173,7 +3273,12 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_s(16, 17);
                         s = 16;
                     }
-                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (s << 16) | (vd << 5)); // FCMP Dvd, Ds  (Rd=0)
+                    // COMISS/COMISD (0x2F) is the SIGNALING ordered compare: it raises Invalid (IE)
+                    // on ANY NaN operand, including qNaN. UCOMISS/UCOMISD (0x2E) is quiet: IE only for
+                    // sNaN. Map 0x2F -> FCMPE (bit4 set) and 0x2E -> FCMP. EFLAGS result is identical
+                    // for both (unordered -> N0 Z0 C1 V1), so the fixup below is unchanged.
+                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (op == 0x2F ? 0x10u : 0u) |
+                           (s << 16) | (vd << 5)); // FCMP/FCMPE Dvd, Ds  (Rd=0)
                     e_nzcv_save_fcmp();  // unordered fixup: x86 ZF=PF=CF=1, SF=0 (ARM FCMP gives N0 Z0 C1 V1)
                 } else if (op == 0xF4) { // pmuludq: vd.u64[i] = (u32)vd.even32[i] * (u32)src.even32[i]
                     // W3b: was UNIMPL -> blocked glibc strchr/strrchr (byte-broadcast via pmuludq).
@@ -3297,6 +3402,37 @@ static void *translate_block(uint64_t gpc) {
                 emit_ea(&I, next);
                 emit_bus_guard(17, (uint64_t)I.opsize, gpc);
                 e_store(I.opsize, I.reg, 17);
+                gpc = next;
+                continue;
+            }
+            if (op == 0xC7 && (I.reg & 7) == 1 && I.is_mem && I.opsize != 8) { // cmpxchg8b: 0F C7 /1 (64-bit compare+swap)
+                // Compare EDX:EAX with the 64-bit memory operand. If equal, store ECX:EBX and set ZF;
+                // else load memory into EDX:EAX and clear ZF. A LOCK prefix makes it atomic; CASAL (a
+                // single 64-bit atomic compare-exchange) is replay-immune and correct for both.
+                // CMPXCHG8B affects ONLY ZF (unlike 32-bit CMPXCHG), so materialize lazy flags first and
+                // edit ZF alone in the stored NZCV.
+                if (g_fl_pending) flags_materialize();
+                emit_ea(&I, next); // x17 = EA
+                emit_bus_guard(17, 8, gpc);
+                e_uxt(19, RAX, 4);
+                e_bfi(19, RDX, 32, 32, 1); // x19 = EDX:EAX (expected)
+                e_uxt(20, RBX, 4);
+                e_bfi(20, RCX, 32, 32, 1); // x20 = ECX:EBX (new value)
+                e_mov_rr(22, 19, 1);       // x22 = expected (CASAL clobbers Rs with the old value)
+                e_cas(8, 19, 20, 17);      // x19 = old; if old==x22 then [m] = x20
+                e_uxt(24, 19, 4);          // old low 32  (EAX candidate, zero-extended)
+                e_lsr_i(25, 19, 32, 1);    // old high 32 (EDX candidate, zero-extended)
+                e_rrr(A_SUBS, 31, 19, 22, 1, 0); // host flags: Z = (old == expected)
+                e_csel(RAX, RAX, 24, 0, 1);      // mismatch -> EAX = old low  (equal keeps RAX)
+                e_csel(RDX, RDX, 25, 0, 1);      // mismatch -> EDX = old high (equal keeps RDX)
+                e_ldr(21, 28, OFF_NZCV);
+                e_movconst(23, 0x40000000u);
+                e_rrr(A_BIC, 21, 21, 23, 1, 0); // clear stored Z (bit 30)
+                e_cset(23, 0, 1);               // x23 = equal (EQ from the SUBS above)
+                e_lsl_i(23, 23, 30, 1);
+                e_rrr(A_ORR, 21, 21, 23, 1, 0); // set ZF from equality; other flags untouched
+                e_str(21, 28, OFF_NZCV);
+                emit32(0xD51B4200u | 21); // sync live ARM nzcv
                 gpc = next;
                 continue;
             }
@@ -3466,6 +3602,10 @@ static void *translate_block(uint64_t gpc) {
                 continue;
             }
             // 0F AE: fences (lfence/mfence/sfence -> dmb), ldmxcsr/stmxcsr, fxsave/fxrstor (xmm area)
+            if (op == 0x77) { // emms: empty MMX state. MMX registers map to the NEON file here (they do not
+                gpc = next;   // alias the x87 stack in this model), so there is no tag word to reset -> no-op.
+                continue;
+            }
             if (op == 0xAE) {
                 int sub = I.reg & 7;
                 if (sub >= 5) {
@@ -3489,6 +3629,18 @@ static void *translate_block(uint64_t gpc) {
                         e_movconst(21, 3u << 22);
                         e_rrr(A_BIC, 19, 19, 21, 1, 0);  // clear RMode
                         e_rrr(A_ORR, 19, 19, 20, 1, 22); // FPCR.RMode = ARM RMode
+                        // MXCSR.FTZ(15)|DAZ(6) -> host FPCR.FZ(24). ARM FPCR.FZ flushes both
+                        // denormal inputs and outputs, so the common FTZ+DAZ pair maps exactly;
+                        // a lone FTZ/DAZ over-flushes the other direction (documented approximation)
+                        // -- strictly better than the prior behavior of never flushing at all.
+                        e_lsr_i(16, 23, 15, 0);          // x16 = MXCSR>>15 (FTZ -> bit0)
+                        e_lsr_i(20, 23, 6, 0);           // x20 = MXCSR>>6  (DAZ -> bit0)
+                        e_rrr(A_ORR, 16, 16, 20, 0, 0);  // x16 = FTZ|DAZ (junk in high bits)
+                        e_movconst(20, 1);
+                        e_rrr(A_AND, 16, 16, 20, 0, 0);  // x16 = (FTZ|DAZ)&1
+                        e_movconst(20, 1u << 24);
+                        e_rrr(A_BIC, 19, 19, 20, 1, 0);  // clear FPCR.FZ
+                        e_rrr(A_ORR, 19, 19, 16, 1, 24); // FPCR.FZ = (FTZ|DAZ)
                         emit32(0xD51B4400u | 19);        // msr fpcr, x19
                         emit_mxcsr_to_fpsr(23);          // MXCSR sticky flags -> host FPSR (so feclearexcept clears)
                     }
@@ -3509,6 +3661,14 @@ static void *translate_block(uint64_t gpc) {
                         e_movconst(16, 0x1f80);          // default MXCSR (all exceptions masked, RC=00)
                         e_rrr(A_ORR, 16, 16, 19, 0, 13); // MXCSR |= RC << 13
                         emit_fpsr_to_mxcsr(16);          // + live sticky exception flags (IE/DE/ZE/OE/UE/PE)
+                        // reflect host FPCR.FZ(24) back to MXCSR FTZ(15)+DAZ(6) so a guest that
+                        // saves/restores the control word preserves flush-to-zero mode.
+                        emit32(0xD53B4400u | 19);        // mrs x19, fpcr
+                        e_lsr_i(19, 19, 24, 0);          // x19 = FPCR>>24 (FZ -> bit0)
+                        e_movconst(20, 1);
+                        e_rrr(A_AND, 19, 19, 20, 0, 0);  // x19 = FZ&1
+                        e_rrr(A_ORR, 16, 16, 19, 0, 15); // MXCSR |= FZ<<15 (FTZ)
+                        e_rrr(A_ORR, 16, 16, 19, 0, 6);  // MXCSR |= FZ<<6  (DAZ)
                         e_store(4, 16, 17);
                     }
                     gpc = next;
@@ -3874,6 +4034,7 @@ static void *translate_block(uint64_t gpc) {
         report_unimpl(gpc, &I);
         break;
     }
+    if (prov_mem) jit_instruction_map_put(prov_host, (uint64_t)g_cp, prov_guest); // close the final insn
     // IRQSLIM: the out-of-line poll exit stub the body-entry cbnz targets (irq set -> exit to
     // the dispatcher at the block start, exactly like the legacy inline poll).
     if (g_irq_patch) {
@@ -3887,7 +4048,7 @@ static void *translate_block(uint64_t gpc) {
     // AFTER icache-flushing the new code). Expose the body for it.
     g_last_body = body;
     if (!g_tier2_build) {
-        map_put(start, host, body);
+        map_put(start, start, gpc > start ? gpc : start + 1, host, body);
         if (!g_threaded) patch_links_to(start, body); // chaining mutates live blocks -> off when threaded
     }
     return host;

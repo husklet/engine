@@ -24,7 +24,7 @@ static void *check_bound_option(void *opaque) {
 
 int main(void) {
     char mutable[] = "original";
-    hl_options first, second;
+    hl_options first, second, snapshot;
     option_thread first_thread, second_thread;
     pthread_t first_id, second_id;
 
@@ -41,6 +41,15 @@ int main(void) {
     HL_CHECK(strcmp(hl_options_get(&first, "HL_CWD"), "/first") == 0);
     HL_CHECK(strcmp(hl_options_get(&first, "HL_CWD"), "/first") == 0);
     HL_CHECK(strcmp(hl_options_get(&second, "HL_CWD"), "/second") == 0);
+    {
+        hl_options *previous = hl_options_bind(&first);
+        HL_CHECK(hl_options_clone_current(&snapshot) == 0);
+        (void)hl_options_bind(previous);
+    }
+    HL_CHECK(hl_options_set(&first, "HL_CWD", "/mutated", 1) == 0);
+    HL_CHECK(strcmp(hl_options_get(&snapshot, "HL_CWD"), "/first") == 0);
+    hl_options_destroy(&snapshot);
+    HL_CHECK(hl_options_set(&first, "HL_CWD", "/first", 1) == 0);
     first_thread = (option_thread){&first, "/first", 0};
     second_thread = (option_thread){&second, "/second", 0};
     HL_CHECK(pthread_create(&first_id, NULL, check_bound_option, &first_thread) == 0);

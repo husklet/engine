@@ -34,6 +34,7 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
     hl_native_host *native = NULL;
     hl_host_services services = {0};
     hl_engine_fd_binding bindings[3] = {0};
+    hl_engine_executable executable = {0};
     hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config), .guest_isa = guest_isa, .rootfs = rootfs};
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     hl_engine *engine = NULL;
@@ -41,6 +42,18 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
     uint32_t binding_count = 0;
     int exit_status = 70;
     if (status == HL_STATUS_OK) {
+        if (rootfs == NULL && argc != 0 && argv != NULL && argv[0] != NULL) {
+            hl_host_result opened = services.file->open_relative(
+                services.context, HL_HOST_HANDLE_CWD, argv[0], strlen(argv[0]),
+                HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+            if (opened.status != HL_STATUS_OK)
+                status = (hl_status)opened.status;
+            else {
+                executable = (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER,
+                                                    0, opened.value, NULL, 0};
+                config.executable = &executable;
+            }
+        }
         uint32_t stream;
         for (stream = 0; stream < 3; ++stream) {
             hl_host_result adopted = services.file->standard_stream(services.context, stream);
@@ -74,6 +87,8 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
         uint32_t index;
         for (index = 0; index < binding_count; ++index)
             (void)services.file->close(services.context, bindings[index].host_handle);
+        if (config.executable != NULL)
+            (void)services.file->close(services.context, executable.host_handle);
     }
     if (status == HL_STATUS_OK)
         status = hl_engine_run(engine, (int)argc, (const char *const *)(uintptr_t)argv, &result);

@@ -50,17 +50,41 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
             break;
         }
         memset(output, 0, 112);
-        total = context->memory_limit ? context->memory_limit : UINT64_C(8) << 30;
-        free_memory = total > context->memory_used ? total - context->memory_used : total / 4;
-        memcpy(output + 0, &(uint64_t){3600}, sizeof(uint64_t));
+        // totalram MUST agree with /proc/meminfo MemTotal and /sys/fs/cgroup/memory.max: a cgroup memory cap
+        // wins; otherwise report the host RAM total (the same figure vfs.c serves to MemTotal). The old
+        // hardcoded 8 GiB disagreed with /proc/meminfo whenever the container was unconstrained, so a runtime
+        // that sizes its heap off sysinfo (glibc get_phys_pages, some JVMs) and one that reads /proc/meminfo
+        // saw two different machine sizes.
+        total = context->memory_limit ? context->memory_limit :
+                (context->host_memory_total ? context->host_memory_total : UINT64_C(8) << 30);
+        if (context->memory_limit)
+            free_memory = total > context->memory_used ? total - context->memory_used : 0;
+        else
+            free_memory = context->host_memory_free ? context->host_memory_free : total / 4;
+        // uptime is monotonic seconds since boot (matches /proc/uptime); the old constant 3600 never advanced
+        // and disagreed with /proc/uptime.
+        uint64_t uptime = context->uptime_seconds ? context->uptime_seconds : 3600;
+        uint32_t procs = context->process_count ? context->process_count : 1;
+        memcpy(output + 0, &uptime, sizeof(uptime));
+        memcpy(output + 8, &context->loads[0], sizeof(uint64_t));
+        memcpy(output + 16, &context->loads[1], sizeof(uint64_t));
+        memcpy(output + 24, &context->loads[2], sizeof(uint64_t));
         memcpy(output + 32, &total, sizeof(total));
         memcpy(output + 40, &free_memory, sizeof(free_memory));
-        memcpy(output + 80, &(uint16_t){64}, sizeof(uint16_t));
+        memcpy(output + 80, &procs, sizeof(uint16_t));
         memcpy(output + 104, &(uint32_t){1}, sizeof(uint32_t));
         *guest_result = 0;
         break;
     }
-    case 278:
+    case 278: {
+        // Validate flags exactly as Linux (drivers/char/random.c): only GRND_NONBLOCK(1) | GRND_RANDOM(2) |
+        // GRND_INSECURE(4) are defined, and GRND_RANDOM|GRND_INSECURE together is invalid. Any other bit ->
+        // EINVAL (previously an unknown flag such as 0x10 wrongly succeeded).
+        uint64_t flags = arguments[2];
+        if ((flags & ~(uint64_t)0x7u) || (flags & 0x2u && flags & 0x4u)) {
+            *guest_result = -EINVAL;
+            break;
+        }
         if (!context->mapped(context->callback_context, (uintptr_t)address, (size_t)size)) {
             *guest_result = -EFAULT;
             break;
@@ -68,6 +92,7 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
         context->random(context->callback_context, (void *)(uintptr_t)address, (size_t)size);
         *guest_result = (int64_t)size;
         break;
+    }
     case 293:
         *guest_result = -ENOSYS;
         break;

@@ -39,6 +39,9 @@ struct hl_engine {
     char *owned_environment;
     char *owned_box_strings[13];
     hl_engine_publish_rule *owned_publish;
+    hl_host_handle executable;
+    hl_engine_executable executable_config;
+    unsigned char *owned_executable_image;
 };
 
 enum {
@@ -74,6 +77,35 @@ const char *hl_engine_version(void) {
 }
 
 enum { HL_ENGINE_STRING_LIMIT = 64 * 1024 * 1024 };
+enum { HL_ENGINE_EXECUTABLE_LIMIT = 64 * 1024 * 1024 };
+
+static hl_status hl_engine_read_executable(hl_engine *engine, hl_host_handle handle) {
+    hl_host_file_metadata before = {0}, after = {0};
+    uint64_t offset = 0;
+    if (engine->host.file->metadata(engine->host.context, handle, &before).status != HL_STATUS_OK)
+        return HL_STATUS_PLATFORM_FAILURE;
+    if (before.type != HL_HOST_FILE_TYPE_REGULAR || before.size == 0 || before.size > HL_ENGINE_EXECUTABLE_LIMIT)
+        return HL_STATUS_INVALID_ARGUMENT;
+    engine->executable_config.image_size = (size_t)before.size;
+    engine->owned_executable_image = malloc((size_t)before.size);
+    if (engine->owned_executable_image == NULL) return HL_STATUS_OUT_OF_MEMORY;
+    while (offset < before.size) {
+        hl_host_result read = engine->host.file->read_at(
+            engine->host.context, handle, offset,
+            (hl_host_bytes){engine->owned_executable_image + offset, before.size - offset});
+        if (read.status != HL_STATUS_OK || read.value == 0 || read.value > before.size - offset)
+            return HL_STATUS_PLATFORM_FAILURE;
+        offset += read.value;
+    }
+    if (engine->host.file->metadata(engine->host.context, handle, &after).status != HL_STATUS_OK)
+        return HL_STATUS_PLATFORM_FAILURE;
+    if (before.stable_device != after.stable_device || before.stable_object != after.stable_object ||
+        before.size != after.size || before.modified_ns != after.modified_ns || before.changed_ns != after.changed_ns)
+        return HL_STATUS_BUSY;
+    engine->executable_config.image = engine->owned_executable_image;
+    engine->executable_config.image_size = (size_t)before.size;
+    return HL_STATUS_OK;
+}
 
 static char *hl_engine_copy_string(const char *value) {
     size_t length;
@@ -405,6 +437,15 @@ hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl
     if (config->flags != 0 || config->reserved != 0) return HL_STATUS_INVALID_ARGUMENT;
     if (config->payload_size != 0 && config->payload == NULL) return HL_STATUS_INVALID_ARGUMENT;
     if (config->payload_size != 0) return HL_STATUS_NOT_SUPPORTED;
+    if (config->executable != NULL &&
+        (config->executable->abi != HL_ENGINE_ABI || config->executable->size < sizeof(*config->executable)))
+        return HL_STATUS_ABI_MISMATCH;
+    if (config->executable != NULL &&
+        (config->executable->reserved != 0 || config->executable->host_handle == HL_HOST_HANDLE_INVALID ||
+         config->executable->image != NULL || config->executable->image_size != 0 ||
+         (config->executable->ownership != HL_ENGINE_FD_TRANSFER &&
+          config->executable->ownership != HL_ENGINE_FD_BORROW)))
+        return HL_STATUS_INVALID_ARGUMENT;
     if (config->fd_binding_count != 0 && config->fd_bindings == NULL) return HL_STATUS_INVALID_ARGUMENT;
     status = hl_host_services_validate(host, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_SYNC);
     if (status != HL_STATUS_OK) return status;
@@ -412,11 +453,36 @@ hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl
     if (engine == NULL) return HL_STATUS_OUT_OF_MEMORY;
     memcpy(&engine->config, config, sizeof(*config));
     memcpy(&engine->host, host, sizeof(*host));
-    if ((source_options == NULL ? hl_options_init(&engine->options)
+    engine->executable = HL_HOST_HANDLE_INVALID;
+    if (config->executable != NULL) {
+        hl_host_result cloned;
+        status = hl_host_services_validate(host, HL_HOST_CAP_FILE);
+        if (status != HL_STATUS_OK) goto fail;
+        if (host->file->clone_for_fork == NULL || host->file->close == NULL) {
+            status = HL_STATUS_ABI_MISMATCH;
+            goto fail;
+        }
+        cloned = host->file->clone_for_fork(host->context, config->executable->host_handle);
+        if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) {
+            status = cloned.status == HL_STATUS_OK ? HL_STATUS_PLATFORM_FAILURE : (hl_status)cloned.status;
+            goto fail;
+        }
+        engine->executable = cloned.value;
+        engine->executable_config = (hl_engine_executable){HL_ENGINE_ABI, sizeof(engine->executable_config),
+                                                          HL_ENGINE_FD_BORROW, 0, cloned.value, NULL, 0};
+        status = hl_engine_read_executable(engine, cloned.value);
+        if (status != HL_STATUS_OK) goto fail;
+        (void)engine->host.file->close(engine->host.context, cloned.value);
+        engine->executable = HL_HOST_HANDLE_INVALID;
+        engine->executable_config.host_handle = HL_HOST_HANDLE_INVALID;
+        engine->config.executable = &engine->executable_config;
+    }
+    if ((source_options == NULL ? hl_options_clone_current(&engine->options)
                                 : hl_options_clone(&engine->options, source_options)) != 0) {
         status = HL_STATUS_OUT_OF_MEMORY;
         goto fail;
     }
+    hl_options_import_environment(&engine->options);
     engine->options_initialized = 1;
     engine->owned_rootfs = hl_engine_copy_string(config->rootfs);
     if (config->rootfs != NULL && engine->owned_rootfs == NULL) {
@@ -503,6 +569,8 @@ hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl
     engine->backend = production_backends[config->guest_isa];
     free(candidate_handles);
     *out_engine = engine;
+    if (config->executable != NULL && config->executable->ownership == HL_ENGINE_FD_TRANSFER)
+        (void)host->file->close(host->context, config->executable->host_handle);
     return HL_STATUS_OK;
 option_fail:
     status = HL_STATUS_OUT_OF_MEMORY;
@@ -529,6 +597,12 @@ fail:
         free(engine->box_ofds);
         if (engine->options_initialized) hl_options_destroy(&engine->options);
         free(engine->owned_rootfs);
+        if (engine->owned_executable_image != NULL) {
+            memset(engine->owned_executable_image, 0, engine->executable_config.image_size);
+            free(engine->owned_executable_image);
+        }
+        if (engine->executable != HL_HOST_HANDLE_INVALID)
+            (void)engine->host.file->close(engine->host.context, engine->executable);
         free(engine->owned_working_directory);
         free(engine->owned_hostname);
         free(engine->owned_environment);
@@ -696,6 +770,12 @@ void hl_engine_destroy(hl_engine *engine) {
     free(engine->box_ofds);
     if (engine->options_initialized) hl_options_destroy(&engine->options);
     free(engine->owned_rootfs);
+    if (engine->owned_executable_image != NULL) {
+        memset(engine->owned_executable_image, 0, engine->executable_config.image_size);
+        free(engine->owned_executable_image);
+    }
+    if (engine->executable != HL_HOST_HANDLE_INVALID)
+        (void)engine->host.file->close(engine->host.context, engine->executable);
     free(engine->owned_working_directory);
     free(engine->owned_hostname);
     free(engine->owned_environment);

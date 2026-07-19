@@ -161,25 +161,31 @@ static long seccomp_set_strict(void) {
 // filter flags (0 for the prctl entry point). Copies the program into engine memory and pushes it onto
 // this thread's stacked chain. Returns 0 or -errno, matching the kernel's argument validation.
 static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
-    // Installing a filter requires CAP_SYS_ADMIN or no_new_privs (kernel: else -EACCES). The container's
-    // default cap set lacks CAP_SYS_ADMIN, so a well-behaved sandbox sets PR_SET_NO_NEW_PRIVS first.
-    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) return -EACCES;
     if (flags & ~HL_LINUX_SECCOMP_FILTER_FLAGS_KNOWN) return -EINVAL;
     // NEW_LISTENER would have us return a userspace-notification fd and run a supervisor protocol we do not
     // implement; reject it honestly rather than hand back a listener that never delivers notifications.
     if (flags & HL_LINUX_SECCOMP_FILTER_FLAG_NEW_LISTENER) return -EINVAL;
-    if (!fprog_ptr) return -EFAULT;
-    if (gna_hit(fprog_ptr, 16)) return -EFAULT;
+    if (!fprog_ptr || !host_range_mapped((uintptr_t)fprog_ptr, 16)) return -EFAULT;
 
     // struct sock_fprog on LP64: u16 len at +0, 8-byte filter pointer at +8.
     uint16_t len;
     uint64_t insn_ptr;
     memcpy(&len, (const void *)(uintptr_t)fprog_ptr, sizeof len);
     memcpy(&insn_ptr, (const void *)(uintptr_t)(fprog_ptr + 8), sizeof insn_ptr);
+    /* sock_fprog contains a second guest pointer.  Static ET_EXEC guests may
+     * embed its low link address even after the outer syscall argument was
+     * rebased, so translate the nested pointer by the same image model. */
+    if (g_nonpie_lo && insn_ptr >= g_nonpie_lo && insn_ptr < g_nonpie_hi) insn_ptr += g_nonpie_bias;
     if (len == 0 || len > HL_LINUX_BPF_MAXINSNS) return -EINVAL;
     if (!insn_ptr) return -EFAULT;
     size_t bytes = (size_t)len * sizeof(struct hl_linux_sock_filter);
-    if (gna_hit(insn_ptr, bytes)) return -EFAULT;
+    if (!host_range_mapped((uintptr_t)insn_ptr, bytes)) return -EFAULT;
+
+    // Linux copies and validates the user program before checking installation
+    // authority.  Consequently an unreadable program is EFAULT even when the
+    // caller also lacks CAP_SYS_ADMIN/no_new_privs (LTP prctl02).  Keeping this
+    // ordering also guarantees no guest pointer reaches memcpy unchecked.
+    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) return -EACCES;
 
     struct hl_linux_bpf_filter *node = (struct hl_linux_bpf_filter *)malloc(sizeof *node);
     if (!node) return -ENOMEM;
@@ -194,5 +200,44 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
     t_seccomp_filters = node;
     t_seccomp_mode = 2;
     g_seccomp_active = 1;
+    return 0;
+}
+
+// SECCOMP_GET_ACTION_AVAIL (op 2): probe whether a filter return action is one the kernel recognises.
+// libseccomp/runc call this before installing the docker profile to learn which actions (KILL_PROCESS, LOG,
+// ...) they may use. `flags` must be 0; `act_ptr` points to a u32 action word that must exactly equal one of
+// the defined SECCOMP_RET_* constants (any data bits set -> the action is "unavailable"). Returns 0 for a
+// recognised action, -EOPNOTSUPP for anything else -- matching native, which reports every canonical action
+// (including USER_NOTIF) available. Previously this op fell through to -EINVAL, so a runtime that probes
+// action support saw the whole seccomp facility as broken.
+static long seccomp_get_action_avail(uint64_t flags, uint64_t act_ptr) {
+    if (flags) return -EINVAL;
+    if (!act_ptr || !host_range_mapped((uintptr_t)act_ptr, sizeof(uint32_t))) return -EFAULT;
+    uint32_t action;
+    memcpy(&action, (const void *)(uintptr_t)act_ptr, sizeof action);
+    switch (action) {
+    case HL_LINUX_SECCOMP_RET_KILL_PROCESS:
+    case HL_LINUX_SECCOMP_RET_KILL_THREAD:
+    case HL_LINUX_SECCOMP_RET_TRAP:
+    case HL_LINUX_SECCOMP_RET_ERRNO:
+    case HL_LINUX_SECCOMP_RET_USER_NOTIF:
+    case HL_LINUX_SECCOMP_RET_TRACE:
+    case HL_LINUX_SECCOMP_RET_LOG:
+    case HL_LINUX_SECCOMP_RET_ALLOW: return 0;
+    default: return -EOPNOTSUPP; // recognised action words carry no data bits
+    }
+}
+
+// SECCOMP_GET_NOTIF_SIZES (op 3): report the sizes of the user-notification ABI structs so a supervisor can
+// size its buffers. `flags` must be 0; `sz_ptr` points to a `struct seccomp_notif_sizes { u16 seccomp_notif;
+// u16 seccomp_notif_resp; u16 seccomp_data; }`. We report the current canonical sizes (matching native) even
+// though NEW_LISTENER is rejected at install: the sizes are a stable query, and a probe must succeed as on
+// Linux rather than see -EINVAL. seccomp_data is our own 64-byte struct; notif/resp mirror the kernel ABI.
+static long seccomp_get_notif_sizes(uint64_t flags, uint64_t sz_ptr) {
+    if (flags) return -EINVAL;
+    if (!sz_ptr || !host_range_mapped((uintptr_t)sz_ptr, 3 * sizeof(uint16_t))) return -EFAULT;
+    uint16_t sizes[3] = {80 /*seccomp_notif*/, 24 /*seccomp_notif_resp*/,
+                         (uint16_t)sizeof(struct hl_linux_seccomp_data) /*seccomp_data = 64*/};
+    memcpy((void *)(uintptr_t)sz_ptr, sizes, sizeof sizes);
     return 0;
 }

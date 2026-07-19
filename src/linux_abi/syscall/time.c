@@ -100,6 +100,24 @@ static int engine_clock_gettime(clockid_t clock_id, struct timespec *output) {
     return hl_production_clock_gettime(effective_host_services(), service_clock, output);
 }
 
+// Linux also exposes CPU clocks through negative, pid-encoded clock ids.  libc
+// constructs these ids for clock_getcpuclockid() and runtimes such as GHC use
+// the pid-zero forms to probe the current process/thread clock:
+//
+//   (~pid << 3) | CPUCLOCK_SCHED | (per_thread ? 4 : 0)
+//
+// A host clock handle cannot safely name an arbitrary guest task, but pid zero
+// is explicitly the caller and maps exactly to the engine's process/thread CPU
+// services.  Keep this decoding in one place so gettime and getres agree.
+static int engine_dynamic_cpu_clock(int guest_clock, clockid_t *host_clock) {
+    if (guest_clock >= 0) return 0;
+    int pid = ~(guest_clock >> 3);
+    int kind = guest_clock & 3;
+    if (pid != 0 || kind != 2) return -EINVAL; // CPUCLOCK_SCHED for the caller only
+    *host_clock = (guest_clock & 4) != 0 ? CLOCK_THREAD_CPUTIME_ID : CLOCK_PROCESS_CPUTIME_ID;
+    return 1;
+}
+
 static int engine_sleep_until_monotonic(const struct timespec *deadline) {
     uint64_t nanoseconds = (uint64_t)deadline->tv_sec * UINT64_C(1000000000) + (uint64_t)deadline->tv_nsec;
     return hl_production_clock_sleep_until(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, nanoseconds);
@@ -315,18 +333,36 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 113: {
         // clock_gettime -- Linux clockid -> macOS
         clockid_t mc;
-        switch ((int)a0) {
-        case 0:
-        // REALTIME(_COARSE)
-        case 5: mc = CLOCK_REALTIME; break;
-        case 1:
-        case 6:
-        // MONOTONIC(_COARSE)/BOOTTIME
-        case 7: mc = CLOCK_MONOTONIC; break;
-        case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
-        case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
-        case 4: mc = CLOCK_MONOTONIC_RAW; break;
-        default: mc = CLOCK_MONOTONIC; break;
+        int dynamic = engine_dynamic_cpu_clock((int)a0, &mc);
+        if (dynamic < 0) {
+            G_RET(c) = (uint64_t)(int64_t)dynamic;
+            break;
+        }
+        if (dynamic == 0) {
+            // Reject unknown clock ids FIRST -- an id past the POSIX range is -EINVAL on Linux, exactly as
+            // clock_getres (case 114) already rejects it. The old code silently aliased any unknown id to
+            // CLOCK_MONOTONIC and returned success.
+            if ((int)a0 > 11) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            switch ((int)a0) {
+            case 0:
+            // REALTIME(_COARSE)/REALTIME_ALARM/TAI all read the host wall clock. The engine has no separate
+            // TAI timeline, so CLOCK_TAI(11) tracks REALTIME (offset 0) rather than the monotonic clock.
+            case 5:
+            case 8:
+            case 11: mc = CLOCK_REALTIME; break;
+            case 1:
+            case 6:
+            // MONOTONIC(_COARSE)/BOOTTIME/BOOTTIME_ALARM
+            case 7:
+            case 9: mc = CLOCK_MONOTONIC; break;
+            case 2: mc = CLOCK_PROCESS_CPUTIME_ID; break;
+            case 3: mc = CLOCK_THREAD_CPUTIME_ID; break;
+            case 4: mc = CLOCK_MONOTONIC_RAW; break;
+            default: mc = CLOCK_MONOTONIC; break; // 10 (SGI_CYCLE): valid id, monotonic-backed fallback
+            }
         }
         struct timespec ts;
         if (engine_clock_gettime(mc, &ts) != 0) {
@@ -337,7 +373,11 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // which are legal no-ops that return 0. The kernel unconditionally copies the result out, so a NULL
         // or otherwise-bad buffer faults. Validate the full 16 bytes; host_range_mapped(NULL,16) probes addr
         // 0 -> unmapped -> EFAULT, so the NULL case falls out here too (the old `if (g)` wrongly returned 0).
-        if (!host_range_mapped((uintptr_t)a1, 16)) {
+        // Static non-PIE guests legitimately place this result in .bss at a low guest address; case 113 is
+        // rebased in dispatch.c (alongside clock_getres) so host_range_mapped classifies it correctly. Use
+        // the same guest_bad_ptr the sibling copyout syscalls (gettimeofday/times/getrusage/newfstatat) use,
+        // so a NULL *or* a wild/unmapped pointer faults EFAULT instead of crashing the engine mid-copyout.
+        if (guest_bad_ptr((uintptr_t)a1, 16)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -348,11 +388,18 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     }
     case 114: {
-        // clock_getres(clockid, res) -> 1ns. validate the clockid FIRST -- an unknown/negative clock
+        // clock_getres(clockid, res).  The coarse clocks must advertise a coarse
+        // resolution: libc and applications use this value as the scheduling
+        // tolerance for CLOCK_*_COARSE-derived timeouts.  Reporting 1ns while
+        // implementing them with the host's millisecond-granularity clock makes
+        // otherwise valid timer results appear late (notably getitimer()).
+        // Validate the clockid FIRST -- an unknown clock
         // is -EINVAL on Linux EVEN with a NULL res (unlike gettimeofday(NULL), the kernel rejects the clock
         // before it would have copied anything out). The POSIX clocks REALTIME(0)..BOOTTIME_ALARM(9) plus
-        // TAI(11) all report a 1ns resolution here; clk_id=-1 (LTP clock_getres01) -> EINVAL.
-        if ((int)a0 < 0 || (int)a0 > 11) {
+        // TAI(11) are supported here; clk_id=-1 (LTP clock_getres01) -> EINVAL.
+        clockid_t dynamic_clock;
+        int dynamic = engine_dynamic_cpu_clock((int)a0, &dynamic_clock);
+        if (dynamic < 0 || (dynamic == 0 && (int)a0 > 11)) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
@@ -362,7 +409,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             *(uint64_t *)a1 = 0;
-            *(uint64_t *)(a1 + 8) = 1;
+            *(uint64_t *)(a1 + 8) = ((int)a0 == 5 || (int)a0 == 6) ? 1000000 : 1;
         }
         G_RET(c) = 0;
         break;

@@ -343,7 +343,8 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
         r[8] = t;
         return 0;
     }
-    // --- fork/vfork -> clone(SIGCHLD): the shared clone host-forks when not CLONE_THREAD ---
+    // --- fork/vfork -> clone(flags): preserve CLONE_VFORK so the shared
+    // process path keeps the parent suspended until child exec/exit. ---
     // Snapshot the registers we are about to repurpose as clone args; the clone handler restores them after
     // the fork (G_FORK_PRESERVE). Without this, glibc's __vfork (`pop %rdi; syscall; push %rdi; ret`) returns
     // through a clobbered rdi (== SIGCHLD = 0x11) -> jumps to 0x11 -> SIGSEGV: the fork-from-a-shell crash.
@@ -355,7 +356,7 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
         g_x86_forksave[3] = r[10];
         g_x86_forksave[4] = r[8];
         g_x86_forksave_on = 1;
-        r[7] = 17;
+        r[7] = r[0] == 58 ? 0x4011 : 17;
         r[6] = 0;
         r[2] = 0;
         r[10] = 0;

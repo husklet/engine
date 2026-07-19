@@ -30,6 +30,7 @@ static int config(const char *guest, char path[64]) {
     launch.uid = -1;
     launch.gid = -1;
     launch.arguments_offset = 1;
+    launch.executable_host_offset = 1;
     if (write(descriptor, &launch, sizeof(launch)) != sizeof(launch) ||
         write(descriptor, pool, launch.pool_size) != launch.pool_size || close(descriptor) != 0) {
         close(descriptor);
@@ -82,7 +83,7 @@ static int process_domain(const char *self, const char *guest, uint32_t isa) {
     hl_process_domain domain = {{(uint64_t)getpid(), ((uint64_t)time(NULL) << 32) ^ isa}};
     hl_activation_stdio stdio;
     char config_path[64], text[64] = {0}, *end;
-    char registry[96];
+    char registry[96], network[96];
     int output[2], status;
     long daemon;
     pid_t sibling;
@@ -107,6 +108,9 @@ static int process_domain(const char *self, const char *guest, uint32_t isa) {
     errno = 0;
     daemon = strtol(text, &end, 10);
     if (errno != 0 || end == text || daemon <= 0 || kill((pid_t)daemon, 0) != 0) return 30;
+    snprintf(network, sizeof network, "/tmp/.hl-net-%016llx%016llx",
+             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+    if (access(network, F_OK) != 0) return 30;
     sibling = fork();
     if (sibling < 0) return 31;
     if (sibling == 0) { for (;;) pause(); }
@@ -125,9 +129,11 @@ static int process_domain(const char *self, const char *guest, uint32_t isa) {
     waitpid(sibling, NULL, 0);
     snprintf(registry, sizeof registry, "/tmp/.hl-domain.%016llx%016llx",
              (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
-    return hl_activation_domain_terminate(domain) == HL_STATUS_OK && access(registry, F_OK) != 0 && errno == ENOENT
-               ? 0
-               : 33;
+    if (hl_activation_domain_terminate(domain) != HL_STATUS_OK) return 33;
+    errno = 0;
+    if (access(registry, F_OK) == 0 || errno != ENOENT) return 33;
+    errno = 0;
+    return access(network, F_OK) != 0 && errno == ENOENT ? 0 : 33;
 }
 
 static int force_stop_descendants(const char *self, const char *guest) {
@@ -138,13 +144,14 @@ static int force_stop_descendants(const char *self, const char *guest) {
     int output[2];
     hl_activation_stdio stdio;
     hl_status status;
+    char config_path[64];
     struct pollfd drained;
     char byte;
     int attempt;
 
-    if (pipe(output) != 0) return 2;
+    if (config(guest, config_path) != 0 || pipe(output) != 0) return 2;
     stdio = (hl_activation_stdio){.input = -1, .output = output[1], .error = output[1]};
-    status = hl_activation_start_with_stdio(self, HL_GUEST_ISA_AARCH64, guest, &stdio, &process);
+    status = hl_activation_start_with_stdio(self, HL_GUEST_ISA_AARCH64, config_path, &stdio, &process);
     close(output[1]);
     if (status != HL_STATUS_OK) { close(output[0]); return 3; }
     if (hl_activation_kill(process) != HL_STATUS_OK) { close(output[0]); return 4; }

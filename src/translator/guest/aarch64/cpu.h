@@ -66,11 +66,26 @@ struct cpu {
     // A tgkill()/tkill() to THIS thread sets a bit here so the signal is delivered by this thread alone
     // (a process-directed signal in g_pending may be taken by any thread). Drained by maybe_deliver_signal.
     volatile uint64_t tpending;
+    int sync_signal;
+    int sync_code;
+    uint64_t sync_address;
+    // Non-nested signal delivery (matches native serialization): the set of signals that were already
+    // pending when the CURRENT handler was entered is deferred until that handler returns, so a batch of
+    // signals unblocked together runs one-after-another (priority order) rather than nesting. A signal that
+    // becomes pending DURING a handler is not in this set and still nests (raise-in-handler / async fault).
+    // sig_defer is the innermost level's deferred set; sig_defer_stack saves the enclosing levels.
+    uint64_t sig_defer;
+    uint64_t sig_defer_stack[32];
+    uint64_t sig_frame_sp[32]; // guest SP of each active handler frame (to detect siglongjmp unwinds)
+    int sig_depth;
     // SMC: guest VA of the most recent `ic ivau` (icache invalidate). The emitter spills it here on the
     // R_ICFLUSH exit so smc_icflush() can do PRECISE invalidation -- only drop the translation map + IBTC
     // when that guest page was actually translated, instead of nuking everything on every guest icache
     // flush (V8 issues one per freshly-written line). Appended after the baked-offset fields.
     uint64_t smc_va;
+    uint64_t smc_ranges[8][2];
+    uint64_t smc_range_count;
+    uint64_t smc_range_overflow;
     // (SIMD-clean syscall exit): RUNTIME "guest vector state may be stale in cpu->V" flag. Set
     // (to the nonzero cpu pointer) by the first vector-writing instruction of a region; the static per-
     // region flag is UNSOUND because blocks CHAIN without spilling (a vectorized region can chain into a
@@ -80,14 +95,32 @@ struct cpu {
     uint64_t vdirty;
     /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
     uint64_t fault_addr;
+    uint64_t bus_ea;
     /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
     uint64_t bus_filter;
     uint64_t bus_force;
-    uint64_t bus_scratch[3];
     // Published while this thread is inside service(). A directed signal
     // needs a host interrupt only in that window; translated code observes
     // irq itself and dispatcher code is already at a delivery boundary.
     volatile uint64_t in_service;
+};
+
+// One coherent description of the AArch64 CPU exposed to the Linux guest.  Every discovery surface
+// (auxv, procfs and emulated system registers) must derive from this model; copying an ID-register MRS to
+// the host leaks the Apple CPU and can make a guest JIT emit extensions that the engine contract did not
+// advertise.  HWCAP_CPUID is deliberately absent, so EL1 ID registers trap at EL0.
+struct hl_aarch64_cpu_model {
+    uint64_t hwcap;
+    uint64_t ctr_el0;
+    uint64_t dczid_el0;
+    int user_id_registers;
+};
+
+static const struct hl_aarch64_cpu_model g_aarch64_cpu_model = {
+    .hwcap = 0x1fb,
+    .ctr_el0 = 0x9444C004,
+    .dczid_el0 = 4,
+    .user_id_registers = 0,
 };
 
 #define OFF_VDIRTY ((int)offsetof(struct cpu, vdirty))
@@ -95,6 +128,14 @@ struct cpu {
 _Static_assert(offsetof(struct cpu, vdirty) % 8 == 0 && offsetof(struct cpu, vdirty) <= 32760,
                "OFF_VDIRTY out of ldr/str imm12 range");
 #define OFF_SMCVA offsetof(struct cpu, smc_va)
+#define OFF_SMC_RANGES ((int)offsetof(struct cpu, smc_ranges))
+#define OFF_SMC_RANGE_COUNT ((int)offsetof(struct cpu, smc_range_count))
+#define OFF_SMC_RANGE_OVERFLOW ((int)offsetof(struct cpu, smc_range_overflow))
+#define G_SMC_QUEUE_RESET(c)                                                                                           \
+    do {                                                                                                               \
+        (c)->smc_range_count = 0;                                                                                      \
+        (c)->smc_range_overflow = 0;                                                                                   \
+    } while (0)
 #define OFF_V 384
 #define OFF_HOSTV 896
 #define OFF_NZCV 1024
@@ -158,6 +199,6 @@ static int is_stolen(int r) {
 #define R_SYSCALL 1
 #define R_BUS 5
 #define OFF_FAULT_ADDR ((int)offsetof(struct cpu, fault_addr))
+#define OFF_BUS_EA ((int)offsetof(struct cpu, bus_ea))
 #define OFF_BUS_FILTER ((int)offsetof(struct cpu, bus_filter))
 #define OFF_BUS_FORCE ((int)offsetof(struct cpu, bus_force))
-#define OFF_BUS_SCRATCH ((int)offsetof(struct cpu, bus_scratch))

@@ -7,7 +7,29 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static int connect_without_listener(void) {
+    int v4 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a4 = {0};
+    a4.sin_family = AF_INET;
+    a4.sin_port = htons(65431);
+    a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int ok4 = v4 >= 0 && connect(v4, (struct sockaddr *)&a4, sizeof a4) == 0;
+    close(v4);
+
+    int v6 = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 a6 = {0};
+    a6.sin6_family = AF_INET6;
+    a6.sin6_port = htons(65432);
+    a6.sin6_addr = in6addr_loopback;
+    int ok6 = v6 >= 0 && connect(v6, (struct sockaddr *)&a6, sizeof a6) == 0;
+    close(v6);
+    printf("udp_no_listener v4=%d v6=%d\n", ok4, ok6);
+    return ok4 && ok6;
+}
+
 int main(void) {
+    if (!connect_without_listener()) return 1;
     int srv = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bind(srv, (struct sockaddr *)&a, sizeof a);

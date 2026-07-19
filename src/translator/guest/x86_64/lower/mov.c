@@ -110,6 +110,12 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
             int dstreg = to_reg ? I->reg : I->rm_reg;
             int sv = byte_val(I, srcreg, 16);
             byte_wb(I, dstreg, sv);
+        } else if (w == 2) {
+            // 16-bit reg-to-reg (0x66): insert low 16 bits, PRESERVE bits 63:16 (unlike a 32-bit
+            // write, which zero-extends). e_mov_rr with sf=0 wrongly zeroed 63:16.
+            int srcreg = to_reg ? I->rm_reg : I->reg;
+            int dstreg = to_reg ? I->reg : I->rm_reg;
+            e_bfi(dstreg, srcreg, 0, 16, 1);
         } else {
             if (to_reg)
                 e_mov_rr(I->reg, I->rm_reg, sf);

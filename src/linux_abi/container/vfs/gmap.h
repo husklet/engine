@@ -11,6 +11,8 @@ typedef struct hl_gmap_entry {
     uint64_t address;
     uint64_t length;
     uint64_t guest_length;
+    uint64_t physical_address;
+    uint64_t physical_length;
 } hl_gmap_entry;
 
 void hl_gmap_bind_limits(const hl_limit_table *limits);
@@ -20,9 +22,12 @@ hl_status hl_gmap_map_anonymous(uint64_t requested_address, uint64_t length, uin
 size_t hl_gmap_count(void);
 int hl_gmap_get(size_t index, hl_gmap_entry *entry);
 void hl_gmap_add(uint64_t address, uint64_t length);
+void hl_gmap_add_physical(uint64_t address, uint64_t length, uint64_t physical_address, uint64_t physical_length);
 void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length);
+int hl_gmap_find_physical(uint64_t address, uint64_t *physical_address, uint64_t *physical_length);
 void hl_gmap_remove(uint64_t address);
 uint64_t hl_gmap_find_length(uint64_t address);
+uint64_t hl_gmap_find_guest_length(uint64_t address);
 int hl_gmap_contains(uint64_t address, uint64_t length);
 void hl_gmap_unmap_range(uint64_t start, uint64_t end);
 void hl_gmap_reset(void);

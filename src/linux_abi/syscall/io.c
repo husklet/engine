@@ -45,6 +45,7 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
+    hl_native_kqueue_duplicate(oldfd, newfd);
     // Synthetic character devices keep their Linux behavior across descriptor duplication. Shell
     // redirections open the target and dup2 it onto stdout before writing; dropping these tags made
     // `echo x > /dev/full` write successfully to the /dev/zero backing instead of failing ENOSPC.
@@ -104,6 +105,7 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
 #else
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
+
 
 /* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
  * available there by finding logical zero/data runs; native filesystem extents remain preferred. */
@@ -305,6 +307,44 @@ static void engine_fd_vacate_range(unsigned first, unsigned last) {
             engine_fd_vacate(g_vols[i].fd);
 }
 
+// Enforce the guest soft RLIMIT_FSIZE on a write to a regular file at absolute offset `pos` (SEEK_CUR for
+// pos < 0). Linux (generic_write_check_limits): if the limit is finite and the start position is already
+// at/beyond it, the write raises SIGXFSZ and returns -EFBIG; if the write would straddle the limit it is
+// clamped to what fits. Returns the number of bytes the write is allowed to proceed with (0..count), or a
+// negative -errno after queuing the signal. No cost when the limit is infinite (the common case).
+static int64_t fsize_gate(struct cpu *c, int fd, off_t pos, uint64_t count) {
+    uint64_t limit = guest_fsize_cur();
+    if (limit == ~UINT64_C(0) || count == 0) return (int64_t)count;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return (int64_t)count; // only regular files are bounded
+    if (pos < 0) {
+        pos = lseek(fd, 0, SEEK_CUR);
+        if (pos < 0) return (int64_t)count; // non-seekable: let the host write proceed
+    }
+    if ((uint64_t)pos >= limit) {
+        raise_guest_signal(c, 25); // SIGXFSZ
+        return -EFBIG;
+    }
+    uint64_t room = limit - (uint64_t)pos;
+    return count > room ? (int64_t)room : (int64_t)count; // clamp a straddling write to the limit
+}
+
+// RLIMIT_FSIZE gate for a RAM-backed (memf) write. A memf file is an unlinked-while-open regular file, so
+// Linux enforces the file-size limit on it exactly as for an on-disk file -- but the memf write paths serve
+// the write from RAM and never reach fsize_gate (which fstat's a host fd). Mirror the same contract off the
+// memf write position `pos`: at/beyond the limit -> raise SIGXFSZ and return -EFBIG; a straddling write is
+// clamped to what fits. Infinite limit (the common case) is a pass-through.
+static int64_t memf_fsize_gate(struct cpu *c, off_t pos, uint64_t count) {
+    uint64_t limit = guest_fsize_cur();
+    if (limit == ~UINT64_C(0) || count == 0 || pos < 0) return (int64_t)count;
+    if ((uint64_t)pos >= limit) {
+        raise_guest_signal(c, 25); // SIGXFSZ
+        return -EFBIG;
+    }
+    uint64_t room = limit - (uint64_t)pos;
+    return count > room ? (int64_t)room : (int64_t)count;
+}
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
@@ -319,7 +359,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 67:
         case 68:
         case 69:
-        case 70: G_RET(c) = (uint64_t)(int64_t)(-EBADF); return svc_done(c);
+        case 70:
+        case 82: /* fsync */
+        case 83: /* fdatasync */
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            return svc_done(c);
         default: break;
         }
     }
@@ -464,17 +508,31 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             char b;
-            // drain one wake byte
+            // drain one wake byte (one byte was written per queued instance -> keeps readability accurate)
             ssize_t pr = read(rfd, &b, 1);
             if (pr <= 0) {
                 G_RET(c) = (uint64_t)(int64_t)(pr < 0 ? -errno : -EAGAIN);
                 break;
             }
-            // Each wake byte IS the queued signal number (host_sigh / raise_guest_signal write (char)signo),
-            // so realtime signals delivered N times read back as N siginfo records each carrying the right
-            // ssi_signo -- unlike the single-bit g_pending, which cannot represent a queue of the same signo.
-            int sig = (unsigned char)b;
-            if (sig > 0 && sig < 64) __atomic_and_fetch(&g_pending, ~(1ull << (unsigned)sig), __ATOMIC_SEQ_CST);
+            // The self-pipe only preserves INSERTION order, but signalfd drains in priority order (lowest
+            // signo first, FIFO within a signo) carrying the queued siginfo (ssi_int / ssi_pid / ssi_code).
+            // So ignore the byte's signo for SELECTION: scan this OFD's mask ascending for the lowest signo
+            // with a queued instance and pop it. Only if nothing is queued (a host async-path wake that set
+            // the bit with an empty queue) do we fall back to the byte's signo and the single-slot g_sig*.
+            int sslot = g_sigfd_slot[rfd] - 1;
+            uint64_t omask = g_sfd[sslot].mask;
+            struct sigq_ent ent;
+            int sig = 0, popped = 0;
+            for (int s = 1; s < 64; s++)
+                if ((omask & (1ull << s)) && sigq_pop(s, &ent)) {
+                    sig = s;
+                    popped = 1;
+                    break;
+                }
+            if (!popped) {
+                sig = (unsigned char)b;
+                if (sig > 0 && sig < 64) __atomic_and_fetch(&g_pending, ~(1ull << (unsigned)sig), __ATOMIC_SEQ_CST);
+            }
             if (a1 && a2 >= 128) {
                 // a1 is a raw guest buffer we write directly -> EFAULT a bad pointer instead of faulting the engine
                 if (!host_range_mapped((uintptr_t)a1, 128)) {
@@ -482,8 +540,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
                 memset((void *)a1, 0, 128);
-                *(uint32_t *)a1 = (uint32_t)sig;
-                // ssi_signo
+                *(uint32_t *)(a1 + 0) = (uint32_t)sig;                              // ssi_signo
+                *(int32_t *)(a1 + 8) = popped ? ent.code : g_sigcode[sig];          // ssi_code
+                *(uint32_t *)(a1 + 12) = (uint32_t)(popped ? ent.pid : g_sigpid[sig]); // ssi_pid
+                *(uint32_t *)(a1 + 16) = (uint32_t)(popped ? ent.uid : g_siguid[sig]); // ssi_uid
+                uint64_t val = popped ? ent.value : g_sigval[sig];
+                *(int32_t *)(a1 + 44) = (int32_t)val;  // ssi_int (sigqueue value)
+                *(uint64_t *)(a1 + 48) = val;          // ssi_ptr
+                if (!popped) {
+                    g_sigcode[sig] = 0;
+                    g_sigval[sig] = 0;
+                    g_sigpid[sig] = 0;
+                    g_siguid[sig] = 0;
+                }
             }
             G_RET(c) = 128;
             break;
@@ -592,19 +661,36 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                  * overdue EV_ONESHOT. Linux timerfd one-shots have exactly one expiration; only a
                  * periodic timer accumulates multiple expirations.
                  */
-                *(uint64_t *)a1 = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
+                uint64_t expirations = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
+                /*
+                 * A distinct first deadline is represented by an EV_ONESHOT.  kqueue can therefore
+                 * only report the first expiry, while Linux accumulates every interval that elapsed
+                 * before read(2).  Derive that count from the original deadline and keep the next
+                 * deadline phase-aligned instead of restarting the period at read time.
+                 */
+                if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0 && g_tfd_deadline[rfd] > 0) {
+                    struct timespec tnow;
+                    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
+                    int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
+                    if (now_ns >= g_tfd_deadline[rfd])
+                        expirations = 1 + (uint64_t)((now_ns - g_tfd_deadline[rfd]) / g_tfd_interval[rfd]);
+                }
+                *(uint64_t *)a1 = expirations;
             }
             // A periodic timerfd whose first expiry (it_value) differed from its interval was armed as a
             // one-shot for that first tick (event.c case 86). Now that the first tick has been consumed,
             // re-arm the recurring periodic at the interval so subsequent expiries fire every it_interval.
             if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0) {
                 struct kevent rkv;
-                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD, NOTE_NSECONDS, g_tfd_interval[rfd], NULL);
-                kevent(rfd, &rkv, 1, NULL, 0, NULL);
-                g_tfd_first_oneshot[rfd] = 0;
                 struct timespec tnow;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
-                g_tfd_deadline[rfd] = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec + g_tfd_interval[rfd];
+                int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
+                int64_t next = g_tfd_deadline[rfd];
+                if (next <= now_ns) next += ((now_ns - next) / g_tfd_interval[rfd] + 1) * g_tfd_interval[rfd];
+                int64_t delay = next - now_ns;
+                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                kevent(rfd, &rkv, 1, NULL, 0, NULL);
+                g_tfd_deadline[rfd] = next;
             }
             G_RET(c) = 8;
             break;
@@ -722,6 +808,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 64: {
         int wfd = (int)a0;
+        // /proc/self/oom_score_adj is guest-visible process state, not a
+        // writable view of the host process. Parse the complete decimal value
+        // and update the synthetic file so reads through this open description
+        // and through later opens agree.
+        if (wfd >= 0 && wfd < HL_NFD && !strcmp(g_proc_text_desc[wfd], "self:oom_score_adj")) {
+            if (!a2 || a2 >= 32 || !host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+                G_RET(c) = (uint64_t)(a2 ? -EFAULT : 0);
+                break;
+            }
+            char value[32];
+            memcpy(value, (const void *)a1, (size_t)a2);
+            value[a2] = 0;
+            char *end = NULL;
+            errno = 0;
+            long parsed = strtol(value, &end, 10);
+            while (end && (*end == '\n' || *end == ' ' || *end == '\t')) end++;
+            if (errno || !end || end == value || *end || parsed < -1000 || parsed > 1000) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            g_proc_oom_score_adj = (int)parsed;
+            char rendered[32];
+            int rendered_size = snprintf(rendered, sizeof rendered, "%d\n", g_proc_oom_score_adj);
+            (void)ftruncate(wfd, 0);
+            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
+            (void)lseek(wfd, rendered_size, SEEK_SET);
+            G_RET(c) = a2;
+            break;
+        }
         // memfd F_SEAL_WRITE: a write to a write-sealed memfd fails EPERM (emulated seal state).
         if (wfd >= 0 && wfd < HL_NFD && (memfd_seals_fd(wfd) & 0x8)) {
             G_RET(c) = (uint64_t)(-EPERM);
@@ -748,6 +863,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
+        {
+            struct iovec vector = {(void *)a1, (size_t)a2};
+            int64_t result;
+            if (udp_switch_write(wfd, &vector, 1, &result)) {
+                G_RET(c) = (uint64_t)result;
+                break;
+            }
+        }
         // RAM-backed scratch file: serve the write from memory (spill to the host file past the cap).
         // Copies straight from the guest buffer, so validate it (a host-fd write's kernel copyin would fault
         // a bad pointer to EFAULT; this engine memcpy would instead crash) --, access_ok.
@@ -756,7 +879,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)a2);
+            int64_t allowed = memf_fsize_gate(c, (off_t)g_memf[wfd]->pos, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+            if (allowed < 0) {
+                G_RET(c) = (uint64_t)allowed;
+                break;
+            }
+            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)allowed);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -810,11 +938,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         hl_fdcache_fd_evict(wfd);
+        // RLIMIT_FSIZE: a write past the soft file-size limit raises SIGXFSZ (and returns EFBIG); a straddling
+        // write is clamped to the limit. No-op unless the guest set a finite limit on a regular file.
+        int64_t allowed = fsize_gate(c, wfd, -1, a2);
+        if (allowed < 0) {
+            G_RET(c) = (uint64_t)allowed;
+            break;
+        }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking write in place (see case 63)
         do {
-            r = write(wfd, (void *)a1, (size_t)a2);
+            r = write(wfd, (void *)a1, (size_t)allowed);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // write(2) to a broken pipe/socket -> guest SIGPIPE
         break;
     }
     case 65: {
@@ -883,6 +1019,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
+        {
+            int64_t result;
+            if (udp_switch_write((int)a0, (const struct iovec *)a1, (int)a2, &result)) {
+                G_RET(c) = (uint64_t)result;
+                break;
+            }
+        }
         if (memf_get((int)a0)) {
             // The iovec array a1 is read directly by the engine (the regular writev path lets the host
             // syscall validate it, but the memf path dereferences it here) -> guard it before the loop.
@@ -892,9 +1035,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             const struct iovec *iv = (const struct iovec *)a1;
-            off_t end = g_memf[(int)a0]->pos;
+            off_t start = g_memf[(int)a0]->pos;
+            off_t end = start;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, start, (uint64_t)(end - start)) < 0) { // RLIMIT_FSIZE at/beyond limit
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, -1, 1);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
@@ -907,6 +1055,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             r = writev((int)a0, (void *)a1, (int)a2);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // writev(2) to a broken pipe/socket -> guest SIGPIPE
         break;
         // writev
     }
@@ -931,14 +1080,25 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a3 + (off_t)a2)) {
-            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)a2, (off_t)a3);
+            int64_t allowed = memf_fsize_gate(c, (off_t)a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
+            if (allowed < 0) {
+                G_RET(c) = (uint64_t)allowed;
+                break;
+            }
+            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)allowed, (off_t)a3);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
         hl_fdcache_fd_evict((int)a0);
+        // RLIMIT_FSIZE: enforce at the explicit pwrite offset (a3), raising SIGXFSZ/EFBIG past the limit.
+        int64_t pw_allowed = fsize_gate(c, (int)a0, (off_t)a3, a2);
+        if (pw_allowed < 0) {
+            G_RET(c) = (uint64_t)pw_allowed;
+            break;
+        }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking pwrite in place (see case 63)
         do {
-            r = pwrite((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
+            r = pwrite((int)a0, (void *)a1, (size_t)pw_allowed, (off_t)a3);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r > 0) filemap_written((int)a0, a3, (uint64_t)r);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -957,13 +1117,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (po) lseek(infd, *po, SEEK_SET);
+        // With a non-NULL offset the input file position must NOT change: read from *po via pread and
+        // report the advanced offset through *po only. A NULL offset reads from (and advances) infd's
+        // own file position.
+        off_t rpos = po ? *po : 0;
         char bf[65536];
         size_t tot = 0;
         int rerr = 0; // a read/write error hit with NOTHING transferred yet -> report -errno, not a fake 0
         while (tot < cnt) {
             size_t w = cnt - tot < sizeof bf ? cnt - tot : sizeof bf;
-            ssize_t n = read(infd, bf, w);
+            ssize_t n = po ? pread(infd, bf, w, rpos) : read(infd, bf, w);
             if (n < 0) { // a mid-copy read error was previously swallowed as EOF -> silent truncation
                 if (tot == 0) rerr = errno;
                 break;
@@ -975,11 +1138,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             tot += wr;
+            rpos += wr;
             if (wr < n) break;
         }
         // Linux: once ANY bytes were transferred, sendfile returns that count (a later error surfaces on the
         // next call); an error before the first byte returns -errno.
-        if (po) *po += tot;
+        if (po) *po = rpos;
         G_RET(c) = rerr ? (uint64_t)(-rerr) : (uint64_t)tot;
         break;
     }
@@ -1201,6 +1365,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r & O_NONBLOCK) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
             if (r & O_ASYNC) lf |= 0x2000;
+#if defined(__linux__) && defined(O_DIRECT)
+            // O_DIRECT is a settable status flag on Linux; the guest fd is a real host fd whose kernel
+            // O_DIRECT bit is authoritative. Translate host O_DIRECT -> the guest-arch G_O_DIRECT so an
+            // fd opened (or F_SETFL'd) O_DIRECT round-trips instead of being silently dropped.
+            if (r & O_DIRECT) lf |= G_O_DIRECT;
+#endif
             // eventfd: the host read end is kept permanently O_NONBLOCK internally, so report the guest's
             // OWN blocking/non-blocking intent (g_eventfd_gnb), not the host flag. See vfs.c g_eventfd_gnb.
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_eventfd_peer[(int)a0]) {
@@ -1228,6 +1398,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (la & 0x800) mf |= O_NONBLOCK;
             // APPEND/NONBLOCK/ASYNC
             if (la & 0x2000) mf |= O_ASYNC;
+#if defined(__linux__) && defined(O_DIRECT)
+            // Forward an O_DIRECT status-flag change straight to the real host fd (guest-arch G_O_DIRECT ->
+            // host O_DIRECT). Previously the bit was dropped, so F_SETFL(O_DIRECT) wrongly returned success
+            // without setting it (and a filesystem that rejects O_DIRECT never produced the EINVAL Linux does).
+            if (la & G_O_DIRECT) mf |= O_DIRECT;
+#endif
             // eventfd: record the guest's blocking/non-blocking intent in the shadow and NEVER clear the
             // host read end's O_NONBLOCK (the internal drains rely on it; clearing it would let a drain
             // block). Other flag changes still apply to the host fd. See vfs.c g_eventfd_gnb.
@@ -1320,12 +1496,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
             break;
         }
-        // F_SETPIPE_SZ(1031)/F_GETPIPE_SZ(1032): macOS can't resize a pipe, so emulate -- record the
-        // requested size (rounded up to a page, >= requested) and report it back on GET. Linux's pipe_fcntl
-        // first rejects a non-pipe object with EBADF (and an invalid fd faults out even earlier), so validate
-        // the fd is a real FIFO before fabricating a size -- otherwise a regular file/socket or bad fd was
-        // reported as a pipe with a plausible size.
+        // F_SETPIPE_SZ(1031)/F_GETPIPE_SZ(1032). The guest's non-O_DIRECT pipe fd is a REAL host pipe
+        // (case 59 pipe()), so on a Linux host the kernel already implements these with exact Linux
+        // semantics: power-of-two rounding (roundup_pow_of_two, NOT page rounding), a real capacity change
+        // that the subsequent fill/EAGAIN reflects, EBUSY when shrinking below the currently buffered data,
+        // and EBADF on a non-pipe fd (incl. an O_DIRECT pipe backed by a socketpair). Forward straight
+        // through. The macOS build keeps the size emulation below (Darwin has no pipe-size fcntl), which
+        // only records a number and never resizes the buffer, so it must stay guarded to that host.
         if (lcmd == 1031 || lcmd == 1032) {
+#if defined(__linux__)
+            long r = (lcmd == 1032) ? fcntl((int)a0, F_GETPIPE_SZ) : fcntl((int)a0, F_SETPIPE_SZ, (int)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)errno) : (uint64_t)(unsigned)r;
+            break;
+#else
+            // Linux's pipe_fcntl first rejects a non-pipe object with EBADF, so validate the fd is a real
+            // FIFO before fabricating a size -- otherwise a regular file/socket or bad fd was reported as a
+            // pipe with a plausible size.
             struct stat pst;
             if (fstat((int)a0, &pst) < 0) {
                 G_RET(c) = (uint64_t)(int64_t)(-EBADF);
@@ -1335,22 +1521,40 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(int64_t)(-EBADF);
                 break;
             }
+            if (lcmd == 1031) {
+                int want = (int)a2;
+                long pg = sysconf(_SC_PAGESIZE);
+                if (pg <= 0) pg = 4096;
+                int rounded = (int)(((want + pg - 1) / pg) * pg);
+                if (rounded < (int)pg) rounded = (int)pg;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_pipesz[(int)a0] = rounded;
+                G_RET(c) = (uint64_t)(unsigned)rounded;
+                break;
+            }
+            // lcmd == 1032
+            {
+                int sz = ((int)a0 >= 0 && (int)a0 < HL_NFD && g_pipesz[(int)a0]) ? g_pipesz[(int)a0] : 65536;
+                G_RET(c) = (uint64_t)(unsigned)sz;
+                break;
+            }
+#endif
         }
-        if (lcmd == 1031) {
-            int want = (int)a2;
-            long pg = sysconf(_SC_PAGESIZE);
-            if (pg <= 0) pg = 4096;
-            int rounded = (int)(((want + pg - 1) / pg) * pg);
-            if (rounded < (int)pg) rounded = (int)pg;
-            if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_pipesz[(int)a0] = rounded;
-            G_RET(c) = (uint64_t)(unsigned)rounded;
+#if defined(__linux__) && defined(F_GET_RW_HINT)
+        // Write life-time hints F_GET_RW_HINT(1035)/F_SET_RW_HINT(1036)/F_GET_FILE_RW_HINT(1037)/
+        // F_SET_FILE_RW_HINT(1038): the arg is a pointer to a uint64 hint. The guest fd is a real host fd,
+        // so forward straight through to the host kernel (which owns the actual per-inode/per-fd hint) --
+        // otherwise the do_fcntl default wrongly returns EINVAL where native returns the real hint. macOS
+        // has no such command, so this stays Linux-only and the default switch keeps EINVAL there.
+        if (lcmd >= 1035 && lcmd <= 1038) {
+            if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(uint64_t))) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            long r = fcntl((int)a0, lcmd, (unsigned long)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)errno) : (uint64_t)(unsigned)r;
             break;
         }
-        if (lcmd == 1032) {
-            int sz = ((int)a0 >= 0 && (int)a0 < HL_NFD && g_pipesz[(int)a0]) ? g_pipesz[(int)a0] : 65536;
-            G_RET(c) = (uint64_t)(unsigned)sz;
-            break;
-        }
+#endif
         int mcmd = lcmd;
         if (lcmd == 8)
             mcmd = F_SETOWN;
@@ -1360,19 +1564,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         else if (lcmd == 1030)
             mcmd = F_DUPFD_CLOEXEC;
         // memfd sealing: F_ADD_SEALS(1033) / F_GET_SEALS(1034) are honoured on an anonymous memfd (macOS has
-        // no native seals, so the state + the F_SEAL_WRITE write-guard are emulated). On a non-memfd both
-        // return EINVAL, as on Linux.
+        // no native seals, so the state + the F_SEAL_WRITE write-guard are emulated). For a NON-memfd the
+        // guest fd is a real host fd, so on Linux forward the command to the host kernel, which knows whether
+        // the underlying filesystem supports sealing: a regular tmpfs/shmem file reports its real seal state
+        // (born F_SEAL_SEAL, so F_GET_SEALS -> 1 and a further F_ADD_SEALS -> EPERM) while a non-sealing fs
+        // (ext4/overlay) answers EINVAL -- exactly like native. The old unconditional EINVAL shadowed that,
+        // returning EINVAL where native tmpfs returns the real seal set. macOS keeps EINVAL (no host seals).
         else if (lcmd == 1033) { // F_ADD_SEALS(fd, seals)
             int fd = (int)a0;
             memfd_ensure_fd(fd);
             if (fd < 0 || fd >= HL_NFD || !g_memfd_is[fd]) {
+#if defined(__linux__) && defined(F_ADD_SEALS)
+                int r = fcntl(fd, F_ADD_SEALS, (int)a2);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+#else
                 G_RET(c) = (uint64_t)(-EINVAL);
+#endif
                 break;
             }
             if (g_memfd_seal[fd] & 0x1) {
                 G_RET(c) = (uint64_t)(-EPERM);
                 break;
             } // already F_SEAL_SEAL'd
+            // F_SEAL_WRITE (0x8) is refused with EBUSY while an outstanding MAP_SHARED mapping of this memfd
+            // is live (Linux mm/shmem.c writable-mapping guard). F_SEAL_FUTURE_WRITE (0x10) only blocks new
+            // writable maps, so it is unaffected.
+            if (((int)a2 & 0x8) && !(g_memfd_seal[fd] & 0x8) && filemap_has_shared_mapping(fd)) {
+                G_RET(c) = (uint64_t)(-EBUSY);
+                break;
+            }
             g_memfd_seal[fd] |= (int)a2 & 0x1f; // SEAL|SHRINK|GROW|WRITE|FUTURE_WRITE
             memfd_reg_set_fd(fd, g_memfd_seal[fd]);
             G_RET(c) = 0;
@@ -1381,7 +1601,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int fd = (int)a0;
             memfd_ensure_fd(fd);
             if (fd < 0 || fd >= HL_NFD || !g_memfd_is[fd]) {
+#if defined(__linux__) && defined(F_GET_SEALS)
+                int r = fcntl(fd, F_GET_SEALS);
+                G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)(unsigned)r;
+#else
                 G_RET(c) = (uint64_t)(-EINVAL);
+#endif
                 break;
             }
             G_RET(c) = (uint64_t)(unsigned)g_memfd_seal[fd];
@@ -1452,6 +1677,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             if (fd < HL_NFD) g_fsig[fd] = (uint8_t)sig;
+#if defined(__linux__)
+            // The guest fd is a REAL host fd; forward F_SETSIG so the host's own O_ASYNC signal-driven I/O
+            // delivers the requested signal (with SI_SIGIO siginfo) instead of the default SIGIO, which the
+            // engine then routes to the guest. Without this the custom async signal is silently ignored and
+            // an app arming F_SETSIG waits for a signal that never comes. g_fsig is still recorded for the
+            // engine-serviced dnotify path (F_NOTIFY), which raises the signal itself. Errors are non-fatal.
+            (void)fcntl(fd, F_SETSIG, sig);
+#endif
             G_RET(c) = 0;
             break;
         } else if (lcmd == 11) { // F_GETSIG(fd): the signal set by F_SETSIG (0 = default SIGIO).
@@ -1486,6 +1719,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         if ((lcmd == 0 || lcmd == 1030) && fd_virt_reserve((int)a0, &fdvis) != 0) {
             G_RET(c) = (uint64_t)(-ENOSPC);
+            goto fcntl_done;
+        }
+        if (lcmd == 0 || lcmd == 1030) engine_fd_vacate((int)a2);
+        if ((lcmd == 0 || lcmd == 1030) && bound_sentinel_vacate((int)a2) != 0) {
+            proc_fdvis_reservation_cancel(&fdvis);
+            G_RET(c) = (uint64_t)(-EMFILE);
             goto fcntl_done;
         }
         int r = fcntl((int)a0, mcmd, a2);
@@ -1531,6 +1770,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // preserves message boundaries exactly, so back an O_DIRECT pipe with one (SOCK_SEQPACKET would be
         // closer but macOS PF_LOCAL doesn't support it). A plain pipe is fine for the non-O_DIRECT case.
         int fds[2], fl = (int)a1;
+        // Validate flags exactly as Linux (fs/pipe.c): only O_CLOEXEC | O_NONBLOCK | O_DIRECT |
+        // O_NOTIFICATION_PIPE are defined; any other bit -> EINVAL (mirrors eventfd2, case 19). A bogus flag
+        // (e.g. 0x4) previously slipped through and pipe2 wrongly succeeded.
+        if ((unsigned)fl & ~(unsigned)(0x800u | 0x80000u | (unsigned)G_O_DIRECT | 0x800000u)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // a0 receives the two result fds (8 bytes). Validate it BEFORE creating the pipe so a bad pointer
         // returns -EFAULT without leaking the freshly-opened fds (and without faulting the engine).
         if (!host_range_mapped((uintptr_t)a0, 2 * sizeof(int))) {
@@ -1618,6 +1864,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         off_t oi = poi ? *poi : -1, oo = poo ? *poo : -1;
+        // Linux rejects a same-file copy whose source and destination ranges overlap (EINVAL) rather than
+        // corrupting the file by copying through the overlap. Compare the underlying file identity and the
+        // effective start offsets (explicit offset, else the current file position for a NULL offset).
+        if (len > 0) {
+            struct stat si, so;
+            if (fstat(fdin, &si) == 0 && fstat(fdout, &so) == 0 && si.st_dev == so.st_dev &&
+                si.st_ino == so.st_ino) {
+                off_t is = poi ? *poi : lseek(fdin, 0, SEEK_CUR);
+                off_t os = poo ? *poo : lseek(fdout, 0, SEEK_CUR);
+                if (is >= 0 && os >= 0 && is < os + (off_t)len && os < is + (off_t)len) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+            }
+        }
         char cb[8192];
         while (done < len) {
             size_t chunk = (len - done > sizeof cb) ? sizeof cb : len - done;
@@ -1671,6 +1932,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE at/beyond limit
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;

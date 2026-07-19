@@ -86,6 +86,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         } else if (op == HL_LINUX_SECCOMP_SET_MODE_STRICT) {
             // strict takes no flags/args (SECCOMP_SET_MODE_STRICT): both must be zero, else -EINVAL.
             G_RET(c) = (a1 || a2) ? (uint64_t)(-EINVAL) : (uint64_t)(int64_t)seccomp_set_strict();
+        } else if (op == 2 /*SECCOMP_GET_ACTION_AVAIL*/) {
+            G_RET(c) = (uint64_t)(int64_t)seccomp_get_action_avail(a1, a2);
+        } else if (op == 3 /*SECCOMP_GET_NOTIF_SIZES*/) {
+            G_RET(c) = (uint64_t)(int64_t)seccomp_get_notif_sizes(a1, a2);
         } else {
             G_RET(c) = (uint64_t)(-EINVAL);
         }
@@ -154,7 +158,35 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (maxfd <= 0 || maxfd > 65536) maxfd = 65536;
         if (last >= (unsigned)maxfd) last = (unsigned)maxfd - 1;
         if (!(flags & 4)) engine_fd_vacate_range(first, last); // relocate engine fds out of the actual-close range
-        for (unsigned fd = first; fd <= last; fd++) {
+        size_t open_count = 0;
+        hl_host_process_fd *open_fds = NULL;
+        int enumerated = hl_host_process_fds((int64_t)getpid(), NULL, 0, &open_count);
+        if (enumerated && open_count != 0) {
+            size_t capacity = open_count;
+            open_fds = calloc(capacity, sizeof *open_fds);
+            if (open_fds == NULL ||
+                !hl_host_process_fds((int64_t)getpid(), open_fds, capacity, &open_count)) {
+                free(open_fds);
+                open_fds = NULL;
+                enumerated = 0;
+            } else if (open_count > capacity) {
+                capacity = open_count;
+                hl_host_process_fd *larger = realloc(open_fds, capacity * sizeof *open_fds);
+                if (larger == NULL ||
+                    !hl_host_process_fds((int64_t)getpid(), larger, capacity, &open_count)) {
+                    free(larger == NULL ? open_fds : larger);
+                    open_fds = NULL;
+                    enumerated = 0;
+                } else {
+                    open_fds = larger;
+                    if (open_count > capacity) open_count = capacity;
+                }
+            }
+        }
+        size_t visits = enumerated ? open_count : (size_t)last - first + 1;
+        for (size_t index = 0; index < visits; ++index) {
+            unsigned fd = enumerated ? (unsigned)open_fds[index].descriptor : first + (unsigned)index;
+            if (fd < first || fd > last) continue;
             hl_linux_fd_snapshot bound;
             if (g_linux_box != NULL && hl_linux_fd_snapshot_get(g_linux_box, fd, &bound) == HL_STATUS_OK) {
                 if (flags & 4) {
@@ -173,9 +205,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             } else {
                 if (exec_fd_is_engine((int)fd)) continue; // never close a (relocated) live engine fd
                 fd_reset_emul((int)fd); // drop hl's emulation tables so a reused fd number isn't misrouted
+                proc_fdvis_close((int)fd);
                 close((int)fd);
             }
         }
+        free(open_fds);
         G_RET(c) = 0;
         break;
     }
@@ -257,10 +291,47 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         break;
     }
+    // pidfd_getfd(pidfd, targetfd, flags): duplicate targetfd out of the process the pidfd refers to
+    // (container managers/debuggers pull a listening socket or log fd out of a child this way). A pidfd we
+    // minted (case 434) is a REAL host pidfd on Linux, and the engine keeps guest fd numbers equal to their
+    // backing host fd numbers, so forward straight to the host syscall: the kernel does the real
+    // ptrace-scope permission check, so success or EPERM (yama) matches native for the caller's privilege.
+    // flags must be 0 (Linux rejects any other value with EINVAL); an fd we never minted -> EBADF (same as
+    // pidfd_send_signal). Without this the syscall fell through to ENOSYS, diverging from a kernel where a
+    // same-user self/child getfd succeeds.
+    case 438: {
+#ifdef SYS_pidfd_getfd
+        if (a2 != 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        pid_t pid;
+        if (pidfd_lookup((int)a0, &pid) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        long r = syscall(SYS_pidfd_getfd, (int)a0, (int)a1, 0u);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+#else
+        G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+#endif
+        break;
+    }
     // mq_open(name, oflag, mode, attr): find-or-create the named queue, hand back a real fd bound to it.
     // (glibc already rejects a name that lacks a leading '/' or is empty with EINVAL before the syscall,
     // so the raw-syscall path only has to police ENAMETOOLONG, EFAULT, ENOENT, EEXIST, ENOSPC + a bad attr.)
     case 180: {
+#if defined(__linux__)
+        // Host-passthrough: a real POSIX mqueue is a kernel object — pollable via poll/select, shared
+        // across fork by name, and its mq_notify is delivered by the kernel's own signal machinery. The
+        // returned descriptor IS a real host mqd (guest fd == host fd, as with pipes/sockets), so it flows
+        // through the existing fd table and the kernel enforces access mode, RLIMIT_MSGQUEUE, geometry, and
+        // the ENOENT/EEXIST/ENAMETOOLONG/EINVAL errno order natively — identical to the native oracle. The
+        // #else in-process broker below backs the macOS build (Darwin has no POSIX mqueue kernel object).
+        long r = syscall(SYS_mq_open, (const char *)a0, (int)a1, (unsigned)a2, (const void *)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
+        break;
+#else
         const char *name = (const char *)a0;
         int oflag = (int)a1;
         const long *at = (const long *)a3; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
@@ -318,12 +389,19 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         g_mqq[qi].refs++;
+        g_mqfd_amode[fd] = (uint8_t)(oflag & O_ACCMODE); // remember O_RDONLY/O_WRONLY/O_RDWR for send/recv EBADF
         mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0); // O_NONBLOCK is a per-descriptor mq_flag
         G_RET(c) = (uint64_t)fd;
         break;
+#endif
     }
     // mq_unlink(name): mark removed; freed once the last descriptor is gone.
     case 181: {
+#if defined(__linux__)
+        long r = syscall(SYS_mq_unlink, (const char *)a0); // host object: ENOENT enforced by the kernel
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         int qi = mq_find((const char *)a0);
         if (qi < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
@@ -333,6 +411,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         mq_maybe_free(qi);
         G_RET(c) = 0;
         break;
+#endif
     }
     // mq_timedsend(mqdes, msg, len, prio, abs_timeout): insert highest-priority-first, FIFO within a prio.
     // Errno order mirrors the kernel: abs_timeout EFAULT/EINVAL (validated first, in the wrapper), then prio
@@ -341,6 +420,16 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // is not emulated (queues aren't shared across fork); a full queue with a blocking descriptor and a NULL
     // timeout therefore blocks forever exactly as Linux would when nothing can drain it.
     case 182: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel enforces prio<MQ_PRIO_MAX, EBADF (fd + access mode), EMSGSIZE, the
+        // msg-buffer EFAULT, then full-queue O_NONBLOCK->EAGAIN / block-until-space-or-abs_timeout
+        // (ETIMEDOUT) / EINTR — the exact native semantics, and a blocked send now wakes when ANY process
+        // sharing the named queue drains it (real cross-process blocking, not the single-process broker).
+        long r = syscall(SYS_mq_timedsend, (int)a0, (const char *)a1, (size_t)a2, (unsigned)a3,
+                         (const struct timespec *)a4);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         struct timespec dl;
         int have_dl;
         int terr = mq_check_timeout(a4, &dl, &have_dl);
@@ -355,6 +444,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         int qi = mq_qof((int)a0);
         if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        if (!mq_fd_canwrite((int)a0)) { // send on a descriptor opened O_RDONLY -> EBADF (before EMSGSIZE)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
             break;
         }
@@ -414,11 +507,22 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         G_RET(c) = 0;
         break;
+#endif
     }
     // mq_timedreceive(mqdes, msg, len, prio*, abs_timeout): pop the head (highest priority, oldest first).
     // Same errno order as mq_timedsend: abs_timeout EFAULT/EINVAL, EBADF, EMSGSIZE (buffer < mq_msgsize),
     // then empty-queue handling: O_NONBLOCK -> EAGAIN, else block until a message / deadline / signal.
     case 183: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel pops the highest-priority-oldest message, writes it + the priority,
+        // and enforces EBADF (fd + access mode), EMSGSIZE (buffer < mq_msgsize), then empty-queue
+        // O_NONBLOCK->EAGAIN / block-until-message-or-abs_timeout (ETIMEDOUT) / EINTR. A blocked receive now
+        // wakes when ANY process sharing the named queue sends (the cross-process fix).
+        long r = syscall(SYS_mq_timedreceive, (int)a0, (char *)a1, (size_t)a2, (unsigned *)a3,
+                         (const struct timespec *)a4);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
+        break;
+#else
         struct timespec dl;
         int have_dl;
         int terr = mq_check_timeout(a4, &dl, &have_dl);
@@ -428,6 +532,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         int qi = mq_qof((int)a0);
         if (qi < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        if (!mq_fd_canread((int)a0)) { // receive on a descriptor opened O_WRONLY -> EBADF (before EMSGSIZE)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
             break;
         }
@@ -467,6 +575,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         free(m.data);
         G_RET(c) = (uint64_t)m.len;
         break;
+#endif
     }
     // mq_notify(mqdes, sevp): register/unregister the single one-shot notification the queue fires on its
     // empty->non-empty edge (delivered in mq_timedsend). Errno order matches the kernel: for a non-NULL sevp,
@@ -476,6 +585,20 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // helper-thread/netlink callback is not driven in-process, so only the registration/EBUSY semantics hold
     // for it (SIGEV_SIGNAL and SIGEV_NONE are fully emulated).
     case 184: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel owns the one-shot registration and delivers the notification. For
+        // SIGEV_SIGNAL it raises the guest's chosen signal with a real SI_MESGQ siginfo carrying the
+        // registered sigev_value (the engine's host-signal interception routes it into the guest with
+        // si_code/si_value intact); SIGEV_NONE registers-only. This is the empty->non-empty edge fired by
+        // the kernel — cross-process and race-correct — and unblocks ipc_mq_notify. A NULL sevp
+        // unregisters. SIGEV_THREAD is glibc-rewritten in the GUEST before this syscall (netlink-socket
+        // delivery), so only its registration/EBUSY errno semantics are guaranteed here; the callback
+        // thread's netlink plumbing is not separately driven (documented, matches the SIGEV_SIGNAL/NONE
+        // fidelity the test asserts). Access-mode/EFAULT/EINVAL/EBADF/EBUSY are enforced by the kernel.
+        long r = syscall(SYS_mq_notify, (int)a0, (const void *)a1);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         const uint8_t *sev = (const uint8_t *)a1;
         if (sev) {
             if (gna_hit(a1, 16)) { // struct sigevent: sigev_value[8], sigev_signo[4], sigev_notify[4] (PIE-safe)
@@ -520,11 +643,20 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
         }
         break;
+#endif
     }
     // mq_getsetattr(mqdes, newattr, oldattr): report mq_flags(O_NONBLOCK)/maxmsg/msgsize/curmsgs into oldattr
     // (the state BEFORE any change), then, if newattr is set, apply it -- only O_NONBLOCK is settable (the
     // kernel masks mq_flags to O_NONBLOCK and ignores the rest), so this is the mq analogue of F_SETFL.
     case 185: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel reports the current mq_flags(O_NONBLOCK)/maxmsg/msgsize/curmsgs into
+        // oldattr and, if newattr is set, applies only the O_NONBLOCK bit (the mq analogue of F_SETFL) —
+        // exact native geometry and EBADF/EFAULT semantics.
+        long r = syscall(SYS_mq_getsetattr, (int)a0, (const void *)a1, (void *)a2);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         if ((a1 && gna_hit(a1, 32)) || (a2 && gna_hit(a2, 32))) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
@@ -548,6 +680,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         G_RET(c) = 0;
         break;
+#endif
     }
     // setsid(): new session / process-group leader
     case 157: {
@@ -664,7 +797,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) =
             setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0 ? (uint64_t)(-errno) : 0;
         break;
-    case 112: G_RET(c) = (uint64_t)(-1); break; // clock_settime: container has no CAP_SYS_TIME -> EPERM
+    // clock_settime: validate the clock id BEFORE the privilege check, as Linux does. An unknown or
+    // non-settable clock id (e.g. CLOCK_MONOTONIC) is -EINVAL; only the settable wall clocks
+    // CLOCK_REALTIME(0)/CLOCK_TAI(11) reach the CAP_SYS_TIME gate the container lacks -> -EPERM.
+    case 112:
+        G_RET(c) = ((int)a0 == 0 || (int)a0 == 11) ? (uint64_t)(int64_t)(-EPERM) : (uint64_t)(int64_t)(-EINVAL);
+        break;
     case 143: G_RET(c) = setregid((gid_t)a0, (gid_t)a1) < 0 ? (uint64_t)(-errno) : 0; break; // setregid
     case 151: G_RET(c) = (uint64_t)cuid(); break; // setfsuid -> previous fsuid (container uid)
     case 152:
@@ -691,17 +829,87 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
         break;
     }
-    case 274:
+    // sched_setattr(pid, attr, flags): validate exactly like the kernel and RECORD the requested
+    // policy/priority so sched_getattr (case 275) and sched_getscheduler (proc.c case 120) round-trip it.
+    // The old handler blanket-returned success, so sched_getattr kept reporting SCHED_OTHER after a policy
+    // change and a real-time policy was "accepted" here even though sched_setscheduler (case 119) rejects it
+    // -- the two entry points disagreed. flags (a2) must be 0 (no sched_setattr flags are defined).
+    case 274: {
+        if (!a1 || a2) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        if (guest_bad_ptr(a1, sizeof(uint32_t))) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        uint32_t size = *(uint32_t *)a1;
+        if (size == 0) size = 48;    // 0 selects the VER0 struct size, as in the kernel
+        if (size < 48) {             // struct sched_attr is 48 bytes; a smaller one is malformed
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        if (guest_bad_ptr(a1, 48)) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        uint32_t policy = *(uint32_t *)(a1 + 4);
+        uint64_t sflags = *(uint64_t *)(a1 + 8);
+        int base = (int)policy & ~HL_SCHED_RESET_ON_FORK, lo, hi;
+        if (sched_prio_band(base, &lo, &hi) < 0) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        int prio = *(int32_t *)(a1 + 20); // sched_priority
+        if (prio < lo || prio > hi) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // Real-time classes need a privilege the container's host process lacks -- reject them the same way
+        // sched_setscheduler does, so a latency probe never believes RT scheduling was installed via setattr.
+        if (base == 1 || base == 2) {
+            G_RET(c) = (uint64_t)(-EPERM);
+            break;
+        }
+        g_sched_policy = base;
+        g_sched_prio = prio;
+        // sched_nice at +16 (unless SCHED_FLAG_KEEP_PARAMS 0x10). Best-effort apply like setpriority
+        // (proc.c case 140): the root container may lower niceness, so clamp to Linux [-20,19] without a
+        // can_nice EPERM. This keeps sched_getattr's reported nice in sync with getpriority.
+        if (!(sflags & 0x10)) {
+            int nice = *(int32_t *)(a1 + 16);
+            if (nice > 19)
+                nice = 19;
+            else if (nice < -20)
+                nice = -20;
+            setpriority(PRIO_PROCESS, 0, nice);
+        }
         G_RET(c) = 0;
-        break; // sched_setattr -> ok (ignored)
-    // preadv2/pwritev2: flags (a5) ignored; offset in a3 (pos_high a4 is 0 on LP64)
+        break;
+    }
+    // preadv2/pwritev2: offset in a3 (pos_high a4 is 0 on LP64), RWF_* flags in a5. The flags are
+    // semantic requirements (RWF_APPEND/DSYNC/SYNC/NOWAIT/HIPRI), not hints: silently dropping them
+    // makes RWF_APPEND write at the supplied offset instead of the end. Honor them via the host
+    // preadv2/pwritev2 (Linux host); the macOS build lacks them, so reject any flag there.
     case 286: {
         if (memf_get((int)a0)) {
+            if (a5) {
+                G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+                break;
+            }
             ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
+#if defined(__linux__)
+        ssize_t r = preadv2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
+#else
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+            break;
+        }
         ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+#endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -711,17 +919,33 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0)) {
+            if (a5) {
+                G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+                break;
+            }
             const struct iovec *iv = (const struct iovec *)a1;
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++)
                 end += iv[i].iov_len;
+            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (memf_room_or_spill((int)a0, end)) {
                 ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
                 break;
             }
         }
+#if defined(__linux__)
+        ssize_t r = pwritev2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
+#else
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+            break;
+        }
         ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+#endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -845,6 +1069,18 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         char pb[4200];
         const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
+        // RLIMIT_FSIZE: a truncate whose target length exceeds the soft file-size limit raises SIGXFSZ and
+        // returns -EFBIG. Linux resolves the path FIRST (a missing file is ENOENT with no signal), so only
+        // gate once the target is known to exist. No-op for an infinite limit (the common case).
+        {
+            uint64_t fslim = guest_fsize_cur();
+            struct stat tst;
+            if (fslim != ~UINT64_C(0) && a1 > fslim && stat(p, &tst) == 0) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
+        }
         int r = truncate(p, (off_t)a1);
         if (r >= 0) hl_fdcache_metadata_evict(p);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
@@ -854,22 +1090,49 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // RLIMIT_STACK(3) reports 8MB, RLIMIT_NOFILE(7) a finite fd cap, everything else unlimited; setrlimit is
     // accepted (no-op).
     case 163:
-        if (a1) svc_fill_rlimit((int)a0, (uint64_t *)a1);
-        G_RET(c) = 0;
+        if ((int)a0 < 0 || (int)a0 >= HL_LIMIT_COUNT) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+        } else if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
+            /* getrlimit copies a complete struct rlimit to userspace.  The
+             * kernel reports EFAULT for NULL, unmapped, wrapped, and
+             * PROT_NONE destinations; never dereference a guest pointer in
+             * the engine to discover that error. */
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+        } else {
+            svc_fill_rlimit((int)a0, (uint64_t *)a1);
+            G_RET(c) = 0;
+        }
         break;
     case 164: {
         // setrlimit(resource, rlim): apply into the same store getrlimit/prlimit64 read, so a direct
         // setrlimit(2) (not funneled through prlimit64/case 261 by glibc) also takes effect -- e.g. a guest
         // raising RLIMIT_CORE to enable cores must have wait4/waitid report WCOREDUMP afterwards.
         int res = (int)a0;
+        if (res < 0 || res >= HL_LIMIT_COUNT) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         const uint64_t *nl = (const uint64_t *)a1;
-        if (nl && res >= 0 && res < HL_LIMIT_COUNT) hl_limit_table_set(&g_limits, res, nl[0], nl[1]);
+        if (nl[0] != ~UINT64_C(0) && nl[1] != ~UINT64_C(0) && nl[0] > nl[1]) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        hl_limit_table_set(&g_limits, res, nl[0], nl[1]);
         G_RET(c) = 0;
         break; // setrlimit -> accepted
     }
 
     // adjtimex(2)/clock_adjtime(2): read-only query fills struct timex + TIME_OK; setting -> EPERM.
     case 266: { // clock_adjtime(clk_id, timex)
+        // Validate the clock id first: an unknown/dynamic id is -EINVAL on Linux, not a silent read.
+        if ((int)a0 < 0 || (int)a0 > 11) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         int r = svc_adjtimex((uint8_t *)a1);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;
@@ -879,15 +1142,24 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;
     }
-    // sched_getattr(pid, attr, size, flags): report a SCHED_OTHER profile. Zero the caller's struct, then
-    // fill size + sched_policy=SCHED_OTHER(0); nice/priority stay 0. (sched_setattr is case 274, ignored.)
+    // sched_getattr(pid, attr, size, flags): report the task's LIVE scheduling profile so it agrees with
+    // sched_getscheduler/sched_getparam. The old handler hardcoded SCHED_OTHER + nice 0, so sched_getattr
+    // disagreed with sched_getscheduler after any policy change (and ignored the process nice). Zero the
+    // caller's struct, then fill size + the recorded policy, the live nice, and the recorded priority.
     case 275: {
         if (a1) {
             size_t sz = (size_t)a2;
             if (sz == 0 || sz > 48) sz = 48; // kernel struct sched_attr is 48+ bytes; cap to a sane size
             memset((void *)a1, 0, sz);
-            *(uint32_t *)(a1 + 0) = (uint32_t)sz; // sched_attr.size
-            *(uint32_t *)(a1 + 4) = 0;            // sched_attr.sched_policy = SCHED_OTHER
+            if (sz >= 4) *(uint32_t *)(a1 + 0) = (uint32_t)sz;                  // sched_attr.size
+            if (sz >= 8) *(uint32_t *)(a1 + 4) = (uint32_t)g_sched_policy;      // sched_policy (live)
+            if (sz >= 20) {
+                errno = 0;
+                int nv = getpriority(PRIO_PROCESS, 0); // sched_nice = the live process nice value
+                if (nv == -1 && errno) nv = 0;
+                *(int32_t *)(a1 + 16) = nv;
+            }
+            if (sz >= 24) *(uint32_t *)(a1 + 20) = (uint32_t)g_sched_prio; // sched_priority (recorded)
         }
         G_RET(c) = 0;
         break;

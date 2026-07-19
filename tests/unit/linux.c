@@ -367,6 +367,7 @@ int main(void) {
         char map_path[128];
         hl_host_file_mapping shared_map = {HL_HOST_FILE_MAPPING_ABI, sizeof(shared_map), 0, 0, 0, 0};
         hl_host_file_mapping private_map = {HL_HOST_FILE_MAPPING_ABI, sizeof(private_map), 0, 0, 0, 0};
+        hl_host_file_mapping unaligned_map = {HL_HOST_FILE_MAPPING_ABI, sizeof(unaligned_map), 0, 0, 0, 0};
         hl_host_result mapped_file;
         char disk = 0;
         snprintf(map_path, sizeof(map_path), "/tmp/hl_file_map_linux_%ld", (long)getpid());
@@ -410,6 +411,11 @@ int main(void) {
                  HL_STATUS_OK);
         HL_CHECK(services.memory->unmap_range(services.context, shared_map.handle, 0, (uint64_t)page).status ==
                  HL_STATUS_OK);
+        HL_CHECK(services.memory->map_file(services.context, mapped_file.value, 0, 0, (uint64_t)page - 17,
+                                           HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE,
+                                           &unaligned_map).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, unaligned_map.handle, 0,
+                                              (uint64_t)page - 17).status == HL_STATUS_OK);
         HL_CHECK(services.file->close(services.context, mapped_file.value).status == HL_STATUS_OK);
         HL_CHECK(unlink(map_path) == 0);
     }

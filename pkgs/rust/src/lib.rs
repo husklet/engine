@@ -11,24 +11,43 @@ mod child;
 mod command;
 mod config;
 mod container;
+pub mod control;
 mod domain;
 mod engine;
 mod error;
+pub mod extension;
 mod ffi;
+mod machine;
 pub mod network;
+mod projection;
 mod result;
 mod runtime;
+#[allow(dead_code)]
+mod service;
+pub mod spec;
 mod terminal;
-mod types;
+pub mod transport;
 mod wire;
+
+pub use hl_engine_api::{checkpoint, observability};
 
 pub use child::{Child, Output};
 pub use command::Command;
 pub use config::Config;
 pub use container::Container;
+pub use control::{
+    AttachRequest, Attachment, AttachmentKind, ControlError, ControlErrorCategory, EventStream,
+    ExtensionHandle, NetworkUpdate, PauseGuard, ProcessInfo, ResourceUpdate, ShutdownPolicy,
+    Signal, SignalTarget,
+};
 pub use domain::Domain;
 pub use engine::Engine;
 pub use error::Error;
+pub use extension::{Authorities, HandlesAuthority, ProviderAuthority};
+pub use hl_engine_api::{Access, Guest, Mount, Sandbox, Stdio};
+pub use machine::Machine;
 pub use result::Exit;
+pub use spec::{
+    EngineCapabilities, MachineSpec, ProcessIo, SpawnError, SpecError, TreeSource, Validation,
+};
 pub use terminal::{Size, Terminal};
-pub use types::{Access, Guest, Mount, Sandbox, Stdio};

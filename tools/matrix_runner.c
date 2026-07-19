@@ -62,6 +62,7 @@ typedef struct resource_baseline {
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
+
 static void interrupt_runner(int signal_number) {
     sig_atomic_t group = active_group;
     interrupted_signal = signal_number;
@@ -395,6 +396,10 @@ static int config_option(config_wire *wire, const char *name, const char *value)
     if (strcmp(name, "HL_NET_ISOLATE") == 0) {
         if (strcmp(value, "1") != 0) return 1;
         wire->config.network_isolated = 1;
+        // ABI12 validate (config.c) rejects the config unless network_transport agrees with the
+        // network_isolated flag; setting the flag alone leaves transport at VIRTUAL (0) and the launch
+        // is rejected as malformed. Pin the transport to ISOLATED so the two fields stay consistent.
+        wire->config.network_transport = HL_CONFIG_NETWORK_ISOLATED;
     } else if (strcmp(name, "HL_CPUS") == 0) {
         char *end;
         unsigned long parsed;

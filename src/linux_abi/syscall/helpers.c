@@ -17,6 +17,14 @@ static int guest_nofile_cur(void) {
     return cur > 0x7fffffff ? 0x7fffffff : (int)cur;
 }
 
+// Guest soft RLIMIT_FSIZE (max file size, bytes). ~0 (RLIM_INFINITY) means no limit -- the common case,
+// where the write path pays nothing. Set by the guest via setrlimit/prlimit64 (stored in g_limits, res 1).
+static uint64_t guest_fsize_cur(void) {
+    uint64_t cur = ~UINT64_C(0);
+    hl_limit_table_get(&g_limits, 1, &cur, NULL); // RLIMIT_FSIZE
+    return cur;
+}
+
 // Gate a freshly-allocated host fd (from a lowest-free allocator: dup, open, pipe, socket, ...) against the
 // guest cap. A number at/above the cap is one Linux would never have handed out -> close it and report
 // EMFILE. Returns r unchanged when in range (or already an error). Pass-through when no cap applies.
@@ -53,6 +61,7 @@ static int nofile_gate(int r) {
 // fcntl record locks stay on the real fd, disjoint from the companion. LOCK_SH->F_RDLCK, LOCK_EX->F_WRLCK,
 // LOCK_NB->F_SETLK (else F_SETLKW), LOCK_UN->F_UNLCK. Per-fd state (fd<HL_NFD) drives release-on-close so a
 // held flock is dropped when its last fd closes, matching flock's "released on last close" semantics.
+#include <sys/file.h> // flock(2) prototype (LOCK_* constants + the host flock() delegate on Linux)
 #define FLOCK_DIR "/tmp/.hl-flock"
 static uint8_t g_flock_type[HL_NFD]; // per guest fd: 0 none, else LOCK_SH / LOCK_EX currently held via companion
 
@@ -103,6 +112,16 @@ static int flock_companion(int fd) {
 // flock(2): whole-file advisory lock delegated to the companion. Returns 0 or -1 (host errno set); the
 // caller applies the normal macOS->Linux errno translation.
 static int hl_flock(int fd, int op) {
+#if defined(__linux__)
+    // On a Linux host, flock(2) on the guest's real descriptor already carries exact flock semantics: the lock
+    // is owned by the OPEN FILE DESCRIPTION, so two separate open()s of one file contend even inside a single
+    // process while dup/fork siblings share it, and it is independent of the guest's fcntl POSIX record locks
+    // (which this engine services in-engine and never places on the host fd). The companion-fd emulation below
+    // exists only for a non-Linux (macOS) host, where flock and fcntl share one per-vnode lock list; it routes
+    // both descriptors to a single process-local fcntl lock and so cannot observe an intra-process cross-fd
+    // flock conflict. Delegate straight to the host on Linux, where the kernel enforces the correct model.
+    return flock(fd, op);
+#else
     int idx = flock_companion(fd);
     if (idx < 0) return -1;
     int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
@@ -123,6 +142,7 @@ static int hl_flock(int fd, int op) {
         g_flock_type[fd] = (uint8_t)base;
     }
     return r;
+#endif
 }
 
 static int hl_flock_identity(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int op) {
@@ -955,17 +975,30 @@ static int resolve_shebang_chain(char **argv, int argc, int cap, const char *hos
 // give real Linux semantics -- re-mmap fresh zero pages over the range -- WITHOUT ever disturbing a
 // file-backed or shared mapping (re-mmapping those with MAP_ANON would discard file data / break
 // sharing). DONTNEED only acts when the advised range is fully contained in a tracked private-anon
-// region; otherwise it falls back to the safe advisory passthrough. Lock-free like g_gmap; a race can
-// only forget an entry (-> safe no-op), and the containment check gates every destructive remap.
-static struct {
+// region; otherwise it falls back to the safe advisory passthrough. Capacity grows with the mapping
+// population like g_gmap so ordinary valid mappings never silently lose their Linux policy metadata.
+struct anon_mapping {
     uint64_t addr, len;
     int prot;
-} g_anonmap[2048];
+};
 
+static struct anon_mapping *g_anonmap;
 static int g_nanonmap;
+static int g_anonmap_capacity;
+
+static void anon_reserve_one(void) {
+    if (g_nanonmap < g_anonmap_capacity) return;
+    int capacity = g_anonmap_capacity ? g_anonmap_capacity * 2 : 256;
+    if (capacity < g_anonmap_capacity || (size_t)capacity > SIZE_MAX / sizeof(*g_anonmap)) abort();
+    struct anon_mapping *mappings = realloc(g_anonmap, (size_t)capacity * sizeof(*mappings));
+    if (!mappings) abort();
+    g_anonmap = mappings;
+    g_anonmap_capacity = capacity;
+}
 
 static void anon_track(uint64_t addr, uint64_t len, int prot) {
-    if (!addr || g_nanonmap >= (int)(sizeof g_anonmap / sizeof g_anonmap[0])) return;
+    if (!addr) return;
+    anon_reserve_one();
     g_anonmap[g_nanonmap].addr = addr;
     g_anonmap[g_nanonmap].len = len;
     g_anonmap[g_nanonmap].prot = prot;
@@ -983,6 +1016,32 @@ static void anon_untrack(uint64_t addr, uint64_t len) {
             g_anonmap[i] = g_anonmap[--g_nanonmap];
         else
             i++;
+    }
+}
+
+// A successful guest mprotect changes the CURRENT protection of tracked private-anon pages, and a
+// later MADV_DONTNEED must re-establish the range with THAT protection -- re-mapping with the stale
+// mmap-time prot (PROT_NONE for a reserve-then-commit arena, the mozjs/V8 GC-chunk pattern) turns the
+// committed pages back into an inaccessible reservation and the guest's next store faults. Split any
+// tracked record around [addr,addr+len) so the subrange records the new prot while the head/tail keep
+// theirs. Same lock-free discipline as the registry: a racing reader can only miss an entry (safe
+// no-op fallback to the advisory passthrough).
+static void anon_update_prot(uint64_t addr, uint64_t len, int prot) {
+    uint64_t end = addr + len;
+    if (!addr || end <= addr) return;
+    int n = g_nanonmap;
+    for (int i = 0; i < n; i++) {
+        uint64_t a = g_anonmap[i].addr, e = a + g_anonmap[i].len;
+        int old = g_anonmap[i].prot;
+        if (a >= end || addr >= e || old == prot) continue;
+        uint64_t lo = addr > a ? addr : a, hi = end < e ? end : e;
+        // Rewrite this record to the updated subrange, then append head/tail remainders with the old
+        // prot. anon_prot_if_contained scans first-match, so the record itself must carry the new prot.
+        g_anonmap[i].addr = lo;
+        g_anonmap[i].len = hi - lo;
+        g_anonmap[i].prot = prot;
+        if (a < lo) anon_track(a, lo - a, old);
+        if (hi < e) anon_track(hi, e - hi, old);
     }
 }
 
@@ -1033,6 +1092,51 @@ static void wipefork_apply_child(void) {
         memset((void *)g_wipefork[i].addr, 0, (size_t)g_wipefork[i].len);
 }
 
+// MADV_DONTFORK(14) ranges: PRIVATE-ANON regions the guest asked NOT to be inherited by a fork(2) child
+// (Linux VM_DONTCOPY). Tracked here (mirrors g_wipefork); fork_child_hooks() unmaps each range in the
+// child so a child access FAULTS exactly as Linux would, while the parent keeps its mapping.
+// MADV_DOFORK(15) undoes it by dropping the range. The registry is inherited across fork.
+static struct {
+    uint64_t addr, len;
+} g_dontfork[256];
+
+static int g_ndontfork;
+
+static void dontfork_add(uint64_t addr, uint64_t len) {
+    if (!addr || !len) return;
+    for (int i = 0; i < g_ndontfork; i++)
+        if (g_dontfork[i].addr == addr && g_dontfork[i].len == len) return; // already tracked
+    if (g_ndontfork >= (int)(sizeof g_dontfork / sizeof g_dontfork[0])) return;
+    g_dontfork[g_ndontfork].addr = addr;
+    g_dontfork[g_ndontfork].len = len;
+    g_ndontfork++;
+}
+
+static void dontfork_del(uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    for (int i = 0; i < g_ndontfork;) {
+        uint64_t a = g_dontfork[i].addr, e = a + g_dontfork[i].len;
+        if (a < end && addr < e)
+            g_dontfork[i] = g_dontfork[--g_ndontfork]; // overlaps the DOFORK/unmapped range -> forget it
+        else
+            i++;
+    }
+}
+
+// Called in the fork CHILD (from fork_child_hooks): drop each MADV_DONTFORK range so the child faults on
+// access (Linux presents the range as unmapped in the child).
+static void dontfork_apply_child(void) {
+    for (int i = 0; i < g_ndontfork; i++) {
+        uint64_t a = g_dontfork[i].addr, l = g_dontfork[i].len;
+        munmap((void *)a, (size_t)l);
+        // Retire the range from the private-anon registry and mark it PROT_NONE so a child access faults
+        // (SIGSEGV) exactly as Linux VM_DONTCOPY presents it -- otherwise the x86 lazy anon-page grower,
+        // seeing the address still inside a tracked anon region, would silently re-serve a zero page.
+        anon_untrack(a, l);
+        gna_add(a & ~(uint64_t)0xfff, (a + l + 0xfff) & ~(uint64_t)0xfff);
+    }
+}
+
 // /proc/self/fd/N (and /proc/<pid>/fd/N for our own pid -- host pid, container pid, or init's "1")
 // names an already-open fd. macOS has no /proc, so detect this form and recover the fd number; the
 // caller then resolves it via F_GETPATH (readlinkat) or dup()/reopen (openat). Returns N>=0 on an
@@ -1071,6 +1175,20 @@ static int procfd_num(const char *p) {
     for (const char *s = rest; *s; s++)
         if (*s < '0' || *s > '9') return -1; // trailing path component -> not a bare fd link
     return atoi(rest);
+}
+
+// Normalize the standard /dev/fd/N alias into the single synthetic procfs namespace used by every
+// path operation. Returning the original path for non-fd entries keeps ordinary /dev resolution unchanged.
+static const char *procfd_namespace_path(const char *path, char *storage, size_t capacity) {
+    int fd = procfd_num(path);
+    if (fd < 0 || path == NULL || strncmp(path, "/dev/fd/", 8) != 0) return path;
+    if (snprintf(storage, capacity, "/proc/self/fd/%d", fd) >= (int)capacity) return path;
+    return storage;
+}
+
+static int procfd_directory_path(const char *path) {
+    return path && (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/") ||
+                    !strcmp(path, "/proc/thread-self/fd") || !strcmp(path, "/proc/thread-self/fd/"));
 }
 
 // The /dev/std{in,out,err} aliases -> fd 0/1/2 for the OPEN path only (readlink keeps its on-disk
@@ -1122,6 +1240,7 @@ static uint8_t g_ep_dupd[HL_NFD];
 static int g_ep_owner[HL_NFD];       // watched fd -> owning epoll instance fd + 1 (0 = not watched)
 static uint32_t g_ep_events[HL_NFD]; // watched fd -> the epoll events mask registered (EPOLLIN/OUT/ET/ONESHOT)
 static uint64_t g_ep_udata[HL_NFD];  // watched fd -> the epoll_event.data registered for it
+static void ep_mem_close(int ep, int fd); // implemented beside the membership table in event.c
 
 // ---- open-file-description identity for fd-number aliases (dup) -------------------------------------
 // hl shares the host descriptor table with the guest, so two guest fds that refer to the same OFD are two
@@ -1177,6 +1296,14 @@ static void ep_push(int ep, uintptr_t ident, int16_t filt, uint16_t flags, void 
 // armed map must follow to avoid a later stale EV_DELETE on a reused fd number).
 static void ep_fd_reset(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
+    // Closing the final descriptor for a watched OFD removes its registration from Linux epoll.  kqueue
+    // removes the knote itself, but our Linux EEXIST/ENOENT membership mirror must be cleared explicitly;
+    // otherwise immediate reuse of this descriptor number makes a fresh EPOLL_CTL_ADD fail with EEXIST.
+    // ep_close_rehome has already moved a surviving dup and cleared this bit, so this is idempotent there.
+    if (g_ep_owner[fd]) ep_mem_close(g_ep_owner[fd] - 1, fd);
+    ep_provider_retire_endpoint(fd);
+    ep_object_retire_endpoint(fd);
+    g_ep_provider_generations[fd] = ep_provider_next(g_ep_provider_generations[fd]);
     g_ep_rd[fd] = g_ep_wr[fd] = g_ep_os[fd] = 0;
     if (g_ep_chg[fd]) {
         free(g_ep_chg[fd]);

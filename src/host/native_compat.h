@@ -1,6 +1,8 @@
 #ifndef HL_HOST_NATIVE_COMPAT_H
 #define HL_HOST_NATIVE_COMPAT_H
 
+#include "system.h"
+
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -17,6 +19,12 @@
 #define HL_NATIVE_RENAME_EXCHANGE RENAME_SWAP
 #define HL_NATIVE_SEEK_DATA SEEK_DATA
 #define HL_NATIVE_SEEK_HOLE SEEK_HOLE
+
+static inline void hl_native_kqueue_close(int descriptor) { (void)descriptor; }
+static inline void hl_native_kqueue_duplicate(int source, int destination) {
+    (void)source;
+    (void)destination;
+}
 
 static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity) {
     (void)capacity;
@@ -118,8 +126,8 @@ struct kevent {
                                 (uint32_t)(event_fflags), (intptr_t)(event_data), (void *)(event_udata)})
 
 typedef struct hl_native_kregistration {
-    dev_t device;
-    ino_t inode;
+    uint64_t queue;
+    uint64_t token;
     int target;
     int wake;
     int16_t filter;
@@ -132,30 +140,92 @@ typedef struct hl_native_kregistration {
 
 static pthread_mutex_t hl_native_klock = PTHREAD_MUTEX_INITIALIZER;
 static hl_native_kregistration *hl_native_kregistrations;
+typedef struct hl_native_kalias {
+    int descriptor;
+    uint64_t queue;
+    struct hl_native_kalias *next;
+} hl_native_kalias;
+static hl_native_kalias *hl_native_kaliases;
+static uint64_t hl_native_knext = 1;
+static uint64_t hl_native_ktoken_next = 1;
 
-static inline int hl_native_kidentity(int descriptor, dev_t *device, ino_t *inode) {
-    struct stat status;
-    if (fstat(descriptor, &status) != 0) return -1;
-    *device = status.st_dev;
-    *inode = status.st_ino;
-    return 0;
-}
-
-static inline hl_native_kregistration *hl_native_kfind(dev_t device, ino_t inode, int target) {
-    hl_native_kregistration *entry;
-    for (entry = hl_native_kregistrations; entry != NULL; entry = entry->next)
-        if (entry->device == device && entry->inode == inode && entry->target == target) return entry;
+static inline hl_native_kalias *hl_native_kalias_find(int descriptor) {
+    for (hl_native_kalias *alias = hl_native_kaliases; alias != NULL; alias = alias->next)
+        if (alias->descriptor == descriptor) return alias;
     return NULL;
 }
 
+static inline hl_native_kregistration *hl_native_kfind(uint64_t queue, int target) {
+    hl_native_kregistration *entry;
+    for (entry = hl_native_kregistrations; entry != NULL; entry = entry->next)
+        if (entry->queue == queue && entry->target == target) return entry;
+    return NULL;
+}
+
+static inline hl_native_kregistration *hl_native_ktoken_find(uint64_t token) {
+    for (hl_native_kregistration *entry = hl_native_kregistrations; entry != NULL; entry = entry->next)
+        if (entry->token == token) return entry;
+    return NULL;
+}
+
+static inline void hl_native_kqueue_release_locked(int descriptor) {
+    hl_native_kalias **alias_cursor = &hl_native_kaliases;
+    while (*alias_cursor != NULL && (*alias_cursor)->descriptor != descriptor) alias_cursor = &(*alias_cursor)->next;
+    if (*alias_cursor == NULL) return;
+    hl_native_kalias *alias = *alias_cursor;
+    uint64_t queue = alias->queue;
+    *alias_cursor = alias->next;
+    free(alias);
+    for (hl_native_kalias *survivor = hl_native_kaliases; survivor != NULL; survivor = survivor->next)
+        if (survivor->queue == queue) return;
+    hl_native_kregistration **cursor = &hl_native_kregistrations;
+    while (*cursor != NULL) {
+        hl_native_kregistration *entry = *cursor;
+        if (entry->queue != queue) {
+            cursor = &entry->next;
+            continue;
+        }
+        *cursor = entry->next;
+        if (entry->wake >= 0) {
+            hl_host_process_fd_private_remove(entry->wake);
+            close(entry->wake);
+        }
+        free(entry);
+    }
+}
+
+static inline void hl_native_kqueue_close(int descriptor) {
+    pthread_mutex_lock(&hl_native_klock);
+    hl_native_kqueue_release_locked(descriptor);
+    pthread_mutex_unlock(&hl_native_klock);
+}
+
+/* A duplicated descriptor names the same epoll open-file description.  Keep a
+   stable identity and retain registrations until the last alias closes. */
+static inline void hl_native_kqueue_duplicate(int source, int destination) {
+    if (source < 0 || destination < 0 || source == destination) return;
+    pthread_mutex_lock(&hl_native_klock);
+    hl_native_kalias *original = hl_native_kalias_find(source);
+    if (original != NULL) {
+        uint64_t queue = original->queue;
+        hl_native_kqueue_release_locked(destination);
+        hl_native_kalias *alias = calloc(1, sizeof(*alias));
+        if (alias != NULL) {
+            alias->descriptor = destination;
+            alias->queue = queue;
+            alias->next = hl_native_kaliases;
+            hl_native_kaliases = alias;
+        }
+    }
+    pthread_mutex_unlock(&hl_native_klock);
+}
+
 static inline int hl_native_kevent_rehome(int descriptor, int old_target, int new_target) {
-    dev_t device;
-    ino_t inode;
     hl_native_kregistration *entry;
     struct epoll_event event = {0};
-    if (hl_native_kidentity(descriptor, &device, &inode) != 0) return -1;
     pthread_mutex_lock(&hl_native_klock);
-    entry = hl_native_kfind(device, inode, old_target);
+    hl_native_kalias *alias = hl_native_kalias_find(descriptor);
+    entry = alias == NULL ? NULL : hl_native_kfind(alias->queue, old_target);
     if (entry == NULL) {
         pthread_mutex_unlock(&hl_native_klock);
         errno = ENOENT;
@@ -164,7 +234,7 @@ static inline int hl_native_kevent_rehome(int descriptor, int old_target, int ne
     event.events = (entry->read ? EPOLLIN : 0u) | (entry->write ? EPOLLOUT : 0u);
     if ((entry->flags & EV_CLEAR) != 0) event.events |= EPOLLET;
     if ((entry->flags & EV_ONESHOT) != 0) event.events |= EPOLLONESHOT;
-    event.data.ptr = entry;
+    event.data.u64 = entry->token;
     if (epoll_ctl(descriptor, EPOLL_CTL_DEL, old_target, NULL) != 0 ||
         epoll_ctl(descriptor, EPOLL_CTL_ADD, new_target, &event) != 0) {
         pthread_mutex_unlock(&hl_native_klock);
@@ -176,21 +246,39 @@ static inline int hl_native_kevent_rehome(int descriptor, int old_target, int ne
 }
 
 static inline int kqueue(void) {
-    return epoll_create1(EPOLL_CLOEXEC);
+    int descriptor = epoll_create1(EPOLL_CLOEXEC);
+    if (descriptor < 0) return descriptor;
+    hl_native_kalias *alias = calloc(1, sizeof(*alias));
+    if (alias == NULL) {
+        close(descriptor);
+        errno = ENOMEM;
+        return -1;
+    }
+    pthread_mutex_lock(&hl_native_klock);
+    alias->descriptor = descriptor;
+    alias->queue = hl_native_knext++;
+    alias->next = hl_native_kaliases;
+    hl_native_kaliases = alias;
+    pthread_mutex_unlock(&hl_native_klock);
+    return descriptor;
 }
 
 static inline int kevent(int descriptor, const struct kevent *changes, int change_count, struct kevent *events,
                          int event_count, const struct timespec *timeout) {
-    dev_t device;
-    ino_t inode;
     int index;
-    if (hl_native_kidentity(descriptor, &device, &inode) != 0) return -1;
     if (change_count < 0 || event_count < 0 || (change_count != 0 && changes == NULL) ||
         (event_count != 0 && events == NULL)) {
         errno = EINVAL;
         return -1;
     }
     pthread_mutex_lock(&hl_native_klock);
+    hl_native_kalias *alias = hl_native_kalias_find(descriptor);
+    if (alias == NULL) {
+        pthread_mutex_unlock(&hl_native_klock);
+        errno = EBADF;
+        return -1;
+    }
+    uint64_t queue = alias->queue;
     for (index = 0; index < change_count; ++index) {
         const struct kevent *change = &changes[index];
         hl_native_kregistration *entry;
@@ -209,7 +297,7 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             return -1;
         }
         target = change->filter == EVFILT_USER ? -1 : change->filter == EVFILT_TIMER ? -2 : (int)change->ident;
-        entry = hl_native_kfind(device, inode, target);
+        entry = hl_native_kfind(queue, target);
         if (change->filter == EVFILT_USER && (change->fflags & NOTE_TRIGGER) != 0) {
             uint64_t one = 1;
             if (entry == NULL || write(entry->wake, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
@@ -236,8 +324,8 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
                     errno = ENOMEM;
                     return -1;
                 }
-                entry->device = device;
-                entry->inode = inode;
+                entry->queue = queue;
+                entry->token = hl_native_ktoken_next++;
                 entry->target = target;
                 entry->wake = -1;
                 entry->filter = change->filter;
@@ -249,10 +337,22 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             if (change->filter == EVFILT_READ) entry->read = 1;
             else if (change->filter == EVFILT_WRITE) entry->write = 1;
             else {
-                if (entry->wake < 0)
-                    entry->wake = change->filter == EVFILT_TIMER
-                                      ? timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)
-                                      : eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                if (entry->wake < 0) {
+                    int wake = change->filter == EVFILT_TIMER
+                                   ? timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)
+                                   : eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                    if (wake >= 0) {
+                        int adopted = hl_host_process_fd_private_adopt(wake);
+                        if (adopted < 0) {
+                            close(wake);
+                            errno = -adopted;
+                            wake = -1;
+                        } else {
+                            wake = adopted;
+                        }
+                    }
+                    entry->wake = wake;
+                }
                 if (entry->wake < 0) {
                     pthread_mutex_unlock(&hl_native_klock);
                     return -1;
@@ -279,10 +379,14 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         } else {
             continue;
         }
-        event.events = (entry->read ? EPOLLIN : 0u) | (entry->write ? EPOLLOUT : 0u);
+        // Always request EPOLLRDHUP on the read side so a peer half-close (shutdown SHUT_WR) surfaces as
+        // EV_EOF, matching macOS kqueue's native EVFILT_READ EV_EOF-on-half-close. Without it Linux epoll
+        // reports a half-close only as a plain EPOLLIN (readable-at-EOF) and never sets EV_EOF, so the engine
+        // could not deliver EPOLLRDHUP to a guest that registered it.
+        event.events = (entry->read ? (EPOLLIN | EPOLLRDHUP) : 0u) | (entry->write ? EPOLLOUT : 0u);
         if ((entry->flags & EV_CLEAR) != 0) event.events |= EPOLLET;
         if ((entry->flags & EV_ONESHOT) != 0) event.events |= EPOLLONESHOT;
-        event.data.ptr = entry;
+        event.data.u64 = entry->token;
         operation = event.events == 0 ? EPOLL_CTL_DEL : EPOLL_CTL_MOD;
         if (entry->wake >= 0) target = entry->wake;
         int control = epoll_ctl(descriptor, operation, target, operation == EPOLL_CTL_DEL ? NULL : &event);
@@ -296,6 +400,7 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             return -1;
         }
         if (operation == EPOLL_CTL_DEL && entry->filter == EVFILT_TIMER && entry->wake >= 0) {
+            hl_host_process_fd_private_remove(entry->wake);
             close(entry->wake);
             entry->wake = -1;
         }
@@ -313,31 +418,39 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         }
         count = epoll_wait(descriptor, native_events, event_count, timeout_ms);
         if (count < 0) return -1;
+        int delivered = 0;
         for (index = 0; index < count; ++index) {
-            hl_native_kregistration *entry = native_events[index].data.ptr;
+            pthread_mutex_lock(&hl_native_klock);
+            hl_native_kregistration *entry = hl_native_ktoken_find(native_events[index].data.u64);
+            if (entry == NULL) {
+                pthread_mutex_unlock(&hl_native_klock);
+                continue; /* stale readiness raced the last alias close */
+            }
             uint32_t ready = native_events[index].events;
             int16_t filter = entry->filter == EVFILT_TIMER
                                  ? EVFILT_TIMER
                                  : (ready & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0 ? EVFILT_READ : EVFILT_WRITE;
-            events[index] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target), filter, 0, 0,
-                                            0, entry->udata};
-            if ((ready & (EPOLLHUP | EPOLLRDHUP)) != 0) events[index].flags |= EV_EOF;
-            if ((ready & EPOLLERR) != 0) events[index].flags |= EV_ERROR;
+            events[delivered] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target), filter,
+                                                0, 0, 0, entry->udata};
+            if ((ready & (EPOLLHUP | EPOLLRDHUP)) != 0) events[delivered].flags |= EV_EOF;
+            if ((ready & EPOLLERR) != 0) events[delivered].flags |= EV_ERROR;
             if (entry->filter == EVFILT_TIMER) {
                 uint64_t expirations = 0;
                 if (read(entry->wake, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations))
-                    events[index].data = (intptr_t)expirations;
+                    events[delivered].data = (intptr_t)expirations;
             } else if (entry->target < 0) {
                 uint64_t value;
                 ssize_t consumed = read(entry->wake, &value, sizeof(value));
                 if (consumed < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    events[index].flags |= EV_ERROR;
-                    events[index].data = errno;
+                    events[delivered].flags |= EV_ERROR;
+                    events[delivered].data = errno;
                 }
-                events[index].filter = EVFILT_USER;
+                events[delivered].filter = EVFILT_USER;
             }
+            delivered++;
+            pthread_mutex_unlock(&hl_native_klock);
         }
-        return count;
+        return delivered;
     }
 }
 #define st_atimespec st_atim

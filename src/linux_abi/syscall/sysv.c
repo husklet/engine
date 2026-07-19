@@ -151,20 +151,22 @@ struct sembuf_guest {
 // ============================================================================================
 // HL-internal shared registry
 // ============================================================================================
-// Advertised Linux-like limits (also mirrored in /proc/sys/kernel/{shmmni,shmmax,shmall,sem,msgmni,...}).
+// Guest-visible limits (also mirrored in /proc/sys/kernel/*).  These must be
+// the capacities actually enforced below: applications legitimately size and
+// exhaust IPC resources from these values, and an optimistic synthetic value
+// makes semget/msgget fail before the advertised limit.
 #define HL_IPC_SHMMAX 0xffffffffffffffffULL
 #define HL_IPC_SHMMNI_ADV 4096
-#define HL_IPC_SEMMNI_ADV 32000
-#define HL_IPC_SEMMSL_ADV 32000
-#define HL_IPC_SEMMNS_ADV 1024000000
+#define HL_IPC_SEMMNI_ADV 512
+#define HL_IPC_SEMMSL_ADV 256
+#define HL_IPC_SEMMNS_ADV (512 * 256)
 #define HL_IPC_SEMOPM_ADV 500
 #define HL_IPC_SEMVMX 32767
 #define HL_IPC_MSGMAX 8192
 #define HL_IPC_MSGMNB 16384
-#define HL_IPC_MSGMNI_ADV 32000
-// Table capacities we actually allocate + enforce (all >> the host's 32; well beyond what real software
-// needs). shm matches the advertised limit; sem/msg are capped lower than the advertised (Linux sizes them
-// dynamically -- impractical in a fixed shared block) but far above any realistic use.
+#define HL_IPC_MSGMNI_ADV 512
+// Table capacities we allocate and enforce. They agree exactly with the
+// discovery plane above and the generated procfs values.
 #define HL_IPC_SHMMNI 4096            // shm segment descriptors (metadata only; data in a per-segment object)
 #define HL_IPC_SEMMNI 512             // semaphore SETS
 #define HL_IPC_SEMMSL 256             // semaphores per set (inline values)

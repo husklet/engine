@@ -21,6 +21,26 @@ portable contract requires host operating-system behavior to enter through `hl_h
 7. Logging calls use portable tags and an instance-owned `hl_log_context`. They are compiled out unless
    `HL_ENABLE_LOGGING=1`; host backends are byte sinks and never implement tag policy.
 
+## Rust package boundary
+
+The Rust surface separates declarative launch data from live provider behavior:
+
+- `hl-engine-api` owns backend-independent discovery, launch-policy, validation, control-data, and negotiated
+  identifiers;
+- `hl-engine-provider` owns live provider ports, requests, replies, authority, and lifecycle contracts and depends
+  only on `hl-engine-api`;
+- `hl-engine` owns native assets, backend lowering, machine lifecycle, and compatibility reexports.
+
+Provider implementations do not depend on `hl-engine`. This keeps product policy and backend machinery out of
+provider contracts and prevents the API/provider dependency cycle. Existing callers may continue to import both
+planes through `hl_engine::extension`.
+
+The native facade keeps composite models whose fields still carry live backend values. In particular, process domains,
+terminal sizes, and virtual-network bridge operations retain their established native methods and error types in
+`hl-engine`; the pure CPU, identity, filesystem, namespace, resource, security, time, observability, capability, and
+validation values they compose live in `hl-engine-api`. This avoids either duplicating public types or smuggling FFI
+callbacks and host filesystem operations into the API package.
+
 ## IR rule
 
 IR is private and versioned. Operands refer only to earlier SSA-like values; blocks end in an explicit terminator;

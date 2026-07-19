@@ -1,5 +1,6 @@
 #include "namespace.h"
 #include "../bus.h"
+#include "../../linux_abi/dns.h"
 
 // HL engine: the aarch64 Linux-guest JIT runner (unity translation unit).
 //
@@ -67,6 +68,7 @@ hl_status hl_run_linux_guest_status(void) {
 }
 
 static uint64_t g_host_launch_monotonic_ns;
+static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 #include "../../translator/guest/aarch64/cpu.h"
 #include "../../translator/guest/aarch64/signal.h"
@@ -149,14 +151,14 @@ static int signal_cache_contains(void *context, uint64_t pc) {
     return jit_pc_in_retained_cache(pc);
 }
 
-static void build_signal_frame(struct cpu *c, int sig) {
+static void build_signal_frame(struct cpu *c, int sig, int synchronous) {
     hl_aarch64_signal_state state = {
         .handler = g_sigact[sig].handler,
         .flags = g_sigact[sig].flags,
         .mask = g_sigact[sig].mask,
-        .code = &g_sigcode[sig],
+        .code = synchronous ? &c->sync_code : &g_sigcode[sig],
         .value = &g_sigval[sig],
-        .address = &g_sigaddr[sig],
+        .address = synchronous ? &c->sync_address : &g_sigaddr[sig],
         .pid = &g_sigpid[sig],
         .uid = &g_siguid[sig],
         .sigreturn_pc = SIGRETURN_PC,
@@ -172,7 +174,11 @@ static void do_sigreturn(struct cpu *c) {
 }
 
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
-    return hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL);
+    if (!hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL)) return 0;
+    uint64_t exact_pc;
+    uint64_t host_pc = (uint64_t)HL_HOST_UC_PC((ucontext_t *)native_context);
+    if (jit_instruction_guest_pc(host_pc, &exact_pc)) c->pc = exact_pc;
+    return 1;
 }
 
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
@@ -180,6 +186,70 @@ static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
 }
 // path jail + overlay + /proc synth
 #include "../../linux_abi/container/vfs.c"
+#include "../../linux_abi/image.h"
+
+static const void *g_initial_executable_image;
+static size_t g_initial_executable_size;
+static const void *g_authorized_executable_image;
+static size_t g_authorized_executable_size;
+static char g_authorized_executable_path[4200];
+
+static int aarch64_image_read(const char *path, hl_linux_image *image) {
+    if (g_initial_executable_image != NULL)
+        return hl_linux_image_read_bytes(g_initial_executable_image, g_initial_executable_size, image);
+    if (g_authorized_executable_image != NULL && path != NULL && g_authorized_executable_path[0]) {
+        char canonical[4200];
+        if (realpath(path, canonical) != NULL && strcmp(canonical, g_authorized_executable_path) == 0)
+            return hl_linux_image_read_bytes(g_authorized_executable_image, g_authorized_executable_size, image);
+    }
+    if (g_rootfs == NULL) return -1;
+    char guest[4200];
+    const char *request = path;
+    if (path != NULL && path[0] == '/') {
+        int backing = g_rootfs && !strncmp(path, g_rootfs_canon, g_rootfs_canon_len) &&
+                      (path[g_rootfs_canon_len] == 0 || path[g_rootfs_canon_len] == '/');
+        for (int volume = 0; !backing && volume < g_nvols; ++volume)
+            backing = !strncmp(path, g_vols[volume].hcanon, g_vols[volume].hlen) &&
+                      (path[g_vols[volume].hlen] == 0 || path[g_vols[volume].hlen] == '/');
+        for (int lower = 0; !backing && lower < g_nlower; ++lower) {
+            if (!strncmp(path, g_lower[lower].canon, g_lower[lower].clen) &&
+                (path[g_lower[lower].clen] == 0 || path[g_lower[lower].clen] == '/')) {
+                const char *suffix = path + g_lower[lower].clen;
+                snprintf(guest, sizeof guest, "%s", suffix[0] ? suffix : "/");
+                request = guest;
+                backing = 2;
+            }
+        }
+        if (backing == 1) {
+            guest_from_host_raw(path, guest, sizeof guest);
+            request = guest;
+        }
+    }
+    if (request != NULL && request[0] == '/' && (g_rootfs != NULL || jail_match(request) >= 0)) {
+        if (g_nlower) {
+            char backing[4200];
+            /* ELF loading follows the final executable symlink, just like execve.
+               overlay_lookup deliberately preserves that link for lstat/readlink,
+               so using it here made ordinary image links such as /bin/python fail
+               the O_NOFOLLOW open below.  Resolve the complete merged-view chain;
+               the returned path is still confined to the selected overlay layer. */
+            if (!overlay_resolve(request, backing, sizeof backing, 0)) return -1;
+            int descriptor = open(backing, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            int result = descriptor < 0 ? -1 : hl_linux_image_read_fd(descriptor, image);
+            if (descriptor >= 0) close(descriptor);
+            return result;
+        }
+        char final[512];
+        int directory = jail_at(-100, request, final, sizeof final, 0);
+        if (directory < 0) return -1;
+        int descriptor = openat(directory, final, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        int result = descriptor < 0 ? -1 : hl_linux_image_read_fd(descriptor, image);
+        if (descriptor >= 0) close(descriptor);
+        close(directory);
+        return result;
+    }
+    return hl_linux_image_read(effective_host_services(), request, image);
+}
 // termios + NET-ns loopback
 #include "../../linux_abi/container/netns.c"
 // ELF fwd-decls + FS-metadata cache
@@ -627,6 +697,9 @@ static void install_mach_exc(void) {
 static int g_engine_inited;
 
 static int container_init(const char *rootfs) {
+#if defined(__APPLE__)
+    hl_linux_dns_prepare();
+#endif
     hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1
     if (rootfs) g_init_hostpid = getpid();
@@ -647,10 +720,11 @@ static int container_init(const char *rootfs) {
         const char *low = hl_option_get("HL_LOWER");
         if (low && !g_nlower) {
             char tb[8192];
-            // ro lowers, colon-sep (highest first)
+            // ABI 12 uses newline records so host paths may contain ':'. Legacy launchers use ':'.
             snprintf(tb, sizeof tb, "%s", low);
             char *sv = NULL;
-            for (char *t = strtok_r(tb, ":", &sv); t; t = strtok_r(NULL, ":", &sv))
+            const char *separator = strchr(tb, '\n') ? "\n" : ":";
+            for (char *t = strtok_r(tb, separator, &sv); t; t = strtok_r(NULL, separator, &sv))
                 add_lower(t);
         }
         // Private-loopback netns: derive g_netns from the HL_NETNS key (set per-container by the
@@ -660,7 +734,7 @@ static int container_init(const char *rootfs) {
         // false, and 127.0.0.1 fell through to the REAL host TCP stack shared by every concurrent guest,
         // so two containers' 127.0.0.1:PORT collided (nc-loopback intermittently reached another
         // container's published listener). Mirrors linux_x86_64.c.
-        if (!g_netns[0]) {
+        if (!g_netns[0] && hl_option_get("HL_NET_HOST") == NULL) {
             const char *nn = hl_option_get("HL_NETNS");
             char key[40];
             if (nn && nn[0])
@@ -673,7 +747,7 @@ static int container_init(const char *rootfs) {
             // container's namespace (hl_option_get("HL_NETNS")); a daemon-supplied key is already in the env.
             if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) == 0 && !(nn && nn[0]))
                 hl_option_set("HL_NETNS", key, 1);
-        } else if (hl_target_services_make_directory(&g_target_services, g_netns, 0700) != 0)
+        } else if (g_netns[0] && hl_target_services_make_directory(&g_target_services, g_netns, 0700) != 0)
             return -1;
         const char *eu = hl_option_get("HL_UID");
         if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);
@@ -682,9 +756,11 @@ static int container_init(const char *rootfs) {
         // USER ns (process.user)
     }
     if (rootfs && rootfs[0]) {
+        const char *owner_lowers[8];
+        for (int i = 0; i < g_nlower; ++i) owner_lowers[i] = g_lower[i].canon;
         g_rootfs = (char *)rootfs;
         if (root_handle_bind(g_rootfs) != 0) return -1;
-        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS")) != 0) return -1;
+        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         if (g_uid < 0) g_uid = 0;
@@ -695,7 +771,7 @@ static int container_init(const char *rootfs) {
         const char *icwd = hl_option_get("HL_CWD");
         if (icwd && icwd[0]) confine(icwd, g_cwd, sizeof g_cwd);
     }
-    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL) != 0)) return -1;
+    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL, NULL, 0) != 0)) return -1;
     // bind-mount volumes: "[ro:]guestpath:hostdir,..." -- delegate to add_vol() (the shared vfs.c parser)
     // so the optional `ro:` read-only marker is handled in ONE place for both engines. Ingested regardless
     // of whether a rootfs is set (matching linux_x86_64.c): add_vol opens the HOST dir directly and the
@@ -812,6 +888,10 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     const char *prog_host =
         // resolve through the overlay (upper, then lowers) + follow the entry symlink (/bin/sh->busybox)
         xresolve_overlay(prog, pb, sizeof pb);
+    if (g_initial_executable_image != NULL && !g_authorized_executable_path[0]) {
+        if (realpath(prog_host, g_authorized_executable_path) == NULL)
+            snprintf(g_authorized_executable_path, sizeof g_authorized_executable_path, "%s", prog_host);
+    }
     // when the persistent cache is on, map the image + interp at FIXED VAs so the translated arena
     // (block-map keys + baked guest addresses) is byte-identical across runs -> reusable from the cache.
     if (g_pcache) g_force_base = PC_IMG_BASE;
@@ -823,7 +903,10 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     *have_interp = 0;
     const char *interp_host = NULL;
     char interp[256];
-    if (elf_interp(prog_host, interp, sizeof interp) == 0) {
+    int has_interp = elf_interp(prog_host, interp, sizeof interp) == 0;
+    g_initial_executable_image = NULL;
+    g_initial_executable_size = 0;
+    if (has_interp) {
         static char ib[4200];
         // follow+confine ld.so symlink (through the overlay)
         interp_host = xresolve_overlay(interp, ib, sizeof ib);
@@ -872,9 +955,14 @@ static int hl_restore_checkpoint(const char *rootfs, const char *dir) {
     return ckpt_restore_tree(rootfs, dir);
 }
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argument_count,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argument_count,
                        char *const argv[]) {
     int argc;
+    (void)executable;
+    g_initial_executable_image = executable_image;
+    g_initial_executable_size = executable_size;
+    g_authorized_executable_image = executable_image;
+    g_authorized_executable_size = executable_size;
     g_engine_result_status = HL_STATUS_OK;
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
@@ -992,6 +1080,7 @@ static void fsrv_restore_prep_a64(const struct loaded *L, uint64_t span) {
 
 static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
     (void)span;
+    size_t host_page = hl_host_page_size();
     const uint8_t *ph = (const uint8_t *)L->phdr;
     uint64_t minv = ~0ull;
     for (int i = 0; i < L->phnum; i++) {
@@ -1008,7 +1097,10 @@ static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
         uint64_t v = rd64(p + 16), msz = rd64(p + 40);
         uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
         int prot = PROT_READ | ((fl & 2) ? PROT_WRITE : 0) | ((fl & 1) ? PROT_EXEC : 0);
-        if (e > s) mprotect((void *)s, e - s, prot);
+        // Reapply only protections that do not round across a neighboring guest segment on a larger
+        // macOS page. load_elf uses the same independently-protectable-range rule.
+        if (e > s && host_page && !(s & (host_page - 1)) && !(e & (host_page - 1)))
+            mprotect((void *)s, e - s, prot);
     }
 }
 
@@ -1027,8 +1119,9 @@ void hl_target_runtime_init(void) {
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
                              const char *result_path) {
+    (void)executable_host;
     return hl_native_engine_run(HL_GUEST_ISA_AARCH64, rootfs, argc, argv, options, result_path);
 }
 #ifndef HL_ENGINE_NO_MAIN
@@ -1087,7 +1180,7 @@ int hl_engine_entry(int argc, char **argv) {
             break;
     }
     if (hl_option_get("HL_RESTORE_DIR"))
-        return hl_standalone_run(rootfs, 0, NULL, NULL, NULL); // resume without an ELF arg
+        return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
                 "usage: %s [--rootfs DIR] [--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
@@ -1097,5 +1190,5 @@ int hl_engine_entry(int argc, char **argv) {
                 argv[0], argv[0]);
         return 2;
     }
-    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL, NULL);
+    return hl_standalone_run(rootfs, NULL, (uint32_t)(argc - ai), argv + ai, NULL, NULL);
 }

@@ -70,7 +70,7 @@
 // interpreter). Opt in via HL_PCACHE=1.
 
 #define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
-#define PC_VERSION 4 // v4 retires mode-dependent A/B cache identities; production codegen is fixed.
+#define PC_VERSION 5 // v5 persists each translated guest source range for precise SMC replacement.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
@@ -187,7 +187,7 @@ struct pc_hdr {
 };
 
 struct pc_mapent {
-    uint64_t gpc, host_off, body_off;
+    uint64_t gpc, guest_start, guest_end, host_off, body_off;
 };
 
 struct pc_pend {
@@ -377,7 +377,8 @@ static int pcache_load(uint64_t entry_jump) {
         return 0;
     }
     for (uint64_t i = 0; i < h.n_mapent; i++)
-        map_put(me[i].gpc, g_cache + me[i].host_off, g_cache + me[i].body_off);
+        map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
+                g_cache + me[i].host_off, g_cache + me[i].body_off);
     g_npend = 0;
     for (uint64_t i = 0; i < h.n_pend; i++) // fwd restored too: a forward pend must patch to body+8 (IRQSLIM)
         add_pend3((uint32_t *)(g_cache + pe[i].slot_off), pe[i].target, (int)pe[i].is_bl, (int)pe[i].fwd);
@@ -465,7 +466,8 @@ static void pcache_save(void) {
         w += (size_t)g_nreloc * sizeof(hl_reloc);
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
             if (!map_live(i)) continue;
-            struct pc_mapent e = {g_map[i].gpc, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
+            struct pc_mapent e = {g_map[i].gpc, g_map[i].guest_start, g_map[i].guest_end,
+                                  (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
             w += sizeof e;

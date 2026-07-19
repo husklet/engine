@@ -1,0 +1,21 @@
+[package]
+name = "hl-engine-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Frozen wire protocol for HL engine provider communication"
+license = "MIT"
+repository = "https://github.com/husklet/engine"
+readme = "README.md"
+include = ["Cargo.toml", "README.md", "src/**"]
+
+[dependencies]
+hl-engine-api = { version = "0.1.0", path = "../api" }
+hl-engine-provider = { version = "0.1.0", path = "../provider" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

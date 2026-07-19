@@ -1,0 +1,20 @@
+[package]
+name = "hl-engine-api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Backend-independent contracts for the HL Linux guest engine"
+license = "MIT"
+repository = "https://github.com/husklet/engine"
+readme = "README.md"
+include = ["Cargo.toml", "README.md", "src/**", "tests/**"]
+
+[lib]
+name = "hl_engine_api"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

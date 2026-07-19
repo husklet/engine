@@ -85,8 +85,11 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 	$(call rwildcard,src/translator/,*.c) $(call rwildcard,src/translator/,*.h) \
 	$(call rwildcard,include/hl/,*.h))
 
+PROVIDER_SOURCES := src/core/environment.c src/core/provider/client.c \
+	src/core/provider/demux.c src/core/provider/files.c src/core/provider/handles.c \
+	src/core/provider/namespace.c
 CORE_SOURCES := src/core/bus.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
-	src/core/options.c src/core/target/bus.c src/core/target/native.c src/core/target/run.c src/core/target/services.c
+	src/core/options.c src/core/target/bus.c src/core/target/native.c src/core/target/run.c src/core/target/services.c $(PROVIDER_SOURCES)
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c \
 	src/translator/guest/x86_64/glue.c src/translator/guest/x86_64/avx.c \
@@ -112,7 +115,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/flags.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/dns.c src/linux_abi/image.c \
 	src/linux_abi/fdcache.c \
 	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_codec.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/shared.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
@@ -131,6 +134,10 @@ EMBEDDED_MAC_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(MAC_LINUX_ABI_SOURCES) $
 EMBEDDED_MAC_OBJECTS := $(EMBEDDED_MAC_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
 LINUX_AARCH64_EMBEDDED_SOURCES = $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(LINUX_HOST_SOURCES)
 LINUX_AARCH64_EMBEDDED_OBJECTS = $(LINUX_AARCH64_EMBEDDED_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
+EMBEDDED_PROVIDER_SOURCES :=
+EMBEDDED_MAC_PROVIDER_OBJECTS := $(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
+LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS := \
+	$(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
 MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
 	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES) $(COMMON_HOST_SOURCES)
@@ -279,7 +286,7 @@ FILESYSTEM_CASE_BINS := $(FILESYSTEM_CASE_NAMES:%=$(BUILD)/compat/filesystem/aar
 SIGNALS_CASE_SOURCES := $(sort $(wildcard tests/compat/signals/*.c))
 SIGNALS_CASE_NAMES := $(basename $(notdir $(SIGNALS_CASE_SOURCES)))
 SIGNALS_CASE_BINS := $(SIGNALS_CASE_NAMES:%=$(BUILD)/compat/signals/aarch64/%) \
-	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt,$(SIGNALS_CASE_NAMES)))
+	$(addprefix $(BUILD)/compat/signals/x86_64/,$(filter-out sigurg_preempt sigurg_go_preempt,$(SIGNALS_CASE_NAMES)))
 PROCESS_CASE_SOURCES := $(filter-out tests/compat/process/integration/%.c,$(sort $(wildcard tests/compat/process/*.c tests/compat/process/*/*.c)))
 PROCESS_CASE_NAMES := $(patsubst tests/compat/process/%.c,%,$(PROCESS_CASE_SOURCES))
 PROCESS_CASE_BINS := $(PROCESS_CASE_NAMES:%=$(BUILD)/compat/process/aarch64/%) \
@@ -301,7 +308,7 @@ CORE_ABI_BINS := $(CORE_ABI_AARCH64:%=$(BUILD)/compat/core/abi/aarch64/%) \
 	$(CORE_ABI_X86_64:%=$(BUILD)/compat/core/abi/x86_64/%)
 CORE_WORKLOAD_BOTH := busyloop ibtc_dispatch bigmem bigarr soak_codecache soak_indirect soak_threadchurn \
 	soak_forkchurn soak_allocchurn smc_mprotect
-CORE_WORKLOAD_AARCH64 := $(CORE_WORKLOAD_BOTH) dbserver soak_smc smc_threads smc_selfflush sqlite
+CORE_WORKLOAD_AARCH64 := $(CORE_WORKLOAD_BOTH) dbserver luajit_trace soak_smc smc_threads smc_selfflush sqlite
 CORE_WORKLOAD_X86_64 := $(CORE_WORKLOAD_BOTH) smc_remap_reuse smc_mremap smc_table_overflow
 CORE_WORKLOAD_BINS := $(CORE_WORKLOAD_AARCH64:%=$(BUILD)/compat/core/workload/aarch64/%) \
 	$(CORE_WORKLOAD_X86_64:%=$(BUILD)/compat/core/workload/x86_64/%)
@@ -326,9 +333,9 @@ THREAD_CASE_BINS := $(THREAD_CASE_NAMES:%=$(BUILD)/compat/threads/aarch64/%) \
 	$(BUILD)/compat/threads/aarch64/threads_mutex_nopie \
 	$(BUILD)/compat/threads/x86_64/threads_mutex_nopie
 PURPOSE_ABI_PIE := atomics_builtins cpuid_features rflags_id tls tlsmodels
-PURPOSE_FILESYSTEM_PIE := dup2redir fcntlflags ltp_aterr ltp_dupfcntl ltp_linkstat mkfifo scratch_exec sentry_fs
+PURPOSE_FILESYSTEM_PIE := dup2redir fcntlflags ltp_aterr ltp_dupfcntl ltp_linkstat missing_root_stat mkfifo scratch_exec sentry_fs
 PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpoint ltp_procmisc \
-	pipeproc procreap sentry_fork sysinfo thrfork waitcore
+	pipeproc procreap sentry_exec_proc sentry_fork sysinfo thrfork waitcore
 PURPOSE_NETWORK_PIE := ltp_neterr net_nonblock net_sendmsg net_sockopt net_tcp net_udp net_unix sentry_net
 PURPOSE_IPC_PIE := msg neonshm sem shm shmposix sysvshm
 PURPOSE_THREADS_PIE := threads_basic threads_many threads_mutex_queue
@@ -493,7 +500,8 @@ package-activation-macos-test: HOST = macos
 package-activation-macos-test: HOST_ARCH = aarch64
 package-activation-macos-test: ACTIVATION_LIBS = -Wl,-force_load,$${libdir}/libhl-engine-activation.a
 package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
-	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-descendant-aarch64 \
+	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-exit-aarch64 \
+	$(BUILD)/e2e/guest-descendant-aarch64 \
 	$(BUILD)/e2e/guest-external-term-aarch64 $(BUILD)/e2e/guest-domain-aarch64 \
 	$(BUILD)/e2e/guest-domain-x86_64
 	rm -rf '$(BUILD)/activation-package-root' '$(BUILD)/activation-package-consumer'
@@ -509,7 +517,15 @@ package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
 		-o '$(BUILD)/activation-package-consumer/activation-package'
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
 		'$(BUILD)/activation-package-consumer/activation-package'
+	$(MAC) clang -I'$(abspath $(BUILD)/activation-package-root/include)' \
+		tests/integration/activation_objc_package.m \
+		-Wl,-force_load,'$(abspath $(BUILD)/activation-package-root/lib/libhl-engine-activation.a)' \
+		-framework Foundation -o '$(BUILD)/activation-package-consumer/activation-objc-package'
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
+		'$(BUILD)/activation-package-consumer/activation-objc-package'
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package)
+	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-objc-package) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64)
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package) \
 		$(abspath $(BUILD)/e2e/guest-descendant-aarch64) $(abspath $(BUILD)/e2e/guest-external-term-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-domain-aarch64) $(abspath $(BUILD)/e2e/guest-domain-x86_64)
@@ -533,7 +549,7 @@ $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
-		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
+		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -lm -o $@
 
 $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -1119,6 +1135,10 @@ $(BUILD)/e2e/stdio-binding-x86_64: tests/e2e/stdio_binding.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
+$(BUILD)/e2e/pty-binding-aarch64: tests/e2e/pty_binding.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
 $(BUILD)/e2e/dir-binding-aarch64: tests/e2e/dir_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
@@ -1150,6 +1170,17 @@ $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD
 # First native-Linux production lane: AArch64 host executing an x86-64 Linux
 # guest through the production JIT. This target is smoke-scoped until the
 # remaining event/path personality seams have native Linux implementations.
+# Provider/bound subsystem + engine environment: each compiled as its own TU (they carry
+# file-local put32/get32 helpers that collide if folded into the unity target object).
+PRODUCTION_PROVIDER_OBJECTS := $(BUILD)/linux-production/core/environment.o \
+	$(BUILD)/linux-production/core/provider/client.o $(BUILD)/linux-production/core/provider/demux.o \
+	$(BUILD)/linux-production/core/provider/files.o $(BUILD)/linux-production/core/provider/handles.o \
+	$(BUILD)/linux-production/core/provider/namespace.o
+
+$(BUILD)/linux-production/core/%.o: src/core/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/linux-production/target/aarch64.o: src/core/target/aarch64.c $(PRODUCTION_UNITY_DEPS)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -D_GNU_SOURCE -O2 $(DEPFLAGS) -c $< -o $@
@@ -1217,13 +1248,13 @@ test-linux-lifecycle: $(BUILD)/tools/lifecycle-linux-aarch64 $(BUILD)/tools/life
 	$(BUILD)/tools/lifecycle-linux-x86_64 --force-stop $(abspath $(BUILD)/e2e/guest-spin-x86_64)
 
 $(BUILD)/linux-production/hl-engine-linux-aarch64: $(BUILD)/linux-production/target/aarch64.o \
-	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/linux-production/lifecycle/aarch64-core.o $(PRODUCTION_PROVIDER_OBJECTS) $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) -o $@ $^ -pthread -lm -ldl -latomic
 
 $(BUILD)/linux-production/hl-engine-linux-x86_64: $(BUILD)/linux-production/target/x86_64.o \
-	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(BUILD)/lib/libhl-engine.a \
+	$(BUILD)/linux-production/lifecycle/x86_64-core.o $(PRODUCTION_PROVIDER_OBJECTS) $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) -o $@ $^ -pthread -lm
@@ -1445,7 +1476,7 @@ $(BUILD)/mac/dual/activation.o: src/core/activation.c include/hl/activation.h
 
 $(BUILD)/mac/lib/libhl-engine-dual.a: $(BUILD)/mac/dual/aarch64-target.o $(BUILD)/mac/dual/x86_64-target.o \
 	$(BUILD)/mac/dual/aarch64-core.o $(BUILD)/mac/dual/x86_64-core.o $(BUILD)/mac/dual/dispatch.o \
-	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS)
+	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS) $(EMBEDDED_MAC_PROVIDER_OBJECTS)
 	@mkdir -p $(@D)
 	$(MAC) libtool -static -o $@ $^
 
@@ -1484,7 +1515,8 @@ $(BUILD)/package/macos-aarch64/libhl-engine.a: $(BUILD)/mac/lib/libhl-engine-dua
 $(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch64-target.o \
 	$(BUILD)/linux-aarch64/dual/x86_64-target.o $(BUILD)/linux-aarch64/dual/aarch64-core.o \
 	$(BUILD)/linux-aarch64/dual/x86_64-core.o $(BUILD)/linux-aarch64/dual/dispatch.o \
-	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS)
+	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS) \
+	$(LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS)
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_AR) rcs $@ $^
 
@@ -1550,6 +1582,10 @@ $(BUILD)/mac/stdio/x86_64-runner.o: tools/stdio_e2e_runner.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/mac/pty/aarch64-runner.o: tools/pty_binding_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/mac/dir/aarch64-runner.o: tools/dir_e2e_runner.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
@@ -1612,6 +1648,13 @@ $(BUILD)/tools/dir-aarch64: $(BUILD)/mac/dir/aarch64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
+$(BUILD)/tools/pty-aarch64: $(BUILD)/mac/pty/aarch64-runner.o \
+	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
+
 $(BUILD)/tools/dir-x86_64: $(BUILD)/mac/dir/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -1635,6 +1678,14 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 
 e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner \
+	$(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
+	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
+	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
+	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
+	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
+	$(BUILD)/tools/pty-aarch64 $(BUILD)/e2e/pty-binding-aarch64 \
+	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
+	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
 	$(BUILD)/e2e/guest-exit70-aarch64 $(BUILD)/e2e/guest-exit70-x86_64 $(E2E_NATIVE_ORACLE_RUNS)
 	$(BUILD)/tools/e2e-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
@@ -2326,7 +2377,19 @@ $(BUILD)/tests/resolve-services-macos: tests/unit/test_resolve_services.c $(BUIL
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_HOST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< \
 		$(BUILD)/mac/lib/libhl-host-macos.a -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos
+$(BUILD)/tests/dns-fork-macos: tests/unit/test_dns_fork_macos.c src/linux_abi/dns.c
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -std=c11 -Wall -Wextra -Werror $^ -o $@
+
+$(BUILD)/tests/dns-objc-fork-macos: tests/unit/test_dns_objc_fork_macos.m src/linux_abi/dns.c
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -std=c11 -Wall -Wextra -Werror -framework Foundation $^ -o $@
+
+.PHONY: test-dns-objc-fork-macos
+test-dns-objc-fork-macos: $(BUILD)/tests/dns-objc-fork-macos
+	$(MAC) $(abspath $<)
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos $(BUILD)/tests/dns-fork-macos $(BUILD)/tests/dns-objc-fork-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
@@ -2338,6 +2401,8 @@ test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/direc
 	$(MAC) $(abspath $(BUILD)/tests/native-macos)
 	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
 	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
+	$(MAC) $(abspath $(BUILD)/tests/dns-fork-macos)
+	$(MAC) $(abspath $(BUILD)/tests/dns-objc-fork-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)

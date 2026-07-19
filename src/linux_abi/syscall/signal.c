@@ -19,16 +19,34 @@ static int syscall_should_restart(struct cpu *c) {
     if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) return 0; // execve teardown: don't re-block, unwind out
     // Process-wide pending (g_pending) AND this thread's directed-pending (c->tpending, set by tkill/tgkill):
     // a thread blocked in read/accept/recv must be interrupted by a thread-directed signal too, not only a
-    // process one. For each deliverable-now signal whose guest handler lacks SA_RESTART, return 0 (EINTR).
+    // process one. Scan every signal deliverable-now (unblocked, with a real guest handler).
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
+    int deliverable = 0;    // at least one runnable guest handler is pending
+    int all_sa_restart = 1; // ...and every such handler asked for SA_RESTART
     for (int s = 1; s <= 64; s++) {
         uint64_t bit = 1ull << s;
         if (!(p & bit)) continue;
         if (c->sigmask & (1ull << (s - 1))) continue; // blocked -> not delivered now
         if (g_sigact[s].handler <= 1) continue;       // SIG_DFL/IGN -> no guest handler runs
-        if (!(g_sigact[s].flags & SA_RESTART_L)) return 0;
+        deliverable = 1;
+        if (!(g_sigact[s].flags & SA_RESTART_L)) all_sa_restart = 0;
     }
-    return 1;
+    // Nothing runnable pending: a spurious/host-actioned EINTR a real kernel would not surface -> re-block the
+    // host call transparently in place (the old restart-in-loop behaviour, kept for this case only).
+    if (!deliverable) return 1;
+    // A runnable guest handler MUST run before the interrupted call proceeds -- Linux runs the handler on EVERY
+    // interrupted slow syscall, THEN (for SA_RESTART) restarts it. Restarting in place here never returns to the
+    // dispatcher, so maybe_deliver_signal never fires and the handler is stranded until the call finally
+    // completes on its own (e.g. `timeout 1 sleep 5`: the SIGALRM handler that must kill the child only ran when
+    // the child already exited). So STOP looping and return to the dispatcher. When every runnable handler is
+    // SA_RESTART, leave the guest PC on the SVC (c->redirect) so the syscall re-executes AFTER the handler runs
+    // (transparent restart); otherwise advance past it and let the guest observe EINTR. Either way the pending
+    // handler is delivered by the dispatcher's maybe_deliver_signal at the next block boundary.
+    if (all_sa_restart) {
+        c->redirect = 1;
+        g_syscall_restart = 1; // service() restores the arg0/return-aliased register before re-executing
+    }
+    return 0;
 }
 
 // An interruptible host syscall failed: should the caller retry it? True iff it was interrupted (EINTR)
@@ -69,8 +87,26 @@ static int svc_poll_retry(struct cpu *c) {
 // default/ignore disposition, or an unknown/dead tid -- fall back to the existing process-directed path on
 // the caller (raise_guest_signal applies the default/ignore action or coalesces into g_pending as before).
 static void thread_kill(struct cpu *c, int tid, int sig) {
-    if (sig >= 1 && sig <= 64 && tid != cpu_tid(c) && g_sigact[sig].handler > 1 && thread_target_signal(tid, sig))
-        return;
+    // Route to exactly the addressed thread's cpu->tpending when it names ANOTHER live thread and the signal
+    // is either handled by a guest handler OR blocked by that target (destined for its sigwait / held
+    // pending). A process-wide g_pending would let any thread consume it, breaking Go's stop-the-world
+    // preemption and thread-directed sigwait alike. Otherwise -- self-signal, default/ignore on an unblocked
+    // signal, or an unknown/dead tid -- fall back to the process-directed path on the caller.
+    if (sig >= 1 && sig <= 64 && tid != cpu_tid(c) &&
+        (g_sigact[sig].handler > 1 || thread_tid_blocks_signal(tid, sig))) {
+        // Stamp the tkill/tgkill siginfo the target thread's handler reads: Linux sets si_code == SI_TKILL
+        // and si_pid == the sender's thread-group (== this guest pid). glibc's SIGCANCEL handler (used by
+        // pthread_cancel) IGNORES any signal whose si_code != SI_TKILL or si_pid != getpid(), so without
+        // this an asynchronous pthread_cancel of a compute-bound thread was silently dropped and pthread_join
+        // hung forever. Written to the single-slot g_sig* (never g_pending) so only the addressed thread's
+        // tpending delivery consumes it; the values are constant for any thread-directed signal.
+        enum { HL_SI_TKILL = -6 };
+        g_sigcode[sig] = HL_SI_TKILL;
+        g_sigval[sig] = 0;
+        g_sigpid[sig] = container_pid();
+        g_siguid[sig] = 0;
+        if (thread_target_signal(tid, sig)) return;
+    }
     raise_guest_signal(c, sig);
 }
 
@@ -191,13 +227,19 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         G_RET(c) = 0;
         break;
     }
-    case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value to the handler's siginfo
+    case 138: { // rt_sigqueueinfo(tgid, sig, siginfo): carry si_code + si_value + sender identity, and
+                // QUEUE every instance for a realtime signal (glibc sigqueue). The user siginfo already
+                // holds si_code (SI_QUEUE), si_pid/si_uid (the sender), and si_value.
         int sig = (int)a1;
         if (sig >= 1 && sig <= 64 && a2) {
-            g_sigcode[sig] = *(int *)(a2 + 8);      // siginfo.si_code
-            g_sigval[sig] = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+            int code = *(int *)(a2 + 8);            // siginfo.si_code
+            int pid = *(int *)(a2 + 16);            // siginfo.si_pid
+            int uid = *(int *)(a2 + 20);            // siginfo.si_uid
+            uint64_t value = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+            raise_guest_signal_si(c, sig, code, value, pid ? pid : container_pid(), uid);
+        } else {
+            raise_guest_signal(c, sig);
         }
-        raise_guest_signal(c, sig);
         G_RET(c) = 0;
         break;
     }
@@ -224,9 +266,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             }
         }
         if (a1) {
-            // report current (or SS_DISABLE=2 if none)
+            // report current (or SS_DISABLE=2 if none). When the querying thread's SP currently lies within
+            // the configured alt stack -- i.e. sigaltstack(NULL,&old) is called from inside an SA_ONSTACK
+            // handler running on it -- Linux ORs in SS_ONSTACK(1); the engine reported a bare 0 before.
+            uint32_t flags = c->alt_sp ? c->alt_flags : 2;
+            uint64_t sp = G_SP(c);
+            if (c->alt_sp && !(flags & 2u) && sp >= c->alt_sp && sp < c->alt_sp + c->alt_size)
+                flags |= 1u; // SS_ONSTACK
             *(uint64_t *)(a1 + 0) = c->alt_sp;
-            *(uint32_t *)(a1 + 8) = c->alt_sp ? c->alt_flags : 2;
+            *(uint32_t *)(a1 + 8) = flags;
             *(uint64_t *)(a1 + 16) = c->alt_size;
         }
         if (a0) {
@@ -395,21 +443,31 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                     break;
                 }
             if (got) {
-                __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST); // dequeue from both
+                // Synchronously dequeue ONE instance. The ascending scan picks the lowest signo (sigwaitinfo
+                // priority order); sigq_pop takes the oldest queued instance of that signo (FIFO within a
+                // signo) and carries its si_value/pid/code -- a realtime signal keeps its pending bit while
+                // more instances remain. If nothing was queued (host async path), fall back to the
+                // single-slot g_sig* the host handler wrote and clear the bit.
+                struct sigq_ent ent;
+                int popped = sigq_pop(got, &ent);
                 __atomic_and_fetch(&c->tpending, ~(1ull << got), __ATOMIC_SEQ_CST);
+                if (!popped) __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST);
                 if (a1) { // fill siginfo_t whenever info != NULL (a3 is the sigsetsize, not a size threshold)
                     memset((void *)a1, 0, 128);
-                    *(int *)(a1 + 0) = got;            // si_signo
-                    *(int *)(a1 + 8) = g_sigcode[got]; // si_code
-                    if (g_sigpid[got]) {
-                        *(int *)(a1 + 16) = g_sigpid[got];
-                        *(int *)(a1 + 20) = g_siguid[got];
+                    *(int *)(a1 + 0) = got;                                       // si_signo
+                    *(int *)(a1 + 8) = popped ? ent.code : g_sigcode[got];        // si_code
+                    int spid = popped ? ent.pid : g_sigpid[got];
+                    if (spid) {
+                        *(int *)(a1 + 16) = spid;
+                        *(int *)(a1 + 20) = popped ? ent.uid : g_siguid[got];
                     }
-                    *(uint64_t *)(a1 + 24) = g_sigval[got];
-                    g_sigcode[got] = 0;
-                    g_sigval[got] = 0;
-                    g_sigpid[got] = 0;
-                    g_siguid[got] = 0;
+                    *(uint64_t *)(a1 + 24) = popped ? ent.value : g_sigval[got]; // si_value
+                    if (!popped) {
+                        g_sigcode[got] = 0;
+                        g_sigval[got] = 0;
+                        g_sigpid[got] = 0;
+                        g_siguid[got] = 0;
+                    }
                 }
                 G_RET(c) = (uint64_t)got;
                 break;
@@ -455,6 +513,13 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     // rt_sigaction(sig, *act, *old)
     case 134: {
         int sig = (int)a0;
+        // Linux validates the ABI sigsetsize (a3) up front: it must equal sizeof(kernel sigset)=8, exactly
+        // as rt_sigprocmask (case 135) does. The kernel checks this before copy_from_user of act, so a
+        // wrong size is -EINVAL regardless of sig/act/oldact.
+        if ((size_t)a3 != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (sig < 1 || sig > 64) {
             G_RET(c) = (uint64_t)(-22);
             break;
@@ -469,14 +534,12 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        // The kernel rt_sigaction layout is 24 bytes on aarch64 and 32 bytes on x86_64, whose ABI carries
-        // sa_restorer between flags and mask. Read/write the target layout rather than interpreting the
-        // x86 restorer trampoline pointer as its signal mask.
-#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+        // glibc's kernel_sigaction on BOTH aarch64 and x86_64 carries an sa_restorer slot between sa_flags
+        // and sa_mask, so the ABI struct is 32 bytes with the mask at offset 24. (The aarch64 leg previously
+        // used 24/16, which read a zero where sa_mask actually sits -- so a handler's sa_mask members were
+        // dropped from the in-handler signal mask; mask_in_handler.) x86 additionally consults the restorer
+        // trampoline pointer (guarded by HL_GUEST_SIGACTION_HAS_RESTORER below).
         const uint64_t action_size = 32, mask_offset = 24;
-#else
-        const uint64_t action_size = 24, mask_offset = 16;
-#endif
         // The act/oldact structs are read/written DIRECTLY by the engine, so
         // a bad/unmapped pointer must return -EFAULT rather than fault the engine. Validate in Linux
         // order -- copyin `act` (a1) before copyout `oldact` (a2) -- so no oldact is written when act faults.
@@ -506,6 +569,13 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             g_sigact[sig].restorer = 0;
 #endif
             g_sigact[sig].mask = *(uint64_t *)(a1 + mask_offset);
+            // Setting SIG_IGN (or SIG_DFL on a default-ignore signal) DISCARDS any pending instance --
+            // Linux flushes the pending queue on an ignore transition. Without this a signal raised while
+            // blocked, then set to SIG_IGN, stayed pending (ignore_discards_pending: sigpending must clear).
+            if (h == 1 || (h == 0 && !sig_default_terminates(sig))) {
+                sigq_flush(sig);
+                __atomic_and_fetch(&c->tpending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+            }
             // Synchronous CPU faults (SIGILL/FPE/TRAP/SEGV/BUS) ALWAYS stay on the engine's own host guard
             // (installed at startup): it intercepts the hardware fault and either delivers it to the guest
             // handler recorded in g_sigact above (deliver_guest_fault) or applies the default action
@@ -523,6 +593,18 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 // g_sigact; never replace their host handlers.
                 if (sig_host_is_engine_control(ms)) {
                     // no host disposition change
+                } else if (h == 0 && sig == 17 && (g_sigact[sig].flags & 0x2)) {
+                    // SA_NOCLDWAIT with the DEFAULT SIGCHLD disposition still auto-reaps children (Linux
+                    // leaves no zombie -> a later wait() gives ECHILD). SIG_DFL for SIGCHLD would install no
+                    // host handler, so the auto-reap in host_sigh_si never ran and zombies lingered. Install
+                    // our SIGCHLD handler so the reap path runs; the guest disposition is still SIG_DFL
+                    // (h==0) so maybe_deliver_signal takes SIGCHLD's ignore default -- no guest handler fires.
+                    struct sigaction sa;
+                    memset(&sa, 0, sizeof sa);
+                    sa.sa_sigaction = host_sigh_si;
+                    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+                    sigfillset(&sa.sa_mask);
+                    sigaction(ms, &sa, NULL);
                 } else if (h == 0)
                     signal(ms, SIG_DFL);
                 else if (h == 1)
@@ -659,7 +741,8 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     case 139:
         do_sigreturn(c);
         c->redirect = 1;
-        // rt_sigreturn (restorer path)
+        // rt_sigreturn (restorer path). The handler-return defer-pop + serial next-signal delivery happen in
+        // the shared dispatcher's SIGRETURN_PC path (core/dispatch.c), which is where glibc's restorer lands.
         break;
     default: return 0;
     }

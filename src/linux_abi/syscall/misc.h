@@ -12,6 +12,13 @@ typedef struct hl_linux_misc_context {
     size_t hostname_capacity;
     uint64_t memory_limit;
     uint64_t memory_used;
+    // Host-backend memory snapshot + uptime, so sysinfo(2) agrees with /proc/meminfo and /proc/uptime (the
+    // same source vfs.c host_mem/host_btime feed those files from). Zero means "host read failed" -> fall back.
+    uint64_t host_memory_total; // bytes; used as sysinfo totalram when there is no cgroup memory limit
+    uint64_t host_memory_free;  // bytes; sysinfo freeram when unconstrained
+    uint64_t uptime_seconds;    // monotonic seconds since boot (matches /proc/uptime)
+    uint64_t loads[3];          // 1-, 5-, 15-minute load, already scaled by 1<<16 (SI_LOAD_SHIFT)
+    uint32_t process_count;     // sysinfo procs
     const char *machine;
     hl_linux_misc_mapped_fn mapped;
     hl_linux_misc_random_fn random;

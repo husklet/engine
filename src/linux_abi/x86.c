@@ -24,6 +24,61 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 #include "page.h"
 #include "image.h"
 
+static int x86_image_read(const char *path, hl_linux_image *image) {
+    if (g_initial_executable_image != NULL)
+        return hl_linux_image_read_bytes(g_initial_executable_image, g_initial_executable_size, image);
+    if (g_authorized_executable_image != NULL && path != NULL && g_authorized_executable_path[0]) {
+        char canonical[4200];
+        if (realpath(path, canonical) != NULL && strcmp(canonical, g_authorized_executable_path) == 0)
+            return hl_linux_image_read_bytes(g_authorized_executable_image, g_authorized_executable_size, image);
+    }
+    if (g_rootfs == NULL) return -1;
+    char guest[4200];
+    const char *request = path;
+    if (path != NULL && path[0] == '/') {
+        int backing = g_rootfs && !strncmp(path, g_rootfs_canon, g_rootfs_canon_len) &&
+                      (path[g_rootfs_canon_len] == 0 || path[g_rootfs_canon_len] == '/');
+        for (int volume = 0; !backing && volume < g_nvols; ++volume)
+            backing = !strncmp(path, g_vols[volume].hcanon, g_vols[volume].hlen) &&
+                      (path[g_vols[volume].hlen] == 0 || path[g_vols[volume].hlen] == '/');
+        for (int lower = 0; !backing && lower < g_nlower; ++lower) {
+            if (!strncmp(path, g_lower[lower].canon, g_lower[lower].clen) &&
+                (path[g_lower[lower].clen] == 0 || path[g_lower[lower].clen] == '/')) {
+                const char *suffix = path + g_lower[lower].clen;
+                snprintf(guest, sizeof guest, "%s", suffix[0] ? suffix : "/");
+                request = guest;
+                backing = 2;
+            }
+        }
+        if (backing == 1) {
+            guest_from_host_raw(path, guest, sizeof guest);
+            request = guest;
+        }
+    }
+    if (request != NULL && request[0] == '/' && (g_rootfs != NULL || jail_match(request) >= 0)) {
+        if (g_nlower) {
+            char backing[4200];
+            /* Executable lookup follows the final symlink.  overlay_lookup is the
+               no-follow primitive used by lstat/readlink and cannot be used with
+               the O_NOFOLLOW ELF open for paths such as /bin/python. */
+            if (!overlay_resolve(request, backing, sizeof backing, 0)) return -1;
+            int descriptor = open(backing, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            int result = descriptor < 0 ? -1 : hl_linux_image_read_fd(descriptor, image);
+            if (descriptor >= 0) close(descriptor);
+            return result;
+        }
+        char final[512];
+        int directory = jail_at(-100, request, final, sizeof final, 0);
+        if (directory < 0) return -1;
+        int descriptor = openat(directory, final, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        int result = descriptor < 0 ? -1 : hl_linux_image_read_fd(descriptor, image);
+        if (descriptor >= 0) close(descriptor);
+        close(directory);
+        return result;
+    }
+    return hl_linux_image_read(effective_host_services(), request, image);
+}
+
 // ---------------- minimal ELF loader (load high; copied from jit.c) ----------------
 static uint16_t rd16(const uint8_t *p) {
     return p[0] | (p[1] << 8);
@@ -49,7 +104,7 @@ static void wr64(uint8_t *p, uint64_t v) {
 
 static int elf_interp(const char *path, char *out, size_t n) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) return -1;
+    if (x86_image_read(path, &image) != 0) return -1;
     uint8_t *f = image.bytes;
     int r = -1;
     uint64_t phoff = rd64(f + 32);
@@ -259,7 +314,7 @@ static void go_rebase_nonpie(const uint8_t *f, size_t fsz, uint64_t bias, uint64
 
 static void load_elf(const char *path, struct loaded *out) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) {
+    if (x86_image_read(path, &image) != 0) {
         fprintf(stderr, "hl-engine: cannot read guest ELF %s through host services\n", path);
         exit(1);
     }
@@ -525,6 +580,15 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, estr[i], l);
         envp_[i] = (uint64_t)top;
     }
+    // AT_EXECFN string: Linux copies the execve PATHNAME (not argv[0]) near the stack top and points
+    // AT_EXECFN at it. Rust std / uutils' multicall read it; a relative argv[0] (fork+exec'd `./x` or
+    // execve("/proc/self/exe")) diverged from the native absolute path. g_exe_path holds the canonical
+    // guest exec path (set by the loader and by execve before this call); fall back to argv[0].
+    const char *execfn_str = (g_exe_path && g_exe_path[0]) ? g_exe_path : (argc ? argv[0] : "");
+    size_t execfn_len = strlen(execfn_str) + 1;
+    top -= execfn_len;
+    memcpy(top, execfn_str, execfn_len);
+    uint64_t execfn = (uint64_t)top;
     top -= 8;
     memcpy(top, "x86_64", 7);
     uint64_t plat = (uint64_t)top;
@@ -550,8 +614,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {23, 0},       // AT_SECURE 0
         {17, 100},     // AT_CLKTCK
         {26, 0},       // AT_HWCAP2
-        {31, argp[0]}, // AT_EXECFN -> argv[0] path string. Rust std / uutils' multicall read this to pick the
-                       // applet name; missing it made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
+        {31, execfn}, // AT_EXECFN -> execve pathname string (glibc/Rust/uutils multicall read it). Missing it
+                      // made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
         {0, 0},        // AT_NULL terminator
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);
@@ -822,6 +886,23 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // a bad guest RESULT pointer in the vDSO fast-clock inline path (emit_fast_syscall). Recover
     // it as -EFAULT BEFORE the lazy-map/guest-fault paths below, matching the slow svc_time() path exactly.
     if (fastclk_fault_fixup(si, uc)) return;
+#if defined(__linux__)
+    // A hardware-raised host SIGBUS (si_code > 0: BUS_ADRERR past-EOF file mapping, BUS_ADRALN misalignment)
+    // is a GENUINE guest bus error on a Linux host, where the kernel raises SIGBUS authoritatively. It must
+    // reach the guest's SIGBUS handler (BUS_ADRERR) or terminate the guest by SIGBUS, and must NEVER fall
+    // into the lazy zero-page grower below: that page sits ADJACENT to the file's mapped first page, so
+    // lazy_neighbor_mapped() judges it "legitimate growth", skips deliver_guest_fault, and maps an anonymous
+    // zero page over it -- silently turning a bus error into a bogus zero read (and, for a handler-armed
+    // guest, crashing the engine's own fault path). Route it straight to the guest, mirroring the gna/gro
+    // hard-fault blocks below and the dispatcher's raise_guest_bus ledger path.
+    if (sig == SIGBUS && si && si->si_code > 0) {
+        if (deliver_guest_fault(sig, si, uc)) return;       // guest handler
+        if (deliver_guest_fatal_fault(sig, si, uc)) return; // no handler -> faithful WIFSIGNALED SIGBUS
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+#endif
     // W6A item 1: a non-PIE absolute DATA ref into the low link range -> serve the access at +bias and
     // advance the host PC. Inert unless g_nonpie_lo is set (ET_EXEC only).
     if (nonpie_fixup(si, uc)) return;
@@ -882,7 +963,18 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
         // growth/over-read and draws on the large grow budget; an isolated fault is a candidate wild
         // pointer on the small budget. NOLAZYFIX=1 forces the legacy single small monotonic budget.
         int adjacent = !lazy_nofix() && lazy_neighbor_mapped(pg);
+#if defined(__linux__)
+        // On a Linux host an ISOLATED fault (no mapped neighbor) is a genuine wild pointer: the kernel raises
+        // it exactly like hardware, and the aarch64 guest path (which has no lazy grower at all) already
+        // faults on it. Silently satisfying it with a zero page is an isolation/correctness hole -- a guest
+        // could read unmapped high-VA memory and see 0 instead of SIGSEGV(SEGV_MAPERR). Keep only the ADJACENT
+        // grow cushion (a legitimate stack-grow / SSE over-read one page past a live mapping); let an isolated
+        // fault fall through to a faithful guest SIGSEGV. The Darwin-only zero-map-and-retry crutch (for
+        // over-reads that raise host SIGBUS on macOS) still applies on the non-Linux build below.
+        int ok = adjacent && (g_growmaps < (256 << 10)); /* 1GB of grow pages */
+#else
         int ok = adjacent ? (g_growmaps < (256 << 10)) /* 1GB of grow pages */ : (g_lazymaps < lazy_budget());
+#endif
         if (ok) {
             static int hooked;
             if (!hooked) {

@@ -11,7 +11,7 @@ static void block_return(void);
 // in the real registers during a block. The cpu pointer is recovered from this
 // global only at block boundaries (set by the dispatcher before each run_block).
 static int g_trace;
-static int g_systrace; // JTS=1: syscall-entry trace only (no per-block dump) -- debug aid
+static int g_systrace;
 // Debug-only no-chain mode: skip direct block chaining so every
 // block re-enters the dispatcher -> the JT per-block trace logs every execution (exact per-block PC
 // attribution, alignable with `qemu -d exec,nochain`). Mirrors x86's g_nochain. Zero-cost when unset.

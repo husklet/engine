@@ -34,6 +34,7 @@ static int logical_fd_path(int descriptor, char *path, size_t capacity) {
 // nofollow=1 leaves the FINAL component unresolved (lstat/AT_SYMLINK_NOFOLLOW unlink), so a
 // symlink is stat'd/removed as the link itself rather than its target.
 static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int nofollow) {
+    resolve_loop_clear(); // reset the per-resolution symlink-loop flag; a followed resolver sets it on ELOOP
     if (!raw) return raw;
     // POSIX shm + named semaphores: glibc backs both with files under /dev/shm (shm_open -> /dev/shm/<name>,
     // sem_open -> /dev/shm/sem.<name>). Route EVERY op (open/link/unlink/stat/rename) at the SAME host
@@ -78,8 +79,16 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
                 base = directory;
             else if (dirfd < 1024 && g_fdpath[dirfd][0])
                 base = g_fdpath[dirfd];
-            if (base != NULL && path_join(buf, n, base, raw) != 0) return NULL;
-            if (base != NULL) return buf;
+            // Only an absolute provider/native path can replace the dirfd.
+            // A bare-mode descriptor may carry the relative spelling used to
+            // open it (for example "test_dir"). Joining that spelling and
+            // then still passing the original dirfd resolves it twice as
+            // test_dir/test_dir/child. Leave such names relative so openat(2)
+            // performs the authoritative descriptor-relative lookup.
+            if (base != NULL && base[0] == '/') {
+                if (path_join(buf, n, base, raw) != 0) return NULL;
+                return buf;
+            }
         }
         return raw;
     }

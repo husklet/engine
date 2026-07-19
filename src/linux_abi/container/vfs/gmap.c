@@ -92,13 +92,22 @@ static void hl_gmap_reserve_one(void) {
 }
 
 void hl_gmap_add(uint64_t address, uint64_t length) {
+    hl_gmap_add_physical(address, length, address, length);
+}
+
+void hl_gmap_add_physical(uint64_t address, uint64_t length, uint64_t physical_address, uint64_t physical_length) {
     hl_gmap_entry *entry;
-    if (!address || !length || address > UINT64_MAX - length) return;
+    if (!address || !length || address > UINT64_MAX - length || !physical_address || !physical_length ||
+        physical_address > UINT64_MAX - physical_length || physical_address > address ||
+        address + length > physical_address + physical_length)
+        return;
     hl_gmap_reserve_one();
     entry = &g_gmap.mappings[g_gmap.mapping_count++];
     entry->address = address;
     entry->length = length;
     entry->guest_length = length;
+    entry->physical_address = physical_address;
+    entry->physical_length = physical_length;
 }
 
 void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length) {
@@ -121,6 +130,23 @@ void hl_gmap_remove(uint64_t address) {
 uint64_t hl_gmap_find_length(uint64_t address) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++)
         if (g_gmap.mappings[index].address == address) return g_gmap.mappings[index].length;
+    return 0;
+}
+
+uint64_t hl_gmap_find_guest_length(uint64_t address) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) return g_gmap.mappings[index].guest_length;
+    return 0;
+}
+
+int hl_gmap_find_physical(uint64_t address, uint64_t *physical_address, uint64_t *physical_length) {
+    if (physical_address == NULL || physical_length == NULL) return 0;
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) {
+            *physical_address = g_gmap.mappings[index].physical_address;
+            *physical_length = g_gmap.mappings[index].physical_length;
+            return 1;
+        }
     return 0;
 }
 
@@ -174,7 +200,7 @@ void hl_gmap_reset(void) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++) {
         const hl_gmap_entry *entry = &g_gmap.mappings[index];
         if (!hl_exec_mapping_owns(entry->address, entry->length))
-            (void)munmap((void *)(uintptr_t)entry->address, (size_t)entry->length);
+            (void)munmap((void *)(uintptr_t)entry->physical_address, (size_t)entry->physical_length);
     }
     hl_exec_mapping_reset();
     g_gmap.mapping_count = 0;

@@ -62,6 +62,11 @@ int main(void) {
     int heap_ok = 1;
 #endif
 
+    // The runner is free to capture output with a pipe, socket, or regular
+    // file. Create the non-file descriptor this assertion needs so the guest
+    // behavior is deterministic and independent of transport plumbing.
+    int pipefd[2] = {-1, -1};
+    int pipe_open = pipe(pipefd) == 0;
     DIR *d = opendir("/proc/self/fd");
     int fdcount = 0, pipe_seen = 0;
     if (d) {
@@ -80,12 +85,14 @@ int main(void) {
         }
         closedir(d);
     }
+    if (pipefd[0] >= 0) close(pipefd[0]);
+    if (pipefd[1] >= 0) close(pipefd[1]);
     char lnk[256];
     ssize_t ll = readlink("/proc/self/fd/1", lnk, sizeof lnk - 1);
     int fd_link_ok = ll > 0;
 
     int ok = n > 0 && nlines >= 3 && perms_ok && dev_ok && has_xp && has_stack && heap_ok &&
-             ascending && probe_mapped && fdcount >= 3 && fd_link_ok && pipe_seen;
+             ascending && probe_mapped && fdcount >= 3 && fd_link_ok && pipe_open && pipe_seen;
     printf("maps ok=%d\n", ok);
     return 0;
 }

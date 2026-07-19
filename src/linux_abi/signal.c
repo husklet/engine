@@ -19,35 +19,39 @@ static struct {
     uint64_t handler, flags, restorer, mask;
 } g_sigact[65];
 
-// ---------------- Go async-preempt SIGURG suppression for iscgo aarch64 images (#423) ----------------
+// ---------------- Go async-preempt SIGURG suppression for aarch64 Go images (#423) ----------------
 // Go's scheduler asynchronously preempts a running goroutine by sending itself SIGURG (23) and injecting a
-// call to runtime.asyncPreempt from the signal handler. For an EXTERNALLY-LINKED / cgo (runtime.iscgo==1)
-// aarch64 Go binary, delivering SIGURG into the guest crashes it -- but NOT via a sigframe/SP overlap (that
-// hypothesis was investigated with the go_cgo_stackgrow_arm fixture and
-// DISPROVEN: build_signal_frame captures a correct, consistent guest SP/PC/LR and the frame sits strictly
-// below SP). The real defect is ASYNC-PREEMPT SAFETY: the engine delivers the caught signal at translation-block
-// boundaries (the cpu->irq poll), which do NOT coincide with Go's compiler-inserted async-safe points. Go's
-// own guard (doSigPreempt -> isAsyncSafePoint / canPreemptM) is meant to no-op an unsafe delivery, but under
-// the engine's non-PIE high-bias translation the interaction with Go's stack-growth machinery corrupts state: the
-// fixture's crash lands squarely in runtime.copystack / runtime.adjustframe / (*stkframe).getStackMap with
-// `fatal error: wirep: already in go` and `untyped locals` (a stack-map/scheduler invariant violation), i.e.
-// an async preempt injected around a stack copy rewrites a frame's return address / pointer. A correct fix
-// requires honoring Go's async-safe-point model (parsing the guest pclntab's PCDATA_UnsafePoint, or a
-// safepoint-accurate delivery scheme) -- a large, fragile undertaking not yet landed. Until then we suppress
-// SIGURG for exactly this class, which is functionally identical to Go's OWN supported `GODEBUG=
-// asyncpreemptoff=1`: async (tight-loop) preemption is disabled, but COOPERATIVE preemption at safepoints
-// still works, so the program runs correctly (proven: this fixture completes, influxd boots, vmetrics serves).
+// call to runtime.asyncPreempt from the signal handler. Delivering SIGURG into a translated aarch64 Go binary
+// crashes it -- but NOT via a sigframe/SP overlap (that hypothesis was investigated with the
+// go_cgo_stackgrow_arm fixture and DISPROVEN: build_signal_frame captures a correct, consistent guest SP/PC/LR
+// and the frame sits strictly below SP). The real defect is ASYNC-PREEMPT SAFETY: the engine delivers the
+// caught signal at translation-block boundaries (the cpu->irq poll), which do NOT coincide with Go's
+// compiler-inserted async-safe points. Go's own guard (doSigPreempt -> isAsyncSafePoint / canPreemptM) is meant
+// to no-op an unsafe delivery, but under the engine's non-PIE high-bias translation the interaction with Go's
+// stack-growth machinery corrupts state: the cgo fixture's crash lands squarely in runtime.copystack /
+// runtime.adjustframe / (*stkframe).getStackMap with `fatal error: wirep: already in go` and `untyped locals`;
+// the INTERNAL-linked Go toolchain children `go build` forks (compile/asm/link) crash the same way -- a SIGURG
+// delivered into sysmon's runtime.usleep SIGSEGVs (addr=0x0) and, under build parallelism, corrupts thread
+// startup so clone/newosproc returns EAGAIN. A correct fix requires honoring Go's async-safe-point model
+// (parsing the guest pclntab's PCDATA_UnsafePoint, or a safepoint-accurate delivery scheme) -- a large,
+// fragile undertaking not yet landed. Until then we suppress SIGURG for EVERY Go image, which is functionally
+// identical to Go's OWN supported `GODEBUG=asyncpreemptoff=1`: async (tight-loop) preemption is disabled, but
+// COOPERATIVE preemption at safepoints still works, so the program runs correctly (proven: `go build` of a
+// hello-world completes, influxd boots, vmetrics serves). This originally suppressed only the cgo
+// (CGO_ENABLED=1 / runtime.iscgo==1) class; it now covers internal-linked Go too, which is exactly the toolchain
+// children that were crashing.
 //
-// Scoped TIGHTLY on purpose: g_go_iscgo (set once by the aarch64 load_elf in os/linux/elf.c) is 1 ONLY for a
-// cgo-enabled aarch64 Go main image. It stays 0 for non-Go guests (some legitimately use SIGURG for OOB TCP
-// data), for internal-linked / CGO_ENABLED=0 Go, and for the entire x86 engine (that TU never includes the
-// aarch64 elf.c, and no x86 path sets it).
-int g_go_iscgo; // 1 iff the loaded aarch64 main image is a cgo (iscgo) Go binary; owned here, set by load_elf
+// Scoped by Go-detection on purpose: g_go_image (set once by the aarch64 load_elf in os/linux/elf.c, keyed on
+// the linker's Go build-info magic) is 1 ONLY for an aarch64 Go main image. It stays 0 for non-Go guests (some
+// legitimately use SIGURG for OOB TCP data -- a Go program never repurposes SIGURG, so dropping it is always
+// safe for a Go image), and for the entire x86 engine (that TU never includes the aarch64 elf.c, and no x86
+// path sets it).
+int g_go_image; // 1 iff the loaded aarch64 main image is a Go binary; owned here, set by load_elf
 
-// Should SIGURG (Go async-preempt) delivery be dropped for this process? The detected iscgo class is fixed
+// Should SIGURG (Go async-preempt) delivery be dropped for this process? The detected Go class is fixed
 // before any signal fires.
 static int sigurg_drop_enabled(void) {
-    return g_go_iscgo ? 1 : 0;
+    return g_go_image ? 1 : 0;
 }
 
 // bitmask of pending signals (1<<signo)
@@ -61,6 +65,12 @@ static volatile uint64_t g_pending;
 // kill-delivered SIGSEGV/ILL/FPE carries si_pid==0 and an si_addr just like a hardware fault), so we key
 // off this instead: in a syscall => async guest delivery; otherwise => the real fault path / re-raise.
 static __thread int g_in_service;
+// Set by syscall_should_restart when an interrupted blocking syscall must be transparently RESTARTED after
+// its pending SA_RESTART handler runs (it also sets c->redirect so the dispatcher re-executes the SVC).
+// service() consumes it to restore the syscall's first argument register before returning: on aarch64 the
+// arg0 and return registers alias (x0), so the result the handler code just wrote would otherwise be the
+// "fd" the re-executed syscall sees. Distinct from the execve/sigreturn redirect (which sets a final x0).
+static __thread int g_syscall_restart;
 // rt_sigqueueinfo extras carried to the handler's siginfo: si_code + si_value (consumed on delivery)
 static int g_sigcode[65];
 static uint64_t g_sigval[65];
@@ -71,6 +81,75 @@ static int g_sigpid[65];
 static int g_siguid[65];
 // synchronous-fault address carried to the handler's siginfo (si_addr; consumed on delivery, 0 for async)
 static uint64_t g_sigaddr[65];
+
+// ---------------- per-signal pending FIFO (siginfo carrier) ----------------
+// g_pending/c->tpending stay the 1-bit-per-signal "is pending" indicators every fast-path scan reads.
+// This queue carries the ORDERED per-instance siginfo (si_code/value/pid/uid/addr/status) that a single
+// bit cannot represent: standard signals (1..31) coalesce to one entry, realtime signals (32..64) queue
+// up to SIGQ_DEPTH instances FIFO. A g_pending bit is set whenever a signal's queue becomes non-empty
+// (the in-process enqueue path); the host async handler path (host_sigh/host_sigh_si) may still set a bit
+// with an EMPTY queue, in which case delivery falls back to the single-slot g_sig* arrays those handlers
+// wrote. Delivery pops one queued instance into the g_sig* slots the per-arch frame builder reads.
+// All queue operations run in guest-thread / dispatcher context (never a host signal handler), so a plain
+// mutex is safe; host_sig* handlers deliberately never touch the ring.
+#define SIGQ_DEPTH 64
+struct sigq_ent {
+    int code;       // si_code
+    uint64_t value; // si_value (sigqueue) / si_status (SIGCHLD; aliases offset 24)
+    int pid;        // si_pid
+    int uid;        // si_uid
+    uint64_t addr;  // si_addr
+};
+static struct {
+    struct sigq_ent e[SIGQ_DEPTH];
+    int head, count;
+} g_sigq[65];
+static pthread_mutex_t g_sigq_lk = PTHREAD_MUTEX_INITIALIZER;
+
+static int sig_is_rt(int s) { return s >= 32 && s <= 64; }
+
+// Enqueue one pending instance of Linux signal `sig`. Standard signals coalesce (keep the first queued
+// siginfo, drop extras -- matching Linux non-RT coalescing); realtime signals queue FIFO up to
+// SIGQ_DEPTH. Always sets the g_pending bit so every existing pending scan sees the signal.
+static void sigq_push(int sig, int code, uint64_t value, int pid, int uid, uint64_t addr) {
+    if (sig < 1 || sig > 64) return;
+    pthread_mutex_lock(&g_sigq_lk);
+    int cap = sig_is_rt(sig) ? SIGQ_DEPTH : 1;
+    if (g_sigq[sig].count < cap) {
+        int t = (g_sigq[sig].head + g_sigq[sig].count) % SIGQ_DEPTH;
+        g_sigq[sig].e[t] = (struct sigq_ent){code, value, pid, uid, addr};
+        g_sigq[sig].count++;
+    }
+    pthread_mutex_unlock(&g_sigq_lk);
+    __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+}
+
+// Pop the oldest queued instance of `sig` into *out. Returns 1 iff one was dequeued; clears the g_pending
+// bit when the queue drains so a realtime signal keeps its bit set while further instances remain.
+static int sigq_pop(int sig, struct sigq_ent *out) {
+    if (sig < 1 || sig > 64) return 0;
+    int got = 0;
+    pthread_mutex_lock(&g_sigq_lk);
+    if (g_sigq[sig].count > 0) {
+        *out = g_sigq[sig].e[g_sigq[sig].head];
+        g_sigq[sig].head = (g_sigq[sig].head + 1) % SIGQ_DEPTH;
+        g_sigq[sig].count--;
+        got = 1;
+        if (g_sigq[sig].count == 0) __atomic_and_fetch(&g_pending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+    }
+    pthread_mutex_unlock(&g_sigq_lk);
+    return got;
+}
+
+// Discard every queued instance of `sig` and clear its pending bit (Linux discards pending on SIG_IGN).
+static void sigq_flush(int sig) {
+    if (sig < 1 || sig > 64) return;
+    pthread_mutex_lock(&g_sigq_lk);
+    g_sigq[sig].head = g_sigq[sig].count = 0;
+    pthread_mutex_unlock(&g_sigq_lk);
+    __atomic_and_fetch(&g_pending, ~(1ull << sig), __ATOMIC_SEQ_CST);
+}
+
 // sentinel lr: handler return -> sigreturn
 #define SIGRETURN_PC 0xFFFFFFFFFFF0ull
 
@@ -286,6 +365,16 @@ static void sfd_deliver(int ls) {
         }
 }
 
+// Is Linux signal `ls` routed to at least one live signalfd (so a blocked instance must be captured for
+// its read queue rather than merely left pending for a future handler run)?
+static int sfd_routed(int ls) {
+    if (ls < 1 || ls > 63) return 0;
+    uint64_t bit = 1ull << ls;
+    for (int i = 0; i < HL_SFD_MAX; i++)
+        if (g_sfd[i].refs > 0 && g_sfd[i].wr >= 0 && (g_sfd[i].mask & bit)) return 1;
+    return 0;
+}
+
 // Is host fd `fd` a signalfd write end? (engine-private -- must survive the guest's close/exec sweep.)
 static int sfd_wr_is(int fd) {
     if (fd < 0) return 0;
@@ -313,6 +402,7 @@ static void host_sigh(int sig) {
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv);
 static void sig_diag_raise_default(struct cpu *c, int sig);
+static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv);
 
 static _Noreturn void guest_group_fatal(struct cpu *c, int sig) {
     sig_diag_raise_default(c, sig);
@@ -333,6 +423,29 @@ static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
     if (si && si->si_pid > 0) {
         g_sigpid[ls] = (int)si->si_pid;
         g_siguid[ls] = (int)si->si_uid;
+    }
+#if defined(__linux__)
+    // A Linux host delivers the real Linux si_code, so forward it (and, for the queued sources that carry a
+    // payload, si_value) into the single-slot siginfo the frame builder reads. This is what lets a kernel
+    // POSIX-mqueue notification (mq_notify SIGEV_SIGNAL, host-forwarded in rare.c) reach the guest handler
+    // as SI_MESGQ with the registered sigev_value, and likewise carries a cross-process sigqueue (SI_QUEUE)
+    // or POSIX-AIO (SI_ASYNCIO) value. SIGCHLD keeps its dedicated si_status handling below (si_status
+    // aliases si_value). SI_USER/SI_KERNEL/SI_TKILL carry no value, so only the value-bearing negative codes
+    // copy si_value (its union slot is meaningful only then); a plain kill stays SI_USER/0.
+    if (si && ls != 17) {
+        g_sigcode[ls] = si->si_code;
+        if (si->si_code == SI_QUEUE || si->si_code == SI_TIMER || si->si_code == SI_MESGQ ||
+            si->si_code == SI_ASYNCIO)
+            g_sigval[ls] = (uint64_t)(uintptr_t)si->si_value.sival_ptr;
+    }
+#endif
+    // SA_SIGINFO SIGCHLD exposes HOW the child ended: si_code (CLD_EXITED/CLD_KILLED/...) and si_status
+    // (exit code or terminating signal). On a Linux host the host siginfo already carries the Linux CLD_*
+    // code and status, so forward them into the single-slot siginfo the frame builder reads (si_status
+    // aliases si_value at offset 24). Leaving these zero made a guest handler see code==0/status==0.
+    if (ls == 17 && si) {
+        g_sigcode[17] = si->si_code;
+        g_sigval[17] = (uint64_t)(uint32_t)si->si_status;
     }
     // SA_NOCLDWAIT on the guest's SIGCHLD: Linux still DELIVERS the SIGCHLD but leaves no zombie. macOS's own
     // SA_NOCLDWAIT would suppress the signal entirely, so we don't set it (see rt_sigaction) -- instead
@@ -360,6 +473,9 @@ static void host_sigh_sync(int sig, siginfo_t *si, void *uc) {
     // port, x86 synthesizes #DE at the dispatcher). In-syscall => deliver async (wakes pause()/sigsuspend
     // + runs the handler); otherwise a genuine fault surfaced as POSIX -> restore default and re-raise.
     if (!g_in_service) {
+        // Linux/AArch64 delivers translated illegal instructions through this POSIX handler. Route a
+        // code-cache fault to the guest's installed SIGILL handler (OpenSSL/V8 feature probes) first.
+        if (deliver_guest_fault(sig, si, uc)) return;
         sig_diag_sync_reraise(sig, ls, si, uc);
         signal(sig, SIG_DFL);
         raise(sig);
@@ -394,7 +510,7 @@ static int mach_async_fault_signal(struct cpu *c, int hostsig, siginfo_t *si) {
 }
 
 // build_signal_frame + do_sigreturn are per-arch -> translator/guest/<arch>/signal.c
-static void build_signal_frame(struct cpu *c, int sig);
+static void build_signal_frame(struct cpu *c, int sig, int synchronous);
 static void do_sigreturn(struct cpu *c);
 // per-arch (the host<->guest register model differs): on a synchronous fault inside translated code,
 // reconstruct the guest register state from the host fault context (returns 1 iff the faulting host PC is
@@ -406,8 +522,20 @@ static void maybe_deliver_signal(struct cpu *c) {
     // Two sources: g_pending (process-directed -- any thread may take it) and c->tpending (thread-directed
     // via tkill/tgkill -- only THIS thread). Consider both; coalescing a process- and thread-directed
     // instance of the same (non-realtime) signal into one delivery is the correct Linux semantics.
+    // A handler may leave without an rt_sigreturn (siglongjmp out of a fault/signal handler restores the guest
+    // registers directly). Detect that by the guest SP unwinding back ABOVE a recorded frame: pop those levels
+    // so their deferred signals are released and the defer stack cannot leak. (The guest stack grows down, so a
+    // live handler's SP is <= its frame base; a longjmp back to an outer context raises SP above it.)
+    while (c->sig_depth > 0 && G_SP(c) > c->sig_frame_sp[c->sig_depth - 1]) {
+        c->sig_depth--;
+        c->sig_defer = c->sig_depth > 0 ? c->sig_defer_stack[c->sig_depth] : 0;
+    }
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
-    for (int sig = 1; sig <= 64; sig++) {
+    // Delivery order matches the native kernel: when several signals are pending together, the
+    // HIGHEST-numbered deliverable one runs first (verified against native aarch64 for both standard
+    // signals -- blocked_delivery_order 15,12,10 -- and realtime signals -- rt_signal_order highest
+    // signo first, FIFO within a signo). Scan high->low; realtime instances are dequeued FIFO per signo.
+    for (int sig = 64; sig >= 1; sig--) {
         uint64_t bit = 1ull << sig;
         // sigmask is sigset_t (bit N-1). A signal blocked by the mask is normally not delivered -- UNLESS it
         // was force-marked by rt_sigsuspend/pause (POSIX: the awaited handler runs during the suspend even
@@ -415,17 +543,22 @@ static void maybe_deliver_signal(struct cpu *c) {
         if (!(p & bit)) continue;
         // INTERIM: suppress Go's async-preempt SIGURG (23) for a cgo aarch64 Go image (see the note at the
         // top of this file). Drop the pending instance from both queues so it is never delivered to the guest
-        // handler; cooperative preemption keeps the program correct. Scoped to exactly the iscgo class + env.
+        // handler; cooperative preemption keeps the program correct. Scoped to exactly the Go-image class.
         if (sig == 23 && sigurg_drop_enabled()) {
             __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
             __atomic_and_fetch(&c->tpending, ~bit, __ATOMIC_SEQ_CST);
             continue;
         }
         if ((c->sigmask & (1ull << (sig - 1))) && !(g_force_deliver & bit)) continue;
+        // Deferred: this signal was already pending when the current handler was entered, so it waits until
+        // that handler returns (native delivers a batch of unblocked signals serially, not nested). A signal
+        // raised DURING the handler is not in c->sig_defer and still nests. Force-delivery overrides.
+        if ((c->sig_defer & bit) && !(g_force_deliver & bit)) continue;
         uint64_t h = g_sigact[sig].handler;
         if (h <= 1) {
-            // No guest handler -- clear this pending instance from both queues (and any force mark).
+            // No guest handler -- discard every pending instance from all queues (and any force mark).
             g_force_deliver &= ~bit;
+            sigq_flush(sig);
             __atomic_and_fetch(&g_pending, ~bit, __ATOMIC_SEQ_CST);
             __atomic_and_fetch(&c->tpending, ~bit, __ATOMIC_SEQ_CST);
             // A SIG_DFL signal whose default action TERMINATES, still pending at the container init, was NOT
@@ -440,14 +573,49 @@ static void maybe_deliver_signal(struct cpu *c) {
             }
             continue;
         }
-        // Claim from both queues (clear unconditionally so the coalesced signal is delivered exactly once),
-        // then run the guest handler on this thread.
+        // Claim ONE instance and run the guest handler on this thread. Pop the per-instance siginfo from
+        // the FIFO into the single-slot g_sig* arrays the frame builder reads; a realtime signal keeps its
+        // g_pending bit set (sigq_pop clears it only when the queue drains) so the next instance is
+        // delivered after this handler returns. The thread-directed bit (synchronous faults, tkill) has no
+        // queue -- clear it directly. If nothing was actually queued (host async path set the bit with an
+        // empty queue), fall back to clearing the process bit and using whatever g_sig* the host wrote.
+        struct sigq_ent ent;
+        int popped = sigq_pop(sig, &ent);
         uint64_t had_t = __atomic_fetch_and(&c->tpending, ~bit, __ATOMIC_SEQ_CST) & bit;
-        uint64_t had_p = __atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit;
-        if (had_t || had_p) {
+        uint64_t had_p = 0;
+        if (!popped) had_p = __atomic_fetch_and(&g_pending, ~bit, __ATOMIC_SEQ_CST) & bit;
+        if (popped || had_t || had_p) {
             g_force_deliver &= ~bit; // consumed: the sigframe (built below) saves the true post-suspend mask
+            if (popped) {
+                g_sigcode[sig] = ent.code;
+                g_sigval[sig] = ent.value;
+                g_sigpid[sig] = ent.pid;
+                g_siguid[sig] = ent.uid;
+                g_sigaddr[sig] = ent.addr;
+            }
+            // Defer every OTHER signal pending right now until this handler returns: they were pending
+            // before it started, so they must run after it (serial priority order), not nest inside it.
+            // Push the enclosing level's deferred set; a signal raised during this handler is not captured
+            // here, so it still nests. (The bit for `sig` is excluded so a realtime signal's further queued
+            // instances -- whose g_pending bit is still set -- deliver after this handler returns.)
+            if (c->sig_depth < (int)(sizeof c->sig_defer_stack / sizeof c->sig_defer_stack[0])) {
+                c->sig_defer_stack[c->sig_depth] = c->sig_defer;
+                c->sig_depth++;
+                c->sig_defer |= (__atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) |
+                                 __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST)) &
+                                ~bit;
+            }
             uint64_t flags = g_sigact[sig].flags;
-            build_signal_frame(c, sig); // captures g_sigact[sig].handler as the target PC -- must run first
+            int synchronous = had_t && c->sync_signal == sig;
+            build_signal_frame(c, sig, synchronous);
+            // Record this handler frame's guest SP so a siglongjmp unwind (which never calls rt_sigreturn)
+            // can be detected at the next delivery and the defer level released.
+            if (c->sig_depth > 0) c->sig_frame_sp[c->sig_depth - 1] = G_SP(c);
+            if (synchronous) {
+                c->sync_signal = 0;
+                c->sync_code = 0;
+                c->sync_address = 0;
+            }
             // SA_RESETHAND (SA_ONESHOT, 0x80000000): the disposition reverts to SIG_DFL after this single
             // delivery (the handler PC is already baked into the frame above). Reset both the recorded
             // disposition and the emulated host disposition, so a second occurrence takes the default action
@@ -463,10 +631,12 @@ static void maybe_deliver_signal(struct cpu *c) {
     }
 }
 
-// A signal aimed at our own process (raise/abort/pthread_kill). Deliver it through our
-// own machinery instead of a real host signal (host signals into a MAP_JIT thread are
-// fragile): a guest handler -> pending bit; otherwise apply the default action here.
-static void raise_guest_signal(struct cpu *c, int sig) {
+// A signal aimed at our own process (raise/abort/pthread_kill/kill-self/sigqueue). Deliver it through our
+// own machinery instead of a real host signal (host signals into a MAP_JIT thread are fragile): a guest
+// handler / blocked -> queue the per-instance siginfo + pending bit; otherwise apply the default action.
+// `code`/`value`/`pid`/`uid` are the siginfo to carry (SI_USER + sender pid for a plain kill/raise, or
+// SI_QUEUE + value + sender pid for sigqueue); realtime signals queue every instance FIFO.
+static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t value, int pid, int uid) {
     if (sig < 1 || sig > 64) return;
     // if this process is traced, a signal it raises on itself (raise/abort/kill-self, incl. the
     // raise(SIGSTOP) tracers' children use) becomes a ptrace signal/group-stop reported to the tracer.
@@ -480,16 +650,25 @@ static void raise_guest_signal(struct cpu *c, int sig) {
         }
     }
     uint64_t h = g_sigact[sig].handler;
-    if (h > 1) {
-        __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    int blocked = c && (c->sigmask & (1ull << (sig - 1)));
+    // A blocked signal routed to a signalfd is captured for that fd's read queue regardless of its
+    // handler disposition (Linux delivers a blocked signal to signalfd, not to a handler). Feed the
+    // self-pipe (readability) AND queue the siginfo (ssi_int/pid/code); the read path drains it in order.
+    if (blocked && sfd_routed(sig)) {
+        sigq_push(sig, code, value, pid, uid, 0);
+        sfd_deliver(sig);
         return;
-        // custom handler
+    }
+    // custom handler -> queue for the dispatcher's maybe_deliver_signal (carries per-instance siginfo)
+    if (h > 1) {
+        sigq_push(sig, code, value, pid, uid, 0);
+        return;
     }
     // SIG_IGN
     if (h == 1) return;
-    // blocked: make pending (signalfd / deliver on unblock)
-    if (c && (c->sigmask & (1ull << (sig - 1)))) {
-        __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    // blocked, no handler: queue pending for delivery on unblock (also feeds any signalfd via sfd_deliver)
+    if (blocked) {
+        sigq_push(sig, code, value, pid, uid, 0);
         sfd_deliver(sig);
         return;
     }
@@ -508,11 +687,39 @@ static void raise_guest_signal(struct cpu *c, int sig) {
         guest_group_fatal(c, sig);
     }
     // Non-terminating default reaching here = a stop signal (STOP/TSTP/TTIN/TTOU): mirror it onto the host so
-    // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask).
-    signal(sig_l2m(sig), SIG_DFL);
-    raise(sig_l2m(sig));
+    // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask). A stop is NOT a
+    // termination: the host process stops, the parent's waitpid(WUNTRACED) reaps the stop, and when a later
+    // SIGCONT resumes it raise() returns 0 -- the guest must then RESUME execution from the stop point, not
+    // exit. Setting c->exited here unconditionally forced the guest to terminate with 128+stopsig (e.g. 147
+    // for SIGSTOP) the instant it was continued, so the parent's next wait saw a bogus WIFEXITED(0x9300)
+    // instead of the child's real exit status. Only fall back to termination when raise() could not deliver
+    // the stop (an invalid host signo returns nonzero).
+    int host_stop = sig_l2m(sig);
+    signal(host_stop, SIG_DFL);
+    if (raise(host_stop) == 0) return; // stopped, then continued by SIGCONT -> resume guest execution
     c->exited = 1;
-    c->exit_code = 128 + sig; // fallback if raise returns / signo invalid on host
+    c->exit_code = 128 + sig; // fallback: raise failed (signo invalid on host)
+}
+
+// Convenience: a self-directed signal with no explicit sender info (raise/abort/kill-self/pthread_kill).
+// Linux stamps si_code == SI_USER(0) and si_pid == the sending (== this) process; stamp the guest pid so
+// an SA_SIGINFO handler / sigwaitinfo sees the correct sender (sigqueue_value's kill(2) leg).
+static void raise_guest_signal(struct cpu *c, int sig) {
+    raise_guest_signal_si(c, sig, 0 /*SI_USER*/, 0, container_pid(), 0);
+}
+
+// Linux delivers SIGPIPE to a guest thread whose write(2)/writev(2)/send(2)-without-MSG_NOSIGNAL hit a
+// pipe or socket whose reader is gone -- the write returns EPIPE AND, unless SIGPIPE is ignored or blocked,
+// a SIGPIPE is raised (default action: terminate, so `cmd | head` stops the writer). The host layer either
+// delivers host SIGPIPE itself or (the container primary-channel path) blocks it and returns EPIPE, so a
+// guest whose write returned EPIPE could otherwise never see SIGPIPE: it kept looping / printed "Broken
+// pipe" and pipelines like `yes | head` hung. Own the delivery here, keyed off the guest disposition:
+// SIG_IGN / blocked -> raise_guest_signal is a no-op and the EPIPE the caller already set stands; a handler
+// -> it runs and the guest still gets EPIPE; SIG_DFL -> the writer is terminated. `ret` is the syscall
+// result already computed by the caller (-EPIPE on the broken-pipe case). Idempotent if the host handler
+// also marked SIGPIPE pending (same non-realtime bit coalesces into one delivery).
+static void svc_sigpipe_on_epipe(struct cpu *c, int64_t ret) {
+    if (c && ret == -(int64_t)EPIPE) raise_guest_signal(c, 13); // Linux SIGPIPE
 }
 
 // A synchronous CPU fault (SIGSEGV/SIGBUS) taken inside translated code is the GUEST's own fault. If the
@@ -539,20 +746,23 @@ static void raise_guest_signal(struct cpu *c, int sig) {
 static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t *si, void *ucv) {
     int sig = sig_m2l(hostsig);
     if (sig < 1 || sig > 64 || !ucv) return 0;
-    // macOS reports ordinary bad-address/protection faults as SIGBUS, while Linux reports SIGSEGV. Do not
-    // query the Mach VM map from this synchronous signal handler: mach_vm_region is not async-signal-safe.
-    // The lock-free BUS ledger is the sole positive classification for a synchronous guest file-EOF
-    // SIGBUS. A fault-class signal received while blocked in a host service is asynchronous guest delivery
-    // and retains its signal number (macOS siginfo does not reliably distinguish that case).
-    if (hostsig == SIGBUS &&
-#if defined(__APPLE__)
-        !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1)
-#else
-        HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
-            (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
-#endif
-    )
+    // macOS raises a PROT_NONE access / unmapped-page / guard-gap fault as host SIGBUS (-> Linux
+    // SIGBUS(7)), whereas Linux reports those as SIGSEGV(11). On macOS, rewrite the host SIGBUS to
+    // SIGSEGV unless the lock-free file-mapping BUS ledger identifies a real Linux past-EOF fault, so a
+    // guest's own SIGSEGV handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it.
+    // Do NOT query the Mach VM map from this synchronous signal handler: mach_vm_region is not
+    // async-signal-safe; the ledger is the sole positive classification. A fault-class signal received
+    // while blocked in a host service is asynchronous guest delivery and retains its signal number.
+    //
+    // This disambiguation is macOS-specific: only there is host SIGBUS overloaded across PROT_NONE guard
+    // accesses AND real past-EOF bus errors, and only there is the ledger populated to tell them apart.
+    // On a Linux host the guest runs on real host file mappings, so the kernel already raises host SIGBUS
+    // exactly (and only) for genuine bus errors (past-EOF, misalignment) -- there the ledger is empty, so
+    // the rewrite would wrongly downgrade every guest SIGBUS to SIGSEGV. Trust the host signo on Linux.
+#if !defined(__linux__)
+    if (hostsig == SIGBUS && !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
         sig = 11;
+#endif
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
     struct cpu *c = cpu_hint ? cpu_hint : (struct cpu *)pthread_getspecific(g_cpu_key);
@@ -579,12 +789,20 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
         }
         return 0;
     }
-    g_sigaddr[sig] = si ? (uint64_t)si->si_addr : 0;
-    // Linux si_code for a hardware fault: SIGBUS -> BUS_ADRERR(2), else SEGV_MAPERR(1).
-    g_sigcode[sig] = (sig == 7) ? 2 : 1;
+    c->sync_signal = sig;
+    c->sync_address = si ? (uint64_t)si->si_addr : 0;
+    // Linux distinguishes an unmapped address (SEGV_MAPERR) from a mapped
+    // protection violation (SEGV_ACCERR).  JIT safepoint/guard handlers use
+    // that distinction; a physically protected g_gna page is ACCERR even
+    // when Darwin surfaced the access as SIGBUS.
+    c->sync_code = (sig == 7 ||
+                    (sig == 11 && si &&
+                     (gna_hit((uint64_t)si->si_addr, 1) || host_addr_mapped((uintptr_t)si->si_addr))))
+                       ? 2
+                       : 1;
     c->sigmask &= ~(1ull << (sig - 1)); // a sync fault forces delivery even if the guest blocked it
     c->reason = R_BRANCH;               // resume as a plain branch (no stale syscall/special-op handling)
-    __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&c->tpending, 1ull << sig, __ATOMIC_SEQ_CST);
     sigframe_resume_dispatch(c, ucv);
     return 1;
 }
@@ -599,8 +817,9 @@ static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) {
         guest_group_fatal(c, 7);
     }
-    g_sigaddr[7] = c->fault_addr;
-    g_sigcode[7] = 2; /* BUS_ADRERR */
+    c->sync_signal = 7;
+    c->sync_address = c->fault_addr;
+    c->sync_code = 2; /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
     /* A synchronous memory fault belongs to the faulting thread.  Process-wide
@@ -644,9 +863,8 @@ static void sig_diag_write(const char *buffer, size_t length) {
     }
 }
 
-static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c) {
-    return;
-    char b[384];
+static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c, void *ucv) {
+    char b[512];
     int n = 0;
     n = sig_diag_put(b, n, "[HLFATAL]");
     n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
@@ -662,12 +880,30 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
     n = sig_diag_put_hex(b, n, " x20=", c ? c->x[20] : 0);
 #endif
     n = sig_diag_put_hex(b, n, " si_addr=", si ? (uint64_t)si->si_addr : 0);
+#if G_GPC_HASH_SHIFT == 2
+    if (c && host_range_mapped((uintptr_t)G_PC(c), 4))
+        n = sig_diag_put_hex(b, n, " insn=", *(const uint32_t *)(uintptr_t)G_PC(c));
+#endif
+    ucontext_t *u = (ucontext_t *)ucv;
+#if defined(__aarch64__)
+    uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
+#else
+    uint64_t hpc = 0;
+#endif
+    uint64_t hgpc = 0, hoff = 0;
+    uint32_t hinsn = 0;
+    extern int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn);
+    if (jit_hostpc_lookup(hpc, &hgpc, &hoff, &hinsn)) {
+        n = sig_diag_put_hex(b, n, " hpc=", hpc);
+        n = sig_diag_put_hex(b, n, " hblk=", hgpc);
+        n = sig_diag_put_hex(b, n, " hoff=", hoff);
+        n = sig_diag_put_hex(b, n, " hinsn=", hinsn);
+    }
     b[n++] = '\n';
     sig_diag_write(b, (size_t)n);
 }
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
-    return;
     ucontext_t *u = (ucontext_t *)ucv;
 #if defined(__aarch64__)
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
@@ -706,23 +942,23 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
-    return;
-    char b[384];
-    int n = 0;
-    n = sig_diag_put(b, n, "[HLRAISE]");
-    n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
-    n = sig_diag_put_hex(b, n, " cpid=", (uint64_t)container_pid());
-    n = sig_diag_put_hex(b, n, " tid=", c ? (uint64_t)cpu_tid(c) : 0);
-    n = sig_diag_put_hex(b, n, " sig=", (uint64_t)sig);
-    n = sig_diag_put_hex(b, n, " pc=", c ? G_PC(c) : 0);
-    n = sig_diag_put_hex(b, n, " sp=", c ? G_SP(c) : 0);
+    // An engine-internal diagnostic for a guest taking a fatal-default signal. It must NEVER reach the
+    // guest's own stderr fd, so route it through the engine's tagged logging facility (HL_LOG_TAG_SIGNAL)
+    // exactly like every other engine diagnostic -- gated on the HL_LOG selector and compiled out entirely
+    // in a production (HL_ENABLE_LOGGING=0) build. A raw write(STDERR_FILENO) here leaked "[HLRAISE] ..."
+    // into the guest's captured stderr on any uncaught fatal signal (e.g. `kill -TERM $$`).
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL,
+            "raise-default pid=%#llx cpid=%#llx tid=%#llx sig=%#llx pc=%#llx sp=%#llx lr=%#llx handler=%#llx mask=%#llx",
+            (unsigned long long)getpid(), (unsigned long long)container_pid(),
+            (unsigned long long)(c ? (uint64_t)cpu_tid(c) : 0), (unsigned long long)sig,
+            (unsigned long long)(c ? G_PC(c) : 0), (unsigned long long)(c ? G_SP(c) : 0),
 #if G_GPC_HASH_SHIFT == 2
-    n = sig_diag_put_hex(b, n, " lr=", c ? c->x[30] : 0);
+            (unsigned long long)(c ? c->x[30] : 0),
+#else
+            0ull,
 #endif
-    n = sig_diag_put_hex(b, n, " handler=", (sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0);
-    n = sig_diag_put_hex(b, n, " mask=", c ? c->sigmask : 0);
-    b[n++] = '\n';
-    sig_diag_write(b, (size_t)n);
+            (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
+            (unsigned long long)(c ? c->sigmask : 0));
 }
 
 // a GENUINE synchronous CPU fault (SIGSEGV/SIGBUS/...) taken in translated code for which the guest
@@ -753,7 +989,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     if (!c) return 0;
     if (!sigframe_capture_fault(c, ucv)) return 0; // host PC not in translated code -> engine/async: re-raise
-    sig_diag_fatal_fault(sig, hostsig, si, c);
+    sig_diag_fatal_fault(sig, hostsig, si, c, ucv);
     // A genuine, fatal, unmaskable guest fault. Terminate the guest process HERE (async-signal-safe _exit),
     // not by resuming the dispatcher: the guest state is captured mid-fault (e.g. SP overrun into the guard),
     // so re-entering the code cache would run off into garbage. A non-init guest records its Linux
@@ -770,5 +1006,16 @@ static int mmap_flags(int lf) {
     if (lf & 0x02) f |= MAP_PRIVATE;
     if (lf & 0x10) f |= MAP_FIXED;
     if (lf & 0x20) f |= MAP_ANON;
+#if defined(__linux__)
+    // On a Linux host the guest's Linux MAP_* bits ARE the host's bits, so the placement/behavior flags
+    // above the type bits can be forwarded verbatim and enforced by the kernel itself instead of being
+    // silently dropped (which turned MAP_FIXED_NOREPLACE into a plain hint that CLOBBERED an existing
+    // mapping, made MAP_HUGETLB fake-succeed as ordinary pages, and ignored MAP_POPULATE/LOCKED/NORESERVE).
+    // Forward the exact bits the kernel would honor; the type bits (0x01/0x02/0x10/0x20) are already set,
+    // and MAP_32BIT (0x40) is x86-guest-specific and meaningless on this aarch64 host, so both are excluded.
+    //   GROWSDOWN 0x100, LOCKED 0x2000, NORESERVE 0x4000, POPULATE 0x8000, NONBLOCK 0x10000,
+    //   STACK 0x20000, HUGETLB 0x40000, FIXED_NOREPLACE 0x100000, MAP_HUGE_* size (0x3f << 26).
+    f |= lf & (0x100 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x100000 | (0x3f << 26));
+#endif
     return f;
 }

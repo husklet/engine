@@ -23,7 +23,7 @@ static uint64_t rd64(const uint8_t *p) {
 // Read PT_INTERP (the dynamic loader path) out of an ELF.
 static int elf_interp(const char *path, char *out, size_t n) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) return -1;
+    if (aarch64_image_read(path, &image) != 0) return -1;
     uint8_t *f = image.bytes;
     int r = -1;
     uint64_t phoff = rd64(f + 32);
@@ -165,9 +165,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     //      faults at the low link address. The guest sized its loop from the host DCZID_EL0 (the frontend
     //      emits the mrs verbatim), so re-derive the same block size here and zero it at +bias.
     if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {
-        uint64_t dczid;
-        __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
-        uint64_t bs = 4ull << (dczid & 0xf);
+        uint64_t bs = 4ull << (g_aarch64_cpu_model.dczid_el0 & 0xf);
         memset((void *)(real & ~(bs - 1)), 0, (size_t)bs);
         HL_HOST_UC_PC(uc) += 4;
         return 1;
@@ -564,6 +562,27 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     // emulate a probe load of a low un-rebased pointer at +bias and resume, mis-reporting it as mapped.
     if (hrm_fault_hook(si)) return; // never actually returns on a claim (siglongjmp); shape-only
     if (nonpie_fixup(si, uc)) return;
+    // The host representation may be narrower than the guest mapping when 4 KiB ELF segment edges share
+    // a 16 KiB macOS page, or after fork-server protection restoration. Re-open only a logically writable,
+    // tracked private-anonymous guest page; PROT_NONE/read-only and file-EOF ledgers remain authoritative.
+    // This is a representation repair, not lazy allocation: the address must already belong to gmap.
+    if (si && si->si_addr) {
+        uint64_t address = (uint64_t)si->si_addr;
+        int anonymous_protection = anon_prot_if_contained(address, 1);
+        int bus_address = 0;
+        for (int i = 0; i < g_ngbus; i++)
+            if (address >= g_gbus[i].lo && address < g_gbus[i].hi) bus_address = 1;
+        hl_host_region region;
+        if ((anonymous_protection & PROT_WRITE) && hl_gmap_contains(address, 1) && !gna_hit(address, 1) &&
+            !gro_hit(address, 1) && !bus_address && hl_host_region_query((uintptr_t)address, &region) &&
+            (region.protection & HL_HOST_REGION_READ) && !(region.protection & HL_HOST_REGION_WRITE)) {
+            size_t page = hl_host_page_size();
+            if (page) {
+                uintptr_t base = (uintptr_t)address & ~(uintptr_t)(page - 1);
+                if (mprotect((void *)base, page, PROT_READ | PROT_WRITE) == 0) return;
+            }
+        }
+    }
     // A genuine guest fault (wild pointer / null deref / stack overflow into the guard gap) with a
     // registered guest handler is the guest's to handle: synthesize+deliver the guest signal. nonpie_fixup
     // (absolute-data) already won above.
@@ -696,6 +715,14 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
 static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void *addr, size_t len, uint32_t protection,
                                    const char *what) {
     (void)what;
+    size_t host_page = hl_host_page_size();
+    uint64_t start = (uint64_t)(uintptr_t)addr;
+    uint64_t end = start + len;
+    // Guest ELF segments are described at guest-page granularity. A host protection change rounds to
+    // macOS's larger VM pages, so an unaligned segment edge can make an adjacent writable .data/.bss
+    // subpage read-only (CoreCLR performs such a relocation during startup). The old mprotect path rejected
+    // these ranges with EINVAL. Preserve that safe behavior and tighten only independently protectable pages.
+    if (!host_page || (start & (host_page - 1)) || (end & (host_page - 1))) return;
     const hl_host_services *host = effective_host_services();
     for (int t = 0;; t++) {
         uint64_t offset = (uint64_t)(uintptr_t)addr - mapping->address;
@@ -705,65 +732,25 @@ static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void 
     }
 }
 
-// INTERIM: does this image's bytes contain `needle`? Small bounded byte search over [f, f+n).
-static int elf_mem_has(const uint8_t *f, size_t n, const char *needle, size_t nl) {
-    if (nl == 0 || nl > n) return 0;
-    for (size_t i = 0; i + nl <= n; i++)
-        if (f[i] == (uint8_t)needle[0] && !memcmp(f + i, needle, nl)) return 1;
-    return 0;
-}
-
-// INTERIM: is `f` (an aarch64 ELF, size `sz`) a cgo-enabled (iscgo) Go image? Every Go binary carries a
-// linker-embedded build-info blob (magic "\xff Go buildinf:"); its recorded build settings include
-// CGO_ENABLED=<0|1>, and CGO_ENABLED=1 is exactly the runtime.iscgo==1 class whose SIGURG async-preempt
-// delivery hl must suppress (see os/linux/signal.c, g_go_iscgo). We GATE on the Go magic first so a non-Go
-// guest is NEVER matched, then decode the two inline strings (Go >=1.18 stores version + modinfo inline when
-// the flags byte has bit 0x2 set, starting at blob offset 32) and scan ONLY the modinfo for the setting. A
-// blob without the inline flag (older linkers) falls back to a bounded scan just past the magic.
-static uint64_t elf_uvarint(const uint8_t **pp, const uint8_t *end) {
-    uint64_t x = 0;
-    int s = 0;
-    while (*pp < end) {
-        uint8_t b = *(*pp)++;
-        if (b < 0x80) return x | ((uint64_t)b << s);
-        x |= (uint64_t)(b & 0x7f) << s;
-        s += 7;
-        if (s > 63) break;
-    }
-    return x;
-}
-
-static int elf_is_go_iscgo(const uint8_t *f, size_t sz) {
+// INTERIM: is `f` (an aarch64 ELF, size `sz`) a Go image at all? Every Go binary carries a linker-embedded
+// build-info blob (magic "\xff Go buildinf:"); its presence uniquely identifies a Go main image, whose
+// runtime OWNS SIGURG for async preemption. hl cannot yet honor Go's async-safe-point model, so it suppresses
+// that SIGURG for EVERY Go image (see os/linux/signal.c, g_go_image) -- functionally identical to Go's own
+// supported GODEBUG=asyncpreemptoff=1. Originally scoped to the cgo (CGO_ENABLED=1 / runtime.iscgo==1) class,
+// but the internal-linked toolchain children `go build` spawns (compile/asm/link) crash identically when
+// SIGURG is delivered (sysmon usleep SIGSEGV / clone EAGAIN under load), so the gate is the Go magic alone.
+// A non-Go guest is NEVER matched, so a non-Go program that legitimately uses SIGURG for OOB TCP data is
+// unaffected; a Go program never repurposes SIGURG, so dropping it is always safe for a Go image.
+static int elf_is_go_image(const uint8_t *f, size_t sz) {
     static const char magic[14] = {(char)0xff, ' ', 'G', 'o', ' ', 'b', 'u', 'i', 'l', 'd', 'i', 'n', 'f', ':'};
-    size_t bi = (size_t)-1;
     for (size_t i = 0; i + sizeof(magic) <= sz; i++)
-        if (f[i] == (uint8_t)magic[0] && !memcmp(f + i, magic, sizeof(magic))) {
-            bi = i;
-            break;
-        }
-    if (bi == (size_t)-1) return 0; // not a Go binary -> never suppress SIGURG for it
-    static const char needle[] = "CGO_ENABLED=1";
-    const size_t NL = sizeof(needle) - 1;
-    // Inline strings (version then modinfo) at blob offset 32 when flags bit 0x2 is set.
-    if (bi + 32 <= sz && (f[bi + 15] & 0x02)) {
-        const uint8_t *p = f + bi + 32, *end = f + sz;
-        uint64_t vlen = elf_uvarint(&p, end);
-        if ((uint64_t)(end - p) >= vlen) {
-            p += vlen; // skip the version string
-            uint64_t mlen = elf_uvarint(&p, end);
-            if ((uint64_t)(end - p) < mlen) mlen = (uint64_t)(end - p);
-            return elf_mem_has(p, (size_t)mlen, needle, NL); // scan ONLY the modinfo (build settings live here)
-        }
-    }
-    // Fallback (non-inline blob): scan a bounded window past the magic; the build settings sit within it.
-    size_t win = sz - bi;
-    if (win > (1u << 20)) win = 1u << 20;
-    return elf_mem_has(f + bi, win, needle, NL);
+        if (f[i] == (uint8_t)magic[0] && !memcmp(f + i, magic, sizeof(magic))) return 1;
+    return 0; // not a Go binary -> never suppress SIGURG for it
 }
 
 static void load_elf(const char *path, struct loaded *out) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) {
+    if (aarch64_image_read(path, &image) != 0) {
         fprintf(stderr, "hl-engine: cannot read guest ELF %s through host services\n", path);
         exit(1);
     }
@@ -875,12 +862,12 @@ static void load_elf(const char *path, struct loaded *out) {
     out->phdr = nonpie ? ((uint64_t)base + phoff - bias) : ((uint64_t)base + phoff);
     out->phent = phentsize;
     out->phnum = phnum;
-    // INTERIM: latch whether this is a cgo (iscgo) Go image so signal delivery can auto-suppress Go's
-    // async-preempt SIGURG for it (os/linux/signal.c, g_go_iscgo). OR (never clear): load_elf runs for the
-    // main image THEN the ld.so interpreter -- the interp is never Go, so '|=' keeps a main-image match from
-    // being clobbered by the interp load. execve resets g_go_iscgo to 0 before re-loading (proc.c) so a later
-    // non-Go image starts clean. See the detailed rationale in signal.c.
-    g_go_iscgo |= elf_is_go_iscgo(f, image.size);
+    // INTERIM: latch whether this is a Go image so signal delivery can auto-suppress Go's async-preempt
+    // SIGURG for it (os/linux/signal.c, g_go_image). OR (never clear): load_elf runs for the main image THEN
+    // the ld.so interpreter -- the interp is never Go, so '|=' keeps a main-image match from being clobbered
+    // by the interp load. execve resets g_go_image to 0 before re-loading (proc.c) so a later non-Go image
+    // starts clean. See the detailed rationale in signal.c.
+    g_go_image |= elf_is_go_image(f, image.size);
     hl_linux_image_release(&image);
 }
 
@@ -1002,6 +989,16 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         argp[i] = (uint64_t)top;
     }
     free(gecopy); // the HL_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
+    // AT_EXECFN string: Linux copies the execve PATHNAME (not argv[0]) near the stack top and points
+    // AT_EXECFN at it. glibc dl-support, Rust std, and uutils' multicall dereference it; pointing it at
+    // a relative argv[0] (e.g. a fork+exec'd `./x` or execve("/proc/self/exe")) diverged from the native
+    // absolute path. g_exe_path holds the canonical guest exec path (set by the loader and by execve
+    // before this call); fall back to argv[0] only if it is somehow unset.
+    const char *execfn_str = (g_exe_path && g_exe_path[0]) ? g_exe_path : (argc ? argv[0] : "");
+    size_t execfn_len = strlen(execfn_str) + 1;
+    top -= execfn_len;
+    memcpy(top, execfn_str, execfn_len);
+    uint64_t execfn = (uint64_t)top;
     top -= 8;
     memcpy(top, "aarch64", 8);
     uint64_t plat = (uint64_t)top;
@@ -1024,12 +1021,12 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {12, (uint64_t)cuid()},
         {13, (uint64_t)cgid()},
         {14, (uint64_t)cgid()},
-        {16, 0x1fb},
+        {16, g_aarch64_cpu_model.hwcap},
         {17, 100},
         {15, plat},
         {25, rnd},
         {23, 0},
-        {31, argc ? argp[0] : 0},
+        {31, execfn},
         {0, 0},
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);

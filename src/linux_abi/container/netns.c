@@ -32,6 +32,28 @@ static const int CC_L2M[17] = {VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, -
                                // Linux c_cc index -> macOS index
                                VSTOP, VSUSP, VEOL, VREPRINT, VDISCARD, VWERASE, VLNEXT, VEOL2};
 
+// Linux termios baud CODE (Bxxx in c_cflag CBAUD/CIBAUD) <-> numeric bits/s (the macOS speed_t form,
+// and what cf{set,get}speed operate on). Standard rates only; custom BOTHER rates are not modeled here.
+// Linux CBAUD mask is 0x100f (CBAUDEX 0x1000 | 0x000f); the input speed lives in CIBAUD (that field << 16).
+#define TIO_CBAUD 0x100fu
+#define TIO_CIBAUD_SHIFT 16
+static const uint32_t TIO_BAUD[][2] = {
+    {0, 0},           {1, 50},          {2, 75},          {3, 110},         {4, 134},
+    {5, 150},         {6, 200},         {7, 300},         {8, 600},         {9, 1200},
+    {0xa, 1800},      {0xb, 2400},      {0xc, 4800},      {0xd, 9600},      {0xe, 19200},
+    {0xf, 38400},     {0x1001, 57600},  {0x1002, 115200}, {0x1003, 230400}, {0x1004, 460800},
+    {0x1005, 500000}, {0x1006, 576000}, {0x1007, 921600}, {0x1008, 1000000}};
+static uint32_t baud_code_to_num(uint32_t code) {
+    for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
+        if (TIO_BAUD[i][0] == code) return TIO_BAUD[i][1];
+    return 0;
+}
+static uint32_t baud_num_to_code(uint32_t num) {
+    for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
+        if (TIO_BAUD[i][1] == num) return TIO_BAUD[i][0];
+    return 0;
+}
+
 // bind()/connect() an AF_UNIX socket at host path `host`. macOS sun_path is only 104 bytes, but a container
 // overlay upper socket path ($HOME/.hl/containers/<64-hex>/upper/.../.s.PGSQL.5432) can exceed that -- a
 // plain snprintf into sun_path SILENTLY TRUNCATES, so bind creates the inode at the wrong (short) path and
@@ -157,6 +179,14 @@ static void termios_l2m(const uint8_t *L, struct termios *M) {
     const uint8_t *lcc = L + 17;
     for (int i = 0; i < 17; i++)
         if (CC_L2M[i] >= 0) M->c_cc[CC_L2M[i]] = lcc[i];
+    // Carry the line speed: map the Linux CBAUD (output) / CIBAUD (input) codes to numeric bits/s so the
+    // host termios keeps the requested rate. map_bits above ignores the baud field, so without this the
+    // speed collapses to B0 (a cfgetispeed/cfgetospeed round-trip then reads 0). An input code of 0 means
+    // "same as output" on Linux.
+    uint32_t ocode = lc & TIO_CBAUD, icode = (lc >> TIO_CIBAUD_SHIFT) & TIO_CBAUD;
+    if (icode == 0) icode = ocode;
+    cfsetospeed(M, baud_code_to_num(ocode));
+    cfsetispeed(M, baud_code_to_num(icode));
 }
 
 static void termios_m2l(const struct termios *M, uint8_t *L) {
@@ -165,6 +195,10 @@ static void termios_m2l(const struct termios *M, uint8_t *L) {
     uint32_t lc = map_bits((uint32_t)M->c_cflag, TIO_C, 6, 0), ll = map_bits((uint32_t)M->c_lflag, TIO_L, 9, 0);
     int csz = M->c_cflag & CSIZE;
     lc |= (csz == CS8 ? 0x30 : csz == CS7 ? 0x20 : csz == CS6 ? 0x10 : 0);
+    // Encode the host line speed back into the Linux CBAUD (output) / CIBAUD (input) fields.
+    uint32_t ocode = baud_num_to_code((uint32_t)cfgetospeed(M)), icode = baud_num_to_code((uint32_t)cfgetispeed(M));
+    lc = (lc & ~TIO_CBAUD) | (ocode & TIO_CBAUD);
+    lc = (lc & ~(TIO_CBAUD << TIO_CIBAUD_SHIFT)) | ((icode & TIO_CBAUD) << TIO_CIBAUD_SHIFT);
     *(uint32_t *)(L + 0) = li;
     *(uint32_t *)(L + 4) = lo;
     *(uint32_t *)(L + 8) = lc;
@@ -589,6 +623,26 @@ static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t 
         size_t need = LX_CMSG_ALIGN(LX_CMSGHDR + dlen);
         if (go + LX_CMSGHDR + dlen > cap) {
             if (truncp) *truncp = 1;
+            // Linux delivers a partial SCM_RIGHTS record with as many whole fds as fit in the
+            // remaining control space and closes the fds that did not fit -- it does not drop the
+            // whole record. Match that (and never leak the undelivered host fds).
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                int *fds = (int *)CMSG_DATA(c);
+                int total = (int)(dlen / sizeof(int));
+                size_t room = (go + LX_CMSGHDR <= cap) ? cap - go - LX_CMSGHDR : 0;
+                int keep = (int)(room / sizeof(int));
+                if (keep > total) keep = total;
+                for (int i = keep; i < total; i++)
+                    if (fds[i] >= 0) close(fds[i]);
+                if (keep > 0) {
+                    size_t kb = (size_t)keep * sizeof(int);
+                    *(uint64_t *)(g + go) = (uint64_t)(LX_CMSGHDR + kb);
+                    *(int *)(g + go + 8) = cmsg_level_m2l(c->cmsg_level);
+                    *(int *)(g + go + 12) = c->cmsg_type;
+                    memcpy(g + go + LX_CMSGHDR, CMSG_DATA(c), kb);
+                    go += LX_CMSG_ALIGN(LX_CMSGHDR + kb);
+                }
+            }
             break;
         }
         *(uint64_t *)(g + go) = (uint64_t)(LX_CMSGHDR + dlen); // Linux cmsg_len
@@ -705,10 +759,13 @@ static char g_netns[64];
 // fd -> the loopback port it's bound/connected to (0 = not a private-lo socket)
 static uint16_t g_lo_port[HL_NFD];
 // fd -> 1 if this private-lo socket is AF_INET6 (so getsockname/getpeername/accept report a sockaddr_in6
-// with ::1 instead of an AF_INET 127.0.0.1). The unix-socket switch is keyed by port only, so a v6 server
-// and a v4 client on the same loopback port still rendezvous (dual-stack); this only picks the address
-// family reported back to the guest.
+// with ::1 instead of an AF_INET 127.0.0.1). Dual-stack listeners use the common port rendezvous; a
+// v6-only wildcard listener uses a separate path so IPv4 may bind the same port. This flag picks the
+// address family reported back to the guest.
 static uint8_t g_lo_v6[HL_NFD];
+// fd -> 1 when an AF_INET6 wildcard bind requested IPV6_V6ONLY. Such a
+// listener owns a rendezvous distinct from an IPv4 listener on the same port.
+static uint8_t g_lo_v6only[HL_NFD];
 // fd -> 1 if created SOCK_STREAM (only those get loopback isolation)
 static uint8_t g_sock_stream[HL_NFD];
 // fd -> 1 once a stream connect() SUCCEEDED on it. Linux keeps a connected stream socket in SS_CONNECTED
@@ -716,8 +773,118 @@ static uint8_t g_sock_stream[HL_NFD];
 // association after FIN so getpeername() there returns ENOTCONN. This sticky flag lets connect(203) report
 // EISCONN faithfully (LTP connect01). Cleared on close (fd_reset_emul) and at socket()/accept re-init.
 static uint8_t g_sock_conn[HL_NFD];
+// fd -> a pending asynchronous socket error (Linux errno) to hand back on the next getsockopt(SO_ERROR),
+// then clear (Linux delivers SO_ERROR once). A non-blocking stream connect() to a closed private-loopback
+// port has no live INET peer to surface ECONNREFUSED through the AF_UNIX switch, so we stash it here and
+// report EINPROGRESS, mirroring a real deferred TCP connect failure. Cleared at socket()/accept() re-init.
+static int g_so_error[HL_NFD];
+// fd -> 1 if the guest set SO_REUSEPORT on this socket. A private-loopback INET socket is backed by an
+// AF_UNIX switch socket, and Linux AF_UNIX accepts setsockopt(SO_REUSEPORT) but always reads it back as 0
+// (unlike SO_REUSEADDR), so the guest's get-after-set would wrongly report 0. Record the guest's intent
+// here and report it on getsockopt. Cleared at socket()/accept() re-init.
+static uint8_t g_so_reuseport[HL_NFD];
+// fd -> shadowed IPPROTO_TCP integer options. A private-loopback/bridge guest INET stream socket is backed
+// on the host by an AF_UNIX switch socket (see lo_swap), which rejects every setsockopt/getsockopt at
+// IPPROTO_TCP with ENOPROTOOPT. Linux round-trips these options on a real TCP socket, and applications
+// routinely set TCP_NODELAY *after* connect(), so a get-after-set (or a plain set) must not fail across the
+// switch. Record the guest's value here and report it back, matching native. Slots: 0 NODELAY, 1 CORK,
+// 2 KEEPIDLE, 3 KEEPINTVL, 4 KEEPCNT, 5 QUICKACK, 6 MAXSEG. Cleared at socket()/accept() re-init.
+#define TCP_SHADOW_N 7
+static int g_tcp_optval[HL_NFD][TCP_SHADOW_N];
+static uint8_t g_tcp_optset[HL_NFD][TCP_SHADOW_N];
+// Map a Linux IPPROTO_TCP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
+// option (e.g. TCP_INFO, which is a struct handled separately). MAXSEG is get-mostly but Linux lets a guest
+// lower the clamp, so it round-trips through a slot too.
+static int tcp_shadow_slot(int optname) {
+    switch (optname) {
+        case 1: return 0;  // TCP_NODELAY
+        case 3: return 1;  // TCP_CORK
+        case 4: return 2;  // TCP_KEEPIDLE
+        case 5: return 3;  // TCP_KEEPINTVL
+        case 6: return 4;  // TCP_KEEPCNT
+        case 12: return 5; // TCP_QUICKACK
+        case 2: return 6;  // TCP_MAXSEG
+        default: return -1;
+    }
+}
+// A get on a MAXSEG slot never set by the guest reports a plausible loopback MSS so diagnostic code that
+// requires a nonzero segment size keeps working over the switch (the exact value is host-variable on native
+// and therefore not a stable fact); every other slot defaults to 0, the Linux default for the booleans.
+static int tcp_shadow_default(int slot) { return slot == 6 ? 65483 : 0; }
+// Drop any shadowed TCP options for a reused fd number (socket()/accept()/close re-init).
+static void tcp_shadow_clear(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (int i = 0; i < TCP_SHADOW_N; i++) g_tcp_optset[fd][i] = 0;
+}
+// fd -> shadowed IPPROTO_IP(level 0) / IPPROTO_IPV6(level 41) integer options. Same class as the TCP shadow
+// above: once a private-loopback/bridge guest INET socket is bound/connected, its host backing becomes an
+// AF_UNIX switch socket (see lo_swap), which rejects every setsockopt/getsockopt at IPPROTO_IP/IPPROTO_IPV6
+// with ENOPROTOOPT. Native Linux round-trips these on a real IP socket -- DNS servers set IP_PKTINFO/
+// IP_RECVTTL to reply from the right address, QUIC/HTTP3 and dual-stack servers set IP_TOS/IPV6_TCLASS and
+// read IPV6_V6ONLY back, and code sets them *after* bind/connect -- so a get-after-set (or plain set) must
+// survive the switch. Only options native actually accepts on a connected/bound unicast stream socket are
+// shadowed here; options native itself rejects on such a socket (IP_HDRINCL raw-only -> ENOPROTOOPT,
+// IP_MULTICAST_HOPS/IPV6_MULTICAST_HOPS on a unicast socket -> ENOPROTOOPT, IP_TRANSPARENT unprivileged ->
+// EPERM) are deliberately left OUT so they fall through to the real setsockopt and surface the true errno.
+// Slots 0-7 are IPPROTO_IP, 8-13 IPPROTO_IPV6. Cleared at socket()/accept()/close re-init.
+#define IPOPT_SHADOW_N 14
+static int g_ipopt_val[HL_NFD][IPOPT_SHADOW_N];
+static uint8_t g_ipopt_set[HL_NFD][IPOPT_SHADOW_N];
+// Map a Linux IPPROTO_IP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
+// option at this level (unknown, struct-valued, or one native rejects on a unicast stream socket).
+static int ip_shadow_slot(int optname) {
+    switch (optname) {
+        case 1: return 0;  // IP_TOS
+        case 2: return 1;  // IP_TTL
+        case 8: return 2;  // IP_PKTINFO
+        case 10: return 3; // IP_MTU_DISCOVER
+        case 11: return 4; // IP_RECVERR
+        case 12: return 5; // IP_RECVTTL
+        case 13: return 6; // IP_RECVTOS
+        case 15: return 7; // IP_FREEBIND
+        default: return -1;
+    }
+}
+// Map a Linux IPPROTO_IPV6 integer optname to a shadow slot, or -1. IPV6_V6ONLY(26) uses slot 13 but its
+// setsockopt is handled specially (native rejects a change after bind with EINVAL), so it is excluded here
+// and matched directly on the optname in the setsockopt/getsockopt paths.
+static int ip6_shadow_slot(int optname) {
+    switch (optname) {
+        case 67: return 8;  // IPV6_TCLASS
+        case 16: return 9;  // IPV6_UNICAST_HOPS
+        case 49: return 10; // IPV6_RECVPKTINFO
+        case 51: return 11; // IPV6_RECVHOPLIMIT
+        case 66: return 12; // IPV6_RECVTCLASS
+        default: return -1;
+    }
+}
+#define IPOPT_V6ONLY_SLOT 13
+// A get on a slot the guest never set reports the Linux default so code that reads an option it did not set
+// still sees a plausible value over the switch instead of ENOPROTOOPT (only reached when the real host
+// getsockopt is also rejected, i.e. the AF_UNIX switch backing). IP_TTL and IPV6_UNICAST_HOPS default to 64;
+// the boolean recv-flags and TOS/TCLASS default to 0.
+static int ipopt_shadow_default(int slot) {
+    switch (slot) {
+        case 1: return 64; // IP_TTL
+        case 9: return 64; // IPV6_UNICAST_HOPS
+        default: return 0;
+    }
+}
+// Drop any shadowed IP/IPV6 options for a reused fd number (socket()/accept()/close re-init).
+static void ipopt_shadow_clear(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (int i = 0; i < IPOPT_SHADOW_N; i++) g_ipopt_set[fd][i] = 0;
+}
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
+static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];
+static uint32_t g_udp_local_ip[HL_NFD], g_udp_peer_ip[HL_NFD];
+static uint8_t g_udp_local_interface[HL_NFD], g_udp_peer_interface[HL_NFD];
+static uint8_t g_udp_local_v6[HL_NFD], g_udp_peer_v6[HL_NFD];
+#define UDP_REF_N 4096
+struct udp_ref { volatile uint32_t used, refs; char path[200]; };
+static struct udp_ref *g_udp_refs;
+static uint16_t g_udp_ref[HL_NFD];
 // fd -> the socket's guest (Linux) address family, recorded at socket()/accept() so connect(203)/bind(200)
 // can validate the guest sockaddr's sa_family against it (EAFNOSUPPORT) without a getsockname() probe --
 // which is unreliable after a prior failed connect on the same fd. 0 = untracked (best-effort fallback).
@@ -734,9 +901,43 @@ static uint8_t g_sock_seqpacket[HL_NFD];
 // recycled only after both endpoint reference counts reach zero.
 static void seq_ref_arena_init(const hl_host_services *host) {
     void *arena = NULL;
-    if (g_seq_refs != NULL) return;
-    if (hl_linux_shared_create(host, sizeof(struct seq_ref) * SEQ_REF_N, &arena) == HL_STATUS_OK)
+    if (g_seq_refs != NULL && g_udp_refs != NULL) return;
+    if (g_seq_refs == NULL && hl_linux_shared_create(host, sizeof(struct seq_ref) * SEQ_REF_N, &arena) == HL_STATUS_OK)
         g_seq_refs = (struct seq_ref *)arena;
+    arena = NULL;
+    if (g_udp_refs == NULL && hl_linux_shared_create(host, sizeof(struct udp_ref) * UDP_REF_N, &arena) == HL_STATUS_OK)
+        g_udp_refs = (struct udp_ref *)arena;
+}
+
+static int udp_ref_create(int fd, const char *path) {
+    if (!g_udp_refs || fd < 0 || fd >= HL_NFD) return 0;
+    for (uint32_t i = 0; i < UDP_REF_N; i++) {
+        if (!__sync_bool_compare_and_swap(&g_udp_refs[i].used, 0, 1)) continue;
+        snprintf(g_udp_refs[i].path, sizeof g_udp_refs[i].path, "%s", path);
+        __atomic_store_n(&g_udp_refs[i].refs, 1, __ATOMIC_RELEASE);
+        g_udp_ref[fd] = (uint16_t)(i + 1);
+        return 0;
+    }
+    errno = ENFILE;
+    return -1;
+}
+
+static void udp_ref_dup(int dst, int src) {
+    if (!g_udp_refs || src < 0 || src >= HL_NFD || dst < 0 || dst >= HL_NFD || !g_udp_ref[src]) return;
+    uint32_t slot = g_udp_ref[src] - 1;
+    __atomic_add_fetch(&g_udp_refs[slot].refs, 1, __ATOMIC_ACQ_REL);
+    g_udp_ref[dst] = g_udp_ref[src];
+}
+
+static void udp_ref_drop(int fd) {
+    if (!g_udp_refs || fd < 0 || fd >= HL_NFD || !g_udp_ref[fd]) return;
+    uint32_t slot = g_udp_ref[fd] - 1;
+    g_udp_ref[fd] = 0;
+    if (__atomic_sub_fetch(&g_udp_refs[slot].refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        unlink(g_udp_refs[slot].path);
+        g_udp_refs[slot].path[0] = 0;
+        __atomic_store_n(&g_udp_refs[slot].used, 0, __ATOMIC_RELEASE);
+    }
 }
 
 static int seq_ref_pair(int first, int second) {
@@ -788,6 +989,9 @@ static void seq_ref_fork_prepare(void) {
         uint32_t slot = g_seq_ref[fd] - 1;
         __atomic_add_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
     }
+    if (g_udp_refs)
+        for (int fd = 0; fd < HL_NFD; fd++)
+            if (g_udp_ref[fd]) __atomic_add_fetch(&g_udp_refs[g_udp_ref[fd] - 1].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 static void seq_ref_fork_cancel(void) {
@@ -797,6 +1001,9 @@ static void seq_ref_fork_cancel(void) {
         uint32_t slot = g_seq_ref[fd] - 1;
         __atomic_sub_fetch(&g_seq_refs[slot].refs[g_seq_end[fd]], 1, __ATOMIC_ACQ_REL);
     }
+    if (g_udp_refs)
+        for (int fd = 0; fd < HL_NFD; fd++)
+            if (g_udp_ref[fd]) __atomic_sub_fetch(&g_udp_refs[g_udp_ref[fd] - 1].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 // fd -> (its socketpair/O_DIRECT-pipe PARTNER fd + 1); 0 = no known partner. Recorded for both ends at
@@ -929,6 +1136,16 @@ static void lo_path(uint16_t port, char *out, size_t n) {
     snprintf(out, n, "%s/p%u", g_netns, (unsigned)port);
 }
 
+// A v6-only wildcard listener and an IPv4 wildcard listener may own the same
+// numeric port at once. Keep the v6-only rendezvous distinct; dual-stack IPv6
+// listeners retain the historical path so IPv4 and IPv6 clients share it.
+static void lo_tcp_path(uint16_t port, int v6only, char *out, size_t n) {
+    if (v6only)
+        snprintf(out, n, "%s/p6-%u", g_netns, (unsigned)port);
+    else
+        lo_path(port, out, n);
+}
+
 // Allocate an ephemeral loopback port for a bind(127.0.0.1:0). The kernel would assign a real port;
 // under the unix-socket emulation we instead pick a port whose `p<port>` path is still free so that a
 // later getsockname()/connect() round-trips to the same socket. (Without this, port 0 collapsed to a
@@ -948,8 +1165,23 @@ static uint16_t lo_alloc_ephemeral(void) {
 }
 
 // Swap the AF_INET socket at `fd` for a fresh AF_UNIX SOCK_STREAM one (keeping the fd number + flags).
+// SOL_SOCKET options a guest may set on its INET socket BEFORE the private-loopback swap replaces it with a
+// fresh AF_UNIX socket. Each is generic to SOL_SOCKET (valid + readable on AF_UNIX), so carrying them over
+// preserves both the option's effect (a receive timeout still fires, so a blocked recv wakes with EAGAIN
+// instead of hanging) and its get-after-set readback (SO_REUSEADDR/SO_REUSEPORT report 1, not the fresh
+// socket's 0). Options the guest sets AFTER the swap already land on the AF_UNIX fd directly.
+static const int lo_carry_opts[] = {SO_REUSEADDR, SO_REUSEPORT, SO_RCVTIMEO, SO_SNDTIMEO,
+                                    SO_KEEPALIVE, SO_BROADCAST, SO_OOBINLINE, SO_LINGER};
+
 static int lo_swap(int fd) {
     int fl = fcntl(fd, F_GETFL), df = fcntl(fd, F_GETFD);
+    // Snapshot the carried SOL_SOCKET options from the old (INET) fd before dup2 replaces it.
+    unsigned char ov[sizeof lo_carry_opts / sizeof lo_carry_opts[0]][64];
+    socklen_t ol[sizeof lo_carry_opts / sizeof lo_carry_opts[0]];
+    for (unsigned i = 0; i < sizeof lo_carry_opts / sizeof lo_carry_opts[0]; i++) {
+        ol[i] = sizeof ov[i];
+        if (getsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], &ol[i]) < 0) ol[i] = 0;
+    }
     int u = socket(AF_UNIX, SOCK_STREAM, 0);
     if (u < 0) return -1;
     if (u != fd) {
@@ -962,6 +1194,10 @@ static int lo_swap(int fd) {
     // keep non-blocking (async connect)
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    // Re-apply the carried options to the fresh AF_UNIX socket (best-effort: a value the AF_UNIX socket
+    // rejects is simply skipped, exactly as it would be ignored on the INET original).
+    for (unsigned i = 0; i < sizeof lo_carry_opts / sizeof lo_carry_opts[0]; i++)
+        if (ol[i]) setsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], ol[i]);
     return 0;
 }
 
@@ -1024,6 +1260,15 @@ static void fd_carry_sock(int dst, int src) {
     if (dst < 0 || dst >= HL_NFD || src < 0 || src >= HL_NFD) return;
     g_sock_stream[dst] = g_sock_stream[src];
     g_sock_dgram[dst] = g_sock_dgram[src];
+    udp_ref_dup(dst, src);
+    g_udp_local_port[dst] = g_udp_local_port[src];
+    g_udp_peer_port[dst] = g_udp_peer_port[src];
+    g_udp_local_ip[dst] = g_udp_local_ip[src];
+    g_udp_peer_ip[dst] = g_udp_peer_ip[src];
+    g_udp_local_interface[dst] = g_udp_local_interface[src];
+    g_udp_peer_interface[dst] = g_udp_peer_interface[src];
+    g_udp_local_v6[dst] = g_udp_local_v6[src];
+    g_udp_peer_v6[dst] = g_udp_peer_v6[src];
     g_sock_seqpacket[dst] = g_sock_seqpacket[src];
     seq_ref_dup(dst, src);
     g_sock_pair_peer[dst] = g_sock_pair_peer[src]; // dup aliases the same end -> same partner
@@ -1033,6 +1278,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_fam[dst] = g_sock_fam[src];
     g_lo_port[dst] = g_lo_port[src];
     g_lo_v6[dst] = g_lo_v6[src];
+    g_lo_v6only[dst] = g_lo_v6only[src];
     g_br_port[dst] = g_br_port[src];
     g_br_ip[dst] = g_br_ip[src];
     g_br_interface[dst] = g_br_interface[src];
@@ -1205,6 +1451,12 @@ static int lo_any_is(const uint8_t *sa, socklen_t l) {
 static void br_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
     const uint8_t *b = (const uint8_t *)&ip_be;
     snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netif[interface].path, b[0], b[1], b[2], b[3], (unsigned)port);
+}
+
+static void br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
+    br_path(interface, ip_be, port, out, n);
+    size_t length = strlen(out);
+    if (length < n) snprintf(out + length, n - length, ".v6only");
 }
 
 // bind(:0) on the bridge -> a free, round-trippable ephemeral port keyed by OUR ip (cf. lo_alloc_ephemeral)
@@ -1459,7 +1711,7 @@ static void fwd_maybe_start(int fd) {
         br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
-        lo_path(cport, upath, sizeof upath);
+        lo_tcp_path(cport, g_lo_v6only[fd], upath, sizeof upath);
     } else
         return; // real host bind (no switch redirect) -> already natively reachable, nothing to do
     if (!pm_published(cport)) return; // not a published port
@@ -1514,6 +1766,131 @@ static int udp_swap(int fd) {
     }
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+// Route every private-network IPv4 datagram through the same AF_UNIX rendezvous namespace as streams.
+// The pathname is also the sender identity returned by recvfrom/recvmsg, so replies need no side table.
+static int udp_switch_bind(int fd, int interface, uint32_t ip, uint16_t port) {
+    char path[200];
+    if (!port) port = interface >= 0 ? br_alloc_ephemeral(interface) : lo_alloc_ephemeral();
+    if (!port) { errno = EADDRINUSE; return -1; }
+    if (interface >= 0) br_path(interface, ip, port, path, sizeof path);
+    else lo_path(port, path, sizeof path);
+    struct sockaddr_un un;
+    if (unix_addr_set(&un, path) < 0) return -1;
+    if (!g_udp_local_port[fd] && udp_swap(fd) < 0) return -1;
+    unlink(path);
+    if (bind(fd, (struct sockaddr *)&un, sizeof un) < 0) return -1;
+    if (udp_ref_create(fd, path) < 0) {
+        int saved = errno;
+        unlink(path);
+        errno = saved;
+        return -1;
+    }
+    g_udp_local_port[fd] = port;
+    g_udp_local_ip[fd] = ip;
+    g_udp_local_interface[fd] = (uint8_t)(interface + 1);
+    return 0;
+}
+
+static int udp_switch_ensure_source(int fd, int interface) {
+    if (g_udp_local_port[fd]) return 0;
+    return udp_switch_bind(fd, interface, interface >= 0 ? g_netif[interface].ip : 0, 0);
+}
+
+static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interface, uint32_t *ip,
+                                  uint16_t *port, char *path, size_t capacity) {
+    if (lo_on() && lo6_is(sa, len)) {
+        *ip = 0;
+        *port = ntohs(*(const uint16_t *)(sa + 2));
+        *interface = -1;
+        lo_path(*port, path, capacity);
+        return 1;
+    }
+    if (!sa || len < 8 || *(const uint16_t *)sa != AF_INET) return 0;
+    *ip = *(const uint32_t *)(sa + 4);
+    *port = ntohs(*(const uint16_t *)(sa + 2));
+    if (lo_on() && sa[4] == 127) {
+        *interface = -1;
+        lo_path(*port, path, capacity);
+        return 1;
+    }
+    *interface = br_on() ? br_for_ip(*ip) : -1;
+    if (*interface >= 0) {
+        br_path(*interface, *ip, *port, path, capacity);
+        return 1;
+    }
+    return 0;
+}
+
+// Materialize the rendezvous address for a logically-connected switch-backed UDP socket. UDP connect
+// records a default peer but deliberately leaves the AF_UNIX transport unconnected: unlike AF_UNIX,
+// Linux UDP connect succeeds when no process is listening and reports refusal on later I/O.
+static int udp_switch_peer_path(int fd, char *path, size_t capacity) {
+    if (fd < 0 || fd >= HL_NFD || !g_udp_peer_port[fd]) return 0;
+    int interface = (int)g_udp_peer_interface[fd] - 1;
+    if (interface >= 0)
+        br_path(interface, g_udp_peer_ip[fd], g_udp_peer_port[fd], path, capacity);
+    else
+        lo_path(g_udp_peer_port[fd], path, capacity);
+    return 1;
+}
+
+// write(2)/writev(2) are valid send operations on a connected datagram socket. The private UDP
+// transport deliberately keeps its AF_UNIX backing unconnected so Linux connect() can succeed before
+// a peer binds; route descriptor writes to the recorded logical peer explicitly instead of writing the
+// unconnected host socket and leaking EDESTADDRREQ to applications such as BusyBox nc.
+static int udp_switch_write(int fd, const struct iovec *iov, int iov_count, int64_t *result) {
+    char path[200];
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd] ||
+        !udp_switch_peer_path(fd, path, sizeof path))
+        return 0;
+    int interface = (int)g_udp_peer_interface[fd] - 1;
+    if (udp_switch_ensure_source(fd, interface) < 0) {
+        *result = -errno;
+        return 1;
+    }
+    struct sockaddr_un address;
+    if (unix_addr_set(&address, path) < 0) {
+        *result = -errno;
+        return 1;
+    }
+    struct msghdr message;
+    memset(&message, 0, sizeof message);
+    message.msg_name = &address;
+    message.msg_namelen = sizeof address;
+    message.msg_iov = (struct iovec *)iov;
+    message.msg_iovlen = iov_count;
+    ssize_t sent = sendmsg(fd, &message, 0);
+    *result = sent < 0 ? -errno : sent;
+    return 1;
+}
+
+static int udp_switch_source(const struct sockaddr_storage *source, socklen_t length, uint8_t *guest,
+                             socklen_t *guest_length) {
+    if (!source || source->ss_family != AF_UNIX || length < offsetof(struct sockaddr_un, sun_path) + 2)
+        return 0;
+    const char *path = ((const struct sockaddr_un *)source)->sun_path;
+    unsigned port;
+    if (g_netns[0] && !strncmp(path, g_netns, strlen(g_netns)) &&
+        sscanf(path + strlen(g_netns), "/p%u", &port) == 1) {
+        fill_inet_lo(guest, guest_length, (uint16_t)port);
+        return 1;
+    }
+    for (int i = 0; i < g_netif_count; i++) {
+        size_t prefix = strlen(g_netif[i].path);
+        unsigned a, b, c, d;
+        if (!strncmp(path, g_netif[i].path, prefix) &&
+            sscanf(path + prefix, "/%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 &&
+            a < 256 && b < 256 && c < 256 && d < 256 && port < 65536) {
+            uint8_t bytes[4] = {(uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d};
+            uint32_t address;
+            memcpy(&address, bytes, sizeof address);
+            fill_inet_br(guest, guest_length, address, (uint16_t)port);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -2093,6 +2470,18 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
     if (!saxl_on() || !m || m->sa_family != AF_UNIX) return -1;
     const struct sockaddr_un *u = (const struct sockaddr_un *)m;
     size_t off = offsetof(struct sockaddr_un, sun_path);
+    // Abstract-namespace name (leading NUL), including a kernel autobind address: an opaque binary blob,
+    // not a filesystem path -- echo it to the guest verbatim (no volume/path translation, no NUL scan).
+    if ((size_t)mlen > off && u->sun_path[0] == 0) {
+        size_t alen = (size_t)mlen - off;
+        uint8_t t[2 + sizeof u->sun_path];
+        if (alen > sizeof u->sun_path) alen = sizeof u->sun_path;
+        *(uint16_t *)t = AF_UNIX;
+        memcpy(t + 2, u->sun_path, alen);
+        int llen = (int)(2 + alen);
+        if (g && gcap) memcpy(g, t, (size_t)gcap < (size_t)llen ? gcap : (size_t)llen);
+        return llen;
+    }
     size_t hplen = (size_t)mlen > off ? (size_t)mlen - off : 0; // path bytes the host reported (no NUL guarantee)
     char hpath[256];
     size_t i = 0;
@@ -2384,18 +2773,34 @@ static void nl_done(uint8_t *b, size_t *o, uint32_t seq) {
     *o += 16;
 }
 
+// One RTM_NEWLINK for a modelled interface slot (0=lo, 1=eth0). Shared by the dump and the
+// single-interface (non-dump) query paths so both stay byte-identical.
+static void nl_link_slot(uint8_t *b, size_t *o, uint32_t seq, int slot) {
+    uint8_t zero6[6] = {0}, ff6[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, mac[6];
+    if (slot == 0)
+        nl_link(b, o, seq, "lo", 1, 772 /*ARPHRD_LOOPBACK*/, 0x10049u /*UP|LOOP|RUN|LOWER_UP*/, zero6, 65536, zero6);
+    else {
+        netif_eth0_mac(mac);
+        nl_link(b, o, seq, "eth0", 2, 1 /*ARPHRD_ETHER*/, 0x11043u /*UP|BCAST|RUN|MCAST|LOWER_UP*/, mac, 1500, ff6);
+    }
+}
+
+// Resolve a non-dump RTM_GETLINK target (ifi_index and/or IFLA_IFNAME) to a modelled slot, or -1 if
+// no such interface exists (eth0 is absent under --network none). Mirrors the dump's lo(+eth0) set.
+static int nl_link_slot_for(int32_t idx, const char *name) {
+    if (idx == 1 || (name && strcmp(name, "lo") == 0)) return 0;
+    if (!net_isolate() && (idx == 2 || (name && strcmp(name, "eth0") == 0))) return 1;
+    return -1;
+}
+
 // Build + queue (one datagram to `peer`) the dump for request `type` with echoed `seq`.
 static void nl_emit_dump(int peer, uint16_t type, uint32_t seq) {
     uint8_t out[4096];
     size_t o = 0;
     if (type == NL_RTM_GETLINK) {
-        uint8_t zero6[6] = {0}, ff6[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, mac[6];
-        netif_eth0_mac(mac);
-        nl_link(out, &o, seq, "lo", 1, 772 /*ARPHRD_LOOPBACK*/, 0x10049u /*UP|LOOP|RUN|LOWER_UP*/, zero6, 65536, zero6);
+        nl_link_slot(out, &o, seq, 0); // lo
         // --network none: loopback-only, so eth0 is absent from the link dump (`ip link` sees just lo).
-        if (!net_isolate())
-            nl_link(out, &o, seq, "eth0", 2, 1 /*ARPHRD_ETHER*/, 0x11043u /*UP|BCAST|RUN|MCAST|LOWER_UP*/, mac, 1500,
-                    ff6);
+        if (!net_isolate()) nl_link_slot(out, &o, seq, 1); // eth0
     } else if (type == NL_RTM_GETADDR) {
         uint32_t lo4 = 0x0100007fu; // 127.0.0.1
         uint8_t lo6[16] = {0};
@@ -2491,6 +2896,44 @@ static void nl_error(int peer, const uint8_t *req_hdr, int err) {
     (void)w;
 }
 
+// NLM_F_DUMP = NLM_F_ROOT(0x100)|NLM_F_MATCH(0x200); the kernel routes a request to the dump handler
+// when either bit is set, otherwise to the single-object (.doit) handler.
+#define NL_NLM_F_DUMP 0x300
+
+// A non-dump RTM_GETLINK targets one interface by ifi_index or IFLA_IFNAME. Emit its single
+// RTM_NEWLINK (no NLM_F_MULTI, no trailing NLMSG_DONE), or NLMSG_ERROR -ENODEV if it does not exist --
+// matching the kernel's rtnl_getlink, where the old code wrongly replied with the whole link dump.
+static void nl_getlink_one(int peer, const uint8_t *req, uint32_t nlen, uint32_t seq) {
+    int32_t idx = 0;
+    const char *name = NULL;
+    char nbuf[64];
+    if (nlen >= 16 + 16) idx = *(const int32_t *)(req + 16 + 4); // ifinfomsg.ifi_index
+    // Optional IFLA_IFNAME attribute after the ifinfomsg.
+    for (uint32_t ao = 16 + 16; ao + 4 <= nlen;) {
+        uint16_t rlen = *(const uint16_t *)(req + ao), rtype = *(const uint16_t *)(req + ao + 2);
+        if (rlen < 4 || ao + rlen > nlen) break;
+        if (rtype == 3 /*IFLA_IFNAME*/) {
+            uint16_t dl = rlen - 4;
+            if (dl >= sizeof nbuf) dl = sizeof nbuf - 1;
+            memcpy(nbuf, req + ao + 4, dl);
+            nbuf[dl] = 0;
+            name = nbuf;
+        }
+        ao += (rlen + 3u) & ~3u;
+    }
+    int slot = nl_link_slot_for(idx, name);
+    if (slot < 0) {
+        nl_error(peer, req, -ENODEV);
+        return;
+    }
+    uint8_t out[1024];
+    size_t o = 0;
+    nl_link_slot(out, &o, seq, slot);
+    *(uint16_t *)(out + 6) = 0; // clear NLM_F_MULTI: a single .doit reply carries no NLMSG_DONE
+    ssize_t w = send(peer, out, o, 0);
+    (void)w;
+}
+
 // A send on a netlink fd: walk the request's nlmsghdr(s) and queue each one's reply. Returns bytes
 // consumed (== len; requests are tiny) so the guest's send returns success.
 static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
@@ -2499,6 +2942,7 @@ static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
     while (off + 16 <= len) {
         uint32_t nlen = *(const uint32_t *)(buf + off);
         uint16_t ntype = *(const uint16_t *)(buf + off + 4);
+        uint16_t nflags = *(const uint16_t *)(buf + off + 6);
         uint32_t nseq = *(const uint32_t *)(buf + off + 8);
         // RTM message groups run base+0=NEW, +1=DEL, +2=GET, +3=SET. A GET (type%4==2) is a read the dump
         // responder answers; a NEW/DEL/SET (type%4!=2) is a MODIFICATION hl has no writable netlink stack to
@@ -2506,6 +2950,9 @@ static int64_t nl_send(int fd, const uint8_t *buf, size_t len) {
         // NLMSG_DONE, so `ip addr/route add`/SETLINK fail loudly rather than silently succeeding unchanged.
         if (ntype >= 16 && (ntype % 4) != 2)
             nl_error(peer, buf + off, -EPERM);
+        else if (ntype == NL_RTM_GETLINK && !(nflags & NL_NLM_F_DUMP))
+            // `ip link show dev X`: a single-interface query, not a dump -> one reply or -ENODEV.
+            nl_getlink_one(peer, buf + off, nlen < len - off ? nlen : (uint32_t)(len - off), nseq);
         else
             nl_emit_dump(peer, ntype, nseq);
         if (nlen < 16 || off + ((nlen + 3) & ~3u) <= off) break; // malformed -> stop
@@ -2834,20 +3281,25 @@ static int icmp_try_send(int fd, const uint8_t *input, size_t size, const uint8_
         *result = -EDESTADDRREQ;
         return 1;
     }
-    if (!br_on() || br_for_ip(peer) < 0) {
+    // Loopback ping (127/8) is a purely local echo: the kernel reflects the request without touching a wire,
+    // so synthesize the reply ourselves regardless of a configured bridge. This is the container-healthcheck
+    // `ping 127.0.0.1` / `ping localhost` case. Off-loopback still requires a bridge route.
+    int loopback = (peer & 0xffu) == 127u;
+    if (!loopback && (!br_on() || br_for_ip(peer) < 0)) {
         *result = -ENETUNREACH;
         return 1;
     }
     if (icmp_swap(fd) < 0) return 0;
     g_icmp_ip[fd] = peer;
     if (g_icmp_kind[fd] == 2) {
+        int bidx = br_for_ip(peer);
         memset(reply, 0, 20);
         reply[0] = 0x45;
         *(uint16_t *)(reply + 2) = htons((uint16_t)(20 + size));
         reply[8] = 64;
         reply[9] = 1;
         *(uint32_t *)(reply + 12) = peer;
-        *(uint32_t *)(reply + 16) = g_netif[br_for_ip(peer)].ip;
+        *(uint32_t *)(reply + 16) = bidx >= 0 ? g_netif[bidx].ip : peer;
         *(uint16_t *)(reply + 10) = icmp_checksum(reply, 20);
         icmp = reply + 20;
         reply_size += 20;

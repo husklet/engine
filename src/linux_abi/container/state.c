@@ -365,14 +365,14 @@ static int cgid(void) {
 #include "owner.h"
 #define HL_MODE_XATTR "user.hl.mode"
 
-static void mode_xattr_set_path(const char *hostpath, mode_t mode) {
+static int mode_xattr_set_path(const char *hostpath, mode_t mode) {
     uint32_t value = (uint32_t)mode & 07777u;
-    (void)hl_native_setxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0);
+    return hl_native_setxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0);
 }
 
-static void mode_xattr_set_fd(int fd, mode_t mode) {
+static int mode_xattr_set_fd(int fd, mode_t mode) {
     uint32_t value = (uint32_t)mode & 07777u;
-    (void)hl_native_fsetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0);
+    return hl_native_fsetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0);
 }
 
 static int mode_xattr_get(const char *hostpath, int fd, mode_t *mode) {
@@ -382,6 +382,87 @@ static int mode_xattr_get(const char *hostpath, int fd, mode_t *mode) {
     if (size != (ssize_t)sizeof value) return 0;
     *mode = (mode_t)(value & 07777u);
     return 1;
+}
+
+static int mode_xattr_fallback_error(int error) {
+    return error == EPERM || error == EACCES || error == ENOTSUP || error == EOPNOTSUPP;
+}
+
+static void mode_xattr_restore_path(const char *path, int existed, mode_t mode) {
+    if (existed)
+        (void)mode_xattr_set_path(path, mode);
+    else
+        (void)hl_native_removexattr(path, HL_MODE_XATTR, 0);
+}
+
+static void mode_xattr_restore_fd(int fd, int existed, mode_t mode) {
+    if (existed) {
+        (void)mode_xattr_set_fd(fd, mode);
+    } else {
+        char path[64];
+        int size = snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+        if (size > 0 && (size_t)size < sizeof path) (void)hl_native_removexattr(path, HL_MODE_XATTR, 0);
+    }
+}
+
+static int mode_transaction_fd(int fd, mode_t requested, mode_t host_mode) {
+    struct stat original;
+    mode_t old_virtual = 0;
+    int old_virtual_exists;
+    if (fstat(fd, &original) != 0) return -1;
+    old_virtual_exists = mode_xattr_get(NULL, fd, &old_virtual);
+    if (fchmod(fd, host_mode | S_IWUSR) == 0) {
+        int metadata_set = mode_xattr_set_fd(fd, requested) == 0;
+        int metadata_error = errno;
+        if (fchmod(fd, host_mode) == 0) {
+            struct stat committed;
+            if (metadata_set) return 0;
+            /* Unix sockets and some host filesystems reject user xattrs.  The
+             * transaction is still truthful when the native inode itself can
+             * represent the requested Linux permission bits: verify the
+             * committed mode and let stat use its native fallback. */
+            if (mode_xattr_fallback_error(metadata_error) && fstat(fd, &committed) == 0 &&
+                (committed.st_mode & 07777) == (requested & 07777))
+                return 0;
+            if (!metadata_set) errno = metadata_error;
+        } else if (!metadata_set) {
+            errno = metadata_error;
+        }
+    }
+    int error = errno;
+    (void)fchmod(fd, original.st_mode & 07777);
+    mode_xattr_restore_fd(fd, old_virtual_exists, old_virtual);
+    errno = error;
+    return -1;
+}
+
+static int mode_transaction_path(int directory, const char *path, const char *xattr_path, mode_t requested,
+                                 mode_t host_mode) {
+    struct stat original;
+    mode_t old_virtual = 0;
+    int old_virtual_exists;
+    if (fstatat(directory, path, &original, 0) != 0) return -1;
+    old_virtual_exists = mode_xattr_get(xattr_path, -1, &old_virtual);
+    if (fchmodat(directory, path, host_mode | S_IWUSR, 0) == 0) {
+        int metadata_set = mode_xattr_set_path(xattr_path, requested) == 0;
+        int metadata_error = errno;
+        if (fchmodat(directory, path, host_mode, 0) == 0) {
+            struct stat committed;
+            if (metadata_set) return 0;
+            if (mode_xattr_fallback_error(metadata_error) && fstatat(directory, path, &committed, 0) == 0 &&
+                (committed.st_mode & 07777) == (requested & 07777))
+                return 0;
+            if (!metadata_set) errno = metadata_error;
+        } else if (!metadata_set) {
+            errno = metadata_error;
+        }
+    }
+    int error = errno;
+    int restored = fchmodat(directory, path, original.st_mode & 07777, 0);
+    (void)restored;
+    mode_xattr_restore_path(xattr_path, old_virtual_exists, old_virtual);
+    errno = error;
+    return -1;
 }
 
 static mode_t stat_virt_mode(const struct stat *status, const char *hostpath, int fd) {
@@ -489,6 +570,11 @@ static int gid_permitted(int id) {
 static uint64_t g_cap_eff = HL_CAP_DEFAULT; // process EFFECTIVE cap set (capset(2) may narrow it)
 static uint64_t g_cap_bnd = HL_CAP_DEFAULT; // process BOUNDING cap set (PR_CAPBSET_DROP clears bits)
 static int g_nnp;                           // PR_SET/GET_NO_NEW_PRIVS: sticky; /proc/self/status NoNewPrivs
+static int g_securebits;                     // PR_SET/GET_SECUREBITS: the per-process securebits flags (0 default)
+// The file-mode creation mask. Forwarded to the host on umask(2) so real inode creation honours it, but ALSO
+// tracked here so /proc/self/status `Umask:` reflects the guest's current value (it was hardcoded 0022, so a
+// guest umask(2) changed real file modes yet the status line stayed 0022 -- a syscall-vs-/proc disagreement).
+static int g_umask = 022;
 // ---- image-derived supplementary groups (runc additionalGids) --------------------------------
 // A default `docker run` gives the container's run user (default root, uid 0) the supplementary GID set
 // runc DERIVES FROM THE IMAGE ROOTFS -- not a fixed constant. runc reads /etc/passwd for the run user's

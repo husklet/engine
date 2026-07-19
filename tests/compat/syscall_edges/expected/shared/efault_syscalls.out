@@ -1,0 +1,6 @@
+getrusage=14
+newfstatat=14
+gettimeofday=14
+times=14
+read=14
+pipe2=14

@@ -2,14 +2,18 @@
 #define _GNU_SOURCE
 #endif
 #include "system.h"
+#include "hl/engine.h"
+#include "hl/linux_abi.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #define HL_PRIVATE_PROCESSES 1024u
@@ -207,6 +211,44 @@ int hl_host_process_fd_private_add(int fd) {
     result = hl_private_add_unlocked(fd);
     (void)pthread_mutex_unlock(&hl_private_fork_lock);
     return result;
+}
+
+int hl_host_process_fd_private_floor(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -errno;
+    /* Split the native descriptor namespace into a low guest interval and a high private interval.  The
+     * old `host_limit - 4096` floor accidentally capped all typed host handles at 4096 even when the host
+     * offered hundreds of thousands of descriptors; MySQL's table cache can legitimately cross that
+     * boundary.  Keep at least 4096 private slots, but otherwise begin the private interval immediately
+     * after the enforceable guest ceiling so it can use the whole remaining host range. */
+    const rlim_t reserve = HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM;
+    const rlim_t maximum_guest = HL_LINUX_FD_LIMIT;
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT32_MAX) limit.rlim_cur = INT32_MAX;
+    if (limit.rlim_cur <= HL_HOST_GUEST_DESCRIPTOR_MINIMUM + reserve) return -EMFILE;
+    rlim_t guest = limit.rlim_cur - reserve;
+    if (guest > maximum_guest) guest = maximum_guest;
+    return (int)guest;
+}
+
+uint32_t hl_engine_guest_fd_limit(void) {
+    int floor = hl_host_process_fd_private_floor();
+    if (floor <= 0) return 0;
+    return (uint32_t)floor;
+}
+
+int hl_host_process_fd_private_adopt(int fd) {
+    if (fd < 0) return -EBADF;
+    int floor = hl_host_process_fd_private_floor();
+    if (floor < 0) return floor;
+    int relocated = fd >= floor ? fd : fcntl(fd, F_DUPFD_CLOEXEC, floor);
+    if (relocated < 0) return -errno;
+    int status = hl_host_process_fd_private_add(relocated);
+    if (status != 0) {
+        if (relocated != fd) close(relocated);
+        return status;
+    }
+    if (relocated != fd) close(fd);
+    return relocated;
 }
 
 static void hl_private_remove_unlocked(int fd) {

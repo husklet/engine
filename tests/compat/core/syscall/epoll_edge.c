@@ -79,6 +79,21 @@ int main(void) {
     int delno = epoll_ctl(ep3, EPOLL_CTL_DEL, a[0], &e2) < 0 && errno == ENOENT;  // now gone -> ENOENT
     printf("ctl add=%d exist=%d noent=%d self=%d perm=%d del=%d delno=%d\n",
            add1, exist, noent, self, perm, delok, delno);
+
+    // Closing a watched fd auto-removes it. Reusing that exact descriptor number is a fresh open file
+    // description and EPOLL_CTL_ADD must not inherit stale EEXIST membership from the closed one.
+    int reuse_ep = epoll_create1(0), old_pipe[2], new_pipe[2];
+    if (pipe(old_pipe) < 0) return 1;
+    int reused_number = old_pipe[0];
+    struct epoll_event reuse_event = {.events = EPOLLIN, .data.fd = reused_number};
+    int reuse_first = epoll_ctl(reuse_ep, EPOLL_CTL_ADD, reused_number, &reuse_event) == 0;
+    close(old_pipe[0]);
+    if (pipe(new_pipe) < 0) return 1;
+    reuse_event.data.fd = new_pipe[0];
+    int reuse_add = new_pipe[0] == reused_number &&
+                    epoll_ctl(reuse_ep, EPOLL_CTL_ADD, new_pipe[0], &reuse_event) == 0;
+    printf("reuse first=%d same=%d add=%d\n", reuse_first, new_pipe[0] == reused_number, reuse_add);
+    close(old_pipe[1]); close(new_pipe[0]); close(new_pipe[1]); close(reuse_ep);
     close(ep3); close(ep);
     close(a[0]); close(a[1]); close(b[0]); close(b[1]);
     return 0;

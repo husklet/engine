@@ -25,21 +25,43 @@ typedef struct hl_terminal_size {
 typedef struct hl_process_domain {
     uint64_t identity[2];
 } hl_process_domain;
+typedef struct hl_activation_process_info {
+    uint64_t host_id;
+    uint32_t initial;
+    uint32_t reserved;
+} hl_activation_process_info;
 
 HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
                                      hl_activation_process **out_process);
 HL_API hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa,
                                                 const char *config_path, const hl_activation_stdio *stdio,
                                                 hl_activation_process **out_process);
+/* Experimental activation plumbing for an engine/provider transport. The descriptor is borrowed and
+ * transferred with SCM_RIGHTS; it is not a guest descriptor and is never exposed through discovery. */
+HL_API hl_status hl_activation_start_with_transport(const char *executable, uint32_t guest_isa,
+                                                    const char *config_path, const hl_activation_stdio *stdio,
+                                                    int32_t transport, hl_activation_process **out_process);
 /* Starts the child in a new session with a controlling terminal. The returned
  * master descriptor is owned by the caller; stdin/stdout/stderr are merged on
  * it. The initial size is applied before the child can execute. */
 HL_API hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa,
                                               const char *config_path, hl_terminal_size size,
                                               int32_t *out_master, hl_activation_process **out_process);
+/* Starts with both a controlling terminal and a provider transport. The
+ * transport descriptor is borrowed under the same rules as
+ * hl_activation_start_with_transport. */
+HL_API hl_status hl_activation_start_terminal_with_transport(
+    const char *executable, uint32_t guest_isa, const char *config_path, hl_terminal_size size,
+    int32_t transport, int32_t *out_master, hl_activation_process **out_process);
 HL_API hl_status hl_terminal_resize(int32_t master, hl_terminal_size size);
 /* Returns the native child process identifier while the opaque handle exists. */
 HL_API hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id);
+/* Takes a deterministic snapshot of verified live process-domain members. Set
+ * capacity to zero to query the required count. A racing exit may make a
+ * subsequent snapshot smaller. */
+HL_API hl_status hl_activation_domain_processes(hl_process_domain domain, uint64_t initial_process_id,
+                                                hl_activation_process_info *processes, uint32_t capacity,
+                                                uint32_t *out_count);
 /* wait is idempotent: completed status/result values are cached in the handle. */
 HL_API hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out_exit);
 /* try_wait sets out_ready=0 without modifying out_exit while the child runs. */

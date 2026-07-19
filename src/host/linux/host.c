@@ -260,11 +260,22 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
                                                int wake_descriptor) {
     uint32_t index;
     hl_host_handle handle = 0;
-    if (descriptor >= 0 && hl_host_process_fd_private_add(descriptor) != 0)
-        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
-    if (wake_descriptor >= 0 && hl_host_process_fd_private_add(wake_descriptor) != 0) {
-        hl_host_process_fd_private_remove(descriptor);
-        return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    /* Process handles store a pid in this field, not a descriptor. */
+    if (descriptor >= 0 && kind != HL_LINUX_HANDLE_PROCESS) {
+        int adopted = hl_host_process_fd_private_adopt(descriptor);
+        if (adopted < 0) {
+            return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
+        descriptor = adopted;
+    }
+    if (wake_descriptor >= 0 && kind != HL_LINUX_HANDLE_PROCESS) {
+        int adopted = hl_host_process_fd_private_adopt(wake_descriptor);
+        if (adopted < 0) {
+            hl_host_process_fd_private_remove(descriptor);
+            close(descriptor);
+            return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
+        wake_descriptor = adopted;
     }
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < host->handle_capacity; ++index) {
@@ -574,7 +585,11 @@ static hl_host_result hl_linux_memory_unmap_range(void *context, hl_host_handle 
     hl_linux_handle_entry *entry;
     int status;
     long page = sysconf(_SC_PAGESIZE);
-    if (size == 0 || size > SIZE_MAX || page <= 0 || offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)
+    /* Linux requires the start address (and therefore the mapping-relative offset) to be page aligned,
+     * but accepts an arbitrary positive length and rounds its end up internally. File mappings commonly
+     * retain their exact byte length in the engine handle; memmap2 then passes that same non-page-aligned
+     * length to munmap. Rejecting it here incorrectly surfaced EINVAL to an otherwise valid Linux guest. */
+    if (size == 0 || size > SIZE_MAX || page <= 0 || offset % (uint64_t)page != 0)
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     entry = hl_linux_lookup_locked(host, mapping, HL_LINUX_HANDLE_MAPPING);
@@ -753,7 +768,9 @@ static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_ma
         /* Publish the replacement under the same opaque handle and generation.
            The inherited VMAs remain mapped until publication is complete, so a
            new alias can never be accidentally removed through a reused VA. */
-        if (hl_host_process_fd_private_add(descriptor) != 0) goto fresh_failed;
+        int adopted = hl_host_process_fd_private_adopt(descriptor);
+        if (adopted < 0) goto fresh_failed;
+        descriptor = adopted;
         pthread_mutex_lock(&host->lock);
         entry = hl_linux_lookup_locked(host, mapping->handle, HL_LINUX_HANDLE_MAPPING);
         if (entry == NULL || entry->descriptor != inherited.descriptor || entry->address != inherited.address ||
@@ -1323,10 +1340,12 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     /* File-service path handles are deliberately opened with O_PATH. fchmod(2) rejects those descriptors;
-       operate on the pinned object through the empty relative path instead, preserving the handle identity
-       without resolving the caller's original pathname again. */
+       operate on the pinned object through fchmodat2's empty relative path instead, preserving the handle
+       identity without resolving the caller's original pathname again.  The legacy fchmodat syscall has no
+       flags argument on Linux; libc emulation cannot implement AT_EMPTY_PATH for an O_PATH descriptor and
+       returns EPERM on overlay-backed files. */
     do
-        status = fchmodat(descriptor, "", (mode_t)permissions, AT_EMPTY_PATH);
+        status = (int)syscall(452 /* fchmodat2 */, descriptor, "", (mode_t)permissions, AT_EMPTY_PATH);
     while (status != 0 && errno == EINTR);
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
@@ -1343,10 +1362,12 @@ static hl_host_result hl_linux_attachment_borrow_file_at_least(void *context, hl
     pthread_mutex_unlock(&host->lock);
     if (borrowed < 0)
         return descriptor < 0 ? hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0) : hl_linux_errno_result();
-    if (hl_host_process_fd_private_add(borrowed) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(borrowed);
+    if (adopted < 0) {
         close(borrowed);
         return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    borrowed = adopted;
     return hl_linux_result(HL_STATUS_OK, (uint64_t)(unsigned)borrowed, 0);
 }
 

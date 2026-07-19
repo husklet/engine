@@ -79,6 +79,7 @@ void hl_x86_x87_store_ext80_pop(struct cpu *cpu) {
 void hl_x86_fxsave(struct cpu *cpu) {
     uint8_t *image = (uint8_t *)(uintptr_t)cpu->x87_ea;
     uint32_t mxcsr = 0x1f80;
+    uint16_t fsw_exc = 0; // x87 FSW exception flags (bits 0..5) + ES(7)/B(15), projected from host FPSR
 #if defined(__aarch64__)
     uint64_t fpcr;
     uint64_t fpsr;
@@ -89,13 +90,18 @@ void hl_x86_fxsave(struct cpu *cpu) {
         uint32_t x86_rounding = ((arm_rounding & 1u) << 1) | ((arm_rounding >> 1) & 1u);
         static const unsigned fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
         mxcsr |= x86_rounding << 13;
-        for (unsigned bit = 0; bit < 6; ++bit)
-            mxcsr |= (uint32_t)((fpsr >> fpsr_bit[bit]) & 1u) << bit;
+        for (unsigned bit = 0; bit < 6; ++bit) {
+            uint16_t raised = (uint16_t)((fpsr >> fpsr_bit[bit]) & 1u);
+            mxcsr |= (uint32_t)raised << bit;
+            fsw_exc |= (uint16_t)(raised << bit); // FSW exception bits are at the same positions as MXCSR
+        }
+        if (fsw_exc & (uint16_t)(~cpu->fpcw & 0x3f))
+            fsw_exc |= (uint16_t)0x8080; // ES(7) + B(15) if any raised exception is unmasked per FCW
     }
 #endif
     memcpy(image, &cpu->fpcw, 2);
     {
-        uint16_t status = (uint16_t)((cpu->fpsw & 0x4700) | ((cpu->fptop & 7) << 11));
+        uint16_t status = (uint16_t)((cpu->fpsw & 0x4700) | ((cpu->fptop & 7) << 11) | fsw_exc);
         memcpy(image + 2, &status, sizeof(status));
     }
     image[4] = 0xff;
@@ -132,7 +138,7 @@ void hl_x86_fxrstor(struct cpu *cpu) {
         fpcr = (fpcr & ~(UINT64_C(3) << 22)) | (uint64_t)arm_rounding << 22;
         fpsr &= ~UINT64_C(0x9f);
         for (unsigned bit = 0; bit < 6; ++bit)
-            fpsr |= (uint64_t)((mxcsr >> bit) & 1u) << fpsr_bit[bit];
+            fpsr |= (uint64_t)(((mxcsr | status) >> bit) & 1u) << fpsr_bit[bit];
         __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
         __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
     }

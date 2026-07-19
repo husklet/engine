@@ -37,7 +37,7 @@ int hl_x86_signal_capture(struct cpu *cpu, void *native_context, hl_x86_signal_c
                           void *callback_context);
 void hl_x86_signal_resume(struct cpu *cpu, void *native_context, uintptr_t dispatcher_return);
 int hl_x86_signal_fast_clock_fault(struct cpu *cpu, uintptr_t fault_address, void *native_context);
-int hl_x86_signal_raise_divide(struct cpu *cpu, const hl_x86_signal_queue *queue);
+int hl_x86_signal_raise_divide(struct cpu *cpu, const hl_x86_signal_queue *queue, int si_code);
 int hl_x86_signal_raise_trap(struct cpu *cpu, const hl_x86_signal_queue *queue);
 
 #endif

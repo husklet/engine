@@ -37,6 +37,7 @@ static int op_has_modrm(int two, uint8_t op) {
     if (op == 0xA8 || op == 0xA9) return 0;                      // test al/eax, imm
     if (op == 0x68 || op == 0x6A) return 0;                      // push imm
     if (op == 0xCC || op == 0xF1) return 0;
+    if (op == 0xD7) return 0; // XLATB: implicit operands (AL, DS:RBX), no ModRM
     // ALU group, mov, lea, test, group1/2/3, etc. all have modrm
     return 1;
 }
@@ -240,7 +241,10 @@ int hl_x86_decode(uint64_t pc, hl_x86_insn *I) {
                 scale = s >> 6;
                 idx = ((s >> 3) & 7) | (I->rexX << 3);
                 base = (s & 7);
-                if (((s >> 3) & 7) == 4 && !I->rexX) idx = -1; // no index
+                // VSIB (AVX2 gather VEX 0F38 90/91/92/93): the SIB index is a VECTOR register, so the
+                // GPR-only "index field == 4 means no index" rule does NOT apply -- ymm4 is a valid index.
+                int is_vsib = I->vex && I->vex_map == 2 && (op == 0x90 || op == 0x91 || op == 0x92 || op == 0x93);
+                if (((s >> 3) & 7) == 4 && !I->rexX && !is_vsib) idx = -1; // no index
                 if ((s & 7) == 5 && I->mod == 0) {
                     I->m_hasbase = 0;
                 } else {

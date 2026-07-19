@@ -14,6 +14,8 @@ compositor, and shader artifacts that do not belong in this generic container en
 `x86/build.sh` shell build helper. The TSV has one additional covered subject, marked
 `provenance_scope=external-bundle`, for a versioned procfd fixture that was never a file under that root. Thus the
 ledger has 880 subjects in total: 783 covered and 97 excluded. `ext_inventory.tsv` separately accounts for every
-legacy Rust `engine_matrix/ext` registration and points to its current C manifest. After replacing the `elf210`
-environment-hook registration with the production loader placement-seam unit test, the audit has no unaccounted
-engine behavior.
+legacy Rust `engine_matrix/ext` registration and points to its current C manifest. These ledgers cover
+repository-owned fixtures; they do not replace the legacy upstream LTP compliance lane. That separate
+430-registration lane is preserved under `tests/compliance/ltp`, pinned to its exact upstream commit, and runs
+through `make ltp-compliance` on both production guest ISAs. `make test-linux-production-full` includes it, so a
+green local-fixture matrix cannot hide a regression in the broader syscall surface.

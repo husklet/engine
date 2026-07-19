@@ -22,12 +22,9 @@ static int jail_ro(const char *abs) {
 // host fd -- the overlay merged-readdir only knows the image lowers + the upper and would return empty.
 // openat uses this to NOT tag a volume dir fd as an overlay dir (else getdents shows an empty mount).
 static int jail_is_vol(const char *abs) {
-    int nv = __atomic_load_n(&g_nvols, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < nv; i++)
-        if (!g_vols[i].dead && !strncmp(abs, g_vols[i].guest, g_vols[i].glen) &&
-            (abs[g_vols[i].glen] == '/' || abs[g_vols[i].glen] == 0))
-            return 1;
-    return 0;
+    char normalized[4200];
+    confine(abs, normalized, sizeof normalized);
+    return jail_match(normalized) >= 0;
 }
 
 // Convenience: resolve a (dirfd, raw) target to its guest abs path (same as abs_guest) and test RO.
@@ -95,7 +92,10 @@ static int resolve_at(const char *guest, char *final, size_t fn, int nofollow) {
         chroot_apply(guest, gbuf, sizeof gbuf);
     else
         snprintf(gbuf, sizeof gbuf, "%s", guest);
-    int xings = 0; // bounded volume-boundary crossings -- guards against a pathological mount stack
+    int xings = 0;   // bounded volume-boundary crossings -- guards against a pathological mount stack
+    int follows = 0; // total symlinks followed across restarts -- the per-walk `budget` below is reset on
+                     // every `goto restart`, so an ABSOLUTE self-referential symlink (loop -> /path/loop)
+                     // would restart forever; this persistent cap turns that into ELOOP like Linux (40).
 restart:;
     const char *rel;
     int volidx;
@@ -226,6 +226,7 @@ restart:;
         struct stat st;
         if (fstatat(fds[nf - 1], comp, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode)) {
             if (--budget < 0) {
+                resolve_loop_mark();
                 ret = -ELOOP;
                 goto out;
             }
@@ -240,6 +241,11 @@ restart:;
                 // Absolute link targets restart namespace routing at the guest root.  In particular, a
                 // link inside a bind volume may point outside that mount; bare mode's outer namespace is
                 // the host root, while container mode selects the configured rootfs.
+                if (++follows > 40) { // Linux caps symlink traversal at 40 (an absolute self-loop else spins)
+                    resolve_loop_mark();
+                    ret = -ELOOP;
+                    goto out;
+                }
                 if (path_concat(gbuf, sizeof gbuf, lk, tail) != 0) {
                     ret = -ENAMETOOLONG;
                     goto out;
@@ -354,17 +360,47 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
     request = (hl_open_request){
         absolute, strlen(absolute), HL_HOST_HANDLE_INVALID, intent, g_nlower != 0, jail_ro(absolute), 0};
     if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
+    {
+        const hl_provider_node *service = hl_provider_namespace_launch_resolve(absolute, strlen(absolute));
+        if (service != NULL) {
+            hl_host_result opened;
+            int placeholder;
+            int reserve_result;
+            if ((intent & (HL_OPEN_CREATE | HL_OPEN_DIRECTORY | HL_OPEN_PATH_ONLY)) != 0) return -EINVAL;
+            reserve_result = reserve != NULL ? reserve(reserve_opaque) : 0;
+            if (reserve_result < 0) return reserve_result;
+            opened = hl_provider_files_open_service(service->service, host_access | HL_HOST_FILE_NONBLOCK);
+            if (opened.status != HL_STATUS_OK) return vfs_host_error((hl_status)opened.status);
+            placeholder = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (placeholder < 0) {
+                (void)g_host_services->file->close(g_host_services->context, opened.value);
+                return -errno;
+            }
+            plan->directory = HL_HOST_HANDLE_INVALID;
+            plan->target = opened.value;
+            plan->target_type = HL_HOST_FILE_TYPE_REGULAR;
+            plan->path_size = 0;
+            plan->path[0] = 0;
+            if (created != NULL) *created = 0;
+            return placeholder;
+        }
+    }
     /* Complete namespace/read-only/overlay validation before open_beneath can
        create or truncate the host object. */
     native_parent = jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);
     if (native_parent < 0) return native_parent;
-    if (plan->kind == HL_OPEN_HOST_PATH && g_host_services &&
+    /* The native descriptor walk above resolves `..` after symlinks and can cross from a bind root
+       into its parent namespace. The host-service resolver is deliberately rooted in one selected
+       jail, so feeding it the same `..` path would clamp at that jail and overwrite the correct
+       native result (for example `/data/..` would remain inside the `/data` bind). */
+    if (plan->kind == HL_OPEN_HOST_PATH && !path_has_dotdot(absolute) && g_host_services &&
         g_host_services->file && g_host_services->file->resolve_beneath) {
         char rooted[8192];
         const char *relative;
         hl_host_handle route_root = g_root_handle;
         hl_host_file_resolution resolved;
         uint32_t policy = (intent & HL_OPEN_NOFOLLOW) ? HL_HOST_RESOLVE_NOFOLLOW_FINAL : 0;
+        if (intent & HL_OPEN_NO_SYMLINKS) policy |= HL_HOST_RESOLVE_NO_SYMLINKS;
         if (intent & HL_OPEN_CREATE) policy |= HL_HOST_RESOLVE_ALLOW_MISSING;
         if (g_chroot[0])
             chroot_apply(absolute, rooted, sizeof rooted);

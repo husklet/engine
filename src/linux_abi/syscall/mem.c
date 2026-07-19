@@ -263,12 +263,16 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         //     [a0, a0+len); the partial edge pages stay mapped. The guest's logical unmap still succeeds
         //     (return 0) -- matching Linux, which never faults an unmap of a partial/already-unmapped range.
         size_t hp = (size_t)getpagesize();
-        int complete = (a0 & (hp - 1)) == 0 && (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000);
+        uint64_t physical_address = 0, physical_length = 0;
+        int has_physical = hl_gmap_find_physical(a0, &physical_address, &physical_length);
+        int complete = (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000) &&
+                       (((a0 & (hp - 1)) == 0) || (has_physical && physical_address != a0));
         int r;
         uint64_t u_lo, u_hi; // the range host munmap actually cleared (empty when u_lo==u_hi)
         if (complete) {
             len = (size_t)full; // include the guard tail; whole extent is ours -> round-up is safe
-            r = munmap((void *)a0, len);
+            r = munmap((void *)(uintptr_t)(has_physical ? physical_address : a0),
+                       (size_t)(has_physical ? physical_length : len));
             u_lo = a0, u_hi = a0 + len;
         } else {
             uint64_t lo = (a0 + hp - 1) & ~(uint64_t)(hp - 1); // first host page fully in range
@@ -285,8 +289,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             hl_gmap_unmap_range(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
             filemap_unmap(u_lo, u_hi);
-            futex_shared_unmap(u_lo, u_hi);         // drop/trim shared-futex-key coverage for the released range
-            wipefork_del(u_lo, u_hi - u_lo);        // a wipe-on-fork range that was unmapped no longer applies
+            futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
+            wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
+            dontfork_del(u_lo, u_hi - u_lo); // ...nor does a dont-fork marking on the released range
             hl_gmap_lock_remove(u_lo, u_hi - u_lo); // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
             // (SIGSEGV). Without this the JIT's lazy zero-page grower (jit86_lazyguard) would re-serve the
@@ -336,6 +341,38 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         const uint64_t guard = 0x10000;
         uint64_t tracked = hl_gmap_find_length(a0);       // full mapped extent at a0 (incl. guard), 0 if untracked
         uint64_t phys = tracked ? tracked : (uint64_t)a1; // bytes we can assume are mapped at a0
+        // MREMAP_DONTUNMAP(4): duplicate the mapping to a new address while the OLD range STAYS mapped as
+        // fresh zero-filled anonymous memory (Linux mm/mremap.c). Requires MREMAP_MAYMOVE, an unchanged
+        // length, and a private-anon source (the only case Linux accepts); anything else is EINVAL. Place a
+        // fresh private-anon copy (+guard) at a kernel-chosen address, copy the bytes, then re-establish the
+        // source range as zero anon so it remains readable/writable. Handled before the FIXED/shrink/grow
+        // paths, which all assume the source is released.
+        if (a3 & 4) {
+            if (!(a3 & 1) || (uint64_t)a2 != (uint64_t)a1 || anon_prot_if_contained(a0, (size_t)a1) < 0) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            void *r = mmap(0, (size_t)a2 + guard, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (r == MAP_FAILED) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            memcpy(r, (void *)a0, (size_t)a1);
+            // Re-zero the source in place (DONTUNMAP leaves it mapped as fresh anon zero pages).
+            mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);
+            hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);
+            anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
+            anon_update_prot(a0, (uint64_t)a1, PROT_READ | PROT_WRITE); // source is writable zero anon again
+            gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+            gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
+            gna_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            gro_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
+            G_SMC_UNMAP((uint64_t)r, (uint64_t)r + (uint64_t)a2);
+            G_RET(c) = (uint64_t)r;
+            break;
+        }
         // MREMAP_FIXED(2): relocate the mapping to EXACTLY new_addr (a4), the way mremap(MREMAP_FIXED) does.
         // Linux (mm/mremap.c) requires MREMAP_MAYMOVE to also be set, a page-aligned new_addr, and that the
         // new range not overlap the old -- otherwise -EINVAL. It then unmaps whatever sat at the destination
@@ -380,6 +417,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
                         hl_gmap_lock_remove(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
+                        dontfork_del(a0, (uint64_t)a1);
                     }
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
                     hl_gmap_set_guest_length(a4, (uint64_t)a2);
@@ -396,7 +434,38 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             // file-backed source (or anon placement failed): fall through -- do NOT break.
         }
-        // Shrink, or a grow that still fits within the already-mapped extent: stay in place, touch nothing.
+        // Genuine shrink: Linux mremap(new_len < old_len) unmaps the released tail [a0+new_len, a0+old_len)
+        // in place (the base and surviving prefix are unchanged). Merely returning a0 -- as an earlier
+        // "grow that fits the extent" fast path did -- left those pages mapped, so a guest access to the
+        // released tail wrongly succeeded instead of faulting. Round new_len up to a guest page (Linux
+        // rounds the length) and release everything from there to the end of the tracked extent (which
+        // also drops the internal guard tail), then retire every registry over the freed range exactly as
+        // munmap does so /proc, the anon/file/futex/lock maps, and the PROT_NONE fault registry all agree.
+        {
+            size_t gpg = guest_pagesz();
+            uint64_t nlen = ((uint64_t)a2 + gpg - 1) & ~((uint64_t)gpg - 1);
+            if (nlen < (uint64_t)a1) {
+                uint64_t nend = a0 + nlen, oend = a0 + phys;
+                if (oend > nend) {
+                    munmap((void *)nend, (size_t)(oend - nend));
+                    hl_gmap_unmap_range(nend, oend); // trim the tracked mapping, keep [a0, nend)
+                    anon_split_unmap(nend, oend);
+                    filemap_unmap(nend, oend);
+                    futex_shared_unmap(nend, oend);
+                    wipefork_del(nend, oend - nend);
+                    dontfork_del(nend, oend - nend);
+                    hl_gmap_lock_remove(nend, oend - nend);
+                    gbus_clear(nend, oend);
+                    // The released tail is genuinely unmapped now -> a guest access must fault. Record it in
+                    // the PROT_NONE fault registry so the lazy zero-page grower does not silently re-serve it.
+                    gna_add(nend, (oend + 0xfff) & ~(uint64_t)0xfff);
+                    G_SMC_UNMAP(nend, oend);
+                }
+                G_RET(c) = a0;
+                break;
+            }
+        }
+        // A grow that still fits within the already-mapped extent: stay in place, touch nothing.
         if ((uint64_t)a2 <= phys) {
             G_RET(c) = a0;
             break;
@@ -460,6 +529,22 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        // MAP_FIXED requires a page-aligned address: Linux mmap validates this up front (mm/mmap.c
+        // addr & ~PAGE_MASK -> EINVAL) BEFORE reserving anything. Reject a misaligned fixed address here so
+        // it never reaches the MAP_FIXED reconciliation below, whose neighbour-preserving memcpy would
+        // otherwise dereference the misaligned low page (a bogus (void*)(ps+1) target) and fault the engine.
+        if ((a3 & 0x10) && (a0 & (uint64_t)(guest_pagesz() - 1))) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // memfd write seal: a MAP_SHARED mapping that carries write permission over a file sealed with
+        // F_SEAL_WRITE (0x8) is refused with EPERM (Linux mm/shmem.c seal check). A PROT_READ shared map
+        // (no write) and a MAP_PRIVATE copy-on-write map are unaffected, so gate strictly on shared+write.
+        if (!(a3 & 0x20) && (a3 & 0x01) && ((int)a2 & PROT_WRITE) && (int)a4 >= 0 && (int)a4 < HL_NFD &&
+            (memfd_seals_fd((int)a4) & 0x8)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EPERM);
+            break;
+        }
         // File-backed mmap of a RAM-backed scratch fd: flush the cache so the mapping sees the real bytes.
         if (!(a3 & 0x20)) memf_materialize((int)a4);
         // charge anon, but NOT MAP_NORESERVE
@@ -478,11 +563,21 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // glibc's vectorized string ops over-read up to 16 bytes past a buffer's logical end; on Darwin
         // that hits an unmapped page -> SIGBUS. Map a 64KB guard tail on non-fixed anon maps so the
         // over-read lands in mapped zero memory (x86 glibc relies on this; harmless for aarch64).
-        size_t guard = (!(a3 & 0x10) && (a3 & 0x20)) ? 0x10000 : 0;
+        // MAP_FIXED_NOREPLACE (0x100000) forwards to the host, whose EEXIST verdict must reflect ONLY the
+        // guest's requested range -- a guard tail would let a collision in the extra pages spuriously fail
+        // (or a free-space map succeed where the tail overlaps), so keep NOREPLACE maps exact-length.
+        size_t guard = (!(a3 & 0x10) && (a3 & 0x20) && !(a3 & 0x100000)) ? 0x10000 : 0;
         // mprotect (case 226) is a no-op (the JIT never executes guest pages), so a later PROT_READ ->
         // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
         // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
+#if defined(__linux__)
+        // Linux host pages have the same granularity as this Linux ABI, so preserve the requested mapping
+        // protection.  In particular, a PROT_NONE reservation must stay inaccessible until mprotect commits
+        // it; the mprotect path below performs the real host transition on this platform.
+        int prot = (int)a2;
+#else
         int prot = (a3 & 0x20) ? ((int)a2 | PROT_READ | PROT_WRITE) : (int)a2;
+#endif
         // W6A item 3: guest RWX / PROT_EXEC mmaps (JVM/V8/LuaJIT/.NET/PyPy JIT arenas). On macOS a
         // non-MAP_JIT mmap that requests PROT_EXEC fails with EPERM under the hardened W^X policy, so
         // these guests can't allocate their code arena. But this is a DBT: the host NEVER executes guest
@@ -509,12 +604,19 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t hp = (size_t)getpagesize();
         void *r;
         int off_emul = 0;
+        void *physical_mapping = NULL;
+        size_t physical_mapping_size = 0;
         uint64_t bus_accessible = a1;
         int bus_prepared = 0;
         int mapping_prepared = 0;
+        // The past-EOF SIGBUS ledger + tail zero-fill below are keyed off st_size, which only bounds the
+        // readable data of a REGULAR file. A character device (/dev/zero, /dev/full backed by /dev/zero,
+        // /dev/mem) reports st_size 0 yet mmaps to an unlimited zero page on Linux -- treating it as a
+        // 0-length file armed the whole mapping for guest SIGBUS, so a plain read of an mmap'd /dev/zero
+        // page terminated the guest (SIGBUS) where Linux returns zero. Restrict the emulation to S_ISREG.
         if (!(a3 & 0x20) && (a3 & 0x02) && (int)a4 >= 0) {
             struct stat metadata;
-            if (fstat((int)a4, &metadata) == 0) {
+            if (fstat((int)a4, &metadata) == 0 && S_ISREG(metadata.st_mode)) {
                 uint64_t available = (uint64_t)metadata.st_size > a5 ? (uint64_t)metadata.st_size - a5 : 0;
                 bus_accessible = available > UINT64_MAX - UINT64_C(4095)
                                      ? UINT64_MAX
@@ -538,6 +640,21 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint64_t ch = hl_linux_snapshot_reserve(&g_ckpt_snapshot, (uint64_t)a1 + guard);
             if (ch) a0 = ch;
         }
+        // A non-PIE ET_EXEC is logically mapped at its low Linux link addresses but physically stored in
+        // the high host arena. The host kernel therefore sees a low mmap hint overlapping the executable
+        // as free and may honor it, while Linux would relocate the mapping because that guest range is busy.
+        // Node 18's V8 allocator hinted 0xf00000 inside its 0x400000.. image, received that colliding address,
+        // then the non-PIE fold correctly rebased a heap-header store into RX text. Treat such a non-fixed
+        // hint as unavailable and let the host choose a genuinely free address. MAP_FIXED retains replacement
+        // semantics and is handled separately.
+        if (a0 && !(a3 & 0x10) && g_nonpie_lo && a0 < g_nonpie_hi && a0 + a1 > g_nonpie_lo)
+            a0 = 0;
+        // The anonymous compatibility tail is host-visible but not part of the guest's requested range.
+        // Darwin may honor an executable mapping hint placed in a hole between ELF segments even when
+        // that hidden tail reaches the next segment; unmapping the generated-code allocation then removes
+        // live image pages. Let Darwin choose a genuinely free address for non-fixed JIT mappings. Their
+        // address is not contractual, and reservation/commit hints without PROT_EXEC keep their cage path.
+        if (a0 && !(a3 & 0x10) && (a3 & 0x20) && (a2 & PROT_EXEC)) a0 = 0;
 #ifdef PCACHE_MMAP_HINT
         // (pcache): give the dynamic linker's file-backed, non-fixed, kernel-placed maps (library
         // loads) a DETERMINISTIC base hint so their translated blocks are reusable across runs of the same
@@ -569,29 +686,26 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 fixed286 = 1;
             }
         }
+        if (fixed286 && r != MAP_FAILED && !(a3 & 0x20) && (a3 & 0x01)) off_emul = 2;
         if (!fixed286)
             r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
         // Host-page-unaligned file offset. macOS uses 16 KB pages and its mmap requires the FILE OFFSET to
         // be a multiple of the host page size, but a Linux guest (4 KB pages) may legitimately map a file at
         // any 4 KB-granular offset. A non-MAP_FIXED file map whose offset is 4 KB- but not 16 KB-aligned is
-        // therefore rejected with EINVAL (gcc maps its spec files at off=0x1000 and dies with an "internal
-        // compiler error"). ld.so never trips this -- it maps its extra segments MAP_FIXED, which the
-        // reconciliation block below already emulates -- which is why it stayed hidden. Emulate it the same
-        // way: a kernel-chosen (a0 honored as a placement hint) private-anon region preloaded from the file
-        // at the requested offset. RW so a later PROT upgrade is already in effect (mprotect is a no-op); a
-        // short pread past EOF leaves the tail as anon zero, exactly as Linux presents it. Gated on the
-        // direct mmap having FAILED for such an offset, so every aligned/fixed map keeps the native path and
-        // is byte-identical. (A writable MAP_SHARED map at such an offset loses write-back -- the same
-        // limitation the MAP_FIXED emulation has -- but read-only/private maps, the common case, are exact.)
+        // therefore rejected with EINVAL. Map from the preceding host-page-aligned file offset and return
+        // the Linux-page-aligned subrange. The physical head remains tracked for complete munmap/exec cleanup.
+        // Keeping the real vnode mapping is essential for MAP_SHARED aliases: runtimes such as CoreCLR map
+        // one memfd RW and RX, then initialize executable stubs through the writable alias.
         if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && ((off_t)a5 & (off_t)(hp - 1))) {
-            void *ar = mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-            if (ar != MAP_FAILED) {
-                if (pread_retry((int)a4, ar, (size_t)a1, (off_t)a5) < 0) {
-                    munmap(ar, (size_t)a1);
-                } else {
-                    r = ar;
-                    off_emul = 1;
-                }
+            size_t head = (size_t)((off_t)a5 & (off_t)(hp - 1));
+            off_t aligned_offset = (off_t)a5 - (off_t)head;
+            size_t mapped_size = (size_t)a1 + head;
+            void *base = mmap(NULL, mapped_size, prot, mmap_flags((int)a3), (int)a4, aligned_offset);
+            if (base != MAP_FAILED) {
+                physical_mapping = base;
+                physical_mapping_size = mapped_size;
+                r = (char *)base + head;
+                off_emul = 0;
             }
         }
         // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
@@ -610,7 +724,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // must stay the real shared mapping; ld.so's .so segments are all MAP_PRIVATE, so julia is covered.
         if (r != MAP_FAILED && !off_emul && !fixed286 && (a3 & 0x02) && !(a3 & 0x20) && (int)a4 >= 0 && a1) {
             struct stat st;
-            if (fstat((int)a4, &st) == 0) {
+            if (fstat((int)a4, &st) == 0 && S_ISREG(st.st_mode)) {
                 uint64_t avail = (uint64_t)st.st_size > a5 ? (uint64_t)st.st_size - (uint64_t)a5 : 0;
                 uint64_t valid_end = (avail + hp - 1) & ~(uint64_t)(hp - 1); // first host page wholly past EOF
                 if (valid_end < a1)
@@ -649,8 +763,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     munmap(ar, (size_t)a1 + head);
                     ar = MAP_FAILED;
                 }
-                if (ar != MAP_FAILED)
+                if (ar != MAP_FAILED) {
                     r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
+                    off_emul = 2;
+                }
             }
             free(hsave);
         }
@@ -692,10 +808,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r != MAP_FAILED) {
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
-            hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard);      // track for execve() teardown
+            if (physical_mapping != NULL)
+                hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,
+                                     (uint64_t)physical_mapping_size);
+            else
+                hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
-                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0,
+                                 off_emul == 2);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range
@@ -718,14 +839,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // DONTNEED anon registry: record PRIVATE-ANON ranges (incl. the guard tail); for any other
             // (file-backed/shared) mapping, forget overlapping anon coverage -- a MAP_FIXED file map may
             // now sit where anon used to, and we must never anon-remap over it.
-            if ((a3 & 0x20) && (a3 & 0x02))
+            if ((a3 & 0x20) && (a3 & 0x02)) {
+                // Keep the private-anon registry's CURRENT protection in sync: anon_prot_if_contained
+                // scans first-match, so a MAP_FIXED re-commit inside an EXISTING tracked reservation
+                // (Go's sysReserve(PROT_NONE) -> sysMap(MAP_FIXED, RW) heap pattern) must rewrite the
+                // overlapped subrange in place -- appending alone leaves the stale PROT_NONE record
+                // shadowing it, and a later MADV_DONTNEED re-establishes the live heap as an
+                // inaccessible reservation (the Go memclr SIGSEGV class). Mirrors the mprotect-commit
+                // path above (mozjs/V8 GC chunks).
+                anon_update_prot((uint64_t)r, (uint64_t)a1 + guard, prot);
                 anon_track((uint64_t)r, (uint64_t)a1 + guard, prot);
-            else
+            } else
                 anon_untrack((uint64_t)r, (uint64_t)a1 + guard);
             // A fresh mapping resets any prior MADV_WIPEONFORK marking on this address range (advice does
             // not survive the region being remapped) -- drop stale wipe coverage so a reused address is
             // never wrongly zeroed in a child.
             wipefork_del((uint64_t)r, (uint64_t)a1 + guard);
+            dontfork_del((uint64_t)r, (uint64_t)a1 + guard); // reused address drops stale dont-fork marking
             // PROT_NONE registry (g_gna, thread.c; read INSIDE host_range_mapped). hl force-maps this region
             // host-RW, so a guest PROT_NONE mmap is really RW -- record the guest's REQUESTED prot so a
             // syscall buffer landing in it still EFAULTs (LTP read02); an accessible map clears stale coverage.
@@ -735,7 +865,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     gna_add(glo, ghi);
                 else
                     gna_clear(glo, ghi);
-                gro_clear(glo, ghi);
+                // Read-only registry (g_gro): a store into a read-only mapping must be delivered as a guest
+                // SIGSEGV, but the x86 write-fault path treats an unrecorded faulting page as a lazy/SMC
+                // page and silently re-opens it. mprotect records this; a MAP_FIXED PROT_READ overmap must
+                // too, or the newly read-only page stays writable (map_over_existing ro_write_faults).
+                if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
+                    gro_add(glo, ghi);
+                else
+                    gro_clear(glo, ghi);
             }
         }
         /* Keep registry publication inside the same serialized mapping
@@ -795,32 +932,36 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 gro_add(glo, ghi);
             else
                 gro_clear(glo, ghi);
+            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
+                filemap_refresh_emulated(physical_a0, physical_a0 + a1);
             // Making translated code writable is itself the guest's declaration that the bytes may change.
             // Drop translations while the SMC page is still tracked, before the host protection below makes
             // the store silent. This also covers 4K guest subpages where a 16K host mprotect is unsafe: the
             // later lazy write fault may open the host page, but the stale translation is already gone.
             if ((int)a2 & PROT_WRITE) G_SMC_UNMAP(physical_a0, physical_a0 + a1);
-            // Enforce protections physically when the requested guest range starts at an independently
-            // tracked mmap and host-page rounding stays inside that mapping's private guard allocation.
-            // This is the safe 4K-guest/16K-host case: rounding a standalone 4K mmap to one 16K host page
-            // cannot clobber a neighbouring guest mapping because mmap reserved a 64K guard tail. Never
-            // round an interior subrange (ELF segments and adjacent 4K guest pages may share that host page).
-            // PROT_EXEC is intentionally omitted: translated guest bytes are data to the host, not executed.
-            {
-                size_t hp = (size_t)getpagesize();
-                uint64_t tracked = hl_gmap_find_length(physical_a0);
-                uint64_t host_len = (a1 + hp - 1) & ~((uint64_t)hp - 1);
-                // A Linux 4 KiB subpage may start inside one 16 KiB macOS VM page. In that case physical
-                // mprotect would be EINVAL (or, after rounding down, alter adjacent guest subpages), so the
-                // logical gna/gro registries above provide the precise Linux permission model instead.
-                if (tracked && !(physical_a0 & (uint64_t)(hp - 1)) && host_len <= tracked) {
-                    int host_prot = (int)a2 & (PROT_READ | PROT_WRITE);
-                    if (mprotect((void *)(uintptr_t)physical_a0, (size_t)host_len, host_prot) != 0) {
-                        G_RET(c) = (uint64_t)(-errno);
-                        break;
-                    }
-                }
+#if defined(__linux__)
+            // On a Linux host the guest and host VM page granularities match.  Apply the transition for
+            // real: managed runtimes reserve file-backed PROT_NONE arenas (commonly /dev/zero) and commit
+            // individual pages with mprotect before their first store.  Merely clearing gna returned success
+            // while leaving the host page PROT_NONE, so CoreCLR faulted on that first committed write.
+            // Guest EXEC is data to this DBT; keep it host-readable for translation and omit host execution.
+            int host_protection = (int)a2;
+            if (host_protection & PROT_EXEC)
+                host_protection = (host_protection | PROT_READ) & ~PROT_EXEC;
+            if (mprotect((void *)(uintptr_t)physical_a0, (size_t)a1, host_protection) != 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-errno);
+                break;
             }
+            // Keep the private-anon registry's CURRENT protection in sync: MADV_DONTNEED re-establishes
+            // a tracked range with the recorded prot, so a committed (mprotect'd RW) subrange of a
+            // PROT_NONE reservation must not be remapped back to PROT_NONE (mozjs/V8 GC chunks:
+            // reserve NONE -> commit RW -> DONTNEED -> store faulted).
+            anon_update_prot(physical_a0 & ~(uint64_t)0xfff, ((physical_a0 + a1 + 0xfff) & ~(uint64_t)0xfff) - (physical_a0 & ~(uint64_t)0xfff), host_protection);
+#endif
+            // Guest permissions remain logical. Translated guest bytes are host data, and a physical
+            // mprotect would turn ordinary guest guard/safepoint accesses into Darwin faults before the
+            // Linux permission model can classify them. The SMC machinery independently protects translated
+            // source pages when it needs a write trap.
             // #423 / H9: a guest that mprotect()s a page to add PROT_EXEC is a JIT toggling an
             // already-written page executable -- the mmap(RW) -> write code -> mprotect(RX) pattern that
             // .NET/Wasm/managed runtimes use (as opposed to the RWX mmap case 222 already covers). It MUST
@@ -850,6 +991,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        // Linux (mm/msync.c) walks the VMAs after the flag check and returns -ENOMEM if the range contains
+        // an unmapped hole -- msync of a stale/never-mapped range must NOT read as a fake success. Reject a
+        // range that is neither a tracked guest mapping nor physically mapped host-side, using the same
+        // hole-detection idiom as mprotect (case 226). len 0 is a Linux no-op success.
+        if (a1 && !hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        filemap_refresh_emulated(a0, a0 + a1);
         G_RET(c) = 0;
         break;
     // mlock(addr,len): wire+fault via macOS mlock so the range is RESIDENT (LTP mincore03), AND track the
@@ -1006,6 +1156,29 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
+        // MADV_REMOVE(9): punch a hole (zero the backing store) in a SHARED file-backed mapping -- the
+        // zeros show through the mapping and via pread -- and EINVAL on a mapping that is not shmem/shared
+        // file backed (a private or anonymous range). hl force-maps the guest region with the SAME kind of
+        // real host mapping (a genuine MAP_SHARED file map, or a MAP_PRIVATE|ANON reservation), and the host
+        // and guest page granularities match here, so the host kernel's own MADV_REMOVE gives exactly the
+        // Linux verdict: it punches the shared file map and returns EINVAL for private/anon. Forward it and
+        // surface the real errno instead of the advisory no-op the generic tail would return.
+        if (adv == 9) {
+            if (a1 == 0) {
+                G_RET(c) = 0;
+                break;
+            }
+#if defined(MADV_REMOVE)
+            G_RET(c) = madvise((void *)a0, (size_t)a1, MADV_REMOVE) == 0 ? 0 : (uint64_t)(int64_t)(-errno);
+#else
+            /* Darwin has no MADV_REMOVE equivalent. In particular, passing
+             * Linux's numeric value through would select an unrelated host
+             * advice. Fail closed until the mapping layer can punch the
+             * backing file through its owned descriptor. */
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+#endif
+            break;
+        }
         // MADV_DONTNEED(4): Linux drops the pages so the NEXT access faults in fresh ZERO pages. macOS
         // MADV_DONTNEED does not zero anon pages, so a reread would return stale data (breaks
         // redis/jemalloc, which lean on the zeroing). For a range fully inside a tracked PRIVATE-ANON
@@ -1047,6 +1220,26 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 }
                 // could not satisfy exactly -> never fail the guest; fall through to advisory
             }
+        }
+        // MADV_DONTFORK(10) / MADV_DOFORK(11): the marked range must NOT be inherited by a fork child (a
+        // child touch faults), DOFORK undoes it. A guest fork re-establishes the child's guest memory
+        // itself rather than relying on host VMA inheritance, so forwarding the advice to the host kernel
+        // is inert; instead track the range (like MADV_WIPEONFORK) and unmap it in the fork child, so the
+        // child faults exactly as Linux's VM_DONTCOPY would make it. Valid on private-anon ranges here;
+        // other mappings keep the advisory no-op. A zero length is a no-op success.
+        if (adv == 10 || adv == 11) {
+            if (a1 == 0) {
+                G_RET(c) = 0;
+                break;
+            }
+            if (anon_prot_if_contained(a0, (size_t)a1) >= 0) {
+                if (adv == 10)
+                    dontfork_add(a0, (size_t)a1);
+                else
+                    dontfork_del(a0, (size_t)a1);
+            }
+            G_RET(c) = 0;
+            break;
         }
         if (adv >= 0 && adv <= 4)
             hadv = adv;

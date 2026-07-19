@@ -1,4 +1,7 @@
 #include "hl/linux_abi.h"
+#if defined(HL_EMBEDDED_BUILD)
+#include "../core/provider/files.h"
+#endif
 #include "object.h"
 
 #include <stdlib.h>
@@ -917,7 +920,15 @@ int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entri
                     count_ready++;
                 } else if (status != HL_STATUS_OK) {
                     return hl_linux_error(status);
-                } else {
+                }
+#if defined(HL_EMBEDDED_BUILD)
+                else if (hl_provider_files_is_handle(snapshot.host_handle)) {
+                    entries[index].readiness =
+                        hl_provider_files_readiness(snapshot.host_handle, entries[index].interests);
+                    if (entries[index].readiness != 0) count_ready++;
+                }
+#endif
+                else {
                     entries[index].readiness =
                         entries[index].interests & (HL_LINUX_READY_READ | HL_LINUX_READY_WRITE);
                     if (entries[index].readiness != 0) count_ready++;

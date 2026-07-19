@@ -21,7 +21,7 @@
 #include "options.h"
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argc,
                        char *const argv[]);
 
 // Read exactly `n` bytes from `fd` into `buf`, looping over short reads. Returns 0 on success, -1 on
@@ -51,6 +51,7 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
     const uint32_t offsets[] = {
         config->rootfs_offset,
         config->lower_layers_offset,
+        config->overlay_work_offset,
         config->hostname_offset,
         config->network_namespace_offset,
         config->volumes_offset,
@@ -68,6 +69,7 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->result_path_offset,
         config->network_interfaces_offset,
         config->file_owners_offset,
+        config->executable_host_offset,
     };
     size_t i;
     for (i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
@@ -100,6 +102,27 @@ static int launch_publish(const hl_launch_config *config, const char *pool, char
     return 0;
 }
 
+static int launch_lowers(const hl_launch_config *config, const char *pool, char *output, size_t capacity) {
+    size_t used = 0;
+    uint32_t offset = config->lower_layers_offset;
+    if (config->lower_layer_count == 0) {
+        const char *legacy = launch_string(config, pool, offset);
+        if (snprintf(output, capacity, "%s", legacy) >= (int)capacity) return -1;
+        return 0;
+    }
+    for (uint32_t index = 0; index < config->lower_layer_count; index++) {
+        const char *path = pool + offset;
+        size_t length = strlen(path);
+        if (used + length + (index != 0) + 1 > capacity) return -1;
+        if (index != 0) output[used++] = '\n';
+        memcpy(output + used, path, length);
+        used += length;
+        output[used] = 0;
+        offset += (uint32_t)length + 1;
+    }
+    return 0;
+}
+
 // Read an hl launch config from an already-open file, populate launch state, rebuild the guest argv, and
 // enter the Linux guest. Private: hl_run_config_file() is the sole launch protocol.
 static int hl_read_config_file(int fd, hl_launch_runner runner) {
@@ -123,7 +146,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     memcpy(&pool_size, prefix + 4, 4);
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
-    if (magic != HL_CONFIG_MAGIC || abi != HL_CONFIG_ABI || header_size < sizeof(hl_launch_config) ||
+    if (magic != HL_CONFIG_MAGIC ||
+        (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_NETWORK_TRANSPORT && abi != HL_CONFIG_ABI_LEGACY) ||
+        header_size < offsetof(hl_launch_config, network_transport) ||
         header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
@@ -149,6 +174,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     hl_options options;
     char num[32];
     char publish[1024];
+    char lowers[8192];
     char process_domain[33];
     const char *s;
     if (hl_options_init(&options) != 0) {
@@ -175,6 +201,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     }
     if (cfg.rootfs_read_only) APPLY_OPTION("HL_ROOTFS_RO", "1");
     if (cfg.network_isolated) APPLY_OPTION("HL_NET_ISOLATE", "1");
+    if (cfg.network_transport == HL_CONFIG_NETWORK_HOST) APPLY_OPTION("HL_NET_HOST", "1");
     if (cfg.publish_external) APPLY_OPTION("HL_PUBLISH_DAEMON", "1");
     if (cfg.uid >= 0) {
         snprintf(num, sizeof num, "%d", cfg.uid);
@@ -195,10 +222,12 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     if (s[0]) APPLY_OPTION("HL_ULIMITS", s);
     if (launch_publish(&cfg, pool, publish, sizeof publish) != 0) goto option_failure;
     if (publish[0]) APPLY_OPTION("HL_PUBLISH", publish);
-    s = launch_string(&cfg, pool, cfg.lower_layers_offset);
-    if (s[0]) APPLY_OPTION("HL_LOWER", s);
+    if (launch_lowers(&cfg, pool, lowers, sizeof lowers) != 0) goto option_failure;
+    if (lowers[0]) APPLY_OPTION("HL_LOWER", lowers);
+    s = launch_string(&cfg, pool, cfg.overlay_work_offset);
+    if (s[0]) APPLY_OPTION("HL_OVERLAY_WORK", s);
     s = launch_string(&cfg, pool, cfg.network_namespace_offset);
-    if (s[0]) APPLY_OPTION("HL_NETNS", s);
+    if (cfg.network_transport != HL_CONFIG_NETWORK_HOST) APPLY_OPTION("HL_NETNS", s[0] ? s : process_domain);
     s = launch_string(&cfg, pool, cfg.volumes_offset);
     if (s[0]) APPLY_OPTION("HL_VOLUMES", s);
     s = launch_string(&cfg, pool, cfg.working_directory_offset);
@@ -272,7 +301,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     const char *rootfs = launch_string(&cfg, pool, cfg.rootfs_offset);
     hl_options *previous_options = hl_options_bind_process(&options);
     const char *result_path = launch_string(&cfg, pool, cfg.result_path_offset);
-    int rc = runner(rootfs[0] ? rootfs : NULL, (uint32_t)argument_count, argv2, &options,
+    const char *executable_host = launch_string(&cfg, pool, cfg.executable_host_offset);
+    int rc = runner(rootfs[0] ? rootfs : NULL, executable_host[0] ? executable_host : NULL,
+                    (uint32_t)argument_count, argv2, &options,
                     result_path[0] ? result_path : NULL);
     (void)hl_options_bind_process(previous_options);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
@@ -289,11 +320,12 @@ option_failure:
     return 78;
 }
 
-static int hl_legacy_launch(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+static int hl_legacy_launch(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
                             const char *result_path) {
     (void)options;
     (void)result_path;
-    return hl_run_linux_guest(NULL, NULL, rootfs, argc, argv);
+    (void)executable_host;
+    return hl_run_linux_guest(NULL, NULL, rootfs, HL_HOST_HANDLE_INVALID, NULL, 0, argc, argv);
 }
 
 int hl_run_config_file_with(const char *path, hl_launch_runner runner) {

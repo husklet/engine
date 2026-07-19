@@ -1,6 +1,11 @@
 #ifndef HL_HOST_SYSTEM_H
 #define HL_HOST_SYSTEM_H
 
+/* Native descriptors kept disjoint from the guest-visible interval. */
+#define HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM 4096u
+#define HL_HOST_GUEST_DESCRIPTOR_MINIMUM 20480u
+
+
 void hl_host_private_init(void);
 
 #include <stddef.h>
@@ -69,6 +74,10 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info);
 /* Enumerate descriptor numbers. kind may remain OTHER until fd_read; count includes truncated entries. */
 int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacity, size_t *count);
 int hl_host_process_fd_private_add(int descriptor);
+/* Takes ownership of descriptor on success and returns its relocated engine-private number; leaves the
+ * input open and returns a negative errno on failure. */
+int hl_host_process_fd_private_adopt(int descriptor);
+int hl_host_process_fd_private_floor(void);
 void hl_host_process_fd_private_remove(int descriptor);
 int hl_host_process_fd_private_is(int64_t pid, uint64_t start_ns, int descriptor);
 int hl_host_process_fd_private_current(int descriptor);

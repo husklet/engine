@@ -13,7 +13,7 @@
 #error HL_PRODUCTION_GUEST_ISA is required
 #endif
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argc,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argc,
                        char *const argv[]);
 hl_status hl_run_linux_guest_status(void);
 
@@ -78,7 +78,11 @@ static int32_t hl_production_entry(void *opaque) {
     active_result = context->result;
     atomic_store_explicit(&result_published, 0, memory_order_release);
     hl_options *previous = hl_options_bind_process(context->options);
-    int32_t result = hl_run_linux_guest(context->host, context->box, context->config->rootfs, context->argc,
+    hl_host_handle executable = context->config->executable == NULL ? HL_HOST_HANDLE_INVALID
+                                                                    : context->config->executable->host_handle;
+    const hl_engine_executable *spec = context->config->executable;
+    int32_t result = hl_run_linux_guest(context->host, context->box, context->config->rootfs, executable,
+                                        spec == NULL ? NULL : spec->image, spec == NULL ? 0 : spec->image_size, context->argc,
                                         (char *const *)(uintptr_t)context->argv);
     (void)hl_options_bind_process(previous);
     hl_engine_child_result_publish(result, hl_run_linux_guest_status(), 0);

@@ -23,6 +23,18 @@ static int dgram_addr_peek(int fd, int wantaddr, size_t totlen) {
     return ty == SOCK_DGRAM || ty == SOCK_RAW;
 }
 
+// UDP datagram size limit. A Linux AF_INET/AF_INET6 SOCK_DGRAM send whose payload exceeds the maximum
+// single UDP datagram fails EMSGSIZE regardless of destination -- the size check happens before the
+// datagram is routed. The cap is 65507 over IPv4 (65535 - 8 UDP header - 20 IP header) and 65535 over
+// IPv6. The private-loopback AF_UNIX switch backing has a different (buffer-based) limit, so without
+// this gate an oversized UDP send leaks the wrong errno (e.g. ENOENT from the missing switch peer path)
+// instead of EMSGSIZE. Returns the EMSGSIZE limit for an INET dgram fd, or 0 for any fd not capped this
+// way (g_sock_dgram is set only for AF_INET/AF_INET6 datagram sockets, never AF_UNIX).
+static size_t udp_dgram_maxlen(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd]) return 0;
+    return (g_sock_fam[fd] == LX_AF_INET6_FAM) ? 65535 : 65507;
+}
+
 // IPPROTO_IPV6 optname: Linux -> macOS. CRITICAL: like IPPROTO_TCP, these numbers diverge, so a raw
 // pass-through silently sets the WRONG option. The load-bearing case is IPV6_V6ONLY (Linux 26 -> macOS 27):
 // leaving it untranslated hits macOS's optname 26 (unrelated) instead, so a wildcard `::` bind stays
@@ -130,6 +142,14 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
     // handles the PROT_NONE case; see thread.c).
     if (addr && guest_bad_ptr(addr, alen)) return -EFAULT;
     int lfam = (addr && alen >= 2) ? *(const uint16_t *)addr : 0; // guest (Linux) sa_family
+    // bind() on an already-bound switch-backed socket -> EINVAL. lo_swap()/br mint a fresh AF_UNIX socket
+    // per bind, so a real host rebind would spuriously succeed; the recorded virtual port is the bound
+    // marker (a plain host-backed bind is rejected by the host itself). AF_UNSPEC never reaches bind here.
+    if (!is_connect && fd >= 0 && fd < HL_NFD && (g_lo_port[fd] || g_br_port[fd])) return -EINVAL;
+    // connect() on a listening socket -> EISCONN (the kernel rejects it on socket state before the protocol
+    // connect, regardless of the destination). The switch model would otherwise dial the destination and
+    // surface ECONNREFUSED.
+    if (is_connect && fd >= 0 && fd < HL_NFD && g_tcp_listen[fd] && lfam != 0) return -EISCONN;
     // connect() on an already-connected stream socket -> EISCONN (kernel checks the socket state before
     // the protocol connect). AF_UNSPEC is the "dissolve association" idiom and is never EISCONN.
     if (is_connect && sotype == SOCK_STREAM && lfam != 0) {
@@ -154,8 +174,14 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
     }
     if (sfam == LX_AF_INET || sfam == LX_AF_INET6) {
         if (!(is_connect && lfam == 0)) { // AF_UNSPEC connect on an INET socket = disconnect: allow
-            socklen_t need = (sfam == LX_AF_INET) ? 16 : 24;
-            if (lfam != sfam) return -EAFNOSUPPORT;
+            socklen_t need = (lfam == LX_AF_INET) ? 16 : 24;
+            // The private UDP switch is family-neutral: dual-stack listeners and BusyBox clients may
+            // select opposite INET families while still addressing the same loopback endpoint. Preserve
+            // strict Linux family validation for every other socket, but allow that narrow datagram pair.
+            int private_udp_dual = fd >= 0 && fd < HL_NFD && g_sock_dgram[fd] && lo_on() &&
+                                   ((sfam == LX_AF_INET && lfam == LX_AF_INET6) ||
+                                    (sfam == LX_AF_INET6 && lfam == LX_AF_INET));
+            if (lfam != sfam && !private_udp_dual) return -EAFNOSUPPORT;
             if (alen < need) return -EINVAL;
         }
     }
@@ -239,6 +265,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int ty = (int)a1;
+        // Linux rejects a type carrying bits outside SOCK_TYPE_MASK(0xf) other than SOCK_CLOEXEC(0x80000)
+        // and SOCK_NONBLOCK(0x800) with EINVAL, before consulting the family. Validate here so a junk-bit
+        // type does not silently mask down to a valid type (host would either accept it or return the wrong
+        // ESOCKTNOSUPPORT for a masked-but-unsupported value).
+        if (ty & ~(0xf | 0x80000 | 0x800)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         int virtual_icmp = (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP &&
                            (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)) && br_on();
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged). Gate the new fd
@@ -260,12 +294,22 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
                 // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
-                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
+                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM &&
+                                   ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
+                g_udp_local_port[r] = g_udp_peer_port[r] = 0;
+                g_udp_local_ip[r] = g_udp_peer_ip[r] = 0;
+                g_udp_local_interface[r] = g_udp_peer_interface[r] = 0;
+                g_udp_local_v6[r] = g_udp_peer_v6[r] = 0;
                 g_sock_seqpacket[r] = 0;
+                g_so_error[r] = 0;            // no pending async socket error on a fresh fd
+                g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
+                tcp_shadow_clear(r);          // no shadowed IPPROTO_TCP options on a fresh fd
+                ipopt_shadow_clear(r);        // ...nor shadowed IPPROTO_IP/IPV6 options
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
                 g_lo_v6[r] = 0;
+                g_lo_v6only[r] = 0;
                 g_br_port[r] = 0;
                 g_br_ip[r] = 0;
                 g_br_interface[r] = 0;
@@ -420,8 +464,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             (lo_any_is(sa, (socklen_t)a2) || is_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = lo_alloc_ephemeral(); // bind(:0) -> a real, round-trippable port
+            int v6only = 0;
+            if (is_lo6) {
+                socklen_t ol = sizeof v6only;
+                if (getsockopt((int)a0, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &ol) != 0) v6only = 0;
+            }
             char up[200];
-            lo_path(p, up, sizeof up);
+            lo_tcp_path(p, is_lo6 && v6only, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -431,11 +480,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            unlink(up);
+            // SO_REUSEPORT dual-bind: native Linux lets a second REUSEPORT socket bind the same
+            // addr:port. The AF_UNIX switch backs each port by one fs inode, so a second bind would
+            // hit EADDRINUSE. Only when THIS socket has SO_REUSEPORT set, drop the existing inode so
+            // the rebind replaces it and succeeds. A normal (non-REUSEPORT) rebind keeps the inode and
+            // correctly returns EADDRINUSE, which also preserves an active wildcard listener's binding.
+            if (g_so_reuseport[(int)a0]) unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_lo_port[(int)a0] = p ? p : 1;
                 g_lo_v6[(int)a0] = (uint8_t)is_lo6; // remember family for getsockname/accept
+                g_lo_v6only[(int)a0] = (uint8_t)(is_lo6 && v6only);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -451,8 +506,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
+            int bridge_v6only = 0;
+            if (br6_any_is(sa, (socklen_t)a2)) {
+                socklen_t option_length = sizeof bridge_v6only;
+                if (getsockopt((int)a0, IPPROTO_IPV6, IPV6_V6ONLY, &bridge_v6only, &option_length) != 0)
+                    bridge_v6only = 0;
+            }
             char up[200];
-            br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            if (bridge_v6only)
+                br_v6only_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            else
+                br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -462,7 +526,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            unlink(up);
+            // SO_REUSEPORT dual-bind over the bridge switch: same rule as the private-loopback path --
+            // only a REUSEPORT socket replaces the existing per-port inode; a normal rebind keeps it and
+            // returns EADDRINUSE, preserving an active wildcard listener's binding.
+            if (g_so_reuseport[(int)a0]) unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_br_port[(int)a0] = p ? p : 1;
@@ -497,6 +564,36 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // AF_UNIX autobind: bind() with only the family (no name) -> Linux assigns a unique abstract-namespace
+        // address. Route it through the same HL_NETNS-keyed fs backing as an explicit abstract bind so the
+        // assigned name is both reported by getsockname and reachable by a connecting peer.
+        if (sa && a2 >= 2 && *(uint16_t *)sa == AF_UNIX &&
+            (socklen_t)a2 <= (socklen_t)offsetof(struct sockaddr_un, sun_path)) {
+            static uint32_t g_autobind_seq;
+            uint8_t syn[3 + 16];
+            *(uint16_t *)syn = AF_UNIX;
+            syn[2] = 0; // abstract (leading NUL)
+            int nl = snprintf((char *)syn + 3, 13, "%05x",
+                              (unsigned)(((uint32_t)getpid() << 12) ^ ++g_autobind_seq) & 0xfffffu);
+            char up[200];
+            abs_path(syn, (socklen_t)(3 + nl), up, sizeof up);
+            struct sockaddr_un un;
+            if (unix_addr_set(&un, up) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            unlink(up);
+            int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
+            if (r == 0) {
+                char an[108];
+                an[0] = '@';
+                memcpy(an + 1, syn + 3, (size_t)nl);
+                an[nl + 1] = 0;
+                unix_bind_note((int)a0, an);
+            }
+            G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+            break;
+        }
         // AF_UNIX pathname bind: materialize the socket inode in the overlay (writable upper), jail-confined,
         // so the guest can stat/chmod/connect it through the SAME resolver. A raw host bind created the inode
         // OUTSIDE the jail (at the literal guest path on the host fs), so the guest's overlay-routed stat()
@@ -520,6 +617,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
     bind_passthrough:
+        // Private UDP uses the same launch-scoped AF_UNIX switch as TCP. This includes ordinary,
+        // unpublished loopback and user-network sockets; publishing is an additional host forwarder.
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            int ui = br_on() ? br_bind_interface(sa, (socklen_t)a2) : -1;
+            int udp_lo6 = lo_on() && lo6_any_is(sa, (socklen_t)a2);
+            if (ui >= 0 || (lo_on() && lo_any_is(sa, (socklen_t)a2)) || udp_lo6) {
+                uint16_t up = ntohs(*(uint16_t *)(sa + 2));
+                uint32_t uip = ui >= 0 ? g_netif[ui].ip : 0;
+                int ur = udp_switch_bind((int)a0, ui, uip, up);
+                if (ur == 0) g_udp_local_v6[(int)a0] = (uint8_t)udp_lo6;
+                if (ur == 0 && up && pm_published(up)) udp_fwd_maybe_start((int)a0);
+                G_RET(c) = ur < 0 ? (uint64_t)(-errno) : 0;
+                break;
+            }
+        }
         // Published UDP (`-p H:C/udp`): swap an AF_INET datagram socket bound to a published port onto
         // the AF_UNIX switch + start its host->guest datagram forwarder. No-op (returns 0) for
         // non-published UDP, non-switch nets, or non-datagram sockets -> they fall through unchanged.
@@ -602,6 +714,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
             (void)hl_native_set_no_sigpipe(r);
             if (r >= 0 && r < HL_NFD) {
+                g_so_error[r] = 0;  // fresh accepted fd carries no pending async error
+                g_so_reuseport[r] = 0;
+                tcp_shadow_clear(r); // no shadowed IPPROTO_TCP options on a fresh accepted fd
+                ipopt_shadow_clear(r);
                 g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
@@ -690,7 +806,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             (lo_is(sa, (socklen_t)a2) || c_lo6)) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
-            lo_path(p, up, sizeof up);
+            lo_tcp_path(p, c_lo6, up, sizeof up);
+            if (c_lo6 && access(up, F_OK) != 0) lo_tcp_path(p, 0, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -728,12 +845,29 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // a redirected TCP dial to a port with no listener fails ENOENT (the per-port unix
             // inode doesn't exist); Linux returns ECONNREFUSED for a closed TCP port. Map it (host
             // errno, translated to Linux 111); other errnos including EINPROGRESS pass through.
-            G_RET(c) = r < 0 ? (uint64_t)(-(errno == ENOENT ? ECONNREFUSED : errno)) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r < 0) {
+                int le = (errno == ENOENT) ? ECONNREFUSED : errno;
+                // A non-blocking connect must not surface ECONNREFUSED synchronously: a real TCP stack
+                // defers the refusal to the next poll/getsockopt(SO_ERROR). The AF_UNIX switch has no live
+                // INET peer to deliver that, so stash the error and report EINPROGRESS -- poll then wakes on
+                // the failed AF_UNIX socket and getsockopt(SO_ERROR) hands the ECONNREFUSED back once.
+                if (le == ECONNREFUSED && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                    (fcntl((int)a0, F_GETFL) & O_NONBLOCK)) {
+                    g_so_error[(int)a0] = ECONNREFUSED;
+                    G_RET(c) = (uint64_t)(-EINPROGRESS);
+                } else {
+                    G_RET(c) = (uint64_t)(-le);
+                }
+            } else {
+                G_RET(c) = 0;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            }
             break;
         }
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0] && sa && (socklen_t)a2 >= 8 &&
-            *(const uint16_t *)sa == AF_INET && br_on() && br_for_ip(*(const uint32_t *)(sa + 4)) >= 0) {
+            *(const uint16_t *)sa == AF_INET &&
+            (((*(const uint32_t *)(sa + 4)) & 0xffu) == 127u || // loopback 127/8: locally reflected echo
+             (br_on() && br_for_ip(*(const uint32_t *)(sa + 4)) >= 0))) {
             g_icmp_ip[(int)a0] = *(const uint32_t *)(sa + 4);
             G_RET(c) = 0;
             break;
@@ -741,6 +875,32 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
         int bridge_enabled = br_on();
         int connect_interface = bridge_enabled ? br_connect_interface(sa, (socklen_t)a2) : -1;
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            // connect(AF_UNSPEC) dissolves a datagram socket's association: clear the recorded peer so a
+            // later getpeername reports ENOTCONN, matching the kernel's disconnect idiom.
+            if (sa && (socklen_t)a2 >= 2 && *(const uint16_t *)sa == AF_UNSPEC) {
+                g_udp_peer_port[(int)a0] = 0;
+                g_udp_peer_ip[(int)a0] = 0;
+                g_udp_peer_interface[(int)a0] = 0;
+                g_udp_peer_v6[(int)a0] = 0;
+                g_sock_conn[(int)a0] = 0;
+                G_RET(c) = 0;
+                break;
+            }
+            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port,
+                                       udp_path, sizeof udp_path)) {
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno); break;
+                }
+                g_udp_peer_port[(int)a0] = udp_port;
+                g_udp_peer_ip[(int)a0] = udp_ip;
+                g_udp_peer_interface[(int)a0] = (uint8_t)(udp_interface + 1);
+                g_udp_peer_v6[(int)a0] = (uint8_t)(*(const uint16_t *)sa == LX_AF_INET6_FAM);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && connect_interface >= 0) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
@@ -798,8 +958,22 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
-            G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            int ce = errno;
+            // An abstract name is not a filesystem object: a missing backing socket means no bound listener,
+            // which Linux reports as ECONNREFUSED (the host fs backing yields ENOENT).
+            if (r < 0 && ce == ENOENT) ce = ECONNREFUSED;
+            G_RET(c) = (r < 0 && ce != EINPROGRESS) ? (uint64_t)(-ce) : 0;
+            if ((r == 0 || ce == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+                g_sock_conn[(int)a0] = 1; // sticky-connected
+                char an[108];
+                int L = (int)a2 - 3; // sun_path[0]==0, name follows; addrlen = 2 (family) + 1 (nul) + name
+                if (L < 0) L = 0;
+                if (L > (int)sizeof an - 2) L = (int)sizeof an - 2;
+                an[0] = '@';
+                memcpy(an + 1, sa + 3, (size_t)L);
+                an[L + 1] = 0;
+                unix_peer_note((int)a0, an); // guest-visible peer name for getpeername
+            }
             break;
         }
         // AF_UNIX pathname connect: resolve through the overlay (same resolver as stat/open) so we dial the
@@ -854,6 +1028,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 204: {
         // getsockname
         int fd = (int)a0;
+        // Abstract-namespace local name: echo the guest name, not the engine's HL_NETNS-keyed backing fs path.
+        if (fd >= 0 && fd < HL_NFD && g_unix_bind[fd][0] == '@' && a1) {
+            socklen_t gl = 0;
+            int ll = unix_name_fill(g_unix_bind[fd], (uint8_t *)a1, a2 ? *(socklen_t *)a2 : 0, &gl);
+            if (ll >= 0) {
+                if (a2) *(socklen_t *)a2 = gl;
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        if (fd >= 0 && fd < HL_NFD && g_udp_local_port[fd]) {
+            if (g_udp_local_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_local_port[fd]);
+            else if (g_udp_local_interface[fd])
+                fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_udp_local_ip[fd], g_udp_local_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_local_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
         if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: report an AF_INET local addr (0.0.0.0:0)
             if (a1) {
                 uint8_t *g = (uint8_t *)a1;
@@ -904,6 +1098,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
+        // Abstract-namespace peer name: echo the guest name recorded on connect, not the backing fs path.
+        if (fd >= 0 && fd < HL_NFD && g_unix_peer[fd][0] == '@' && a1) {
+            socklen_t gl = 0;
+            int ll = unix_name_fill(g_unix_peer[fd], (uint8_t *)a1, a2 ? *(socklen_t *)a2 : 0, &gl);
+            if (ll >= 0) {
+                if (a2) *(socklen_t *)a2 = gl;
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        if (fd >= 0 && fd < HL_NFD && g_udp_peer_port[fd]) {
+            if (g_udp_peer_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_port[fd]);
+            else if (g_udp_peer_interface[fd])
+                fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_ip[fd], g_udp_peer_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
         if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: peer is the nameserver 127.0.0.11:53
             dns_fill_ns((uint8_t *)a1, (socklen_t *)a2);
             G_RET(c) = 0;
@@ -953,6 +1167,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        // Oversized UDP datagram -> EMSGSIZE, enforced before routing (matches Linux; the AF_UNIX switch
+        // backing would otherwise leak a wrong errno for a too-large payload).
+        {
+            size_t udp_cap = udp_dgram_maxlen((int)a0);
+            if (udp_cap && (size_t)a2 > udp_cap) {
+                G_RET(c) = (uint64_t)(-EMSGSIZE);
+                break;
+            }
+        }
         // Container DNS: a query sent to 127.0.0.11:53 (connected send, or first unconnected sendto) is
         // parsed + answered via the host resolver; nothing hits the wire. a4/a5 are the optional dest addr.
         {
@@ -989,6 +1212,33 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            int udp_route = a4 ? udp_switch_destination((const uint8_t *)a4, (socklen_t)a5, &udp_interface,
+                                                        &udp_ip, &udp_port, udp_path, sizeof udp_path)
+                               : udp_switch_peer_path((int)a0, udp_path, sizeof udp_path);
+            if (udp_route) {
+                if (!a4) udp_interface = (int)g_udp_peer_interface[(int)a0] - 1;
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno); break;
+                }
+                struct sockaddr_un un;
+                ssize_t ur = unix_addr_set(&un, udp_path) < 0 ? -1 :
+                    sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+                           (struct sockaddr *)&un, sizeof un);
+                // Unconnected UDP send to a loopback port with no bound receiver: Linux drops the datagram
+                // and reports success (no ICMP error is delivered to an unconnected socket). The AF_UNIX
+                // switch backing instead surfaces ENOENT/ECONNREFUSED from the missing peer path -- coerce
+                // it to a fire-and-forget success. Only for an explicit dest (a4); a connected socket (peer
+                // path) keeps the underlying error so ICMP port-unreach can map to ECONNREFUSED.
+                if (ur < 0 && a4 && (errno == ENOENT || errno == ECONNREFUSED)) {
+                    G_RET(c) = (uint64_t)a2;
+                    break;
+                }
+                G_RET(c) = ur < 0 ? (uint64_t)(-errno) : (uint64_t)ur;
+                break;
+            }
+        }
         // dest addr (UDP): translate Linux AF_INET/INET6 sockaddr -> macOS; NULL/non-inet pass through.
         struct sockaddr_storage dss;
         socklen_t dhl = a4 ? sa_l2m((uint8_t *)a4, (socklen_t)a5, &dss) : (socklen_t)-1;
@@ -1005,6 +1255,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             r = sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3), dst, dl);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        // send/sendto to a peer-closed socket -> guest SIGPIPE (Linux), unless MSG_NOSIGNAL was requested.
+        if (!((int)a3 & 0x4000)) svc_sigpipe_on_epipe(c, (int64_t)G_RET(c));
         break;
     }
     case 207: {
@@ -1035,6 +1287,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // DNS socket: report the source as the nameserver (127.0.0.11:53) so the guest resolver's
             // "answer came from the server we queried" anti-spoof check passes (the real src is AF_UNIX).
             dns_fill_ns((uint8_t *)a4, (socklen_t *)a5);
+        } else if (r >= 0 && want && udp_switch_source(&hss, hsl, (uint8_t *)a4, (socklen_t *)a5)) {
+            // translated from the switch's opaque AF_UNIX sender identity
         } else if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
@@ -1053,6 +1307,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // setsockopt(fd, level, optname, val, len)
     case 208: {
         int lvl = (int)a1, opt = (int)a2;
+        // SO_REUSEPORT (Linux SOL_SOCKET/15): remember the guest's intent so getsockopt reports it even when
+        // this INET socket is later backed by an AF_UNIX switch socket (which reads SO_REUSEPORT back as 0).
+        // The real setsockopt still runs below (dual-bind on the switch relies on it); this only tracks readback.
+        if (lvl == 1 && opt == 15 && (int)a0 >= 0 && (int)a0 < HL_NFD)
+            g_so_reuseport[(int)a0] = (a3 && (socklen_t)a4 >= 4 && *(int *)a3) ? 1 : 0;
         // SO_PASSCRED (Linux SOL_SOCKET/16): macOS has no equivalent. Record it per-fd so recvmsg(212)
         // synthesizes the SCM_CREDENTIALS ancillary record the Linux kernel would auto-attach (credential-aware
         // credential-aware IPC bootstrap requires it). Never fail the guest.
@@ -1093,6 +1352,68 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
+        // IPPROTO_TCP integer options on a tracked guest INET stream socket: once bind/connect swaps its host
+        // backing to an AF_UNIX switch socket, the host rejects IPPROTO_TCP setsockopt with ENOPROTOOPT, but
+        // Linux round-trips these on a real TCP socket and apps set TCP_NODELAY *after* connect(). Record the
+        // guest's value so a later getsockopt reports it, and best-effort apply it to the host fd (a genuine
+        // unswapped AF_INET socket still honors it). Never fail the guest.
+        if (lvl == 6 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0]) {
+            int slot = tcp_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_tcp_optval[(int)a0][slot] = val;
+                g_tcp_optset[(int)a0][slot] = 1;
+                int mo = tcp_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_TCP, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IP integer options on a tracked AF_INET socket: same story as TCP -- the AF_UNIX switch
+        // backing rejects them with ENOPROTOOPT while native round-trips them. Record + best-effort apply to
+        // the host fd (an unswapped socket still honors it). Only options native accepts on a connected
+        // socket are shadow-slotted; the rest fall through to the real setsockopt (true ENOPROTOOPT/EPERM).
+        if (lvl == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_fam[(int)a0] == AF_INET) {
+            int slot = ip_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_ipopt_val[(int)a0][slot] = val;
+                g_ipopt_set[(int)a0][slot] = 1;
+                int mo = ip_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_IP, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IPV6 integer options on a tracked AF_INET6 socket. IPV6_V6ONLY(26) is special: native
+        // rejects a change once the socket is bound/connected (EINVAL), so try the real setsockopt first --
+        // it succeeds pre-bind (unswapped) and its success/failure decides the shadow update and the errno.
+        if (lvl == 41 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_fam[(int)a0] == LX_AF_INET6_FAM) {
+            if ((int)a2 == 26) { // IPV6_V6ONLY
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                int mo = ip6_opt_l2m(26);
+                int r = (mo >= 0) ? setsockopt((int)a0, IPPROTO_IPV6, mo, &val, sizeof val) : -1;
+                if (r == 0) { // pre-bind, host honored it -> record and report the new value
+                    g_ipopt_val[(int)a0][IPOPT_V6ONLY_SLOT] = val ? 1 : 0;
+                    g_ipopt_set[(int)a0][IPOPT_V6ONLY_SLOT] = 1;
+                    G_RET(c) = 0;
+                } else {
+                    // Swapped backing rejected it: native cannot change V6ONLY after bind/connect -> EINVAL.
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                }
+                break;
+            }
+            int slot = ip6_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val = (a3 && (socklen_t)a4 >= 4) ? *(int *)a3 : 0;
+                g_ipopt_val[(int)a0][slot] = val;
+                g_ipopt_set[(int)a0][slot] = 1;
+                int mo = ip6_opt_l2m((int)a2);
+                if (mo >= 0) (void)setsockopt((int)a0, IPPROTO_IPV6, mo, &val, sizeof val);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (lvl == 1) {
             lvl = SOL_SOCKET;
             opt = so_opt_l2m((int)a2);
@@ -1130,6 +1451,52 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // getsockopt(fd, level, optname, val, len)
     case 209: {
         int lvl = (int)a1, opt = (int)a2;
+        int gfd = (int)a0;
+        // A deferred asynchronous connect error (stashed for a non-blocking dial to a closed private-loopback
+        // port) is delivered exactly once through SO_ERROR, mirroring a real TCP stack.
+        if (lvl == 1 && opt == 4 && gfd >= 0 && gfd < HL_NFD && g_so_error[gfd]) {
+            if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                *(int *)a3 = hl_linux_errno_from_macos(g_so_error[gfd]);
+                *(socklen_t *)a4 = 4;
+            }
+            g_so_error[gfd] = 0;
+            G_RET(c) = 0;
+            break;
+        }
+        // SO_REUSEPORT(15): report the guest's recorded intent (an AF_UNIX switch socket always reads it
+        // back as 0), for any tracked socket that had it set. An un-set fd falls through to the host value.
+        if (lvl == 1 && opt == 15 && gfd >= 0 && gfd < HL_NFD && g_so_reuseport[gfd]) {
+            if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                *(int *)a3 = 1;
+                *(socklen_t *)a4 = 4;
+            }
+            G_RET(c) = 0;
+            break;
+        }
+        // SO_DOMAIN(39)/SO_PROTOCOL(38): a private-loopback/bridge INET socket is backed on the host by an
+        // AF_UNIX switch socket, so a raw getsockopt would report AF_UNIX/0 rather than the guest's real
+        // AF_INET[6]/IPPROTO_TCP[UDP]. Report the family/protocol recorded at socket() for any tracked INET
+        // socket -- identical to the host answer for an un-swapped fd, corrected for a swapped one.
+        if (lvl == 1 && (opt == 38 || opt == 39) && gfd >= 0 && gfd < HL_NFD &&
+            (g_sock_fam[gfd] == AF_INET || g_sock_fam[gfd] == LX_AF_INET6_FAM)) {
+            int val = 0, have = 1;
+            if (opt == 39)
+                val = g_sock_fam[gfd]; // SO_DOMAIN: the guest address family
+            else if (g_sock_stream[gfd])
+                val = IPPROTO_TCP;
+            else if (g_sock_dgram[gfd])
+                val = IPPROTO_UDP;
+            else
+                have = 0; // unknown protocol -> fall through to the host value
+            if (have) {
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+        }
         // SO_PEERCRED (Linux SOL_SOCKET/17): macOS has no SO_PEERCRED. Report the peer's credentials as the
         // container identity (so cr.uid/gid match the guest's getuid/getgid) and the peer pid via macOS
         // LOCAL_PEERPID. struct ucred is { pid_t pid; uid_t uid; gid_t gid; } (3x u32 = 12 bytes).
@@ -1169,7 +1536,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     // guest pid of the process holding the OTHER end, stamped across fork/close -- see
                     // g_sock_peer_pid / seq_reassign_peer); else this guest's own pid.
                     int sp = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_peer_pid[(int)a0] : 0;
+#if defined(__linux__)
+                    // On Linux the host SO_PEERCRED is authoritative: ppid==getpid() means the peer end is
+                    // held in THIS process (an un-forked socketpair), whose guest pid is our own. A synthetic
+                    // distinct id here would make SO_PEERCRED disagree with the guest's getpid() for a plain
+                    // socketpair; report the guest self pid, keeping the synthetic only as a last resort.
+                    ppid = (ppid == getpid()) ? container_pid() : (sp ? sp : container_pid());
+#else
                     ppid = sp ? sp : container_pid();
+#endif
                 } else if (g_init_hostpid && ppid == g_init_hostpid) {
                     ppid = 1; // peer is the container init -> guest pid 1
                 }
@@ -1208,6 +1583,97 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             G_RET(c) = 0;
             break;
+        }
+        // IPPROTO_TCP integer options on a tracked guest INET stream socket: report the shadowed value the
+        // guest set (see case 208). If unset, prefer the real host value for a still-genuine AF_INET socket,
+        // falling back to a stable default only when the AF_UNIX switch backing rejects the query.
+        if (lvl == 6 && gfd >= 0 && gfd < HL_NFD && g_sock_stream[gfd]) {
+            int slot = tcp_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_tcp_optset[gfd][slot]) {
+                    val = g_tcp_optval[gfd][slot];
+                } else {
+                    val = tcp_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = tcp_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_TCP, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+            // TCP_INFO(11): a struct the AF_UNIX switch backing cannot answer. Try the host first (an unswapped
+            // AF_INET socket returns the real thing); on rejection synthesize a minimal record whose only stable
+            // fact is tcpi_state (byte 0) = ESTABLISHED for a connected socket, so diagnostic code sees a live
+            // connection instead of ENOPROTOOPT. The rest is zero-filled.
+            if ((int)a2 == 11 && a3 && a4) {
+                socklen_t cap = *(socklen_t *)a4;
+#if defined(__linux__)
+                // Linux TCP_INFO == 11; an unswapped AF_INET socket answers it authoritatively.
+                if (getsockopt(gfd, IPPROTO_TCP, 11, (void *)a3, (socklen_t *)a4) == 0) {
+                    G_RET(c) = 0;
+                    break;
+                }
+#endif
+                socklen_t n = cap < 512 ? cap : 512;
+                memset((void *)a3, 0, n);
+                if (n >= 1) *(uint8_t *)a3 = g_sock_conn[gfd] ? 1 /*TCP_ESTABLISHED*/ : 7 /*TCP_CLOSE*/;
+                *(socklen_t *)a4 = n;
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IP integer options on a tracked AF_INET socket: report the shadowed value the guest set.
+        // If unset, prefer the real host value (a still-genuine AF_INET socket answers it), falling back to
+        // the Linux default only when the AF_UNIX switch backing rejects the query.
+        if (lvl == 0 && gfd >= 0 && gfd < HL_NFD && g_sock_fam[gfd] == AF_INET) {
+            int slot = ip_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_ipopt_set[gfd][slot]) {
+                    val = g_ipopt_val[gfd][slot];
+                } else {
+                    val = ipopt_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = ip_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_IP, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+        }
+        // IPPROTO_IPV6 integer options on a tracked AF_INET6 socket, including IPV6_V6ONLY(26) whose readback
+        // must survive bind (dual-stack servers set it v6-only then read it back).
+        if (lvl == 41 && gfd >= 0 && gfd < HL_NFD && g_sock_fam[gfd] == LX_AF_INET6_FAM) {
+            int slot = ((int)a2 == 26) ? IPOPT_V6ONLY_SLOT : ip6_shadow_slot((int)a2);
+            if (slot >= 0) {
+                int val;
+                if (g_ipopt_set[gfd][slot]) {
+                    val = g_ipopt_val[gfd][slot];
+                } else {
+                    val = ipopt_shadow_default(slot);
+                    int hv;
+                    socklen_t hl = sizeof hv;
+                    int mo = ip6_opt_l2m((int)a2);
+                    if (mo >= 0 && getsockopt(gfd, IPPROTO_IPV6, mo, &hv, &hl) == 0) val = hv;
+                }
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
         }
         if (lvl == 1) {
             lvl = SOL_SOCKET;
@@ -1259,6 +1725,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             rebased_iov[i] = guest_iov[i];
             rebased_iov[i].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[i].iov_base);
         }
+        // Oversized UDP datagram -> EMSGSIZE, before routing (see udp_dgram_maxlen).
+        if (nr == 211) {
+            size_t udp_cap = udp_dgram_maxlen((int)a0);
+            if (udp_cap) {
+                size_t tot = 0;
+                for (uint64_t i = 0; i < giov_count; ++i) tot += rebased_iov[i].iov_len;
+                if (tot > udp_cap) {
+                    G_RET(c) = (uint64_t)(-EMSGSIZE);
+                    break;
+                }
+            }
+        }
         // Container DNS: a sendmsg carrying a query to 127.0.0.11:53 (or on an already-swapped DNS socket).
         if (nr == 211 && dns_enabled()) {
             int dfd = (int)a0;
@@ -1300,7 +1778,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         char ud_host[1200];
         int ud_route = 0;                     // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
         if (nr == 211 && gname && gnamelen) { // sendmsg: guest -> host
-            if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
+            int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
+                                       ud_host, sizeof ud_host)) {
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno);
+                    break;
+                }
+                ud_route = 1;
+            } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
                 unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                 ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
             } else {
@@ -1316,6 +1803,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     mh.msg_namelen = hl;
                 }
             }
+        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                   g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+            ud_route = 1;
         } else if (nr == 212 && gname && gnamelen) { // recvmsg: receive into host scratch
             mh.msg_name = &nss;
             mh.msg_namelen = sizeof nss;
@@ -1400,6 +1890,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // DNS socket: report the nameserver (127.0.0.11:53) as the source (see case 207).
                 dns_fill_ns(gname, NULL);
                 *(uint32_t *)(g + 8) = 16;
+            } else if (gname && gnamelen &&
+                       udp_switch_source(&nss, mh.msg_namelen, gname, (socklen_t *)(g + 8))) {
+                // AF_UNIX switch sender restored to its Linux AF_INET identity.
             } else if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
                 int ll = sa_m2l((struct sockaddr *)&nss, gname, gnamelen);
                 *(uint32_t *)(g + 8) = (ll >= 0) ? (uint32_t)ll : mh.msg_namelen;
@@ -1458,6 +1951,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (hctl != hstack) free(hctl);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        // sendmsg to a peer-closed socket -> guest SIGPIPE (Linux), unless MSG_NOSIGNAL was requested.
+        if (nr == 211 && !((int)a2 & 0x4000)) svc_sigpipe_on_epipe(c, (int64_t)G_RET(c));
         break;
     }
     case 269:
@@ -1526,6 +2021,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 rebased_iov[j] = guest_iov[j];
                 rebased_iov[j].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[j].iov_base);
             }
+            // Oversized UDP datagram -> EMSGSIZE for this submessage (prior sends still count).
+            if (nr == 269) {
+                size_t udp_cap = udp_dgram_maxlen((int)a0);
+                if (udp_cap) {
+                    size_t tot = 0;
+                    for (uint64_t j = 0; j < giov_count; ++j) tot += rebased_iov[j].iov_len;
+                    if (tot > udp_cap) {
+                        err = EMSGSIZE;
+                        break;
+                    }
+                }
+            }
             memset(&mh, 0, sizeof mh);
             mh.msg_name = (void *)net_nonpie_p(*(uint64_t *)(g + 0));
             mh.msg_namelen = *(uint32_t *)(g + 8);
@@ -1539,7 +2046,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char ud_host[1200];
             int ud_route = 0; // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
             if (nr == 269 && gname && gnamelen) { // sendmmsg: guest -> host
-                if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
+                int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                    udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
+                                           ud_host, sizeof ud_host)) {
+                    // AF_INET(6) dest over the private-loopback switch: resolve to the peer AF_UNIX path
+                    // and send there (mirrors sendto/sendmsg cases 206/211).
+                    if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                        err = errno;
+                        break;
+                    }
+                    ud_route = 1;
+                } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
                     unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                     ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
                 } else {
@@ -1549,6 +2067,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         mh.msg_namelen = hl;
                     }
                 }
+            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                       g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+                ud_route = 1; // connected UDP over the switch: send to the recorded peer AF_UNIX path
             } else if (nr == 243 && gname && gnamelen) { // recvmmsg: receive into host scratch
                 mh.msg_name = &nss;
                 mh.msg_namelen = sizeof nss;

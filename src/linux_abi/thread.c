@@ -41,6 +41,7 @@ static void run_guest(struct cpu *c);
 // `imprecise` (WAKE falls back to the bucket-aggregate `waiters`) until it fully drains -- a bounded,
 // wake-count-only degradation that never drops a wakeup (the broadcast still wakes everyone).
 #define FUTEX_ASLOTS 16
+#define FUTEX_WSLOTS 128
 
 struct futex_bucket {
     pthread_mutex_t m;
@@ -49,8 +50,52 @@ struct futex_bucket {
     uintptr_t saddr[FUTEX_ASLOTS]; // distinct uaddrs with >=1 parked waiter (0 == free slot)
     uint32_t scnt[FUTEX_ASLOTS];   // parked-waiter count for saddr[i]
     uint32_t sbits[FUTEX_ASLOTS];  // OR of the FUTEX_WAIT_BITSET masks parked on saddr[i] (plain WAIT = ~0)
+    uintptr_t waddr[FUTEX_WSLOTS]; // individual waiters, for exact FUTEX_WAKE(n) selection
+    uint32_t wbits[FUTEX_WSLOTS];  // this waiter's FUTEX_WAIT_BITSET mask
+    uint8_t wgrant[FUTEX_WSLOTS];  // selected by a wake; consumed by that waiter
+    uint16_t wcursor;              // next waiter slot considered by FUTEX_WAKE (queue progress)
     int imprecise;                 // slots overflowed while waiters were parked -> WAKE count approximate
 };
+
+// pthread_cond_broadcast is only the transport that gets sleepers runnable;
+// Linux FUTEX_WAKE(n) selects at most n waiters.  Keep that selection in the
+// shared bucket so non-selected sleepers re-park instead of spuriously
+// returning success.  Fixed slots are process-shared and therefore work for
+// futexes inherited across a real host fork (unlike linked host pointers).
+static int fbk_wait_register(struct futex_bucket *b, uintptr_t address, uint32_t bits) {
+    for (int i = 0; i < FUTEX_WSLOTS; ++i)
+        if (!b->waddr[i]) {
+            b->waddr[i] = address;
+            b->wbits[i] = bits;
+            b->wgrant[i] = 0;
+            return i;
+        }
+    return -1;
+}
+
+static void fbk_wait_unregister(struct futex_bucket *b, int slot) {
+    if (slot < 0) return;
+    b->wgrant[slot] = 0;
+    b->wbits[slot] = 0;
+    b->waddr[slot] = 0;
+}
+
+static int fbk_wait_grant(struct futex_bucket *b, uintptr_t address, int count, uint32_t mask,
+                          int *has_registered) {
+    int granted = 0;
+    *has_registered = 0;
+    int start = b->wcursor % FUTEX_WSLOTS;
+    for (int offset = 0; offset < FUTEX_WSLOTS; ++offset) {
+        int i = (start + offset) % FUTEX_WSLOTS;
+        if (b->waddr[i] != address) continue;
+        *has_registered = 1;
+        if (b->wgrant[i] || !(b->wbits[i] & mask) || granted >= count) continue;
+        b->wgrant[i] = 1;
+        b->wcursor = (uint16_t)((i + 1) % FUTEX_WSLOTS);
+        granted++;
+    }
+    return granted;
+}
 
 // Called under b->m. Register/unregister one parked waiter on `a`, and report the parked count for `a`.
 // `bits` is the waiter's FUTEX_WAIT_BITSET mask (~0u for a plain FUTEX_WAIT); it is OR'd into the address's
@@ -134,6 +179,7 @@ static struct futex_bucket *futex_table_alloc(const hl_host_services *host, int 
         pthread_mutex_init(&t[i].m, &ma);
         pthread_cond_init(&t[i].c, &ca);
         atomic_store_explicit(&t[i].waiters, 0, memory_order_relaxed);
+        t[i].wcursor = 0;
     }
     pthread_mutexattr_destroy(&ma);
     pthread_condattr_destroy(&ca);
@@ -157,6 +203,10 @@ static void futex_private_table_after_fork(void) {
         memset(b->saddr, 0, sizeof b->saddr);
         memset(b->scnt, 0, sizeof b->scnt);
         memset(b->sbits, 0, sizeof b->sbits);
+        memset(b->waddr, 0, sizeof b->waddr);
+        memset(b->wbits, 0, sizeof b->wbits);
+        memset(b->wgrant, 0, sizeof b->wgrant);
+        b->wcursor = 0;
         b->imprecise = 0;
     }
     g_fbk_active = g_fbk_private;
@@ -371,6 +421,7 @@ struct guest_file_mapping {
     uint64_t follow_lo, follow_hi;
     int fd;
     uint32_t shared;
+    uint32_t emulated;
 };
 static struct guest_file_mapping g_filemap[GNA_MAX];
 static int g_nfilemap;
@@ -451,15 +502,76 @@ static uint64_t filemap_accessible(const struct guest_file_mapping *mapping, uin
     return rounded < length ? rounded : length;
 }
 
-static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t offset, int shared) {
+static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t offset, int shared, int emulated) {
     struct stat st;
     if (size == 0 || address > UINT64_MAX - size || fstat(fd, &st) != 0) return;
     pthread_mutex_lock(&g_filemap_lock);
     filemap_events_init_locked();
-    if (g_nfilemap < GNA_MAX)
+    int retained = -1;
+    for (int index = 0; index < g_nfilemap; ++index)
+        if (g_filemap[index].device == (uint64_t)st.st_dev && g_filemap[index].inode == (uint64_t)st.st_ino) {
+            retained = g_filemap[index].fd;
+            break;
+        }
+    if (retained < 0) {
+        retained = fcntl(fd, F_DUPFD_CLOEXEC, 1 << 20);
+        if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, HL_NFD);
+    }
+    if (g_nfilemap < GNA_MAX && retained >= 0)
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
                                                               (uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                                                              0, 0, fd, (uint32_t)shared};
+                                                              0, 0, retained, (uint32_t)shared, (uint32_t)emulated};
+    else if (retained >= 0) {
+        int shared_source = 0;
+        for (int index = 0; index < g_nfilemap; ++index)
+            if (g_filemap[index].fd == retained) shared_source = 1;
+        if (!shared_source) close(retained);
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static ssize_t filemap_pread(int fd, void *buffer, size_t length, off_t offset) {
+    ssize_t result;
+    do
+        result = pread(fd, buffer, length, offset);
+    while (result < 0 && errno == EINTR);
+    return result;
+}
+
+static int filemap_source_fd(struct guest_file_mapping *mapping);
+
+static void filemap_refresh_emulated(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    /* Host-page emulation creates a private snapshot.  Refresh every
+       registered snapshot of the same shared file extent, not merely the
+       virtual range named by the caller: MAP_SHARED coherence is defined by
+       backing identity and offset.  Provider memory is not registered here
+       and remains owned by its explicit provider coherence contract. */
+    for (int source_index = 0; source_index < g_nfilemap; ++source_index) {
+        struct guest_file_mapping *source = &g_filemap[source_index];
+        if (!source->shared || hi <= source->lo || lo >= source->hi) continue;
+        uint64_t source_first = lo > source->lo ? lo : source->lo;
+        uint64_t source_last = hi < source->hi ? hi : source->hi;
+        uint64_t file_first = source->offset + source_first - source->lo;
+        uint64_t file_last = source->offset + source_last - source->lo;
+        int fd = filemap_source_fd(source);
+        if (fd < 0) continue;
+
+        for (int target_index = 0; target_index < g_nfilemap; ++target_index) {
+            struct guest_file_mapping *target = &g_filemap[target_index];
+            uint64_t target_size = target->hi - target->lo;
+            if (!target->shared || !target->emulated || target->device != source->device ||
+                target->inode != source->inode || target->offset > UINT64_MAX - target_size)
+                continue;
+            uint64_t target_last = target->offset + target_size;
+            uint64_t overlap_first = file_first > target->offset ? file_first : target->offset;
+            uint64_t overlap_last = file_last < target_last ? file_last : target_last;
+            if (overlap_last <= overlap_first) continue;
+            (void)filemap_pread(fd, (void *)(uintptr_t)(target->lo + overlap_first - target->offset),
+                                (size_t)(overlap_last - overlap_first), (off_t)overlap_first);
+        }
+    }
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
@@ -471,7 +583,12 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
         if (hi <= mapping->lo || lo >= mapping->hi) { i++; continue; }
         uint64_t old_lo = mapping->lo, old_hi = mapping->hi;
         if (lo <= old_lo && hi >= old_hi) {
+            int retained = mapping->fd;
             g_filemap[i] = g_filemap[--g_nfilemap];
+            int used = 0;
+            for (int index = 0; index < g_nfilemap; ++index)
+                if (g_filemap[index].fd == retained) used = 1;
+            if (!used && retained >= 0) close(retained);
             continue;
         }
         if (lo > old_lo && hi < old_hi && g_nfilemap < GNA_MAX) {
@@ -493,6 +610,27 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
         i++;
     }
     pthread_mutex_unlock(&g_filemap_lock);
+}
+
+// memfd F_SEAL_WRITE (io.c fcntl) must fail EBUSY while an outstanding MAP_SHARED mapping of the same object
+// is live (Linux mm/shmem.c gates the seal on the address_space's writable-mapping count). A memfd is always
+// opened read-write, so every shared mapping of it carries VM_MAYWRITE and counts regardless of the
+// mapping's current PROT (a PROT_READ shared map, or a shared map later mprotect'd read-only, still blocks);
+// only MAP_PRIVATE (COW) mappings are exempt. Scan the file-mapping registry for a live shared mapping of
+// this fd's (device, inode).
+static int filemap_has_shared_mapping(int fd) {
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int i = 0; i < g_nfilemap; ++i)
+        if (g_filemap[i].shared && g_filemap[i].device == (uint64_t)st.st_dev &&
+            g_filemap[i].inode == (uint64_t)st.st_ino) {
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_filemap_lock);
+    return found;
 }
 
 static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t old_size, uint64_t new_size) {
@@ -552,11 +690,6 @@ static int filemap_source_fd(struct guest_file_mapping *mapping) {
     if (mapping->fd >= 0 && fstat(mapping->fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device &&
         (uint64_t)st.st_ino == mapping->inode)
         return mapping->fd;
-    for (int fd = 0; fd < HL_NFD; ++fd)
-        if (fstat(fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device && (uint64_t)st.st_ino == mapping->inode) {
-            mapping->fd = fd;
-            return fd;
-        }
     return -1;
 }
 
@@ -976,6 +1109,13 @@ static void gna_reset(void) {
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_filemap_lock);
+    for (int index = 0; index < g_nfilemap; ++index) {
+        int retained = g_filemap[index].fd;
+        int first = 1;
+        for (int previous = 0; previous < index; ++previous)
+            if (g_filemap[previous].fd == retained) first = 0;
+        if (first && retained >= 0) close(retained);
+    }
     g_nfilemap = 0;
     pthread_mutex_unlock(&g_filemap_lock);
     pthread_mutex_lock(&g_bus_transition);
@@ -1121,11 +1261,55 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     } else {
         g_hrm_lo = lo;
         g_hrm_hi = end;
-        for (uintptr_t p = lo; p < end; p += 0x1000)
+        for (uintptr_t p = lo; p < end; p += 0x1000) {
             (void)*(volatile const uint8_t *)p;
+            /* A file mapping can end in the middle of a guest page.  Darwin's
+               VM region query and a probe at the page start both succeed, but
+               bytes after EOF raise SIGBUS.  Probe the last covered byte too;
+               mapped ranges cannot contain an interior hole, so the pair
+               proves the complete page fragment is readable. */
+            uintptr_t q = p + 0xfff;
+            if (q >= end) q = end - 1;
+            if (q != p) (void)*(volatile const uint8_t *)q;
+        }
     }
     g_hrm_lo = 0;
     g_hrm_hi = 0; // probe window closed (hook inert again)
+    return ok;
+}
+
+/* Prove that every guest-page fragment in a range accepts stores without
+   changing its contents.  A Darwin file mapping can be readable while writes
+   to its EOF tail raise SIGBUS; VM-region protection alone cannot detect that
+   state.  The same guarded fault window used by host_range_mapped keeps this
+   suitable for reconciling Linux MAP_FIXED sub-host-page mappings. */
+static int host_range_writable(uintptr_t a, size_t len) {
+    if (!len) return 1;
+    uintptr_t end = a + len;
+    if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
+    uintptr_t lo = a & ~(uintptr_t)0xfff;
+    volatile int ok = 1;
+    if (sigsetjmp(g_hrm_jb, 0)) {
+        ok = 0;
+    } else {
+        g_hrm_lo = lo;
+        g_hrm_hi = end;
+        for (uintptr_t p = lo; p < end; p += 0x1000) {
+            uintptr_t begin = p < a ? a : p;
+            volatile uint8_t *first = (volatile uint8_t *)begin;
+            uint8_t value = *first;
+            *first = value;
+            uintptr_t q = p + 0xfff;
+            if (q >= end) q = end - 1;
+            if (q != begin) {
+                volatile uint8_t *last = (volatile uint8_t *)q;
+                value = *last;
+                *last = value;
+            }
+        }
+    }
+    g_hrm_lo = 0;
+    g_hrm_hi = 0;
     return ok;
 }
 
@@ -1221,7 +1405,10 @@ static inline void ts_wait_leave(void);
 // WAKE block exactly: PROF fast/slow split, lock+broadcast (the lock orders the guest's pre-syscall store
 // to *uaddr ahead of an arriving waiter's under-lock value-check, so no wakeup is lost), and a count taken
 // from the per-address slot (the number of waiters that will re-check their word and leave).
-static int futex_wake_bucket(const int *uaddr, int n, uint32_t match) {
+// `grant_all` selects EVERY matching waiter (returning only the first `n` as the woken count) for the
+// REQUEUE family, whose parked peers have no secondary queue to be woken from later, so this
+// approximation moves them by waking them all; plain FUTEX_WAKE(n) passes 0 and grants exactly `n`.
+static int futex_wake_bucket(const int *uaddr, int n, uint32_t match, int grant_all) {
     struct futex_bucket *b = fbk_of(uaddr);
     if (g_prof) {
         if (atomic_load_explicit(&b->waiters, memory_order_relaxed))
@@ -1236,8 +1423,19 @@ static int futex_wake_bucket(const int *uaddr, int n, uint32_t match) {
         pthread_mutex_unlock(&b->m);
         return 0;
     }
-    int woke = fbk_parked(b, futex_key(uaddr));
-    if (woke > n) woke = n;
+    int registered = 0;
+    int woke = fbk_wait_grant(b, futex_key(uaddr), n, match, &registered);
+    if (grant_all && registered) { // REQUEUE approximation: also release the peers left behind
+        int r2 = 0;
+        (void)fbk_wait_grant(b, futex_key(uaddr), INT_MAX, match, &r2);
+    }
+    // PI and overflow fallback waiters do not occupy ordinary-wait slots;
+    // their loops re-check ownership/value after a broadcast, so the old
+    // bounded parked count remains correct for that exceptional path.
+    if (!registered) {
+        woke = fbk_parked(b, futex_key(uaddr));
+        if (woke > n) woke = n;
+    }
     pthread_cond_broadcast(&b->c); // waiters re-check their own word; spurious wakes are legal
     pthread_mutex_unlock(&b->m);
     return woke;
@@ -1471,7 +1669,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // Wake up to `val` signalled + `nr_wake2` requeue-budget waiters in one broadcast; each self-acquires
         // uaddr2, so the physical requeue is unnecessary. (A single broadcast wakes all parked in the bucket.)
         long budget = (long)(val < 1 ? 1 : val) + (nr_wake2 > 0 ? nr_wake2 : 0);
-        return futex_wake_bucket(uaddr, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u);
+        return futex_wake_bucket(uaddr, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u, 1);
     }
     if (!g_futexq) {
         // ---- legacy single global queue ----
@@ -1559,20 +1757,34 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // bucket, so a cross-fork waker sees it. Carry the wait bitset (op 9 = FUTEX_WAIT_BITSET's val3;
         // plain FUTEX_WAIT matches any) so FUTEX_WAKE_BITSET can skip a non-overlapping wake.
         fbk_park(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
+        int wait_slot = fbk_wait_register(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
         ts_wait_enter(); // 'S' (sleeping) while parked in FUTEX_WAIT; peer /proc/<pid>/stat|status must not show 'R'
         int rc = 0;
+        struct timespec abs;
         if (ts) {
-            struct timespec abs, rel;
+            struct timespec rel;
             // op 9 (FUTEX_WAIT_BITSET): ts is an absolute deadline; op 0: it is relative.
             if (op == 9) futex_rel_from_abs(&rel, ts);
             abs_from_rel(&abs, op == 9 ? &rel : ts);
-            rc = pthread_cond_timedwait(&b->c, &b->m, &abs);
-        } else
-            pthread_cond_wait(&b->c, &b->m);
+        }
+        // FUTEX_WAKE(n) selects EXACTLY n waiters by setting their wgrant slot (fbk_wait_grant); the
+        // pthread_cond_broadcast is only the transport that makes sleepers runnable. An unselected peer
+        // that wakes must therefore re-park rather than return success -- otherwise a WAKE(1) releases
+        // every waiter in the bucket. Loop until we are granted, time out, or a signal interrupts us. A
+        // waiter that overflowed the exact-selection slots (wait_slot < 0) keeps the legacy re-check-word
+        // wake so it can never be stranded.
+        int intr = 0;
+        for (;;) {
+            rc = ts ? pthread_cond_timedwait(&b->c, &b->m, &abs) : pthread_cond_wait(&b->c, &b->m);
+            if (cpu_wait_interrupted(c)) { intr = 1; break; }
+            if (rc == ETIMEDOUT) break;
+            if (wait_slot < 0) break;
+            if (b->wgrant[wait_slot]) { b->wgrant[wait_slot] = 0; break; }
+        }
         ts_wait_leave();
         thread_wait_clear();
+        fbk_wait_unregister(b, wait_slot);
         fbk_unpark(b, futex_key(uaddr));
-        int intr = cpu_wait_interrupted(c);
         // fetch_sub returns the PREVIOUS value; == 1 means the bucket just fully drained -> a stale
         // `imprecise` flag (set by a past slot overflow) can be cleared so exact counting resumes.
         if (atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed) == 1) b->imprecise = 0;
@@ -1598,7 +1810,9 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // parked on THIS uaddr: each re-checks its word, sees the store, and leaves -- exactly the woken
         // count. (Returning `val` broke LTP tst_checkpoint_wake's `waked += WAKE(INT_MAX)` -> fork04.)
         // FUTEX_WAKE_BITSET (op 10) wakes only waiters whose bitset overlaps val3; the others match any.
-        int woke = futex_wake_bucket(uaddr, val, op == 10 ? val3 : ~0u);
+        // REQUEUE(3)/CMP_REQUEUE(4) have no modelled secondary queue, so wake every parked peer (grant_all);
+        // plain WAKE(1)/WAKE_BITSET(10) must release EXACTLY `val` -- unselected peers re-park (see WAIT loop).
+        int woke = futex_wake_bucket(uaddr, val, op == 10 ? val3 : ~0u, op == 3 || op == 4);
         return woke;
     }
     if (op == 5) { // FUTEX_WAKE_OP: atomically mutate *uaddr2, wake uaddr waiters, conditionally uaddr2's.
@@ -1609,8 +1823,8 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         int do_wake2 = 0;
         int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
         if (rc < 0) return rc; // -EFAULT (bad uaddr2) / -ENOSYS (unknown op|cmp): report to the guest as-is
-        int woke = futex_wake_bucket(uaddr, val, ~0u);
-        if (do_wake2) woke += futex_wake_bucket(uaddr2, nr_wake2, ~0u);
+        int woke = futex_wake_bucket(uaddr, val, ~0u, 0);
+        if (do_wake2) woke += futex_wake_bucket(uaddr2, nr_wake2, ~0u, 0);
         return woke;
     }
     // A genuinely undefined command (the removed FUTEX_FD=2, or any value >= 14 that names no futex op) is
@@ -1639,15 +1853,21 @@ static void futex_wake_addr(uint64_t uaddr) {
         pthread_mutex_unlock(&g_futex_m);
         return;
     }
-    // Linux's kernel-driven clear-child-tid wake uses shared futex semantics; glibc's lll_wait_tid joins on
-    // that same key class. Do not route it through whichever table this thread's last syscall selected.
-    g_fbk_active = g_fbk;
-    // Always lock+broadcast (same reasoning as futex_op's WAKE): the joiner's FUTEX_WAIT re-checks
-    // *ctid under this bucket's mutex, so the zero store above is ordered ahead of its check.
-    struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
-    pthread_mutex_lock(&b->m);
-    pthread_cond_broadcast(&b->c);
-    pthread_mutex_unlock(&b->m);
+    // libc implementations use both private and shared futex operations for
+    // thread joins.  The kernel-generated clear-child-tid wake is not tagged
+    // by the exiting guest syscall, so notify both key spaces.  The word is
+    // already zero and waiters re-check it, making the second notification a
+    // harmless spurious wake while avoiding a permanently parked exact waiter.
+    struct futex_bucket *tables[] = {g_fbk_private, g_fbk};
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; ++i) {
+        g_fbk_active = tables[i];
+        struct futex_bucket *b = fbk_of((const void *)(uintptr_t)uaddr);
+        pthread_mutex_lock(&b->m);
+        int registered = 0;
+        (void)fbk_wait_grant(b, futex_key((const void *)(uintptr_t)uaddr), INT_MAX, ~0u, &registered);
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+    }
 }
 
 static volatile int g_next_tid = 1000;
@@ -1837,6 +2057,24 @@ static int thread_target_signal(int tid, int sig) {
     return found;
 }
 
+// Does the live guest thread `tid` currently BLOCK signal `sig`? A thread-directed tkill/tgkill of a signal
+// the target has blocked must be held pending on THAT specific thread -- so the thread's own sigwait/
+// sigtimedwait dequeues it (or it is delivered when the thread unblocks) -- rather than being dropped into
+// the process-wide g_pending, where any thread (often the sender) could consume it. That misrouting is what
+// left a pthread_kill()+sigwait target hung / a peer thread waking instead of the addressed one.
+static int thread_tid_blocks_signal(int tid, int sig) {
+    if (sig < 1 || sig > 64) return 0;
+    int blocked = 0;
+    pthread_mutex_lock(&g_threg_m);
+    for (int i = 0; i < THREAD_REG_MAX; i++)
+        if (g_threg[i].c && cpu_tid(g_threg[i].c) == tid) {
+            blocked = (g_threg[i].c->sigmask & (1ull << (sig - 1))) != 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_threg_m);
+    return blocked;
+}
+
 // Is `tid` a LIVE guest thread of this process? tkill/tgkill (syscall/signal.c) use it to return ESRCH for
 // a tid no thread carries -- e.g. a joined/exited thread whose id LTP tgkill03 reuses ("defunct tid"). The
 // process shares one thread-group, so a tid absent from the registry is gone. (The caller's own tid is
@@ -1953,7 +2191,7 @@ static void robust_handle_death(uint64_t futex_addr, int mytid) {
         if (((uint32_t)v & HL_FUTEX_TID_MASK) != (uint32_t)mytid) return; // not (or no longer) ours
         int nv = (int)(((uint32_t)v & HL_FUTEX_WAITERS) | HL_FUTEX_OWNER_DIED);
         if (__atomic_compare_exchange_n(w, &v, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-            if ((uint32_t)v & HL_FUTEX_WAITERS) futex_wake_bucket(w, 1, ~0u); // one waiter -> EOWNERDEAD
+            if ((uint32_t)v & HL_FUTEX_WAITERS) futex_wake_bucket(w, 1, ~0u, 0); // one waiter -> EOWNERDEAD
             return;
         }
         // v was reloaded with the current word by the failed cmpxchg -> re-check ownership and retry
@@ -2016,6 +2254,20 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     G_THREAD_RESUME(child, parent);
     // §B: child starts with an EMPTY shadow stack (no parent frames)
     G_SHADOW_RESET(child);
+    G_SMC_QUEUE_RESET(child);
+    /* clone() inherits architectural register state and the signal mask, but
+       these fields describe an in-flight engine operation on the parent host
+       thread.  Copying them can deliver the parent's synchronous fault to the
+       child or resume a BUS/service handoff with stale scratch state. */
+    child->irq = 0;
+    child->tpending = 0;
+    child->sync_signal = 0;
+    child->sync_code = 0;
+    child->sync_address = 0;
+    child->vdirty = 0;
+    child->fault_addr = 0;
+    child->bus_ea = 0;
+    child->in_service = 0;
     child->exited = 0;
     child->redirect = 0;
     // CLONE_SETTLS
@@ -2032,6 +2284,11 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     // robust list is per-thread and NOT inherited: a new thread starts empty and re-registers via
     // set_robust_list itself (otherwise the copied parent head would be walked twice on exit).
     child->robust_list = 0;
+    // A new CLONE_VM thread starts with no alternate signal stack (Linux
+    // sigaltstack(2)); it installs its own stack after startup when needed.
+    child->alt_sp = 0;
+    child->alt_size = 0;
+    child->alt_flags = 2; /* SS_DISABLE */
     g_threaded = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, thread_trampoline, child) != 0) {

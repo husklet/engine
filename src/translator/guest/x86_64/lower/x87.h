@@ -19,6 +19,7 @@ void hl_x86_x87_extract(void);
 void hl_x86_x87_round(void);
 void hl_x86_x87_test(void);
 void hl_x86_x87_status(void);
+void hl_x86_x87_clear_exceptions(void);
 void hl_x86_x87_classify(void);
 void hl_x86_x87_function(int function, uint64_t next);
 

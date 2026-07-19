@@ -7,12 +7,16 @@
 
 HL_EXTERN_C_BEGIN
 
-#define HL_ENGINE_ABI 4u
+#define HL_ENGINE_ABI 5u
 #define HL_ENGINE_BOX_ABI 4u
 #define HL_ENGINE_BOX_ABI_3 3u
 #define HL_ENGINE_BOX_ABI_1 1u
 
 typedef struct hl_engine hl_engine;
+
+/* Highest descriptor number available to a guest launch; descriptors at and above this value are reserved
+ * for engine-private host authority. Returns zero when the host cannot provide a disjoint range. */
+HL_API uint32_t hl_engine_guest_fd_limit(void);
 
 typedef enum hl_guest_isa { HL_GUEST_ISA_AARCH64 = 1, HL_GUEST_ISA_X86_64 = 2 } hl_guest_isa;
 
@@ -45,6 +49,16 @@ typedef struct hl_engine_fd_binding {
     uint32_t ownership;
     hl_host_handle host_handle;
 } hl_engine_fd_binding;
+
+typedef struct hl_engine_executable {
+    HL_ABI_HEADER;
+    uint32_t ownership;
+    uint32_t reserved;
+    hl_host_handle host_handle;
+    /* Engine-populated immutable image. Callers must pass NULL/zero. */
+    const void *image;
+    size_t image_size;
+} hl_engine_executable;
 
 enum {
     HL_ENGINE_BOX_ROOTFS_READ_ONLY = 1u << 0,
@@ -108,6 +122,8 @@ typedef struct hl_engine_config {
     uint32_t reserved;
     /* Optional, ABI-versioned Linux-box settings. */
     const hl_engine_box_config *box;
+    /* Optional authority for the initial main executable only. Never reused by exec or an interpreter. */
+    const hl_engine_executable *executable;
 } hl_engine_config;
 
 typedef struct hl_engine_exit {

@@ -23,9 +23,11 @@ int g_rwx_guest;
 #include <stdlib.h>
 #include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
 #include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
+#include <time.h>      // sysinfo(2) uptime = now - host boot time
 #include "../errno.h"
 #include "../../host/directory.h"
 #include "../../host/process.h"
+#include "../../host/system.h" // host memory/boot snapshot feeding sysinfo(2), consistent with /proc/meminfo
 // seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
 // here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
 // handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
@@ -106,11 +108,98 @@ static void fd_reset_emul(int fd);
 static void mq_fd_close(int fd);
 static void mq_fd_duplicate(int newfd, int oldfd);
 
+#include "../../core/provider/files.h"
+#include "../object.h"
+#include "provider_epoll_registry.h"
+static ep_provider_watch g_ep_provider_watches[EP_PROVIDER_WATCH_LIMIT];
+static uint32_t g_ep_provider_generations[HL_NFD];
+static uint32_t g_ep_provider_serial;
+
+static void ep_provider_retire(ep_provider_watch *watch) {
+    if (!ep_provider_retire_begin(watch)) return;
+    hl_provider_files_unsubscribe(watch->handle, watch, atomic_load(&watch->serial));
+    while (atomic_load_explicit(&watch->callbacks, memory_order_acquire) != 0) sched_yield();
+    ep_provider_retire_finish(watch);
+}
+
+static void ep_provider_retire_endpoint(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    uint32_t epoll_generation = g_ep_provider_generations[fd];
+    for (uint32_t index = 0; index < EP_PROVIDER_WATCH_LIMIT; ++index) {
+        ep_provider_watch *watch = &g_ep_provider_watches[index];
+        if (atomic_load_explicit(&watch->state, memory_order_acquire) == EP_PROVIDER_ACTIVE &&
+            ((watch->epoll == fd && watch->epoll_generation == epoll_generation) || watch->descriptor == fd))
+            ep_provider_retire(watch);
+    }
+}
+
+/* Object-backed epoll watches.  A typed box object (an inotify watch is the
+ * canonical case) exposes readiness only through its object adapter -- it owns
+ * host observation and never surfaces a host descriptor the guest epoll kqueue
+ * could wait on.  poll()/select() already observe such objects by sampling their
+ * readiness on a bounded tick (hl_linux_object_poll); epoll mirrors that exact
+ * pattern here so an armed inotify fd is epollable as it is on native Linux.
+ * epoll_generation reuses g_ep_provider_generations, which is bumped whenever an
+ * epoll or watched fd number is closed, so a reused number never matches. */
+#define EP_OBJECT_WATCH_LIMIT 1024u
+typedef struct ep_object_watch {
+    _Atomic uint32_t active;
+    int epoll;
+    uint32_t epoll_generation;
+    int descriptor;
+    uint32_t descriptor_generation;
+    uint32_t events;   /* raw guest epoll event mask (EPOLLONESHOT etc.) */
+    uint32_t interests;
+    uint64_t data;
+} ep_object_watch;
+static ep_object_watch g_ep_object_watches[EP_OBJECT_WATCH_LIMIT];
+static uint16_t g_ep_object_count[HL_NFD];
+
+static ep_object_watch *ep_object_find(int epoll, uint32_t epoll_generation, int descriptor,
+                                       uint32_t descriptor_generation) {
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        ep_object_watch *watch = &g_ep_object_watches[index];
+        if (atomic_load_explicit(&watch->active, memory_order_acquire) != 0 && watch->epoll == epoll &&
+            watch->epoll_generation == epoll_generation && watch->descriptor == descriptor &&
+            watch->descriptor_generation == descriptor_generation)
+            return watch;
+    }
+    return NULL;
+}
+
+static ep_object_watch *ep_object_alloc(void) {
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        uint32_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&g_ep_object_watches[index].active, &expected, 1u,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return &g_ep_object_watches[index];
+    }
+    return NULL;
+}
+
+static void ep_object_free(ep_object_watch *watch) {
+    if (watch->epoll >= 0 && watch->epoll < HL_NFD && g_ep_object_count[watch->epoll] > 0)
+        g_ep_object_count[watch->epoll]--;
+    atomic_store_explicit(&watch->active, 0u, memory_order_release);
+}
+
+static void ep_object_retire_endpoint(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        ep_object_watch *watch = &g_ep_object_watches[index];
+        if (atomic_load_explicit(&watch->active, memory_order_acquire) != 0 &&
+            (watch->epoll == fd || watch->descriptor == fd))
+            ep_object_free(watch);
+    }
+    g_ep_object_count[fd] = 0;
+}
+
 #include "helpers.c"
 #include "sysv.c"
 #include "mem.c"
 #include "signal.c"
 #include "time.c"
+static int bound_sentinel_vacate(int target);
 #include "io.c"
 #include "aio.c"
 #include "net.c"
@@ -320,6 +409,7 @@ static struct mq_queue g_mqq[MQ_MAXQ];
 
 static int8_t g_mqfd_queue[HL_NFD]; /* queue index + 1; zero means this fd is not an mqueue descriptor */
 static uint16_t g_mqfd_flags[HL_NFD];
+static uint8_t g_mqfd_amode[HL_NFD]; /* O_ACCMODE of the open: O_RDONLY(0)/O_WRONLY(1)/O_RDWR(2) */
 static uint32_t g_mqfd_group[HL_NFD];
 static uint32_t g_mqfd_next_group = 1;
 static void mq_maybe_free(int qi);
@@ -347,6 +437,7 @@ static void mq_fd_duplicate(int newfd, int oldfd) {
     if (qi < 0 || newfd < 0 || newfd >= HL_NFD || g_mqfd_queue[newfd] != 0) return;
     g_mqfd_queue[newfd] = (int8_t)(qi + 1);
     g_mqfd_flags[newfd] = g_mqfd_flags[oldfd];
+    g_mqfd_amode[newfd] = g_mqfd_amode[oldfd]; // a dup shares the open file description's access mode
     g_mqfd_group[newfd] = g_mqfd_group[oldfd];
     g_mqq[qi].refs++;
 }
@@ -356,6 +447,7 @@ static void mq_fd_close(int fd) {
     if (qi < 0) return;
     g_mqfd_queue[fd] = 0;
     g_mqfd_flags[fd] = 0;
+    g_mqfd_amode[fd] = 0;
     g_mqfd_group[fd] = 0;
     g_mqq[qi].refs--;
     mq_maybe_free(qi);
@@ -374,6 +466,16 @@ static void mq_fd_setnb(int fd, int on) {
     group = g_mqfd_group[fd];
     for (int i = 0; i < HL_NFD; ++i)
         if (g_mqfd_group[i] == group) g_mqfd_flags[i] = on ? MQ_O_NONBLOCK : 0;
+}
+
+// Access-mode enforcement: the kernel checks FMODE_WRITE/FMODE_READ on the descriptor right after the fd
+// lookup (before EMSGSIZE), so a send on an O_RDONLY descriptor or a receive on an O_WRONLY one is EBADF.
+// O_RDONLY(0)/O_WRONLY(1)/O_RDWR(2) are identical on aarch64 and x86_64.
+static int mq_fd_canwrite(int fd) {
+    return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_RDONLY; // O_WRONLY or O_RDWR
+}
+static int mq_fd_canread(int fd) {
+    return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_WRONLY; // O_RDONLY or O_RDWR
 }
 
 static void mq_maybe_free(int qi) {
@@ -513,6 +615,10 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
 // included AFTER them.
 #include "../watch.h"
 #include "inotify.c"
+/* fs.c handles synthetic /proc/self/fd and /dev/fd opens before the generic bound syscall route.  A
+ * projected/typed descriptor must be duplicated through the Linux fd model rather than reopening its
+ * native sentinel path; binding.c supplies the allocator after the syscall families are included. */
+static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t descriptor_flags);
 #include "fs.c"
 static void bound_mapping_reset(void);
 static size_t bound_mapping_watch_capacity(void);
@@ -543,16 +649,27 @@ static void service(struct cpu *c) {
         g_in_service = 0;
         return;
     }
-    uint64_t _rnr = g_systrace ? G_NR(c) : 0; // JTS: capture nr to pair the return log below
+    // Preserve the guest's first syscall-argument register so a transparent SA_RESTART restart (see
+    // syscall_should_restart) can re-execute the SVC with the ORIGINAL arg. On aarch64 arg0 and the return
+    // value share x0, so a handler-then-restart would otherwise feed the just-written result back as arg0.
+    uint64_t _svc_arg0 = G_A0(c);
+    // On x86-64 the syscall NUMBER and the return value share RAX (G_RET), so once the interrupted call wrote
+    // its -EINTR result the number is gone -- a transparent restart would re-issue `syscall` with -EINTR as
+    // the number. Preserve the entry number register so the SA_RESTART restart re-executes the SAME syscall.
+    uint64_t _svc_nrreg = G_RET(c);
+    g_syscall_restart = 0;
+    uint64_t _rnr = g_systrace ? G_NR(c) : 0;
     // seccomp gate: run the guest's installed cBPF filter(s) / STRICT policy against this syscall BEFORE it
     // is routed anywhere. On an intercepted syscall (ERRNO/TRAP/TRACE/KILL/strict-violation) the result is
     // already set in G_RET / a signal is queued / the process is killed, so we must NOT service it. Inert
     // (one predicted-not-taken load) until a guest installs a filter. Runs on the RAW guest register state,
     // before x86 legacy-syscall normalization, so the filter sees the number/args the guest actually issued.
     if (__builtin_expect(seccomp_gate(c) != 0, 0)) {
+#if HL_ENABLE_LOGGING
         if (g_systrace)
             fprintf(stderr, "[ret pid=%d] %llu -> %lld (seccomp)\n", (int)getpid(), (unsigned long long)_rnr,
                     (long long)(int64_t)G_RET(c));
+#endif
         __atomic_store_n(&c->in_service, 0, __ATOMIC_SEQ_CST);
         g_in_service = 0;
         return;
@@ -566,10 +683,49 @@ static void service(struct cpu *c) {
     } else {
         service_local(c); // trusted: byte-identical path
     }
+    if (!g_untrusted && (int64_t)G_RET(c) >= 0) {
+        int fd = (int)G_RET(c);
+        switch (_rnr ? _rnr : G_NR(c)) {
+        case 19:  /* eventfd2 */
+        case 20:  /* epoll_create1 */
+        case 23:  /* dup */
+        case 56:  /* openat */
+        case 198: /* socket */
+        case 202: /* accept */
+        case 242: /* accept4 */
+        case 437: /* openat2 */
+            (void)proc_fdvis_publish_native_fd(fd);
+            break;
+        case 24: /* dup3: result is the requested target descriptor */
+            (void)proc_fdvis_publish_native_fd((int)G_A1(c));
+            break;
+        default: break;
+        }
+    }
     filemap_replay();
+    // A restart-redirect was requested (SA_RESTART handler pending on an interrupted blocking syscall): the
+    // syscall re-executes at the same SVC once the handler returns, so restore the arg0/return-aliased
+    // register the dispatch overwrote with the (discarded) EINTR result. The negative EINTR already made the
+    // fd-publish block above a no-op, so this runs strictly after it.
+    if (g_syscall_restart && c->redirect) {
+        G_A0(c) = _svc_arg0;
+#if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
+        // x86 pre-advances rip past the `syscall` instruction (0F 05, 2 bytes) at emit time, so `redirect`
+        // alone -- which only suppresses aarch64's post-service pc+=4 -- cannot re-execute it. Rewind rip to
+        // the syscall instruction so the pending SA_RESTART handler's sigframe saves that pc and sigreturn
+        // resumes ON it, transparently restarting the interrupted read()/waitpid() (eintr_restart_read/wait,
+        // sarestart). aarch64 needs no rewind: leaving pc on the SVC is exactly what skipping the +4 does.
+        G_PC(c) -= 2;
+        // Restore RAX to the original syscall number (it shares the register with the just-written -EINTR
+        // return), so the re-executed `syscall` re-issues the same call rather than a garbage number.
+        G_RET(c) = _svc_nrreg;
+#endif
+    }
+#if HL_ENABLE_LOGGING
     if (g_systrace)
         fprintf(stderr, "[ret pid=%d] %llu -> %lld\n", (int)getpid(), (unsigned long long)_rnr,
                 (long long)(int64_t)G_RET(c));
+#endif
     __atomic_store_n(&c->in_service, 0, __ATOMIC_SEQ_CST);
     g_in_service = 0;
 }
@@ -585,10 +741,12 @@ static void service_local(struct cpu *c) {
     uint64_t nr = G_NR(c), a0 = G_A0(c), a1 = G_A1(c), a2 = G_A2(c), a3 = G_A3(c), a4 = G_A4(c), a5 = G_A5(c);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_SYSCALL, "nr=%llu a0=%#llx a1=%#llx a2=%#llx", (unsigned long long)nr,
             (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+#if HL_ENABLE_LOGGING
     if (g_trace || g_systrace)
         fprintf(stderr, "[sys pid=%d] %llu (%llx,%llx,%llx,%llx,%llx,%llx)\n", (int)getpid(), (unsigned long long)nr,
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
                 (unsigned long long)a4, (unsigned long long)a5);
+#endif
     // --- non-PIE ET_EXEC pointer-arg redirect (g2h) --------------------------------------------------
     // Rebase ONLY the pointer-typed args of each syscall a non-PIE realistically hands a low-image
     // (.rodata/.data/.bss) pointer to, so the host syscall reads/writes the SAME bytes a native run would.
@@ -606,6 +764,7 @@ static void service_local(struct cpu *c) {
         case 48:  // faccessat(dfd, PATH, mode)
         case 439: // faccessat2(dfd, PATH, mode, flags)
         case 53:  // fchmodat(dfd, PATH, mode, flags)
+        case 452: // fchmodat2(dfd, PATH, mode, flags)
         case 54:  // fchownat(dfd, PATH, uid, gid, flags)
             a1 = nonpie_p(a1);
             break; //   path is a1 for the whole *at family
@@ -863,6 +1022,7 @@ static void service_local(struct cpu *c) {
             break;
         case 167: // prctl: only pointer-bearing option arguments are rebased
             if (a0 == 2 || a0 == 15 || a0 == 16 || a0 == 37) a1 = nonpie_p(a1);
+            if (a0 == 22 && a1 == 2) a2 = nonpie_p(a2); // PR_SET_SECCOMP(FILTER, sock_fprog *)
             break;
         case 148: // getresuid(RUID, EUID, SUID) -- all three written directly
         case 150: // getresgid(RGID, EGID, SGID)
@@ -924,6 +1084,7 @@ static void service_local(struct cpu *c) {
             break;             //   below g_nonpie_lo, so nonpie_p leaves it unchanged).
         case 163:              // getrlimit(res, RLIM) -- rlim written
         case 164:              // setrlimit(res, RLIM) -- rlim read
+        case 274:              // sched_setattr(pid, ATTR, flags)        -- attr read directly
         case 275:              // sched_getattr(pid, ATTR, size, flags) -- attr zeroed+written directly
             a1 = nonpie_p(a1);
             break;
@@ -958,6 +1119,9 @@ static void service_local(struct cpu *c) {
             a1 = nonpie_p(a1);
             a3 = nonpie_p(a3);
             a4 = nonpie_p(a4);
+            break;
+        case 184: // mq_notify(mqdes, SEVP) -- sigevent read (host-forwarded / broker-parsed)
+            a1 = nonpie_p(a1);
             break;
         case 185: // mq_getsetattr(mqdes, NEWATTR, OLDATTR) -- oldattr written (newattr ignored by handler)
             a1 = nonpie_p(a1);
@@ -1003,7 +1167,7 @@ static void service_local(struct cpu *c) {
     }
     default: break;
     }
-    if (bound_route(c, nr, a0, a1, a2, a3)) return;
+    if (bound_route(c, nr, a0, a1, a2, a3, a4)) return;
     if (svc_sysv(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_mem(c, nr, a0, a1, a2, a3, a4, a5)) return;
     if (svc_signal(c, nr, a0, a1, a2, a3, a4, a5)) return;
@@ -1017,11 +1181,28 @@ static void service_local(struct cpu *c) {
     {
         const uint64_t arguments[6] = {a0, a1, a2, a3, a4, a5};
         int64_t result = 0;
+        // Host memory/uptime/load snapshot for sysinfo(2). Read from the SAME host backend vfs.c feeds
+        // /proc/meminfo and /proc/uptime from, so the three sources report the same machine size and uptime.
+        hl_host_system_info hsi;
+        uint64_t host_total = 0, host_free = 0, uptime_s = 0, loads[3] = {0, 0, 0};
+        if (hl_host_system_read(&hsi, NULL, 0)) {
+            host_total = hsi.memory_total;
+            host_free = hsi.memory_free;
+            time_t now = time(NULL);
+            if ((uint64_t)now > hsi.boot_time_seconds) uptime_s = (uint64_t)now - hsi.boot_time_seconds;
+        }
+        double la[3] = {0, 0, 0};
+        if (getloadavg(la, 3) == 3)
+            for (int li = 0; li < 3; li++) loads[li] = (uint64_t)(la[li] * 65536.0);
         hl_linux_misc_context misc = {
             .hostname = g_hostname,
             .hostname_capacity = sizeof(g_hostname),
             .memory_limit = g_mem_max,
             .memory_used = atomic_load(&g_mem_charged),
+            .host_memory_total = host_total,
+            .host_memory_free = host_free,
+            .uptime_seconds = uptime_s,
+            .loads = {loads[0], loads[1], loads[2]},
             .machine = G_UNAME_MACHINE,
             .mapped = misc_mapped,
             .random = misc_random,
@@ -1041,11 +1222,13 @@ static void service_local(struct cpu *c) {
     // GUEST's stderr, not the engine's. A guest that pokes an unimplemented number in a hot loop (the arm64 Go
     // toolchain does, per goroutine/child) then floods its OWN stderr with thousands of engine lines, both
     // corrupting the guest's stream and stalling the build on pipe backpressure. It is a debug aid, so gate it
-    // behind the same JT/JTS syscall-tracing flags as the [sys] trace above -- silent by default. The ENOSYS
+    // behind the same syscall-tracing flags as the [sys] trace above -- silent by default. The ENOSYS
     // return below is the real, correct behaviour and stays unconditional.
+#if HL_ENABLE_LOGGING
     if (g_trace || g_systrace)
         fprintf(stderr, "[jit] unhandled syscall %llu (a0=%llx a1=%llx) at pc=%llx\n", (unsigned long long)nr,
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)G_PC(c));
+#endif
     G_RET(c) = (uint64_t)(-ENOSYS);
     // Boundary errno translation: every case sets G_RET(c) to a host(macOS) errno on error
     // (-errno, saved e, helper returns, or a macOS E* constant). Map to the Linux errno the guest

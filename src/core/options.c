@@ -1,5 +1,6 @@
 // Authoritative engine option registry and instance-owned value store.
 #include "options.h"
+#include "environment.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -34,11 +35,13 @@ static const hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_HOSTNAME", "Linux guest hostname", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_IP", "guest virtual IPv4 address paired with HL_NETBR", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_LOWER", "ordered root filesystem lower layers", HL_OPTION_RECORDS),
+    HL_LAUNCH_OPTION("HL_OVERLAY_WORK", "launch-private portable overlay work directory", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_MEM_MAX", "guest memory limit", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_NETBR", "shared virtual-network bridge identity", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_NETIFS", "serialized virtual-network interfaces", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_NETNS", "guest network and IPC namespace identity", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_NET_ISOLATE", "disable guest external networking", HL_OPTION_FLAG),
+    HL_LAUNCH_OPTION("HL_NET_HOST", "use the host network stack directly", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_PCACHE", "enable persistent translated-code caching", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_PCACHE_DIR", "persistent translated-code cache storage", HL_OPTION_PATH),
     HL_LAUNCH_OPTION("HL_PIDS_MAX", "guest process limit", HL_OPTION_INTEGER),
@@ -63,6 +66,15 @@ static _Thread_local hl_options *hl_bound_options;
 static hl_options *hl_process_options;
 static _Thread_local hl_options hl_default_options;
 static _Thread_local int hl_default_options_ready;
+
+void hl_options_import_environment(hl_options *options) {
+#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
+    const char *selector = hl_environment_debug_log();
+    if (selector != NULL) (void)hl_options_set(options, "HL_LOG", selector, 0);
+#else
+    (void)options;
+#endif
+}
 
 static size_t hl_option_index(const char *name) {
     size_t index;
@@ -181,14 +193,14 @@ static hl_options *hl_options_current(void) {
     if (!hl_default_options_ready) {
         if (hl_options_init(&hl_default_options) != 0) return NULL;
         hl_default_options_ready = 1;
-#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
-        {
-            const char *selector = getenv("HL_LOG");
-            if (selector != NULL) (void)hl_options_set(&hl_default_options, "HL_LOG", selector, 1);
-        }
-#endif
+        hl_options_import_environment(&hl_default_options);
     }
     return &hl_default_options;
+}
+
+int hl_options_clone_current(hl_options *destination) {
+    hl_options *current = hl_options_current();
+    return current == NULL ? -1 : hl_options_clone(destination, current);
 }
 
 const char *hl_option_get(const char *name) { return hl_options_get(hl_options_current(), name); }
@@ -201,10 +213,5 @@ void hl_option_reset(void) {
     if (options == NULL) return;
     hl_options_destroy(options);
     (void)hl_options_init(options);
-#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
-    {
-        const char *selector = getenv("HL_LOG");
-        if (selector != NULL) (void)hl_options_set(options, "HL_LOG", selector, 1);
-    }
-#endif
+    hl_options_import_environment(options);
 }

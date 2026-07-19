@@ -32,6 +32,13 @@ pub(crate) struct ProcessDomain {
     pub identity: [u64; 2],
 }
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ProcessInfo {
+    pub host_id: u64,
+    pub initial: u32,
+    pub reserved: u32,
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct EngineExit {
     pub abi: u32,
@@ -43,7 +50,7 @@ pub(crate) struct EngineExit {
 impl Default for EngineExit {
     fn default() -> Self {
         Self {
-            abi: 4,
+            abi: 5,
             size: 24,
             kind: 0,
             guest_status: 0,
@@ -53,6 +60,7 @@ impl Default for EngineExit {
 }
 
 unsafe extern "C" {
+    pub(crate) fn hl_engine_guest_fd_limit() -> u32;
     pub(crate) fn hl_activation_start_with_stdio(
         executable: *const c_char,
         guest: u32,
@@ -60,11 +68,28 @@ unsafe extern "C" {
         streams: *const Streams,
         process: *mut *mut Process,
     ) -> i32;
+    pub(crate) fn hl_activation_start_with_transport(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        streams: *const Streams,
+        transport: c_int,
+        process: *mut *mut Process,
+    ) -> i32;
     pub(crate) fn hl_activation_start_terminal(
         executable: *const c_char,
         guest: u32,
         config: *const c_char,
         size: TerminalSize,
+        master: *mut i32,
+        process: *mut *mut Process,
+    ) -> i32;
+    pub(crate) fn hl_activation_start_terminal_with_transport(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        size: TerminalSize,
+        transport: c_int,
         master: *mut i32,
         process: *mut *mut Process,
     ) -> i32;
@@ -77,10 +102,24 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn hl_activation_kill(process: *mut Process) -> i32;
     pub(crate) fn hl_activation_domain_terminate(domain: ProcessDomain) -> i32;
+    pub(crate) fn hl_activation_domain_processes(
+        domain: ProcessDomain,
+        initial_process_id: u64,
+        processes: *mut ProcessInfo,
+        capacity: u32,
+        count: *mut u32,
+    ) -> i32;
     pub(crate) fn hl_activation_process_destroy(process: *mut Process);
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
+    #[link_name = "kill"]
+    fn process_signal(process: c_int, signal: c_int) -> c_int;
+}
+
+pub(crate) fn guest_fd_limit() -> u32 {
+    // SAFETY: this query reads the current process resource limit and has no pointer arguments or side effects.
+    unsafe { hl_engine_guest_fd_limit() }
 }
 pub(crate) fn start_terminal(
     executable: &std::ffi::CStr,
@@ -96,6 +135,33 @@ pub(crate) fn start_terminal(
             guest,
             config.as_ptr(),
             size,
+            &mut master,
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() && master >= 0 {
+        Ok((Handle(process), unsafe { File::from_raw_fd(master) }))
+    } else {
+        Err(status)
+    }
+}
+
+pub(crate) fn start_terminal_with_transport(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    size: TerminalSize,
+    transport: &std::os::unix::net::UnixStream,
+) -> Result<(Handle, File), i32> {
+    let mut process = std::ptr::null_mut();
+    let mut master = -1;
+    let status = unsafe {
+        hl_activation_start_terminal_with_transport(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            size,
+            transport.as_raw_fd(),
             &mut master,
             &mut process,
         )
@@ -128,6 +194,32 @@ pub(crate) fn start(
             guest,
             config.as_ptr(),
             streams,
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() {
+        Ok(Handle(process))
+    } else {
+        Err(status)
+    }
+}
+
+#[allow(dead_code)] // Kept private until native VFS dispatch makes the capability truthful.
+pub(crate) fn start_with_transport(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    streams: &Streams,
+    transport: &std::os::unix::net::UnixStream,
+) -> Result<Handle, i32> {
+    let mut process = std::ptr::null_mut();
+    let status = unsafe {
+        hl_activation_start_with_transport(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            streams,
+            transport.as_raw_fd(),
             &mut process,
         )
     };
@@ -174,6 +266,49 @@ pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
         Err(status)
     }
 }
+pub(crate) fn domain_processes(
+    identity: [u64; 2],
+    initial_process_id: u64,
+    maximum: u32,
+) -> Result<Vec<ProcessInfo>, i32> {
+    let mut count = 0;
+    let status = unsafe {
+        hl_activation_domain_processes(
+            ProcessDomain { identity },
+            initial_process_id,
+            std::ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    if status != 0 && status != 5 {
+        return Err(status);
+    }
+    if count > maximum {
+        return Err(5);
+    }
+    for _ in 0..4 {
+        let capacity = count;
+        let mut processes = vec![ProcessInfo::default(); capacity as usize];
+        let status = unsafe {
+            hl_activation_domain_processes(
+                ProcessDomain { identity },
+                initial_process_id,
+                processes.as_mut_ptr(),
+                capacity,
+                &mut count,
+            )
+        };
+        if status == 0 {
+            processes.truncate(count as usize);
+            return Ok(processes);
+        }
+        if status != 5 || count > maximum {
+            return Err(status);
+        }
+    }
+    Err(5)
+}
 #[allow(clippy::needless_pass_by_value)] // Consumption enforces exactly-once destruction.
 pub(crate) fn destroy(process: Handle) {
     unsafe { hl_activation_process_destroy(process.0) }
@@ -185,6 +320,14 @@ pub(crate) fn process_id(process: &Handle) -> Result<u64, i32> {
         Ok(id)
     } else {
         Err(status)
+    }
+}
+pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
+    let process = c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;
+    if unsafe { process_signal(process, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 pub(crate) fn pipe_pair() -> std::io::Result<(File, File)> {

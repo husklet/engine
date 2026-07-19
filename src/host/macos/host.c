@@ -311,11 +311,15 @@ static hl_host_result hl_macos_result(hl_status status, uint64_t value, uint64_t
     return (hl_host_result){(int32_t)status, 2, value, detail};
 }
 
-static int hl_macos_private_add_many(const int *descriptors, uint32_t count) {
+static int hl_macos_private_add_many(int *descriptors, uint32_t count) {
     uint32_t index;
     for (index = 0; index < count; ++index) {
         if (descriptors[index] < 0) continue;
-        if (hl_host_process_fd_private_add(descriptors[index]) == 0) continue;
+        int adopted = hl_host_process_fd_private_adopt(descriptors[index]);
+        if (adopted >= 0) {
+            descriptors[index] = adopted;
+            continue;
+        }
         while (index != 0) {
             --index;
             if (descriptors[index] >= 0) hl_host_process_fd_private_remove(descriptors[index]);
@@ -856,11 +860,16 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
     hl_macos_mapping *mapping;
     int status;
     long page = sysconf(_SC_PAGESIZE);
-    if (size == 0 || size > SIZE_MAX || page <= 0 || offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)
+    if (size == 0 || size > SIZE_MAX || page <= 0)
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     mapping = hl_macos_lookup(host, handle);
     if (mapping == NULL || offset > mapping->size || size > mapping->size - offset) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    if ((offset != 0 || size != mapping->size) &&
+        (offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
@@ -1090,11 +1099,19 @@ static hl_host_result hl_macos_file_register(hl_host_macos *host, int descriptor
                                              uint32_t shared) {
     uint32_t index;
     hl_host_handle handle = 0;
-    if (descriptor >= 0 && hl_host_process_fd_private_add(descriptor) != 0)
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
-    if (append_descriptor >= 0 && hl_host_process_fd_private_add(append_descriptor) != 0) {
-        hl_host_process_fd_private_remove(descriptor);
-        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    if (descriptor >= 0) {
+        int adopted = hl_host_process_fd_private_adopt(descriptor);
+        if (adopted < 0) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        descriptor = adopted;
+    }
+    if (append_descriptor >= 0) {
+        int adopted = hl_host_process_fd_private_adopt(append_descriptor);
+        if (adopted < 0) {
+            hl_host_process_fd_private_remove(descriptor);
+            close(descriptor);
+            return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
+        append_descriptor = adopted;
     }
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < host->file_capacity; ++index) {
@@ -1332,10 +1349,12 @@ static hl_host_result hl_macos_attachment_borrow_file_at_least(void *context, hl
     if (found) descriptor = fcntl(file->descriptor, F_DUPFD_CLOEXEC, (int)minimum_descriptor);
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return found ? hl_macos_errno() : hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     return hl_macos_result(HL_STATUS_OK, (uint64_t)(unsigned)descriptor, 0);
 }
 
@@ -1390,11 +1409,13 @@ static hl_host_result hl_macos_file_read_sequential(void *context, hl_host_handl
     }
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         hl_macos_stream_release(stream);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     if (stream != NULL && hl_macos_stream_lock(stream, endpoint) != 0) {
         hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
@@ -1431,11 +1452,13 @@ static hl_host_result hl_macos_file_write_sequential(void *context, hl_host_hand
     }
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         hl_macos_stream_release(stream);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     if (stream != NULL && hl_macos_stream_lock(stream, endpoint) != 0) {
         hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
@@ -1672,11 +1695,13 @@ static hl_host_result hl_macos_stream_set_status_flags(void *context, hl_host_ha
     }
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         hl_macos_stream_release(shared);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     if (hl_macos_stream_lock(shared, endpoint) != 0) {
         hl_host_process_fd_private_remove(descriptor);
         close(descriptor);
@@ -2630,11 +2655,13 @@ static hl_host_result hl_macos_directory_create(void *context) {
         return hl_macos_errno();
     }
     (void)fcntl(object->descriptor, F_SETFD, FD_CLOEXEC);
-    if (hl_host_process_fd_private_add(object->descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(object->descriptor);
+    if (adopted < 0) {
         close(object->descriptor);
         free(object);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    object->descriptor = adopted;
     hl_host_result result = hl_macos_directory_register(host, object);
     if (result.status != HL_STATUS_OK) {
         hl_host_process_fd_private_remove(object->descriptor);
@@ -2675,9 +2702,14 @@ static hl_host_result hl_macos_directory_add(void *context, hl_host_handle insta
     hl_macos_file *file_entry = hl_macos_file_lookup(host, file);
     int descriptor = file_entry == NULL ? -1 : fcntl(file_entry->descriptor, F_DUPFD_CLOEXEC, 0);
     pthread_mutex_unlock(&host->lock);
-    if (descriptor >= 0 && hl_host_process_fd_private_add(descriptor) != 0) {
-        close(descriptor);
-        descriptor = -1;
+    if (descriptor >= 0) {
+        int adopted = hl_host_process_fd_private_adopt(descriptor);
+        if (adopted < 0) {
+            close(descriptor);
+            descriptor = -1;
+        } else {
+            descriptor = adopted;
+        }
     }
     if (object == NULL || descriptor < 0 || token == 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     for (uint32_t index = 0; index < object->watch_capacity; ++index) {
@@ -2838,7 +2870,9 @@ static hl_macos_transfer *hl_macos_transfer_lookup(hl_host_macos *host, hl_host_
 
 static hl_host_result hl_macos_transfer_register(hl_host_macos *host, int descriptor) {
     uint32_t index;
-    if (hl_host_process_fd_private_add(descriptor) != 0) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    descriptor = adopted;
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < host->transfer_capacity; ++index) {
         hl_macos_transfer *transfer = &host->transfers[index];
@@ -3584,10 +3618,12 @@ static hl_host_result hl_macos_watch_open(void *context, hl_host_handle file) {
         close(descriptor);
         return error;
     }
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     pthread_mutex_lock(&host->lock);
     for (index = 0; index < host->watch_capacity && host->watches[index].active; ++index) {}
     if (index == host->watch_capacity) {
@@ -3699,10 +3735,12 @@ static hl_host_result hl_macos_event_create(void *context) {
     uint32_t index;
     int descriptor = kqueue();
     if (descriptor < 0) return hl_macos_errno();
-    if (hl_host_process_fd_private_add(descriptor) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(descriptor);
+    if (adopted < 0) {
         close(descriptor);
         return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     }
+    descriptor = adopted;
     EV_SET(&wake, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
     if (kevent(descriptor, &wake, 1, NULL, 0, NULL) != 0) {
         hl_host_result error = hl_macos_errno();
@@ -4323,11 +4361,13 @@ static hl_host_result hl_macos_fork_child(void *context) {
             break;
         }
         (void)fcntl(replacement, F_SETFD, FD_CLOEXEC);
-        if (hl_host_process_fd_private_add(replacement) != 0) {
+        int adopted = hl_host_process_fd_private_adopt(replacement);
+        if (adopted < 0) {
             close(replacement);
             result = hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
             break;
         }
+        replacement = adopted;
         for (uint32_t watch_index = 0; watch_index < object->watch_capacity; ++watch_index) {
             hl_macos_directory_watch *watch = &object->watches[watch_index];
             if (!watch->active) continue;

@@ -1,4 +1,5 @@
 #include "epoll.h"
+#include "../core/provider/files.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@ typedef struct hl_linux_epoll_watch {
     uint32_t disabled;
     uint32_t subscribed;
     hl_host_handle wait_handle;
+    hl_host_handle provider_handle;
     uint64_t data;
     uint64_t token;
 } hl_linux_epoll_watch;
@@ -60,6 +62,11 @@ static void epoll_unsubscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *watch
         return;
     }
     if (watch->subscribed != EPOLL_CALLBACK) return;
+    if (hl_provider_files_is_handle(watch->provider_handle)) {
+        hl_provider_files_unsubscribe(watch->provider_handle, epoll, watch->token);
+        watch->subscribed = EPOLL_STALE;
+        return;
+    }
     if (hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target) == HL_STATUS_OK) {
         if (target.ops->unsubscribe != NULL) target.ops->unsubscribe(target.context, epoll, watch->token);
         hl_linux_object_unpin(&target);
@@ -162,6 +169,15 @@ static const hl_linux_object_ops epoll_ops = {
 static hl_status epoll_subscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *watch) {
     hl_linux_object_pin target;
     hl_status status = hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target);
+    if ((status == HL_STATUS_NOT_SUPPORTED || status == HL_STATUS_NOT_FOUND) &&
+        hl_provider_files_is_handle(watch->provider_handle)) {
+        if (hl_provider_files_subscribe(watch->provider_handle, watch->interests, epoll_notify, epoll,
+                                        watch->token) == 0) {
+            watch->subscribed = EPOLL_CALLBACK;
+            return HL_STATUS_OK;
+        }
+        return HL_STATUS_IO;
+    }
     if (status != HL_STATUS_OK) return status;
     if (target.ops->wait_handle != NULL) {
         hl_host_result handle = target.ops->wait_handle(target.context);
@@ -292,6 +308,7 @@ int64_t hl_linux_epoll_control(hl_linux_abi *linux_abi, hl_linux_fd epoll_fd, ui
                                                               .ofd_generation = target.ofd_generation,
                                                               .interests = interests,
                                                               .wait_handle = HL_HOST_HANDLE_INVALID,
+                                                              .provider_handle = target.host_handle,
                                                               .data = data,
                                                               .token = epoll->next_token};
         pthread_mutex_unlock(&epoll->lock);
@@ -355,7 +372,9 @@ static int64_t epoll_sample(hl_linux_epoll *epoll, hl_linux_epoll_event *events,
         if (hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target) == HL_STATUS_OK) {
             ready = hl_linux_object_ready(&target, watch->interests);
             hl_linux_object_unpin(&target);
-        } else
+        } else if (hl_provider_files_is_handle(watch->provider_handle))
+            ready = hl_provider_files_readiness(watch->provider_handle, watch->interests);
+        else
             /* A final target close already quiesced this subscription by contract. */
             watch->subscribed = EPOLL_STALE;
         if ((watch->interests & HL_LINUX_EPOLL_EDGE) != 0) {

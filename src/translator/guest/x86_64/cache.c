@@ -57,7 +57,7 @@
 #include "../../persist.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
-#define PC_VERSION 7 // v7 retires mode-dependent A/B cache identities; production codegen is fixed.
+#define PC_VERSION 8 // v8 persists translated guest source ranges.
 #define PC_VERSION_EFF PC_VERSION
 // Fixed guest VA bases (high, reliably free above the kernel-chosen heap/stack and below the dyld shared
 // cache). Probed stable on Apple silicon; PIE images so we choose the base.
@@ -85,7 +85,7 @@ struct pc_hdr {
 };
 
 struct pc_mapent {
-    uint64_t gpc, host_off, body_off;
+    uint64_t gpc, guest_start, guest_end, host_off, body_off;
 }; // host/body as arena offsets
 
 struct pc_pend {
@@ -258,7 +258,8 @@ static void pcache_note_libmap(uint64_t base, uint64_t len, const hl_host_file_m
         for (uint64_t j = 0; j < g_pc_ndefer; j++) {
             uint64_t gpc = g_pc_defer[j].gpc;
             if (gpc >= base && gpc < base + len && g_pc_defer[j].host_off) {
-                map_put(gpc, g_cache + g_pc_defer[j].host_off, g_cache + g_pc_defer[j].body_off);
+                map_put(gpc, g_pc_defer[j].guest_start, g_pc_defer[j].guest_end,
+                        g_cache + g_pc_defer[j].host_off, g_cache + g_pc_defer[j].body_off);
                 g_pc_defer[j].host_off = 0; // consumed
                 g_pc_activated++;
             }
@@ -417,7 +418,8 @@ static int pcache_load(uint64_t entry_jump) {
     uint64_t nlive = 0, ndefer = 0;
     for (uint64_t i = 0; i < h.n_mapent; i++) {
         if (pc_gpc_fixed(me[i].gpc)) {
-            map_put(me[i].gpc, g_cache + me[i].host_off, g_cache + me[i].body_off);
+            map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
+                    g_cache + me[i].host_off, g_cache + me[i].body_off);
             nlive++;
         } else if (pc_gpc_in_lib(me[i].gpc)) {
             ndefer++;
@@ -520,7 +522,8 @@ static void pcache_save(void) {
         w += (size_t)g_nreloc * sizeof g_reloc[0];
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
             if (!map_live(i) || !(pc_gpc_fixed(g_map[i].gpc) || pc_gpc_in_lib(g_map[i].gpc))) continue;
-            struct pc_mapent e = {g_map[i].gpc, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
+            struct pc_mapent e = {g_map[i].gpc, g_map[i].guest_start, g_map[i].guest_end,
+                                  (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
             w += sizeof e;

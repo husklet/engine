@@ -64,3 +64,16 @@ rflags-identity	cpu	rflags_id.c	rflags_id.c	x86_64	-static-pie -O2 -pthread -lm	
 tls-basic	tls	tls.c	tls.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tls.out	linux-libc	active	exact source; deterministic checked registration
 tls-models	tls	tlsmodels.c	tlsmodels.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels.out	linux-libc	active	exact source; deterministic checked registration
 tls-models-main	tls	tlsmodels_main.c	tlsmodels_main.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels_main.out	linux-libc	active	exact source; static non-PIE variant retained
+bitscan.c	differential-hunt/abi/bitscan.c	aarch64,x86_64	0	golden/bitscan.out	sha256:769c2fb99cfd678b550aa57be53cdcb72a8a6b9a76d5c08b075672a3db72f0ed;bytes:468	portable-c
+bitfield.c	differential-hunt/abi/bitfield.c	aarch64,x86_64	0	golden/bitfield.out	sha256:f3b0a393184e01b5d9b4a5d6a5ef24b775b45fc125b26a2731d49e7905b9a7ef;bytes:103	portable-c
+layout.c	differential-hunt/abi/layout.c	aarch64,x86_64	0	golden/layout.out	sha256:6245c1c084ee782f77ce50cb99fcb1be6ac1b1ce67632770f43bc70bfcd5b90a;bytes:232	portable-c
+atomicops.c	differential-hunt/abi/atomicops.c	aarch64,x86_64	0	golden/atomicops.out	sha256:f6c6bc60674ef48be9758b987d75cc187ff8f660b1334e6e75fb62dcc04b37d3;bytes:99	portable-c
+unaligned.c	differential-hunt/abi/unaligned.c	aarch64,x86_64	0	golden/unaligned.out	sha256:6fabf3cb34a72cccd0539ab182754fbeb1235304f92d4419dd6d88a21f873b9f;bytes:419	portable-c
+memmove_overlap.c	differential-hunt/abi/memmove_overlap.c	aarch64,x86_64	0	golden/memmove_overlap.out	sha256:4b09f8d20bb5d4bf2a3aee7555c2f3298b10f9f6c8d6f1069ba0240b4537d0cd;bytes:984	portable-c
+ackermann.c	differential-hunt/abi/ackermann.c	aarch64,x86_64	0	golden/ackermann.out	sha256:1fe3bf274ab889e46e3bd7a63a94e930096ee4fe1742f7ad79bad945d59affd5;bytes:98	portable-c
+vacopy.c	differential-hunt/abi/vacopy.c	aarch64,x86_64	0	golden/vacopy.out	sha256:86f3cc6f4836c3ff2e0bfe478eb0fd63e2a3ea7eca0c88a217d0ad4e7c5b9897;bytes:33	portable-c
+int128div.c	differential-hunt/abi/int128div.c	aarch64,x86_64	0	golden/int128div.out	sha256:fbcb00c7ebbf5056e4beb4788d3f669a13cdd69f18f7a57a25fb7496e23b4c04;bytes:258	portable-c
+fenv_round.c	differential-hunt/abi/fenv_round.c	aarch64,x86_64	0	golden/fenv_round.out	sha256:855fe76f30a31f22ede16e3c44631e835cd118c211d8f4270e1ad7b25a4402a0;bytes:386	portable-c
+longjmp_deep.c	differential-hunt/abi/longjmp_deep.c	aarch64,x86_64	0	golden/longjmp_deep.out	sha256:8b569b941cbdde918e4886bcae779aea3c88e2dbf53dc6e025c0738a22508939;bytes:132	portable-c
+complexf.c	differential-hunt/abi/complexf.c	aarch64,x86_64	0	golden/complexf.out	sha256:cfdc828dfd126105949a029ff6814daf085d0ffb1e0251ac4dc1e5ba741fef1b;bytes:265	portable-c
+ucontext_swap.c	differential-hunt/abi/ucontext_swap.c	aarch64,x86_64	0	golden/ucontext_swap.out	sha256:3e525116d36b2742aa828a26be5a6ae1f48a6605a3979d1216575e64a968c408;bytes:42	portable-c
