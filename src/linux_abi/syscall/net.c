@@ -1236,7 +1236,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // port) is delivered exactly once through SO_ERROR, mirroring a real TCP stack.
         if (lvl == 1 && opt == 4 && gfd >= 0 && gfd < HL_NFD && g_so_error[gfd]) {
             if (a3 && a4 && *(socklen_t *)a4 >= 4) {
-                *(int *)a3 = g_so_error[gfd];
+                *(int *)a3 = hl_linux_errno_from_macos(g_so_error[gfd]);
                 *(socklen_t *)a4 = 4;
             }
             g_so_error[gfd] = 0;

@@ -397,6 +397,22 @@ static int eventfd_poll_writable_fixup(struct pollfd *fds, nfds_t n, int r) {
     return r;
 }
 
+// A private-loopback non-blocking connect has no host TCP stack behind it.  When its AF_UNIX rendezvous
+// rejects the dial synchronously, connect() still reports Linux EINPROGRESS and g_so_error carries the
+// deferred refusal.  macOS does not subsequently make that rejected AF_UNIX fd pollable, so publish the
+// completion ourselves: Linux poll reports POLLOUT|POLLERR and SO_ERROR returns ECONNREFUSED.
+static int socket_poll_error_fixup(struct pollfd *fds, nfds_t n, int r) {
+    if (!fds || r < 0) return r;
+    for (nfds_t index = 0; index < n; ++index) {
+        int fd = fds[index].fd;
+        if (fd < 0 || fd >= HL_NFD || !g_so_error[fd]) continue;
+        if (fds[index].revents == 0) ++r;
+        fds[index].revents |= POLLERR;
+        if (fds[index].events & POLLOUT) fds[index].revents |= POLLOUT;
+    }
+    return r;
+}
+
 static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                      uint64_t a5) {
     switch (nr) {
@@ -1091,6 +1107,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
         int r;
         for (;;) {
+            r = socket_poll_error_fixup(fds, (nfds_t)a1, 0);
+            if (r > 0) break;
             struct timespec rem = {0, 0};
             if (have_to && ts->tv_sec >= 0) {
                 struct timespec now;
@@ -1123,6 +1141,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             r = poll(fds, (nfds_t)a1, tmo);
 #endif
             ts_wait_leave(); // S while blocked (glibc pause on aarch64 -> ppoll)
+            r = socket_poll_error_fixup(fds, (nfds_t)a1, r);
             if (r == 0 && have_to) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
