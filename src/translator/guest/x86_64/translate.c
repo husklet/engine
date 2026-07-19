@@ -3573,6 +3573,10 @@ static void *translate_block(uint64_t gpc) {
                 continue;
             }
             // 0F AE: fences (lfence/mfence/sfence -> dmb), ldmxcsr/stmxcsr, fxsave/fxrstor (xmm area)
+            if (op == 0x77) { // emms: empty MMX state. MMX registers map to the NEON file here (they do not
+                gpc = next;   // alias the x87 stack in this model), so there is no tag word to reset -> no-op.
+                continue;
+            }
             if (op == 0xAE) {
                 int sub = I.reg & 7;
                 if (sub >= 5) {
