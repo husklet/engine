@@ -443,6 +443,7 @@ pub(super) fn validate(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_selected_runtime(
     spec: &MachineSpec,
     active: &BTreeSet<&ProviderId>,
@@ -470,6 +471,27 @@ fn validate_selected_runtime(
                     "handles contract v1 advertises only read, write, poll, and engine-owned OFD lifecycle",
                 ));
             }
+            for entry in &extension.namespace {
+                if matches!(entry, NamespaceEntry::Device(value) if value.service.is_none()) {
+                    return Err(resource_error(
+                        SpecErrorCategory::Unsupported,
+                        "extensions.namespace",
+                        crate::spec::SpecResource::Path(entry.path().to_owned()),
+                        "projected devices require an open-handle service",
+                    ));
+                }
+                if !matches!(
+                    entry,
+                    NamespaceEntry::Service(_) | NamespaceEntry::Device(_)
+                ) {
+                    return Err(resource_error(
+                        SpecErrorCategory::Unsupported,
+                        "extensions.namespace",
+                        crate::spec::SpecResource::Path(entry.path().to_owned()),
+                        "handles contract projects only services and service-backed devices",
+                    ));
+                }
+            }
             continue;
         }
         if extension.provider != namespace_provider() {
@@ -496,6 +518,7 @@ fn validate_selected_runtime(
                         access: BindAccess::ReadOnly,
                         ..
                     })
+                    | NamespaceEntry::Socket(_)
             ) {
                 return Err(resource_error(
                     SpecErrorCategory::Unsupported,
@@ -521,6 +544,25 @@ fn validate_selected_runtime(
                         "extensions.namespace",
                         crate::spec::SpecResource::Path(bind.host.clone()),
                         "projected host binds support only regular files and directories",
+                    ));
+                }
+            }
+            if let NamespaceEntry::Socket(socket) = entry {
+                use std::os::unix::fs::FileTypeExt as _;
+                let metadata = std::fs::symlink_metadata(&socket.host).map_err(|_| {
+                    resource_error(
+                        SpecErrorCategory::Invalid,
+                        "extensions.namespace",
+                        crate::spec::SpecResource::Path(socket.host.clone()),
+                        "projected socket must name an existing host socket",
+                    )
+                })?;
+                if !metadata.file_type().is_socket() {
+                    return Err(resource_error(
+                        SpecErrorCategory::Invalid,
+                        "extensions.namespace",
+                        crate::spec::SpecResource::Path(socket.host.clone()),
+                        "projected socket must name a Unix socket",
                     ));
                 }
             }

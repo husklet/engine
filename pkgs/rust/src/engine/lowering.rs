@@ -238,7 +238,33 @@ fn lower_services(spec: &MachineSpec) -> Option<ServiceLaunch> {
                     mode: value.metadata.mode,
                     uid: value.metadata.uid,
                     gid: value.metadata.gid,
+                    kind: crate::service::ProjectionKind::Service,
                 })
+            }
+            crate::extension::NamespaceEntry::Device(value) => {
+                value
+                    .service
+                    .map(|service| crate::service::ServiceProjection {
+                        path: value.path.clone(),
+                        service,
+                        mode: value.metadata.mode,
+                        uid: value.metadata.uid,
+                        gid: value.metadata.gid,
+                        kind: match value.kind {
+                            crate::extension::DeviceKind::Character => {
+                                crate::service::ProjectionKind::CharacterDevice {
+                                    major: value.major,
+                                    minor: value.minor,
+                                }
+                            }
+                            crate::extension::DeviceKind::Block => {
+                                crate::service::ProjectionKind::BlockDevice {
+                                    major: value.major,
+                                    minor: value.minor,
+                                }
+                            }
+                        },
+                    })
             }
             _ => None,
         })
@@ -273,7 +299,13 @@ fn lower_projections(
     let materialized = entries
         .iter()
         .copied()
-        .filter(|entry| !matches!(entry, crate::extension::NamespaceEntry::HostBind(_)))
+        .filter(|entry| {
+            !matches!(
+                entry,
+                crate::extension::NamespaceEntry::HostBind(_)
+                    | crate::extension::NamespaceEntry::Socket(_)
+            )
+        })
         .collect::<Vec<_>>();
     let mut projections = Vec::new();
     if !materialized.is_empty() {
@@ -282,8 +314,14 @@ fn lower_projections(
         projections.push(projection);
     }
     for entry in &entries {
-        if let crate::extension::NamespaceEntry::HostBind(bind) = entry {
-            config.mounts.push(Mount::read_only(&bind.host, &bind.path));
+        match entry {
+            crate::extension::NamespaceEntry::HostBind(bind) => {
+                config.mounts.push(Mount::read_only(&bind.host, &bind.path));
+            }
+            crate::extension::NamespaceEntry::Socket(socket) => config
+                .mounts
+                .push(Mount::read_write(&socket.host, &socket.path)),
+            _ => {}
         }
     }
     for entry in entries {

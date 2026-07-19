@@ -144,6 +144,7 @@ fn handles_features() -> BTreeSet<crate::extension::Feature> {
         "poll",
         "ofd-lifecycle",
         "memory-allocation",
+        "devices",
     ]
     .into_iter()
     .map(|name| crate::extension::Feature::new(name).unwrap_or_else(|_| unreachable!()))
@@ -156,6 +157,7 @@ fn namespace_features() -> BTreeSet<crate::extension::Feature> {
         "host-bind-read-only",
         "immutable-files",
         "mutable-files",
+        "unix-sockets",
         "symlinks",
     ]
     .into_iter()

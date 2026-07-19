@@ -42,6 +42,13 @@ static void entry_v2(unsigned char **cursor, uint8_t kind, uint64_t service, con
     }
 }
 
+static void device_v3(unsigned char **cursor, uint8_t kind, uint64_t service, const char *path,
+                      uint32_t major, uint32_t minor) {
+    entry_v2(cursor, kind, service, path, NULL);
+    put32(cursor, major);
+    put32(cursor, minor);
+}
+
 int main(void) {
     hl_provider_namespace namespace = {0};
     unsigned char wire[256], invalid[256];
@@ -82,6 +89,14 @@ int main(void) {
     node = hl_provider_namespace_resolve(&namespace, "/run/domain/current", 19);
     HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_SYMLINK && node->target_size == 7 &&
              memcmp(node->target, "control", 7) == 0);
+
+    cursor = wire;
+    put32(&cursor, UINT32_C(0xc0000001));
+    device_v3(&cursor, HL_PROVIDER_NODE_CHARACTER, 55, "/dev/provider", 226, 128);
+    HL_CHECK(hl_provider_namespace_install(&namespace, wire, (size_t)(cursor - wire), 4, 128) == 0);
+    node = hl_provider_namespace_resolve(&namespace, "/dev/provider", 13);
+    HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_CHARACTER && node->service == 55 &&
+             node->major == 226 && node->minor == 128);
     hl_provider_namespace_revoke(&namespace);
     HL_CHECK(namespace.count == 0 && namespace.generation != generation);
     return 0;

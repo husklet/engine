@@ -85,13 +85,14 @@ int hl_provider_namespace_install(hl_provider_namespace *namespace, const void *
     hl_provider_namespace *pending;
     input source = {.bytes = bytes, .size = size, .offset = 0};
     uint32_t count, index;
-    int version_two;
+    int version_two, version_three;
     int status = -EPROTO;
     if (namespace == NULL || bytes == NULL || maximum_entries > HL_PROVIDER_NAMESPACE_MAX || maximum_path == 0 ||
         maximum_path > HL_PROVIDER_PATH_MAX || u32(&source, &count) != 0)
         return -EINVAL;
-    version_two = (count & UINT32_C(0x80000000)) != 0;
-    count &= UINT32_C(0x7fffffff);
+    version_three = (count & UINT32_C(0xc0000000)) == UINT32_C(0xc0000000);
+    version_two = version_three || (count & UINT32_C(0x80000000)) != 0;
+    count &= version_three ? UINT32_C(0x3fffffff) : UINT32_C(0x7fffffff);
     if (count > maximum_entries) return -E2BIG;
     pending = calloc(1, sizeof(*pending));
     if (pending == NULL) return -ENOMEM;
@@ -105,8 +106,10 @@ int hl_provider_namespace_install(hl_provider_namespace *namespace, const void *
             u32(&source, &node->mode) != 0 || u32(&source, &node->uid) != 0 || u32(&source, &node->gid) != 0 ||
             u16(&source, &node->path_size) != 0 ||
             (node->kind != HL_PROVIDER_NODE_SERVICE && node->kind != HL_PROVIDER_NODE_DIRECTORY &&
-             node->kind != HL_PROVIDER_NODE_SYMLINK) ||
-            (node->kind == HL_PROVIDER_NODE_SERVICE ? node->service == 0 : node->service != 0) ||
+             node->kind != HL_PROVIDER_NODE_SYMLINK && node->kind != HL_PROVIDER_NODE_CHARACTER &&
+             node->kind != HL_PROVIDER_NODE_BLOCK) ||
+            ((node->kind == HL_PROVIDER_NODE_SERVICE || node->kind == HL_PROVIDER_NODE_CHARACTER ||
+              node->kind == HL_PROVIDER_NODE_BLOCK) ? node->service == 0 : node->service != 0) ||
             (node->mode & ~07777u) != 0 || node->path_size > maximum_path || take(&source, node->path_size, &path) != 0)
             goto done;
         memcpy(node->path, path, node->path_size);
@@ -118,8 +121,14 @@ int hl_provider_namespace_install(hl_provider_namespace *namespace, const void *
                             take(&source, node->target_size, &target) != 0))
             goto done;
         if (version_two && node->target_size != 0) memcpy(node->target, target, node->target_size);
+        if (version_three && (u32(&source, &node->major) != 0 || u32(&source, &node->minor) != 0)) goto done;
         if ((node->kind == HL_PROVIDER_NODE_SYMLINK) != (node->target_size != 0) ||
             (node->target_size != 0 && memchr(node->target, 0, node->target_size) != NULL)) {
+            status = -EINVAL;
+            goto done;
+        }
+        if ((node->kind == HL_PROVIDER_NODE_CHARACTER || node->kind == HL_PROVIDER_NODE_BLOCK) &&
+            (node->major >= 4096 || node->minor >= (1u << 20))) {
             status = -EINVAL;
             goto done;
         }

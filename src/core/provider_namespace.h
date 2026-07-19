@@ -6,7 +6,13 @@
 
 enum { HL_PROVIDER_NAMESPACE_MAX = 64, HL_PROVIDER_PATH_MAX = 4096 };
 
-enum { HL_PROVIDER_NODE_SERVICE = 1, HL_PROVIDER_NODE_DIRECTORY = 2, HL_PROVIDER_NODE_SYMLINK = 3 };
+enum {
+    HL_PROVIDER_NODE_SERVICE = 1,
+    HL_PROVIDER_NODE_DIRECTORY = 2,
+    HL_PROVIDER_NODE_SYMLINK = 3,
+    HL_PROVIDER_NODE_CHARACTER = 4,
+    HL_PROVIDER_NODE_BLOCK = 5
+};
 
 typedef struct hl_provider_node {
     uint64_t service;
@@ -18,6 +24,8 @@ typedef struct hl_provider_node {
     char path[HL_PROVIDER_PATH_MAX];
     uint16_t target_size;
     char target[HL_PROVIDER_PATH_MAX];
+    uint32_t major;
+    uint32_t minor;
 } hl_provider_node;
 
 typedef struct hl_provider_namespace {

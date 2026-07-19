@@ -11,11 +11,12 @@ use std::{
 use hl_engine::{
     extension::{
         AllocationRequest, Authorities, BindAccess, Coherency, DirectoryEntry, ExtensionConfig,
-        ExtensionSpec, Feature, FileEntry, FileSource, HandleOperation, Handles, HostBindEntry,
-        HostResource, Inheritance, Interest, LinuxError, Memory, MemoryRequirement, Metadata,
-        NamespaceEntry, OpenHandle, OpenRequest, Protections, ProviderAuthority, ProviderId,
-        ReadRequest, Readiness, ReadyState, Region, ResourceDescriptor, ResourceError, ResourceId,
-        ServiceEntry, ServiceId, ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
+        DeviceEntry, DeviceKind, ExtensionSpec, Feature, FileEntry, FileSource, HandleOperation,
+        Handles, HostBindEntry, HostResource, Inheritance, Interest, LinuxError, Memory,
+        MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
+        ProviderAuthority, ProviderId, ReadRequest, Readiness, ReadyState, Region,
+        ResourceDescriptor, ResourceError, ResourceId, ServiceEntry, ServiceId,
+        ServiceRegistration, Sharing, SocketEntry, SymlinkEntry, WriteRequest,
     },
     network::Namespace,
     spec::{NetworkMode, SpecErrorCategory, TreeSource, Version},
@@ -141,6 +142,7 @@ int main(void) {
     for (int i = 0; i < 4097; ++i) if (close(descriptors[i]) != 0) return 21;
     return 0;
 }
+
 "#,
         )
         .unwrap();
@@ -155,6 +157,47 @@ int main(void) {
         let _ = fs::remove_file(source);
     });
     "/tmp/descriptor-pressure-probe"
+}
+
+fn projected_socket_probe() -> &'static str {
+    static PROBE: OnceLock<()> = OnceLock::new();
+    PROBE.get_or_init(|| {
+        let source = std::env::temp_dir().join(format!(
+            "hl-projected-socket-probe-{}.c",
+            std::process::id()
+        ));
+        fs::write(
+            &source,
+            r#"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 10;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0); if (fd < 0) return 11;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    if (strlen(argv[1]) >= sizeof(address.sun_path)) return 12;
+    strcpy(address.sun_path, argv[1]);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address))) return 13;
+    char reply[4];
+    if (write(fd, "ping", 4) != 4 || read(fd, reply, 4) != 4 || memcmp(reply, "pong", 4)) return 14;
+    return close(fd) != 0;
+}
+"#,
+        )
+        .unwrap();
+        let output = rootfs().join("tmp/projected-socket-probe");
+        assert!(Command::new("cc")
+            .args(["-static", "-O2", "-o"])
+            .arg(&output)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        let _ = fs::remove_file(source);
+    });
+    "/tmp/projected-socket-probe"
 }
 
 fn unix_stream_reuse_probe() -> &'static str {
@@ -326,6 +369,98 @@ fn host_fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+fn socket_projection_accepts_only_existing_unix_sockets() {
+    use std::os::unix::net::UnixListener;
+    let directory = host_fixture("socket-projection");
+    let socket = directory.join("provider.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let mut extension = namespace_extension(b"unused");
+    extension.required_features = BTreeSet::from([Feature::new("unix-sockets").unwrap()]);
+    extension.namespace = vec![NamespaceEntry::Socket(SocketEntry {
+        path: "/run/provider.sock".into(),
+        host: socket,
+    })];
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
+    spec.extensions.push(extension);
+    assert!(Engine::new().validate(&spec).is_ok());
+
+    let file = directory.join("not-a-socket");
+    fs::write(&file, b"no").unwrap();
+    if let NamespaceEntry::Socket(entry) = &mut spec.extensions[0].namespace[0] {
+        entry.host = file;
+    }
+    assert_eq!(
+        Engine::new().validate(&spec).unwrap_err().category,
+        SpecErrorCategory::Invalid
+    );
+}
+
+#[test]
+fn projected_socket_connects_to_the_granted_host_endpoint() {
+    use std::os::unix::net::UnixListener;
+    let directory = host_fixture("socket-execution");
+    let socket = directory.join("provider.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").unwrap();
+    });
+    let mut extension = namespace_extension(b"unused");
+    extension.required_features = BTreeSet::from([Feature::new("unix-sockets").unwrap()]);
+    extension.namespace = vec![NamespaceEntry::Socket(SocketEntry {
+        path: "/run/provider.sock".into(),
+        host: socket,
+    })];
+    let mut spec = MachineSpec::new(Guest::Aarch64, projected_socket_probe());
+    spec.process.argv.push("/run/provider.sock".into());
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.extensions.push(extension);
+    assert_eq!(
+        Engine::new()
+            .spawn(spec, ProcessIo::default())
+            .unwrap()
+            .wait()
+            .unwrap(),
+        Exit::Code(0)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn device_projection_requires_and_accepts_a_registered_service() {
+    let mut extension = handles_extension();
+    extension
+        .required_features
+        .insert(Feature::new("devices").unwrap());
+    extension.namespace = vec![NamespaceEntry::Device(DeviceEntry {
+        path: "/dev/provider".into(),
+        metadata: Metadata {
+            mode: 0o660,
+            uid: 10,
+            gid: 20,
+        },
+        kind: DeviceKind::Character,
+        major: 226,
+        minor: 128,
+        service: Some(ServiceId(77)),
+    })];
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
+    spec.extensions.push(extension);
+    assert!(Engine::new().validate(&spec).is_ok());
+
+    if let NamespaceEntry::Device(entry) = &mut spec.extensions[0].namespace[0] {
+        entry.service = None;
+    }
+    assert_eq!(
+        Engine::new().validate(&spec).unwrap_err().category,
+        SpecErrorCategory::Unsupported
+    );
+}
+
+#[test]
 fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
     let capabilities = Engine::new().capabilities();
     assert!(capabilities
@@ -360,7 +495,8 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
             "host-bind-read-only",
             "immutable-files",
             "mutable-files",
-            "symlinks"
+            "symlinks",
+            "unix-sockets"
         ]
     );
     assert!(!capabilities.checkpoint.supported);

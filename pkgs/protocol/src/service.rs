@@ -5,14 +5,16 @@ mod namespace;
 
 pub use codec::{decode_reply, decode_request, encode_reply, encode_request};
 pub use model::{Reply, Request, SeekWhence, ServiceFailure, ServiceStat};
-pub use namespace::{decode_namespace_install, encode_namespace_install, ServiceProjection};
+pub use namespace::{
+    decode_namespace_install, encode_namespace_install, ProjectionKind, ServiceProjection,
+};
 
 #[cfg(test)]
 mod tests {
     use super::{
         codec::WRITE, decode_namespace_install, decode_reply, decode_request,
-        encode_namespace_install, encode_reply, encode_request, input::protocol, Reply, Request,
-        ServiceFailure, ServiceProjection,
+        encode_namespace_install, encode_reply, encode_request, input::protocol, ProjectionKind,
+        Reply, Request, ServiceFailure, ServiceProjection,
     };
     use hl_engine_api::extension::ServiceId;
     use hl_engine_provider::{LinuxError, Readiness, ReadyState};
@@ -81,9 +83,24 @@ mod tests {
             mode: 0o660,
             uid: 10,
             gid: 20,
+            kind: ProjectionKind::Service,
         }];
         let wire = encode_namespace_install(&entries, 4, 128).unwrap();
         assert_eq!(decode_namespace_install(&wire, 4, 128).unwrap(), entries);
+
+        let devices = vec![ServiceProjection {
+            path: "/dev/provider".into(),
+            service: ServiceId(10),
+            mode: 0o660,
+            uid: 11,
+            gid: 12,
+            kind: ProjectionKind::CharacterDevice {
+                major: 226,
+                minor: 128,
+            },
+        }];
+        let wire = encode_namespace_install(&devices, 4, 128).unwrap();
+        assert_eq!(decode_namespace_install(&wire, 4, 128).unwrap(), devices);
 
         let conflicts = vec![
             ServiceProjection {
@@ -92,6 +109,7 @@ mod tests {
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
+                kind: ProjectionKind::Service,
             },
             ServiceProjection {
                 path: "/run/provider/child".into(),
@@ -99,6 +117,7 @@ mod tests {
                 mode: 0o600,
                 uid: 0,
                 gid: 0,
+                kind: ProjectionKind::Service,
             },
         ];
         assert!(matches!(
@@ -106,7 +125,7 @@ mod tests {
             Err(ServiceFailure::Linux(LinuxError { errno: 20, .. }))
         ));
 
-        let mut trailing = wire;
+        let mut trailing = encode_namespace_install(&entries, 4, 128).unwrap();
         trailing.push(0);
         assert_eq!(
             decode_namespace_install(&trailing, 4, 128).unwrap_err(),
