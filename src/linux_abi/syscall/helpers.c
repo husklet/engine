@@ -61,6 +61,7 @@ static int nofile_gate(int r) {
 // fcntl record locks stay on the real fd, disjoint from the companion. LOCK_SH->F_RDLCK, LOCK_EX->F_WRLCK,
 // LOCK_NB->F_SETLK (else F_SETLKW), LOCK_UN->F_UNLCK. Per-fd state (fd<HL_NFD) drives release-on-close so a
 // held flock is dropped when its last fd closes, matching flock's "released on last close" semantics.
+#include <sys/file.h> // flock(2) prototype (LOCK_* constants + the host flock() delegate on Linux)
 #define FLOCK_DIR "/tmp/.hl-flock"
 static uint8_t g_flock_type[HL_NFD]; // per guest fd: 0 none, else LOCK_SH / LOCK_EX currently held via companion
 
@@ -111,6 +112,16 @@ static int flock_companion(int fd) {
 // flock(2): whole-file advisory lock delegated to the companion. Returns 0 or -1 (host errno set); the
 // caller applies the normal macOS->Linux errno translation.
 static int hl_flock(int fd, int op) {
+#if defined(__linux__)
+    // On a Linux host, flock(2) on the guest's real descriptor already carries exact flock semantics: the lock
+    // is owned by the OPEN FILE DESCRIPTION, so two separate open()s of one file contend even inside a single
+    // process while dup/fork siblings share it, and it is independent of the guest's fcntl POSIX record locks
+    // (which this engine services in-engine and never places on the host fd). The companion-fd emulation below
+    // exists only for a non-Linux (macOS) host, where flock and fcntl share one per-vnode lock list; it routes
+    // both descriptors to a single process-local fcntl lock and so cannot observe an intra-process cross-fd
+    // flock conflict. Delegate straight to the host on Linux, where the kernel enforces the correct model.
+    return flock(fd, op);
+#else
     int idx = flock_companion(fd);
     if (idx < 0) return -1;
     int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
@@ -131,6 +142,7 @@ static int hl_flock(int fd, int op) {
         g_flock_type[fd] = (uint8_t)base;
     }
     return r;
+#endif
 }
 
 static int hl_flock_identity(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int op) {
