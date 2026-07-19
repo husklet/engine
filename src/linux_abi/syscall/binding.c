@@ -2992,14 +2992,47 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
 #endif
                     result = 0;
                 }
-            } else if (request == 0x802c542au || (request >= 0x402c542bu && request <= 0x402c542du)) {
+            } else if (request == 0x802c542au) { /* TCGETS2 */
                 /* Linux termios2 has an encoded 44-byte payload. On the Linux/aarch64 host its ABI is
                  * byte-identical to the aarch64 guest ABI, so preserve the extended speed fields and
-                 * forward the complete request instead of narrowing it through struct termios. */
+                 * forward the complete request. macOS has no termios2 request, so translate its native
+                 * termios and explicitly populate the two Linux speed fields. */
                 if (!host_range_mapped((uintptr_t)a2, 44))
                     result = -EFAULT;
+#if defined(__linux__)
                 else
                     result = ioctl(native_fd, request, (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+#else
+                else {
+                    struct termios native;
+                    if (tcgetattr(native_fd, &native) != 0)
+                        result = -errno;
+                    else {
+                        termios_m2l(&native, (uint8_t *)(uintptr_t)a2);
+                        *(uint32_t *)((uint8_t *)(uintptr_t)a2 + 36) = (uint32_t)cfgetispeed(&native);
+                        *(uint32_t *)((uint8_t *)(uintptr_t)a2 + 40) = (uint32_t)cfgetospeed(&native);
+                        result = 0;
+                    }
+                }
+#endif
+            } else if (request >= 0x402c542bu && request <= 0x402c542du) { /* TCSETS2/W2/F2 */
+                if (!host_range_mapped((uintptr_t)a2, 44))
+                    result = -EFAULT;
+#if defined(__linux__)
+                else
+                    result = ioctl(native_fd, request, (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+#else
+                else {
+                    struct termios native;
+                    termios_l2m((const uint8_t *)(uintptr_t)a2, &native);
+                    (void)cfsetispeed(&native, *(const uint32_t *)((const uint8_t *)(uintptr_t)a2 + 36));
+                    (void)cfsetospeed(&native, *(const uint32_t *)((const uint8_t *)(uintptr_t)a2 + 40));
+                    int action = request == 0x402c542bu ? TCSANOW
+                               : request == 0x402c542cu ? TCSADRAIN
+                                                        : TCSAFLUSH;
+                    result = tcsetattr(native_fd, action, &native) == 0 ? 0 : -errno;
+                }
+#endif
             } else if (request >= 0x5402u && request <= 0x5404u) { /* TCSETS{,W,F} */
                 struct termios native;
                 if (!host_range_mapped((uintptr_t)a2, 36))

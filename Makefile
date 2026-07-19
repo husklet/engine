@@ -1101,6 +1101,10 @@ $(BUILD)/e2e/stdio-binding-x86_64: tests/e2e/stdio_binding.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static $< -o $@
 
+$(BUILD)/e2e/pty-binding-aarch64: tests/e2e/pty_binding.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
 $(BUILD)/e2e/dir-binding-aarch64: tests/e2e/dir_binding.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
@@ -1544,6 +1548,10 @@ $(BUILD)/mac/stdio/x86_64-runner.o: tools/stdio_e2e_runner.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2 $(DEPFLAGS) -c $< -o $@
 
+$(BUILD)/mac/pty/aarch64-runner.o: tools/pty_binding_e2e_runner.c
+	@mkdir -p $(@D)
+	$(MAC) clang $(CPPFLAGS) -O2 $(DEPFLAGS) -c $< -o $@
+
 $(BUILD)/mac/dir/aarch64-runner.o: tools/dir_e2e_runner.c
 	@mkdir -p $(@D)
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_GUEST_ISA=HL_GUEST_ISA_AARCH64 -O2 $(DEPFLAGS) -c $< -o $@
@@ -1587,6 +1595,13 @@ $(BUILD)/tools/dir-aarch64: $(BUILD)/mac/dir/aarch64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
+$(BUILD)/tools/pty-aarch64: $(BUILD)/mac/pty/aarch64-runner.o \
+	$(BUILD)/mac/lifecycle/aarch64-target.o $(BUILD)/mac/lifecycle/aarch64-core.o $(MAC_LIBS) \
+	packaging/macos/jit.entitlements
+	@mkdir -p $(@D)
+	$(MAC) clang -o $@ $(filter %.o %.a,$^)
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
+
 $(BUILD)/tools/dir-x86_64: $(BUILD)/mac/dir/x86_64-runner.o \
 	$(BUILD)/mac/lifecycle/x86_64-target.o $(BUILD)/mac/lifecycle/x86_64-core.o $(MAC_LIBS) \
 	packaging/macos/jit.entitlements
@@ -1613,6 +1628,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64 \
 	$(BUILD)/tools/stdio-aarch64 $(BUILD)/tools/stdio-x86_64 \
 	$(BUILD)/e2e/stdio-binding-aarch64 $(BUILD)/e2e/stdio-binding-x86_64 \
+	$(BUILD)/tools/pty-aarch64 $(BUILD)/e2e/pty-binding-aarch64 \
 	$(BUILD)/tools/dir-aarch64 $(BUILD)/tools/dir-x86_64 \
 	$(BUILD)/e2e/dir-binding-aarch64 $(BUILD)/e2e/dir-binding-x86_64 \
 	$(BUILD)/e2e/guest-exit-aarch64 $(BUILD)/e2e/guest-exit-x86_64 \
@@ -1658,6 +1674,7 @@ e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core c
 	$(MAC) $(abspath $(BUILD)/tools/binding-x86_64) $(abspath $(BUILD)/e2e/fd-binding-x86_64)
 	$(MAC) $(abspath $(BUILD)/tools/stdio-aarch64) $(abspath $(BUILD)/e2e/stdio-binding-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/stdio-x86_64) $(abspath $(BUILD)/e2e/stdio-binding-x86_64)
+	$(MAC) $(abspath $(BUILD)/tools/pty-aarch64) $(abspath $(BUILD)/e2e/pty-binding-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/dir-aarch64) $(abspath $(BUILD)/e2e/dir-binding-aarch64)
 	$(MAC) $(abspath $(BUILD)/tools/dir-x86_64) $(abspath $(BUILD)/e2e/dir-binding-x86_64)
 
