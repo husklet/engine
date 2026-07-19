@@ -1,13 +1,14 @@
 use super::lowering::{Launch, ServiceLaunch};
 use super::{
     ffi, wire, Arc, AsRawFd, CString, Child, Config, ConfigFile, Duration, Error, File, Guest,
-    HandlesAuthority, Instant, OpenOptions, OsStr, OsStrExt, Size, Stdio, EXECUTABLE,
+    Instant, OpenOptions, OsStr, OsStrExt, Size, Stdio, EXECUTABLE,
 };
 
 pub(super) fn start(
     launch: Launch,
     io: crate::spec::ProcessIo,
-    authority: HandlesAuthority,
+    authorities: crate::extension::Authorities,
+    resources: Vec<super::lowering::AllocatedResource>,
 ) -> Result<Child, Error> {
     start_legacy(
         launch.guest,
@@ -17,7 +18,8 @@ pub(super) fn start(
         (io.stdin, io.stdout, io.stderr),
         launch.terminal,
         launch.projections,
-        launch.services.map(|services| (services, authority)),
+        launch.services.map(|services| (services, authorities)),
+        resources,
     )
 }
 
@@ -30,7 +32,8 @@ pub(super) fn start_legacy<I, S>(
     streams: (Stdio, Stdio, Stdio),
     terminal: Option<Size>,
     projections: Vec<crate::projection::Projection>,
-    services: Option<(ServiceLaunch, HandlesAuthority)>,
+    services: Option<(ServiceLaunch, crate::extension::Authorities)>,
+    resources: Vec<super::lowering::AllocatedResource>,
 ) -> Result<Child, Error>
 where
     I: IntoIterator<Item = S>,
@@ -94,6 +97,7 @@ where
         domain,
         completed: false,
         _projections: projections,
+        _provider_resources: resources,
     })
 }
 
@@ -103,10 +107,11 @@ fn start_services(
     config: &std::ffi::CStr,
     streams: &ffi::Streams,
     launch: ServiceLaunch,
-    authority: &HandlesAuthority,
+    authority: &crate::extension::Authorities,
 ) -> Result<ffi::Handle, Error> {
     let handles = authority
-        .handles(&launch.provider)
+        .provider(&launch.provider)
+        .and_then(|provider| provider.handles.as_ref())
         .cloned()
         .ok_or(Error::InvalidConfig("missing provider handle authority"))?;
     let maximum_request = launch

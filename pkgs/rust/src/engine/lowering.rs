@@ -1,7 +1,99 @@
 use super::{
-    handles_provider, namespace_provider, spec_error, BindAccess, Config, Guest, MachineSpec,
-    Mount, NetworkMode, ProviderId, Size, SpecError, SpecErrorCategory, TreeSource,
+    handles_provider, namespace_provider, resource_error, spec_error, BindAccess, Config, Guest,
+    MachineSpec, Mount, NetworkMode, ProviderId, Size, SpecError, SpecErrorCategory, TreeSource,
 };
+
+pub(super) fn allocate_memory(
+    spec: &MachineSpec,
+    authorities: &crate::extension::Authorities,
+) -> Result<Vec<AllocatedResource>, SpecError> {
+    let mut resources = Vec::new();
+    for extension in &spec.extensions {
+        let Some(memory) = authorities
+            .provider(&extension.provider)
+            .and_then(|authority| authority.memory.as_ref())
+        else {
+            continue;
+        };
+        for requirement in &extension.memory {
+            let resource = memory
+                .allocate(crate::extension::AllocationRequest {
+                    size: requirement.size,
+                    alignment: requirement.alignment,
+                    protections: requirement.protections,
+                    sharing: requirement.sharing,
+                })
+                .map_err(|error| {
+                    resource_error(
+                        SpecErrorCategory::Invalid,
+                        "extensions.memory",
+                        crate::spec::SpecResource::Provider(extension.provider.clone()),
+                        format!("provider memory allocation failed: {}", error.context),
+                    )
+                })?;
+            if let Err(error) = validate_resource(extension, requirement, &resource) {
+                memory.release(resource.id);
+                return Err(error);
+            }
+            resources.push(AllocatedResource {
+                id: resource.id,
+                resource,
+                provider: memory.clone(),
+            });
+        }
+    }
+    Ok(resources)
+}
+
+pub(crate) struct AllocatedResource {
+    pub(crate) resource: crate::extension::HostResource,
+    id: crate::extension::ResourceId,
+    provider: std::sync::Arc<dyn crate::extension::Memory>,
+}
+
+impl std::fmt::Debug for AllocatedResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("AllocatedResource")
+            .field(&self.resource)
+            .finish()
+    }
+}
+
+impl Drop for AllocatedResource {
+    fn drop(&mut self) {
+        self.provider.release(self.id);
+    }
+}
+
+fn validate_resource(
+    extension: &crate::extension::ExtensionSpec,
+    requirement: &crate::extension::MemoryRequirement,
+    resource: &crate::extension::HostResource,
+) -> Result<(), SpecError> {
+    let covered = resource.regions.iter().try_fold(0_u64, |total, region| {
+        if region.size == 0
+            || region.offset % requirement.alignment != 0
+            || (region.protections.read && !requirement.protections.read)
+            || (region.protections.write && !requirement.protections.write)
+            || (region.protections.execute && !requirement.protections.execute)
+        {
+            return None;
+        }
+        total.checked_add(region.size)
+    });
+    if covered.map_or(true, |size| size < requirement.size)
+        || resource.inheritance != requirement.inheritance
+    {
+        return Err(resource_error(
+            SpecErrorCategory::Invalid,
+            "extensions.memory",
+            crate::spec::SpecResource::Provider(extension.provider.clone()),
+            "provider returned memory outside the declared size, alignment, protection, or inheritance contract",
+        ));
+    }
+    Ok(())
+}
 
 pub(super) struct Launch {
     pub(super) guest: Guest,
@@ -135,7 +227,7 @@ fn lower_services(spec: &MachineSpec) -> Option<ServiceLaunch> {
         .extensions
         .iter()
         .find(|extension| extension.provider == handles_provider())?;
-    let projections = extension
+    let projections: Vec<_> = extension
         .namespace
         .iter()
         .filter_map(|entry| match entry {
@@ -151,6 +243,9 @@ fn lower_services(spec: &MachineSpec) -> Option<ServiceLaunch> {
             _ => None,
         })
         .collect();
+    if extension.services.is_empty() && projections.is_empty() {
+        return None;
+    }
     Some(ServiceLaunch {
         provider: extension.provider.clone(),
         registrations: extension.services.clone(),

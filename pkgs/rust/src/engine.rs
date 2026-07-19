@@ -1,5 +1,5 @@
 use crate::{
-    extension::{BindAccess, ExtensionCapability, HandlesAuthority, ProviderId},
+    extension::{Authorities, BindAccess, ExtensionCapability, HandlesAuthority, ProviderId},
     ffi,
     runtime::ConfigFile,
     spec::{
@@ -24,7 +24,7 @@ static EXECUTABLE: OnceLock<Result<CString, String>> = OnceLock::new();
 
 mod discovery;
 mod launch;
-mod lowering;
+pub(crate) mod lowering;
 mod validation;
 
 /// Entry point for constructing guest commands.
@@ -75,10 +75,25 @@ impl Engine {
         io: ProcessIo,
         authority: HandlesAuthority,
     ) -> Result<Machine, SpawnError> {
+        self.spawn_with_authorities(spec, io, authority.into())
+    }
+
+    /// Starts a machine with the narrow provider ports granted for this launch.
+    ///
+    /// # Errors
+    /// Returns a typed specification error for missing or excess authority, invalid provider
+    /// resources, or an engine error when activation fails.
+    pub fn spawn_with_authorities(
+        &self,
+        spec: MachineSpec,
+        io: ProcessIo,
+        authorities: Authorities,
+    ) -> Result<Machine, SpawnError> {
         self.validate(&spec).map_err(SpawnError::Spec)?;
-        validation::validate_authority(&spec, &authority).map_err(SpawnError::Spec)?;
+        validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
+        let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
-        launch::start(launch, io, authority)
+        launch::start(launch, io, authorities, resources)
             .map(Machine::new)
             .map_err(SpawnError::Engine)
     }
@@ -106,7 +121,8 @@ impl Engine {
             streams,
             terminal,
             projections,
-            services,
+            services.map(|(launch, authority)| (launch, authority.into())),
+            Vec::new(),
         )
     }
 }
@@ -122,10 +138,16 @@ fn handles_provider() -> ProviderId {
 }
 
 fn handles_features() -> BTreeSet<crate::extension::Feature> {
-    ["read", "write", "poll", "ofd-lifecycle"]
-        .into_iter()
-        .map(|name| crate::extension::Feature::new(name).unwrap_or_else(|_| unreachable!()))
-        .collect()
+    [
+        "read",
+        "write",
+        "poll",
+        "ofd-lifecycle",
+        "memory-allocation",
+    ]
+    .into_iter()
+    .map(|name| crate::extension::Feature::new(name).unwrap_or_else(|_| unreachable!()))
+    .collect()
 }
 
 fn namespace_features() -> BTreeSet<crate::extension::Feature> {

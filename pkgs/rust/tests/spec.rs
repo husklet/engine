@@ -10,11 +10,12 @@ use std::{
 
 use hl_engine::{
     extension::{
-        BindAccess, DirectoryEntry, ExtensionConfig, ExtensionSpec, Feature, FileEntry, FileSource,
-        HandleOperation, Handles, HostBindEntry, Inheritance, Interest, LinuxError,
-        MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
-        ProviderId, ReadRequest, Readiness, ReadyState, ServiceEntry, ServiceId,
-        ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
+        AllocationRequest, Authorities, BindAccess, Coherency, DirectoryEntry, ExtensionConfig,
+        ExtensionSpec, Feature, FileEntry, FileSource, HandleOperation, Handles, HostBindEntry,
+        HostResource, Inheritance, Interest, LinuxError, Memory, MemoryRequirement, Metadata,
+        NamespaceEntry, OpenHandle, OpenRequest, Protections, ProviderAuthority, ProviderId,
+        ReadRequest, Readiness, ReadyState, Region, ResourceDescriptor, ResourceError, ResourceId,
+        ServiceEntry, ServiceId, ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
     },
     network::Namespace,
     spec::{NetworkMode, SpecErrorCategory, TreeSource, Version},
@@ -1334,6 +1335,161 @@ fn handles_extension() -> ExtensionSpec {
         memory: Vec::new(),
         environment: Vec::new(),
     }
+}
+
+fn memory_extension() -> ExtensionSpec {
+    ExtensionSpec {
+        provider: ProviderId::new("engine.handles").unwrap(),
+        version: Version::new(1, 0),
+        required: true,
+        required_features: BTreeSet::from([Feature::new("memory-allocation").unwrap()]),
+        optional_features: BTreeSet::new(),
+        config: ExtensionConfig::empty("engine.handles/v1"),
+        namespace: Vec::new(),
+        services: Vec::new(),
+        memory: vec![MemoryRequirement {
+            size: 4096,
+            alignment: 4096,
+            protections: Protections {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            sharing: Sharing::Shared,
+            inheritance: Inheritance::Retain,
+        }],
+        environment: Vec::new(),
+    }
+}
+
+struct TestMemory {
+    allocated: Arc<std::sync::atomic::AtomicUsize>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct InvalidMemory {
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Memory for InvalidMemory {
+    fn allocate(&self, request: AllocationRequest) -> Result<HostResource, ResourceError> {
+        Ok(HostResource {
+            id: ResourceId(42),
+            regions: vec![Region {
+                offset: 1,
+                size: request.size,
+                protections: request.protections,
+            }],
+            handles: Vec::new(),
+            coherency: Coherency::Coherent,
+            inheritance: Inheritance::Retain,
+        })
+    }
+
+    fn import(&self, _descriptor: &ResourceDescriptor) -> Result<HostResource, ResourceError> {
+        unreachable!("test does not import resources")
+    }
+
+    fn release(&self, resource: ResourceId) {
+        assert_eq!(resource, ResourceId(42));
+        self.released
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Memory for TestMemory {
+    fn allocate(&self, request: AllocationRequest) -> Result<HostResource, ResourceError> {
+        self.allocated
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(HostResource {
+            id: ResourceId(41),
+            regions: vec![Region {
+                offset: 0,
+                size: request.size,
+                protections: request.protections,
+            }],
+            handles: Vec::new(),
+            coherency: Coherency::Coherent,
+            inheritance: Inheritance::Retain,
+        })
+    }
+
+    fn import(&self, _descriptor: &ResourceDescriptor) -> Result<HostResource, ResourceError> {
+        unreachable!("test does not import resources")
+    }
+
+    fn release(&self, resource: ResourceId) {
+        assert_eq!(resource, ResourceId(41));
+        self.released
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn provider_memory_is_allocated_with_launch_authority_and_released_after_exit() {
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.extensions.push(memory_extension());
+    let validation = Engine::new().validate(&spec).unwrap();
+    assert_eq!(validation.resources.extension_memory_bytes, 4096);
+
+    let error = Engine::new()
+        .spawn(spec.clone(), ProcessIo::default())
+        .unwrap_err();
+    let hl_engine::SpawnError::Spec(error) = error else {
+        panic!("missing memory authority reached launch")
+    };
+    assert_eq!(error.field, "extensions.authority");
+
+    let allocated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut authorities = Authorities::new();
+    authorities
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            ProviderAuthority {
+                handles: None,
+                memory: Some(Arc::new(TestMemory {
+                    allocated: allocated.clone(),
+                    released: released.clone(),
+                })),
+            },
+        )
+        .unwrap();
+    let machine = Engine::new()
+        .spawn_with_authorities(spec, ProcessIo::default(), authorities)
+        .unwrap();
+    assert_eq!(allocated.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+    assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn provider_memory_result_is_validated_and_rolled_back_before_process_start() {
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/does/not/run");
+    spec.extensions.push(memory_extension());
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut authorities = Authorities::new();
+    authorities
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            ProviderAuthority {
+                handles: None,
+                memory: Some(Arc::new(InvalidMemory {
+                    released: released.clone(),
+                })),
+            },
+        )
+        .unwrap();
+    let error = Engine::new()
+        .spawn_with_authorities(spec, ProcessIo::default(), authorities)
+        .unwrap_err();
+    let hl_engine::SpawnError::Spec(error) = error else {
+        panic!("invalid provider resource reached process start")
+    };
+    assert_eq!(error.field, "extensions.memory");
+    assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]

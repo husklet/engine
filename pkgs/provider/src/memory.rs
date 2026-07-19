@@ -15,6 +15,12 @@ pub trait Memory: Send + Sync {
     /// # Errors
     /// Returns a typed resource error when the descriptor is incompatible or cannot be imported.
     fn import(&self, descriptor: &ResourceDescriptor) -> Result<HostResource, ResourceError>;
+
+    /// Releases one resource previously returned by this provider.
+    ///
+    /// The default supports providers whose returned resource is independently owned. Providers
+    /// retaining state behind a resource id override this callback.
+    fn release(&self, _resource: ResourceId) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,4 +1,4 @@
-use crate::Handles;
+use crate::{Handles, Memory};
 use hl_engine_api::extension::{ContractError, ProviderId};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -10,6 +10,70 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 #[derive(Default)]
 pub struct HandlesAuthority {
     providers: BTreeMap<ProviderId, Arc<dyn Handles>>,
+}
+
+/// The narrow live ports granted to one provider for one launch.
+#[derive(Default)]
+pub struct ProviderAuthority {
+    pub handles: Option<Arc<dyn Handles>>,
+    pub memory: Option<Arc<dyn Memory>>,
+}
+
+/// Launch-scoped provider authority, kept separate from serializable specifications.
+#[derive(Default)]
+pub struct Authorities {
+    providers: BTreeMap<ProviderId, ProviderAuthority>,
+}
+
+impl Authorities {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Grants one provider's selected live ports.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::DuplicateProvider`] for a duplicate provider grant.
+    pub fn grant(
+        &mut self,
+        provider: ProviderId,
+        authority: ProviderAuthority,
+    ) -> Result<(), ContractError> {
+        if self.providers.insert(provider, authority).is_some() {
+            return Err(ContractError::DuplicateProvider);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn provider(&self, provider: &ProviderId) -> Option<&ProviderAuthority> {
+        self.providers.get(provider)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ProviderId, &ProviderAuthority)> {
+        self.providers.iter()
+    }
+}
+
+impl From<HandlesAuthority> for Authorities {
+    fn from(authority: HandlesAuthority) -> Self {
+        Self {
+            providers: authority
+                .providers
+                .into_iter()
+                .map(|(provider, handles)| {
+                    (
+                        provider,
+                        ProviderAuthority {
+                            handles: Some(handles),
+                            memory: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 impl HandlesAuthority {

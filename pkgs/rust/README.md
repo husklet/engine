@@ -50,8 +50,11 @@ coherence while isolating launches. A host bind must grant an existing regular f
 or directory; writable binds, host symlink roots, sockets, and other special nodes are rejected. Entries use the
 ordinary read-only mount/VFS path, so open, stat, readlink,
 canonicalization, and directory enumeration do not use extension-specific syscall hooks. Launch-private backing is
-revoked when the machine exits. Other node sources, open services, provider memory, and checkpoints remain
-undiscovered or return a typed unsupported error.
+revoked when the machine exits. The `engine.handles` contract also advertises bounded
+`memory-allocation`: launch-scoped `Memory` authority allocates validated host resources before the guest starts,
+retains them for the machine lifetime, and releases them on exit or rollback. This does not advertise guest virtual
+address mapping or transferable memory handles. Other node sources and checkpoints remain undiscovered or return a
+typed unsupported error.
 
 The public `transport` module contains the frozen, bounded provider-channel foundation: versioned
 frames, request ids, deadlines, cancellation, peer-close detection, lifecycle handshake, and a

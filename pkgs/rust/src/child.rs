@@ -13,6 +13,7 @@ pub struct Child {
     pub(crate) domain: Domain,
     pub(crate) completed: bool,
     pub(crate) _projections: Vec<crate::projection::Projection>,
+    pub(crate) _provider_resources: Vec<crate::engine::lowering::AllocatedResource>,
 }
 /// Captured output and typed guest status.
 #[derive(Clone, Debug, Eq, PartialEq)]

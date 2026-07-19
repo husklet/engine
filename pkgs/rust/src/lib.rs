@@ -43,7 +43,7 @@ pub use control::{
 pub use domain::Domain;
 pub use engine::Engine;
 pub use error::Error;
-pub use extension::HandlesAuthority;
+pub use extension::{Authorities, HandlesAuthority, ProviderAuthority};
 pub use hl_engine_api::{Access, Guest, Mount, Sandbox, Stdio};
 pub use machine::Machine;
 pub use result::Exit;

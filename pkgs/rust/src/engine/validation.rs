@@ -12,8 +12,8 @@ use self::{
 };
 use super::{
     handles_provider, namespace_provider, resource_error, spec_error, BTreeMap, BTreeSet,
-    BindAccess, EngineCapabilities, HandlesAuthority, MachineSpec, NetworkMode, ProviderId,
-    SpecError, SpecErrorCategory, TreeSource, Validation,
+    BindAccess, EngineCapabilities, MachineSpec, NetworkMode, ProviderId, SpecError,
+    SpecErrorCategory, TreeSource, Validation,
 };
 
 // Keeping the complete preflight in one linear pass makes `validate` and `spawn` structurally
@@ -453,14 +453,6 @@ fn validate_selected_runtime(
             continue;
         }
         if extension.provider == handles_provider() {
-            if !extension.memory.is_empty() {
-                return Err(resource_error(
-                    SpecErrorCategory::Unsupported,
-                    "extensions.memory",
-                    crate::spec::SpecResource::Provider(extension.provider.clone()),
-                    "provider memory is not implemented by handles contract v1",
-                ));
-            }
             let supported = BTreeSet::from([
                 crate::extension::HandleOperation::Read,
                 crate::extension::HandleOperation::Write,
@@ -537,15 +529,17 @@ fn validate_selected_runtime(
     Ok(())
 }
 
-pub(super) fn validate_authority(
+pub(super) fn validate_authorities(
     spec: &MachineSpec,
-    authority: &HandlesAuthority,
+    authorities: &crate::extension::Authorities,
 ) -> Result<(), SpecError> {
     if spec.process.terminal.is_some()
         && spec
             .extensions
             .iter()
-            .any(|extension| extension.provider == handles_provider())
+            .any(|extension| {
+                extension.provider == handles_provider() && !extension.services.is_empty()
+            })
     {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
@@ -554,14 +548,46 @@ pub(super) fn validate_authority(
         ));
     }
     for extension in &spec.extensions {
-        if extension.provider == handles_provider()
-            && authority.handles(&extension.provider).is_none()
+        if extension.provider != handles_provider() {
+            continue;
+        }
+        let authority = authorities.provider(&extension.provider);
+        if !extension.services.is_empty()
+            && authority.and_then(|value| value.handles.as_ref()).is_none()
         {
             return Err(resource_error(
                 SpecErrorCategory::Invalid,
                 "extensions.authority",
                 crate::spec::SpecResource::Provider(extension.provider.clone()),
                 "selected handle services require launch-scoped Handles authority",
+            ));
+        }
+        if !extension.memory.is_empty()
+            && authority.and_then(|value| value.memory.as_ref()).is_none()
+        {
+            return Err(resource_error(
+                SpecErrorCategory::Invalid,
+                "extensions.authority",
+                crate::spec::SpecResource::Provider(extension.provider.clone()),
+                "selected memory requirements need launch-scoped Memory authority",
+            ));
+        }
+    }
+    for (provider, authority) in authorities.iter() {
+        let extension = spec
+            .extensions
+            .iter()
+            .find(|value| &value.provider == provider);
+        let handles_needed = extension.is_some_and(|value| !value.services.is_empty());
+        let memory_needed = extension.is_some_and(|value| !value.memory.is_empty());
+        if authority.handles.is_some() != handles_needed
+            || authority.memory.is_some() != memory_needed
+        {
+            return Err(resource_error(
+                SpecErrorCategory::Invalid,
+                "extensions.authority",
+                crate::spec::SpecResource::Provider(provider.clone()),
+                "provider grant contains missing or excess live ports",
             ));
         }
     }
