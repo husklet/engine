@@ -342,7 +342,17 @@ fn validate_extension_memory(
     extension: &crate::extension::ExtensionSpec,
     index: usize,
 ) -> Result<(), SpecError> {
-    if extension.memory.len() > capabilities.limits.mappings as usize {
+    let contract_limit = capabilities
+        .extensions
+        .iter()
+        .find(|capability| {
+            capability.provider == extension.provider
+                && capability.versions.contains(&extension.version)
+        })
+        .map_or(capabilities.limits.mappings, |capability| {
+            capability.limits.mappings
+        });
+    if extension.memory.len() > capabilities.limits.mappings.min(contract_limit) as usize {
         return Err(spec_error(
             SpecErrorCategory::Limit,
             format!("extensions[{index}].memory"),

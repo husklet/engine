@@ -484,6 +484,7 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
         .find(|extension| extension.provider.as_str() == "engine.namespace")
         .unwrap();
     assert_eq!(namespace.versions, [Version::new(1, 0)]);
+    assert_eq!(namespace.limits.mappings, 0);
     assert_eq!(
         namespace
             .features
@@ -499,6 +500,16 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
             "unix-sockets"
         ]
     );
+    let handles = capabilities
+        .extensions
+        .iter()
+        .find(|extension| extension.provider.as_str() == "engine.handles")
+        .unwrap();
+    assert!(handles
+        .features
+        .iter()
+        .any(|feature| feature.as_str() == "memory-allocation"));
+    assert_eq!(handles.limits.mappings, 64);
     assert!(!capabilities.checkpoint.supported);
 }
 
@@ -1626,6 +1637,18 @@ fn provider_memory_result_is_validated_and_rolled_back_before_process_start() {
     };
     assert_eq!(error.field, "extensions.memory");
     assert_eq!(released.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn provider_memory_enforces_its_discovered_contract_limit() {
+    let mut extension = memory_extension();
+    let requirement = extension.memory[0].clone();
+    extension.memory = vec![requirement; 65];
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
+    spec.extensions.push(extension);
+    let error = Engine::new().validate(&spec).unwrap_err();
+    assert_eq!(error.category, SpecErrorCategory::Limit);
+    assert_eq!(error.field, "extensions[0].memory");
 }
 
 #[test]

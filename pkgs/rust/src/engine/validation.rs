@@ -576,12 +576,9 @@ pub(super) fn validate_authorities(
     authorities: &crate::extension::Authorities,
 ) -> Result<(), SpecError> {
     if spec.process.terminal.is_some()
-        && spec
-            .extensions
-            .iter()
-            .any(|extension| {
-                extension.provider == handles_provider() && !extension.services.is_empty()
-            })
+        && spec.extensions.iter().any(|extension| {
+            extension.provider == handles_provider() && !extension.services.is_empty()
+        })
     {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,

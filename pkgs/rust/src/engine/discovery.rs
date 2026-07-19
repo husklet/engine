@@ -76,7 +76,7 @@ pub(super) fn capabilities() -> EngineCapabilities {
                 limits: crate::extension::ExtensionLimits {
                     namespace_entries: 4096,
                     services: 0,
-                    mappings: 64,
+                    mappings: 0,
                     queued_events: 0,
                     request_bytes: 0,
                 },
@@ -89,7 +89,7 @@ pub(super) fn capabilities() -> EngineCapabilities {
                 limits: crate::extension::ExtensionLimits {
                     namespace_entries: 64,
                     services: 64,
-                    mappings: 0,
+                    mappings: 64,
                     queued_events: 64,
                     request_bytes: 1024 * 1024,
                 },
