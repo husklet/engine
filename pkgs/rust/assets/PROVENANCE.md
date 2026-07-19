@@ -5,10 +5,10 @@ the activation constructor. No native executable is stored or extracted at
 runtime. The macOS archive includes ABI9 process-domain ownership; the Linux
 archive remains the target-specific archive shipped with this crate revision.
 
-| Host target | Build target | SHA-256 |
-|---|---|---|
-| `aarch64-apple-darwin` | `build-cap-mac/package/macos-aarch64/libhl-engine.a` | `52210f2a9298f75af004f156024ee77351eaed44f30ab2acfb61d176874c820b` |
-| `aarch64-unknown-linux-gnu` | `build-cap-linux/package/linux-aarch64/libhl-engine.a` | `900e3ff97dbea86e61d64e79a82290e905c289fd6ed55e3fb4551e7359cf32ff` |
+| Host target | Source commit | Build target | SHA-256 |
+|---|---|---|---|
+| `aarch64-apple-darwin` | `b7de85947` | `build-package/package/macos-aarch64/libhl-engine.a` | `99495ce8cbe3708244213a8c51eac58bf37a1cbe5e4674973656ac295076fb0a` |
+| `aarch64-unknown-linux-gnu` | not recorded | `build-cap-linux/package/linux-aarch64/libhl-engine.a` | `900e3ff97dbea86e61d64e79a82290e905c289fd6ed55e3fb4551e7359cf32ff` |
 
 Cargo links the selected archive with whole-archive semantics so the private
 pre-main activation constructor is retained in downstream executables. A
