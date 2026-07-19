@@ -315,6 +315,11 @@ static void hl_activation_child(void) {
     int environment = hl_environment_take_activation_descriptor(&descriptor);
     if (environment == 0) return;
     if (environment < 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
+#if defined(__APPLE__)
+    /* Foundation's concrete string classes must finish initialization before
+     * activation creates its relay thread and the host backend forks a guest. */
+    hl_linux_dns_prepare();
+#endif
     /* Embedded builds deliberately omit the native constructor.  Transport
      * adoption needs the private descriptor registry before the later backend
      * initialization boundary, otherwise every attached provider fails with

@@ -506,7 +506,15 @@ package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
 		-o '$(BUILD)/activation-package-consumer/activation-package'
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
 		'$(BUILD)/activation-package-consumer/activation-package'
+	$(MAC) clang -I'$(abspath $(BUILD)/activation-package-root/include)' \
+		tests/integration/activation_objc_package.m \
+		-Wl,-force_load,'$(abspath $(BUILD)/activation-package-root/lib/libhl-engine-activation.a)' \
+		-framework Foundation -o '$(BUILD)/activation-package-consumer/activation-objc-package'
+	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f \
+		'$(BUILD)/activation-package-consumer/activation-objc-package'
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package)
+	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-objc-package) \
+		$(abspath $(BUILD)/e2e/guest-exit-aarch64)
 	$(MAC) $(abspath $(BUILD)/activation-package-consumer/activation-package) \
 		$(abspath $(BUILD)/e2e/guest-descendant-aarch64) $(abspath $(BUILD)/e2e/guest-external-term-aarch64) \
 		$(abspath $(BUILD)/e2e/guest-domain-aarch64) $(abspath $(BUILD)/e2e/guest-domain-x86_64)
