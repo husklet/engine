@@ -31,8 +31,9 @@ static int listener(int family, int port) {
 }
 
 int main(void) {
-    int v6 = listener(AF_INET6, 16379);
-    int v4 = listener(AF_INET, 16379);
+    int port = 16000 + (getpid() % 40000);
+    int v6 = listener(AF_INET6, port);
+    int v4 = listener(AF_INET, port);
     printf("v6=%d v4=%d\n", v6 >= 0, v4 >= 0);
     if (v6 >= 0) close(v6);
     if (v4 >= 0) close(v4);

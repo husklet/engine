@@ -466,8 +466,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
+            int bridge_v6only = 0;
+            if (br6_any_is(sa, (socklen_t)a2)) {
+                socklen_t option_length = sizeof bridge_v6only;
+                if (getsockopt((int)a0, IPPROTO_IPV6, IPV6_V6ONLY, &bridge_v6only, &option_length) != 0)
+                    bridge_v6only = 0;
+            }
             char up[200];
-            br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            if (bridge_v6only)
+                br_v6only_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            else
+                br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);

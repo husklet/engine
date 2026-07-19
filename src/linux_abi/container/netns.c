@@ -1341,6 +1341,12 @@ static void br_path(int interface, uint32_t ip_be, uint16_t port, char *out, siz
     snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netif[interface].path, b[0], b[1], b[2], b[3], (unsigned)port);
 }
 
+static void br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
+    br_path(interface, ip_be, port, out, n);
+    size_t length = strlen(out);
+    if (length < n) snprintf(out + length, n - length, ".v6only");
+}
+
 // bind(:0) on the bridge -> a free, round-trippable ephemeral port keyed by OUR ip (cf. lo_alloc_ephemeral)
 static uint16_t br_alloc_ephemeral(int interface) {
     static uint16_t next;
