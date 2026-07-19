@@ -4,7 +4,7 @@
 #include "../epoll.h"
 #include "../watch.h"
 #include "../bus.h"
-#include "../../core/provider_files.h"
+#include "../../core/provider/files.h"
 
 static int g_bound_sentinel = -1;
 static void bound_epoll_provider_ready(void *opaque, uint64_t token) {

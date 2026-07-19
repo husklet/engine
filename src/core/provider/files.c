@@ -1,5 +1,5 @@
-#include "provider_files.h"
-#include "provider_handles.h"
+#include "files.h"
+#include "handles.h"
 
 #include <errno.h>
 #include <stdatomic.h>

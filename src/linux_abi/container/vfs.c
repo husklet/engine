@@ -5,8 +5,8 @@
 #include "../shared.h"
 #include "../../host/file.h"
 #include "../../host/resolve.h"
-#include "../../core/provider_files.h"
-#include "../../core/provider_namespace.h"
+#include "../../core/provider/files.h"
+#include "../../core/provider/namespace.h"
 
 // Set when a followed path resolution exceeds the symlink-traversal limit (Linux caps at 40 -> ELOOP). The
 // jail resolvers return a host-path string with no errno channel, so a self-referential / cyclic symlink

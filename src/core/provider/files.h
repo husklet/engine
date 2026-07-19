@@ -2,7 +2,7 @@
 #define HL_CORE_PROVIDER_FILES_H
 
 #include "hl/host_services.h"
-#include "provider_client.h"
+#include "client.h"
 
 /* Process-isolated activation wrapper. Untagged handles delegate to the captured host file table. */
 int hl_provider_files_install(hl_host_services *services, hl_provider_client *client);

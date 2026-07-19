@@ -1134,9 +1134,9 @@ $(BUILD)/production/hl-engine-linux-x86_64: $(BUILD)/mac/target/x86_64.o $(BUILD
 # Provider/bound subsystem + engine environment: each compiled as its own TU (they carry
 # file-local put32/get32 helpers that collide if folded into the unity target object).
 PRODUCTION_PROVIDER_OBJECTS := $(BUILD)/linux-production/core/environment.o \
-	$(BUILD)/linux-production/core/provider_client.o $(BUILD)/linux-production/core/provider_demux.o \
-	$(BUILD)/linux-production/core/provider_files.o $(BUILD)/linux-production/core/provider_handles.o \
-	$(BUILD)/linux-production/core/provider_namespace.o
+	$(BUILD)/linux-production/core/provider/client.o $(BUILD)/linux-production/core/provider/demux.o \
+	$(BUILD)/linux-production/core/provider/files.o $(BUILD)/linux-production/core/provider/handles.o \
+	$(BUILD)/linux-production/core/provider/namespace.o
 
 $(BUILD)/linux-production/core/%.o: src/core/%.c
 	@mkdir -p $(@D)

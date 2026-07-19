@@ -1,4 +1,4 @@
-#include "provider_namespace.h"
+#include "namespace.h"
 
 #include <errno.h>
 #include <stdlib.h>

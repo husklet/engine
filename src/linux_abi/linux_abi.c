@@ -1,6 +1,6 @@
 #include "hl/linux_abi.h"
 #if defined(HL_EMBEDDED_BUILD)
-#include "../core/provider_files.h"
+#include "../core/provider/files.h"
 #endif
 #include "object.h"
 

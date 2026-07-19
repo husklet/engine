@@ -1,7 +1,7 @@
 #ifndef HL_CORE_PROVIDER_DEMUX_H
 #define HL_CORE_PROVIDER_DEMUX_H
 
-#include "provider_client.h"
+#include "client.h"
 
 #include <stdint.h>
 
