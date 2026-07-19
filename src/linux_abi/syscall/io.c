@@ -1086,13 +1086,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (po) lseek(infd, *po, SEEK_SET);
+        // With a non-NULL offset the input file position must NOT change: read from *po via pread and
+        // report the advanced offset through *po only. A NULL offset reads from (and advances) infd's
+        // own file position.
+        off_t rpos = po ? *po : 0;
         char bf[65536];
         size_t tot = 0;
         int rerr = 0; // a read/write error hit with NOTHING transferred yet -> report -errno, not a fake 0
         while (tot < cnt) {
             size_t w = cnt - tot < sizeof bf ? cnt - tot : sizeof bf;
-            ssize_t n = read(infd, bf, w);
+            ssize_t n = po ? pread(infd, bf, w, rpos) : read(infd, bf, w);
             if (n < 0) { // a mid-copy read error was previously swallowed as EOF -> silent truncation
                 if (tot == 0) rerr = errno;
                 break;
@@ -1104,11 +1107,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             tot += wr;
+            rpos += wr;
             if (wr < n) break;
         }
         // Linux: once ANY bytes were transferred, sendfile returns that count (a later error surfaces on the
         // next call); an error before the first byte returns -errno.
-        if (po) *po += tot;
+        if (po) *po = rpos;
         G_RET(c) = rerr ? (uint64_t)(-rerr) : (uint64_t)tot;
         break;
     }
@@ -1760,6 +1764,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         off_t oi = poi ? *poi : -1, oo = poo ? *poo : -1;
+        // Linux rejects a same-file copy whose source and destination ranges overlap (EINVAL) rather than
+        // corrupting the file by copying through the overlap. Compare the underlying file identity and the
+        // effective start offsets (explicit offset, else the current file position for a NULL offset).
+        if (len > 0) {
+            struct stat si, so;
+            if (fstat(fdin, &si) == 0 && fstat(fdout, &so) == 0 && si.st_dev == so.st_dev &&
+                si.st_ino == so.st_ino) {
+                off_t is = poi ? *poi : lseek(fdin, 0, SEEK_CUR);
+                off_t os = poo ? *poo : lseek(fdout, 0, SEEK_CUR);
+                if (is >= 0 && os >= 0 && is < os + (off_t)len && os < is + (off_t)len) {
+                    G_RET(c) = (uint64_t)(-EINVAL);
+                    break;
+                }
+            }
+        }
         char cb[8192];
         while (done < len) {
             size_t chunk = (len - done > sizeof cb) ? sizeof cb : len - done;

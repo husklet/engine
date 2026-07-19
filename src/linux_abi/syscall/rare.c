@@ -700,14 +700,29 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 274:
         G_RET(c) = 0;
         break; // sched_setattr -> ok (ignored)
-    // preadv2/pwritev2: flags (a5) ignored; offset in a3 (pos_high a4 is 0 on LP64)
+    // preadv2/pwritev2: offset in a3 (pos_high a4 is 0 on LP64), RWF_* flags in a5. The flags are
+    // semantic requirements (RWF_APPEND/DSYNC/SYNC/NOWAIT/HIPRI), not hints: silently dropping them
+    // makes RWF_APPEND write at the supplied offset instead of the end. Honor them via the host
+    // preadv2/pwritev2 (Linux host); the macOS build lacks them, so reject any flag there.
     case 286: {
         if (memf_get((int)a0)) {
+            if (a5) {
+                G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+                break;
+            }
             ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
+#if defined(__linux__)
+        ssize_t r = preadv2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
+#else
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+            break;
+        }
         ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+#endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -717,6 +732,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0)) {
+            if (a5) {
+                G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+                break;
+            }
             const struct iovec *iv = (const struct iovec *)a1;
             off_t end = (off_t)a3;
             for (int i = 0; i < (int)a2; i++)
@@ -727,7 +746,15 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
         }
+#if defined(__linux__)
+        ssize_t r = pwritev2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
+#else
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
+            break;
+        }
         ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+#endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
