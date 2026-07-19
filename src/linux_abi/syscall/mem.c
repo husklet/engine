@@ -610,6 +610,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // semantics and is handled separately.
         if (a0 && !(a3 & 0x10) && g_nonpie_lo && a0 < g_nonpie_hi && a0 + a1 > g_nonpie_lo)
             a0 = 0;
+        // The anonymous compatibility tail is host-visible but not part of the guest's requested range.
+        // Darwin may honor an executable mapping hint placed in a hole between ELF segments even when
+        // that hidden tail reaches the next segment; unmapping the generated-code allocation then removes
+        // live image pages. Let Darwin choose a genuinely free address for non-fixed JIT mappings. Their
+        // address is not contractual, and reservation/commit hints without PROT_EXEC keep their cage path.
+        if (a0 && !(a3 & 0x10) && (a3 & 0x20) && (a2 & PROT_EXEC)) a0 = 0;
 #ifdef PCACHE_MMAP_HINT
         // (pcache): give the dynamic linker's file-backed, non-fixed, kernel-placed maps (library
         // loads) a DETERMINISTIC base hint so their translated blocks are reusable across runs of the same

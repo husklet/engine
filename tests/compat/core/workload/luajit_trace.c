@@ -3,10 +3,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
-
 enum { CODE_WORDS = 64 };
 
 static uint32_t branch(uint32_t opcode, unsigned from, unsigned to) {
@@ -71,7 +67,7 @@ int main(void) {
     for (unsigned i = 0; i < 256; i++) {
         uintptr_t candidate = 0x100000000ull + (uintptr_t)i * 0x200000ull;
         uint32_t *code = mmap((void *)candidate, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (code == MAP_FAILED) continue;
         emit_trace(code);
         __builtin___clear_cache((char *)code, (char *)code + CODE_WORDS * sizeof(*code));
