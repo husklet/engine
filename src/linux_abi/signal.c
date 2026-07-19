@@ -738,9 +738,17 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     // guest's own SIGSEGV handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it.
     // AArch64 permits unaligned accesses; file EOF is the mapped-memory SIGBUS case Linux exposes here.
     // Only host SIGBUS needs the check (host SIGSEGV already maps to Linux SIGSEGV).
+    //
+    // This disambiguation is macOS-specific: only there is host SIGBUS overloaded across PROT_NONE guard
+    // accesses AND real past-EOF bus errors, and only there is the gbus ledger populated to tell them apart.
+    // On a Linux host the guest runs on real host file mappings, so the kernel already raises host SIGBUS
+    // exactly (and only) for genuine bus errors (past-EOF, misalignment) -- there the ledger is empty, so the
+    // rewrite would wrongly downgrade every guest SIGBUS to SIGSEGV. Trust the host signo on Linux.
+#if !defined(__linux__)
     if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
         !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
         sig = 11;
+#endif
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
     struct cpu *c = cpu_hint ? cpu_hint : (struct cpu *)pthread_getspecific(g_cpu_key);
