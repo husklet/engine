@@ -44,6 +44,7 @@ static int write_full(int fd, const void *data, size_t size) {
 }
 
 static int make_config(const char *guest, char path[64]) {
+    static uint64_t next_domain = 1;
     hl_launch_config config = {0};
     char pool[4096] = {0};
     size_t guest_size = strlen(guest) + 1;
@@ -59,6 +60,8 @@ static int make_config(const char *guest, char path[64]) {
     config.pool_size = (uint32_t)(guest_size + 2);
     config.uid = -1;
     config.gid = -1;
+    config.process_domain[0] = (uint64_t)getpid();
+    config.process_domain[1] = next_domain++;
     config.arguments_offset = 1;
     if (write_full(fd, &config, sizeof(config)) != 0 || write_full(fd, pool, config.pool_size) != 0 ||
         close(fd) != 0) { close(fd); unlink(path); return -1; }
