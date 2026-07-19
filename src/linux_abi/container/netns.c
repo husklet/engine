@@ -3281,20 +3281,25 @@ static int icmp_try_send(int fd, const uint8_t *input, size_t size, const uint8_
         *result = -EDESTADDRREQ;
         return 1;
     }
-    if (!br_on() || br_for_ip(peer) < 0) {
+    // Loopback ping (127/8) is a purely local echo: the kernel reflects the request without touching a wire,
+    // so synthesize the reply ourselves regardless of a configured bridge. This is the container-healthcheck
+    // `ping 127.0.0.1` / `ping localhost` case. Off-loopback still requires a bridge route.
+    int loopback = (peer & 0xffu) == 127u;
+    if (!loopback && (!br_on() || br_for_ip(peer) < 0)) {
         *result = -ENETUNREACH;
         return 1;
     }
     if (icmp_swap(fd) < 0) return 0;
     g_icmp_ip[fd] = peer;
     if (g_icmp_kind[fd] == 2) {
+        int bidx = br_for_ip(peer);
         memset(reply, 0, 20);
         reply[0] = 0x45;
         *(uint16_t *)(reply + 2) = htons((uint16_t)(20 + size));
         reply[8] = 64;
         reply[9] = 1;
         *(uint32_t *)(reply + 12) = peer;
-        *(uint32_t *)(reply + 16) = g_netif[br_for_ip(peer)].ip;
+        *(uint32_t *)(reply + 16) = bidx >= 0 ? g_netif[bidx].ip : peer;
         *(uint16_t *)(reply + 10) = icmp_checksum(reply, 20);
         icmp = reply + 20;
         reply_size += 20;

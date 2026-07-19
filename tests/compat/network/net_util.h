@@ -33,6 +33,15 @@ static const char *err_name(int e) {
         case EBADF: return "EBADF";
         case ENOTSOCK: return "ENOTSOCK";
         case EOPNOTSUPP: return "EOPNOTSUPP";
+        case EPERM: return "EPERM";
+        case EACCES: return "EACCES";
+        case EPROTONOSUPPORT: return "EPROTONOSUPPORT";
+        case EPROTOTYPE: return "EPROTOTYPE";
+        case ESOCKTNOSUPPORT: return "ESOCKTNOSUPPORT";
+        case EADDRNOTAVAIL: return "EADDRNOTAVAIL";
+        case ENODEV: return "ENODEV";
+        case ENOTTY: return "ENOTTY";
+        case ENOSYS: return "ENOSYS";
         default: return "OTHER";
     }
 }

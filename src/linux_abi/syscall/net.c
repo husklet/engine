@@ -142,6 +142,14 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
     // handles the PROT_NONE case; see thread.c).
     if (addr && guest_bad_ptr(addr, alen)) return -EFAULT;
     int lfam = (addr && alen >= 2) ? *(const uint16_t *)addr : 0; // guest (Linux) sa_family
+    // bind() on an already-bound switch-backed socket -> EINVAL. lo_swap()/br mint a fresh AF_UNIX socket
+    // per bind, so a real host rebind would spuriously succeed; the recorded virtual port is the bound
+    // marker (a plain host-backed bind is rejected by the host itself). AF_UNSPEC never reaches bind here.
+    if (!is_connect && fd >= 0 && fd < HL_NFD && (g_lo_port[fd] || g_br_port[fd])) return -EINVAL;
+    // connect() on a listening socket -> EISCONN (the kernel rejects it on socket state before the protocol
+    // connect, regardless of the destination). The switch model would otherwise dial the destination and
+    // surface ECONNREFUSED.
+    if (is_connect && fd >= 0 && fd < HL_NFD && g_tcp_listen[fd] && lfam != 0) return -EISCONN;
     // connect() on an already-connected stream socket -> EISCONN (kernel checks the socket state before
     // the protocol connect). AF_UNSPEC is the "dissolve association" idiom and is never EISCONN.
     if (is_connect && sotype == SOCK_STREAM && lfam != 0) {
@@ -257,6 +265,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int ty = (int)a1;
+        // Linux rejects a type carrying bits outside SOCK_TYPE_MASK(0xf) other than SOCK_CLOEXEC(0x80000)
+        // and SOCK_NONBLOCK(0x800) with EINVAL, before consulting the family. Validate here so a junk-bit
+        // type does not silently mask down to a valid type (host would either accept it or return the wrong
+        // ESOCKTNOSUPPORT for a masked-but-unsupported value).
+        if (ty & ~(0xf | 0x80000 | 0x800)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged). Gate the new fd
         // against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the host table is far larger).
         int r = nofile_gate(socket(af_l2m((int)a0), ty & 0xf, (int)a2));
@@ -845,7 +861,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0] && sa && (socklen_t)a2 >= 8 &&
-            *(const uint16_t *)sa == AF_INET && br_on() && br_for_ip(*(const uint32_t *)(sa + 4)) >= 0) {
+            *(const uint16_t *)sa == AF_INET &&
+            (((*(const uint32_t *)(sa + 4)) & 0xffu) == 127u || // loopback 127/8: locally reflected echo
+             (br_on() && br_for_ip(*(const uint32_t *)(sa + 4)) >= 0))) {
             g_icmp_ip[(int)a0] = *(const uint32_t *)(sa + 4);
             G_RET(c) = 0;
             break;
@@ -854,6 +872,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int bridge_enabled = br_on();
         int connect_interface = bridge_enabled ? br_connect_interface(sa, (socklen_t)a2) : -1;
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            // connect(AF_UNSPEC) dissolves a datagram socket's association: clear the recorded peer so a
+            // later getpeername reports ENOTCONN, matching the kernel's disconnect idiom.
+            if (sa && (socklen_t)a2 >= 2 && *(const uint16_t *)sa == AF_UNSPEC) {
+                g_udp_peer_port[(int)a0] = 0;
+                g_udp_peer_ip[(int)a0] = 0;
+                g_udp_peer_interface[(int)a0] = 0;
+                g_udp_peer_v6[(int)a0] = 0;
+                g_sock_conn[(int)a0] = 0;
+                G_RET(c) = 0;
+                break;
+            }
             char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
             if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port,
                                        udp_path, sizeof udp_path)) {
