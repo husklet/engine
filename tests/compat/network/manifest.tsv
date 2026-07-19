@@ -39,3 +39,25 @@ net_udp	network	net_udp.c	net_udp.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	
 net_unix	network	net_unix.c	net_unix.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/net_unix.out	linux-libc	active	exact source; deterministic checked registration
 sentry_net	network	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/sentry_net.out	linux-libc	active	exact source; deterministic checked registration
 sentry-net-untrusted	sandbox	sentry_net.c	sentry_net.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	HL_UNTRUSTED=1	0	expected/sentry_net.out	linux-libc	active	exact typed untrusted registration
+ipv6-loopback	network	net_ipv6_loopback.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_ipv6_loopback.out	linux-libc	active	IPv6 ::1 TCP echo and loopback getsockname
+ipv6-v6only	network	net_ipv6_v6only.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_ipv6_v6only.out	linux-libc	active	IPV6_V6ONLY get-after-set toggling
+socketpair	network	net_socketpair.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_socketpair.out	linux-libc	active	socketpair full-duplex round-trip and SO_TYPE
+scm-rights	network	net_scm_rights.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_scm_rights.out	linux-libc	active	SCM_RIGHTS fd passing and read through received fd
+epoll-readiness	network	net_epoll.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_epoll.out	linux-libc	active	epoll_wait readiness edge on socketpair
+dup-socket	network	net_dup_socket.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_dup_socket.out	linux-libc	active	dup'd socket shares connection state
+fionread	network	net_fionread.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_fionread.out	linux-libc	active	FIONREAD queued/remaining byte counts on TCP
+nonblock-connect	network	net_nonblock_connect.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_nonblock_connect.out	linux-libc	active	non-blocking connect EINPROGRESS/POLLOUT/SO_ERROR
+shutdown-rd	network	net_shutdown_rd.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_shutdown_rd.out	linux-libc	active	shutdown SHUT_RD recv EOF with write open
+waitall-partial	network	net_waitall_partial.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_waitall_partial.out	linux-libc	active	MSG_WAITALL fills across chunked writes
+getpeername-notconn	network	net_getpeername_notconn.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_getpeername_notconn.out	linux-libc	active	getpeername ENOTCONN and unbound getsockname
+bufsize	network	net_bufsize.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_bufsize.out	linux-libc	active	SO_RCVBUF/SO_SNDBUF at-least get-after-set
+keepalive	network	net_keepalive.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_keepalive.out	linux-libc	active	SO_KEEPALIVE/SO_OOBINLINE get-after-set
+accept-backlog	network	net_accept_backlog.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_accept_backlog.out	linux-libc	active	listen backlog delivers all queued connects
+recvmsg-trunc	network	net_recvmsg_trunc.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_recvmsg_trunc.out	linux-libc	active	recvmsg msg_flags MSG_TRUNC on oversized datagram
+sendmsg-iov	network	net_sendmsg_iov.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_sendmsg_iov.out	linux-libc	active	sendmsg gathers iovecs in order
+udp-pair	network	net_udp_pair.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_udp_pair.out	linux-libc	active	connected UDP loopback bidirectional exchange
+unix-abstract-stream	network	net_unix_abstract_stream.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_abstract_stream.out	linux-libc	active	AF_UNIX abstract-namespace stream echo
+poll-events	network	net_poll_events.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_poll_events.out	linux-libc	active	poll POLLIN/POLLOUT readiness transitions
+msg-peek-stream	network	net_msg_peek_stream.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_msg_peek_stream.out	linux-libc	active	MSG_PEEK non-destructive stream read
+errpaths	network	net_errpaths.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_errpaths.out	linux-libc	active	EDESTADDRREQ/EMSGSIZE/EPIPE send error paths
+shutdown-wr	network	net_shutdown_wr.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_shutdown_wr.out	linux-libc	active	shutdown SHUT_WR peer EOF and reverse open
