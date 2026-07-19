@@ -343,7 +343,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 67:
         case 68:
         case 69:
-        case 70: G_RET(c) = (uint64_t)(int64_t)(-EBADF); return svc_done(c);
+        case 70:
+        case 82: /* fsync */
+        case 83: /* fdatasync */
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            return svc_done(c);
         default: break;
         }
     }

@@ -1210,10 +1210,13 @@ static int bound_handle_dirfd_error(int fd) {
     hl_linux_fd_snapshot snapshot;
     hl_host_file_metadata metadata;
     if (fd < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return -EBADF;
-    /* Stdio channels, pipes, sockets, and device handles are known
-       non-directories from the descriptor table itself.  Do not submit their
-       provider-specific opaque handle to the host-file metadata port. */
-    if (snapshot.kind != HL_HOST_FD_FILE) return -ENOTDIR;
+    /* Pipes and sockets are known non-directories from the descriptor table
+       itself; do not submit their provider-specific opaque handle to the
+       host-file metadata port.  HL_HOST_FD_FILE and HL_HOST_FD_OTHER cover
+       regular files, directories, and device nodes: a directory opened through
+       the absolute-path resolver is classified HL_HOST_FD_OTHER, so its type
+       must be confirmed by the metadata port rather than assumed. */
+    if (snapshot.kind == HL_HOST_FD_PIPE || snapshot.kind == HL_HOST_FD_SOCKET) return -ENOTDIR;
     if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
         return -ENOTDIR;
     hl_host_result result = g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata);
@@ -1868,6 +1871,33 @@ static int64_t bound_fsize_gate(struct cpu *c, const hl_linux_fd_snapshot *sourc
     return count > room ? (int64_t)room : (int64_t)count;
 }
 
+/* renameat2(RENAME_EXCHANGE) across bound directories.  The host exposes only a
+   replacing rename (renameat), so an atomic swap is staged through a private
+   temporary in the destination directory: new->temp, old->new, temp->old.  Both
+   operands must exist, matching the Linux contract; a failed middle step rolls
+   the temporary back so neither name is lost. */
+static int64_t bound_rename_exchange(hl_host_handle old_dir, const char *old_path, size_t old_size,
+                                     hl_host_handle new_dir, const char *new_path, size_t new_size) {
+    static uint64_t counter;
+    const hl_host_file_services *file = g_host_services->file;
+    void *ctx = g_host_services->context;
+    char temp[64];
+    int written = snprintf(temp, sizeof temp, ".hl-xchg-%d-%llu", (int)getpid(),
+                           (unsigned long long)__atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED));
+    if (written <= 0 || (size_t)written >= sizeof temp) return -EIO;
+    size_t temp_size = (size_t)written;
+    hl_host_result step = file->rename_relative(ctx, new_dir, new_path, new_size, new_dir, temp, temp_size);
+    if (step.status != HL_STATUS_OK) return bound_host_error(step.status);
+    step = file->rename_relative(ctx, old_dir, old_path, old_size, new_dir, new_path, new_size);
+    if (step.status != HL_STATUS_OK) {
+        (void)file->rename_relative(ctx, new_dir, temp, temp_size, new_dir, new_path, new_size);
+        return bound_host_error(step.status);
+    }
+    step = file->rename_relative(ctx, new_dir, temp, temp_size, old_dir, old_path, old_size);
+    if (step.status != HL_STATUS_OK) return bound_host_error(step.status);
+    return 0;
+}
+
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                        uint64_t a4) {
     hl_linux_fd_snapshot source;
@@ -2074,16 +2104,40 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                                   .status);
             } else {
                 uint64_t flags = nr == 276 ? G_A4(c) : 0;
-                if (flags != 0)
-                    result = -ENOSYS;
+                /* RENAME_NOREPLACE (0x1) and RENAME_EXCHANGE (0x2) are honored;
+                   they are mutually exclusive and no other flag is supported. */
+                if ((flags & ~UINT64_C(0x3)) != 0 || (flags & UINT64_C(0x3)) == UINT64_C(0x3))
+                    result = -EINVAL;
                 else if (g_host_services->file->rename_relative == NULL)
                     result = -ENOSYS;
-                else if (result == 0)
+                else if (result != 0) {
+                    /* preserve earlier path-copy error */
+                } else if ((flags & UINT64_C(0x2)) != 0) {
+                    result = (int)bound_rename_exchange(source.host_handle, old_path, old_size,
+                                                        destination.host_handle, new_path, new_size);
+                } else if ((flags & UINT64_C(0x1)) != 0) {
+                    hl_host_result probe = g_host_services->file->open_relative(
+                        g_host_services->context, destination.host_handle, new_path, new_size,
+                        HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_NOFOLLOW, 0, 0);
+                    if (probe.status == HL_STATUS_OK) {
+                        (void)g_host_services->file->close(g_host_services->context, probe.value);
+                        result = -EEXIST;
+                    } else if (probe.status != HL_STATUS_NOT_FOUND) {
+                        result = (int)bound_host_error(probe.status);
+                    } else {
+                        result = (int)bound_host_error(
+                            g_host_services->file
+                                ->rename_relative(g_host_services->context, source.host_handle, old_path, old_size,
+                                                  destination.host_handle, new_path, new_size)
+                                .status);
+                    }
+                } else {
                     result =
                         bound_host_error(g_host_services->file
                                              ->rename_relative(g_host_services->context, source.host_handle, old_path,
                                                                old_size, destination.host_handle, new_path, new_size)
                                              .status);
+                }
             }
             if (result == 0) {
                 bound_evict_relative(source.host_handle, old_path);
@@ -2324,7 +2378,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         char path[HL_LINUX_PATH_MAX + 1];
         size_t path_size;
         uint64_t flags = nr == 439 ? a3 : 0;
-        if (a2 > 7 || (flags & ~UINT64_C(0x1200)) != 0) {
+        if (a2 > 7 || (flags & ~UINT64_C(0x1300)) != 0) {
             result = -EINVAL;
             break;
         }
@@ -2335,6 +2389,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if ((a2 & 4u) != 0) access |= HL_HOST_FILE_READ;
         if ((a2 & 2u) != 0) access |= HL_HOST_FILE_WRITE;
         if ((a2 & 1u) != 0) access |= HL_HOST_FILE_PATH_ONLY;
+        /* AT_SYMLINK_NOFOLLOW checks the link itself instead of its target. */
+        if ((flags & UINT64_C(0x100)) != 0) access |= HL_HOST_FILE_NOFOLLOW;
         hl_host_result opened = g_host_services->file->open_relative(g_host_services->context, source.host_handle, path,
                                                                      path_size, access, 0, 0);
         result = bound_host_error(opened.status);
@@ -2652,8 +2708,15 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (prepared) { gbus_prepare_release(); }
         break;
     }
-    case 82: result = hl_linux_fsync(g_linux_box, source.fd); break;
-    case 83: result = hl_linux_fdatasync(g_linux_box, source.fd); break;
+    case 82: /* fsync */
+    case 83: /* fdatasync */
+        /* An O_PATH descriptor names a file but is not open for I/O; Linux
+           rejects the sync family through it with EBADF (fs/sync.c). */
+        result = (source.status_flags & HL_LINUX_O_PATH) != 0
+                     ? -EBADF
+                     : (nr == 82 ? hl_linux_fsync(g_linux_box, source.fd)
+                                 : hl_linux_fdatasync(g_linux_box, source.fd));
+        break;
     case 84:
         if ((G_A3(c) & ~(uint64_t)7u) != 0)
             result = -EINVAL;

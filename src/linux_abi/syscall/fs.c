@@ -4,6 +4,11 @@
 // cpu_range_str it calls) and before service() -- same TU scope.
 #include "../device.h"
 
+/* Resolve intent (HL_OPEN_NO_SYMLINKS) carried from an openat2 fall-through into
+ * the shared openat handler.  Set on the openat2 (437) path and consumed once on
+ * entry to the openat (56) case; a direct openat always observes it cleared. */
+static _Thread_local uint32_t g_openat2_resolve_intent;
+
 static int jail_routed_at(int dirfd, const char *path) {
     (void)dirfd;
     if (g_rootfs) return 1;
@@ -1377,6 +1382,76 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
+        // O_TMPFILE materialization: linkat(AT_SYMLINK_FOLLOW) of /proc/self/fd/N gives a name to the
+        // anonymous inode named by descriptor N. Recover the descriptor, flush any RAM write-back cache to
+        // its backing host file, then re-link it through the host's own /proc/self/fd magic symlink (guest
+        // fd numbers match the engine's native numbers). This must precede the /proc-source EXDEV rejection.
+        if (a4 & 0x400 /*AT_SYMLINK_FOLLOW*/) {
+            char sgp[4200];
+            abs_guest((int)a0, (const char *)a1, sgp, sizeof sgp);
+            int pfn = procfd_num(sgp);
+            if (pfn >= 0) {
+                if (jail_ro_at((int)a2, (const char *)a3)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+                    break;
+                }
+                memf_materialize(pfn);
+                char nfin[512], nb[4200];
+                int npfd;
+                const char *nname;
+                if (jail_routed_at((int)a2, (const char *)a3)) {
+                    npfd = jail_at((int)a2, (const char *)a3, nfin, sizeof nfin, 1);
+                    if (npfd < 0) {
+                        G_RET(c) = (uint64_t)(int64_t)npfd;
+                        break;
+                    }
+                    nname = nfin;
+                } else {
+                    nname = atpath((int)a2, (const char *)a3, nb, sizeof nb, 0);
+                    npfd = ATFD(a2);
+                }
+                /* Give the unnamed inode a link.  A true O_TMPFILE inode re-links
+                 * straight through AT_EMPTY_PATH; the create-then-unlink emulation
+                 * of O_TMPFILE cannot, so fall back to publishing a fresh file with
+                 * the descriptor's (now materialized) contents. */
+                int r = linkat(pfn, "", npfd, nname, AT_EMPTY_PATH);
+                int e = errno;
+                if (r < 0) {
+                    int out = openat(npfd, nname, O_WRONLY | O_CREAT | O_EXCL, 0600);
+                    if (out < 0) {
+                        e = errno;
+                    } else {
+                        char copy[65536];
+                        off_t off = 0;
+                        ssize_t got;
+                        r = 0;
+                        while ((got = pread(pfn, copy, sizeof copy, off)) > 0) {
+                            ssize_t put = 0;
+                            while (put < got) {
+                                ssize_t w = pwrite(out, copy + put, (size_t)(got - put), off + put);
+                                if (w <= 0) {
+                                    r = -1;
+                                    e = errno;
+                                    break;
+                                }
+                                put += w;
+                            }
+                            if (r < 0) break;
+                            off += got;
+                        }
+                        if (got < 0) {
+                            r = -1;
+                            e = errno;
+                        }
+                        close(out);
+                        if (r < 0) (void)unlinkat(npfd, nname, 0);
+                    }
+                }
+                if (nname == nfin) close(npfd);
+                G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
+                break;
+            }
+        }
         // A hardlink whose SOURCE lives on a hl-synthetic pseudo-filesystem (/proc, /sys, /dev) crosses a
         // device boundary -> EXDEV, exactly as on Linux where those are separate mounts. (LTP linkat01 case 20.)
         {
@@ -2270,12 +2345,32 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (resolve & 0x04ULL /*RESOLVE_NO_SYMLINKS*/) oflags |= (uint64_t)G_O_NOFOLLOW;
+        /* RESOLVE_BENEATH refuses to cross out of the starting directory: an
+         * absolute path argument names an escape and is rejected up front. Both
+         * BENEATH and IN_ROOT must also refuse symlink escapes; the resolver has
+         * no per-link escape check, so the whole walk is confined to no-symlink
+         * resolution (fail-closed) when either containment flag is set. */
+        if ((resolve & 0x08ULL /*RESOLVE_BENEATH*/) && !guest_bad_ptr(a1, 1) && *(const char *)a1 == '/') {
+            G_RET(c) = (uint64_t)(int64_t)(-EXDEV);
+            break;
+        }
+        /* NO_SYMLINKS forbids every symlink; BENEATH/IN_ROOT forbid an escaping
+         * one and are enforced fail-closed as no-symlink resolution.  The shared
+         * openat handler enforces this through the jail resolver (rootfs setups)
+         * and through O_NOFOLLOW plus a no-follow walk on the native bind-volume
+         * path. */
+        g_openat2_resolve_intent =
+            (resolve & (0x04ULL /*NO_SYMLINKS*/ | 0x08ULL /*BENEATH*/ | 0x10ULL /*IN_ROOT*/)) ? HL_OPEN_NO_SYMLINKS : 0;
+        if (resolve & (0x04ULL | 0x08ULL | 0x10ULL)) oflags |= (uint64_t)G_O_NOFOLLOW;
         a2 = oflags; // open_how.flags -> openat flags
         a3 = omode;  // open_how.mode  -> openat mode
     } /* fall through to openat */
     case 56: {
         // openat -- Linux O_* -> macOS O_* (they differ!)
+        /* Consume any resolve intent carried over from an openat2 fall-through;
+         * a direct openat leaves it cleared. */
+        uint32_t openat2_intent = g_openat2_resolve_intent;
+        g_openat2_resolve_intent = 0;
         int lf = (int)a2, mf = lf & 0x3;
         // O_PATH (Linux 0x200000, arch-independent): the fd only NAMES the file -- fstat / *at dirfd /
         // fchdir work through it, but read/write are rejected EBADF. macOS has no O_PATH, so we open a
@@ -2766,6 +2861,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (is_opath) intent |= HL_OPEN_PATH_ONLY;
             if (lf & G_O_NOFOLLOW) intent |= HL_OPEN_NOFOLLOW;
             if (lf & G_O_DIRECTORY) intent |= HL_OPEN_DIRECTORY;
+            intent |= openat2_intent;
             if (is_opath)
                 intent &=
                     ~(uint32_t)(HL_OPEN_READ | HL_OPEN_WRITE | HL_OPEN_CREATE | HL_OPEN_TRUNCATE | HL_OPEN_APPEND);
@@ -2855,12 +2951,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         char pb[4200];
         // no jail
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, osymlink ? 1 : 0);
+        /* openat2 containment (RESOLVE_NO_SYMLINKS/BENEATH/IN_ROOT, carried as
+         * HL_OPEN_NO_SYMLINKS) forbids resolving a symlink: keep the final
+         * component unresolved and open it with O_NOFOLLOW so a symlink errors
+         * with ELOOP instead of being silently followed. */
+        int o2_nofollow = (openat2_intent & HL_OPEN_NO_SYMLINKS) != 0 && !osymlink;
+        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, (osymlink || o2_nofollow) ? 1 : 0);
         int nf_new = nf_want && faccessat(ATFD(a0), p, F_OK, AT_SYMLINK_NOFOLLOW) != 0; // stamp only fresh
         // Gate the new fd against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the shared host fd
         // table is far larger; engine-private fds are hoisted above 1<<20, so the guest limit is emulated).
         // O_PATH|O_NOFOLLOW on a symlink -> O_SYMLINK opens the link itself.
-        int r = nofile_gate(openat(ATFD(a0), p, mf | osymlink, (mode_t)a3));
+        int r = nofile_gate(openat(ATFD(a0), p, mf | osymlink | (o2_nofollow ? O_NOFOLLOW : 0), (mode_t)a3));
         if (r >= 0 && nf_new) newfile_stamp_fd(r);
         if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
         if (r >= 0) {

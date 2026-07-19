@@ -400,6 +400,7 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
         hl_host_handle route_root = g_root_handle;
         hl_host_file_resolution resolved;
         uint32_t policy = (intent & HL_OPEN_NOFOLLOW) ? HL_HOST_RESOLVE_NOFOLLOW_FINAL : 0;
+        if (intent & HL_OPEN_NO_SYMLINKS) policy |= HL_HOST_RESOLVE_NO_SYMLINKS;
         if (intent & HL_OPEN_CREATE) policy |= HL_HOST_RESOLVE_ALLOW_MISSING;
         if (g_chroot[0])
             chroot_apply(absolute, rooted, sizeof rooted);
