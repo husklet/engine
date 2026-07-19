@@ -15,6 +15,7 @@ pub mod control;
 mod domain;
 mod engine;
 mod error;
+pub mod extension;
 mod ffi;
 mod machine;
 pub mod network;
@@ -28,7 +29,7 @@ mod terminal;
 pub mod transport;
 mod wire;
 
-pub use hl_engine_api::{checkpoint, extension, observability};
+pub use hl_engine_api::{checkpoint, observability};
 
 pub use child::{Child, Output};
 pub use command::Command;

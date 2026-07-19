@@ -2,6 +2,7 @@ use hl_engine::{extension, spec};
 
 fn accepts_api_provider(_: hl_engine_api::extension::ProviderId) {}
 fn accepts_api_version(_: hl_engine_api::Version) {}
+fn accepts_provider_process(_: hl_engine_provider::ProcessId) {}
 
 #[test]
 fn legacy_module_paths_reexport_api_contracts() {
@@ -10,4 +11,5 @@ fn legacy_module_paths_reexport_api_contracts() {
 
     accepts_api_provider(provider);
     accepts_api_version(version);
+    accepts_provider_process(extension::ProcessId(1));
 }
