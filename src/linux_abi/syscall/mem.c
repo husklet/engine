@@ -238,12 +238,16 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         //     [a0, a0+len); the partial edge pages stay mapped. The guest's logical unmap still succeeds
         //     (return 0) -- matching Linux, which never faults an unmap of a partial/already-unmapped range.
         size_t hp = (size_t)getpagesize();
-        int complete = (a0 & (hp - 1)) == 0 && (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000);
+        uint64_t physical_address = 0, physical_length = 0;
+        int has_physical = hl_gmap_find_physical(a0, &physical_address, &physical_length);
+        int complete = (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000) &&
+                       (((a0 & (hp - 1)) == 0) || (has_physical && physical_address != a0));
         int r;
         uint64_t u_lo, u_hi; // the range host munmap actually cleared (empty when u_lo==u_hi)
         if (complete) {
             len = (size_t)full; // include the guard tail; whole extent is ours -> round-up is safe
-            r = munmap((void *)a0, len);
+            r = munmap((void *)(uintptr_t)(has_physical ? physical_address : a0),
+                       (size_t)(has_physical ? physical_length : len));
             u_lo = a0, u_hi = a0 + len;
         } else {
             uint64_t lo = (a0 + hp - 1) & ~(uint64_t)(hp - 1); // first host page fully in range
@@ -569,6 +573,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t hp = (size_t)getpagesize();
         void *r;
         int off_emul = 0;
+        void *physical_mapping = NULL;
+        size_t physical_mapping_size = 0;
         uint64_t bus_accessible = a1;
         int bus_prepared = 0;
         int mapping_prepared = 0;
@@ -637,29 +643,26 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 fixed286 = 1;
             }
         }
+        if (fixed286 && r != MAP_FAILED && !(a3 & 0x20) && (a3 & 0x01)) off_emul = 2;
         if (!fixed286)
             r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
         // Host-page-unaligned file offset. macOS uses 16 KB pages and its mmap requires the FILE OFFSET to
         // be a multiple of the host page size, but a Linux guest (4 KB pages) may legitimately map a file at
         // any 4 KB-granular offset. A non-MAP_FIXED file map whose offset is 4 KB- but not 16 KB-aligned is
-        // therefore rejected with EINVAL (gcc maps its spec files at off=0x1000 and dies with an "internal
-        // compiler error"). ld.so never trips this -- it maps its extra segments MAP_FIXED, which the
-        // reconciliation block below already emulates -- which is why it stayed hidden. Emulate it the same
-        // way: a kernel-chosen (a0 honored as a placement hint) private-anon region preloaded from the file
-        // at the requested offset. RW so a later PROT upgrade is already in effect (mprotect is a no-op); a
-        // short pread past EOF leaves the tail as anon zero, exactly as Linux presents it. Gated on the
-        // direct mmap having FAILED for such an offset, so every aligned/fixed map keeps the native path and
-        // is byte-identical. (A writable MAP_SHARED map at such an offset loses write-back -- the same
-        // limitation the MAP_FIXED emulation has -- but read-only/private maps, the common case, are exact.)
+        // therefore rejected with EINVAL. Map from the preceding host-page-aligned file offset and return
+        // the Linux-page-aligned subrange. The physical head remains tracked for complete munmap/exec cleanup.
+        // Keeping the real vnode mapping is essential for MAP_SHARED aliases: runtimes such as CoreCLR map
+        // one memfd RW and RX, then initialize executable stubs through the writable alias.
         if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && ((off_t)a5 & (off_t)(hp - 1))) {
-            void *ar = mmap((void *)a0, (size_t)a1, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-            if (ar != MAP_FAILED) {
-                if (pread_retry((int)a4, ar, (size_t)a1, (off_t)a5) < 0) {
-                    munmap(ar, (size_t)a1);
-                } else {
-                    r = ar;
-                    off_emul = 1;
-                }
+            size_t head = (size_t)((off_t)a5 & (off_t)(hp - 1));
+            off_t aligned_offset = (off_t)a5 - (off_t)head;
+            size_t mapped_size = (size_t)a1 + head;
+            void *base = mmap(NULL, mapped_size, prot, mmap_flags((int)a3), (int)a4, aligned_offset);
+            if (base != MAP_FAILED) {
+                physical_mapping = base;
+                physical_mapping_size = mapped_size;
+                r = (char *)base + head;
+                off_emul = 0;
             }
         }
         // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
@@ -718,8 +721,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     munmap(ar, (size_t)a1 + head);
                     ar = MAP_FAILED;
                 }
-                if (ar != MAP_FAILED)
+                if (ar != MAP_FAILED) {
                     r = (void *)a0; // success: the mapping now lives at the requested fixed guest address
+                    off_emul = 2;
+                }
             }
             free(hsave);
         }
@@ -761,10 +766,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (r != MAP_FAILED) {
             if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
-            hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+            if (physical_mapping != NULL)
+                hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,
+                                     (uint64_t)physical_mapping_size);
+            else
+                hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
-                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0);
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0,
+                                 off_emul == 2);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range
@@ -880,6 +890,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 gro_add(glo, ghi);
             else
                 gro_clear(glo, ghi);
+            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
+                filemap_refresh_emulated(physical_a0, physical_a0 + a1);
             // Making translated code writable is itself the guest's declaration that the bytes may change.
             // Drop translations while the SMC page is still tracked, before the host protection below makes
             // the store silent. This also covers 4K guest subpages where a 16K host mprotect is unsafe: the

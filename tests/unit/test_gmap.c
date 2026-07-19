@@ -137,6 +137,22 @@ int main(void) {
     }
     {
         long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(4096);
+        void *physical = mmap(NULL, (size_t)(page * 2), PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uint64_t physical_address = (uint64_t)(uintptr_t)physical;
+        uint64_t logical_address = physical_address + page / 2;
+        uint64_t found_address = 0, found_length = 0;
+        HL_CHECK(physical != MAP_FAILED);
+        hl_gmap_add_physical(logical_address, page, physical_address, page * 2);
+        HL_CHECK(hl_gmap_find_physical(logical_address, &found_address, &found_length));
+        HL_CHECK(found_address == physical_address && found_length == page * 2);
+        hl_gmap_reset();
+        errno = 0;
+        HL_CHECK(mprotect(physical, (size_t)(page * 2), PROT_READ) == -1 && errno == ENOMEM);
+    }
+    {
+        long page_value = sysconf(_SC_PAGESIZE);
         size_t page = page_value > 0 ? (size_t)page_value : 4096u;
         mapping_probe probe = {0};
         hl_host_memory_services memory = {0};

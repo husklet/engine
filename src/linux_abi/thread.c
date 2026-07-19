@@ -412,6 +412,7 @@ struct guest_file_mapping {
     uint64_t follow_lo, follow_hi;
     int fd;
     uint32_t shared;
+    uint32_t emulated;
 };
 static struct guest_file_mapping g_filemap[GNA_MAX];
 static int g_nfilemap;
@@ -492,7 +493,7 @@ static uint64_t filemap_accessible(const struct guest_file_mapping *mapping, uin
     return rounded < length ? rounded : length;
 }
 
-static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t offset, int shared) {
+static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t offset, int shared, int emulated) {
     struct stat st;
     if (size == 0 || address > UINT64_MAX - size || fstat(fd, &st) != 0) return;
     pthread_mutex_lock(&g_filemap_lock);
@@ -500,7 +501,33 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
     if (g_nfilemap < GNA_MAX)
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
                                                               (uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                                                              0, 0, fd, (uint32_t)shared};
+                                                              0, 0, fd, (uint32_t)shared, (uint32_t)emulated};
+    pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static ssize_t filemap_pread(int fd, void *buffer, size_t length, off_t offset) {
+    ssize_t result;
+    do
+        result = pread(fd, buffer, length, offset);
+    while (result < 0 && errno == EINTR);
+    return result;
+}
+
+static int filemap_source_fd(struct guest_file_mapping *mapping);
+
+static void filemap_refresh_emulated(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int index = 0; index < g_nfilemap; ++index) {
+        struct guest_file_mapping *mapping = &g_filemap[index];
+        if (!mapping->shared || !mapping->emulated || hi <= mapping->lo || lo >= mapping->hi) continue;
+        uint64_t first = lo > mapping->lo ? lo : mapping->lo;
+        uint64_t last = hi < mapping->hi ? hi : mapping->hi;
+        int fd = filemap_source_fd(mapping);
+        if (fd >= 0)
+            (void)filemap_pread(fd, (void *)(uintptr_t)first, (size_t)(last - first),
+                                (off_t)(mapping->offset + first - mapping->lo));
+    }
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
