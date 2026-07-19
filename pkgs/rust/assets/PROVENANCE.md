@@ -7,7 +7,7 @@ archive remains the target-specific archive shipped with this crate revision.
 
 | Host target | Source commit | Build target | SHA-256 |
 |---|---|---|---|
-| `aarch64-apple-darwin` | `e2ab6e724` | `build-package/package/macos-aarch64/libhl-engine.a` | `af33e86b1460317c306dc12eaf5f3996e28520dcba3c6da6c2e42ea34b39c7fc` |
+| `aarch64-apple-darwin` | `49154fa20` | `build-package/package/macos-aarch64/libhl-engine.a` | `22bb44a1069f922b6a70ac7f1137e98c85bcedd2680d7f67914603808abc0388` |
 | `aarch64-unknown-linux-gnu` | not recorded | `build-cap-linux/package/linux-aarch64/libhl-engine.a` | `900e3ff97dbea86e61d64e79a82290e905c289fd6ed55e3fb4551e7359cf32ff` |
 
 Cargo links the selected archive with whole-archive semantics so the private
