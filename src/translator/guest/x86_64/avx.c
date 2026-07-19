@@ -217,6 +217,29 @@ static double avx_fp_arith_f64(int op, double x, double y) {
     }
 }
 
+// VCMP{PS,PD,SS,SD} predicate (imm[4:0]). Float operands are promoted to double exactly, so a single
+// comparator serves both widths; the 16..31 signaling variants yield the same boolean as 0..15.
+static int avx_cmp_pred(double x, double y, int pred) {
+    switch (pred & 0xf) {
+    case 0: return x == y;                          // EQ_OQ
+    case 1: return x < y;                           // LT_OS
+    case 2: return x <= y;                          // LE_OS
+    case 3: return !(x == x) || !(y == y);          // UNORD_Q
+    case 4: return !(x == y);                       // NEQ_UQ
+    case 5: return !(x < y);                        // NLT_US
+    case 6: return !(x <= y);                       // NLE_US
+    case 7: return (x == x) && (y == y);            // ORD_Q
+    case 8: return (x == y) || !(x == x) || !(y == y); // EQ_UQ
+    case 9: return !(x >= y);                       // NGE_US
+    case 10: return !(x > y);                       // NGT_US
+    case 11: return 0;                              // FALSE_OQ
+    case 12: return (x < y) || (x > y);             // NEQ_OQ
+    case 13: return x >= y;                         // GE_OS
+    case 14: return x > y;                          // GT_OS
+    default: return 1;                              // TRUE_UQ
+    }
+}
+
 // F16C uses the host's native fp16 so the half<->single conversion matches x86. `imm` is the vcvtps2ph
 // rounding-control immediate: imm[2]=1 -> use MXCSR (host FPCR already tracks the guest rounding mode),
 // else imm[1:0] selects 0=nearest-even, 1=down(-inf), 2=up(+inf), 3=truncate(toward-zero). x86 imm[1:0]
@@ -774,6 +797,67 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
+        case 0xC2: { // vcmpps/pd/ss/sd: per-lane predicate compare -> all-ones/zero mask
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            int pred = (int)(I.imm & 0x1f);
+            int dbl = (pp == 1 || pp == 3), scalar = (pp == 2 || pp == 3), es = dbl ? 8 : 4;
+            memcpy(d, a, 64); // scalar keeps src1's upper lanes; packed overwrites fully
+            int n = scalar ? es : W;
+            for (int i = 0; i < n; i += es) {
+                double x, y;
+                if (dbl) {
+                    memcpy(&x, a + i, 8);
+                    memcpy(&y, b + i, 8);
+                } else {
+                    float xf, yf;
+                    memcpy(&xf, a + i, 4);
+                    memcpy(&yf, b + i, 4);
+                    x = xf;
+                    y = yf;
+                }
+                int t = avx_cmp_pred(x, y, pred);
+                uint64_t m = t ? ~0ull : 0ull;
+                memcpy(d + i, &m, es);
+            }
+            avx_put(c, rd, d, scalar ? 16 : W);
+            goto done;
+        }
+        case 0x5B: { // vcvtdq2ps(NP) / vcvtps2dq(66) / vcvttps2dq(F3): packed 32-bit int<->float
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 4) {
+                if (pp == 0) { // cvtdq2ps: int32 -> float32
+                    int32_t v;
+                    memcpy(&v, b + i, 4);
+                    float f = (float)v;
+                    memcpy(d + i, &f, 4);
+                } else { // cvtps2dq(66, round)/cvttps2dq(F3, truncate) -> int32; x86 indefinite on overflow/NaN
+                    float f;
+                    memcpy(&f, b + i, 4);
+                    int32_t r;
+                    if (!(f == f) || f >= 2147483648.0f || f < -2147483648.0f)
+                        r = (int32_t)0x80000000; // integer indefinite
+                    else
+                        r = (int32_t)(pp == 3 ? __builtin_truncf(f) : __builtin_rintf(f));
+                    memcpy(d + i, &r, 4);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0xF4: { // vpmuludq: dst.u64[i] = (u32)src1.even32[i] * (u32)rm.even32[i]
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int i = 0; i < W; i += 8) {
+                uint32_t x, y;
+                memcpy(&x, a + i, 4); // low dword of each qword lane
+                memcpy(&y, b + i, 4);
+                uint64_t z = (uint64_t)x * (uint64_t)y;
+                memcpy(d + i, &z, 8);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
         case 0x63: // vpacksswb: signed word -> signed byte, saturate
         case 0x67: // vpackuswb: signed word -> unsigned byte, saturate
         case 0x6B: // vpackssdw: signed dword -> signed word, saturate  (per-128-lane; a low, b high)
@@ -901,6 +985,49 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(d + i, b + 4 * (idx & 7), 4);
             }
             avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x90: // vpgatherd{d,q}: 32-bit (dword) indices
+        case 0x92: // vgatherd{ps,pd}: 32-bit indices (same addressing; element bits are float)
+        case 0x91: // vpgatherq{d,q}: 64-bit (qword) indices
+        case 0x93: { // vgatherq{ps,pd}: 64-bit indices
+            // AVX2 masked gather. VSIB: index is a VECTOR register (I.m_index) scaled by 1<<m_scale off a
+            // GPR base+disp. Mask = VEX.vvvv; per element the top bit selects "load", and the WHOLE mask
+            // register is zeroed afterwards (Intel SDM). elem = dst element size (W0=dword, W1=qword).
+            int elem = I.vex_w ? 8 : 4;
+            int isz = (op == 0x90 || op == 0x92) ? 4 : 8; // index element size
+            int nlanes = (isz == 4) ? (W / elem) : (W / 8);
+            int result_bytes = nlanes * elem;
+            uint8_t idxv[64], mask[64];
+            avx_get(c, I.m_index, idxv); // VSIB vector index register
+            avx_get(c, vv, mask);        // mask register (VEX.vvvv)
+            avx_get(c, rd, d);           // masked-off lanes keep the old destination value
+            uint64_t base = 0;
+            if (I.m_hasbase) base += c->r[I.m_base];
+            base += (uint64_t)I.disp;
+            if (I.seg == 1)
+                base += c->fs_base;
+            else if (I.seg == 2)
+                base += c->gs_base;
+            int64_t scale = (int64_t)1 << I.m_scale;
+            for (int i = 0; i < nlanes; i++) {
+                if (mask[(i + 1) * elem - 1] & 0x80) {
+                    int64_t index;
+                    if (isz == 4) {
+                        int32_t t;
+                        memcpy(&t, idxv + i * 4, 4);
+                        index = t;
+                    } else {
+                        memcpy(&index, idxv + i * 8, 8);
+                    }
+                    uint64_t addr = hl_x86_avx_address(state, base + (uint64_t)(index * scale));
+                    memcpy(d + i * elem, (void *)addr, elem);
+                }
+            }
+            avx_put(c, rd, d, result_bytes); // dst above the result width is zeroed
+            uint8_t zero[64];
+            memset(zero, 0, 64);
+            avx_put(c, vv, zero, W); // the entire mask register is cleared after the gather
             goto done;
         }
         case 0x2B: { // vpackusdw: signed dword -> unsigned word, saturate (per-128-lane; a low, b high)
