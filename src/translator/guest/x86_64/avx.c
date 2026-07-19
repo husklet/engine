@@ -1461,6 +1461,16 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
                 r[i] = (s[i] & 0x80) ? 0 : t[s[i] & 0x0f];
             break;
         }
+        case 0x04: { // pmaddubsw: word k = sat16( uD[2k]*sB[2k] + uD[2k+1]*sB[2k+1] ) -- D unsigned, s signed
+            int16_t o[8];
+            for (int k = 0; k < 8; k++) {
+                int p = (int)(uint8_t)D[2 * k] * (int)(int8_t)s[2 * k] +
+                        (int)(uint8_t)D[2 * k + 1] * (int)(int8_t)s[2 * k + 1];
+                o[k] = (int16_t)sat_s16(p);
+            }
+            memcpy(r, o, 16);
+            break;
+        }
         case 0x01:
         case 0x02:
         case 0x03:

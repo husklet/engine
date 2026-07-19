@@ -2633,6 +2633,50 @@ static void *translate_block(uint64_t gpc) {
                         else
                             emit32(0x6E080400u | (vm << 5) | vd);
                     } // ins .d[0]
+                } else if (op == 0x7C || op == 0x7D) { // SSE3 haddps/hsubps (F2) or haddpd/hsubpd (66)
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    uint32_t szb = I.p66 ? 0x00400000u : 0; // 66 -> double lanes (.2d), F2 -> single (.4s)
+                    if (op == 0x7C) {                       // HADD: FADDP vd, vd, s = [d0+d1, d2+d3, s0+s1, s2+s3]
+                        e_v3(0x6E20D400u | szb, vd, vd, s);
+                    } else { // HSUB: even/odd deinterleave (UZP1/UZP2) then FSUB even-odd
+                        e_v3(0x4E801800u | szb, 17, vd, s); // uzp1 v17 = even lanes
+                        e_v3(0x4E805800u | szb, 18, vd, s); // uzp2 v18 = odd lanes
+                        e_v3(0x4EA0D400u | szb, vd, 17, 18); // fsub vd = even - odd
+                    }
+                } else if (op == 0xD0) { // SSE3 addsubps (F2) / addsubpd (66): even lanes sub, odd lanes add
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    if (I.p66) { // addsubpd: negate only the low double lane, then add
+                        e_movconst(19, 0x8000000000000000ULL);
+                        emit32(0x9E670000u | (19 << 5) | 17); // fmov d17, x19 -> v17 = [sign, 0]
+                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate low double)
+                        e_v3(0x4E60D400u, vd, vd, 17);        // fadd vd.2d = vd + v17
+                    } else {                                  // addsubps: negate even single lanes (0,2), then add
+                        e_movconst(19, 0x0000000080000000ULL);
+                        emit32(0x4E080C00u | (19 << 5) | 17); // dup v17.2d, x19 -> [0x80000000,0,0x80000000,0]
+                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate even lanes)
+                        e_v3(0x4E20D400u, vd, vd, 17);        // fadd vd.4s = vd + v17
+                    }
+                } else if ((op == 0x12 || op == 0x16) && I.rep) { // SSE3 movsldup/movshdup: dup even/odd single lanes
+                    int s = vm;
+                    if (I.is_mem) {
+                        emit_ea(&I, next);
+                        g_ldr_q(16, 17, 0);
+                        s = 16;
+                    }
+                    if (op == 0x12)
+                        e_v3(0x4E802800u, vd, s, s); // movsldup: TRN1 vd.4s, s, s = [s0,s0,s2,s2]
+                    else
+                        e_v3(0x4E806800u, vd, s, s); // movshdup: TRN2 vd.4s, s, s = [s1,s1,s3,s3]
                 } else if (op == 0x12 && I.repne) { // movddup: dst[0]=dst[1]=src low 64-bit double
                     int s = vm;
                     if (I.is_mem) {
