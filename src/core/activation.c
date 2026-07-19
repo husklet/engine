@@ -737,6 +737,14 @@ hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_is
     return activation_start(executable, guest_isa, guest, NULL, &size, out_master, -1, out_process);
 }
 
+hl_status hl_activation_start_terminal_with_transport(
+    const char *executable, uint32_t guest_isa, const char *guest, hl_terminal_size size,
+    int32_t transport, int32_t *out_master, hl_activation_process **out_process) {
+    if (transport < 0) return HL_STATUS_INVALID_ARGUMENT;
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, transport,
+                            out_process);
+}
+
 hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {
     struct winsize native = {.ws_row = size.rows, .ws_col = size.columns};
     if (master < 0 || size.rows == 0 || size.columns == 0) return HL_STATUS_INVALID_ARGUMENT;

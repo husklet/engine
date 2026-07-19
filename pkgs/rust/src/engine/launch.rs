@@ -58,9 +58,20 @@ where
     let config_path = CString::new(config.path().as_os_str().as_bytes())
         .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
     let (process, stdin, stdout, stderr, terminal) = if let Some(size) = terminal {
-        let (process, file) =
+        let result = if let Some((services, authority)) = services {
+            start_services_terminal(
+                executable,
+                guest_number(guest),
+                &config_path,
+                size,
+                services,
+                &authority,
+            )
+        } else {
             ffi::start_terminal(executable, guest_number(guest), &config_path, size.native())
-                .map_err(native_error)?;
+                .map_err(native_error)
+        };
+        let (process, file) = result?;
         (process, None, None, None, Some(crate::Terminal::new(file)))
     } else {
         let (input, stdin, input_child) = prepare(streams.0, true)?;
@@ -109,6 +120,27 @@ fn start_services(
     launch: ServiceLaunch,
     authority: &crate::extension::Authorities,
 ) -> Result<ffi::Handle, Error> {
+    let (child, _server) = prepare_services(launch, authority)?;
+    ffi::start_with_transport(executable, guest, config, streams, &child).map_err(native_error)
+}
+
+fn start_services_terminal(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    size: Size,
+    launch: ServiceLaunch,
+    authority: &HandlesAuthority,
+) -> Result<(ffi::Handle, File), Error> {
+    let (child, _server) = prepare_services(launch, authority)?;
+    ffi::start_terminal_with_transport(executable, guest, config, size.native(), &child)
+        .map_err(native_error)
+}
+
+fn prepare_services(
+    launch: ServiceLaunch,
+    authority: &HandlesAuthority,
+) -> Result<(std::os::unix::net::UnixStream, std::thread::JoinHandle<()>), Error> {
     let handles = authority
         .provider(&launch.provider)
         .and_then(|provider| provider.handles.as_ref())
@@ -150,7 +182,7 @@ fn start_services(
         64,
         Duration::from_secs(30),
     );
-    std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let startup = Instant::now() + Duration::from_secs(5);
         if channel.accept_handshake(1, startup) == Ok(1)
             && channel.install_namespace(payload, startup).is_ok()
@@ -158,7 +190,7 @@ fn start_services(
             let _ = server.run(Instant::now() + Duration::from_secs(24 * 60 * 60));
         }
     });
-    ffi::start_with_transport(executable, guest, config, streams, &child).map_err(native_error)
+    Ok((child, server))
 }
 
 fn prepare(value: Stdio, input: bool) -> Result<(i32, Option<File>, Option<File>), Error> {

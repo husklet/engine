@@ -575,17 +575,6 @@ pub(super) fn validate_authorities(
     spec: &MachineSpec,
     authorities: &crate::extension::Authorities,
 ) -> Result<(), SpecError> {
-    if spec.process.terminal.is_some()
-        && spec.extensions.iter().any(|extension| {
-            extension.provider == handles_provider() && !extension.services.is_empty()
-        })
-    {
-        return Err(spec_error(
-            SpecErrorCategory::Unsupported,
-            "process.terminal",
-            "provider service activation with a controlling terminal is not implemented",
-        ));
-    }
     for extension in &spec.extensions {
         if extension.provider != handles_provider() {
             continue;

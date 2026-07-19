@@ -131,6 +131,12 @@ EMBEDDED_MAC_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(MAC_LINUX_ABI_SOURCES) $
 EMBEDDED_MAC_OBJECTS := $(EMBEDDED_MAC_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
 LINUX_AARCH64_EMBEDDED_SOURCES = $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(LINUX_HOST_SOURCES)
 LINUX_AARCH64_EMBEDDED_OBJECTS = $(LINUX_AARCH64_EMBEDDED_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
+EMBEDDED_PROVIDER_SOURCES := src/core/environment.c src/core/provider_client.c \
+	src/core/provider_demux.c src/core/provider_files.c src/core/provider_handles.c \
+	src/core/provider_namespace.c
+EMBEDDED_MAC_PROVIDER_OBJECTS := $(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
+LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS := \
+	$(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
 MAC_LIBS := $(BUILD)/mac/lib/libhl-engine.a $(BUILD)/mac/lib/libhl-translator.a \
 	$(BUILD)/mac/lib/libhl-linux-abi.a $(BUILD)/mac/lib/libhl-host-macos.a
 PORTABLE_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(FAKE_HOST_SOURCES) $(COMMON_HOST_SOURCES)
@@ -1431,7 +1437,7 @@ $(BUILD)/mac/dual/activation.o: src/core/activation.c include/hl/activation.h
 
 $(BUILD)/mac/lib/libhl-engine-dual.a: $(BUILD)/mac/dual/aarch64-target.o $(BUILD)/mac/dual/x86_64-target.o \
 	$(BUILD)/mac/dual/aarch64-core.o $(BUILD)/mac/dual/x86_64-core.o $(BUILD)/mac/dual/dispatch.o \
-	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS)
+	$(BUILD)/mac/dual/activation.o $(EMBEDDED_MAC_OBJECTS) $(EMBEDDED_MAC_PROVIDER_OBJECTS)
 	@mkdir -p $(@D)
 	$(MAC) libtool -static -o $@ $^
 
@@ -1470,7 +1476,8 @@ $(BUILD)/package/macos-aarch64/libhl-engine.a: $(BUILD)/mac/lib/libhl-engine-dua
 $(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch64-target.o \
 	$(BUILD)/linux-aarch64/dual/x86_64-target.o $(BUILD)/linux-aarch64/dual/aarch64-core.o \
 	$(BUILD)/linux-aarch64/dual/x86_64-core.o $(BUILD)/linux-aarch64/dual/dispatch.o \
-	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS)
+	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS) \
+	$(LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS)
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_AR) rcs $@ $^
 

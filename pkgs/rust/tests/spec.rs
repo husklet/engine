@@ -1769,3 +1769,41 @@ int main(int argc, char **argv) {
     }
     assert_eq!(closes.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+#[test]
+fn controlling_terminal_and_projected_service_run_together() {
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.process.argv.extend([
+        "-c".into(),
+        "exec 3</run/provider/basic; IFS= read -r -n 5 value <&3; test \"$value\" = hello".into(),
+    ]);
+    spec.process.terminal = Some(hl_engine::Size::new(24, 80).unwrap());
+    spec.extensions.push(handles_extension());
+    let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut authority = HandlesAuthority::new();
+    authority
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            Arc::new(BasicHandles {
+                closes: closes.clone(),
+            }),
+        )
+        .unwrap();
+
+    let mut machine = Engine::new()
+        .spawn_with_authority(spec, ProcessIo::default(), authority)
+        .unwrap();
+    let mut terminal = machine.take_terminal().expect("controlling terminal");
+    let exit = machine.wait().unwrap();
+    let mut output = String::new();
+    terminal.read_to_string(&mut output).unwrap();
+    assert_eq!(exit, Exit::Code(0), "terminal output: {output:?}");
+    for _ in 0..100 {
+        if closes.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(closes.load(std::sync::atomic::Ordering::Relaxed), 1);
+}

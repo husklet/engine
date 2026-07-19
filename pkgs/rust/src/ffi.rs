@@ -77,6 +77,15 @@ unsafe extern "C" {
         master: *mut i32,
         process: *mut *mut Process,
     ) -> i32;
+    pub(crate) fn hl_activation_start_terminal_with_transport(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        size: TerminalSize,
+        transport: c_int,
+        master: *mut i32,
+        process: *mut *mut Process,
+    ) -> i32;
     pub(crate) fn hl_terminal_resize(master: i32, size: TerminalSize) -> i32;
     pub(crate) fn hl_activation_wait(process: *mut Process, exit: *mut EngineExit) -> i32;
     pub(crate) fn hl_activation_try_wait(
@@ -112,6 +121,33 @@ pub(crate) fn start_terminal(
             guest,
             config.as_ptr(),
             size,
+            &mut master,
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() && master >= 0 {
+        Ok((Handle(process), unsafe { File::from_raw_fd(master) }))
+    } else {
+        Err(status)
+    }
+}
+
+pub(crate) fn start_terminal_with_transport(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    size: TerminalSize,
+    transport: &std::os::unix::net::UnixStream,
+) -> Result<(Handle, File), i32> {
+    let mut process = std::ptr::null_mut();
+    let mut master = -1;
+    let status = unsafe {
+        hl_activation_start_terminal_with_transport(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            size,
+            transport.as_raw_fd(),
             &mut master,
             &mut process,
         )

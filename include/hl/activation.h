@@ -42,6 +42,12 @@ HL_API hl_status hl_activation_start_with_transport(const char *executable, uint
 HL_API hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa,
                                               const char *config_path, hl_terminal_size size,
                                               int32_t *out_master, hl_activation_process **out_process);
+/* Starts with both a controlling terminal and a provider transport. The
+ * transport descriptor is borrowed under the same rules as
+ * hl_activation_start_with_transport. */
+HL_API hl_status hl_activation_start_terminal_with_transport(
+    const char *executable, uint32_t guest_isa, const char *config_path, hl_terminal_size size,
+    int32_t transport, int32_t *out_master, hl_activation_process **out_process);
 HL_API hl_status hl_terminal_resize(int32_t master, hl_terminal_size size);
 /* Returns the native child process identifier while the opaque handle exists. */
 HL_API hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id);
