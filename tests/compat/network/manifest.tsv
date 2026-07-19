@@ -61,3 +61,13 @@ poll-events	network	net_poll_events.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	
 msg-peek-stream	network	net_msg_peek_stream.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_msg_peek_stream.out	linux-libc	active	MSG_PEEK non-destructive stream read
 errpaths	network	net_errpaths.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_errpaths.out	linux-libc	active	EDESTADDRREQ/EMSGSIZE/EPIPE send error paths
 shutdown-wr	network	net_shutdown_wr.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_shutdown_wr.out	linux-libc	active	shutdown SHUT_WR peer EOF and reverse open
+so-type	network	net_so_type.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_so_type.out	linux-libc	active	SO_TYPE/DOMAIN/PROTOCOL/ACCEPTCONN getsockopt readback
+so-reuseport	network	net_so_reuseport.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_so_reuseport.out	linux-libc	active	SO_REUSEADDR/SO_REUSEPORT get-after-set + dual bind
+udp-msg-trunc	network	net_udp_msg_trunc.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_udp_msg_trunc.out	linux-libc	active	recv MSG_TRUNC reports true datagram length
+rcvtimeo	network	net_rcvtimeo.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_rcvtimeo.out	linux-libc	active	SO_RCVTIMEO honored recv EAGAIN not hang
+async-refused	network	net_async_refused.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_async_refused.out	linux-libc	active	non-blocking connect refused delivers POLLERR+SO_ERROR
+linger-reset	network	net_linger_reset.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_linger_reset.out	linux-libc	excluded-known-bug	AF_UNIX loopback switch cannot emulate TCP SO_LINGER l_linger=0 abortive RST (peer gets EOF not ECONNRESET); demonstrating test, deferred
+passcred-scm	network	net_passcred.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_passcred.out	linux-libc	active	SO_PASSCRED/SCM_CREDENTIALS/SO_PEERCRED pid-virtualized
+unix-seqpacket	network	net_unix_seqpacket.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_unix_seqpacket.out	linux-libc	active	AF_UNIX SOCK_SEQPACKET message boundaries
+mmsg	network	net_mmsg.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_mmsg.out	linux-libc	excluded-known-bug	sendmmsg/recvmmsg over connected private-loopback UDP switch hangs (batched send/recv not routed through switch peer path); demonstrating test, deferred
+oob	network	net_oob.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/net_oob.out	linux-libc	active	TCP MSG_OOB urgent data + POLLPRI

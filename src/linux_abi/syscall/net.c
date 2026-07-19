@@ -258,6 +258,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
                 g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
                 g_sock_seqpacket[r] = 0;
+                g_so_error[r] = 0;            // no pending async socket error on a fresh fd
+                g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
@@ -598,6 +600,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
             (void)hl_native_set_no_sigpipe(r);
             if (r >= 0 && r < HL_NFD) {
+                g_so_error[r] = 0;  // fresh accepted fd carries no pending async error
+                g_so_reuseport[r] = 0;
                 g_sock_conn[r] = 1; // an accepted socket is already connected
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
             }
@@ -724,8 +728,23 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // a redirected TCP dial to a port with no listener fails ENOENT (the per-port unix
             // inode doesn't exist); Linux returns ECONNREFUSED for a closed TCP port. Map it (host
             // errno, translated to Linux 111); other errnos including EINPROGRESS pass through.
-            G_RET(c) = r < 0 ? (uint64_t)(-(errno == ENOENT ? ECONNREFUSED : errno)) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r < 0) {
+                int le = (errno == ENOENT) ? ECONNREFUSED : errno;
+                // A non-blocking connect must not surface ECONNREFUSED synchronously: a real TCP stack
+                // defers the refusal to the next poll/getsockopt(SO_ERROR). The AF_UNIX switch has no live
+                // INET peer to deliver that, so stash the error and report EINPROGRESS -- poll then wakes on
+                // the failed AF_UNIX socket and getsockopt(SO_ERROR) hands the ECONNREFUSED back once.
+                if (le == ECONNREFUSED && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                    (fcntl((int)a0, F_GETFL) & O_NONBLOCK)) {
+                    g_so_error[(int)a0] = ECONNREFUSED;
+                    G_RET(c) = (uint64_t)(-EINPROGRESS);
+                } else {
+                    G_RET(c) = (uint64_t)(-le);
+                }
+            } else {
+                G_RET(c) = 0;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            }
             break;
         }
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0] && sa && (socklen_t)a2 >= 8 &&
@@ -1051,6 +1070,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // setsockopt(fd, level, optname, val, len)
     case 208: {
         int lvl = (int)a1, opt = (int)a2;
+        // SO_REUSEPORT (Linux SOL_SOCKET/15): remember the guest's intent so getsockopt reports it even when
+        // this INET socket is later backed by an AF_UNIX switch socket (which reads SO_REUSEPORT back as 0).
+        // The real setsockopt still runs below (dual-bind on the switch relies on it); this only tracks readback.
+        if (lvl == 1 && opt == 15 && (int)a0 >= 0 && (int)a0 < HL_NFD)
+            g_so_reuseport[(int)a0] = (a3 && (socklen_t)a4 >= 4 && *(int *)a3) ? 1 : 0;
         // SO_PASSCRED (Linux SOL_SOCKET/16): macOS has no equivalent. Record it per-fd so recvmsg(212)
         // synthesizes the SCM_CREDENTIALS ancillary record the Linux kernel would auto-attach (credential-aware
         // credential-aware IPC bootstrap requires it). Never fail the guest.
@@ -1128,6 +1152,52 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // getsockopt(fd, level, optname, val, len)
     case 209: {
         int lvl = (int)a1, opt = (int)a2;
+        int gfd = (int)a0;
+        // A deferred asynchronous connect error (stashed for a non-blocking dial to a closed private-loopback
+        // port) is delivered exactly once through SO_ERROR, mirroring a real TCP stack.
+        if (lvl == 1 && opt == 4 && gfd >= 0 && gfd < HL_NFD && g_so_error[gfd]) {
+            if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                *(int *)a3 = g_so_error[gfd];
+                *(socklen_t *)a4 = 4;
+            }
+            g_so_error[gfd] = 0;
+            G_RET(c) = 0;
+            break;
+        }
+        // SO_REUSEPORT(15): report the guest's recorded intent (an AF_UNIX switch socket always reads it
+        // back as 0), for any tracked socket that had it set. An un-set fd falls through to the host value.
+        if (lvl == 1 && opt == 15 && gfd >= 0 && gfd < HL_NFD && g_so_reuseport[gfd]) {
+            if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                *(int *)a3 = 1;
+                *(socklen_t *)a4 = 4;
+            }
+            G_RET(c) = 0;
+            break;
+        }
+        // SO_DOMAIN(39)/SO_PROTOCOL(38): a private-loopback/bridge INET socket is backed on the host by an
+        // AF_UNIX switch socket, so a raw getsockopt would report AF_UNIX/0 rather than the guest's real
+        // AF_INET[6]/IPPROTO_TCP[UDP]. Report the family/protocol recorded at socket() for any tracked INET
+        // socket -- identical to the host answer for an un-swapped fd, corrected for a swapped one.
+        if (lvl == 1 && (opt == 38 || opt == 39) && gfd >= 0 && gfd < HL_NFD &&
+            (g_sock_fam[gfd] == AF_INET || g_sock_fam[gfd] == LX_AF_INET6_FAM)) {
+            int val = 0, have = 1;
+            if (opt == 39)
+                val = g_sock_fam[gfd]; // SO_DOMAIN: the guest address family
+            else if (g_sock_stream[gfd])
+                val = IPPROTO_TCP;
+            else if (g_sock_dgram[gfd])
+                val = IPPROTO_UDP;
+            else
+                have = 0; // unknown protocol -> fall through to the host value
+            if (have) {
+                if (a3 && a4 && *(socklen_t *)a4 >= 4) {
+                    *(int *)a3 = val;
+                    *(socklen_t *)a4 = 4;
+                }
+                G_RET(c) = 0;
+                break;
+            }
+        }
         // SO_PEERCRED (Linux SOL_SOCKET/17): macOS has no SO_PEERCRED. Report the peer's credentials as the
         // container identity (so cr.uid/gid match the guest's getuid/getgid) and the peer pid via macOS
         // LOCAL_PEERPID. struct ucred is { pid_t pid; uid_t uid; gid_t gid; } (3x u32 = 12 bytes).
@@ -1167,7 +1237,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     // guest pid of the process holding the OTHER end, stamped across fork/close -- see
                     // g_sock_peer_pid / seq_reassign_peer); else this guest's own pid.
                     int sp = ((int)a0 >= 0 && (int)a0 < HL_NFD) ? g_sock_peer_pid[(int)a0] : 0;
+#if defined(__linux__)
+                    // On Linux the host SO_PEERCRED is authoritative: ppid==getpid() means the peer end is
+                    // held in THIS process (an un-forked socketpair), whose guest pid is our own. A synthetic
+                    // distinct id here would make SO_PEERCRED disagree with the guest's getpid() for a plain
+                    // socketpair; report the guest self pid, keeping the synthetic only as a last resort.
+                    ppid = (ppid == getpid()) ? container_pid() : (sp ? sp : container_pid());
+#else
                     ppid = sp ? sp : container_pid();
+#endif
                 } else if (g_init_hostpid && ppid == g_init_hostpid) {
                     ppid = 1; // peer is the container init -> guest pid 1
                 }

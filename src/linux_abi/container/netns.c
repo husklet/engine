@@ -716,6 +716,16 @@ static uint8_t g_sock_stream[HL_NFD];
 // association after FIN so getpeername() there returns ENOTCONN. This sticky flag lets connect(203) report
 // EISCONN faithfully (LTP connect01). Cleared on close (fd_reset_emul) and at socket()/accept re-init.
 static uint8_t g_sock_conn[HL_NFD];
+// fd -> a pending asynchronous socket error (Linux errno) to hand back on the next getsockopt(SO_ERROR),
+// then clear (Linux delivers SO_ERROR once). A non-blocking stream connect() to a closed private-loopback
+// port has no live INET peer to surface ECONNREFUSED through the AF_UNIX switch, so we stash it here and
+// report EINPROGRESS, mirroring a real deferred TCP connect failure. Cleared at socket()/accept() re-init.
+static int g_so_error[HL_NFD];
+// fd -> 1 if the guest set SO_REUSEPORT on this socket. A private-loopback INET socket is backed by an
+// AF_UNIX switch socket, and Linux AF_UNIX accepts setsockopt(SO_REUSEPORT) but always reads it back as 0
+// (unlike SO_REUSEADDR), so the guest's get-after-set would wrongly report 0. Record the guest's intent
+// here and report it on getsockopt. Cleared at socket()/accept() re-init.
+static uint8_t g_so_reuseport[HL_NFD];
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
 static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];
@@ -996,8 +1006,23 @@ static uint16_t lo_alloc_ephemeral(void) {
 }
 
 // Swap the AF_INET socket at `fd` for a fresh AF_UNIX SOCK_STREAM one (keeping the fd number + flags).
+// SOL_SOCKET options a guest may set on its INET socket BEFORE the private-loopback swap replaces it with a
+// fresh AF_UNIX socket. Each is generic to SOL_SOCKET (valid + readable on AF_UNIX), so carrying them over
+// preserves both the option's effect (a receive timeout still fires, so a blocked recv wakes with EAGAIN
+// instead of hanging) and its get-after-set readback (SO_REUSEADDR/SO_REUSEPORT report 1, not the fresh
+// socket's 0). Options the guest sets AFTER the swap already land on the AF_UNIX fd directly.
+static const int lo_carry_opts[] = {SO_REUSEADDR, SO_REUSEPORT, SO_RCVTIMEO, SO_SNDTIMEO,
+                                    SO_KEEPALIVE, SO_BROADCAST, SO_OOBINLINE, SO_LINGER};
+
 static int lo_swap(int fd) {
     int fl = fcntl(fd, F_GETFL), df = fcntl(fd, F_GETFD);
+    // Snapshot the carried SOL_SOCKET options from the old (INET) fd before dup2 replaces it.
+    unsigned char ov[sizeof lo_carry_opts / sizeof lo_carry_opts[0]][64];
+    socklen_t ol[sizeof lo_carry_opts / sizeof lo_carry_opts[0]];
+    for (unsigned i = 0; i < sizeof lo_carry_opts / sizeof lo_carry_opts[0]; i++) {
+        ol[i] = sizeof ov[i];
+        if (getsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], &ol[i]) < 0) ol[i] = 0;
+    }
     int u = socket(AF_UNIX, SOCK_STREAM, 0);
     if (u < 0) return -1;
     if (u != fd) {
@@ -1010,6 +1035,10 @@ static int lo_swap(int fd) {
     // keep non-blocking (async connect)
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    // Re-apply the carried options to the fresh AF_UNIX socket (best-effort: a value the AF_UNIX socket
+    // rejects is simply skipped, exactly as it would be ignored on the INET original).
+    for (unsigned i = 0; i < sizeof lo_carry_opts / sizeof lo_carry_opts[0]; i++)
+        if (ol[i]) setsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], ol[i]);
     return 0;
 }
 
