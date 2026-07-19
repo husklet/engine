@@ -42,3 +42,11 @@ timerfd-gettime	events	timerfd_gettime.c	ext_linuxsys/timerfd_gettime.c	aarch64,
 timerfd-interval	events	timerfd_interval.c	ext_linuxsys/timerfd_interval.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/timerfd_interval.out	linux-libc	active	exact source and behavioral registration transfer
 unshare-files	process	unshare_files.c	ext_linuxsys/unshare_files.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/unshare_files.out	linux-libc	active	exact source and behavioral registration transfer
 vmsplice	filesystem	vmsplice.c	ext_linuxsys/vmsplice.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/vmsplice.out	linux-libc	active	exact source and behavioral registration transfer
+faccessat-flags	filesystem	faccessat_flags.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/faccessat_flags.out	linux-libc	active	access/faccessat2 errno matrix and AT_EMPTY_PATH check
+statx-fields	filesystem	statx_fields.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/statx_fields.out	linux-libc	active	statx mask/size/type/nlink coherence and ENOENT
+close-range-flags	filesystem	close_range_flags.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/close_range_flags.out	linux-libc	active	close_range close vs CLOSE_RANGE_CLOEXEC and EINVAL
+prctl-name	process	prctl_name.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/prctl_name.out	linux-libc	active	prctl PR_SET/GET_NAME and TIMERSLACK round-trip plus EINVAL
+getrandom-len	misc	getrandom_len.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/getrandom_len.out	linux-libc	active	getrandom zero-length, GRND_NONBLOCK fill/entropy and EINVAL
+sysinfo-uname	misc	sysinfo_uname.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/sysinfo_uname.out	linux-libc	active	sysinfo/uname/times coherent Linux facts (arch-neutral)
+sendfile-splice	filesystem	sendfile_splice.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/sendfile_splice.out	linux-libc	active	sendfile and splice zero-copy byte counts and content
+umask-open	filesystem	umask_open.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/umask_open.out	linux-libc	active	umask affects create mode and returns prior mask
