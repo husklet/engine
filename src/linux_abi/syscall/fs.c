@@ -1184,6 +1184,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     aino = (uint64_t)ps.st_ino;
                 }
             }
+            // Linux: a trailing slash names a directory, so unlink("file/") is ENOTDIR -- do_unlinkat rejects
+            // the slash before removing anything. jail_at strips the trailing slash from `fin`, so re-check the
+            // raw guest spelling against the resolved node type (a non-directory under a trailing slash -> ENOTDIR).
+            if (!(a2 & 0x200) && nlink != 0 && !S_ISDIR(ps.st_mode)) {
+                const char *rawp = (const char *)a1;
+                size_t rl = strlen(rawp);
+                if (rl > 1 && rawp[rl - 1] == '/') {
+                    close(pfd);
+                    G_RET(c) = (uint64_t)(int64_t)(-ENOTDIR);
+                    break;
+                }
+            }
             // AT_REMOVEDIR: linux 0x200
             int r = unlinkat(pfd, fin, (a2 & 0x200) ? AT_REMOVEDIR : 0), e = errno;
             char dp[4200];
