@@ -2750,6 +2750,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     // like every other open path (the /dev/* device open used to skip this and let the guest
                     // exceed its own soft limit -- opening /dev/null in a loop never hit EMFILE).
                     int d = nofile_gate(open(hd, mf));
+                    // O_CLOEXEC (0x80000) must set FD_CLOEXEC on the new descriptor exactly like every
+                    // other open branch -- mf here carries only the access mode (the flag translation at
+                    // the bottom of case 56 runs after this block breaks), so a /dev/null (or any device
+                    // node) opened O_CLOEXEC used to leak across execve because FD_CLOEXEC was never set.
+                    if (d >= 0 && (lf & 0x80000)) fcntl(d, F_SETFD, FD_CLOEXEC);
                     // /dev/full is backed by /dev/zero for reads; flag the fd so its writes fail ENOSPC.
                     if (d >= 0 && d < HL_NFD) g_devfull[d] = !strcmp(rp, "/dev/full");
                     // /dev/tty (and /dev/console, backed by /dev/null): tty read semantics -- a nonblocking

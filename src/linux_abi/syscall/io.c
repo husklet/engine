@@ -1365,6 +1365,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (r & O_NONBLOCK) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
             if (r & O_ASYNC) lf |= 0x2000;
+#if defined(__linux__) && defined(O_DIRECT)
+            // O_DIRECT is a settable status flag on Linux; the guest fd is a real host fd whose kernel
+            // O_DIRECT bit is authoritative. Translate host O_DIRECT -> the guest-arch G_O_DIRECT so an
+            // fd opened (or F_SETFL'd) O_DIRECT round-trips instead of being silently dropped.
+            if (r & O_DIRECT) lf |= G_O_DIRECT;
+#endif
             // eventfd: the host read end is kept permanently O_NONBLOCK internally, so report the guest's
             // OWN blocking/non-blocking intent (g_eventfd_gnb), not the host flag. See vfs.c g_eventfd_gnb.
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_eventfd_peer[(int)a0]) {
@@ -1392,6 +1398,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (la & 0x800) mf |= O_NONBLOCK;
             // APPEND/NONBLOCK/ASYNC
             if (la & 0x2000) mf |= O_ASYNC;
+#if defined(__linux__) && defined(O_DIRECT)
+            // Forward an O_DIRECT status-flag change straight to the real host fd (guest-arch G_O_DIRECT ->
+            // host O_DIRECT). Previously the bit was dropped, so F_SETFL(O_DIRECT) wrongly returned success
+            // without setting it (and a filesystem that rejects O_DIRECT never produced the EINVAL Linux does).
+            if (la & G_O_DIRECT) mf |= O_DIRECT;
+#endif
             // eventfd: record the guest's blocking/non-blocking intent in the shadow and NEVER clear the
             // host read end's O_NONBLOCK (the internal drains rely on it; clearing it would let a drain
             // block). Other flag changes still apply to the host fd. See vfs.c g_eventfd_gnb.
@@ -1527,6 +1539,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
 #endif
         }
+#if defined(__linux__) && defined(F_GET_RW_HINT)
+        // Write life-time hints F_GET_RW_HINT(1035)/F_SET_RW_HINT(1036)/F_GET_FILE_RW_HINT(1037)/
+        // F_SET_FILE_RW_HINT(1038): the arg is a pointer to a uint64 hint. The guest fd is a real host fd,
+        // so forward straight through to the host kernel (which owns the actual per-inode/per-fd hint) --
+        // otherwise the do_fcntl default wrongly returns EINVAL where native returns the real hint. macOS
+        // has no such command, so this stays Linux-only and the default switch keeps EINVAL there.
+        if (lcmd >= 1035 && lcmd <= 1038) {
+            if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(uint64_t))) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            long r = fcntl((int)a0, lcmd, (unsigned long)a2);
+            G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)errno) : (uint64_t)(unsigned)r;
+            break;
+        }
+#endif
         int mcmd = lcmd;
         if (lcmd == 8)
             mcmd = F_SETOWN;
@@ -1635,6 +1663,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             if (fd < HL_NFD) g_fsig[fd] = (uint8_t)sig;
+#if defined(__linux__)
+            // The guest fd is a REAL host fd; forward F_SETSIG so the host's own O_ASYNC signal-driven I/O
+            // delivers the requested signal (with SI_SIGIO siginfo) instead of the default SIGIO, which the
+            // engine then routes to the guest. Without this the custom async signal is silently ignored and
+            // an app arming F_SETSIG waits for a signal that never comes. g_fsig is still recorded for the
+            // engine-serviced dnotify path (F_NOTIFY), which raises the signal itself. Errors are non-fatal.
+            (void)fcntl(fd, F_SETSIG, sig);
+#endif
             G_RET(c) = 0;
             break;
         } else if (lcmd == 11) { // F_GETSIG(fd): the signal set by F_SETSIG (0 = default SIGIO).
