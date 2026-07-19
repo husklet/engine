@@ -187,9 +187,9 @@ int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
 // then builds the rt_sigframe and runs the handler (which typically siglongjmps out and recovers). Returns
 // 1 when queued (caller `continue`s the loop), 0 when no handler is installed (caller default-terminates).
 // cpu->rip already holds the architectural #DE PC set by the emitted block exit.
-int hl_x86_signal_raise_divide(struct cpu *c, const hl_x86_signal_queue *queue) {
+int hl_x86_signal_raise_divide(struct cpu *c, const hl_x86_signal_queue *queue, int si_code) {
     if (queue->handler(queue->context, 8) <= 1) return 0; // SIG_DFL/SIG_IGN
-    queue->codes[8] = 1;                                 // FPE_INTDIV
+    queue->codes[8] = si_code;                           // FPE_INTDIV / FPE_INTOVF
     queue->addresses[8] = c->rip;                        // si_addr = faulting instruction
     c->sigmask &= ~(1ull << 7);             // a synchronous fault forces delivery even if SIGFPE was blocked
     c->reason = R_BRANCH;                   // resume as a plain branch (no stale special-op handling)

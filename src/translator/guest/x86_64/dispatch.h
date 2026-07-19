@@ -293,17 +293,11 @@ static int smc_on_write(uint64_t a) {
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
         if (d == 0) {                                                                                                  \
-            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
-            fprintf(stderr, "[hl] #DE divide-by-zero\n");                                                              \
-            (c)->exited = 1;                                                                                           \
-            (c)->exit_code = 136;                                                                                      \
-            break;                                                                                                     \
+            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
+            break; /* raise_guest_de recorded death-by-SIGFPE / set exited+exit_code */                                \
         }                                                                                                              \
         if ((c)->r[RDX] >= d) { /* quotient overflow (high half >= divisor): x86 #DE, same as /0 */                    \
-            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
-            fprintf(stderr, "[hl] #DE divide overflow\n");                                                             \
-            (c)->exited = 1;                                                                                           \
-            (c)->exit_code = 136;                                                                                      \
+            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) { maybe_deliver_signal(c); continue; }                            \
             break;                                                                                                     \
         }                                                                                                              \
         unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                  \
@@ -314,19 +308,13 @@ static int smc_on_write(uint64_t a) {
     if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                              \
         int64_t d = (int64_t)(c)->divop;                                                                               \
         if (d == 0) {                                                                                                  \
-            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
-            fprintf(stderr, "[hl] #DE divide-by-zero\n");                                                              \
-            (c)->exited = 1;                                                                                           \
-            (c)->exit_code = 136;                                                                                      \
+            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
             break;                                                                                                     \
         }                                                                                                              \
         __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
         __int128 q = num / d;                                                                                          \
         if ((__int128)(int64_t)q != q) { /* quotient doesn't fit int64 (incl. INT_MIN/-1): x86 #DE */                  \
-            if (raise_guest_de(c)) { maybe_deliver_signal(c); continue; }                                              \
-            fprintf(stderr, "[hl] #DE divide overflow\n");                                                             \
-            (c)->exited = 1;                                                                                           \
-            (c)->exit_code = 136;                                                                                      \
+            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) { maybe_deliver_signal(c); continue; }                            \
             break;                                                                                                     \
         }                                                                                                              \
         (c)->r[RAX] = (uint64_t)q;                                                                                     \

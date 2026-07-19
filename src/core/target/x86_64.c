@@ -297,9 +297,27 @@ static int fastclk_fault_fixup(siginfo_t *info, void *native_context) {
     return hl_x86_signal_fast_clock_fault(c, (uintptr_t)(info != NULL ? info->si_addr : NULL), native_context);
 }
 
-static int raise_guest_de(struct cpu *c) {
+// x86 integer #DE (divide-by-zero / INT_MIN-over-minus-one overflow). si_code is FPE_INTDIV(1) for a zero
+// divisor or FPE_INTOVF(2) for a quotient-overflow -- Linux/x86 reports FPE_INTDIV for the #DE trap in both
+// cases, but the queued value is honoured for a guest handler. Returns 1 when a handler was queued (caller
+// resumes). With no handler this owns the default disposition exactly like raise_guest_bus does for a
+// past-EOF SIGBUS: on Linux the guest process is a real host process, so raise the host SIGFPE and record
+// the intended Linux termination so the parent's wait4/waitid reconstructs WIFSIGNALED/WTERMSIG==SIGFPE
+// (the dispatcher used to set a plain exit_code=136, i.e. WIFEXITED, which is not a signal-death).
+static int raise_guest_de(struct cpu *c, int si_code) {
     hl_x86_signal_queue queue = x86_signal_queue();
-    return hl_x86_signal_raise_divide(c, &queue);
+    if (hl_x86_signal_raise_divide(c, &queue, si_code)) return 1;
+    if (container_pid() != 1) {
+#if defined(__linux__)
+        signal(SIGFPE, SIG_DFL);
+        raise(SIGFPE);
+#endif
+        int core = sig_coredumps(8) && svc_core_rlimit_cur() > 0;
+        sigexit_record(8, core);
+    }
+    c->exited = 1;
+    c->exit_code = 136; // 128 + SIGFPE, the container-init / relay-exhausted fallback
+    return 0;
 }
 
 static int raise_guest_trap(struct cpu *c) {
