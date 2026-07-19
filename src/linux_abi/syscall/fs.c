@@ -361,6 +361,11 @@ static void fd_reset_emul(int fd) {
 // -errno. Absolute paths, AT_FDCWD, and the empty path (AT_EMPTY_PATH / the ENOENT case) never consult the
 // dirfd. (LTP fstatat01 / statx03 / symlinkat01 / linkat01.)
 static int at_dirfd_check(int dirfd, const char *raw) {
+    // A bad path pointer (unmapped, or a PROT_NONE guard page -- the LTP tst_get_bad_addr idiom) faults
+    // during the kernel's getname() copy BEFORE the dirfd is resolved, so EFAULT precedes EBADF/ENOTDIR.
+    // On the Linux engine a guest PROT_NONE page is a real host PROT_NONE mapping, so reading raw[0] to
+    // classify absolute-vs-relative would fault the engine itself; screen the pointer first.
+    if (raw && guest_bad_ptr((uintptr_t)raw, 1)) return -EFAULT;
     if (!raw || !raw[0] || raw[0] == '/') return 0; // empty or absolute: the dirfd is not walked
     if (dirfd == -100 /*AT_FDCWD*/) return 0;       // cwd-relative
     struct stat ds;
@@ -3081,12 +3086,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
          * component unresolved and open it with O_NOFOLLOW so a symlink errors
          * with ELOOP instead of being silently followed. */
         int o2_nofollow = (openat2_intent & HL_OPEN_NO_SYMLINKS) != 0 && !osymlink;
-        const char *p = atpath((int)a0, (const char *)a1, pb, sizeof pb, (osymlink || o2_nofollow) ? 1 : 0);
+        // A plain (non-O_PATH) guest O_NOFOLLOW must keep the final symlink component unresolved and open it
+        // with host O_NOFOLLOW so Linux's ELOOP is produced -- `mf` never carries O_NOFOLLOW, so relying on
+        // it silently followed the link and opened the target. The O_PATH|O_NOFOLLOW case is handled by
+        // osymlink (O_SYMLINK opens the link itself), so exclude it here.
+        int nofollow_final = ((lf & G_O_NOFOLLOW) != 0 || o2_nofollow) && !osymlink;
+        const char *p =
+            atpath((int)a0, (const char *)a1, pb, sizeof pb, (osymlink || nofollow_final) ? 1 : 0);
         int nf_new = nf_want && faccessat(ATFD(a0), p, F_OK, AT_SYMLINK_NOFOLLOW) != 0; // stamp only fresh
         // Gate the new fd against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the shared host fd
         // table is far larger; engine-private fds are hoisted above 1<<20, so the guest limit is emulated).
         // O_PATH|O_NOFOLLOW on a symlink -> O_SYMLINK opens the link itself.
-        int r = nofile_gate(openat(ATFD(a0), p, mf | osymlink | (o2_nofollow ? O_NOFOLLOW : 0), (mode_t)a3));
+        int r = nofile_gate(openat(ATFD(a0), p, mf | osymlink | (nofollow_final ? O_NOFOLLOW : 0), (mode_t)a3));
         if (r >= 0 && nf_new) newfile_stamp_fd(r);
         if (r >= 0 && r < HL_NFD) g_opath[r] = is_opath;
         if (r >= 0) {
@@ -4074,10 +4085,30 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
+        // faccessat2(439) accepts AT_SYMLINK_NOFOLLOW(0x100): check the LINK itself, don't dereference it.
+        // hl ignored the flag and always followed, so faccessat(dangling-symlink, F_OK, AT_SYMLINK_NOFOLLOW)
+        // wrongly ENOENT'd (the link exists) instead of succeeding. Resolve the final component unfollowed
+        // and evaluate the link node directly. (faccessat(48) has no flags word; a3 is unused there.)
+        int access_nofollow = (nr == 439) && (a3 & 0x100);
         // faccessat
         const char *p = procfd_directory_path(gp48)
                             ? gp48
-                            : atpath((int)a0, (const char *)a1, pb, sizeof pb, 0);
+                            : atpath((int)a0, (const char *)a1, pb, sizeof pb, access_nofollow ? 1 : 0);
+        if (access_nofollow && p) {
+            struct stat ls;
+            if (fstatat(ATFD(a0), p, &ls, AT_SYMLINK_NOFOLLOW) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            // The link node itself: existence (F_OK) always holds; a symlink's own mode bits are 0777, so a
+            // permission probe reduces to its mode -- match the synth mode-check for consistency.
+            int mode = (int)a2 & 7, ok = 1;
+            if ((mode & 4) && !(ls.st_mode & 0444)) ok = 0;
+            if ((mode & 2) && !(ls.st_mode & 0222)) ok = 0;
+            if ((mode & 1) && !(S_ISDIR(ls.st_mode) || (ls.st_mode & 0111))) ok = 0;
+            G_RET(c) = ok ? 0 : (uint64_t)(int64_t)(-EACCES);
+            break;
+        }
         {
             const char *gp =
                 (g_rootfs && p && !strncmp(p, g_rootfs_canon, g_rootfs_canon_len)) ? p + g_rootfs_canon_len : p;
