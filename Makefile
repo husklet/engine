@@ -490,7 +490,8 @@ package-activation-macos-test: HOST = macos
 package-activation-macos-test: HOST_ARCH = aarch64
 package-activation-macos-test: ACTIVATION_LIBS = -Wl,-force_load,$${libdir}/libhl-engine-activation.a
 package-activation-macos-test: $(BUILD)/package/macos-aarch64/libhl-engine.a \
-	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-descendant-aarch64 \
+	$(BUILD)/pkgconfig/hl-engine-activation.pc $(BUILD)/e2e/guest-exit-aarch64 \
+	$(BUILD)/e2e/guest-descendant-aarch64 \
 	$(BUILD)/e2e/guest-external-term-aarch64 $(BUILD)/e2e/guest-domain-aarch64 \
 	$(BUILD)/e2e/guest-domain-x86_64
 	rm -rf '$(BUILD)/activation-package-root' '$(BUILD)/activation-package-consumer'
