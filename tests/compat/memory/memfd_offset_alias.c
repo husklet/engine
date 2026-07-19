@@ -34,6 +34,7 @@ int main(void) {
     if (fixed == MAP_FAILED ||
         mmap(fixed, page, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, (off_t)page) != fixed)
         return 4;
+    if (close(fd) != 0) return 5;
     int protected = mprotect(fixed, page, PROT_READ | PROT_EXEC) == 0;
     writable[1] = 0x36;
     writable[page - 2] = 0x9a;
@@ -44,8 +45,6 @@ int main(void) {
     int writable_publish_coherent = publish(writable, page) == 0 && fixed[2] == 0x47 && fixed[page - 3] == 0xa5;
 
     int unmapped = munmap(readable, page) == 0 && munmap(writable, page) == 0 && munmap(fixed, page) == 0;
-    close(fd);
-
     printf("memfd-offset-alias alias=%d fixed=%d writable-publish=%d unmapped=%d\n", alias_coherent, fixed_coherent,
            writable_publish_coherent, unmapped);
     return alias_coherent && fixed_coherent && writable_publish_coherent && unmapped ? 0 : 1;

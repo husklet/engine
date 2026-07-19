@@ -498,10 +498,26 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
     if (size == 0 || address > UINT64_MAX - size || fstat(fd, &st) != 0) return;
     pthread_mutex_lock(&g_filemap_lock);
     filemap_events_init_locked();
-    if (g_nfilemap < GNA_MAX)
+    int retained = -1;
+    for (int index = 0; index < g_nfilemap; ++index)
+        if (g_filemap[index].device == (uint64_t)st.st_dev && g_filemap[index].inode == (uint64_t)st.st_ino) {
+            retained = g_filemap[index].fd;
+            break;
+        }
+    if (retained < 0) {
+        retained = fcntl(fd, F_DUPFD_CLOEXEC, 1 << 20);
+        if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, HL_NFD);
+    }
+    if (g_nfilemap < GNA_MAX && retained >= 0)
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
                                                               (uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                                                              0, 0, fd, (uint32_t)shared, (uint32_t)emulated};
+                                                              0, 0, retained, (uint32_t)shared, (uint32_t)emulated};
+    else if (retained >= 0) {
+        int shared_source = 0;
+        for (int index = 0; index < g_nfilemap; ++index)
+            if (g_filemap[index].fd == retained) shared_source = 1;
+        if (!shared_source) close(retained);
+    }
     pthread_mutex_unlock(&g_filemap_lock);
 }
 
@@ -558,7 +574,12 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
         if (hi <= mapping->lo || lo >= mapping->hi) { i++; continue; }
         uint64_t old_lo = mapping->lo, old_hi = mapping->hi;
         if (lo <= old_lo && hi >= old_hi) {
+            int retained = mapping->fd;
             g_filemap[i] = g_filemap[--g_nfilemap];
+            int used = 0;
+            for (int index = 0; index < g_nfilemap; ++index)
+                if (g_filemap[index].fd == retained) used = 1;
+            if (!used && retained >= 0) close(retained);
             continue;
         }
         if (lo > old_lo && hi < old_hi && g_nfilemap < GNA_MAX) {
@@ -639,11 +660,6 @@ static int filemap_source_fd(struct guest_file_mapping *mapping) {
     if (mapping->fd >= 0 && fstat(mapping->fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device &&
         (uint64_t)st.st_ino == mapping->inode)
         return mapping->fd;
-    for (int fd = 0; fd < HL_NFD; ++fd)
-        if (fstat(fd, &st) == 0 && (uint64_t)st.st_dev == mapping->device && (uint64_t)st.st_ino == mapping->inode) {
-            mapping->fd = fd;
-            return fd;
-        }
     return -1;
 }
 
@@ -1063,6 +1079,13 @@ static void gna_reset(void) {
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_filemap_lock);
+    for (int index = 0; index < g_nfilemap; ++index) {
+        int retained = g_filemap[index].fd;
+        int first = 1;
+        for (int previous = 0; previous < index; ++previous)
+            if (g_filemap[previous].fd == retained) first = 0;
+        if (first && retained >= 0) close(retained);
+    }
     g_nfilemap = 0;
     pthread_mutex_unlock(&g_filemap_lock);
     pthread_mutex_lock(&g_bus_transition);
