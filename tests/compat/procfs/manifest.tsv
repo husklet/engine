@@ -22,3 +22,19 @@ pf-peer-fd	proc	peerfd.c	ext_procfs/peerfd.c	aarch64,x86_64	-static -O2 -std=gnu
 pf-fdvis-capacity	proc	fdvis_capacity.c	-	aarch64,x86_64	-static -O2 -std=gnu11	-	-	0	expected/shared/fdvis_capacity.out	linux-libc,procfs,process	active	fork replay remains transactional with many live children
 pf-ttynonblock	device	ttynonblock.c	ext_procfs/ttynonblock.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/ttynonblock.out	linux-libc,procfs	active	byte-preserving transfer
 pf-permbits	permission	permbits.c	ext_procfs/permbits.c	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/permbits.out	linux-libc	active	byte-preserving transfer
+pf-selflink	proc	selflink.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selflink.out	linux-libc,procfs	active	self magic-link resolves to live pid; root link is /
+pf-selfcmdline	proc	selfcmdline.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfcmdline.out	linux-libc,procfs	active	cmdline NUL-separated, token count==argc, argv0 exact
+pf-selfexe	proc	selfexe.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfexe.out	linux-libc,procfs	active	exe link absolute and opens the running ELF image
+pf-selfcwd	proc	selfcwd.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfcwd.out	linux-libc,procfs	active	cwd link tracks getcwd and follows chdir live
+pf-selfauxv	proc	selfauxv.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfauxv.out	linux-libc,procfs	active	auxv AT_PAGESZ==sysconf, AT_PHENT/PHDR/ENTRY present
+pf-selflimits	proc	selflimits.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selflimits.out	linux-libc,procfs	active	limits table agrees with getrlimit for NOFILE/STACK
+pf-selfstatm	proc	selfstatm.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfstatm.out	linux-libc,procfs	active	statm 7 fields, size>=resident>=1 page, text>0
+pf-selftask	proc	selftask.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selftask.out	linux-libc,procfs,threads	active	task dir count and status Threads == live thread set
+pf-selfenviron	proc	selfenviron.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfenviron.out	linux-libc,procfs	active	environ NUL-separated, every entry name=value
+pf-selfoom	proc	selfoom.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfoom.out	linux-libc,procfs	active	oom_score/oom_score_adj parse, range, write-back
+pf-selfcgroup	proc	selfcgroup.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfcgroup.out	linux-libc,procfs	active	cgroup v2 single line 0::/<path> shape
+pf-unamehost	proc	unamehost.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/unamehost.out	linux-libc,procfs	active	ostype/osrelease/hostname agree with uname and version
+pf-selfsmaps	proc	selfsmaps.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfsmaps.out	linux-libc,procfs	active	smaps region Size>=Rss kB, Pss present, live Rss>0
+pf-selfmounts	proc	selfmounts.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/selfmounts.out	linux-libc,procfs	active	mounts 6-col rows with root; mountinfo has - separator
+pf-cpucount	proc	cpucount.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/cpucount.out	linux-libc,procfs	active	cpuinfo/stat cpu counts agree with sysconf NPROC_CONF
+pf-cpusysfs	sysfs	cpusysfs.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -Itests/compat/procfs	-	-	0	expected/shared/cpusysfs.out	linux-libc,procfs	active	sys cpu online list count == NPROCESSORS_ONLN
