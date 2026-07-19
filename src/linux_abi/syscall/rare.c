@@ -321,6 +321,17 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // (glibc already rejects a name that lacks a leading '/' or is empty with EINVAL before the syscall,
     // so the raw-syscall path only has to police ENAMETOOLONG, EFAULT, ENOENT, EEXIST, ENOSPC + a bad attr.)
     case 180: {
+#if defined(__linux__)
+        // Host-passthrough: a real POSIX mqueue is a kernel object — pollable via poll/select, shared
+        // across fork by name, and its mq_notify is delivered by the kernel's own signal machinery. The
+        // returned descriptor IS a real host mqd (guest fd == host fd, as with pipes/sockets), so it flows
+        // through the existing fd table and the kernel enforces access mode, RLIMIT_MSGQUEUE, geometry, and
+        // the ENOENT/EEXIST/ENAMETOOLONG/EINVAL errno order natively — identical to the native oracle. The
+        // #else in-process broker below backs the macOS build (Darwin has no POSIX mqueue kernel object).
+        long r = syscall(SYS_mq_open, (const char *)a0, (int)a1, (unsigned)a2, (const void *)a3);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
+        break;
+#else
         const char *name = (const char *)a0;
         int oflag = (int)a1;
         const long *at = (const long *)a3; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
@@ -382,9 +393,15 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0); // O_NONBLOCK is a per-descriptor mq_flag
         G_RET(c) = (uint64_t)fd;
         break;
+#endif
     }
     // mq_unlink(name): mark removed; freed once the last descriptor is gone.
     case 181: {
+#if defined(__linux__)
+        long r = syscall(SYS_mq_unlink, (const char *)a0); // host object: ENOENT enforced by the kernel
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         int qi = mq_find((const char *)a0);
         if (qi < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
@@ -394,6 +411,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         mq_maybe_free(qi);
         G_RET(c) = 0;
         break;
+#endif
     }
     // mq_timedsend(mqdes, msg, len, prio, abs_timeout): insert highest-priority-first, FIFO within a prio.
     // Errno order mirrors the kernel: abs_timeout EFAULT/EINVAL (validated first, in the wrapper), then prio
@@ -402,6 +420,16 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // is not emulated (queues aren't shared across fork); a full queue with a blocking descriptor and a NULL
     // timeout therefore blocks forever exactly as Linux would when nothing can drain it.
     case 182: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel enforces prio<MQ_PRIO_MAX, EBADF (fd + access mode), EMSGSIZE, the
+        // msg-buffer EFAULT, then full-queue O_NONBLOCK->EAGAIN / block-until-space-or-abs_timeout
+        // (ETIMEDOUT) / EINTR — the exact native semantics, and a blocked send now wakes when ANY process
+        // sharing the named queue drains it (real cross-process blocking, not the single-process broker).
+        long r = syscall(SYS_mq_timedsend, (int)a0, (const char *)a1, (size_t)a2, (unsigned)a3,
+                         (const struct timespec *)a4);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         struct timespec dl;
         int have_dl;
         int terr = mq_check_timeout(a4, &dl, &have_dl);
@@ -479,11 +507,22 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         G_RET(c) = 0;
         break;
+#endif
     }
     // mq_timedreceive(mqdes, msg, len, prio*, abs_timeout): pop the head (highest priority, oldest first).
     // Same errno order as mq_timedsend: abs_timeout EFAULT/EINVAL, EBADF, EMSGSIZE (buffer < mq_msgsize),
     // then empty-queue handling: O_NONBLOCK -> EAGAIN, else block until a message / deadline / signal.
     case 183: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel pops the highest-priority-oldest message, writes it + the priority,
+        // and enforces EBADF (fd + access mode), EMSGSIZE (buffer < mq_msgsize), then empty-queue
+        // O_NONBLOCK->EAGAIN / block-until-message-or-abs_timeout (ETIMEDOUT) / EINTR. A blocked receive now
+        // wakes when ANY process sharing the named queue sends (the cross-process fix).
+        long r = syscall(SYS_mq_timedreceive, (int)a0, (char *)a1, (size_t)a2, (unsigned *)a3,
+                         (const struct timespec *)a4);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
+        break;
+#else
         struct timespec dl;
         int have_dl;
         int terr = mq_check_timeout(a4, &dl, &have_dl);
@@ -536,6 +575,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         free(m.data);
         G_RET(c) = (uint64_t)m.len;
         break;
+#endif
     }
     // mq_notify(mqdes, sevp): register/unregister the single one-shot notification the queue fires on its
     // empty->non-empty edge (delivered in mq_timedsend). Errno order matches the kernel: for a non-NULL sevp,
@@ -545,6 +585,20 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // helper-thread/netlink callback is not driven in-process, so only the registration/EBUSY semantics hold
     // for it (SIGEV_SIGNAL and SIGEV_NONE are fully emulated).
     case 184: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel owns the one-shot registration and delivers the notification. For
+        // SIGEV_SIGNAL it raises the guest's chosen signal with a real SI_MESGQ siginfo carrying the
+        // registered sigev_value (the engine's host-signal interception routes it into the guest with
+        // si_code/si_value intact); SIGEV_NONE registers-only. This is the empty->non-empty edge fired by
+        // the kernel — cross-process and race-correct — and unblocks ipc_mq_notify. A NULL sevp
+        // unregisters. SIGEV_THREAD is glibc-rewritten in the GUEST before this syscall (netlink-socket
+        // delivery), so only its registration/EBUSY errno semantics are guaranteed here; the callback
+        // thread's netlink plumbing is not separately driven (documented, matches the SIGEV_SIGNAL/NONE
+        // fidelity the test asserts). Access-mode/EFAULT/EINVAL/EBADF/EBUSY are enforced by the kernel.
+        long r = syscall(SYS_mq_notify, (int)a0, (const void *)a1);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         const uint8_t *sev = (const uint8_t *)a1;
         if (sev) {
             if (gna_hit(a1, 16)) { // struct sigevent: sigev_value[8], sigev_signo[4], sigev_notify[4] (PIE-safe)
@@ -589,11 +643,20 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
         }
         break;
+#endif
     }
     // mq_getsetattr(mqdes, newattr, oldattr): report mq_flags(O_NONBLOCK)/maxmsg/msgsize/curmsgs into oldattr
     // (the state BEFORE any change), then, if newattr is set, apply it -- only O_NONBLOCK is settable (the
     // kernel masks mq_flags to O_NONBLOCK and ignores the rest), so this is the mq analogue of F_SETFL.
     case 185: {
+#if defined(__linux__)
+        // Host-passthrough: the kernel reports the current mq_flags(O_NONBLOCK)/maxmsg/msgsize/curmsgs into
+        // oldattr and, if newattr is set, applies only the O_NONBLOCK bit (the mq analogue of F_SETFL) —
+        // exact native geometry and EBADF/EFAULT semantics.
+        long r = syscall(SYS_mq_getsetattr, (int)a0, (const void *)a1, (void *)a2);
+        G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+        break;
+#else
         if ((a1 && gna_hit(a1, 32)) || (a2 && gna_hit(a2, 32))) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
@@ -617,6 +680,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         G_RET(c) = 0;
         break;
+#endif
     }
     // setsid(): new session / process-group leader
     case 157: {

@@ -1120,6 +1120,9 @@ static void service_local(struct cpu *c) {
             a3 = nonpie_p(a3);
             a4 = nonpie_p(a4);
             break;
+        case 184: // mq_notify(mqdes, SEVP) -- sigevent read (host-forwarded / broker-parsed)
+            a1 = nonpie_p(a1);
+            break;
         case 185: // mq_getsetattr(mqdes, NEWATTR, OLDATTR) -- oldattr written (newattr ignored by handler)
             a1 = nonpie_p(a1);
             a2 = nonpie_p(a2);

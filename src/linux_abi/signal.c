@@ -414,6 +414,21 @@ static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
         g_sigpid[ls] = (int)si->si_pid;
         g_siguid[ls] = (int)si->si_uid;
     }
+#if defined(__linux__)
+    // A Linux host delivers the real Linux si_code, so forward it (and, for the queued sources that carry a
+    // payload, si_value) into the single-slot siginfo the frame builder reads. This is what lets a kernel
+    // POSIX-mqueue notification (mq_notify SIGEV_SIGNAL, host-forwarded in rare.c) reach the guest handler
+    // as SI_MESGQ with the registered sigev_value, and likewise carries a cross-process sigqueue (SI_QUEUE)
+    // or POSIX-AIO (SI_ASYNCIO) value. SIGCHLD keeps its dedicated si_status handling below (si_status
+    // aliases si_value). SI_USER/SI_KERNEL/SI_TKILL carry no value, so only the value-bearing negative codes
+    // copy si_value (its union slot is meaningful only then); a plain kill stays SI_USER/0.
+    if (si && ls != 17) {
+        g_sigcode[ls] = si->si_code;
+        if (si->si_code == SI_QUEUE || si->si_code == SI_TIMER || si->si_code == SI_MESGQ ||
+            si->si_code == SI_ASYNCIO)
+            g_sigval[ls] = (uint64_t)(uintptr_t)si->si_value.sival_ptr;
+    }
+#endif
     // SA_SIGINFO SIGCHLD exposes HOW the child ended: si_code (CLD_EXITED/CLD_KILLED/...) and si_status
     // (exit code or terminating signal). On a Linux host the host siginfo already carries the Linux CLD_*
     // code and status, so forward them into the single-slot siginfo the frame builder reads (si_status
