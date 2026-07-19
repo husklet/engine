@@ -1,3 +1,0 @@
-[workspace]
-members = ["api", "provider", "protocol", "runtime", "rust"]
-resolver = "2"

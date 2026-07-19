@@ -91,16 +91,16 @@
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
             version = "0.1.10";
-            # The publishable `hl-engine` crate (pkgs/rust) has path deps on its
-            # sibling workspace crates (api/provider/protocol/runtime), so the
-            # whole `pkgs` workspace must be in the sandbox, not just pkgs/rust.
+            # The publishable `hl-engine` crate is the workspace root at
+            # pkgs/rust; its member crates (api/provider/protocol/runtime) live
+            # under pkgs/rust/crates, so the whole pkgs/rust tree is the sandbox.
             src = pkgs.lib.cleanSourceWith {
-              src = ./pkgs;
+              src = ./pkgs/rust;
               filter = path: type:
                 let base = baseNameOf (toString path);
-                in !(type == "directory" && (base == "target" || base == "rust-mongo-fix"));
+                in !(type == "directory" && base == "target");
             };
-            cargoLock.lockFile = ./pkgs/Cargo.lock;
+            cargoLock.lockFile = ./pkgs/rust/Cargo.lock;
             nativeBuildInputs = [ pkgs.pkg-config ];
             # Build every workspace crate (lib + bins). Native-linking test
             # binaries are skipped: they link the frozen `libhl-engine.a`
