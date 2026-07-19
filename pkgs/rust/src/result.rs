@@ -30,7 +30,7 @@ impl Exit {
     }
 }
 pub(crate) fn native(value: crate::ffi::EngineExit) -> Result<Exit, Error> {
-    if value.abi != 4 || value.size != 24 {
+    if value.abi != 5 || value.size != 24 {
         return Err(Error::ResultProtocol("invalid native exit layout".into()));
     }
     match value.kind {

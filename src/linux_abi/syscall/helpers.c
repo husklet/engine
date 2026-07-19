@@ -1107,6 +1107,15 @@ static int procfd_num(const char *p) {
     return atoi(rest);
 }
 
+// Normalize the standard /dev/fd/N alias into the single synthetic procfs namespace used by every
+// path operation. Returning the original path for non-fd entries keeps ordinary /dev resolution unchanged.
+static const char *procfd_namespace_path(const char *path, char *storage, size_t capacity) {
+    int fd = procfd_num(path);
+    if (fd < 0 || path == NULL || strncmp(path, "/dev/fd/", 8) != 0) return path;
+    if (snprintf(storage, capacity, "/proc/self/fd/%d", fd) >= (int)capacity) return path;
+    return storage;
+}
+
 // The /dev/std{in,out,err} aliases -> fd 0/1/2 for the OPEN path only (readlink keeps its on-disk
 // symlink text, so `ls -l /dev` doesn't F_GETPATH a pipe fd and get EBADF). Returns the fd, else -1.
 static int dev_std_fd(const char *p) {
@@ -1156,6 +1165,7 @@ static uint8_t g_ep_dupd[HL_NFD];
 static int g_ep_owner[HL_NFD];       // watched fd -> owning epoll instance fd + 1 (0 = not watched)
 static uint32_t g_ep_events[HL_NFD]; // watched fd -> the epoll events mask registered (EPOLLIN/OUT/ET/ONESHOT)
 static uint64_t g_ep_udata[HL_NFD];  // watched fd -> the epoll_event.data registered for it
+static void ep_mem_close(int ep, int fd); // implemented beside the membership table in event.c
 
 // ---- open-file-description identity for fd-number aliases (dup) -------------------------------------
 // hl shares the host descriptor table with the guest, so two guest fds that refer to the same OFD are two
@@ -1211,6 +1221,13 @@ static void ep_push(int ep, uintptr_t ident, int16_t filt, uint16_t flags, void 
 // armed map must follow to avoid a later stale EV_DELETE on a reused fd number).
 static void ep_fd_reset(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
+    // Closing the final descriptor for a watched OFD removes its registration from Linux epoll.  kqueue
+    // removes the knote itself, but our Linux EEXIST/ENOENT membership mirror must be cleared explicitly;
+    // otherwise immediate reuse of this descriptor number makes a fresh EPOLL_CTL_ADD fail with EEXIST.
+    // ep_close_rehome has already moved a surviving dup and cleared this bit, so this is idempotent there.
+    if (g_ep_owner[fd]) ep_mem_close(g_ep_owner[fd] - 1, fd);
+    ep_provider_retire_endpoint(fd);
+    g_ep_provider_generations[fd] = ep_provider_next(g_ep_provider_generations[fd]);
     g_ep_rd[fd] = g_ep_wr[fd] = g_ep_os[fd] = 0;
     if (g_ep_chg[fd]) {
         free(g_ep_chg[fd]);

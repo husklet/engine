@@ -10,7 +10,14 @@
 
 int main(void) {
     const char *dir = "/tmp/hl_realpath_dir";
+    char original[PATH_MAX], dotted[PATH_MAX], cwd[PATH_MAX];
+    int cwd_dot_ok = getcwd(original, sizeof original) != NULL;
     mkdir(dir, 0755);
+    snprintf(dotted, sizeof dotted, "%s/.", dir);
+    cwd_dot_ok = cwd_dot_ok && chdir(dotted) == 0 && getcwd(cwd, sizeof cwd) != NULL &&
+                 strcmp(cwd, dotted) != 0 && strstr(cwd, "/./") == NULL &&
+                 (strlen(cwd) < 2 || strcmp(cwd + strlen(cwd) - 2, "/.") != 0);
+    if (original[0]) chdir(original);
     char target[256], l1[256], l2[256], l3[256];
     snprintf(target, sizeof target, "%s/target.txt", dir);
     snprintf(l1, sizeof l1, "%s/link1", dir);
@@ -39,6 +46,6 @@ int main(void) {
     unlink(l3);
     unlink(target);
     rmdir(dir);
-    printf("realpath readlink=%d resolve=%d\n", readlink_ok, realpath_ok); // 1 1
+    printf("realpath readlink=%d resolve=%d cwd-dot=%d\n", readlink_ok, realpath_ok, cwd_dot_ok); // 1 1 1
     return 0;
 }

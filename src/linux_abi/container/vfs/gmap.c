@@ -124,6 +124,12 @@ uint64_t hl_gmap_find_length(uint64_t address) {
     return 0;
 }
 
+uint64_t hl_gmap_find_guest_length(uint64_t address) {
+    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+        if (g_gmap.mappings[index].address == address) return g_gmap.mappings[index].guest_length;
+    return 0;
+}
+
 int hl_gmap_contains(uint64_t address, uint64_t length) {
     uint64_t end = address + length;
     if (end < address) return 0;

@@ -1,4 +1,4 @@
-use crate::{Access, Config, Error, Sandbox};
+use crate::{config::NetworkTransport, Access, Config, Error, Sandbox};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -14,9 +14,9 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 9;
-const HEADER_SIZE: usize = 168;
-const HEADER_SIZE_U32: u32 = 168;
+const ABI: u32 = 12;
+const HEADER_SIZE: usize = 200;
+const HEADER_SIZE_U32: u32 = 200;
 const MAGIC_OFFSET: usize = 0;
 const POOL_SIZE_OFFSET: usize = 4;
 const HEADER_SIZE_OFFSET: usize = 8;
@@ -31,6 +31,7 @@ const SANDBOX_OFFSET: usize = 44;
 const NETWORK_ISOLATED_OFFSET: usize = 48;
 const PUBLISH_EXTERNAL_OFFSET: usize = 52;
 const ROOTFS_OFFSET: usize = 56;
+const LOWER_LAYERS_OFFSET: usize = 60;
 const HOSTNAME_OFFSET: usize = 64;
 const NETWORK_NAMESPACE_OFFSET: usize = 68;
 const PUBLISH_OFFSET: usize = 72;
@@ -47,10 +48,19 @@ const PUBLISH_COUNT_OFFSET: usize = 136;
 const INTERFACES_OFFSET: usize = 140;
 const FILE_OWNERS_OFFSET: usize = 144;
 const PROCESS_DOMAIN_OFFSET: usize = 152;
+const EXECUTABLE_HOST_OFFSET: usize = 168;
+const RESERVED_OFFSET: usize = 172;
+const NETWORK_TRANSPORT_OFFSET: usize = 176;
+const RESERVED_ABI11_OFFSET: usize = 180;
+const LOWER_COUNT_OFFSET: usize = 184;
+const OVERLAY_WORK_OFFSET: usize = 188;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
-const _: () = assert!(PROCESS_DOMAIN_OFFSET + 16 == HEADER_SIZE);
+const _: () = assert!(EXECUTABLE_HOST_OFFSET + 8 == NETWORK_TRANSPORT_OFFSET);
+const _: () = assert!(RESERVED_OFFSET + 4 == NETWORK_TRANSPORT_OFFSET);
+const _: () = assert!(RESERVED_ABI11_OFFSET + 4 == LOWER_COUNT_OFFSET);
+const _: () = assert!(OVERLAY_WORK_OFFSET + 12 == HEADER_SIZE);
 
 struct Pool(Vec<u8>);
 
@@ -71,6 +81,19 @@ impl Pool {
 
     fn path(&mut self, value: Option<&Path>) -> Result<u32, Error> {
         self.string(value.map(Path::as_os_str))
+    }
+
+    fn paths(&mut self, values: &[std::path::PathBuf]) -> Result<u32, Error> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let offset = u32::try_from(self.0.len())
+            .map_err(|_| Error::InvalidConfig("launch configuration is too large"))?;
+        for value in values {
+            self.0.extend_from_slice(checked_bytes(value.as_os_str())?);
+            self.0.push(0);
+        }
+        Ok(offset)
     }
 
     fn arguments(&mut self, values: &[OsString]) -> Result<u32, Error> {
@@ -103,6 +126,14 @@ impl Pool {
 }
 
 struct Header([u8; HEADER_SIZE]);
+
+const fn network_transport(value: NetworkTransport) -> u32 {
+    match value {
+        NetworkTransport::Virtual => 0,
+        NetworkTransport::Isolated => 1,
+        NetworkTransport::Host => 2,
+    }
+}
 
 impl Header {
     fn new() -> Self {
@@ -228,9 +259,16 @@ fn validate_network(config: &Config) -> Result<(), Error> {
         || !config.publish.is_empty()
         || config.publish_external
         || !config.network_interfaces.is_empty();
-    if config.network_isolated && configured {
+    if config.network_transport == NetworkTransport::Isolated && configured {
         return Err(Error::InvalidConfig(
             "isolated networking cannot use bridge, IPv4, or publication settings",
+        ));
+    }
+    if config.network_transport == NetworkTransport::Host
+        && (config.network_namespace.is_some() || configured)
+    {
+        return Err(Error::InvalidConfig(
+            "host networking cannot be combined with isolation or virtual networking",
         ));
     }
     if config.network_ipv4.is_some() && config.network_bridge.is_none() {
@@ -277,15 +315,26 @@ fn interfaces(config: &Config) -> Option<OsString> {
     Some(OsString::from_vec(bytes))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn encode(
     config: &Config,
     arguments: &[OsString],
     result: Option<&Path>,
 ) -> Result<Vec<u8>, Error> {
+    if config.lower_layers.len() > 8
+        || (config.lower_layers.is_empty() != config.overlay_work.is_none())
+    {
+        return Err(Error::InvalidConfig(
+            "overlay requires one to eight lower layers and a work directory",
+        ));
+    }
     validate_network(config)?;
     validate_publish(config)?;
     let mut pool = Pool::new();
     let rootfs = pool.path(config.rootfs.as_deref())?;
+    let lower_layers = pool.paths(&config.lower_layers)?;
+    let overlay_work = pool.path(config.overlay_work.as_deref())?;
+    let executable_host = pool.path(config.executable_host.as_deref())?;
     let hostname = pool.string(config.hostname.as_deref())?;
     let workdir = pool.string(config.working_directory.as_deref())?;
     let environment = environment(config)?;
@@ -339,9 +388,23 @@ pub(crate) fn encode(
             Sandbox::SentryOnly => 2,
         },
     );
-    header.u32(NETWORK_ISOLATED_OFFSET, u32::from(config.network_isolated));
+    header.u32(
+        NETWORK_ISOLATED_OFFSET,
+        u32::from(config.network_transport == NetworkTransport::Isolated),
+    );
+    header.u32(
+        NETWORK_TRANSPORT_OFFSET,
+        network_transport(config.network_transport),
+    );
     header.u32(PUBLISH_EXTERNAL_OFFSET, u32::from(config.publish_external));
     header.u32(ROOTFS_OFFSET, rootfs);
+    header.u32(LOWER_LAYERS_OFFSET, lower_layers);
+    header.u32(
+        LOWER_COUNT_OFFSET,
+        u32::try_from(config.lower_layers.len())
+            .map_err(|_| Error::InvalidConfig("too many overlay lower layers"))?,
+    );
+    header.u32(OVERLAY_WORK_OFFSET, overlay_work);
     header.u32(HOSTNAME_OFFSET, hostname);
     header.u32(NETWORK_NAMESPACE_OFFSET, namespace);
     header.u32(PUBLISH_OFFSET, publish);
@@ -354,12 +417,20 @@ pub(crate) fn encode(
     header.u32(FILESYSTEM_GENERATION_OFFSET, filesystem_generation);
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(RESULT_OFFSET, result);
-    header.u32(PUBLISH_COUNT_OFFSET, config.publish.len() as u32);
+    header.u32(
+        PUBLISH_COUNT_OFFSET,
+        u32::try_from(config.publish.len())
+            .map_err(|_| Error::InvalidConfig("too many port publication rules"))?,
+    );
     header.u32(INTERFACES_OFFSET, interfaces);
     header.u32(FILE_OWNERS_OFFSET, file_owners);
-    let process_domain = config.process_domain.unwrap_or(crate::Domain::create()?).identity();
+    let process_domain = config
+        .process_domain
+        .unwrap_or(crate::Domain::create()?)
+        .identity();
     header.u64(PROCESS_DOMAIN_OFFSET, process_domain[0]);
     header.u64(PROCESS_DOMAIN_OFFSET + 8, process_domain[1]);
+    header.u32(EXECUTABLE_HOST_OFFSET, executable_host);
 
     let mut wire = Vec::with_capacity(HEADER_SIZE + pool.0.len());
     wire.extend_from_slice(&header.0);
@@ -488,7 +559,46 @@ mod tests {
     }
 
     #[test]
+    fn host_network_has_a_distinct_typed_wire_encoding() {
+        let wire = encode(
+            &Config::new().host_network(true),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(word(&wire, NETWORK_ISOLATED_OFFSET), 0);
+        assert_eq!(word(&wire, NETWORK_TRANSPORT_OFFSET), 2);
+        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
+        assert_eq!(word(&wire, RESERVED_ABI11_OFFSET), 0);
+        assert_eq!(string(&wire, NETWORK_NAMESPACE_OFFSET), None);
+    }
+
+    #[test]
+    fn overlay_paths_are_ordered_nul_records_in_abi_twelve() {
+        let config = Config::new().overlay(
+            vec!["/lower/high".into(), "/lower/low".into()],
+            "/overlay/upper",
+            "/overlay/work",
+        );
+        let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
+        assert_eq!(word(&wire, ABI_OFFSET), 12);
+        assert_eq!(word(&wire, HEADER_SIZE_OFFSET), 200);
+        assert_eq!(word(&wire, LOWER_COUNT_OFFSET), 2);
+        assert_eq!(string(&wire, ROOTFS_OFFSET), Some("/overlay/upper"));
+        assert_eq!(string(&wire, OVERLAY_WORK_OFFSET), Some("/overlay/work"));
+        let offset = word(&wire, LOWER_LAYERS_OFFSET) as usize;
+        let pool = &wire[HEADER_SIZE..];
+        assert_eq!(
+            &pool[offset..offset + b"/lower/high\0/lower/low\0".len()],
+            b"/lower/high\0/lower/low\0"
+        );
+        assert_eq!(word(&wire, RESERVED_ABI11_OFFSET), 0);
+    }
+
+    #[test]
     fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
+        use std::os::unix::ffi::OsStringExt;
+
         let wire = encode(
             &Config::new().filesystem_generation("/run/hl/filesystem-generation"),
             &[OsString::from("/bin/true")],
@@ -500,7 +610,6 @@ mod tests {
             Some("/run/hl/filesystem-generation")
         );
 
-        use std::os::unix::ffi::OsStringExt;
         let invalid = std::path::PathBuf::from(OsString::from_vec(b"/run/bad\0path".to_vec()));
         assert!(encode(
             &Config::new().filesystem_generation(invalid),

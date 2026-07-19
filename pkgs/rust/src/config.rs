@@ -4,9 +4,19 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 /// Configuration for one Linux launch and its initial process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NetworkTransport {
+    #[default]
+    Virtual,
+    Isolated,
+    Host,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub(crate) rootfs: Option<PathBuf>,
+    pub(crate) lower_layers: Vec<PathBuf>,
+    pub(crate) overlay_work: Option<PathBuf>,
     pub(crate) working_directory: Option<OsString>,
     pub(crate) hostname: Option<OsString>,
     pub(crate) environment: Vec<(OsString, OsString)>,
@@ -16,7 +26,7 @@ pub struct Config {
     pub(crate) uid: Option<i32>,
     pub(crate) gid: Option<i32>,
     pub(crate) rootfs_read_only: bool,
-    pub(crate) network_isolated: bool,
+    pub(crate) network_transport: NetworkTransport,
     pub(crate) network_namespace: Option<network::Namespace>,
     pub(crate) network_bridge: Option<network::Bridge>,
     pub(crate) network_ipv4: Option<Ipv4Addr>,
@@ -29,6 +39,7 @@ pub struct Config {
     pub(crate) mounts: Vec<Mount>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
     pub(crate) process_domain: Option<Domain>,
+    pub(crate) executable_host: Option<PathBuf>,
 }
 
 impl Config {
@@ -39,6 +50,18 @@ impl Config {
     #[must_use]
     pub fn root(mut self, path: impl Into<PathBuf>) -> Self {
         self.rootfs = Some(path.into());
+        self
+    }
+    #[must_use]
+    pub fn overlay(
+        mut self,
+        lower: Vec<PathBuf>,
+        upper: impl Into<PathBuf>,
+        work: impl Into<PathBuf>,
+    ) -> Self {
+        self.rootfs = Some(upper.into());
+        self.lower_layers = lower;
+        self.overlay_work = Some(work.into());
         self
     }
     #[must_use]
@@ -98,7 +121,21 @@ impl Config {
     }
     #[must_use]
     pub const fn network(mut self, value: bool) -> Self {
-        self.network_isolated = value;
+        self.network_transport = if value {
+            NetworkTransport::Isolated
+        } else {
+            NetworkTransport::Virtual
+        };
+        self
+    }
+    /// Use the host network stack, including host loopback, without a virtual namespace.
+    #[must_use]
+    pub const fn host_network(mut self, value: bool) -> Self {
+        self.network_transport = if value {
+            NetworkTransport::Host
+        } else {
+            NetworkTransport::Virtual
+        };
         self
     }
     /// Select the virtual network namespace shared by related engine instances.

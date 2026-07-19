@@ -16,6 +16,10 @@ typedef struct hl_options {
 
 int hl_options_init(hl_options *options);
 int hl_options_clone(hl_options *destination, const hl_options *source);
+/* Snapshot the scoped, process, or centralized default context into an owned store. */
+int hl_options_clone_current(hl_options *destination);
+/* Import supported host environment defaults without replacing explicit values. */
+void hl_options_import_environment(hl_options *options);
 void hl_options_destroy(hl_options *options);
 const char *hl_options_get(const hl_options *options, const char *name);
 int hl_options_set(hl_options *options, const char *name, const char *value, int overwrite);

@@ -19,7 +19,7 @@ static int syscall_should_restart(struct cpu *c) {
     if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) return 0; // execve teardown: don't re-block, unwind out
     // Process-wide pending (g_pending) AND this thread's directed-pending (c->tpending, set by tkill/tgkill):
     // a thread blocked in read/accept/recv must be interrupted by a thread-directed signal too, not only a
-    // process one. For each deliverable-now signal whose guest handler lacks SA_RESTART, return 0 (EINTR).
+    // process one. Scan every signal deliverable-now (unblocked, with a real guest handler).
     uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST);
     int deliverable = 0;    // at least one runnable guest handler is pending
     int all_sa_restart = 1; // ...and every such handler asked for SA_RESTART

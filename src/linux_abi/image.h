@@ -14,5 +14,8 @@ typedef struct hl_linux_image {
 
 void hl_linux_image_release(hl_linux_image *image);
 int hl_linux_image_read(const hl_host_services *host, const char *path, hl_linux_image *image);
+int hl_linux_image_read_handle(const hl_host_services *host, hl_host_handle handle, hl_linux_image *image);
+int hl_linux_image_read_bytes(const void *bytes, size_t size, hl_linux_image *image);
+int hl_linux_image_read_fd(int descriptor, hl_linux_image *image);
 
 #endif

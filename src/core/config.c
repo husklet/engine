@@ -5,18 +5,49 @@
 hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launch_config *out_config,
                                     const char **out_pool) {
     hl_launch_config config;
+    const size_t legacy_size = offsetof(hl_launch_config, network_transport);
     size_t complete_size;
     if (out_config != NULL) memset(out_config, 0, sizeof(*out_config));
     if (out_pool != NULL) *out_pool = NULL;
-    if (wire == NULL || wire_size < sizeof(config)) return HL_STATUS_INVALID_ARGUMENT;
-    memcpy(&config, wire, sizeof(config));
+    if (wire == NULL || wire_size < legacy_size) return HL_STATUS_INVALID_ARGUMENT;
+    memset(&config, 0, sizeof(config));
+    memcpy(&config, wire, wire_size < sizeof(config) ? wire_size : sizeof(config));
     if (config.magic != HL_CONFIG_MAGIC) return HL_STATUS_CORRUPT;
-    if (config.abi != HL_CONFIG_ABI) return HL_STATUS_ABI_MISMATCH;
+    if (config.abi != HL_CONFIG_ABI && config.abi != HL_CONFIG_ABI_NETWORK_TRANSPORT &&
+        config.abi != HL_CONFIG_ABI_LEGACY) return HL_STATUS_ABI_MISMATCH;
+    if (config.abi == HL_CONFIG_ABI_LEGACY) {
+        if (config.header_size != legacy_size || config.reserved != 0) return HL_STATUS_CORRUPT;
+        config.network_transport = config.network_isolated ? HL_CONFIG_NETWORK_ISOLATED : HL_CONFIG_NETWORK_VIRTUAL;
+    } else if (config.abi == HL_CONFIG_ABI_NETWORK_TRANSPORT) {
+        if (config.header_size != offsetof(hl_launch_config, lower_layer_count) || config.reserved != 0 ||
+            config.reserved_abi11 != 0 || config.network_transport > HL_CONFIG_NETWORK_HOST ||
+            config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED))
+            return HL_STATUS_CORRUPT;
+    } else if (config.header_size < sizeof(config) || config.reserved != 0 || config.reserved_abi11 != 0 ||
+               config.reserved_abi12[0] != 0 || config.reserved_abi12[1] != 0 ||
+               config.network_transport > HL_CONFIG_NETWORK_HOST ||
+               config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED) ||
+               config.lower_layer_count > 8 ||
+               ((config.lower_layer_count == 0) != (config.lower_layers_offset == 0)) ||
+               ((config.lower_layer_count == 0) != (config.overlay_work_offset == 0))) {
+        return HL_STATUS_CORRUPT;
+    }
     if ((config.process_domain[0] | config.process_domain[1]) == 0) return HL_STATUS_INVALID_ARGUMENT;
-    if (config.header_size < sizeof(config) || config.header_size > wire_size) return HL_STATUS_CORRUPT;
+    if (config.header_size > wire_size) return HL_STATUS_CORRUPT;
     complete_size = (size_t)config.header_size + config.pool_size;
     if (complete_size < config.header_size || complete_size != wire_size) return HL_STATUS_CORRUPT;
     if (config.pool_size == 0 || ((const char *)wire)[config.header_size] != '\0') return HL_STATUS_CORRUPT;
+    if (config.lower_layer_count != 0) {
+        const char *pool = (const char *)wire + config.header_size;
+        uint32_t offset = config.lower_layers_offset;
+        for (uint32_t index = 0; index < config.lower_layer_count; index++) {
+            const char *end;
+            if (offset == 0 || offset >= config.pool_size) return HL_STATUS_CORRUPT;
+            end = memchr(pool + offset, '\0', config.pool_size - offset);
+            if (end == NULL || end == pool + offset || pool[offset] != '/') return HL_STATUS_CORRUPT;
+            offset = (uint32_t)(end - pool) + 1;
+        }
+    }
     if ((config.publish_count == 0) != (config.publish_offset == 0)) return HL_STATUS_CORRUPT;
     if (config.publish_count != 0) {
         size_t bytes = (size_t)config.publish_count * sizeof(hl_engine_publish_rule);

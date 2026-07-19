@@ -4,12 +4,64 @@
 #include "../epoll.h"
 #include "../watch.h"
 #include "../bus.h"
+#include "../../core/provider_files.h"
 
 static int g_bound_sentinel = -1;
+static void bound_epoll_provider_ready(void *opaque, uint64_t token) {
+    ep_provider_watch *watch = opaque;
+    uint32_t ready;
+    struct kevent trigger;
+    if (!ep_provider_callback_enter(watch, token)) return;
+    if (watch->epoll < 0 || watch->epoll >= HL_NFD ||
+        watch->epoll_generation != g_ep_provider_generations[watch->epoll]) {
+        ep_provider_callback_leave(watch);
+        return;
+    }
+    ready = hl_provider_files_cached_readiness(watch->handle, watch->interests);
+    atomic_fetch_or(&watch->ready, ready);
+    ep_wake_arm(watch->epoll);
+    EV_SET(&trigger, EP_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(watch->epoll, &trigger, 1, NULL, 0, NULL);
+    ep_provider_callback_leave(watch);
+}
+
+static int bound_sentinel_vacate(int target) {
+    if (target < 0 || g_bound_sentinel != target) return 0;
+    int relocated = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, target < 64 ? 64 : target + 1);
+    if (relocated < 0) return -errno;
+    int adopted = hl_host_process_fd_private_adopt(relocated);
+    if (adopted < 0) {
+        close(relocated);
+        return -ENOSPC;
+    }
+    hl_host_process_fd_private_remove(g_bound_sentinel);
+    close(g_bound_sentinel);
+    g_bound_sentinel = adopted;
+    return 0;
+}
+
+/* dup2 may transiently fail with EBUSY when another thread allocates a file
+ * descriptor at the same instant.  Shadow publication is an internal engine
+ * operation, so retry the exact target without exposing a false guest limit.
+ * A persistent collision remains EBUSY after a bounded amount of work. */
+static int bound_shadow_dup2(int target) {
+    unsigned attempt;
+    for (attempt = 0; attempt < 65u; ++attempt) {
+        int descriptor = dup2(g_bound_sentinel, target);
+        if (descriptor >= 0 || errno != EBUSY) return descriptor;
+    }
+    errno = EBUSY;
+    return -1;
+}
+
 /* The sentry translates virtual descriptors before dispatch. A native descriptor may share an integer
  * with a logical typed descriptor in the sentry's forked ABI box; this per-servicer marker prevents that
  * native argument from being mistaken for typed authority. */
 static _Thread_local int g_bound_source_native;
+
+static int bound_source_is_native(void) {
+    return g_bound_source_native;
+}
 static _Thread_local int g_bound_second_native;
 
 typedef struct bound_watch_source {
@@ -375,6 +427,26 @@ static int64_t bound_host_error(int32_t status) {
     case HL_STATUS_RESOURCE_LIMIT: return -ENOMEM;
     case HL_STATUS_NOT_SUPPORTED: return -ENOTSUP;
     case HL_STATUS_INTERRUPTED: return -EINTR;
+    case HL_STATUS_WOULD_BLOCK: return -EAGAIN;
+    case HL_STATUS_OUT_OF_MEMORY: return -ENOMEM;
+    case HL_STATUS_BUSY: return -EBUSY;
+    case HL_STATUS_NOT_DIRECTORY: return -ENOTDIR;
+    case HL_STATUS_IS_DIRECTORY: return -EISDIR;
+    case HL_STATUS_NAME_TOO_LONG: return -ENAMETOOLONG;
+    case HL_STATUS_SYMLINK_LOOP: return -ELOOP;
+    case HL_STATUS_READ_ONLY: return -EROFS;
+    case HL_STATUS_DISCONNECTED: return -EPIPE;
+    case HL_STATUS_PROCESS_LIMIT: return -EMFILE;
+    case HL_STATUS_CROSS_DEVICE: return -EXDEV;
+    case HL_STATUS_NOT_EMPTY: return -ENOTEMPTY;
+    case HL_STATUS_NO_SPACE: return -ENOSPC;
+    case HL_STATUS_QUOTA: return -EDQUOT;
+    case HL_STATUS_FILE_TOO_LARGE: return -EFBIG;
+    case HL_STATUS_TIMED_OUT: return -ETIMEDOUT;
+    case HL_STATUS_CONNECTION_REFUSED: return -ECONNREFUSED;
+    case HL_STATUS_CONNECTION_RESET: return -ECONNRESET;
+    case HL_STATUS_NETWORK_UNREACHABLE: return -ENETUNREACH;
+    case HL_STATUS_ADDRESS_IN_USE: return -EADDRINUSE;
     default: return -EIO;
     }
 }
@@ -891,7 +963,8 @@ static int bound_fdvis_publish_snapshot(int fd, const hl_linux_fd_snapshot *snap
     if (g_host_services->file->metadata(g_host_services->context, snapshot->host_handle, &metadata).status ==
         HL_STATUS_OK) {
         if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
-            metadata.type == HL_HOST_FILE_TYPE_SYMLINK)
+            metadata.type == HL_HOST_FILE_TYPE_SYMLINK || metadata.type == HL_HOST_FILE_TYPE_CHARACTER ||
+            metadata.type == HL_HOST_FILE_TYPE_BLOCK)
             kind = HL_HOST_FD_FILE;
         else if (metadata.type == HL_HOST_FILE_TYPE_FIFO)
             kind = HL_HOST_FD_PIPE;
@@ -902,34 +975,24 @@ static int bound_fdvis_publish_snapshot(int fd, const hl_linux_fd_snapshot *snap
 }
 
 static int bound_shadow_reserve(int minimum) {
-    int candidate;
+    int shadow;
     if (g_bound_sentinel < 0 || minimum < 0) {
         errno = EBADF;
         return -1;
     }
-    /* Allocate in the guest namespace, not by the host kernel's lowest native
-     * descriptor. Opaque and engine-private descriptors may occupy low host
-     * numbers but are not guest-visible. Relocate known engine descriptors,
-     * skip live native guest descriptors and typed reservations, then install
-     * the sentinel shadow at the exact lowest logical slot. */
-    for (candidate = minimum; candidate < guest_nofile_cur(); ++candidate) {
-        hl_linux_fd_snapshot snapshot;
-        int shadow;
-        if (bound_snapshot((uint64_t)(unsigned)candidate, &snapshot)) continue;
-        engine_fd_vacate(candidate);
-        if (fcntl(candidate, F_GETFD) >= 0 || errno != EBADF) continue;
-        shadow = dup2(g_bound_sentinel, candidate);
-        if (shadow < 0) return -1;
-        if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) {
-            int error = errno;
-            close(shadow);
-            errno = error;
-            return -1;
-        }
-        return shadow;
+    /* Every live typed slot already owns a sentinel shadow, while private
+     * engine descriptors are rehomed above the guest interval.  Let the host
+     * kernel select and reserve the lowest free slot atomically: scanning and
+     * then dup2 allowed a concurrent open to claim the candidate in between,
+     * after which a successful dup2 silently replaced the other thread's fd. */
+    shadow = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, minimum);
+    if (shadow < 0) return -1;
+    if (shadow >= guest_nofile_cur()) {
+        close(shadow);
+        errno = EMFILE;
+        return -1;
     }
-    errno = EMFILE;
-    return -1;
+    return shadow;
 }
 
 static int bound_shadow_matches(int fd) {
@@ -948,7 +1011,7 @@ static int bound_shadow_install(int fd) {
         return -1;
     }
     engine_fd_vacate(fd);
-    shadow = dup2(g_bound_sentinel, fd);
+    shadow = bound_shadow_dup2(fd);
     if (shadow < 0) return -1;
     if (fcntl(shadow, F_SETFD, FD_CLOEXEC) != 0) {
         int error = errno;
@@ -1000,13 +1063,15 @@ static int bound_shadow_activate(void) {
         return -1;
     }
     close(opened);
-    if (hl_host_process_fd_private_add(g_bound_sentinel) != 0) {
+    int adopted = hl_host_process_fd_private_adopt(g_bound_sentinel);
+    if (adopted < 0) {
         int error = ENOSPC;
         close(g_bound_sentinel);
         g_bound_sentinel = -1;
         errno = error;
         return -1;
     }
+    g_bound_sentinel = adopted;
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
@@ -1145,6 +1210,10 @@ static int bound_handle_dirfd_error(int fd) {
     hl_linux_fd_snapshot snapshot;
     hl_host_file_metadata metadata;
     if (fd < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return -EBADF;
+    /* Stdio channels, pipes, sockets, and device handles are known
+       non-directories from the descriptor table itself.  Do not submit their
+       provider-specific opaque handle to the host-file metadata port. */
+    if (snapshot.kind != HL_HOST_FD_FILE) return -ENOTDIR;
     if (g_host_services == NULL || g_host_services->file == NULL || g_host_services->file->metadata == NULL)
         return -ENOTDIR;
     hl_host_result result = g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata);
@@ -1195,7 +1264,11 @@ static int64_t bound_relocate_lowest(int64_t opened) {
     int shadow;
     int64_t duplicated;
     hl_linux_fd_snapshot snapshot;
+    char guest_path[sizeof g_fdpath[0]];
+    guest_path[0] = 0;
     if (opened < 0) return opened;
+    if (opened < HL_NFD && g_fdpath[(int)opened][0])
+        snprintf(guest_path, sizeof guest_path, "%s", g_fdpath[(int)opened]);
     shadow = bound_shadow_reserve(0);
     if (shadow < 0) return opened;
     if (proc_fdvis_reserve(&fdvis) != 0) {
@@ -1215,6 +1288,9 @@ static int64_t bound_relocate_lowest(int64_t opened) {
     (void)hl_linux_close(g_linux_box, (hl_linux_fd)opened);
     proc_fdvis_close((int)opened);
     (void)close((int)opened);
+    if (opened < HL_NFD) g_fdpath[(int)opened][0] = 0;
+    if (duplicated >= 0 && duplicated < HL_NFD && guest_path[0])
+        snprintf(g_fdpath[(int)duplicated], sizeof g_fdpath[(int)duplicated], "%s", guest_path);
     {
         hl_linux_fd_snapshot duplicate;
         hl_host_file_metadata metadata = {0};
@@ -1792,7 +1868,8 @@ static int64_t bound_fsize_gate(struct cpu *c, const hl_linux_fd_snapshot *sourc
     return count > room ? (int64_t)room : (int64_t)count;
 }
 
-static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                       uint64_t a4) {
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = !g_bound_source_native && bound_snapshot(a0, &source);
@@ -1881,9 +1958,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 pthread_mutex_unlock(&g_bound_mapping_gate);
                 return 1;
             }
+            uint64_t operation_size = a1;
+            if (nr == 215 && offset == 0 && a1 == hl_gmap_find_guest_length(a0))
+                operation_size = mapping->size;
             if (nr == 215)
                 operation = g_host_services->memory->unmap_range(g_host_services->context, mapping->object->handle,
-                                                                 mapping->object_offset + offset, a1);
+                                                                 mapping->object_offset + offset, operation_size);
             else
                 operation = g_host_services->memory->sync(g_host_services->context, mapping->object->handle,
                                                           mapping->object_offset + offset, a1);
@@ -1891,9 +1971,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 hl_host_handle retired = mapping->object->handle;
                 mapping->object->handle = HL_HOST_HANDLE_INVALID;
                 (void)g_host_services->memory->discard(g_host_services->context, retired);
-                bound_mapping_retire(a0, a1);
-                hl_gmap_unmap_range(a0, a0 + a1);
-                gbus_clear(a0, a0 + a1);
+                bound_mapping_retire(a0, operation_size);
+                hl_gmap_unmap_range(a0, a0 + operation_size);
+                gbus_clear(a0, a0 + operation_size);
             }
             G_RET(c) = (uint64_t)bound_host_error(operation.status);
             pthread_mutex_unlock(&g_bound_mapping_lock);
@@ -1958,13 +2038,28 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (source_bound || destination_bound) {
             char old_path[HL_LINUX_PATH_MAX + 1], new_path[HL_LINUX_PATH_MAX + 1];
             size_t old_size, new_size;
+            result = bound_path_copy(a1, old_path, &old_size);
+            if (result == 0) result = bound_path_copy(a3, new_path, &new_size);
+            if (result == 0 && source_bound && old_path[0] != '/') {
+                int error = bound_handle_dirfd_error((int)a0);
+                if (error != -EACCES) result = error;
+            }
+            if (result == 0 && destination_bound && new_path[0] != '/') {
+                int error = bound_handle_dirfd_error((int)a2);
+                if (error != -EACCES) result = error;
+            }
+            if (result != 0) {
+                G_RET(c) = (uint64_t)result;
+                return 1;
+            }
+            /* Absolute operands ignore their corresponding dirfd.  Let the
+               ordinary jailed path resolver handle mixed bound/native fds in
+               that case instead of rejecting a descriptor Linux never reads. */
+            if (old_path[0] == '/' || new_path[0] == '/') return 0;
             if (!source_bound || !destination_bound) {
                 G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
                 return 1;
             }
-            result = bound_path_copy(a1, old_path, &old_size);
-            if (result == 0) result = bound_path_copy(a3, new_path, &new_size);
-            if (result == 0 && (old_path[0] == '/' || new_path[0] == '/')) return 0;
             if (nr == 37) {
                 uint64_t flags = G_A4(c);
                 if ((flags & ~UINT64_C(0x400)) != 0)
@@ -2033,6 +2128,48 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_fd_snapshot watched;
         if (bound_snapshot(a2, &watched)) {
             int64_t epoll_result = -ENOSYS;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD && (int)a2 >= 0 && (int)a2 < HL_NFD &&
+                hl_provider_files_is_handle(watched.host_handle)) {
+                uint32_t epoll_generation = g_ep_provider_generations[(int)a0];
+                ep_provider_watch *watch = ep_provider_find(g_ep_provider_watches, EP_PROVIDER_WATCH_LIMIT,
+                                                            (int)a0, epoll_generation, (int)a2,
+                                                            watched.descriptor_generation);
+                if (a1 == HL_LINUX_EPOLL_DELETE) {
+                    if (watch == NULL) epoll_result = -ENOENT;
+                    else {
+                        ep_provider_retire(watch);
+                        epoll_result = 0;
+                    }
+                } else if ((a1 == HL_LINUX_EPOLL_ADD || a1 == HL_LINUX_EPOLL_MODIFY) && a3 != 0) {
+                    uint32_t events = *(uint32_t *)(uintptr_t)a3;
+                    uint64_t data;
+                    memcpy(&data, (const void *)((uintptr_t)a3 + G_EPEV_DOFF), sizeof(data));
+                    if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL) epoll_result = -EEXIST;
+                    else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL) epoll_result = -ENOENT;
+                    else {
+                        ep_provider_watch *previous = watch;
+                        ep_provider_watch *replacement =
+                            ep_provider_alloc(g_ep_provider_watches, EP_PROVIDER_WATCH_LIMIT);
+                        if (replacement == NULL) {
+                            G_RET(c) = (uint64_t)(int64_t)-ENOSPC;
+                            return 1;
+                        }
+                        uint32_t serial = g_ep_provider_serial = ep_provider_next(g_ep_provider_serial);
+                        uint32_t interests = ((events & 1u) ? HL_LINUX_READY_READ : 0u) |
+                                             ((events & 4u) ? HL_LINUX_READY_WRITE : 0u);
+                        ep_provider_activate(replacement, (int)a0, epoll_generation, (int)a2,
+                                             watched.descriptor_generation, serial, watched.host_handle,
+                                             events, interests, data);
+                        ep_wake_arm((int)a0);
+                        epoll_result = hl_provider_files_subscribe(replacement->handle, replacement->interests,
+                            bound_epoll_provider_ready, replacement, atomic_load(&replacement->serial)) == 0 ? 0 : -EIO;
+                        if (epoll_result != 0) ep_provider_retire(replacement);
+                        else if (previous != NULL) ep_provider_retire(previous);
+                    }
+                } else epoll_result = -EINVAL;
+                G_RET(c) = (uint64_t)epoll_result;
+                return 1;
+            }
             if (a1 == HL_LINUX_EPOLL_ADD && g_host_services != NULL && g_host_services->file != NULL &&
                 g_host_services->file->metadata != NULL) {
                 hl_host_file_metadata metadata;
@@ -2048,6 +2185,33 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
+    case 7:   /* fsetxattr */
+    case 10:  /* fgetxattr */
+    case 13:  /* flistxattr */
+    case 16: { /* fremovexattr */
+        char path[HL_LINUX_PATH_MAX + 1];
+        hl_host_result named;
+        if (g_host_services->file->path == NULL) {
+            result = -ENOSYS;
+            break;
+        }
+        named = g_host_services->file->path(g_host_services->context, source.host_handle,
+                                            (hl_host_bytes){path, HL_LINUX_PATH_MAX});
+        if (named.status != HL_STATUS_OK || named.value > HL_LINUX_PATH_MAX) {
+            result = bound_host_error(named.status);
+            break;
+        }
+        path[named.value] = 0;
+        if (nr == 7)
+            result = guest_xattr_set(path, (const char *)a1, (const void *)a2, (size_t)a3, a4, 0);
+        else if (nr == 10)
+            result = guest_xattr_get(path, (const char *)a1, (void *)a2, (size_t)a3, 0);
+        else if (nr == 13)
+            result = guest_xattr_list(path, (char *)a1, (size_t)a2, 0);
+        else
+            result = guest_xattr_remove(path, (const char *)a1, 0);
+        break;
+    }
     case 33: {
         char path[HL_LINUX_PATH_MAX + 1];
         size_t path_size;
@@ -2122,6 +2286,18 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
+        if (nr == 452 && (flags & UINT64_C(0x1000)) != 0 && a1 != 0 &&
+            host_range_mapped((uintptr_t)a1, 1) && *(const char *)(uintptr_t)a1 == '\0') {
+            if (g_host_services->file->set_permissions == NULL) {
+                result = -ENOSYS;
+                break;
+            }
+            result = bound_host_error(g_host_services->file
+                                          ->set_permissions(g_host_services->context, source.host_handle,
+                                                            (uint32_t)a2 & 07777u)
+                                          .status);
+            break;
+        }
         result = bound_path_copy(a1, path, &path_size);
         if (result != 0) break;
         if (path[0] == '/') return 0;
@@ -2191,6 +2367,26 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         int empty = result == -HL_LINUX_ENOENT && (a3 & UINT64_C(0x1000)) != 0;
         if (result != 0 && !empty) break;
         if (!empty && path[0] == '/') return 0;
+        if (!empty) {
+            char backing[HL_LINUX_PATH_MAX + 1];
+            if (bound_handle_host_path(source.host_handle, backing, sizeof backing) == 0 &&
+                strstr(backing, "/.hl-proc-fd") != NULL) {
+                char synthetic[HL_LINUX_PATH_MAX + 1];
+                struct stat status;
+                int written = snprintf(synthetic, sizeof synthetic, "/proc/self/fd/%s", path);
+                int measured = written > 0 && (size_t)written < sizeof synthetic
+                                   ? ((a3 & UINT64_C(0x100)) != 0 ? synth_stat_raw(synthetic, &status)
+                                                                  : procfd_follow_stat(synthetic, &status))
+                                   : 0;
+                if (measured <= 0) {
+                    result = -ENOENT;
+                } else {
+                    fill_linux_stat((uint8_t *)(uintptr_t)a2, &status, NULL, -1);
+                    result = 0;
+                }
+                break;
+            }
+        }
         hl_host_handle target = source.host_handle;
         int close_target = 0;
         if (!empty) {
@@ -2291,6 +2487,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         }
         result = hl_linux_openat_reserved(g_linux_box, &reservation, (int32_t)source.fd, path, path_size, flags,
                                           (uint32_t)a3);
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "openat-bound path=%s flags=%#x result=%lld", path, flags,
+                (long long)result);
         if (result < 0) {
             (void)hl_linux_fd_cancel(g_linux_box, &reservation);
             close(shadow);
@@ -2317,6 +2515,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     }
     case 57: /* close */
+        ep_provider_retire_endpoint((int)source.fd);
         flock_broker_detach(&source);
         if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
             hl_host_file_metadata metadata;
@@ -2707,7 +2906,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             }
         } else if (request == 0x5401u || request == 0x5402u || request == 0x5403u ||
                    request == 0x5404u || request == 0x5413u || request == 0x5414u ||
-                   request == 0x540fu || request == 0x5410u || request == 0x540eu) {
+                   request == 0x540fu || request == 0x5410u || request == 0x540eu ||
+                   request == 0x802c542au || request == 0x402c542bu || request == 0x402c542cu ||
+                   request == 0x402c542du) {
             int native_fd = -1;
             int borrowed = bound_attachment_borrow((int)source.fd, &native_fd);
             if (borrowed < 0) {
@@ -2728,6 +2929,14 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
 #endif
                     result = 0;
                 }
+            } else if (request == 0x802c542au || (request >= 0x402c542bu && request <= 0x402c542du)) {
+                /* Linux termios2 has an encoded 44-byte payload. On the Linux/aarch64 host its ABI is
+                 * byte-identical to the aarch64 guest ABI, so preserve the extended speed fields and
+                 * forward the complete request instead of narrowing it through struct termios. */
+                if (!host_range_mapped((uintptr_t)a2, 44))
+                    result = -EFAULT;
+                else
+                    result = ioctl(native_fd, request, (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
             } else if (request >= 0x5402u && request <= 0x5404u) { /* TCSETS{,W,F} */
                 struct termios native;
                 if (!host_range_mapped((uintptr_t)a2, 36))
@@ -2851,7 +3060,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             } else {
                 engine_fd_vacate(target);
                 fd_reset_emul(target);
-                shadow = dup2(g_bound_sentinel, target);
+                shadow = bound_shadow_dup2(target);
                 if (shadow < 0) {
                     proc_fdvis_reservation_cancel(&fdvis);
                     result = -(int64_t)errno;

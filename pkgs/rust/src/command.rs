@@ -1,5 +1,6 @@
 use crate::{Child, Config, Container, Engine, Error, Exit, Guest, Mount, Output, Size, Stdio};
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 /// A configured guest process command.
 pub struct Command {
@@ -89,6 +90,10 @@ impl Command {
     }
     fn resolved(mut self) -> Result<Self, Error> {
         self.container.clone().resolve(&mut self.config)?;
+        let executable = PathBuf::from(&self.program);
+        if self.config.rootfs.is_none() && executable.is_absolute() && executable.is_file() {
+            self.config.executable_host = Some(executable);
+        }
         Ok(self)
     }
     /// Starts the configured guest process.
@@ -104,6 +109,8 @@ impl Command {
             this.args,
             (this.stdin, this.stdout, this.stderr),
             this.terminal,
+            Vec::new(),
+            None,
         )
     }
     /// Runs the command and returns its typed status.

@@ -284,6 +284,8 @@ static void sentry_ctl_op(uint32_t op, uint64_t a0, uint64_t a1) {
     atomic_store_explicit(&R->busy, 0, memory_order_release);
 }
 
+
+
 // SCM_RIGHTS fd passing over a control socketpair. sentry_send_fd lends one fd; sentry_recv_fd borrows it.
 // A NULL control message (fd<0) is still sent so the worker's recv stays in lockstep with the round-trip.
 static void sentry_send_fd(int sock, int fd) {
@@ -452,6 +454,7 @@ static int sentry_forwarded(uint64_t nr) {
     case 29:  // ioctl        (FIONBIO/FIONREAD/winsize/termios arg in/out)
     case 59:  // pipe2        (out int[2] -- both ends sentry-owned)
     case 199: // socketpair   (out int[2] -- both ends sentry-owned)
+    case 436: // close_range  (operates transactionally on the process virtual-fd table)
         return 1;
     // --- handled SPECIALLY in syscall_route (NOT via this table): 220/435 clone(fork) lane, 221 execve
     //     (stays local -- it reloads the guest image in-process, keeping the worker's ring/sentry), 260
@@ -533,6 +536,7 @@ struct sentry_proc {
     uint8_t borrowed[SENTRY_VFD_MAX]; // 1 = inherited/borrowed real fd (stdio): never close() it on drop
     uint8_t cloexec[SENTRY_VFD_MAX];  // 1 = FD_CLOEXEC set (O_CLOEXEC open / F_SETFD): swept on guest execve
     uint8_t typed[SENTRY_VFD_MAX];    // 1 = real[] names an opaque ABI descriptor shadow, not a native fd
+    uint8_t procfd_dir[SENTRY_VFD_MAX]; // 1 = open description is the synthetic /proc/self/fd directory
 };
 static struct sentry_proc g_proc[SENTRY_NPROC];
 static pthread_mutex_t g_fd_lock = PTHREAD_MUTEX_INITIALIZER; // guards g_proc[] (alloc / lookup / map)
@@ -546,6 +550,7 @@ static void proc_init_table(struct sentry_proc *p, pid_t wpid) {
         p->borrowed[i] = 0;
         p->cloexec[i] = 0;
         p->typed[i] = 0;
+        p->procfd_dir[i] = 0;
     }
     for (int i = 0; i < 3; i++) {
         p->real[i] = i;
@@ -576,6 +581,8 @@ static struct sentry_proc *proc_find_locked(pid_t wpid) {
     return free_slot;
 }
 
+
+
 // Allocate the lowest free virtual fd >= minv, map it to (owned, closeable) real fd `rfd`. Returns vfd, or -1
 // if the table is full (caller closes `rfd` and returns -EMFILE -- never leaks the real fd to the guest).
 static int vfd_alloc(struct sentry_proc *p, int rfd, uint32_t minv) {
@@ -596,6 +603,38 @@ static int vfd_real(struct sentry_proc *p, int vfd) {
     return p->real[vfd];
 }
 
+// Translate an exact procfs descriptor link from the guest's virtual descriptor namespace into the
+// sentry's real descriptor namespace.  The path is consumed later by service_local(), whose procfs
+// implementation necessarily sees sentry-owned descriptors; forwarding the guest number unchanged can
+// therefore alias an unrelated internal descriptor.  Return 1 when translated, 0 for a non-procfd path,
+// and -1 when the path names an unmapped guest descriptor.
+static int vfd_proc_path(struct sentry_proc *p, char *path, size_t cap) {
+    static const char dev_prefix[] = "/dev/fd/";
+    static const char self_prefix[] = "/proc/self/fd/";
+    const char *digits = NULL;
+    size_t prefix_len = 0;
+    if (strncmp(path, dev_prefix, sizeof dev_prefix - 1) == 0) {
+        digits = path + sizeof dev_prefix - 1;
+        prefix_len = sizeof dev_prefix - 1;
+    } else if (strncmp(path, self_prefix, sizeof self_prefix - 1) == 0) {
+        digits = path + sizeof self_prefix - 1;
+        prefix_len = sizeof self_prefix - 1;
+    } else {
+        return 0;
+    }
+    if (*digits < '0' || *digits > '9') return 0;
+    uint32_t vfd = 0;
+    for (const char *s = digits; *s; s++) {
+        if (*s < '0' || *s > '9') return 0; // only an exact descriptor-link leaf is translated
+        if (vfd >= SENTRY_VFD_MAX || vfd > (UINT32_MAX - (uint32_t)(*s - '0')) / 10u) return -1;
+        vfd = vfd * 10u + (uint32_t)(*s - '0');
+    }
+    int real = vfd_real(p, (int)vfd);
+    if (real < 0) return -1;
+    int n = snprintf(path + prefix_len, cap - prefix_len, "%d", real);
+    return n >= 0 && (size_t)n < cap - prefix_len ? (p->typed[vfd] ? 1 : 2) : -1;
+}
+
 // Drop a guest virtual fd from the table. Returns the real fd the caller must close(), or -1 if the entry was
 // BORROWED (stdio) or unmapped -- in which case the caller must NOT close the real fd.
 static int vfd_drop(struct sentry_proc *p, int vfd) {
@@ -605,7 +644,13 @@ static int vfd_drop(struct sentry_proc *p, int vfd) {
     p->borrowed[vfd] = 0;
     p->cloexec[vfd] = 0;
     p->typed[vfd] = 0;
+    p->procfd_dir[vfd] = 0;
     return rfd;
+}
+
+static void sentry_real_close(int descriptor) {
+    hl_native_kqueue_close(descriptor);
+    close(descriptor);
 }
 
 // fork inheritance (P2): give the CHILD process its own table as a dup-COPY of the parent's virtual->real
@@ -633,6 +678,7 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
             if (pp->real[v] < 0) continue;
             cp->cloexec[v] = pp->cloexec[v]; // FD_CLOEXEC is inherited across fork (Linux fd semantics)
             cp->typed[v] = pp->typed[v];
+            cp->procfd_dir[v] = pp->procfd_dir[v];
             if (pp->borrowed[v]) {
                 cp->real[v] = pp->real[v];
                 cp->borrowed[v] = 1;
@@ -644,6 +690,7 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
                             : dup(pp->real[v]);
                 cp->real[v] = d;
                 cp->borrowed[v] = (d < 0); // dup failure: leave the slot unusable but never closeable
+                if (d >= 0) hl_native_kqueue_duplicate(pp->real[v], d);
                 if (d >= 0 && d < HL_NFD && pp->real[v] >= 0 && pp->real[v] < HL_NFD) {
                     strcpy(g_fdpath[d], g_fdpath[pp->real[v]]);
                     strcpy(g_proc_text_desc[d], g_proc_text_desc[pp->real[v]]);
@@ -664,7 +711,7 @@ static void sentry_proc_release(pid_t wpid) {
     struct sentry_proc *p = proc_lookup_locked(wpid);
     if (p) {
         for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++)
-            if (p->real[v] >= 0 && !p->borrowed[v]) close(p->real[v]);
+            if (p->real[v] >= 0 && !p->borrowed[v]) sentry_real_close(p->real[v]);
         p->inuse = 0;
     }
     pthread_mutex_unlock(&g_fd_lock);
@@ -680,8 +727,8 @@ static void sentry_proc_exec_sweep(pid_t wpid) {
     if (p)
         for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++)
             if (p->real[v] >= 0 && p->cloexec[v]) {
-                int rfd = vfd_drop(p, (int)v); // clears real/borrowed/cloexec; returns the fd to close (-1 if borrowed)
-                if (rfd >= 0) close(rfd);
+                int rfd = vfd_drop(p, (int)v);
+                if (rfd >= 0) sentry_real_close(rfd);
             }
     pthread_mutex_unlock(&g_fd_lock);
 }
@@ -855,6 +902,37 @@ static void sentry_service_one(struct sentry_ring *R) {
         R->nserved++;
         return;
     }
+    if (R->rawnr == SENTRY_OP_REAP) {
+        sentry_proc_release((pid_t)R->a[0]);
+        R->ret = 0;
+        R->nserved++;
+        return;
+    }
+    if (R->rawnr == 436) { /* close_range over this process's virtual descriptor table */
+        uint32_t first = (uint32_t)R->a[0], last = (uint32_t)R->a[1];
+        uint32_t flags = (uint32_t)R->a[2];
+        if ((flags & ~(uint32_t)(2u | 4u)) != 0 || first > last) {
+            R->ret = -EINVAL;
+        } else {
+            if (last >= SENTRY_VFD_MAX) last = SENTRY_VFD_MAX - 1;
+            pthread_mutex_lock(&g_fd_lock);
+            struct sentry_proc *p = proc_lookup_locked((pid_t)R->wpid);
+            if (p != NULL && first < SENTRY_VFD_MAX)
+                for (uint32_t v = first; v <= last; ++v) {
+                    if (p->real[v] < 0) continue;
+                    if ((flags & 4u) != 0) {
+                        p->cloexec[v] = 1;
+                    } else {
+                        int real = vfd_drop(p, (int)v);
+                        if (real >= 0) sentry_real_close(real);
+                    }
+                }
+            pthread_mutex_unlock(&g_fd_lock);
+            R->ret = 0;
+        }
+        R->nserved++;
+        return;
+    }
     struct cpu tmp;
     memset(&tmp, 0, sizeof tmp);
     G_RAWNR(&tmp) = R->rawnr; // service_local() re-runs G_NORMALIZE on this as a no-op (already *at)
@@ -966,9 +1044,12 @@ static void sentry_service_one(struct sentry_ring *R) {
             if (have[1] && G_A2(&tmp) > (uint64_t)(SENTRY_BUFSZ / SENTRY_EPEV_SZ))
                 G_A2(&tmp) = SENTRY_BUFSZ / SENTRY_EPEV_SZ;
             break;
+        case 48:
         case 56:
+        case 78:
         case 79:
         case 291:                           // openat / newfstatat / statx: force the in-path NUL-terminated within
+        case 439:
             R->buf[SENTRY_PATHCAP - 1] = 0; // its window so service_local()'s C-string walk can't run off buf
             break;
         default: break;
@@ -1112,7 +1193,7 @@ static void sentry_service_one(struct sentry_ring *R) {
         int eb = (p == NULL);
         g_bound_source_native = 0;
         g_bound_second_native = 0;
-        if (p && (fd_in_a0(snr) || snr == 56 || snr == 79 || snr == 291)) {
+        if (p && (fd_in_a0(snr) || snr == 48 || snr == 56 || snr == 78 || snr == 79 || snr == 291 || snr == 439)) {
             int v = (int)(int64_t)G_A0(&tmp);
             if (v >= 0 && (uint32_t)v < SENTRY_VFD_MAX && p->real[v] >= 0 && !p->typed[v])
                 g_bound_source_native = 1;
@@ -1133,16 +1214,80 @@ static void sentry_service_one(struct sentry_ring *R) {
                 }
                 break;
             }
+            case 48:
             case 56:
+            case 78:
             case 79:
-            case 291: { // openat/newfstatat/statx: a0 = dirfd; AT_FDCWD (<0) passes through
+            case 291:
+            case 439: { // *at path operations: a0 = dirfd; AT_FDCWD (<0) passes through
+                int path_fd = vfd_proc_path(p, (char *)G_A1(&tmp), SENTRY_PATHCAP);
+                if (path_fd < 0) {
+                    handled_local = 1;
+                    local_ret = -ENOENT;
+                    break;
+                }
+                if (path_fd == 2) g_bound_source_native = 1;
                 int d = (int)(int64_t)G_A0(&tmp);
                 if (d >= 0) {
                     int r = vfd_real(p, d);
                     if (r < 0)
                         eb = 1;
-                    else
+                    else {
+                        char *relative = (char *)G_A1(&tmp);
+                        int procfd_directory = p->procfd_dir[d];
+                        if (!procfd_directory && relative[0] != '/') {
+                            char descriptor_path[64];
+                            char backing[HL_LINUX_PATH_MAX + 1];
+                            int descriptor_length = snprintf(descriptor_path, sizeof descriptor_path,
+                                                             "/proc/self/fd/%d", r);
+                            ssize_t backing_length = descriptor_length > 0 &&
+                                                             (size_t)descriptor_length < sizeof descriptor_path
+                                                         ? readlink(descriptor_path, backing, sizeof backing - 1u)
+                                                         : -1;
+                            if (backing_length > 0) {
+                                backing[backing_length] = 0;
+                                procfd_directory = strstr(backing, "/.hl-proc-fd") != NULL;
+                            }
+                        }
+                        if (relative[0] != '/' && procfd_directory) {
+                            char joined[SENTRY_PATHCAP];
+                            int length = snprintf(joined, sizeof joined, "/proc/self/fd/%s", relative);
+                            if (length < 0 || (size_t)length >= sizeof joined) {
+                                handled_local = 1;
+                                local_ret = -ENAMETOOLONG;
+                                break;
+                            }
+                            memcpy(relative, joined, (size_t)length + 1u);
+                            int translated = vfd_proc_path(p, relative, SENTRY_PATHCAP);
+                            if (translated < 0) {
+                                handled_local = 1;
+                                local_ret = -ENOENT;
+                                break;
+                            }
+                            if (translated == 2) g_bound_source_native = 1;
+                            G_A0(&tmp) = (uint64_t)(int64_t)-100;
+                            break;
+                        }
+                        const char *directory = r < HL_NFD ? g_fdpath[r] : NULL;
+                        if (relative[0] != '/' && directory != NULL && directory[0]) {
+                            if (g_rootfs && !strncmp(directory, g_rootfs_canon, g_rootfs_canon_len))
+                                directory += g_rootfs_canon_len;
+                            if (!strncmp(directory, "/proc/", 6) || !strcmp(directory, "/proc") ||
+                                !strncmp(directory, "/dev/fd", 7)) {
+                                char joined[SENTRY_PATHCAP];
+                                int length = snprintf(joined, sizeof joined, "%s/%s", directory, relative);
+                                if (length < 0 || (size_t)length >= sizeof joined) {
+                                    handled_local = 1;
+                                    local_ret = -ENAMETOOLONG;
+                                    break;
+                                }
+                                memcpy(relative, joined, (size_t)length + 1u);
+                                G_A0(&tmp) = (uint64_t)(int64_t)-100;
+                                break;
+                            }
+                        }
                         G_A0(&tmp) = (uint64_t)(int64_t)r;
+                    }
                 }
                 break;
             }
@@ -1356,6 +1501,11 @@ static void sentry_service_one(struct sentry_ring *R) {
                         R->ret = -EMFILE;
                     } else {
                         p->cloexec[v] = (G_A1(&tmp) == 1030); // F_DUPFD_CLOEXEC sets FD_CLOEXEC on the new fd
+                        int source_vfd = (int)(int64_t)R->a[0];
+                        if (source_vfd >= 0 && (uint32_t)source_vfd < SENTRY_VFD_MAX) {
+                            p->typed[v] = p->typed[source_vfd];
+                            p->procfd_dir[v] = p->procfd_dir[source_vfd];
+                        }
                         R->ret = v;
                     }
                 } else if (G_A1(&tmp) == 2 /* F_SETFD */) {
@@ -1385,6 +1535,8 @@ static void sentry_service_one(struct sentry_ring *R) {
                     } else {
                         // pipe2(fds,flags): flags=a1; socketpair(dom,type,proto,fds): SOCK_CLOEXEC rides type=a1.
                         uint8_t cx = (R->a[1] & LX_O_CLOEXEC) != 0;
+                        p->typed[v0] = 0;
+                        p->typed[v1] = 0;
                         p->cloexec[v0] = cx;
                         p->cloexec[v1] = cx;
                         *(int *)(R->buf) = v0;
@@ -1502,6 +1654,28 @@ static void sentry_init(void) {
         if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ctl[i]) < 0) {
             g_ctl[i][0] = -1;
             g_ctl[i][1] = -1;
+        } else {
+            int worker = hl_host_process_fd_private_adopt(g_ctl[i][0]);
+            int service = hl_host_process_fd_private_adopt(g_ctl[i][1]);
+            if (worker < 0 || service < 0) {
+                if (worker >= 0) {
+                    hl_host_process_fd_private_remove(worker);
+                    close(worker);
+                } else {
+                    close(g_ctl[i][0]);
+                }
+                if (service >= 0) {
+                    hl_host_process_fd_private_remove(service);
+                    close(service);
+                } else {
+                    close(g_ctl[i][1]);
+                }
+                g_ctl[i][0] = -1;
+                g_ctl[i][1] = -1;
+            } else {
+                g_ctl[i][0] = worker;
+                g_ctl[i][1] = service;
+            }
         }
     }
     g_worker_pid = getpid();
@@ -1641,6 +1815,39 @@ static void syscall_route(struct cpu *c) {
     if (G_NORMALIZE(c)) return;
     uint64_t nr = G_NR(c);
 
+    /* service_local normally rebases pointer arguments from a biased ET_EXEC's Linux link range to the
+     * host mapping. Forwarded calls are marshaled before service_local runs, so perform the same operation
+     * at the trust boundary; otherwise static x86 strings/buffers are copied from their unmapped low link
+     * addresses (observed as empty paths and zero-filled pipe writes after exec). */
+    if (g_nonpie_lo) {
+        switch (nr) {
+        case 48: case 56: case 439: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 78: case 79:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A2(c) = nonpie_p(G_A2(c));
+            break;
+        case 291:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A4(c) = nonpie_p(G_A4(c));
+            break;
+        case 61: case 63: case 64: case 67: case 68: case 80:
+        case 200: case 202: case 203: case 204: case 205:
+            G_A1(c) = nonpie_p(G_A1(c));
+            break;
+        case 206: case 207:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A4(c) = nonpie_p(G_A4(c));
+            break;
+        case 208: case 209: G_A3(c) = nonpie_p(G_A3(c)); break;
+        case 21: G_A3(c) = nonpie_p(G_A3(c)); break;
+        case 22: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 59: G_A0(c) = nonpie_p(G_A0(c)); break;
+        case 199: G_A3(c) = nonpie_p(G_A3(c)); break;
+        case 211: case 212: G_A1(c) = nonpie_p(G_A1(c)); break;
+        default: break;
+        }
+    }
+
     // exit(93)/exit_group(94): service_local() _exit()s this worker. exit_group ends the PROCESS so the
     // owner reaps the sentry FIRST (sentry_shutdown is owner-gated -> a forked child just releases its
     // lane). exit(93) ends only THIS THREAD: free its lane but DON'T tear the sentry down (siblings need it).
@@ -1725,7 +1932,23 @@ static void syscall_route(struct cpu *c) {
                 G_RET(c) = (uint64_t)(-ECHILD);
                 return;
             }
-            atomic_fetch_sub(&g_guest_children, 1);
+            // A normally exiting worker sends SENTRY_OP_EXIT itself. A worker killed by a signal cannot
+            // run that cleanup, so its sentry-owned descriptor copy would otherwise remain live forever
+            // (notably keeping pipe writers open after waitpid returned). A successful wait without
+            // WUNTRACED/WCONTINUED necessarily reaped a terminated child. With either reporting option,
+            // inspect the Linux status when supplied; for a NULL status, a reaped pid no longer exists.
+            int terminated = (G_A2(c) & (2u | 8u)) == 0;
+            if (!terminated && G_A1(c) && host_range_mapped((uintptr_t)G_A1(c), sizeof(int))) {
+                int status = *(const int *)G_A1(c);
+                terminated = (status & 0xff) != 0x7f && status != 0xffff;
+            } else if (!terminated && !G_A1(c)) {
+                errno = 0;
+                terminated = kill((pid_t)r, 0) < 0 && errno == ESRCH;
+            }
+            if (terminated) {
+                sentry_ctl_op(SENTRY_OP_REAP, (uint64_t)(uint32_t)r, 0);
+                atomic_fetch_sub(&g_guest_children, 1);
+            }
         }
         return;
     }
@@ -1825,6 +2048,9 @@ static void syscall_route(struct cpu *c) {
         R->buf[n] = 0;
         R->inlen = n + 1;
         R->redir[1] = 0;
+        R->redir[2] = SENTRY_PATHCAP;
+        uint32_t cap = SENTRY_BUFSZ - SENTRY_PATHCAP;
+        if (R->a[3] > cap) R->a[3] = cap;
         break;
     }
     case 64:   // write(fd, a1=buf, a2=len)
@@ -2144,7 +2370,21 @@ static void syscall_route(struct cpu *c) {
 
     // ---- copy outputs back into guest memory (guest pointers only ever touched here, on the worker) ----
     int64_t ret = R->ret;
+    if (nr == 56 && ret >= 0 && ret < HL_NFD) {
+        const char *opened_path = (const char *)G_A1(c);
+        if (opened_path != NULL &&
+            (!strcmp(opened_path, "/proc") || !strncmp(opened_path, "/proc/", 6) ||
+             !strcmp(opened_path, "/dev/fd")))
+            snprintf(g_fdpath[(int)ret], sizeof g_fdpath[(int)ret], "%s", opened_path);
+    }
     switch (nr) {
+    case 78: // readlinkat: sentry landed the non-NUL-terminated link bytes after the path window
+        if (ret > 0) {
+            uint32_t n = (uint32_t)ret;
+            if (n > (uint32_t)R->a[3]) n = (uint32_t)R->a[3];
+            memcpy((void *)G_A2(c), R->buf + SENTRY_PATHCAP, n);
+        }
+        break;
     case 63: // read
     case 67: // pread64
     case 61: // getdents64: the sentry landed ret bytes at buf[0]

@@ -3887,7 +3887,7 @@ static void *translate_block(uint64_t gpc) {
     // AFTER icache-flushing the new code). Expose the body for it.
     g_last_body = body;
     if (!g_tier2_build) {
-        map_put(start, host, body);
+        map_put(start, start, gpc > start ? gpc : start + 1, host, body);
         if (!g_threaded) patch_links_to(start, body); // chaining mutates live blocks -> off when threaded
     }
     return host;

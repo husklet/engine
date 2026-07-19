@@ -5,6 +5,8 @@
 #include "../shared.h"
 #include "../../host/file.h"
 #include "../../host/resolve.h"
+#include "../../core/provider_files.h"
+#include "../../core/provider_namespace.h"
 
 // Set when a followed path resolution exceeds the symlink-traversal limit (Linux caps at 40 -> ELOOP). The
 // jail resolvers return a host-path string with no errno channel, so a self-referential / cyclic symlink
@@ -202,6 +204,10 @@ static uint8_t g_opath[1024];
 // Synthesized /proc text files are backed by mkstemp(), so the host fd is O_RDWR even though Linux exposes
 // procfs regular files as read-only for file-status queries. 1 = force F_GETFL access mode to O_RDONLY.
 static uint8_t g_proc_text_ro[HL_NFD];
+// Linux exposes oom_score_adj as writable per-process state inherited by fork
+// and preserved across exec. Keep the guest value independent of the host's OOM
+// policy; allowing a guest to mutate the host process would violate isolation.
+static int g_proc_oom_score_adj;
 // /dev/full: reads return zeros (backed by /dev/zero) but every WRITE fails ENOSPC. macOS has no
 // /dev/full, so we flag the fd here and gate the write family in svc_io. 1 = /dev/full.
 static uint8_t g_devfull[HL_NFD];
@@ -366,6 +372,8 @@ static uint8_t g_fdvis_private[HL_NFD];
 static _Atomic uint64_t g_pipe_identity_next = 1;
 static void proc_fdvis_cleanup(void);
 static void proc_fdvis_close(int guest_fd);
+static int proc_fdvis_publish_native_fd(int guest_fd);
+
 
 struct fdvis_fork_entry {
     unsigned slot;
@@ -402,6 +410,15 @@ static void fdvis_init(const hl_host_services *host) {
     g_fdvis = arena;
     g_fdvis_control = (void *)((unsigned char *)arena + sizeof(struct fdvis_slot) * FDVIS_N);
     (void)atexit(proc_fdvis_cleanup);
+    size_t count = 0;
+    if (hl_host_process_fds(getpid(), NULL, 0, &count)) {
+        hl_host_process_fd *entries = count ? calloc(count, sizeof(*entries)) : NULL;
+        if ((!count || entries) && hl_host_process_fds(getpid(), entries, count, &count))
+            for (size_t index = 0; index < count; ++index)
+                if ((entries[index].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) == 0)
+                    (void)proc_fdvis_publish_native_fd(entries[index].descriptor);
+        free(entries);
+    }
 }
 
 static struct fdvis_slot *fdvis_find(uint64_t key, uint64_t owner_start_ns, int claim) {
@@ -571,6 +588,13 @@ static int proc_fdvis_publish(int guest_fd, uint32_t kind, uint64_t device, uint
     slot->generation = generation;
     fdvis_unlock();
     return 0;
+}
+
+static int proc_fdvis_publish_native_fd(int guest_fd) {
+    hl_host_process_fd detail;
+    size_t ignored = 0;
+    if (guest_fd < 0 || !hl_host_process_fd_read(getpid(), guest_fd, &detail, NULL, 0, &ignored)) return -EBADF;
+    return proc_fdvis_publish(guest_fd, detail.kind, detail.stable_device, detail.stable_object);
 }
 
 static int proc_fdvis_publish_pipe_pair(int first, int second) {
@@ -1661,6 +1685,51 @@ static const char *xresolve(const char *p, char *buf, size_t n) {
     return p;
 }
 
+// Follow a guest-visible symlink chain while preserving its guest spelling.  Host-path resolution
+// deliberately cannot represent synthetic targets such as /proc/self/fd/N: those names have no host
+// inode, but open(2) still has to recognize them after traversing an image symlink such as
+// /var/log/nginx/error.log -> /dev/stderr -> /proc/self/fd/2.  Return the last guest name even when it
+// names a synthetic endpoint; callers classify that endpoint before attempting a host-backed open.
+static const char *guest_symlink_target(const char *path, char *out, size_t capacity) {
+    if (path == NULL || path[0] != '/' || capacity == 0) return path;
+    char current[4200];
+    if (path_copy(current, sizeof current, path) != 0) return path;
+    for (int hop = 0; hop < 40; ++hop) {
+        char host[4200];
+        int present;
+        if (g_nlower)
+            present = overlay_resolve(current, host, sizeof host, 1);
+        else {
+            secure_resolve(current, host, sizeof host, 1);
+            struct stat probe;
+            present = lstat(host, &probe) == 0;
+        }
+        if (!present) break;
+        struct stat metadata;
+        if (lstat(host, &metadata) != 0 || !S_ISLNK(metadata.st_mode)) break;
+        char target[4200];
+        ssize_t length = readlink(host, target, sizeof target - 1);
+        if (length <= 0) break;
+        target[length] = 0;
+        if (target[0] == '/') {
+            if (path_copy(current, sizeof current, target) != 0) return path;
+        } else {
+            char directory[4200], joined[8400];
+            if (path_copy(directory, sizeof directory, current) != 0) return path;
+            char *separator = strrchr(directory, '/');
+            if (separator != NULL)
+                *separator = 0;
+            else
+                directory[0] = 0;
+            if (snprintf(joined, sizeof joined, "%s/%s", directory, target) >= (int)sizeof joined ||
+                path_copy(current, sizeof current, joined) != 0)
+                return path;
+        }
+    }
+    confine(current, out, capacity);
+    return out;
+}
+
 static int jail_at(int dirfd, const char *raw, char *final, size_t fn, int nofollow);
 
 // Resolve an EXEC entrypoint (or PT_INTERP) to a host path, following symlinks the way the kernel
@@ -2425,13 +2494,13 @@ static void procfd_dirs_atexit(void) {
     procfd_dirs_reap(1);
 }
 
-static int proc_fd_dir_pid_open(int host);
+static int proc_fd_dir_pid_open(int guest, int host);
 
 // Build the temp dir of fd symlinks and return its fd. The guest fd numbers ARE the host fd numbers here,
 // so this process's open fds are exactly the guest's; each link's target is the fd's path (or an
 // anon_inode placeholder for a pipe/socket/eventfd with no path). -1 on error.
 static int proc_fd_dir_open(void) {
-    return proc_fd_dir_pid_open((int)getpid());
+    return proc_fd_dir_pid_open(0, (int)getpid());
 }
 
 static void proc_dir_register(int fd, const char *tmpl, const char *guestpath); // defined below (dir synth)
@@ -2837,7 +2906,8 @@ static int hl_get_procinfo(int pid, struct hl_procinfo *pi) {
 
 // Rebase a host vnode path into the container's guest namespace (strip the rootfs prefix), in place.
 static void proc_fd_rebase(char *tgt, size_t capacity) {
-    int mapped = g_rootfs != NULL;
+    int mapped = g_rootfs_canon_len != 0 && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len) &&
+                 (tgt[g_rootfs_canon_len] == '/' || tgt[g_rootfs_canon_len] == 0);
     for (int index = 0; !mapped && index < g_nvols; ++index)
         if (!g_vols[index].dead && !strncmp(tgt, g_vols[index].hcanon, g_vols[index].hlen) &&
             (tgt[g_vols[index].hlen] == '/' || tgt[g_vols[index].hlen] == 0))
@@ -2891,7 +2961,8 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
     if (host <= 0 || fd < 0) return -1;
     uint32_t logical_kind = HL_HOST_FD_OTHER;
     uint64_t logical_device = 0, logical_object = 0;
-    if (proc_fdvis_lookup(host, fd, &logical_kind, &logical_device, &logical_object) &&
+    int logical_found = proc_fdvis_lookup(host, fd, &logical_kind, &logical_device, &logical_object);
+    if (logical_found &&
         logical_kind != HL_HOST_FD_FILE && logical_object != 0) {
         const char *logical_name = logical_kind == HL_HOST_FD_SOCKET ? "socket"
                                    : logical_kind == HL_HOST_FD_PIPE ? "pipe"
@@ -2907,6 +2978,13 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
     if (!hl_host_process_fd_read(host, inspected_fd, &entry, tgt, sizeof tgt - 1, &target_size)) return -1;
     if (entry.kind == HL_HOST_FD_FILE && target_size != 0) {
         tgt[target_size] = 0;
+        /* A launch-scoped controlling terminal is the first slave in the
+         * guest devpts namespace regardless of the host's global pty number.
+         * Only typed launch stdio receives this projection; ordinary host
+         * binds and guest-created ptys retain their own namespace identity. */
+        if (logical_found && fd >= 0 && fd <= STDERR_FILENO &&
+            (strncmp(tgt, "/dev/pts/", 9) == 0 || strncmp(tgt, "/dev/ttys", 9) == 0))
+            snprintf(tgt, sizeof tgt, "/dev/pts/0");
         proc_fd_rebase(tgt, sizeof tgt);
         size_t l = strlen(tgt);
         if (l > n) l = n;
@@ -2940,8 +3018,8 @@ static int proc_fd_pid_open_one(int host, int fd) {
 // dir fd, or -1. NOTE: this is the LISTING + readlink view only; actually OPENING a peer fd (using
 // /proc/<pid>/fd/N as a working descriptor) needs the owner to hand the real fd across processes
 // (SCM_RIGHTS-level fd passing) -- deferred; open of a peer fd link still ENOENTs.
-static int proc_fd_dir_pid_open(int host) {
-    int self = host == (int)getpid();
+static int proc_fd_dir_pid_open(int guest, int host) {
+    int self = guest == 0;
     static int registered = 0;
     if (!registered) {
         atexit(procfd_dirs_atexit);
@@ -2958,14 +3036,15 @@ static int proc_fd_dir_pid_open(int host) {
         return -1;
     }
     if (nfd > fd_capacity) nfd = fd_capacity;
-    size_t nviews = proc_fdvis_list(host, NULL, 0);
+    int identity = self ? host : guest;
+    size_t nviews = proc_fdvis_list(identity, NULL, 0);
     struct fdvis_view *views = nviews ? malloc(nviews * sizeof *views) : NULL;
     if (nviews && !views) {
         free(fds);
         return -1;
     }
     if (nviews) {
-        size_t copied = proc_fdvis_list(host, views, nviews);
+        size_t copied = proc_fdvis_list(identity, views, nviews);
         if (copied < nviews) nviews = copied;
     }
     char tmpl[] = "/tmp/.hl-proc-fd-dirXXXXXX";
@@ -2981,7 +3060,7 @@ static int proc_fd_dir_pid_open(int host) {
         hl_host_process_fd entry = {.descriptor = -1};
         int have = hl_host_process_fd_read(host, fd, &entry, tgt, sizeof tgt - 1, &target_size) &&
                    entry.kind == HL_HOST_FD_FILE && target_size != 0;
-        int hidden = (fds[i].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0;
+        int hidden = nviews != 0 || (fds[i].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) != 0;
         for (size_t view = 0; view < nviews && !hidden; ++view)
             if (views[view].guest_fd == fd) hidden = 1;
         if (!hidden && have && strstr(tgt, "/.hl-proc-fd-dir") != NULL)
@@ -3008,7 +3087,7 @@ static int proc_fd_dir_pid_open(int host) {
     }
     for (size_t view = 0; view < nviews; ++view) {
         char tgt[4200] = {0};
-        int length = proc_fd_link_pid(host, views[view].guest_fd, tgt, sizeof tgt - 1);
+        int length = proc_fd_link_pid(identity, views[view].guest_fd, tgt, sizeof tgt - 1);
         if (length <= 0) continue;
         tgt[length] = 0;
         char link[80];
@@ -3030,22 +3109,27 @@ static int proc_fd_dir_pid_open(int host) {
         snprintf(target, sizeof target, "/proc/self/fd/%d", d);
         if (symlink(target, link) != 0 && errno != EEXIST) {}
         if (fstat(d, &status) == 0) {
-            if (hl_host_process_fd_private_add(d) != 0 ||
-                proc_fdvis_publish(d, HL_HOST_FD_FILE, (uint64_t)status.st_dev, (uint64_t)status.st_ino) != 0) {
-                hl_host_process_fd_private_remove(d);
+            /* This directory is returned to the guest and therefore is not engine-private. Publish its
+             * logical identity normally; private adoption would move it outside the guest fd range. */
+            if (proc_fdvis_publish(d, HL_HOST_FD_FILE, (uint64_t)status.st_dev, (uint64_t)status.st_ino) != 0) {
                 close(d);
                 procfd_dir_rm(tmpl);
                 return -1;
             }
-            if (d >= 0 && d < HL_NFD) g_fdvis_private[d] = 1;
         }
     }
-    for (int i = 0; i < 64; i++)
-        if (!g_procfd_dirs[i].path[0]) {
-            g_procfd_dirs[i].fd = d;
-            snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
-            break;
-        }
+    if (self) {
+        /* Tag the materialized directory with its guest namespace path. Relative openat/stat/readlink
+         * operations must re-enter procfd synthesis instead of following the temporary host symlinks. */
+        proc_dir_register(d, tmpl, "/proc/self/fd");
+    } else {
+        for (int i = 0; i < 64; i++)
+            if (!g_procfd_dirs[i].path[0]) {
+                g_procfd_dirs[i].fd = d;
+                snprintf(g_procfd_dirs[i].path, sizeof g_procfd_dirs[i].path, "%s", tmpl);
+                break;
+            }
+    }
     return d;
 }
 
@@ -3961,6 +4045,10 @@ static int synth_misc_dir_open(const char *gp) {
             int i = 0;
             while (q[i] >= '0' && q[i] <= '9')
                 i++;
+            if (i > 0 && (!strcmp(q + i, "/fd") || !strcmp(q + i, "/fd/"))) {
+                int guest = atoi(q);
+                return guest == (int)getpid() ? proc_fd_dir_open() : proc_fd_dir_pid_open(guest, guest);
+            }
             if (i > 0 && (!strcmp(q + i, "/ns") || !strcmp(q + i, "/ns/"))) {
                 static const char *const ns[] = {
                     "cgroup", "ipc", "mnt", "net", "pid", "pid_for_children", "time", "time_for_children",
@@ -4417,8 +4505,10 @@ static int proc_open(const char *rp) {
             n = proc_mountinfo_text(buf, sizeof buf);
         else if (!strcmp(leaf, "limits"))
             n = proc_limits_text(buf, sizeof buf); // rlimit table
-        else if (!strcmp(leaf, "oom_score_adj") || !strcmp(leaf, "oom_adj") || !strcmp(leaf, "oom_score"))
-            n = snprintf(buf, sizeof buf, "0\n"); // not OOM-adjusted (systemd/containerd read/probe)
+        else if (!strcmp(leaf, "oom_score_adj"))
+            n = snprintf(buf, sizeof buf, "%d\n", g_proc_oom_score_adj);
+        else if (!strcmp(leaf, "oom_adj") || !strcmp(leaf, "oom_score"))
+            n = snprintf(buf, sizeof buf, "0\n");
         else if (!strcmp(leaf, "loginuid"))
             n = snprintf(buf, sizeof buf, "4294967295\n"); // unset (pam)
         else if (!strcmp(leaf, "io"))
@@ -4450,7 +4540,7 @@ static int proc_open(const char *rp) {
                 // Peer /proc/<pid>/fd: a listable dir of symlinks built from the peer descriptor snapshot, so
                 // each entry readlinks to the fd's target. (Opening a peer fd link stays deferred -- needs
                 // cross-process fd passing; see proc_fd_dir_pid_open.)
-                if (!strcmp(fl, "fd")) return proc_fd_dir_pid_open(host);
+                if (!strcmp(fl, "fd")) return proc_fd_dir_pid_open(gp2, host);
                 if (!strcmp(fl, "stat"))
                     n = proc_stat_pid_text(buf, sizeof buf, gp2, host);
                 else if (!strcmp(fl, "status"))
@@ -5054,10 +5144,10 @@ static int proc_open(const char *rp) {
             {"/proc/sys/kernel/shmmax", "18446744073692774399\n"},
             {"/proc/sys/kernel/shmall", "18446744073692774399\n"},
             {"/proc/sys/kernel/shmmni", "4096\n"},
-            {"/proc/sys/kernel/sem", "32000\t1024000000\t500\t32000\n"},
+            {"/proc/sys/kernel/sem", "256\t131072\t500\t512\n"},
             {"/proc/sys/kernel/msgmax", "8192\n"},
             {"/proc/sys/kernel/msgmnb", "16384\n"},
-            {"/proc/sys/kernel/msgmni", "32000\n"},
+            {"/proc/sys/kernel/msgmni", "512\n"},
             {"/proc/sys/kernel/yama/ptrace_scope", "1\n"},
             {"/proc/sys/kernel/random/poolsize", "256\n"},
             {"/proc/sys/kernel/printk", "4\t4\t1\t7\n"},
@@ -5762,7 +5852,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
     // sees the right type WITHOUT proc_open() materializing a temp dir as a stat side effect.
     const char *leaf = proc_self_leaf(gp);
     if (leaf) {
-        if (!strcmp(leaf, "fd")) {
+        if (!strcmp(leaf, "fd") || !strcmp(leaf, "fd/")) {
             memset(s, 0, sizeof *s);
             s->st_mode = S_IFDIR | 0555;
             s->st_nlink = 2;
@@ -5774,7 +5864,10 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
                 if (*t < '0' || *t > '9') isnum = 0;
             if (isnum) {
                 int fn = atoi(leaf + 7);
-                if (eventfd_hidden_peer_fd(fn) || fcntl(fn, F_GETFD) < 0) return 0;
+                hl_linux_fd_snapshot typed;
+                int typed_live = g_linux_box != NULL &&
+                                 hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fn, &typed) == HL_STATUS_OK;
+                if (eventfd_hidden_peer_fd(fn) || (!typed_live && fcntl(fn, F_GETFD) < 0)) return 0;
                 memset(s, 0, sizeof *s);
                 s->st_mode = S_IFREG | 0444;
                 s->st_nlink = 1;
@@ -5788,10 +5881,12 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
             if (isnum) {
                 int pfd = atoi(leaf + 3);
                 if (eventfd_hidden_peer_fd(pfd)) return 0;
-                // A CLOSED fd has no /proc/self/fd/N entry on Linux -- stat/access must ENOENT, not report a
-                // stale live link (readlink already returns ENOENT for it). Only our own pid reaches here
-                // (proc_self_leaf gates on self), so F_GETFD names the caller's fd.
-                if (fcntl(pfd, F_GETFD) < 0) return 0;
+                // Typed provider/embedding descriptors need not occupy the same native fd number. The guest
+                // descriptor table is authoritative; F_GETFD remains the compatibility path for legacy fds.
+                hl_linux_fd_snapshot typed;
+                int typed_live = g_linux_box != NULL &&
+                                 hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)pfd, &typed) == HL_STATUS_OK;
+                if (!typed_live && fcntl(pfd, F_GETFD) < 0) return 0;
                 memset(s, 0, sizeof *s);
                 s->st_mode = S_IFLNK | 0777;
                 s->st_nlink = 1;

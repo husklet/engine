@@ -43,7 +43,7 @@ pub(crate) struct EngineExit {
 impl Default for EngineExit {
     fn default() -> Self {
         Self {
-            abi: 4,
+            abi: 5,
             size: 24,
             kind: 0,
             guest_status: 0,
@@ -53,11 +53,20 @@ impl Default for EngineExit {
 }
 
 unsafe extern "C" {
+    pub(crate) fn hl_engine_guest_fd_limit() -> u32;
     pub(crate) fn hl_activation_start_with_stdio(
         executable: *const c_char,
         guest: u32,
         config: *const c_char,
         streams: *const Streams,
+        process: *mut *mut Process,
+    ) -> i32;
+    pub(crate) fn hl_activation_start_with_transport(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        streams: *const Streams,
+        transport: c_int,
         process: *mut *mut Process,
     ) -> i32;
     pub(crate) fn hl_activation_start_terminal(
@@ -81,6 +90,13 @@ unsafe extern "C" {
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
+    #[link_name = "kill"]
+    fn process_signal(process: c_int, signal: c_int) -> c_int;
+}
+
+pub(crate) fn guest_fd_limit() -> u32 {
+    // SAFETY: this query reads the current process resource limit and has no pointer arguments or side effects.
+    unsafe { hl_engine_guest_fd_limit() }
 }
 pub(crate) fn start_terminal(
     executable: &std::ffi::CStr,
@@ -128,6 +144,32 @@ pub(crate) fn start(
             guest,
             config.as_ptr(),
             streams,
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() {
+        Ok(Handle(process))
+    } else {
+        Err(status)
+    }
+}
+
+#[allow(dead_code)] // Kept private until native VFS dispatch makes the capability truthful.
+pub(crate) fn start_with_transport(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    streams: &Streams,
+    transport: &std::os::unix::net::UnixStream,
+) -> Result<Handle, i32> {
+    let mut process = std::ptr::null_mut();
+    let status = unsafe {
+        hl_activation_start_with_transport(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            streams,
+            transport.as_raw_fd(),
             &mut process,
         )
     };
@@ -185,6 +227,14 @@ pub(crate) fn process_id(process: &Handle) -> Result<u64, i32> {
         Ok(id)
     } else {
         Err(status)
+    }
+}
+pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
+    let process = c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;
+    if unsafe { process_signal(process, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 pub(crate) fn pipe_pair() -> std::io::Result<(File, File)> {

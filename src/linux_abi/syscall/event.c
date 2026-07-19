@@ -26,7 +26,6 @@
 // already reports current readiness), so only EPOLLET arms reach here -- level semantics are untouched.
 static struct kevent *g_ep_prime[HL_NFD];
 static int g_ep_primen[HL_NFD], g_ep_primecap[HL_NFD];
-
 static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
     if (ep < 0 || ep >= HL_NFD) return;
     struct kevent *a = g_ep_prime[ep];
@@ -122,6 +121,10 @@ static void ep_mem_set(int ep, int fd, int on) {
         __atomic_fetch_or(&m[fd >> 3], bit, __ATOMIC_SEQ_CST);
     else
         __atomic_fetch_and(&m[fd >> 3], (uint8_t)~bit, __ATOMIC_SEQ_CST);
+}
+
+static void ep_mem_close(int ep, int fd) {
+    ep_mem_set(ep, fd, 0);
 }
 
 static void ep_mem_clear(int ep) {
@@ -426,6 +429,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // a reused fd number must start with an empty prime buffer + no stale wake knote + no stale membership
         // (close() doesn't clear ours -- this is how an epoll fd's per-instance state is reset on reuse)
         if (r >= 0 && r < HL_NFD) {
+            g_ep_provider_generations[r] = ep_provider_next(g_ep_provider_generations[r]);
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
@@ -706,6 +710,43 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 }
                 oi++;
             }
+            /* Provider pumps only publish an atomic readiness mark and trigger the
+             * EVFILT_USER wake.  The epoll owner consumes and formats it here, so
+             * callbacks never mutate epoll queues or acquire inherited locks. */
+            uint32_t provider_ep_generation =
+                ep >= 0 && ep < HL_NFD ? g_ep_provider_generations[ep] : 0;
+            for (uint32_t provider_index = 0; provider_index < EP_PROVIDER_WATCH_LIMIT && oi < maxev;
+                 ++provider_index) {
+                ep_provider_watch *provider_watch = &g_ep_provider_watches[provider_index];
+                if (atomic_load_explicit(&provider_watch->state, memory_order_acquire) != EP_PROVIDER_ACTIVE ||
+                    provider_watch->epoll != ep ||
+                    provider_watch->epoll_generation != provider_ep_generation)
+                    continue;
+                hl_linux_fd_snapshot provider_snapshot;
+                if (g_linux_box == NULL ||
+                    hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)provider_watch->descriptor,
+                                             &provider_snapshot) != HL_STATUS_OK ||
+                    provider_snapshot.descriptor_generation != provider_watch->descriptor_generation ||
+                    provider_snapshot.host_handle != provider_watch->handle) {
+                    ep_provider_retire(provider_watch);
+                    continue;
+                }
+                uint32_t level = 0;
+                if (!(provider_watch->events & 0x80000000u) && !(provider_watch->events & 0x40000000u))
+                    level = hl_provider_files_cached_readiness(provider_watch->handle,
+                                                               provider_watch->interests);
+                int unsubscribe = 0;
+                uint32_t provider_ready = ep_provider_take_ready(provider_watch, level, &unsubscribe);
+                if (provider_ready == 0) continue;
+                *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ep_provider_linux_events(provider_ready);
+                memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF,
+                       &provider_watch->data, sizeof(provider_watch->data));
+                if (unsubscribe) {
+                    hl_provider_files_unsubscribe(provider_watch->handle, provider_watch,
+                                                  atomic_load(&provider_watch->serial));
+                }
+                oi++;
+            }
             // Deliver edge-triggered primes that kqueue didn't surface (fds already ready at registration).
             // This is the cross-thread-readiness delivery: a peer M that registered an already-ready fd
             // stashed a prime here, so a wake that carried no kqueue edge still hands the guest the ready fd.
@@ -951,7 +992,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         // Linux rejects an out-of-range timeout nanoseconds field (tv_nsec < 0 or >= 1e9) with EINVAL.
-        if (ts && (ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
+        if (ts && (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -970,26 +1011,16 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             sm_set = a3;
         }
         int have_to = ts != NULL;
-        // Full requested budget in ms, clamped (see above).
-        int tmo_full;
-        if (!ts)
-            tmo_full = -1; // NULL timespec -> block forever
-        else if (ts->tv_sec < 0)
-            tmo_full = 0; // past/negative deadline -> don't block
-        else if (ts->tv_sec >= 0x7fffffff / 1000)
-            tmo_full = 0x7fffffff; // would overflow ms range -> cap (~24.8d)
-        else {
-            long long ms = (long long)ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
-            tmo_full = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
-        }
         // like pselect (case 72), a spurious EINTR must re-block only for the REMAINING time, not the
         // full budget again -- otherwise a repeating hooked-but-blocked signal restarts the timeout forever
-        // (the select02-class hang) and every finite wait overshoots. Capture the deadline once.
+        // (the select02-class hang) and every finite wait overshoots. Capture the exact nanosecond deadline;
+        // truncating ppoll's timeout to integer milliseconds made sub-ms waits return immediately and every
+        // non-integral-ms wait finish early.
         struct timespec deadline = {0, 0};
-        if (have_to && tmo_full > 0) {
+        if (have_to && ts->tv_sec >= 0) {
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
-            deadline.tv_sec += tmo_full / 1000;
-            deadline.tv_nsec += (long)(tmo_full % 1000) * 1000000L;
+            deadline.tv_sec += ts->tv_sec;
+            deadline.tv_nsec += ts->tv_nsec;
             if (deadline.tv_nsec >= 1000000000L) {
                 deadline.tv_sec++;
                 deadline.tv_nsec -= 1000000000L;
@@ -998,17 +1029,45 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
         int r;
         for (;;) {
-            int tmo = tmo_full;
-            if (have_to && tmo_full > 0) {
+            struct timespec rem = {0, 0};
+            if (have_to && ts->tv_sec >= 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t ms =
-                    (int64_t)(deadline.tv_sec - now.tv_sec) * 1000LL + (deadline.tv_nsec - now.tv_nsec) / 1000000LL;
-                tmo = ms < 0 ? 0 : (ms > 0x7fffffff ? 0x7fffffff : (int)ms);
+                int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
+                             (deadline.tv_nsec - now.tv_nsec);
+                if (ns > 0) {
+                    rem.tv_sec = (time_t)(ns / 1000000000LL);
+                    rem.tv_nsec = (long)(ns % 1000000000LL);
+                }
             }
             ts_wait_enter();
+#if defined(__linux__)
+            // Linux already provides the exact relative-timespec primitive.
+            // Hand it the complete remaining budget.  An earlier attempt to
+            // wake several milliseconds early and spin to the deadline burned
+            // a scheduler quantum on every call; repeated timer waits were
+            // consequently preempted for about 8ms and became much less
+            // accurate than the host ppoll they were trying to improve.
+            r = ppoll(fds, (nfds_t)a1, have_to ? &rem : NULL, NULL);
+#else
+            // poll(2) only accepts milliseconds. Round UP so a finite wait
+            // never returns before its Linux ppoll deadline.
+            int tmo = -1;
+            if (have_to) {
+                int64_t ns = (int64_t)rem.tv_sec * 1000000000LL + rem.tv_nsec;
+                int64_t ms = (ns + 999999LL) / 1000000LL;
+                tmo = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+            }
             r = poll(fds, (nfds_t)a1, tmo);
+#endif
             ts_wait_leave(); // S while blocked (glibc pause on aarch64 -> ppoll)
+            if (r == 0 && have_to) {
+                struct timespec now;
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                int64_t left = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
+                               (deadline.tv_nsec - now.tv_nsec);
+                if (left > 0) continue;
+            }
             // poll/ppoll is never restarted by a handler; loop only on a spurious EINTR (svc_poll_retry).
             if (r < 0 && svc_poll_retry(c)) continue;
             break;
@@ -1018,7 +1077,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // a local copy, so this is invisible to POSIX callers but correct for the raw syscall).
         if (r >= 0 && have_to) {
             struct timespec left = {0, 0};
-            if (tmo_full > 0) {
+            if (ts->tv_sec >= 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                 int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);

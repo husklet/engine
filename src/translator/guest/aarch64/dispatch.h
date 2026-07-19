@@ -24,6 +24,7 @@
 //   g_smc_seen     a guest icache flush was observed -> indirect branches must stay invalidatable (see G_IBTC_FILL)
 //   g_smc_flushes  PROF: number of SMC re-translate events
 #define R_ICFLUSH 4
+#define R_ICCOMMIT 6
 static int g_smc_seen;
 static uint64_t g_smc_flushes;
 
@@ -102,7 +103,9 @@ static uint64_t g_smc_flushes;
         if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
         break;                                                                                                         \
     } else if ((c)->reason == R_ICFLUSH) {                                                                             \
-        smc_icflush((c)->smc_va); /* guest `ic ivau`: precise drop keyed on the invalidated VA (cpu->smc_va) */        \
+        smc_icflush((c), (c)->smc_va); /* queue dirty line until the architecturally-visible ISB */                    \
+    } else if ((c)->reason == R_ICCOMMIT) {                                                                            \
+        if (smc_commit(c)) g_smc_flushes++;                                                                            \
     } else if ((c)->reason == R_SYSCALL) {                                                                             \
         if (g_prof) g_prof_sys++;                                                                                      \
         service(c);                                                                                                    \

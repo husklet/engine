@@ -108,10 +108,29 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int r
                page boundary; replace that poisoned page before zeroing it.
                Linux rounds the mapping to guest pages, and bytes beyond hi in
                this host page were inaccessible past-EOF reservation bytes. */
-            if (anon && replace_tail) {
+            if (anon && (replace_tail || !host_range_writable((uintptr_t)tl, (size_t)(hi - tl)))) {
+                /* The page may be a mapped-but-poisoned file tail: Darwin's VM
+                   query reports it mapped, but touching bytes beyond EOF raises
+                   SIGBUS.  host_range_mapped performs a guarded probe, so use
+                   that result rather than the region table alone.  Preserve a
+                   readable neighbour after the guest range before replacing
+                   the whole host page. */
+                uint64_t page_end = tl + hp;
+                size_t suffix_len = hi < page_end ? (size_t)(page_end - hi) : 0;
+                unsigned char *suffix = NULL;
+                if (suffix_len && host_range_mapped((uintptr_t)hi, suffix_len)) {
+                    suffix = malloc(suffix_len);
+                    if (suffix) memcpy(suffix, (void *)(uintptr_t)hi, suffix_len);
+                }
                 if (mmap((void *)tl, hp, PROT_READ | PROT_WRITE,
-                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
+                         MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED) {
+                    free(suffix);
                     return -1;
+                }
+                if (suffix) {
+                    memcpy((void *)(uintptr_t)hi, suffix, suffix_len);
+                    free(suffix);
+                }
             } else {
                 memset((void *)tl, 0, (size_t)(hi - tl));
             }
@@ -576,6 +595,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint64_t ch = hl_linux_snapshot_reserve(&g_ckpt_snapshot, (uint64_t)a1 + guard);
             if (ch) a0 = ch;
         }
+        // A non-PIE ET_EXEC is logically mapped at its low Linux link addresses but physically stored in
+        // the high host arena. The host kernel therefore sees a low mmap hint overlapping the executable
+        // as free and may honor it, while Linux would relocate the mapping because that guest range is busy.
+        // Node 18's V8 allocator hinted 0xf00000 inside its 0x400000.. image, received that colliding address,
+        // then the non-PIE fold correctly rebased a heap-header store into RX text. Treat such a non-fixed
+        // hint as unavailable and let the host choose a genuinely free address. MAP_FIXED retains replacement
+        // semantics and is handled separately.
+        if (a0 && !(a3 & 0x10) && g_nonpie_lo && a0 < g_nonpie_hi && a0 + a1 > g_nonpie_lo)
+            a0 = 0;
 #ifdef PCACHE_MMAP_HINT
         // (pcache): give the dynamic linker's file-backed, non-fixed, kernel-placed maps (library
         // loads) a DETERMINISTIC base hint so their translated blocks are reusable across runs of the same

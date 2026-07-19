@@ -262,14 +262,14 @@ static hl_x86_signal_queue x86_signal_queue(void) {
     return (hl_x86_signal_queue){x86_signal_handler, NULL, g_sigcode, g_sigaddr, &g_pending};
 }
 
-static void build_signal_frame(struct cpu *c, int sig) {
+static void build_signal_frame(struct cpu *c, int sig, int synchronous) {
     hl_x86_signal_state state = {
         .handler = g_sigact[sig].handler,
         .flags = g_sigact[sig].flags,
         .mask = g_sigact[sig].mask,
-        .code = &g_sigcode[sig],
+        .code = synchronous ? &c->sync_code : &g_sigcode[sig],
         .value = &g_sigval[sig],
-        .address = &g_sigaddr[sig],
+        .address = synchronous ? &c->sync_address : &g_sigaddr[sig],
         .pid = &g_sigpid[sig],
         .uid = &g_siguid[sig],
         .sigreturn_pc = SIGRETURN_PC,
@@ -334,10 +334,15 @@ static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining
     return 0;
 }
 
+static char g_authorized_executable_path[4200];
 #include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
+static const void *g_initial_executable_image;
+static size_t g_initial_executable_size;
+static const void *g_authorized_executable_image;
+static size_t g_authorized_executable_size;
 #include "../../linux_abi/x86.c" // Linux x86-64 ELF loader + stack + fault handlers
 
 // ---- entry + main ----
@@ -371,7 +376,7 @@ static int container_init(const char *rootfs) {
     // out-of-process SpawnConfig::script() path passes them as CLI flags, which is why the default test
     // matrix missed this. Guard on the CLI value (only fill when the flag path left it unset), matching
     // aarch64, so a genuine --hostname flag still wins.
-    {
+    if (hl_option_get("HL_NET_HOST") == NULL) {
         const char *h = hl_option_get("HL_HOSTNAME");
         if (h && h[0] && !g_hostname[0]) {
             strncpy(g_hostname, h, 64);
@@ -385,7 +390,6 @@ static int container_init(const char *rootfs) {
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
         if (root_handle_bind(g_rootfs) != 0) return -1;
-        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS")) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
@@ -396,7 +400,7 @@ static int container_init(const char *rootfs) {
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
     }
-    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL) != 0)) return -1;
+    if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL, NULL, 0) != 0)) return -1;
     {
         // HL_NETNS is a short key (not a path) used to derive abstract-socket and IPC identities.
         // The daemon and both guest ISAs share it across exec; the private-loopback directory is derived from it.
@@ -433,12 +437,16 @@ static int container_init(const char *rootfs) {
             char tmp[4096];
             snprintf(tmp, sizeof tmp, "%s", ls);
             char *sv;
-            // colon-separated (highest first), UNIFIED with linux_aarch64.c and the Rust
-            // engine launch-wire joiner (`src/launch/wire.rs`, `lowers.join(":")`). This
-            // target historically split on ',', so multi-lower typed launches mis-split here.
-            for (char *t = strtok_r(tmp, ":", &sv); t; t = strtok_r(NULL, ":", &sv))
+            // ABI 12 uses newline records so host paths may contain ':'. Legacy launchers use ':'.
+            const char *separator = strchr(tmp, '\n') ? "\n" : ":";
+            for (char *t = strtok_r(tmp, separator, &sv); t; t = strtok_r(NULL, separator, &sv))
                 add_lower(t);
         }
+    }
+    if (g_rootfs) {
+        const char *owner_lowers[8];
+        for (int i = 0; i < g_nlower; ++i) owner_lowers[i] = g_lower[i].canon;
+        if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
     }
     if (g_rootfs && chdir(g_rootfs) != 0) return -1; // guest cwd "/" maps to the rootfs root
     // Docker -w / initial working directory: start the guest in HL_CWD (must be reachable inside the
@@ -524,6 +532,10 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 
     static char pb[4200];
     const char *prog_host = xresolve_overlay(prog, pb, sizeof pb); // upper, then lowers (pure --lower image)
+    if (g_initial_executable_image != NULL && !g_authorized_executable_path[0]) {
+        if (realpath(prog_host, g_authorized_executable_path) == NULL)
+            snprintf(g_authorized_executable_path, sizeof g_authorized_executable_path, "%s", prog_host);
+    }
     // opt8: load the guest image + interp at FIXED VAs so the translated arena is byte-identical across
     // runs (one-shot g_force_base, cleared inside load_elf). Only when the persistent cache is enabled.
     if (g_pcache) g_force_base = PC_IMG_BASE;
@@ -534,7 +546,10 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     *have_interp = 0;
     const char *interp_host = NULL;
     char interp[256];
-    if (elf_interp(prog_host, interp, sizeof interp) == 0) {
+    int has_interp = elf_interp(prog_host, interp, sizeof interp) == 0;
+    g_initial_executable_image = NULL;
+    g_initial_executable_size = 0;
+    if (has_interp) {
         static char ib[4200];
         interp_host = xresolve_overlay(interp, ib, sizeof ib);
         if (g_pcache) g_force_base = PC_INTERP_BASE;
@@ -582,10 +597,15 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     return c.exit_code;
 }
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, uint32_t argument_count,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argument_count,
                        char *const argv[]) {
     int argc;
     g_engine_result_status = HL_STATUS_OK;
+    (void)executable;
+    g_initial_executable_image = executable_image;
+    g_initial_executable_size = executable_size;
+    g_authorized_executable_image = executable_image;
+    g_authorized_executable_size = executable_size;
     if (argument_count > (uint32_t)INT_MAX) return 2;
     argc = (int)argument_count;
     hl_target_services_inject(&g_target_services, host);
@@ -697,8 +717,9 @@ void hl_target_runtime_init(void) {
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, uint32_t argc, char *const argv[], const hl_options *options,
+static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
                              const char *result_path) {
+    (void)executable_host;
     return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options, result_path);
 }
 #ifndef HL_ENGINE_NO_MAIN
@@ -761,5 +782,5 @@ int hl_engine_entry(int argc, char **argv) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;
     }
-    return hl_standalone_run(rootfs, (uint32_t)(argc - ai), argv + ai, NULL, NULL);
+    return hl_standalone_run(rootfs, NULL, (uint32_t)(argc - ai), argv + ai, NULL, NULL);
 }

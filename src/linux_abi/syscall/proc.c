@@ -80,7 +80,15 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
     // Docker --ulimit override wins (g_limits, seeded from HL_ULIMITS in state.c): a guest that reads its
     // limits (memcached calloc's off RLIMIT_NOFILE, the JVM sizes threads off RLIMIT_NPROC) must see the
     // requested value, not the hl default. `set` gates each resource so unspecified ones keep the defaults.
-    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) { return; }
+    if (hl_limit_table_get(&g_limits, resource, &o[0], &o[1])) {
+        if (resource == 7) {
+            uint32_t guest_limit = hl_engine_guest_fd_limit();
+            uint64_t ceiling = guest_limit > 0 ? guest_limit : 20480;
+            if (o[1] > ceiling) o[1] = ceiling;
+            if (o[0] > o[1]) o[0] = o[1];
+        }
+        return;
+    }
     switch (resource) {
     case 3: // RLIMIT_STACK
         o[0] = 8ull << 20;
@@ -88,7 +96,10 @@ static void svc_fill_rlimit(int resource, uint64_t *o) {
         break;
     case 7: // RLIMIT_NOFILE -- docker container default (oracle: soft 20480, hard 1048576; was 1024/1048576)
         o[0] = 20480;
-        o[1] = 1048576;
+        {
+            uint32_t guest_limit = hl_engine_guest_fd_limit();
+            o[1] = guest_limit > 0 ? guest_limit : 20480;
+        }
         break;
     case 4: // RLIMIT_CORE -- match the Linux/docker default: cores OFF via soft=0, hard unlimited. A guest that
             // wants cores (LTP, crash handlers) raises rlim_cur with setrlimit; that soft limit governs whether
@@ -152,6 +163,7 @@ static void exec_close_cloexec_scan(int maxfd) {
 
 static void exec_bound_closed(void *context, hl_linux_fd fd) {
     (void)context;
+    ep_provider_retire_endpoint((int)fd);
     proc_fdvis_close((int)fd);
     /* Every typed guest descriptor has a same-number native shadow used only by legacy syscall paths. */
     close((int)fd);
@@ -163,6 +175,10 @@ static void exec_close_bound_cloexec_all(void) {
 }
 
 #include "../../host/system.h"
+
+#if defined(__linux__)
+#include <sys/prctl.h> // host PR_SET_CHILD_SUBREAPER: let the host kernel reparent orphaned guest tasks
+#endif
 
 static void exec_close_cloexec(void) {
     // Sweep only the fds that are actually OPEN, not the whole descriptor table. The daemon raises the
@@ -430,9 +446,10 @@ static int sched_prio_band(int policy, int *lo, int *hi) {
     case 0:
     case 3:
     case 5:
+    case 6:
         *lo = 0;
         *hi = 0;
-        return 0; // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE
+        return 0; // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE / SCHED_DEADLINE
     default: return -1;
     }
 }
@@ -617,6 +634,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // exit_group: end the whole process
     case 94:
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "exit_group pid=%d code=%d", (int)getpid(), (int)a0);
         if (0)
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
@@ -1327,6 +1345,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // SIGCHLD/wait subtests are a known process-model gap, out of this syscall layer's scope.
         if ((int)a0 == 36) {
             g_subreaper = (a1 != 0);
+            // hl runs each guest task as a real host process, so orphan reparenting is a host-kernel
+            // decision. Forward the flag to the host prctl on Linux: the host kernel then reparents an
+            // orphaned guest grandchild onto THIS engine process (the marked subreaper) instead of host
+            // init, so the guest's own waitpid(-1) harvests it -- matching PR_SET_CHILD_SUBREAPER. The
+            // guest-visible flag still round-trips via g_subreaper for PR_GET below.
+#if defined(__linux__) && defined(PR_SET_CHILD_SUBREAPER)
+            (void)prctl(PR_SET_CHILD_SUBREAPER, a1 != 0 ? 1UL : 0UL, 0UL, 0UL, 0UL);
+#endif
             G_RET(c) = 0;
             break;
         }
@@ -1695,9 +1721,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // so `./x` was access()'d against the host process cwd (never the mounted guest cwd) -> ENOENT.
             atpath(-100, (const char *)a0, pb, sizeof pb, 0);
         // execve(2) error classification, matching Linux binfmt semantics, applied to the resolved target
-        // BEFORE the blanket-ENOENT access() check below: a directory is EACCES, and a regular file that is
-        // neither an ELF nor a #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the
-        // existing path. This only reclassifies the error the guest receives; it never runs the target.
+        // BEFORE the bare-mode authorized-executable gate below (which otherwise collapses every non-image
+        // target to a blanket ENOENT): a directory is EACCES, and a regular file that is neither an ELF nor
+        // a #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the existing paths.
+        // This only reclassifies the error the guest receives; it never authorizes running the target.
         {
             struct stat xst;
             if (stat(p, &xst) == 0) {
@@ -1720,6 +1747,18 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     }
                 }
             }
+        }
+        if (!g_rootfs) {
+            char candidate[4200];
+            int authorized = g_authorized_executable_path[0] && realpath(p, candidate) != NULL &&
+                             strcmp(candidate, g_authorized_executable_path) == 0;
+            if (!authorized && !g_untrusted) {
+                char interpreter[4200], option[256], canonical[4200];
+                authorized = parse_shebang(p, interpreter, sizeof interpreter, option, sizeof option) == 1 &&
+                             realpath(interpreter, canonical) != NULL &&
+                             strcmp(canonical, g_authorized_executable_path) == 0;
+            }
+            if (!authorized) { G_RET(c) = (uint64_t)(-2); break; }
         }
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
@@ -1862,7 +1901,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             at_base = li.base;
         }
         g_cp = g_cache;
-        memset(g_map, 0, sizeof g_map);
+        /* Translation-map visibility is generation-tagged. Clearing only the
+           record payload leaves the old generation slots logically live and
+           lets the new exec image observe zero/stale translation records. */
+        map_clear();
         // flush old translations
         g_npend = 0;
         memset(g_ibtc, 0, sizeof g_ibtc);
@@ -2077,6 +2119,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
+        if ((a2 && guest_bad_ptr((uintptr_t)a2, sizeof(uint64_t) * 2)) ||
+            (a3 && guest_bad_ptr((uintptr_t)a3, sizeof(uint64_t) * 2))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (a3) svc_fill_rlimit(res, (uint64_t *)a3);
         if (a2) {
             const uint64_t *nl = (const uint64_t *)a2;
@@ -2085,6 +2132,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (ncur != ~0ull && nmax != ~0ull && ncur > nmax) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
+            }
+            if (res == 7) {
+                uint32_t guest_limit = hl_engine_guest_fd_limit();
+                uint64_t ceiling = guest_limit > 0 ? guest_limit : 20480;
+                if (nmax == ~0ull || nmax > ceiling || ncur == ~0ull || ncur > ceiling) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EPERM);
+                    break;
+                }
             }
             hl_limit_table_set(&g_limits, res, ncur, nmax);
         }

@@ -45,6 +45,7 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // Tag both fds as the same open file description so a later close of one (while the other survives) can
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
+    hl_native_kqueue_duplicate(oldfd, newfd);
     // Synthetic character devices keep their Linux behavior across descriptor duplication. Shell
     // redirections open the target and dup2 it onto stdout before writing; dropping these tags made
     // `echo x > /dev/full` write successfully to the /dev/zero backing instead of failing ENOSPC.
@@ -104,6 +105,7 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
 #else
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
+
 
 /* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
  * available there by finding logical zero/data runs; native filesystem extents remain preferred. */
@@ -761,6 +763,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 64: {
         int wfd = (int)a0;
+        // /proc/self/oom_score_adj is guest-visible process state, not a
+        // writable view of the host process. Parse the complete decimal value
+        // and update the synthetic file so reads through this open description
+        // and through later opens agree.
+        if (wfd >= 0 && wfd < HL_NFD && !strcmp(g_proc_text_desc[wfd], "self:oom_score_adj")) {
+            if (!a2 || a2 >= 32 || !host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+                G_RET(c) = (uint64_t)(a2 ? -EFAULT : 0);
+                break;
+            }
+            char value[32];
+            memcpy(value, (const void *)a1, (size_t)a2);
+            value[a2] = 0;
+            char *end = NULL;
+            errno = 0;
+            long parsed = strtol(value, &end, 10);
+            while (end && (*end == '\n' || *end == ' ' || *end == '\t')) end++;
+            if (errno || !end || end == value || *end || parsed < -1000 || parsed > 1000) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            g_proc_oom_score_adj = (int)parsed;
+            char rendered[32];
+            int rendered_size = snprintf(rendered, sizeof rendered, "%d\n", g_proc_oom_score_adj);
+            (void)ftruncate(wfd, 0);
+            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
+            (void)lseek(wfd, rendered_size, SEEK_SET);
+            G_RET(c) = a2;
+            break;
+        }
         // memfd F_SEAL_WRITE: a write to a write-sealed memfd fails EPERM (emulated seal state).
         if (wfd >= 0 && wfd < HL_NFD && (memfd_seals_fd(wfd) & 0x8)) {
             G_RET(c) = (uint64_t)(-EPERM);
@@ -1555,6 +1586,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         if ((lcmd == 0 || lcmd == 1030) && fd_virt_reserve((int)a0, &fdvis) != 0) {
             G_RET(c) = (uint64_t)(-ENOSPC);
+            goto fcntl_done;
+        }
+        if (lcmd == 0 || lcmd == 1030) engine_fd_vacate((int)a2);
+        if ((lcmd == 0 || lcmd == 1030) && bound_sentinel_vacate((int)a2) != 0) {
+            proc_fdvis_reservation_cancel(&fdvis);
+            G_RET(c) = (uint64_t)(-EMFILE);
             goto fcntl_done;
         }
         int r = fcntl((int)a0, mcmd, a2);

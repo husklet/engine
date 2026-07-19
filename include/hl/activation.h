@@ -31,6 +31,11 @@ HL_API hl_status hl_activation_start(const char *executable, uint32_t guest_isa,
 HL_API hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa,
                                                 const char *config_path, const hl_activation_stdio *stdio,
                                                 hl_activation_process **out_process);
+/* Experimental activation plumbing for an engine/provider transport. The descriptor is borrowed and
+ * transferred with SCM_RIGHTS; it is not a guest descriptor and is never exposed through discovery. */
+HL_API hl_status hl_activation_start_with_transport(const char *executable, uint32_t guest_isa,
+                                                    const char *config_path, const hl_activation_stdio *stdio,
+                                                    int32_t transport, hl_activation_process **out_process);
 /* Starts the child in a new session with a controlling terminal. The returned
  * master descriptor is owned by the caller; stdin/stdout/stderr are merged on
  * it. The initial size is applied before the child can execute. */

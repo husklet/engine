@@ -182,7 +182,7 @@ static int hl_owner_number(const char *begin, const char *end, uint32_t *output)
     return 0;
 }
 
-static int hl_owner_seed(const char *rootfs, const char *spec) {
+static int hl_owner_seed(const char *rootfs, const char *spec, const char *const *lowers, size_t lower_count) {
     const char *line;
     size_t count = 0;
     if (spec != NULL)
@@ -209,7 +209,17 @@ static int hl_owner_seed(const char *rootfs, const char *spec) {
         memcpy(path, line, (size_t)(first - line));
         path[first - line] = 0;
         if (snprintf(host, sizeof(host), "%s/%s", rootfs, path) < 0 || strlen(host) >= sizeof(host) - 1u) return -1;
-        hl_owner_set_path(host, (int32_t)uid, (int32_t)gid, 1);
+        {
+            struct stat status;
+            size_t layer = 0;
+            while (lstat(host, &status) != 0 && layer < lower_count) {
+                if (snprintf(host, sizeof(host), "%s/%s", lowers[layer++], path) < 0 ||
+                    strlen(host) >= sizeof(host) - 1u)
+                    return -1;
+            }
+            if (lstat(host, &status) == 0)
+                hl_owner_set_metadata(&status, hl_owner_birth(host, -1, 1, &status), (int32_t)uid, (int32_t)gid);
+        }
         line = *end == 0 ? end : end + 1;
     }
     return 0;

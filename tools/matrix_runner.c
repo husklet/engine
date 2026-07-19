@@ -60,6 +60,7 @@ typedef struct resource_baseline {
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
+
 static void interrupt_runner(int signal_number) {
     sig_atomic_t group = active_group;
     interrupted_signal = signal_number;

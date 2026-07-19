@@ -154,8 +154,14 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
     }
     if (sfam == LX_AF_INET || sfam == LX_AF_INET6) {
         if (!(is_connect && lfam == 0)) { // AF_UNSPEC connect on an INET socket = disconnect: allow
-            socklen_t need = (sfam == LX_AF_INET) ? 16 : 24;
-            if (lfam != sfam) return -EAFNOSUPPORT;
+            socklen_t need = (lfam == LX_AF_INET) ? 16 : 24;
+            // The private UDP switch is family-neutral: dual-stack listeners and BusyBox clients may
+            // select opposite INET families while still addressing the same loopback endpoint. Preserve
+            // strict Linux family validation for every other socket, but allow that narrow datagram pair.
+            int private_udp_dual = fd >= 0 && fd < HL_NFD && g_sock_dgram[fd] && lo_on() &&
+                                   ((sfam == LX_AF_INET && lfam == LX_AF_INET6) ||
+                                    (sfam == LX_AF_INET6 && lfam == LX_AF_INET));
+            if (lfam != sfam && !private_udp_dual) return -EAFNOSUPPORT;
             if (alen < need) return -EINVAL;
         }
     }
@@ -256,7 +262,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
                 // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
-                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && (int)a0 == AF_INET);
+                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM &&
+                                   ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
+                g_udp_local_port[r] = g_udp_peer_port[r] = 0;
+                g_udp_local_ip[r] = g_udp_peer_ip[r] = 0;
+                g_udp_local_interface[r] = g_udp_peer_interface[r] = 0;
+                g_udp_local_v6[r] = g_udp_peer_v6[r] = 0;
                 g_sock_seqpacket[r] = 0;
                 g_so_error[r] = 0;            // no pending async socket error on a fresh fd
                 g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
@@ -518,6 +529,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
     bind_passthrough:
+        // Private UDP uses the same launch-scoped AF_UNIX switch as TCP. This includes ordinary,
+        // unpublished loopback and user-network sockets; publishing is an additional host forwarder.
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            int ui = br_on() ? br_bind_interface(sa, (socklen_t)a2) : -1;
+            int udp_lo6 = lo_on() && lo6_any_is(sa, (socklen_t)a2);
+            if (ui >= 0 || (lo_on() && lo_any_is(sa, (socklen_t)a2)) || udp_lo6) {
+                uint16_t up = ntohs(*(uint16_t *)(sa + 2));
+                uint32_t uip = ui >= 0 ? g_netif[ui].ip : 0;
+                int ur = udp_switch_bind((int)a0, ui, uip, up);
+                if (ur == 0) g_udp_local_v6[(int)a0] = (uint8_t)udp_lo6;
+                if (ur == 0 && up && pm_published(up)) udp_fwd_maybe_start((int)a0);
+                G_RET(c) = ur < 0 ? (uint64_t)(-errno) : 0;
+                break;
+            }
+        }
         // Published UDP (`-p H:C/udp`): swap an AF_INET datagram socket bound to a published port onto
         // the AF_UNIX switch + start its host->guest datagram forwarder. No-op (returns 0) for
         // non-published UDP, non-switch nets, or non-datagram sockets -> they fall through unchanged.
@@ -756,6 +782,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // NET bridge: connect(peer-ip:port in our subnet) -> dial the namespace's private bridge path.
         int bridge_enabled = br_on();
         int connect_interface = bridge_enabled ? br_connect_interface(sa, (socklen_t)a2) : -1;
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port,
+                                       udp_path, sizeof udp_path)) {
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno); break;
+                }
+                g_udp_peer_port[(int)a0] = udp_port;
+                g_udp_peer_ip[(int)a0] = udp_ip;
+                g_udp_peer_interface[(int)a0] = (uint8_t)(udp_interface + 1);
+                g_udp_peer_v6[(int)a0] = (uint8_t)(*(const uint16_t *)sa == LX_AF_INET6_FAM);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && connect_interface >= 0) {
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
@@ -869,6 +910,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 204: {
         // getsockname
         int fd = (int)a0;
+        if (fd >= 0 && fd < HL_NFD && g_udp_local_port[fd]) {
+            if (g_udp_local_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_local_port[fd]);
+            else if (g_udp_local_interface[fd])
+                fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_udp_local_ip[fd], g_udp_local_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_local_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
         if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: report an AF_INET local addr (0.0.0.0:0)
             if (a1) {
                 uint8_t *g = (uint8_t *)a1;
@@ -919,6 +970,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
+        if (fd >= 0 && fd < HL_NFD && g_udp_peer_port[fd]) {
+            if (g_udp_peer_v6[fd])
+                fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_port[fd]);
+            else if (g_udp_peer_interface[fd])
+                fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_ip[fd], g_udp_peer_port[fd]);
+            else
+                fill_inet_lo((uint8_t *)a1, (socklen_t *)a2, g_udp_peer_port[fd]);
+            G_RET(c) = 0;
+            break;
+        }
         if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd]) { // DNS socket: peer is the nameserver 127.0.0.11:53
             dns_fill_ns((uint8_t *)a1, (socklen_t *)a2);
             G_RET(c) = 0;
@@ -1004,6 +1065,24 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            int udp_route = a4 ? udp_switch_destination((const uint8_t *)a4, (socklen_t)a5, &udp_interface,
+                                                        &udp_ip, &udp_port, udp_path, sizeof udp_path)
+                               : udp_switch_peer_path((int)a0, udp_path, sizeof udp_path);
+            if (udp_route) {
+                if (!a4) udp_interface = (int)g_udp_peer_interface[(int)a0] - 1;
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno); break;
+                }
+                struct sockaddr_un un;
+                ssize_t ur = unix_addr_set(&un, udp_path) < 0 ? -1 :
+                    sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+                           (struct sockaddr *)&un, sizeof un);
+                G_RET(c) = ur < 0 ? (uint64_t)(-errno) : (uint64_t)ur;
+                break;
+            }
+        }
         // dest addr (UDP): translate Linux AF_INET/INET6 sockaddr -> macOS; NULL/non-inet pass through.
         struct sockaddr_storage dss;
         socklen_t dhl = a4 ? sa_l2m((uint8_t *)a4, (socklen_t)a5, &dss) : (socklen_t)-1;
@@ -1052,6 +1131,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // DNS socket: report the source as the nameserver (127.0.0.11:53) so the guest resolver's
             // "answer came from the server we queried" anti-spoof check passes (the real src is AF_UNIX).
             dns_fill_ns((uint8_t *)a4, (socklen_t *)a5);
+        } else if (r >= 0 && want && udp_switch_source(&hss, hsl, (uint8_t *)a4, (socklen_t *)a5)) {
+            // translated from the switch's opaque AF_UNIX sender identity
         } else if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
@@ -1376,7 +1457,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         char ud_host[1200];
         int ud_route = 0;                     // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
         if (nr == 211 && gname && gnamelen) { // sendmsg: guest -> host
-            if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
+            int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
+                                       ud_host, sizeof ud_host)) {
+                if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                    G_RET(c) = (uint64_t)(-errno);
+                    break;
+                }
+                ud_route = 1;
+            } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
                 unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                 ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
             } else {
@@ -1392,6 +1482,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     mh.msg_namelen = hl;
                 }
             }
+        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                   g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+            ud_route = 1;
         } else if (nr == 212 && gname && gnamelen) { // recvmsg: receive into host scratch
             mh.msg_name = &nss;
             mh.msg_namelen = sizeof nss;
@@ -1476,6 +1569,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // DNS socket: report the nameserver (127.0.0.11:53) as the source (see case 207).
                 dns_fill_ns(gname, NULL);
                 *(uint32_t *)(g + 8) = 16;
+            } else if (gname && gnamelen &&
+                       udp_switch_source(&nss, mh.msg_namelen, gname, (socklen_t *)(g + 8))) {
+                // AF_UNIX switch sender restored to its Linux AF_INET identity.
             } else if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
                 int ll = sa_m2l((struct sockaddr *)&nss, gname, gnamelen);
                 *(uint32_t *)(g + 8) = (ll >= 0) ? (uint32_t)ll : mh.msg_namelen;

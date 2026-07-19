@@ -2,6 +2,8 @@
 // most instructions verbatim; MANGLE only stolen-register (x18/x28/x30) users. Optimizations: LSE
 // atomic upgrade, §B shadow-return prediction (depth-gated), tier-2 purity gate. See OPTIMIZATIONS.md.
 
+#include <assert.h>
+
 // Non-PIE ET_EXEC link span + high-map bias. Really defined (and set by load_elf) in os/linux/container/
 // vfs.c and os/linux/elf.c, both compiled LATER in the same unity TU; forward-declared here (static, so
 // it merges into the single later definition) so adr/adrp can un-bias the PC. 0 for PIE/static-PIE.
@@ -435,25 +437,27 @@ static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
    to the dispatcher as R_BUS or reload byte-for-byte state and continue. */
 static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     /* x16 carries the state loaded by the caller. */
-    e_str(9, CPUREG, OFF_BUS_SCRATCH);
     uint32_t *force_slow = (uint32_t *)g_cp;
     emit32(0); /* tbnz w16,#1,slow */
-    e_ldr(16, CPUREG, OFF_FAULT_ADDR);
-    emit32(0xD3400000u | (12u << 16) | (63u << 10) | (16u << 5) | 16u);
-    e_movr(17, 16);
-    emit32(0xD3400000u | (6u << 16) | (15u << 10) | (16u << 5) | 16u);
-    e_ldr(9, CPUREG, OFF_BUS_FILTER);
-    emit32(0x8B000000u | (16u << 16) | (3u << 10) | (9u << 5) | 9u);
-    e_ldr(9, 9, 0);
-    emit32(0x9AC02400u | (17u << 16) | (9u << 5) | 9u);
+    /* Use only engine-reserved x16/x17. A live guest register cannot be
+       parked in shared per-thread scratch here: an asynchronous signal may
+       re-enter translated code and run another guard before this one resumes. */
+    e_ldr(17, CPUREG, OFF_BUS_EA);
+    emit32(0xD34CFC00u | (17u << 5) | 17u); /* lsr x17,x17,#12: page */
+    emit32(0xD3400000u | (6u << 16) | (15u << 10) | (17u << 5) | 16u); /* ubfx x16,x17,#6,#10 */
+    e_ldr(17, CPUREG, OFF_BUS_FILTER);
+    emit32(0x8B000000u | (16u << 16) | (3u << 10) | (17u << 5) | 16u); /* add x16,x17,x16,lsl#3 */
+    e_ldr(16, 16, 0);
+    e_ldr(17, CPUREG, OFF_BUS_EA);
+    emit32(0xD34CFC00u | (17u << 5) | 17u);
+    emit32(0x9AD12610u); /* lsrv x16,x16,x17 */
     uint32_t *filter_miss = (uint32_t *)g_cp;
     emit32(0); /* tbz x18,#0,resume */
     uint8_t *slow = g_cp;
     *force_slow = 0x37000000u | (1u << 19) |
                   (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
-    e_ldr(9, CPUREG, OFF_BUS_SCRATCH);
     emit_spill();
-    e_ldr(0, CPUREG, OFF_FAULT_ADDR);
+    e_ldr(0, CPUREG, OFF_BUS_EA);
     e_movconst(1, bytes);
     emit_busfaultptr(16);
     emit32(0xD63F0000u | (16u << 5)); /* blr x16 */
@@ -478,20 +482,23 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
         if (!is_stolen(r)) e_ldr(r, CPUREG, r * 8);
     e_ldr(0, CPUREG, 0);
     uint8_t *resume_fast = g_cp;
-    e_ldr(9, CPUREG, OFF_BUS_SCRATCH);
-    *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 9u;
+    *filter_miss = 0x36000000u |
+                   (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 16u;
 }
 
 static void emit_a64_bus_guard(int ea, uint64_t bytes, uint64_t pc) {
     if (!jit_guest_bus_active()) return;
-    e_str(ea, CPUREG, OFF_FAULT_ADDR);
+    /* The inline BUS ABI reserves x16/x17 as engine registers. Target
+       initialization fixes g_steal1617 on and exposes no legacy override. */
+    assert(g_steal1617);
+    e_str(ea, CPUREG, OFF_BUS_EA);
     e_ldr(16, CPUREG, OFF_BUS_FORCE);
     emit32(0xB9400000u | (16u << 5) | 16u);
     uint32_t *inactive_fast = (uint32_t *)g_cp;
     emit32(0);
     emit_a64_bus_guard_saved(bytes, pc);
     uint8_t *resume_inactive = g_cp;
-    e_ldr(ea, CPUREG, OFF_FAULT_ADDR);
+    e_ldr(ea, CPUREG, OFF_BUS_EA);
     *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
                      16u;
 }
@@ -511,6 +518,44 @@ static void emit_a64_bus_guard_base(int base, int64_t offset, uint64_t bytes, ui
     emit_a64_bus_guard(16, bytes, pc);
 }
 
+/* Compute and guard the architectural guest EA while preserving the original
+   memory opcode. BUS observation must not broaden non-PIE bias folding. */
+static void emit_a64_bus_guard_instruction(uint32_t in, uint64_t pc) {
+    int base = (int)((in >> 5) & 31u);
+    int regoff = (in & 0x3B200C00u) == 0x38200800u;
+    if (base == 31)
+        e_mov_from_sp(16);
+    else if (is_stolen(base))
+        e_ldr(16, CPUREG, base * 8);
+    else
+        e_movr(16, base);
+    if (regoff) {
+        int rm = (int)((in >> 16) & 31u), opt = (int)((in >> 13) & 7u);
+        int vector = (int)((in >> 26) & 1u);
+        int size = vector ? (int)((((in >> 22) & 3u) >> 1) << 2) | (int)((in >> 30) & 3u)
+                          : (int)((in >> 30) & 3u);
+        int amount = ((in >> 12) & 1u) ? size : 0;
+        if (is_stolen(rm))
+            e_ldr(17, CPUREG, rm * 8);
+        else
+            e_movr(17, rm);
+        emit32(0x8B200000u | (17u << 16) | ((unsigned)opt << 13) |
+               ((unsigned)(amount & 7) << 10) | (16u << 5) | 16u);
+    } else {
+        int64_t offset = a64_fold_mem_offset(in, 0);
+        if (((in >> 27) & 7u) == 7u && !((in >> 24) & 1u)) {
+            int mode = (int)((in >> 10) & 3u);
+            if (mode == 1) offset = 0;
+        }
+        if (offset != 0) {
+            uint64_t magnitude = (uint64_t)(offset < 0 ? -offset : offset);
+            e_movconst(17, magnitude);
+            emit32((offset < 0 ? 0xCB000000u : 0x8B000000u) | (17u << 16) | (16u << 5) | 16u);
+        }
+    }
+    emit_a64_bus_guard(16, a64_mem_bytes(in), pc);
+}
+
 // Emit a folded memory op: compute the guest effective address into a scratch Sb, add g_nonpie_bias iff
 // that address is a LOW image address (< 4GiB; everything else -- stack/heap/mmap/libs -- is >= the
 // engine's 4GiB __PAGEZERO), then the access re-pointed at Sb. Flag-free (loads/stores must not disturb the
@@ -520,7 +565,7 @@ static void emit_a64_bus_guard_base(int base, int64_t offset, uint64_t bytes, ui
 // plain [Sb] (unscaled, #0) so the single < 4GiB test is on the real target. Pre/post-index writeback is
 // de-indexed too: the access runs against the biased Sb, then the writeback updates the LOW guest base. Any
 // stolen Rt/Rt2/Rs is handled by reusing emit_mangled_x18 on the re-based instruction (base field -> Sb).
-static void emit_fold_mem(uint32_t in) {
+static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
     int mask = gpr_field_mask(in), base = (in >> 5) & 31;
     // LSE atomic memory ops (LDADD/SWP/...) carry an operand register Rs at [20:16] that gpr_field_mask
     // does not flag; mark it (bit2) so the scratch picker never aliases Rs and a stolen Rs is mangled.
@@ -616,12 +661,12 @@ static void emit_fold_mem(uint32_t in) {
         else if ((in & 0x3a000000u) == 0x28000000u)
             m &= ~(0x7fu << 15); /* pair immediate */
     }
-    if (jit_guest_bus_active()) {
+    if (emit_bus_guard && jit_guest_bus_active()) {
         /* Preserve the exact EA, then restore scratch registers before
            emit_spill captures the architectural register file.  Spilling Sb,
            T, T2, or Tm while they contain translator temporaries silently
            corrupts guest registers on every guarded miss. */
-        e_str(Sb, CPUREG, OFF_FAULT_ADDR);
+        e_str(Sb, CPUREG, OFF_BUS_EA);
         e_ldr(16, CPUREG, OFF_BUS_FORCE);
         emit32(0xB9400000u | (16u << 5) | 16u);
         uint32_t *inactive_fast = (uint32_t *)g_cp;
@@ -631,7 +676,7 @@ static void emit_fold_mem(uint32_t in) {
         e_ldr(T, CPUREG, M + 40);
         e_ldr(T2, CPUREG, M + 48);
         emit_a64_bus_guard_saved(a64_mem_bytes(in), g_emit_gpc);
-        e_ldr(Sb, CPUREG, OFF_FAULT_ADDR);
+        e_ldr(Sb, CPUREG, OFF_BUS_EA);
         uint8_t *resume_inactive = g_cp;
         *inactive_fast = 0x36000000u |
                          (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
@@ -1207,8 +1252,10 @@ static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body
 // instruction (no monitor), so the injected spill/fill is harmless, making this the correct path. The
 // common clean PIE case still lowers to the bare op -> byte-identical to before.
 static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
-    if (is_mem && guestbase_on() && ((in >> 5) & 31) != 31)
-        emit_fold_mem(in);
+    if (is_mem && guestbase_on() && ((in >> 5) & 31) != 31) {
+        if (jit_guest_bus_active()) emit_a64_bus_guard_instruction(in, g_emit_gpc);
+        emit_fold_mem(in, 0);
+    }
     else if (uses_x18(in, mask))
         emit_mangled_x18(in, mask);
     else
@@ -1448,6 +1495,86 @@ static void stitch_cond(uint32_t inv, uint64_t taken) {
 
 static int smc_disabled(void) { return 0; }
 
+static void *translate_block(uint64_t gpc);
+static uint64_t g_last_guest_start;
+static uint64_t g_last_guest_end;
+
+static void smc_queue_line(struct cpu *c, uint64_t address) {
+    uint64_t start = address & ~UINT64_C(63), end = start + 64;
+    for (uint32_t i = 0; i < c->smc_range_count; i++) {
+        if (end < c->smc_ranges[i][0] || start > c->smc_ranges[i][1]) continue;
+        if (start < c->smc_ranges[i][0]) c->smc_ranges[i][0] = start;
+        if (end > c->smc_ranges[i][1]) c->smc_ranges[i][1] = end;
+        return;
+    }
+    if (c->smc_range_count == 8) {
+        c->smc_range_overflow = 1;
+        return;
+    }
+    c->smc_ranges[c->smc_range_count][0] = start;
+    c->smc_ranges[c->smc_range_count][1] = end;
+    c->smc_range_count++;
+}
+
+static int smc_commit(struct cpu *c) {
+    if (!c->smc_range_count && !c->smc_range_overflow) return 1;
+    g_smc_seen = 1;
+    if (!c->smc_range_overflow) {
+        pthread_mutex_lock(&g_jit_lock);
+        uint32_t retained = 0;
+        for (uint32_t i = 0; i < c->smc_range_count; i++) {
+            uint64_t dirty_start = UINT64_MAX, dirty_end = 0;
+            for (uint64_t line = c->smc_ranges[i][0]; line < c->smc_ranges[i][1]; line += 64) {
+                int classification = txln_flush_class(line);
+                if (classification == 1 || (classification == 0 && g_pcache_loaded && txpg_has(line))) {
+                    if (dirty_start == UINT64_MAX) dirty_start = line;
+                    dirty_end = line + 64;
+                }
+            }
+            if (dirty_start != UINT64_MAX) {
+                c->smc_ranges[retained][0] = dirty_start;
+                c->smc_ranges[retained][1] = dirty_end;
+                retained++;
+            }
+        }
+        c->smc_range_count = retained;
+        pthread_mutex_unlock(&g_jit_lock);
+        if (!retained) {
+            c->smc_range_count = 0;
+            c->smc_range_overflow = 0;
+            return 1;
+        }
+    }
+    /*
+     * Do not rewrite live map entries in place here.  Besides leaving several
+     * independent ingress paths to the old body (direct chains, shadow
+     * returns and per-site ICs), recompiling every overlapping entry can emit
+     * an unbounded amount of code during one dispatcher crossing.  Large JITs
+     * such as Julia reached the end of the writable alias and the assembler
+     * then faulted on the adjacent RX alias.
+     *
+     * All peers are brought to a dispatcher boundary, so invalidating every
+     * lookup/chain is both simpler and coherent.  The old bytes remain mapped
+     * and untouched until the ordinary capacity rotation retires them; no
+     * executing host PC is invalidated.  Subsequent entries translate the
+     * modified guest bytes on demand.
+     */
+    stw_mapping_begin();
+    map_clear();
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    g_npend = 0;
+    txpg_clear();
+    for (int i = 0; i < STW_MAXTHREAD; i++)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
+            g_stw_threads[i].cpu)
+            g_stw_threads[i].cpu->ssp = 0;
+    g_smc_flushes++;
+    stw_mapping_end();
+    c->smc_range_count = 0;
+    c->smc_range_overflow = 0;
+    return 1;
+}
+
 // A guest `ic ivau` reached the dispatcher (R_ICFLUSH): the guest is about to execute code it just rewrote,
 // so every gpc->host translation may be stale. Drop the whole block map + IBTC + pending chains (mirrors the
 // x86 smc_on_write flush). We deliberately do NOT reset g_cp: the just-exited block's host code stays intact
@@ -1455,7 +1582,7 @@ static int smc_disabled(void) { return 0; }
 // shadow stack is left alone -- its host_rets point at old code that is still present in g_cp (valid targets).
 // g_smc_seen latches so indirect branches stop populating the per-site IC (see G_IBTC_FILL): that literal
 // lives in the unmodified CALLER block, which this flush cannot reach.
-static void smc_icflush(uint64_t va) {
+static void smc_icflush(struct cpu *c, uint64_t va) {
     // The guest issued `ic ivau` -> it generates/patches code -> the per-site monomorphic IC stays disabled
     // (its literal lives in an unmodified caller block this flush can't reach). Latch this unconditionally,
     // even when the precise gate below skips, so a code-modifying guest never trusts the per-site IC.
@@ -1514,17 +1641,78 @@ static void smc_icflush(uint64_t va) {
     // fallback is taken only on a true overwrite of executed code.
     // Single-threaded (incl. all peers exited): the wholesale in-place drop IS coherent -- one thread, no
     // split -- so re-translate for correct self-modification (a single-isolate V8, the soak_smc test).
-    if (!g_threaded) {
-        smc_inplace_drop();
-        g_smc_flushes++;
-        return;
+    smc_queue_line(c, va);
+}
+
+static void emit_smc_queue(int va_register) {
+    assert(g_steal1617);
+    if (is_stolen(va_register)) e_ldr(16, CPUREG, va_register * 8);
+    else e_movr(16, va_register);
+    emit32(0x927AE610u); /* and x16,x16,#-64 */
+    e_str(16, CPUREG, OFF_SMCVA);
+    e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
+    uint32_t *empty = (uint32_t *)g_cp;
+    emit32(0); /* cbz x16,append */
+    e_subi(16, 16, 1);
+    e_addlsl4(17, CPUREG, 16);
+    unsigned offset = (unsigned)OFF_SMC_RANGES;
+    if (offset >= 4096) {
+        emit32(0x91400000u | (((offset >> 12) & 0xfffu) << 10) | (17u << 5) | 17u);
+        offset &= 0xfffu;
     }
-    pthread_mutex_lock(&g_jit_lock);
-    if (!stw_peers_live()) { // threaded but no OTHER thread live right now -> a drop is still coherent
-        smc_inplace_drop();
-        g_smc_flushes++;
+    if (offset) e_addi(17, 17, offset);
+    e_ldr(17, 17, 8);
+    e_ldr(16, CPUREG, OFF_SMCVA);
+    emit32(0xCB110211u); /* sub x17,x16,x17 */
+    uint32_t *not_adjacent = (uint32_t *)g_cp;
+    emit32(0); /* cbnz x17,append */
+    e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
+    e_subi(16, 16, 1);
+    e_addlsl4(17, CPUREG, 16);
+    offset = (unsigned)OFF_SMC_RANGES;
+    if (offset >= 4096) {
+        emit32(0x91400000u | (((offset >> 12) & 0xfffu) << 10) | (17u << 5) | 17u);
+        offset &= 0xfffu;
     }
-    pthread_mutex_unlock(&g_jit_lock);
+    if (offset) e_addi(17, 17, offset);
+    e_ldr(16, CPUREG, OFF_SMCVA);
+    e_addi(16, 16, 64);
+    e_str(16, 17, 8);
+    uint32_t *extended = (uint32_t *)g_cp;
+    emit32(0); /* b done */
+
+    uint8_t *append = g_cp;
+    e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
+    e_subi(17, 16, 8);
+    uint32_t *overflow = (uint32_t *)g_cp;
+    emit32(0); /* cbz x17,overflow */
+    e_addlsl4(17, CPUREG, 16);
+    offset = (unsigned)OFF_SMC_RANGES;
+    if (offset >= 4096) {
+        emit32(0x91400000u | (((offset >> 12) & 0xfffu) << 10) | (17u << 5) | 17u);
+        offset &= 0xfffu;
+    }
+    if (offset) e_addi(17, 17, offset);
+    e_ldr(16, CPUREG, OFF_SMCVA);
+    e_str(16, 17, 0);
+    e_addi(16, 16, 64);
+    e_str(16, 17, 8);
+    e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
+    e_addi(16, 16, 1);
+    e_str(16, CPUREG, OFF_SMC_RANGE_COUNT);
+    uint32_t *skip = (uint32_t *)g_cp;
+    emit32(0); /* b done */
+    uint8_t *overflow_body = g_cp;
+    e_movconst(16, 1);
+    e_str(16, CPUREG, OFF_SMC_RANGE_OVERFLOW);
+    uint8_t *done = g_cp;
+    *empty = 0xB4000000u | (((uint32_t)((append - (uint8_t *)empty) / 4) & 0x7ffffu) << 5) | 16u;
+    *not_adjacent = 0xB5000000u |
+                    (((uint32_t)((append - (uint8_t *)not_adjacent) / 4) & 0x7ffffu) << 5) | 17u;
+    *extended = 0x14000000u | ((uint32_t)((done - (uint8_t *)extended) / 4) & 0x03ffffffu);
+    *overflow = 0xB4000000u |
+                (((uint32_t)((overflow_body - (uint8_t *)overflow) / 4) & 0x7ffffu) << 5) | 17u;
+    *skip = 0x14000000u | ((uint32_t)((done - (uint8_t *)skip) / 4) & 0x03ffffffu);
 }
 
 // async-interrupt poll: emit a CHEAP flag-free check of cpu->irq at the block body entry (the target
@@ -1584,12 +1772,30 @@ static int insn_touches_vreg(uint32_t in) {
     return 0;
 }
 
+static void emit_cpu_model_value(int rd, uint64_t value) {
+    if (is_stolen(rd)) {
+        if (stealfast_on()) {
+            e_movconst(16, value);
+            e_str(16, CPUREG, rd * 8);
+        } else {
+            x18_prolog();
+            e_movconst(0, value);
+            e_str(0, 1, rd * 8);
+            x18_epilog();
+        }
+    } else {
+        e_movconst(rd, value);
+    }
+}
+
 static void *translate_block(uint64_t gpc) {
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 guest_pc=%#llx", (unsigned long long)gpc);
     // W4E tier-2: read NOTIER2 / TIER2_THRESHOLD once (idempotent) before any self-loop detection.
     tier2_env_init();
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
+    uint64_t guest_start = gpc;
+    uint64_t guest_end = gpc + 4;
     g_blk_vdirty = 0; // reset per block; set below when a V-writing insn is emitted
     void *host = g_cp;
     emit_prologue();
@@ -1610,6 +1816,9 @@ static void *translate_block(uint64_t gpc) {
     } defer[64];
 
     int ndefer = 0;
+    uint64_t provenance_host = 0;
+    uint64_t provenance_guest = 0;
+    int provenance_fault_capable = 0;
     // opt4 region state: guest block-starts inlined into this region + a block budget. The
     // region STOPS (falls to the baseline single-block exit) at any dispatcher-mediated edge
     // (indirect br/blr, bl/call, ret, svc/syscall), inside an exclusive monitor region, or on
@@ -1617,9 +1826,20 @@ static void *translate_block(uint64_t gpc) {
     if (g_stitch < 0) g_stitch = 1;
     uint64_t seen[TRACE_MAX_BLK];
     int nseen = 0, trace_blk = 0;
-#define STITCH_OK (g_stitch && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
+#define STITCH_OK                                                                                                      \
+    (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 &&                                          \
+     (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
+        if (gpc < guest_start) guest_start = gpc;
+        if (gpc + 4 > guest_end) guest_end = gpc + 4;
+        if (provenance_fault_capable)
+            jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
+        provenance_host = (uint64_t)g_cp;
+        provenance_guest = gpc;
+        uint32_t provenance_major = (in >> 25) & 0xFu;
+        provenance_fault_capable = ((in & 0x0A000000u) == 0x08000000u) || provenance_major == 0xA ||
+                                   provenance_major == 0xB;
         g_emit_gpc = gpc; // IRQSLIM: tag the current guest PC for the forward/backward edge test in emit_chain_exit
         // at the FIRST vector-touching instruction of the region, store the (nonzero) cpu pointer
         // into cpu->vdirty so a later (possibly chained-to) syscall exit takes the full V spill. Emitted
@@ -2002,19 +2222,39 @@ static void *translate_block(uint64_t gpc) {
         //   DIC (bit29) = 0 -> "IC invalidate IS required": keeps the guest issuing `ic ivau`, our SMC hook.
         if ((in & 0xFFFFFFE0u) == 0xD53B0020u) {
             int rd = in & 31;
-            uint64_t ctr = 0x9444C004ull;
-            if (is_stolen(rd)) {
-                if (stealfast_on()) {
-                    e_movconst(16, ctr);
-                    e_str(16, CPUREG, rd * 8);
-                } else {
-                    x18_prolog();
-                    e_movconst(0, ctr);
-                    e_str(0, 1, rd * 8);
-                    x18_epilog();
-                }
-            } else
-                e_movconst(rd, ctr);
+            emit_cpu_model_value(rd, g_aarch64_cpu_model.ctr_el0);
+            gpc += 4;
+            continue;
+        }
+        if ((in & 0xFFFFFFE0u) == 0xD53B00E0u) {
+            emit_cpu_model_value(in & 31, g_aarch64_cpu_model.dczid_el0);
+            gpc += 4;
+            continue;
+        }
+        // HWCAP_CPUID is absent: EL1 ID-register families are inaccessible to EL0 and must not leak host IDs.
+        if ((in & 0xFFFF0000u) == 0xD5380000u && !g_aarch64_cpu_model.user_id_registers) {
+            emit32(0);
+            gpc += 4;
+            continue;
+        }
+
+        /* DC ZVA is defined by the guest's DCZID_EL0, not by the host CPU.
+           Apple hosts may use a different zero-block size; copying the opcode
+           verbatim then clears bytes outside the 64-byte block advertised to
+           the guest.  Managed runtimes place live metadata immediately after
+           such blocks, so the mismatch surfaces later as pointer corruption.
+           Lower to four exact stores at the guest-model-aligned address. */
+        if ((in & 0xFFFFFFE0u) == 0xD50B7420u) {
+            int source = (int)(in & 31u);
+            if (is_stolen(source))
+                e_ldr(16, CPUREG, source * 8);
+            else
+                e_movr(16, source);
+            emit32(0x927AE610u); /* and x16,x16,#-64 */
+            if (jit_guest_bus_active()) emit_a64_bus_guard(16, 64, gpc);
+            for (unsigned offset = 0; offset < 64; offset += 16)
+                emit32(0xA9000000u | (((offset / 8) & 0x7Fu) << 15) |
+                       (31u << 10) | (16u << 5) | 31u); /* stp xzr,xzr,[x16,#offset] */
             gpc += 4;
             continue;
         }
@@ -2036,8 +2276,12 @@ static void *translate_block(uint64_t gpc) {
         // map + IBTC (smc_icflush) and the modified bytes re-translate. pc resumes PAST the ic ivau. Gated by
         // NOSMC; the dc cvau / isb in the same dance run verbatim (harmless: they touch real data memory).
         if ((in & 0xFFFFFFE0u) == 0xD50B7520u && !smc_disabled()) {
-            // Capture the invalidated VA (cpu->x[Xt]) on the exit so smc_icflush() can invalidate precisely.
-            emit_exit_icflush(gpc + 4, (int)(in & 31));
+            emit_smc_queue((int)(in & 31));
+            gpc += 4;
+            continue;
+        }
+        if (in == 0xD5033FDFu && !smc_disabled()) {
+            emit_exit_const(gpc + 4, R_ICCOMMIT);
             break;
         }
 
@@ -2211,9 +2455,10 @@ static void *translate_block(uint64_t gpc) {
         // clear the monitor) and only for a non-SP base (the stack is always high). The AdvSIMD load/store
         // structure family (ld1/st1.., ld1r) has no offset/index so is_foldable_mem omits it -- fold it via
         // its own emitter (else glibc's NEON strlen/memcpy trap once per access on the image). Inert for PIE.
-        if ((guestbase_on() || jit_guest_bus_active()) && !in_excl && ((in >> 5) & 31) != 31) {
+        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31) {
             if (is_foldable_mem(in)) {
-                emit_fold_mem(in);
+                if (jit_guest_bus_active()) emit_a64_bus_guard_instruction(in, gpc);
+                emit_fold_mem(in, 0);
                 gpc += 4;
                 continue;
             }
@@ -2224,6 +2469,11 @@ static void *translate_block(uint64_t gpc) {
             }
         }
         if (jit_guest_bus_active()) {
+            if (!guestbase_on() && !in_excl && is_foldable_mem(in))
+                emit_a64_bus_guard_instruction(in, gpc);
+            if (!guestbase_on() && !in_excl && is_advsimd_struct(in))
+                emit_a64_bus_guard_base((in >> 5) & 31, 0,
+                                        (uint64_t)advsimd_struct_bytes(in), gpc);
             /* Pair pre/post-index forms are deliberately not bias-folded.  Guard
                their architectural access address, then preserve the native
                writeback opcode verbatim below. */
@@ -2244,11 +2494,6 @@ static void *translate_block(uint64_t gpc) {
                 if ((in >> 21) & 1) bytes *= 2;
                 emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
             }
-            /* DC ZVA writes one synthetic 64-byte D-cache line (matching the
-               CTR_EL0 value exposed above), so it is a real guest store for
-               EOF/BUS purposes even though the opcode is copied natively. */
-            if ((in & 0xFFFFFFE0u) == 0xD50B7420u)
-                emit_a64_bus_guard_base(in & 31, 0, 64, gpc);
         }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
@@ -2259,6 +2504,8 @@ static void *translate_block(uint64_t gpc) {
             emit32(in);
         gpc += 4;
     }
+    if (provenance_fault_capable)
+        jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
     // emit the deferred exit stubs for branches taken inside an exclusive region
     for (int i = 0; i < ndefer; i++) {
         int64_t d = ((uint8_t *)g_cp - (uint8_t *)defer[i].patch) / 4;
@@ -2278,12 +2525,14 @@ static void *translate_block(uint64_t gpc) {
     // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
     // itself, so don't insert a duplicate. Expose the body for it.
     g_last_body = body;
+    g_last_guest_start = guest_start;
+    g_last_guest_end = guest_end;
     if (!g_tier2_build) {
-        map_put(start, host, body);
+        map_put(start, guest_start, guest_end, host, body);
         // SMC precise gate: record every guest page this block's SOURCE spans, so a later guest `ic ivau`
         // to one of these pages takes the full invalidation while a flush of any never-translated page is
         // skipped. `gpc` is the (exclusive) end of the decoded block here; `start` is its entry.
-        txpg_mark(start, gpc);
+        txpg_mark(start, guest_end);
     }
     // patch_links_to is MOVED to the dispatcher, AFTER the new block's icache is invalidated:
     // chaining an existing block X -> this new block before its code is icache-coherent on a peer
@@ -2311,7 +2560,7 @@ static void tier2_promote(uint64_t gpc) {
     // Demand the same headroom a normal translate does; if it's not there, skip promotion. That is always
     // safe: the loop keeps running its correct tier-1 body (the spent down-counter simply wraps past 0 and
     // stops re-raising R_TIER2), and it can promote later once a flush has reset the arena.
-    if (g_cp + (1u << 16) > g_cache + CACHE_SZ) return;
+    if (g_cp + CACHE_EMIT_HEADROOM > g_cache + CACHE_SZ) return;
     int mi = map_idx(gpc);
     if (mi < 0) return;
     if (!jit_wprot(0)) return;

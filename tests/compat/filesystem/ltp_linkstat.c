@@ -16,16 +16,26 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 int main(void) {
-    const char *base = "/tmp/ltp_ls_a";
-    const char *l1 = "/tmp/ltp_ls_b";
-    const char *l2 = "/tmp/ltp_ls_c";
-    const char *sym = "/tmp/ltp_ls_sym";
+#if defined(__aarch64__)
+    char directory[] = "/tmp/ltp_ls_a_XXXXXX";
+#else
+    char directory[] = "/tmp/ltp_ls_x_XXXXXX";
+#endif
+    char base[96], l1[96], l2[96], sym[96], missing[96], child[128];
+    if (!mkdtemp(directory)) return 2;
+    snprintf(base, sizeof base, "%s/a", directory);
+    snprintf(l1, sizeof l1, "%s/b", directory);
+    snprintf(l2, sizeof l2, "%s/c", directory);
+    snprintf(sym, sizeof sym, "%s/sym", directory);
+    snprintf(missing, sizeof missing, "%s/nope", directory);
+    snprintf(child, sizeof child, "%s/x", base);
     unlink(base); unlink(l1); unlink(l2); unlink(sym);
 
     int fd = open(base, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -60,8 +70,20 @@ int main(void) {
 
     // link with a nonexistent source -> ENOENT.
     errno = 0;
-    int e2 = link("/tmp/ltp_ls_nope", "/tmp/ltp_ls_x");
+    int e2 = link(missing, missing);
     printf("link ENOENT: ret=%d ok=%d\n", e2, e2 < 0 && errno == ENOENT);
+
+    // linkat validates a relative path's directory descriptor before path
+    // lookup: an open non-directory is ENOTDIR and a closed descriptor is
+    // EBADF.  This is the point where upstream LTP linkat01 case 8 diverges.
+    int nondir = open("/dev/null", O_RDONLY);
+    errno = 0;
+    int la_nd = linkat(nondir, "child", AT_FDCWD, missing, 0);
+    printf("linkat ENOTDIR: ret=%d ok=%d\n", la_nd, la_nd < 0 && errno == ENOTDIR);
+    close(nondir);
+    errno = 0;
+    int la_bad = linkat(nondir, "child", AT_FDCWD, missing, 0);
+    printf("linkat EBADF: ret=%d ok=%d\n", la_bad, la_bad < 0 && errno == EBADF);
 
     // symlink + lstat: lstat must report the LINK (S_ISLNK, size==strlen(target)), not the target file.
     symlink(base, sym);
@@ -77,12 +99,12 @@ int main(void) {
     // lstat on a nonexistent path -> ENOENT.
     errno = 0;
     struct stat ns;
-    int nr = lstat("/tmp/ltp_ls_nope", &ns);
+    int nr = lstat(missing, &ns);
     printf("lstat ENOENT: ret=%d ok=%d\n", nr, nr < 0 && errno == ENOENT);
 
     // lstat where a path component is a file (not a dir) -> ENOTDIR.
     errno = 0;
-    int nd = lstat("/tmp/ltp_ls_a/x", &ns);
+    int nd = lstat(child, &ns);
     printf("lstat ENOTDIR: ret=%d ok=%d\n", nd, nd < 0 && errno == ENOTDIR);
 
     // #402(a): utimensat with NULL `times` (LTP SAFE_TOUCH) sets atime/mtime to now and SUCCEEDS.
@@ -112,5 +134,6 @@ int main(void) {
     printf("statx(NULL): ret=%d efault=%d\n", (int)xe, xe < 0 && errno == EFAULT);
 
     unlink(base); unlink(l1); unlink(l2); unlink(sym);
+    rmdir(directory);
     return 0;
 }

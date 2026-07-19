@@ -173,6 +173,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             } else {
                 if (exec_fd_is_engine((int)fd)) continue; // never close a (relocated) live engine fd
                 fd_reset_emul((int)fd); // drop hl's emulation tables so a reused fd number isn't misrouted
+                proc_fdvis_close((int)fd);
                 close((int)fd);
             }
         }
@@ -859,16 +860,38 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // RLIMIT_STACK(3) reports 8MB, RLIMIT_NOFILE(7) a finite fd cap, everything else unlimited; setrlimit is
     // accepted (no-op).
     case 163:
-        if (a1) svc_fill_rlimit((int)a0, (uint64_t *)a1);
-        G_RET(c) = 0;
+        if ((int)a0 < 0 || (int)a0 >= HL_LIMIT_COUNT) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+        } else if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
+            /* getrlimit copies a complete struct rlimit to userspace.  The
+             * kernel reports EFAULT for NULL, unmapped, wrapped, and
+             * PROT_NONE destinations; never dereference a guest pointer in
+             * the engine to discover that error. */
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+        } else {
+            svc_fill_rlimit((int)a0, (uint64_t *)a1);
+            G_RET(c) = 0;
+        }
         break;
     case 164: {
         // setrlimit(resource, rlim): apply into the same store getrlimit/prlimit64 read, so a direct
         // setrlimit(2) (not funneled through prlimit64/case 261 by glibc) also takes effect -- e.g. a guest
         // raising RLIMIT_CORE to enable cores must have wait4/waitid report WCOREDUMP afterwards.
         int res = (int)a0;
+        if (res < 0 || res >= HL_LIMIT_COUNT) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         const uint64_t *nl = (const uint64_t *)a1;
-        if (nl && res >= 0 && res < HL_LIMIT_COUNT) hl_limit_table_set(&g_limits, res, nl[0], nl[1]);
+        if (nl[0] != ~UINT64_C(0) && nl[1] != ~UINT64_C(0) && nl[0] > nl[1]) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        hl_limit_table_set(&g_limits, res, nl[0], nl[1]);
         G_RET(c) = 0;
         break; // setrlimit -> accepted
     }

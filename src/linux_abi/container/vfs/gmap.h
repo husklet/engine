@@ -23,6 +23,7 @@ void hl_gmap_add(uint64_t address, uint64_t length);
 void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length);
 void hl_gmap_remove(uint64_t address);
 uint64_t hl_gmap_find_length(uint64_t address);
+uint64_t hl_gmap_find_guest_length(uint64_t address);
 int hl_gmap_contains(uint64_t address, uint64_t length);
 void hl_gmap_unmap_range(uint64_t start, uint64_t end);
 void hl_gmap_reset(void);

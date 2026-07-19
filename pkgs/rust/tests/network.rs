@@ -36,3 +36,16 @@ fn incompatible_network_policy_is_rejected_before_process_start() {
         .unwrap_err();
     assert!(matches!(error, Error::InvalidConfig(_)));
 }
+
+#[test]
+fn host_network_rejects_virtual_network_configuration() {
+    let config = Config::new()
+        .host_network(true)
+        .network_namespace(Namespace::new("virtual").unwrap());
+    let error = Engine::new()
+        .command(Guest::Aarch64, fixture())
+        .config(config)
+        .status()
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidConfig(_)));
+}

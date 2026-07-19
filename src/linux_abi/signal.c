@@ -323,6 +323,7 @@ static void host_sigh(int sig) {
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv);
 static void sig_diag_raise_default(struct cpu *c, int sig);
+static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv);
 
 // SA_SIGINFO host handler: same delivery as host_sigh, plus it captures the sender's pid/uid so an
 // SA_SIGINFO guest handler (or sigwaitinfo) sees si_pid/si_uid. macOS populates si_pid for a kill(2) but
@@ -360,6 +361,9 @@ static void host_sigh_sync(int sig, siginfo_t *si, void *uc) {
     // port, x86 synthesizes #DE at the dispatcher). In-syscall => deliver async (wakes pause()/sigsuspend
     // + runs the handler); otherwise a genuine fault surfaced as POSIX -> restore default and re-raise.
     if (!g_in_service) {
+        // Linux/AArch64 delivers translated illegal instructions through this POSIX handler. Route a
+        // code-cache fault to the guest's installed SIGILL handler (OpenSSL/V8 feature probes) first.
+        if (deliver_guest_fault(sig, si, uc)) return;
         sig_diag_sync_reraise(sig, ls, si, uc);
         signal(sig, SIG_DFL);
         raise(sig);
@@ -394,7 +398,7 @@ static int mach_async_fault_signal(struct cpu *c, int hostsig, siginfo_t *si) {
 }
 
 // build_signal_frame + do_sigreturn are per-arch -> translator/guest/<arch>/signal.c
-static void build_signal_frame(struct cpu *c, int sig);
+static void build_signal_frame(struct cpu *c, int sig, int synchronous);
 static void do_sigreturn(struct cpu *c);
 // per-arch (the host<->guest register model differs): on a synchronous fault inside translated code,
 // reconstruct the guest register state from the host fault context (returns 1 iff the faulting host PC is
@@ -449,7 +453,13 @@ static void maybe_deliver_signal(struct cpu *c) {
         if (had_t || had_p) {
             g_force_deliver &= ~bit; // consumed: the sigframe (built below) saves the true post-suspend mask
             uint64_t flags = g_sigact[sig].flags;
-            build_signal_frame(c, sig); // captures g_sigact[sig].handler as the target PC -- must run first
+            int synchronous = had_t && c->sync_signal == sig;
+            build_signal_frame(c, sig, synchronous);
+            if (synchronous) {
+                c->sync_signal = 0;
+                c->sync_code = 0;
+                c->sync_address = 0;
+            }
             // SA_RESETHAND (SA_ONESHOT, 0x80000000): the disposition reverts to SIG_DFL after this single
             // delivery (the handler PC is already baked into the frame above). Reset both the recorded
             // disposition and the emulated host disposition, so a second occurrence takes the default action
@@ -573,12 +583,12 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     if (sig < 1 || sig > 64 || !ucv) return 0;
     // Linux reports a BAD-ADDRESS fault (unmapped page / PROT_NONE guard / a stack overflow into the
     // guard gap) as SIGSEGV, but macOS raises a PROT_NONE access as host SIGBUS (-> Linux SIGBUS(7)). Rewrite
-    // it to SIGSEGV(11) when the address is a tracked guard (gna_hit) or is unmapped, so a guest's own SIGSEGV
-    // handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it. A genuine SIGBUS on
-    // MAPPED memory (misalignment, file mapping past EOF) is left as SIGBUS. Only host SIGBUS needs the check
-    // (host SIGSEGV already maps to Linux SIGSEGV), so the common fault path pays no extra probe.
+    // it to SIGSEGV(11) unless the file-mapping BUS ledger identifies a real Linux past-EOF fault, so a
+    // guest's own SIGSEGV handler (glibc stack-overflow detection, a JIT/VM's guard-page trap) catches it.
+    // AArch64 permits unaligned accesses; file EOF is the mapped-memory SIGBUS case Linux exposes here.
+    // Only host SIGBUS needs the check (host SIGSEGV already maps to Linux SIGSEGV).
     if (hostsig == SIGBUS && HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
-        (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr)))
+        !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
         sig = 11;
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
@@ -606,12 +616,20 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
         }
         return 0;
     }
-    g_sigaddr[sig] = si ? (uint64_t)si->si_addr : 0;
-    // Linux si_code for a hardware fault: SIGBUS -> BUS_ADRERR(2), else SEGV_MAPERR(1).
-    g_sigcode[sig] = (sig == 7) ? 2 : 1;
+    c->sync_signal = sig;
+    c->sync_address = si ? (uint64_t)si->si_addr : 0;
+    // Linux distinguishes an unmapped address (SEGV_MAPERR) from a mapped
+    // protection violation (SEGV_ACCERR).  JIT safepoint/guard handlers use
+    // that distinction; a physically protected g_gna page is ACCERR even
+    // when Darwin surfaced the access as SIGBUS.
+    c->sync_code = (sig == 7 ||
+                    (sig == 11 && si &&
+                     (gna_hit((uint64_t)si->si_addr, 1) || host_addr_mapped((uintptr_t)si->si_addr))))
+                       ? 2
+                       : 1;
     c->sigmask &= ~(1ull << (sig - 1)); // a sync fault forces delivery even if the guest blocked it
     c->reason = R_BRANCH;               // resume as a plain branch (no stale syscall/special-op handling)
-    __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&c->tpending, 1ull << sig, __ATOMIC_SEQ_CST);
     sigframe_resume_dispatch(c, ucv);
     return 1;
 }
@@ -638,8 +656,9 @@ static int raise_guest_bus(struct cpu *c) {
         c->exit_code = 135;
         return 0;
     }
-    g_sigaddr[7] = c->fault_addr;
-    g_sigcode[7] = 2; /* BUS_ADRERR */
+    c->sync_signal = 7;
+    c->sync_address = c->fault_addr;
+    c->sync_code = 2; /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
     /* A synchronous memory fault belongs to the faulting thread.  Process-wide
@@ -683,9 +702,8 @@ static void sig_diag_write(const char *buffer, size_t length) {
     }
 }
 
-static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c) {
-    return;
-    char b[384];
+static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu *c, void *ucv) {
+    char b[512];
     int n = 0;
     n = sig_diag_put(b, n, "[HLFATAL]");
     n = sig_diag_put_hex(b, n, " pid=", (uint64_t)getpid());
@@ -701,12 +719,30 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
     n = sig_diag_put_hex(b, n, " x20=", c ? c->x[20] : 0);
 #endif
     n = sig_diag_put_hex(b, n, " si_addr=", si ? (uint64_t)si->si_addr : 0);
+#if G_GPC_HASH_SHIFT == 2
+    if (c && host_range_mapped((uintptr_t)G_PC(c), 4))
+        n = sig_diag_put_hex(b, n, " insn=", *(const uint32_t *)(uintptr_t)G_PC(c));
+#endif
+    ucontext_t *u = (ucontext_t *)ucv;
+#if defined(__aarch64__)
+    uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
+#else
+    uint64_t hpc = 0;
+#endif
+    uint64_t hgpc = 0, hoff = 0;
+    uint32_t hinsn = 0;
+    extern int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn);
+    if (jit_hostpc_lookup(hpc, &hgpc, &hoff, &hinsn)) {
+        n = sig_diag_put_hex(b, n, " hpc=", hpc);
+        n = sig_diag_put_hex(b, n, " hblk=", hgpc);
+        n = sig_diag_put_hex(b, n, " hoff=", hoff);
+        n = sig_diag_put_hex(b, n, " hinsn=", hinsn);
+    }
     b[n++] = '\n';
     sig_diag_write(b, (size_t)n);
 }
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
-    return;
     ucontext_t *u = (ucontext_t *)ucv;
 #if defined(__aarch64__)
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
@@ -787,7 +823,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     if (!c) return 0;
     if (!sigframe_capture_fault(c, ucv)) return 0; // host PC not in translated code -> engine/async: re-raise
-    sig_diag_fatal_fault(sig, hostsig, si, c);
+    sig_diag_fatal_fault(sig, hostsig, si, c, ucv);
     // A genuine, fatal, unmaskable guest fault. Terminate the guest process HERE (async-signal-safe _exit),
     // not by resuming the dispatcher: the guest state is captured mid-fault (e.g. SP overrun into the guard),
     // so re-entering the code cache would run off into garbage. A non-init guest records its Linux

@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static int mode_is(const char *p, unsigned want) {
@@ -35,6 +37,18 @@ int main(void) {
     chmod(path, 0755);
     int canexec = access(path, X_OK) == 0;     // 0755: executable
     ok &= noexec && canrw && canexec;
+
+    /* PostgreSQL chmods its bound Unix socket.  Some hosts permit native
+     * socket mode changes but reject user xattrs on the socket inode. */
+    char socket_path[96];
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    snprintf(socket_path, sizeof socket_path, "/tmp/hl_perm_sock_%d", (int)getpid());
+    snprintf(address.sun_path, sizeof address.sun_path, "%s", socket_path);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok &= socket_fd >= 0 && bind(socket_fd, (struct sockaddr *)&address, sizeof address) == 0 &&
+          chmod(socket_path, 0770) == 0 && mode_is(socket_path, 0770);
+    if (socket_fd >= 0) close(socket_fd);
+    unlink(socket_path);
 
     unlink(path);
     printf("permbits ok=%d\n", ok);

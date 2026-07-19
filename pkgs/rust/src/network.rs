@@ -37,6 +37,22 @@ impl Bridge {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Removes the host rendezvous state for an unused virtual bridge.
+    ///
+    /// Callers must ensure no engine process remains attached to the bridge.
+    /// Repeated removal is safe.
+    ///
+    /// # Errors
+    /// Returns an I/O error when existing bridge state cannot be removed.
+    pub fn remove(&self) -> Result<(), Error> {
+        let path = std::path::PathBuf::from(format!("/tmp/.hl-bridge-{}", self.0));
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// One virtual IPv4 interface attached to an engine bridge.
@@ -175,5 +191,16 @@ mod tests {
         );
         assert!(Rule::new(0, 80).is_err());
         assert!(Rule::new(8_080, 0).is_err());
+    }
+
+    #[test]
+    fn bridge_removal_is_idempotent() {
+        let bridge = Bridge::new(format!("test-{}", std::process::id())).unwrap();
+        let path = std::path::PathBuf::from(format!("/tmp/.hl-bridge-{}", bridge.as_str()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("state"), b"stale").unwrap();
+        bridge.remove().unwrap();
+        bridge.remove().unwrap();
+        assert!(!path.exists());
     }
 }

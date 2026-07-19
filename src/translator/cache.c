@@ -9,6 +9,13 @@
 #include "emit.h"
 
 #define CACHE_SZ (64u << 20)
+/* A stitched AArch64 region may contain 4096 guest instructions.  When a
+   file-backed BUS ledger is active, one memory instruction expands into a
+   validated guard plus the original operation.  Reserve enough space for the
+   largest translated region before entering an emitter; the former 64 KiB
+   reserve was smaller than a legal guarded region and allowed g_cp to reach
+   the adjacent executable alias. */
+#define CACHE_EMIT_HEADROOM (4u << 20)
 // Emission-arena state stays TU-local. The aliases preserve existing unity callsites while making the
 // ownership boundary explicit for the future inline assembler context.
 static hl_emit_state g_emit;
@@ -152,6 +159,8 @@ static int g_threaded;
 
 typedef struct {
     uint64_t gpc;
+    uint64_t guest_start;
+    uint64_t guest_end;
     void *host;
     void *body;
 } hl_translation_map_entry;
@@ -180,10 +189,51 @@ static hl_translation_index g_translation_index;
 // generation invalidates the whole table in O(1), while normal lookup still stops at the first slot that
 // is empty in the current generation.  A physical clear is needed only after the 32-bit epoch wraps.
 static uint32_t g_map_epoch = 1;
+static uint32_t g_live_map_indices[JIT_MAP_N];
+static uint32_t g_live_map_count;
+
+// Bounded instruction provenance shared by diagnostics and synchronous guest-fault delivery. Translation
+// records source boundaries; execution performs no checkpoint writes. Epoch publication makes signal-side
+// reads coherent, while the circular bound caps metadata at 8 MiB.
+#define JIT_INSN_MAP_N (1u << 18)
+typedef struct { uint64_t host, end, guest; uint32_t epoch; } jit_instruction_map_entry;
+static jit_instruction_map_entry g_instruction_map[JIT_INSN_MAP_N];
+static uint32_t g_instruction_map_next;
+
+static void jit_instruction_map_put(uint64_t host, uint64_t end, uint64_t guest) {
+    if (host >= end) return;
+    uint32_t index = __atomic_fetch_add(&g_instruction_map_next, 1u, __ATOMIC_RELAXED) & (JIT_INSN_MAP_N - 1u);
+    g_instruction_map[index].host = host;
+    g_instruction_map[index].end = end;
+    g_instruction_map[index].guest = guest;
+    __atomic_store_n(&g_instruction_map[index].epoch, g_map_epoch, __ATOMIC_RELEASE);
+}
+
+static int jit_instruction_map_lookup(uint64_t rwpc, uint64_t *guest) {
+    uint64_t best = 0, source = 0;
+    for (uint32_t i = 0; i < JIT_INSN_MAP_N; i++) {
+        uint32_t epoch = __atomic_load_n(&g_instruction_map[i].epoch, __ATOMIC_ACQUIRE);
+        if (epoch == g_map_epoch && g_instruction_map[i].host <= rwpc && rwpc < g_instruction_map[i].end &&
+            g_instruction_map[i].host >= best) {
+            best = g_instruction_map[i].host;
+            source = g_instruction_map[i].guest;
+        }
+    }
+    if (!best) return 0;
+    if (guest) *guest = source;
+    return 1;
+}
+
+static int jit_instruction_guest_pc(uint64_t host_pc, uint64_t *guest_pc) {
+    uint64_t rwpc = host_pc - g_rw2rx;
+    if (!g_cache || rwpc < (uint64_t)g_cache || rwpc >= (uint64_t)g_cache + CACHE_SZ) return 0;
+    return jit_instruction_map_lookup(rwpc, guest_pc);
+}
 
 static int map_live(uint32_t index) { return g_map_generation[index] == g_map_epoch; }
 
 static void map_clear(void) {
+    g_live_map_count = 0;
     g_map_epoch++;
     if (g_map_epoch == 0) {
         memset(g_map_generation, 0, sizeof g_map_generation);
@@ -214,7 +264,8 @@ int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn
         }
     }
     if (!best) return 0;
-    if (gpc) *gpc = bgpc;
+    uint64_t exact = 0;
+    if (gpc) *gpc = jit_instruction_map_lookup(rwpc, &exact) ? exact : bgpc;
     if (off) *off = rwpc - best;
     if (insn) *insn = *(uint32_t *)rwpc;
     return 1;
@@ -386,15 +437,18 @@ static void *map_body(uint64_t gpc) {
     return i < 0 ? NULL : g_map[i].body;
 }
 
-static void map_put(uint64_t gpc, void *host, void *body) {
+static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void *host, void *body) {
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
         if (!map_live(j)) {
             g_map[j].gpc = gpc;
+            g_map[j].guest_start = guest_start;
+            g_map[j].guest_end = guest_end;
             g_map[j].host = host;
             g_map[j].body = body;
             g_map_generation[j] = g_map_epoch;
+            g_live_map_indices[g_live_map_count++] = j;
             return;
         }
     }

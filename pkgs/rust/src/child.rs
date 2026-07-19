@@ -11,6 +11,8 @@ pub struct Child {
     pub(crate) stderr: Option<File>,
     pub(crate) terminal: Option<Terminal>,
     pub(crate) domain: Domain,
+    pub(crate) completed: bool,
+    pub(crate) _projections: Vec<crate::projection::Projection>,
 }
 /// Captured output and typed guest status.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,10 +52,12 @@ impl Child {
     /// # Errors
     /// Returns native lifecycle or result-protocol failures.
     pub fn try_wait(&mut self) -> Result<Option<Exit>, Error> {
-        ffi::try_wait(self.process.as_ref().ok_or(Error::InvalidState)?)
+        let exit = ffi::try_wait(self.process.as_ref().ok_or(Error::InvalidState)?)
             .map_err(native_error)?
             .map(result::native)
-            .transpose()
+            .transpose()?;
+        self.completed |= exit.is_some();
+        Ok(exit)
     }
     /// Force-stops the child.
     ///
@@ -61,6 +65,16 @@ impl Child {
     /// Returns native process-control failures.
     pub fn force_stop(&mut self) -> Result<(), Error> {
         ffi::kill(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(native_error)
+    }
+    pub(crate) fn signal(&self, signal: i32) -> Result<(), Error> {
+        if self.completed {
+            return Err(Error::InvalidState);
+        }
+        ffi::signal(self.id(), signal).map_err(Error::Io)
+    }
+
+    pub(crate) const fn completed(&self) -> bool {
+        self.completed
     }
     /// Waits for the typed guest status.
     ///

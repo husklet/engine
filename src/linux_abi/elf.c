@@ -23,7 +23,7 @@ static uint64_t rd64(const uint8_t *p) {
 // Read PT_INTERP (the dynamic loader path) out of an ELF.
 static int elf_interp(const char *path, char *out, size_t n) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) return -1;
+    if (aarch64_image_read(path, &image) != 0) return -1;
     uint8_t *f = image.bytes;
     int r = -1;
     uint64_t phoff = rd64(f + 32);
@@ -165,9 +165,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     //      faults at the low link address. The guest sized its loop from the host DCZID_EL0 (the frontend
     //      emits the mrs verbatim), so re-derive the same block size here and zero it at +bias.
     if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {
-        uint64_t dczid;
-        __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
-        uint64_t bs = 4ull << (dczid & 0xf);
+        uint64_t bs = 4ull << (g_aarch64_cpu_model.dczid_el0 & 0xf);
         memset((void *)(real & ~(bs - 1)), 0, (size_t)bs);
         HL_HOST_UC_PC(uc) += 4;
         return 1;
@@ -564,6 +562,27 @@ static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
     // emulate a probe load of a low un-rebased pointer at +bias and resume, mis-reporting it as mapped.
     if (hrm_fault_hook(si)) return; // never actually returns on a claim (siglongjmp); shape-only
     if (nonpie_fixup(si, uc)) return;
+    // The host representation may be narrower than the guest mapping when 4 KiB ELF segment edges share
+    // a 16 KiB macOS page, or after fork-server protection restoration. Re-open only a logically writable,
+    // tracked private-anonymous guest page; PROT_NONE/read-only and file-EOF ledgers remain authoritative.
+    // This is a representation repair, not lazy allocation: the address must already belong to gmap.
+    if (si && si->si_addr) {
+        uint64_t address = (uint64_t)si->si_addr;
+        int anonymous_protection = anon_prot_if_contained(address, 1);
+        int bus_address = 0;
+        for (int i = 0; i < g_ngbus; i++)
+            if (address >= g_gbus[i].lo && address < g_gbus[i].hi) bus_address = 1;
+        hl_host_region region;
+        if ((anonymous_protection & PROT_WRITE) && hl_gmap_contains(address, 1) && !gna_hit(address, 1) &&
+            !gro_hit(address, 1) && !bus_address && hl_host_region_query((uintptr_t)address, &region) &&
+            (region.protection & HL_HOST_REGION_READ) && !(region.protection & HL_HOST_REGION_WRITE)) {
+            size_t page = hl_host_page_size();
+            if (page) {
+                uintptr_t base = (uintptr_t)address & ~(uintptr_t)(page - 1);
+                if (mprotect((void *)base, page, PROT_READ | PROT_WRITE) == 0) return;
+            }
+        }
+    }
     // A genuine guest fault (wild pointer / null deref / stack overflow into the guard gap) with a
     // registered guest handler is the guest's to handle: synthesize+deliver the guest signal. nonpie_fixup
     // (absolute-data) already won above.
@@ -696,6 +715,14 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
 static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void *addr, size_t len, uint32_t protection,
                                    const char *what) {
     (void)what;
+    size_t host_page = hl_host_page_size();
+    uint64_t start = (uint64_t)(uintptr_t)addr;
+    uint64_t end = start + len;
+    // Guest ELF segments are described at guest-page granularity. A host protection change rounds to
+    // macOS's larger VM pages, so an unaligned segment edge can make an adjacent writable .data/.bss
+    // subpage read-only (CoreCLR performs such a relocation during startup). The old mprotect path rejected
+    // these ranges with EINVAL. Preserve that safe behavior and tighten only independently protectable pages.
+    if (!host_page || (start & (host_page - 1)) || (end & (host_page - 1))) return;
     const hl_host_services *host = effective_host_services();
     for (int t = 0;; t++) {
         uint64_t offset = (uint64_t)(uintptr_t)addr - mapping->address;
@@ -723,7 +750,7 @@ static int elf_is_go_image(const uint8_t *f, size_t sz) {
 
 static void load_elf(const char *path, struct loaded *out) {
     hl_linux_image image;
-    if (hl_linux_image_read(effective_host_services(), path, &image) != 0) {
+    if (aarch64_image_read(path, &image) != 0) {
         fprintf(stderr, "hl-engine: cannot read guest ELF %s through host services\n", path);
         exit(1);
     }
@@ -984,7 +1011,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {12, (uint64_t)cuid()},
         {13, (uint64_t)cgid()},
         {14, (uint64_t)cgid()},
-        {16, 0x1fb},
+        {16, g_aarch64_cpu_model.hwcap},
         {17, 100},
         {15, plat},
         {25, rnd},

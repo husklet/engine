@@ -65,6 +65,9 @@ struct cpu {
     // Thread-DIRECTED pending signals (1<<signo) -- the per-thread analogue of g_pending. A tkill/tgkill to
     // THIS thread sets a bit here so only this thread delivers it. Drained by maybe_deliver_signal.
     volatile uint64_t tpending;
+    int sync_signal;
+    int sync_code;
+    uint64_t sync_address;
     // x86 RFLAGS.ID (bit 21) substrate. There is no ARM-NZCV equivalent, so popfq(9D) stashes the popped
     // bit 21 here and pushfq(9C) reads it back -- a software toggle of ID round-trips, which is exactly the
     // CPUID-availability probe 32-bit code uses (flip ID via pushf/popf and check it changed). 0/1 valued.
@@ -92,6 +95,7 @@ struct cpu {
     uint64_t df;
     /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
     uint64_t fault_addr;
+    uint64_t bus_ea;
     /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
     uint64_t bus_filter;
     uint64_t bus_force;
@@ -199,7 +203,9 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_FXSAVE 15
 #define R_FXRSTOR 16
 #define R_BUS 17
+#define G_SMC_QUEUE_RESET(c) ((void)(c))
 #define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
+#define OFF_BUS_EA ((int)__builtin_offsetof(struct cpu, bus_ea))
 #define OFF_BUS_FILTER ((int)__builtin_offsetof(struct cpu, bus_filter))
 #define OFF_BUS_FORCE ((int)__builtin_offsetof(struct cpu, bus_force))
 #define OFF_BUS_SCRATCH ((int)__builtin_offsetof(struct cpu, bus_scratch))

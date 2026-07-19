@@ -165,25 +165,31 @@ static long seccomp_set_strict(void) {
 // filter flags (0 for the prctl entry point). Copies the program into engine memory and pushes it onto
 // this thread's stacked chain. Returns 0 or -errno, matching the kernel's argument validation.
 static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
-    // Installing a filter requires CAP_SYS_ADMIN or no_new_privs (kernel: else -EACCES). The container's
-    // default cap set lacks CAP_SYS_ADMIN, so a well-behaved sandbox sets PR_SET_NO_NEW_PRIVS first.
-    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) return -EACCES;
     if (flags & ~HL_LINUX_SECCOMP_FILTER_FLAGS_KNOWN) return -EINVAL;
     // NEW_LISTENER would have us return a userspace-notification fd and run a supervisor protocol we do not
     // implement; reject it honestly rather than hand back a listener that never delivers notifications.
     if (flags & HL_LINUX_SECCOMP_FILTER_FLAG_NEW_LISTENER) return -EINVAL;
-    if (!fprog_ptr) return -EFAULT;
-    if (gna_hit(fprog_ptr, 16)) return -EFAULT;
+    if (!fprog_ptr || !host_range_mapped((uintptr_t)fprog_ptr, 16)) return -EFAULT;
 
     // struct sock_fprog on LP64: u16 len at +0, 8-byte filter pointer at +8.
     uint16_t len;
     uint64_t insn_ptr;
     memcpy(&len, (const void *)(uintptr_t)fprog_ptr, sizeof len);
     memcpy(&insn_ptr, (const void *)(uintptr_t)(fprog_ptr + 8), sizeof insn_ptr);
+    /* sock_fprog contains a second guest pointer.  Static ET_EXEC guests may
+     * embed its low link address even after the outer syscall argument was
+     * rebased, so translate the nested pointer by the same image model. */
+    if (g_nonpie_lo && insn_ptr >= g_nonpie_lo && insn_ptr < g_nonpie_hi) insn_ptr += g_nonpie_bias;
     if (len == 0 || len > HL_LINUX_BPF_MAXINSNS) return -EINVAL;
     if (!insn_ptr) return -EFAULT;
     size_t bytes = (size_t)len * sizeof(struct hl_linux_sock_filter);
-    if (gna_hit(insn_ptr, bytes)) return -EFAULT;
+    if (!host_range_mapped((uintptr_t)insn_ptr, bytes)) return -EFAULT;
+
+    // Linux copies and validates the user program before checking installation
+    // authority.  Consequently an unreadable program is EFAULT even when the
+    // caller also lacks CAP_SYS_ADMIN/no_new_privs (LTP prctl02).  Keeping this
+    // ordering also guarantees no guest pointer reaches memcpy unchecked.
+    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) return -EACCES;
 
     struct hl_linux_bpf_filter *node = (struct hl_linux_bpf_filter *)malloc(sizeof *node);
     if (!node) return -ENOMEM;

@@ -1,5 +1,11 @@
 #include "hl/activation.h"
+#include "../host/fork_wire.h"
+#include "../host/system.h"
+#include "provider_client.h"
+#include "provider_files.h"
+#include "provider_namespace.h"
 #include "engine_backend.h"
+#include "environment.h"
 #include "launch.h"
 #include "../host/system.h"
 #include "hl/config.h"
@@ -33,6 +39,7 @@ typedef hl_host_linux hl_activation_host;
 #include <pty.h>
 #endif
 #include <unistd.h>
+
 
 static hl_status activation_host_create(hl_activation_host **host, hl_host_services *services) {
 #if defined(__APPLE__)
@@ -95,6 +102,46 @@ static int transfer(int fd, void *data, size_t size, int writing) {
     return 0;
 }
 
+static int activation_provider_handshake(int descriptor) {
+    unsigned char hello[32] = {'R', 'P', 'L', 'H', 1, 0, 1, 0};
+    unsigned char ready[32], setup[32], acknowledged[32] = {'R', 'P', 'L', 'H', 1, 0, 8, 0};
+    unsigned char *payload = NULL;
+    struct pollfd pollfd = {.fd = descriptor, .events = POLLIN | POLLHUP};
+    int result;
+    hello[20] = 1; /* NamespaceInstall v1. */
+    if (transfer(descriptor, hello, sizeof(hello), 1) != 0) return -1;
+    do { result = poll(&pollfd, 1, 5000); } while (result < 0 && errno == EINTR);
+    if (result <= 0 || (pollfd.revents & POLLIN) == 0 || transfer(descriptor, ready, sizeof(ready), 0) != 0)
+        return -1;
+    /* HLPR, version 1, READY, empty payload, request id zero, reserved zero. */
+    if (ready[0] != 'R' || ready[1] != 'P' || ready[2] != 'L' || ready[3] != 'H' ||
+        ready[4] != 1 || ready[5] != 0 || ready[6] != 2 || ready[7] != 0)
+        return -1;
+    for (size_t index = 8; index < 20; ++index)
+        if (ready[index] != 0) return -1;
+    for (size_t index = 28; index < sizeof(ready); ++index)
+        if (ready[index] != 0) return -1;
+    if ((ready[20] & 1u) != 0) {
+        uint32_t size;
+        if (transfer(descriptor, setup, sizeof(setup), 0) != 0 || setup[0] != 'R' || setup[1] != 'P' ||
+            setup[2] != 'L' || setup[3] != 'H' || setup[4] != 1 || setup[5] != 0 || setup[6] != 7 ||
+            setup[7] != 0)
+            return -1;
+        size = (uint32_t)setup[8] | (uint32_t)setup[9] << 8 | (uint32_t)setup[10] << 16 |
+               (uint32_t)setup[11] << 24;
+        if (size > 1024 * 1024 || memcmp(setup + 12, "\0\0\0\0\0\0\0\0", 8) != 0) return -1;
+        payload = malloc(size == 0 ? 1 : size);
+        if (payload == NULL || (size != 0 && transfer(descriptor, payload, size, 0) != 0) ||
+            hl_provider_namespace_launch_install(payload, size) != 0) {
+            free(payload);
+            return -1;
+        }
+        free(payload);
+        if (transfer(descriptor, acknowledged, sizeof(acknowledged), 1) != 0) return -1;
+    }
+    return 0;
+}
+
 void hl_aarch64_target_register_backend(void);
 void hl_x86_64_target_register_backend(void);
 void hl_aarch64_target_runtime_init(void);
@@ -118,6 +165,7 @@ static uint32_t activation_guest_isa;
 static hl_engine_exit *activation_result;
 static hl_status activation_status;
 static hl_engine *activation_engine;
+static hl_provider_client activation_provider_client;
 static pthread_mutex_t activation_engine_lock = PTHREAD_MUTEX_INITIALIZER;
 static int activation_signal_pipe[2] = {-1, -1};
 static uint32_t activation_pending_signal;
@@ -186,9 +234,10 @@ static void activation_signal_relay_stop(pthread_t thread) {
     activation_signal_pipe[1] = -1;
 }
 
-static int activation_run_config(const char *rootfs, uint32_t argc, char *const argv[],
+static int activation_run_config(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
                                  const hl_options *options, const char *result_path) {
     hl_engine_fd_binding bindings[3] = {0};
+    hl_engine_executable executable = {0};
     hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config),
                                .guest_isa = activation_guest_isa, .rootfs = rootfs};
     hl_engine *engine = NULL;
@@ -217,7 +266,21 @@ static int activation_run_config(const char *rootfs, uint32_t argc, char *const 
     }
     config.fd_bindings = bindings;
     config.fd_binding_count = count;
+    if (executable_host != NULL) {
+        hl_host_result opened = activation_services->file->open_relative(
+            activation_services->context, HL_HOST_HANDLE_CWD, executable_host, strlen(executable_host),
+            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        if (opened.status != HL_STATUS_OK) {
+            activation_status = (hl_status)opened.status;
+            return 78;
+        }
+        executable = (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0,
+                                            opened.value, NULL, 0};
+        config.executable = &executable;
+    }
     activation_status = hl_engine_create_with_options(&config, activation_services, options, &engine);
+    if (activation_status != HL_STATUS_OK && config.executable != NULL)
+        (void)activation_services->file->close(activation_services->context, executable.host_handle);
     if (activation_status == HL_STATUS_OK) {
         uint32_t pending;
         pthread_mutex_lock(&activation_engine_lock);
@@ -237,22 +300,36 @@ static int activation_run_config(const char *rootfs, uint32_t argc, char *const 
 }
 
 static void hl_activation_child(void) {
-    const char *value = getenv("HL_ACTIVATION_FD");
     hl_activation_request request;
     hl_activation_reply reply = {0};
     hl_activation_host *host = NULL;
     hl_host_services services;
-    char *end = NULL;
     long descriptor;
     hl_status status = HL_STATUS_CORRUPT;
     unsigned char commit;
     pthread_t signal_thread;
     int signal_relay = 0;
-    if (value == NULL) return;
-    descriptor = strtol(value, &end, 10);
-    (void)unsetenv("HL_ACTIVATION_FD");
-    if (end == value || *end != 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
-    if (transfer((int)descriptor, &request, sizeof(request), 0) != 0) _exit(126);
+    int inherited[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int inherited_count = 0;
+    int environment = hl_environment_take_activation_descriptor(&descriptor);
+    if (environment == 0) return;
+    if (environment < 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
+    /* Embedded builds deliberately omit the native constructor.  Transport
+     * adoption needs the private descriptor registry before the later backend
+     * initialization boundary, otherwise every attached provider fails with
+     * ENOSPC before it can send HELLO. */
+    hl_host_private_init();
+    if (hl_fork_wire_receive_descriptors((int)descriptor, &request, sizeof(request), inherited,
+                                         &inherited_count) != (int)sizeof(request)) _exit(126);
+    if (request.reserved > 1 || inherited_count != (int)request.reserved) {
+        while (inherited_count > 0) (void)close(inherited[--inherited_count]);
+        _exit(126);
+    }
+    if (inherited_count == 1) {
+        int adopted = hl_host_process_fd_private_adopt(inherited[0]);
+        if (adopted < 0) _exit(126);
+        inherited[0] = adopted;
+    }
     reply.magic = HL_ACTIVATION_MAGIC;
     reply.abi = HL_ACTIVATION_ABI;
     reply.size = sizeof(reply);
@@ -269,10 +346,15 @@ static void hl_activation_child(void) {
         if (transfer((int)descriptor, &reply, sizeof(reply), 1) != 0) _exit(124);
         if (request.test_flags == 4) _exit(123);
         if (transfer((int)descriptor, &commit, 1, 0) != 0 || commit != 0xa5u) _exit(124);
+        if (inherited[0] >= 0 && activation_provider_handshake(inherited[0]) != 0) _exit(124);
         /* Explicit setup is idempotent and independent of constructor order. */
         hl_embedded_runtime_init(request.guest_isa);
         hl_embedded_runtime_init(request.guest_isa);
         status = activation_host_create(&host, &services);
+        if (status == HL_STATUS_OK && inherited[0] >= 0 &&
+            (hl_provider_client_init(&activation_provider_client, inherited[0], 1024 * 1024) != 0 ||
+             hl_provider_files_install(&services, &activation_provider_client) != 0))
+            status = HL_STATUS_PLATFORM_FAILURE;
         activation_services = &services;
         activation_guest_isa = request.guest_isa;
         activation_result = &reply.result;
@@ -296,6 +378,15 @@ static void hl_activation_child(void) {
     (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
     if (signal_relay) activation_signal_relay_stop(signal_thread);
     activation_host_destroy(host);
+    if (inherited[0] >= 0) {
+        hl_provider_files_revoke();
+        hl_provider_namespace_launch_revoke();
+        hl_provider_client_destroy(&activation_provider_client);
+    }
+    if (inherited[0] >= 0) {
+        hl_host_process_fd_private_remove(inherited[0]);
+        (void)close(inherited[0]);
+    }
     (void)close((int)descriptor);
     _exit(status == HL_STATUS_OK ? 0 : 127);
 }
@@ -375,6 +466,26 @@ static void domain_directory_remove(const char *directory) {
     (void)rmdir(directory);
 }
 
+static void domain_network_remove(hl_process_domain domain) {
+    char directory[96];
+    DIR *entries;
+    struct dirent *entry;
+    snprintf(directory, sizeof directory, "/tmp/.hl-net-%016llx%016llx",
+             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+    entries = opendir(directory);
+    if (entries == NULL) return;
+    while ((entry = readdir(entries)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] != 'p' || name[1] < '0' || name[1] > '9') continue;
+        for (const char *digit = name + 1; *digit != 0; ++digit)
+            if (*digit < '0' || *digit > '9') goto next;
+        (void)unlinkat(dirfd(entries), name, 0);
+    next:;
+    }
+    (void)closedir(entries);
+    (void)rmdir(directory);
+}
+
 hl_status hl_activation_domain_terminate(hl_process_domain domain) {
     char directory[96];
     unsigned round;
@@ -385,7 +496,11 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
         DIR *entries = opendir(directory);
         struct dirent *entry;
         unsigned live = 0;
-        if (entries == NULL) return errno == ENOENT ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
+        if (entries == NULL) {
+            if (errno != ENOENT) return HL_STATUS_PLATFORM_FAILURE;
+            domain_network_remove(domain);
+            return HL_STATUS_OK;
+        }
         while ((entry = readdir(entries)) != NULL) {
             char *end;
             long raw;
@@ -410,6 +525,7 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
         if (live == 0) {
             if (++empty >= 2) {
                 domain_directory_remove(directory);
+                domain_network_remove(domain);
                 return HL_STATUS_OK;
             }
         } else {
@@ -448,7 +564,7 @@ static void cache_failure(hl_activation_process *process, hl_status status) {
 
 static hl_status activation_start(const char *executable, uint32_t guest_isa, const char *guest,
                                   const hl_activation_stdio *stdio, const hl_terminal_size *terminal,
-                                  int32_t *out_master, hl_activation_process **out_process) {
+                                  int32_t *out_master, int transport, hl_activation_process **out_process) {
     int pair[2];
     pid_t child;
     posix_spawn_file_actions_t actions;
@@ -474,6 +590,7 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         return HL_STATUS_INVALID_ARGUMENT;
     if (stdio != NULL && (stdio->input < -1 || stdio->output < -1 || stdio->error < -1))
         return HL_STATUS_INVALID_ARGUMENT;
+    if (transport < -1) return HL_STATUS_INVALID_ARGUMENT;
     if (terminal != NULL && (stdio != NULL || out_master == NULL || terminal->rows == 0 || terminal->columns == 0))
         return HL_STATUS_INVALID_ARGUMENT;
     path_size = strlen(guest) + 1;
@@ -502,6 +619,7 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     request.size = sizeof(request);
     request.guest_isa = guest_isa;
     request.path_size = (uint32_t)path_size;
+    request.reserved = transport >= 0 ? 1u : 0u;
     test_mode = activation_test_mode;
     request.test_flags = test_mode == 1 ? 1u : test_mode == 4 ? 4u : test_mode == 5 ? 5u : 0u;
     if (test_mode == 2) request.magic ^= UINT64_C(1);
@@ -574,7 +692,10 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
 spawned:
     close(pair[1]);
     free(child_env);
-    if (transfer(pair[0], &request, test_mode == 3 ? sizeof(request) / 2u : sizeof(request), 1) != 0) {
+    if ((transport >= 0 && test_mode != 3
+             ? hl_fork_wire_send_descriptors(pair[0], &request, sizeof(request), &transport, 1)
+             : hl_fork_wire_send_descriptors(pair[0], &request,
+                                             test_mode == 3 ? sizeof(request) / 2u : sizeof(request), NULL, 0)) != 0) {
         close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
     }
     if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
@@ -600,13 +721,20 @@ spawned:
 
 hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
                                          const hl_activation_stdio *stdio, hl_activation_process **out_process) {
-    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, out_process);
+    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, -1, out_process);
+}
+
+hl_status hl_activation_start_with_transport(const char *executable, uint32_t guest_isa, const char *guest,
+                                             const hl_activation_stdio *stdio, int32_t transport,
+                                             hl_activation_process **out_process) {
+    if (transport < 0) return HL_STATUS_INVALID_ARGUMENT;
+    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, transport, out_process);
 }
 
 hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa, const char *guest,
                                        hl_terminal_size size, int32_t *out_master,
                                        hl_activation_process **out_process) {
-    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, out_process);
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, -1, out_process);
 }
 
 hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {
