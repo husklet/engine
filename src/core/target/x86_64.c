@@ -285,7 +285,15 @@ static void do_sigreturn(struct cpu *c) {
 }
 
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
-    return hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL);
+    if (!hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL)) return 0;
+    // Recover the EXACT faulting guest RIP from the per-instruction provenance map (translate.c records
+    // the host code range of each memory-accessing insn). Without this the mcontext RIP is only
+    // block-granular; a crash reporter (breakpad/sentry) or a JIT that maps the trapping PC back to a
+    // bytecode site would misreport. Falls back to the block-granular cpu->rip when unmapped.
+    uint64_t exact_pc;
+    uint64_t host_pc = (uint64_t)HL_HOST_UC_PC((ucontext_t *)native_context);
+    if (jit_instruction_guest_pc(host_pc, &exact_pc)) c->rip = exact_pc;
+    return 1;
 }
 
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {

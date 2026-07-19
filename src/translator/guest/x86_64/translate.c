@@ -1153,7 +1153,14 @@ static void *translate_block(uint64_t gpc) {
     uint64_t seen[HL_X86_TRACE_MAX_BLOCKS];
     int nseen = 0, trace_blk = 0;
     seen[nseen++] = start;
-#define STITCH_OK                                                                                                      \
+    // Exact fault-PC provenance: record, per memory-accessing guest instruction, the host code range it
+    // compiled to and its guest RIP, so a synchronous SIGSEGV/SIGBUS inside translated code recovers the
+    // EXACT faulting instruction (crash reporters / JIT null-check-elimination read gregs[REG_RIP]).
+    // Mirrors the aarch64 translator's provenance map. Deferred-by-one (close the previous insn's host
+    // range at the next loop top, once g_cp has advanced past its emitted code); flushed after the loop.
+    uint64_t prov_host = 0, prov_guest = 0;
+    int prov_mem = 0;
+#define STITCH_OK                                                                                                    \
     (stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < HL_X86_TRACE_MAX_BLOCKS - 1 &&                               \
      (size_t)((uint8_t *)g_cp - (uint8_t *)host) < HL_X86_TRACE_MAX_BYTES)
     for (;;) {
@@ -1167,6 +1174,10 @@ static void *translate_block(uint64_t gpc) {
         g_emit_gpc = gpc; // IRQSLIM: tag chain emission with the current branch's rip
         hl_x86_decode(gpc, &I);
         uint64_t next = gpc + I.len;
+        if (prov_mem) jit_instruction_map_put(prov_host, (uint64_t)g_cp, prov_guest); // close previous insn
+        prov_host = (uint64_t)g_cp;
+        prov_guest = gpc;
+        prov_mem = I.is_mem; // a memory operand -> this insn can raise a synchronous guest fault
         uint8_t op = I.op;
         int sf = I.opsize == 8;
         // VEX/EVEX (AVX/AVX2/AVX-512): not lowered to NEON. Exit the block and emulate this single insn in C
@@ -4023,6 +4034,7 @@ static void *translate_block(uint64_t gpc) {
         report_unimpl(gpc, &I);
         break;
     }
+    if (prov_mem) jit_instruction_map_put(prov_host, (uint64_t)g_cp, prov_guest); // close the final insn
     // IRQSLIM: the out-of-line poll exit stub the body-entry cbnz targets (irq set -> exit to
     // the dispatcher at the block start, exactly like the legacy inline poll).
     if (g_irq_patch) {
