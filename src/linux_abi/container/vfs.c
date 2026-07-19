@@ -7,6 +7,11 @@
 #include "../../host/resolve.h"
 #include "../../core/provider/files.h"
 #include "../../core/provider/namespace.h"
+#if defined(__linux__)
+#include <sys/prctl.h> // host PR_SET_NAME: mirror the guest comm onto this host task so a PEER's
+                       // /proc/<pid>/{stat,status,comm} read (hl_host_process_read) reports the guest
+                       // program name, not the engine binary "hl-engine-linux".
+#endif
 
 // Set when a followed path resolution exceeds the symlink-traversal limit (Linux caps at 40 -> ELOOP). The
 // jail resolvers return a host-path string with no errno channel, so a self-referential / cyclic symlink
@@ -1961,6 +1966,11 @@ static void set_guest_comm(const char *execpath) {
     const char *s = strrchr(b, '/');
     if (s) b = s + 1;
     snprintf(g_comm_store, sizeof g_comm_store, "%.15s", b[0] ? b : "init");
+#if defined(__linux__)
+    // Mirror onto the host task name so a peer reading /proc/<pid>/{stat,status,comm} sees this comm
+    // (each guest process is its own host process; without this a peer read reports the engine binary).
+    (void)prctl(PR_SET_NAME, (unsigned long)g_comm_store, 0, 0, 0);
+#endif
 }
 
 // Set the task comm verbatim (not a basename): prctl(PR_SET_NAME) renames the running task, and Linux
@@ -1968,6 +1978,9 @@ static void set_guest_comm(const char *execpath) {
 // in sync with the prctl name so a rename after boot/exec is reflected everywhere.
 static void set_guest_comm_name(const char *name) {
     snprintf(g_comm_store, sizeof g_comm_store, "%.15s", (name && name[0]) ? name : "init");
+#if defined(__linux__)
+    (void)prctl(PR_SET_NAME, (unsigned long)g_comm_store, 0, 0, 0); // keep the host task name in sync (see set_guest_comm)
+#endif
 }
 
 // Normalize a guest path LEXICALLY: collapse "//" and "." components and fold ".." (clamped at "/").

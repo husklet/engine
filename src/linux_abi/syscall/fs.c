@@ -2669,8 +2669,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
             }
-            // cgroup v2 limit files (JVM/Go self-size on these)
+            // cgroup v2 limit files (JVM/Go self-size on these). The synthesized cgroup2 mount is advertised
+            // read-only (mountinfo "cgroup2 ... ro,nsdelegate") and its values are fixed, so a write-intent
+            // open must fail EROFS -- exactly as a non-delegated container's cgroup mount does. Without this
+            // proc_open handed back a (falsely writable) temp fd, so `echo max > cpu.max` reported success and
+            // a runtime believed it had changed a limit it had not (silent fake-success).
             if (rp && !strncmp(rp, "/sys/fs/cgroup/", 15)) {
+                int cg_write = (lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400); // RW/CREAT/TRUNC/APPEND
+                if (cg_write) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EROFS);
+                    break;
+                }
                 int pf = proc_open(rp);
                 if (pf != -2) {
                     G_RET(c) = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
