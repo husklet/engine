@@ -1693,6 +1693,33 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // not the host cwd. The old xresolve_overlay bailed on any non-'/' path and returned it raw,
             // so `./x` was access()'d against the host process cwd (never the mounted guest cwd) -> ENOENT.
             atpath(-100, (const char *)a0, pb, sizeof pb, 0);
+        // execve(2) error classification, matching Linux binfmt semantics, applied to the resolved target
+        // BEFORE the blanket-ENOENT access() check below: a directory is EACCES, and a regular file that is
+        // neither an ELF nor a #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the
+        // existing path. This only reclassifies the error the guest receives; it never runs the target.
+        {
+            struct stat xst;
+            if (stat(p, &xst) == 0) {
+                if (S_ISDIR(xst.st_mode)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EACCES);
+                    break;
+                }
+                if (S_ISREG(xst.st_mode)) {
+                    FILE *xf = fopen(p, "rb");
+                    if (xf) {
+                        unsigned char mag[4] = {0};
+                        size_t got = fread(mag, 1, sizeof mag, xf);
+                        fclose(xf);
+                        int is_elf = got >= 4 && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F';
+                        int is_script = got >= 2 && mag[0] == '#' && mag[1] == '!';
+                        if (!is_elf && !is_script) {
+                            G_RET(c) = (uint64_t)(int64_t)(-ENOEXEC);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
             break;
