@@ -458,6 +458,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
+            // SO_REUSEPORT dual-bind: native Linux lets a second REUSEPORT socket bind the same
+            // addr:port. The AF_UNIX switch backs each port by one fs inode, so a second bind would
+            // hit EADDRINUSE. Only when THIS socket has SO_REUSEPORT set, drop the existing inode so
+            // the rebind replaces it and succeeds. A normal (non-REUSEPORT) rebind keeps the inode and
+            // correctly returns EADDRINUSE, which also preserves an active wildcard listener's binding.
+            if (g_so_reuseport[(int)a0]) unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_lo_port[(int)a0] = p ? p : 1;
@@ -498,6 +504,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
+            // SO_REUSEPORT dual-bind over the bridge switch: same rule as the private-loopback path --
+            // only a REUSEPORT socket replaces the existing per-port inode; a normal rebind keeps it and
+            // returns EADDRINUSE, preserving an active wildcard listener's binding.
+            if (g_so_reuseport[(int)a0]) unlink(up);
             int r = bind((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0) {
                 g_br_port[(int)a0] = p ? p : 1;
