@@ -886,6 +886,23 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // a bad guest RESULT pointer in the vDSO fast-clock inline path (emit_fast_syscall). Recover
     // it as -EFAULT BEFORE the lazy-map/guest-fault paths below, matching the slow svc_time() path exactly.
     if (fastclk_fault_fixup(si, uc)) return;
+#if defined(__linux__)
+    // A hardware-raised host SIGBUS (si_code > 0: BUS_ADRERR past-EOF file mapping, BUS_ADRALN misalignment)
+    // is a GENUINE guest bus error on a Linux host, where the kernel raises SIGBUS authoritatively. It must
+    // reach the guest's SIGBUS handler (BUS_ADRERR) or terminate the guest by SIGBUS, and must NEVER fall
+    // into the lazy zero-page grower below: that page sits ADJACENT to the file's mapped first page, so
+    // lazy_neighbor_mapped() judges it "legitimate growth", skips deliver_guest_fault, and maps an anonymous
+    // zero page over it -- silently turning a bus error into a bogus zero read (and, for a handler-armed
+    // guest, crashing the engine's own fault path). Route it straight to the guest, mirroring the gna/gro
+    // hard-fault blocks below and the dispatcher's raise_guest_bus ledger path.
+    if (sig == SIGBUS && si && si->si_code > 0) {
+        if (deliver_guest_fault(sig, si, uc)) return;       // guest handler
+        if (deliver_guest_fatal_fault(sig, si, uc)) return; // no handler -> faithful WIFSIGNALED SIGBUS
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+#endif
     // W6A item 1: a non-PIE absolute DATA ref into the low link range -> serve the access at +bias and
     // advance the host PC. Inert unless g_nonpie_lo is set (ET_EXEC only).
     if (nonpie_fixup(si, uc)) return;

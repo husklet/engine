@@ -9,7 +9,7 @@
 //     and _exit()s with a distinctive code,
 //   - default disposition: the process is terminated by SIGBUS (observed via the child wait status).
 // The mapping is two pages over a one-page file, and the probe touches the first byte of the second (unbacked)
-// page. Arch-neutral output; scoped to aarch64 (the x86 guest's file-mmap fault path is tracked separately).
+// page. Arch-neutral output; verified on both the aarch64 and x86_64 guest file-mmap fault paths.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <signal.h>
