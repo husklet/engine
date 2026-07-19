@@ -131,9 +131,9 @@ EMBEDDED_MAC_SOURCES := $(CORE_SOURCES) $(IR_SOURCES) $(MAC_LINUX_ABI_SOURCES) $
 EMBEDDED_MAC_OBJECTS := $(EMBEDDED_MAC_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
 LINUX_AARCH64_EMBEDDED_SOURCES = $(CORE_SOURCES) $(IR_SOURCES) $(LINUX_ABI_SOURCES) $(LINUX_HOST_SOURCES)
 LINUX_AARCH64_EMBEDDED_OBJECTS = $(LINUX_AARCH64_EMBEDDED_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
-EMBEDDED_PROVIDER_SOURCES := src/core/environment.c src/core/provider_client.c \
-	src/core/provider_demux.c src/core/provider_files.c src/core/provider_handles.c \
-	src/core/provider_namespace.c
+EMBEDDED_PROVIDER_SOURCES := src/core/environment.c src/core/provider/client.c \
+	src/core/provider/demux.c src/core/provider/files.c src/core/provider/handles.c \
+	src/core/provider/namespace.c
 EMBEDDED_MAC_PROVIDER_OBJECTS := $(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/mac/embedded/%.o)
 LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS := \
 	$(EMBEDDED_PROVIDER_SOURCES:%.c=$(BUILD)/linux-aarch64/embedded/%.o)
