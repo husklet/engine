@@ -287,6 +287,32 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         break;
     }
+    // pidfd_getfd(pidfd, targetfd, flags): duplicate targetfd out of the process the pidfd refers to
+    // (container managers/debuggers pull a listening socket or log fd out of a child this way). A pidfd we
+    // minted (case 434) is a REAL host pidfd on Linux, and the engine keeps guest fd numbers equal to their
+    // backing host fd numbers, so forward straight to the host syscall: the kernel does the real
+    // ptrace-scope permission check, so success or EPERM (yama) matches native for the caller's privilege.
+    // flags must be 0 (Linux rejects any other value with EINVAL); an fd we never minted -> EBADF (same as
+    // pidfd_send_signal). Without this the syscall fell through to ENOSYS, diverging from a kernel where a
+    // same-user self/child getfd succeeds.
+    case 438: {
+#ifdef SYS_pidfd_getfd
+        if (a2 != 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        pid_t pid;
+        if (pidfd_lookup((int)a0, &pid) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+            break;
+        }
+        long r = syscall(SYS_pidfd_getfd, (int)a0, (int)a1, 0u);
+        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+#else
+        G_RET(c) = (uint64_t)(int64_t)(-ENOSYS);
+#endif
+        break;
+    }
     // mq_open(name, oflag, mode, attr): find-or-create the named queue, hand back a real fd bound to it.
     // (glibc already rejects a name that lacks a leading '/' or is empty with EINVAL before the syscall,
     // so the raw-syscall path only has to police ENAMETOOLONG, EFAULT, ENOENT, EEXIST, ENOSPC + a bad attr.)
