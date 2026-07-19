@@ -644,7 +644,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                      : (op == 0xFD || op == 0xF9) ? 2
                      : (op == 0xFE || op == 0xFA) ? 4
                                                   : 8;
-            int sub = (op >= 0xF8);
+            int sub = (op >= 0xF8 && op <= 0xFB); // 0xF8..0xFB = psub b/w/d/q; 0xFC/FD/FE/D4 = padd
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, W, b);
             for (int i = 0; i < W; i += es) {
@@ -748,6 +748,59 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, vv, d, W); // dst = VEX.vvvv
             goto done;
         }
+        case 0x60:
+        case 0x61:
+        case 0x62:
+        case 0x6C: // vpunpckl bw/wd/dq/qdq
+        case 0x68:
+        case 0x69:
+        case 0x6A:
+        case 0x6D: // vpunpckh bw/wd/dq/qdq -- per-128-lane interleave of src1(vvvv)/rm elements
+        {
+            int es = (op == 0x60 || op == 0x68)   ? 1
+                     : (op == 0x61 || op == 0x69) ? 2
+                     : (op == 0x62 || op == 0x6A) ? 4
+                                                  : 8;
+            int hi = (op == 0x68 || op == 0x69 || op == 0x6A || op == 0x6D); // 0x6C=punpcklqdq (low)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                int half = hi ? 8 : 0; // interleave the low (0) or high (8) 8 bytes of each lane
+                for (int i = 0; i < 8; i += es) {
+                    memcpy(d + lane + 2 * i, a + lane + half + i, es);
+                    memcpy(d + lane + 2 * i + es, b + lane + half + i, es);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x63: // vpacksswb: signed word -> signed byte, saturate
+        case 0x67: // vpackuswb: signed word -> unsigned byte, saturate
+        case 0x6B: // vpackssdw: signed dword -> signed word, saturate  (per-128-lane; a low, b high)
+        {
+            int src_es = (op == 0x6B) ? 4 : 2, dst_es = src_es / 2, usat = (op == 0x67);
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16) {
+                int nper = 16 / src_es;
+                for (int k = 0; k < nper; k++) {
+                    int64_t va = 0, vb = 0;
+                    memcpy(&va, a + lane + k * src_es, src_es);
+                    memcpy(&vb, b + lane + k * src_es, src_es);
+                    int sh = 64 - src_es * 8; // sign-extend the source element
+                    va = (va << sh) >> sh;
+                    vb = (vb << sh) >> sh;
+                    int64_t lo = usat ? 0 : (dst_es == 1 ? -128 : -32768);
+                    int64_t hiv = usat ? (dst_es == 1 ? 255 : 65535) : (dst_es == 1 ? 127 : 32767);
+                    int64_t ca = va < lo ? lo : va > hiv ? hiv : va;
+                    int64_t cb = vb < lo ? lo : vb > hiv ? hiv : vb;
+                    memcpy(d + lane + k * dst_es, &ca, dst_es);
+                    memcpy(d + lane + (nper + k) * dst_es, &cb, dst_es);
+                }
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
         case 0x77: { // vzeroupper (L=0): zero bits[128:256) of ymm0..15. vzeroall (L=1): zero all of 0..15.
             uint8_t z[64];
             memset(z, 0, 64);
@@ -847,6 +900,22 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(&idx, a + i, 4);
                 memcpy(d + i, b + 4 * (idx & 7), 4);
             }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x2B: { // vpackusdw: signed dword -> unsigned word, saturate (per-128-lane; a low, b high)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int lane = 0; lane < W; lane += 16)
+                for (int k = 0; k < 4; k++) {
+                    int32_t va, vb;
+                    memcpy(&va, a + lane + 4 * k, 4);
+                    memcpy(&vb, b + lane + 4 * k, 4);
+                    uint16_t ca = va < 0 ? 0 : va > 65535 ? 65535 : (uint16_t)va;
+                    uint16_t cb = vb < 0 ? 0 : vb > 65535 ? 65535 : (uint16_t)vb;
+                    memcpy(d + lane + 2 * k, &ca, 2);
+                    memcpy(d + lane + 8 + 2 * k, &cb, 2);
+                }
             avx_put(c, rd, d, W);
             goto done;
         }
@@ -972,6 +1041,49 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put_rm(state, c, &I, next, 16, d);
             goto done;
         }
+        case 0x00: // vpermq (integer) / vpermpd (fp): imm8 selects 4 qwords across the full 256
+        case 0x01: {
+            avx_get_rm(state, c, &I, next, W, b);
+            for (int k = 0; k < 4; k++) {
+                int sel = (I.imm >> (2 * k)) & 3;
+                memcpy(d + 8 * k, b + 8 * sel, 8);
+            }
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x02: { // vpblendd: per 32-bit lane, imm bit i set -> take from rm (src2), else src1(vvvv)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            memcpy(d, a, W);
+            for (int i = 0; i < W / 4; i++)
+                if ((I.imm >> i) & 1) memcpy(d + 4 * i, b + 4 * i, 4);
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x0E: { // vpblendw: per-128-lane, 8 words, imm bit selects rm (repeats each lane)
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            memcpy(d, a, W);
+            for (int lane = 0; lane < W; lane += 16)
+                for (int i = 0; i < 8; i++)
+                    if ((I.imm >> i) & 1) memcpy(d + lane + 2 * i, b + lane + 2 * i, 2);
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x4A: // vblendvps (dword)
+        case 0x4B: // vblendvpd (qword)
+        case 0x4C: { // vpblendvb (byte): mask register = is4 imm[7:4]; element taken from rm if mask top bit set
+            avx_get(c, vv, a);
+            avx_get_rm(state, c, &I, next, W, b);
+            uint8_t m[64];
+            avx_get(c, (I.imm >> 4) & 0xF, m);
+            int es = (op == 0x4C) ? 1 : (op == 0x4A) ? 4 : 8;
+            for (int i = 0; i < W; i += es)
+                memcpy(d + i, (m[i + es - 1] & 0x80) ? b + i : a + i, es);
+            avx_put(c, rd, d, W);
+            goto done;
+        }
+        case 0x46:   // vperm2i128 (integer form; identical 128-bit lane select semantics)
         case 0x06: { // vperm2f128: select a 128-bit lane into each half (imm[3]/[7] zero the lane)
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, 32, b);
