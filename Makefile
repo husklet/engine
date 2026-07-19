@@ -112,7 +112,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/flags.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/image.c \
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/dns.c src/linux_abi/image.c \
 	src/linux_abi/fdcache.c \
 	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_codec.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/shared.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
@@ -2207,7 +2207,11 @@ $(BUILD)/tests/resolve-services-macos: tests/unit/test_resolve_services.c $(BUIL
 	$(MAC) clang $(CPPFLAGS) -DHL_TEST_HOST_MACOS=1 -Itests/unit $(ENGINE_CFLAGS) $< \
 		$(BUILD)/mac/lib/libhl-host-macos.a -o $@
 
-test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos
+$(BUILD)/tests/dns-fork-macos: tests/unit/test_dns_fork_macos.c src/linux_abi/dns.c
+	@mkdir -p $(@D)
+	$(MAC) clang -O2 -std=c11 -Wall -Wextra -Werror $^ -o $@
+
+test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos $(BUILD)/tests/dns-fork-macos
 	$(MAC) $(abspath $<)
 	$(MAC) $(abspath $(BUILD)/tests/child-macos)
 	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
@@ -2219,6 +2223,7 @@ test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/direc
 	$(MAC) $(abspath $(BUILD)/tests/native-macos)
 	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
 	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
+	$(MAC) $(abspath $(BUILD)/tests/dns-fork-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)

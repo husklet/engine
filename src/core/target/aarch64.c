@@ -1,5 +1,6 @@
 #include "namespace.h"
 #include "../bus.h"
+#include "../../linux_abi/dns.h"
 
 // HL engine: the aarch64 Linux-guest JIT runner (unity translation unit).
 //
@@ -695,6 +696,9 @@ static void install_mach_exc(void) {
 static int g_engine_inited;
 
 static int container_init(const char *rootfs) {
+#if defined(__APPLE__)
+    hl_linux_dns_prepare();
+#endif
     hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1
     if (rootfs) g_init_hostpid = getpid();

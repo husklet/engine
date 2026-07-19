@@ -1,5 +1,6 @@
 #include "namespace.h"
 #include "../bus.h"
+#include "../../linux_abi/dns.h"
 
 // hl/core/target -- x86-64 Linux guest target composition.
 //
@@ -357,6 +358,9 @@ static size_t g_authorized_executable_size;
 static int g_engine_inited;
 
 static int container_init(const char *rootfs) {
+#if defined(__APPLE__)
+    hl_linux_dns_prepare();
+#endif
     hl_gmap_bind_limits(&g_limits);
     // PID ns: only containers (rootfs) get PID 1. Record the init's real host pid so the shared Linux
     // personality can virtualize just the init's identity (getpid()==1, host pgid<->guest pgid 1) and

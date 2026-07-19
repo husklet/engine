@@ -7,6 +7,7 @@
 #include "engine_backend.h"
 #include "environment.h"
 #include "launch.h"
+#include "../linux_abi/dns.h"
 #include "../host/system.h"
 #include "hl/config.h"
 #if defined(__APPLE__)
@@ -656,6 +657,9 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     if (transport < -1) return HL_STATUS_INVALID_ARGUMENT;
     if (terminal != NULL && (stdio != NULL || out_master == NULL || terminal->rows == 0 || terminal->columns == 0))
         return HL_STATUS_INVALID_ARGUMENT;
+#if defined(__APPLE__)
+    hl_linux_dns_prepare();
+#endif
     path_size = strlen(guest) + 1;
     if (path_size > sizeof(request.path)) return HL_STATUS_INVALID_ARGUMENT;
     while (environ[env_count] != NULL) ++env_count;
