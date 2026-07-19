@@ -23,6 +23,18 @@ static int dgram_addr_peek(int fd, int wantaddr, size_t totlen) {
     return ty == SOCK_DGRAM || ty == SOCK_RAW;
 }
 
+// UDP datagram size limit. A Linux AF_INET/AF_INET6 SOCK_DGRAM send whose payload exceeds the maximum
+// single UDP datagram fails EMSGSIZE regardless of destination -- the size check happens before the
+// datagram is routed. The cap is 65507 over IPv4 (65535 - 8 UDP header - 20 IP header) and 65535 over
+// IPv6. The private-loopback AF_UNIX switch backing has a different (buffer-based) limit, so without
+// this gate an oversized UDP send leaks the wrong errno (e.g. ENOENT from the missing switch peer path)
+// instead of EMSGSIZE. Returns the EMSGSIZE limit for an INET dgram fd, or 0 for any fd not capped this
+// way (g_sock_dgram is set only for AF_INET/AF_INET6 datagram sockets, never AF_UNIX).
+static size_t udp_dgram_maxlen(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd]) return 0;
+    return (g_sock_fam[fd] == LX_AF_INET6_FAM) ? 65535 : 65507;
+}
+
 // IPPROTO_IPV6 optname: Linux -> macOS. CRITICAL: like IPPROTO_TCP, these numbers diverge, so a raw
 // pass-through silently sets the WRONG option. The load-bearing case is IPV6_V6ONLY (Linux 26 -> macOS 27):
 // leaving it untranslated hits macOS's optname 26 (unrelated) instead, so a wildcard `::` bind stays
@@ -1108,6 +1120,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        // Oversized UDP datagram -> EMSGSIZE, enforced before routing (matches Linux; the AF_UNIX switch
+        // backing would otherwise leak a wrong errno for a too-large payload).
+        {
+            size_t udp_cap = udp_dgram_maxlen((int)a0);
+            if (udp_cap && (size_t)a2 > udp_cap) {
+                G_RET(c) = (uint64_t)(-EMSGSIZE);
+                break;
+            }
+        }
         // Container DNS: a query sent to 127.0.0.11:53 (connected send, or first unconnected sendto) is
         // parsed + answered via the host resolver; nothing hits the wire. a4/a5 are the optional dest addr.
         {
@@ -1158,6 +1179,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 ssize_t ur = unix_addr_set(&un, udp_path) < 0 ? -1 :
                     sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
                            (struct sockaddr *)&un, sizeof un);
+                // Unconnected UDP send to a loopback port with no bound receiver: Linux drops the datagram
+                // and reports success (no ICMP error is delivered to an unconnected socket). The AF_UNIX
+                // switch backing instead surfaces ENOENT/ECONNREFUSED from the missing peer path -- coerce
+                // it to a fire-and-forget success. Only for an explicit dest (a4); a connected socket (peer
+                // path) keeps the underlying error so ICMP port-unreach can map to ECONNREFUSED.
+                if (ur < 0 && a4 && (errno == ENOENT || errno == ECONNREFUSED)) {
+                    G_RET(c) = (uint64_t)a2;
+                    break;
+                }
                 G_RET(c) = ur < 0 ? (uint64_t)(-errno) : (uint64_t)ur;
                 break;
             }
@@ -1495,6 +1525,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             rebased_iov[i] = guest_iov[i];
             rebased_iov[i].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[i].iov_base);
         }
+        // Oversized UDP datagram -> EMSGSIZE, before routing (see udp_dgram_maxlen).
+        if (nr == 211) {
+            size_t udp_cap = udp_dgram_maxlen((int)a0);
+            if (udp_cap) {
+                size_t tot = 0;
+                for (uint64_t i = 0; i < giov_count; ++i) tot += rebased_iov[i].iov_len;
+                if (tot > udp_cap) {
+                    G_RET(c) = (uint64_t)(-EMSGSIZE);
+                    break;
+                }
+            }
+        }
         // Container DNS: a sendmsg carrying a query to 127.0.0.11:53 (or on an already-swapped DNS socket).
         if (nr == 211 && dns_enabled()) {
             int dfd = (int)a0;
@@ -1779,6 +1821,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 rebased_iov[j] = guest_iov[j];
                 rebased_iov[j].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[j].iov_base);
             }
+            // Oversized UDP datagram -> EMSGSIZE for this submessage (prior sends still count).
+            if (nr == 269) {
+                size_t udp_cap = udp_dgram_maxlen((int)a0);
+                if (udp_cap) {
+                    size_t tot = 0;
+                    for (uint64_t j = 0; j < giov_count; ++j) tot += rebased_iov[j].iov_len;
+                    if (tot > udp_cap) {
+                        err = EMSGSIZE;
+                        break;
+                    }
+                }
+            }
             memset(&mh, 0, sizeof mh);
             mh.msg_name = (void *)net_nonpie_p(*(uint64_t *)(g + 0));
             mh.msg_namelen = *(uint32_t *)(g + 8);
@@ -1792,7 +1846,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char ud_host[1200];
             int ud_route = 0; // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
             if (nr == 269 && gname && gnamelen) { // sendmmsg: guest -> host
-                if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
+                int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                    udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
+                                           ud_host, sizeof ud_host)) {
+                    // AF_INET(6) dest over the private-loopback switch: resolve to the peer AF_UNIX path
+                    // and send there (mirrors sendto/sendmsg cases 206/211).
+                    if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
+                        err = errno;
+                        break;
+                    }
+                    ud_route = 1;
+                } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
                     unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                     ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
                 } else {
@@ -1802,6 +1867,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         mh.msg_namelen = hl;
                     }
                 }
+            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
+                       g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+                ud_route = 1; // connected UDP over the switch: send to the recorded peer AF_UNIX path
             } else if (nr == 243 && gname && gnamelen) { // recvmmsg: receive into host scratch
                 mh.msg_name = &nss;
                 mh.msg_namelen = sizeof nss;
