@@ -3232,6 +3232,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
                 uint8_t *ld = out + o;
+                // The guest result buffer is written directly; a straddling/unmapped destination must
+                // EFAULT like Linux copy_to_user, not fault the engine. Validate the exact destination
+                // sub-range before every entry: entries that fit in mapped memory are emitted, and the
+                // first faulting entry (nothing emitted yet) reports EFAULT.
+                if (!host_range_mapped((uintptr_t)ld, lr)) {
+                    if (o == 0) einval = -1; // sentinel: EFAULT rather than EINVAL
+                    break;
+                }
                 // REAL inode: stat the merged entry (its host backing across upper/lowers), so `ls -i`,
                 // `find -inum`, and hardlink detection work on a layered image. The old `pos+1` fabricated a
                 // unique per-position number -> every entry looked like a distinct inode (hardlinks/du/rsync
@@ -3257,7 +3265,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             // exhausted -> free the snapshot (releases the heap arrays too)
             if (o == 0 && !einval) ovldents_free(fd);
-            G_RET(c) = einval ? (uint64_t)(int64_t)(-EINVAL) : (uint64_t)o;
+            G_RET(c) = einval > 0 ? (uint64_t)(int64_t)(-EINVAL)
+                       : einval < 0 ? (uint64_t)(int64_t)(-EFAULT)
+                       : (uint64_t)o;
             break;
         }
         DIR *dir = NULL;
@@ -3293,6 +3303,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             uint8_t *ld = out + o;
+            // Guest buffer written directly: a straddling/unmapped destination must EFAULT like Linux
+            // copy_to_user, not fault the engine. Validate the exact destination before writing; rewind
+            // the stream so the un-emitted entry is not lost, and report EFAULT only when nothing was
+            // emitted (matching the kernel's lastdirent behavior).
+            if (!host_range_mapped((uintptr_t)ld, lr)) {
+                seekdir(dir, pos);
+                if (o == 0) einval = -1; // sentinel: EFAULT rather than EINVAL
+                break;
+            }
             *(uint64_t *)(ld + 0) = de->d_ino;
             *(uint64_t *)(ld + 8) = o + lr;
             *(uint16_t *)(ld + 16) = (uint16_t)lr;
@@ -3302,7 +3321,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             o += lr;
             pos = telldir(dir);
         }
-        G_RET(c) = einval ? (uint64_t)(int64_t)(-EINVAL) : (uint64_t)o;
+        G_RET(c) = einval > 0 ? (uint64_t)(int64_t)(-EINVAL)
+                   : einval < 0 ? (uint64_t)(int64_t)(-EFAULT)
+                   : (uint64_t)o;
         break;
     }
     // readlinkat(dirfd, path, buf, bufsiz)
