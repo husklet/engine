@@ -1443,7 +1443,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     G_RET(c) = (uint64_t)(-EINVAL);
                     break;
                 }
-                G_RET(c) = (a1 == 1) ? 0 /* IS_SET: not in the (empty) ambient set */ : 0;
+                // PR_CAP_AMBIENT_RAISE(2) requires the cap be present in BOTH the permitted and the
+                // inheritable set (kernel/sys.c: !pP || !pI || issecure(NO_CAP_AMBIENT_RAISE) -> -EPERM).
+                // The container's inheritable set is always empty (capget reports CapInh=0), so no RAISE
+                // can ever be satisfied -> -EPERM, exactly as native. LOWER(3) always succeeds (removing an
+                // absent cap is a no-op) and IS_SET(1) reports "not set" against the empty ambient set.
+                // Previously RAISE returned 0, falsely claiming the ambient capability had been granted.
+                G_RET(c) = (a1 == 2) ? (uint64_t)(-EPERM) : 0;
                 break;
             }
             G_RET(c) = (uint64_t)(-EINVAL); // unknown sub-command
