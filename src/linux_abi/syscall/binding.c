@@ -2788,6 +2788,18 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     }
     case 46: {
+        // RLIMIT_FSIZE: Linux (do_sys_ftruncate) raises SIGXFSZ and returns -EFBIG when the target length
+        // exceeds the soft file-size limit, before touching the filesystem. The bound-descriptor path used
+        // to skip this (only the bound write path enforced it), so an ftruncate grow past the limit on a
+        // /tmp-backed fd silently succeeded. No-op for an infinite limit (the common case).
+        {
+            uint64_t fslim = guest_fsize_cur();
+            if (fslim != ~UINT64_C(0) && a1 > fslim) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                result = -EFBIG;
+                break;
+            }
+        }
         hl_host_file_metadata metadata = {0};
         int have_metadata = 0, prepared = 0;
         if (g_host_services != NULL && g_host_services->file != NULL && g_host_services->file->metadata != NULL) {
@@ -2899,6 +2911,19 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (a2 > INT64_MAX - a3) {
             result = -EFBIG;
             break;
+        }
+        // RLIMIT_FSIZE: a fallocate that reserves past the soft file-size limit raises SIGXFSZ/-EFBIG (Linux
+        // gates it even with FALLOC_FL_KEEP_SIZE). Only the size-extending modes are bounded -- PUNCH_HOLE /
+        // COLLAPSE_RANGE / INSERT_RANGE never place data beyond the current end, so they are exempt.
+        {
+            uint64_t fslim = guest_fsize_cur();
+            if (fslim != ~UINT64_C(0) && (a2 + a3) > fslim &&
+                (mode & (HL_HOST_FILE_ALLOC_PUNCH_HOLE | HL_HOST_FILE_ALLOC_COLLAPSE_RANGE |
+                         HL_HOST_FILE_ALLOC_INSERT_RANGE)) == 0) {
+                raise_guest_signal(c, 25); // SIGXFSZ
+                result = -EFBIG;
+                break;
+            }
         }
         if (!bound_file_abi14() || g_host_services->file->allocate_range == NULL) {
             result = -ENOSYS;
