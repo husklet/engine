@@ -738,6 +738,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 7: {
         char host[4300];
         int e;
+        // EFAULT before any deref: the path (a0, non-fd forms) is walked by abs_guest and the name (a1) is
+        // copied by snprintf in guest_xattr_set -- a wild guest pointer to either would fault the engine
+        // (SIGSEGV) instead of returning the kernel's EFAULT. The value (a2) is validated by the host set.
+        if ((nr != 7 && (!a0 || guest_bad_ptr((uintptr_t)a0, 1))) || !a1 || guest_bad_ptr((uintptr_t)a1, 1)) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         if (nr == 7)
             e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
@@ -756,6 +763,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 10: {
         char host[4300];
         int e;
+        // EFAULT before deref: path (a0, non-fd) walked by abs_guest, name (a1) copied by snprintf. The
+        // value out-buffer (a2) is validated by the host get.
+        if ((nr != 10 && (!a0 || guest_bad_ptr((uintptr_t)a0, 1))) || !a1 || guest_bad_ptr((uintptr_t)a1, 1)) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         if (nr == 10)
             e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
@@ -774,6 +787,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 13: {
         char host[4300];
         int e;
+        // EFAULT before deref: path (a0, non-fd) walked by abs_guest. The list out-buffer (a1) is validated
+        // inside guest_xattr_list, which mirrors the kernel's order (ERANGE/length-query before any copy) and
+        // only faults when bytes are actually written -- so an empty list with a bad buffer succeeds, as on Linux.
+        if (nr != 13 && (!a0 || guest_bad_ptr((uintptr_t)a0, 1))) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         if (nr == 13)
             e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
@@ -791,6 +811,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 16: {
         char host[4300];
         int e;
+        // EFAULT before deref: path (a0, non-fd) walked by abs_guest, name (a1) copied by snprintf in
+        // guest_xattr_remove.
+        if ((nr != 16 && (!a0 || guest_bad_ptr((uintptr_t)a0, 1))) || !a1 || guest_bad_ptr((uintptr_t)a1, 1)) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         if (nr == 16)
             e = hl_native_fd_path((int)a0, host, sizeof host) == 0 ? 0 : -EBADF;
         else
