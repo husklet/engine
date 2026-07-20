@@ -1166,6 +1166,22 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (isatty(fd)) (void)ioctl(fd, TIOCSCTTY, 0);
             G_RET(c) = 0;
             break;
+        // TIOCNOTTY -- drop the controlling terminal. A guest daemonizing without setsid (or a session
+        // leader detaching the tty) issues it on its ctty fd; the guest task is a real host process whose
+        // ctty is the real host pty, so forward to the real fd. The host kernel drops the binding (and, for
+        // a session leader, delivers SIGHUP+SIGCONT to the old foreground group), after which /dev/tty
+        // faithfully surfaces ENXIO. Without this the guest kept a phantom ctty and /dev/tty stayed open.
+        case 0x5422:
+#ifdef TIOCNOTTY
+            if (!isatty(fd)) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOTTY);
+                break;
+            }
+            G_RET(c) = ioctl(fd, TIOCNOTTY, 0) < 0 ? (uint64_t)(int64_t)(-errno) : 0;
+#else
+            G_RET(c) = (uint64_t)(int64_t)(-ENOTTY);
+#endif
+            break;
         // TIOCGSID -- session id of the terminal (tcgetsid(3) drives this). The guest's children are real
         // host processes in the engine's session, so the kernel's own tty->session binding is authoritative:
         // forward to the real fd and translate only the INIT's identity (its real host session id -> guest 1),
