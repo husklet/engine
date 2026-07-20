@@ -41,27 +41,34 @@
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             enableParallelBuilding = true;
 
-            # The macOS host file-service unit tests (tests/unit/macos.c) touch two
-            # filesystem locations the Nix darwin build sandbox does not grant under
-            # its `(deny default)` policy, so each open fails with EPERM and the test
-            # sees status != HL_STATUS_OK. This only bites when the daemon builds with
-            # `sandbox = true` (e.g. the macos-26 CI runner); it is invisible on hosts
-            # with sandboxing off.
-            #   1. It opens the filesystem root ("/") as a PATH_ONLY directory handle
-            #      (line 166). Opening a directory needs only `file-read-metadata`,
-            #      which no open flag (O_EVTONLY included) can bypass, so the grant
-            #      must live here. `(literal "/")` matches just "/", not its children.
-            #   2. It creates/reads/renames/symlinks scratch files under /tmp
-            #      (canonicalising to /private/tmp), starting at line 185. The build's
-            #      own TMPDIR is allowed, but these tests use a fixed /tmp path that
-            #      the sandbox rejects unless /private/tmp is granted.
-            # Grants are minimal: read on the root vnode, and file access confined to
-            # the temp directory the tests write into.
+            # The macOS host unit tests (the `test-macos` suite in `make unit`) exercise
+            # filesystem and DNS behaviour that the Nix darwin build sandbox rejects
+            # under its `(deny default)` policy. This only bites when the daemon builds
+            # with `sandbox = true` (e.g. the macos-26 CI runner); it is invisible on
+            # hosts with sandboxing off. Two independent grants are needed:
+            #
+            # (a) sandboxProfile — filesystem paths the tests open:
+            #   1. tests/unit/macos.c opens the filesystem root ("/") as a PATH_ONLY
+            #      directory handle (line 166). Opening a directory needs only
+            #      `file-read-metadata`, which no open flag (O_EVTONLY included) can
+            #      bypass, so the grant must live here. `(literal "/")` matches just "/".
+            #   2. Several tests (macos, directory, directory-services, system, native,
+            #      native-capacity, resolve-services, dns-objc-fork) create scratch
+            #      files/dirs under a fixed /tmp path (canonicalising to /private/tmp).
+            #      The build's own TMPDIR is allowed, but these fixed /tmp paths are not
+            #      unless /private/tmp (and its /tmp symlink) are granted.
+            #
+            # (b) __darwinAllowLocalNetworking — tests/unit/test_dns_fork_macos.c calls
+            #     getaddrinfo("localhost") across fork/threads. Loopback resolution needs
+            #     mDNSResponder, /etc/hosts and /etc/resolv.conf, which the sandbox blocks
+            #     unless local networking is permitted. Without this the whole test-macos
+            #     step fails at dns-fork-macos even after the filesystem grants above.
             sandboxProfile = pkgs.lib.optionalString (system == "aarch64-darwin") ''
               (allow file-read* (literal "/"))
               (allow file* (subpath "/private/tmp"))
               (allow file* (subpath "/tmp"))
             '';
+            __darwinAllowLocalNetworking = system == "aarch64-darwin";
 
             buildPhase = ''
               runHook preBuild
