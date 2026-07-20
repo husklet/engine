@@ -1,6 +1,7 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 #include "../host/range.h"
+#include "../host/system.h"
 #include "bus.h"
 #include "shared.h"
 
@@ -514,8 +515,19 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
             break;
         }
     if (retained < 0) {
-        retained = fcntl(fd, F_DUPFD_CLOEXEC, 1 << 20);
+        // The retained backing descriptor must stay OUT of the guest's fd interval. The fixed 1<<20 / HL_NFD
+        // targets fail with EINVAL when RLIMIT_NOFILE sits below them (the GitHub aarch64 runner boots with a
+        // soft limit under 65536), which previously left retained < 0 and DROPPED the mapping entirely -- so
+        // filemap_has_shared_mapping() then missed a live MAP_SHARED memfd mapping and the F_SEAL_WRITE EBUSY
+        // guard regressed (memfd-seal-busy: wr_ebusy/ro_ebusy=0 vs golden 1) while the VM's huge limit hid it.
+        // Anchor at the engine's RLIMIT-aware private floor first (the boundary hl_host_process_fd_private_*
+        // already use to keep native handles disjoint from guest fds), then the legacy fixed targets, then any
+        // free descriptor -- so a file-backed mapping is always registered regardless of the host fd limit.
+        int floor = hl_host_process_fd_private_floor();
+        if (floor > 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, floor);
+        if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, 1 << 20);
         if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, HL_NFD);
+        if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     }
     if (g_nfilemap < GNA_MAX && retained >= 0)
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
