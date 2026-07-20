@@ -997,6 +997,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // inotify_add_watch(fd, path, mask) -- kqueue EVFILT_VNODE
     case 27: {
         char pb[4200];
+        // EFAULT on an inaccessible path pointer BEFORE atpath dereferences it -- inotify_add_watch(fd, NULL,
+        // mask) and a wild/unmapped path both return -EFAULT on Linux; without this guard atpath reads the
+        // unmapped guest address and the engine SIGSEGVs (guest-triggerable crash). guest_bad_ptr also catches
+        // a PROT_NONE guard page that host_range_mapped alone would miss. Mirrors the sibling *at path syscalls
+        // in fs.c (openat/newfstatat/unlinkat all guard `!a1 || guest_bad_ptr(a1, 1)` first).
+        if (!a1 || guest_bad_ptr((uintptr_t)a1, 1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         // confined (realpath gate)
         const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
 #if defined(__linux__)

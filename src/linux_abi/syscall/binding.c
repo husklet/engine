@@ -1984,6 +1984,14 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (nr == 27 && source_bound) {
         char path[4200];
+        // EFAULT on an inaccessible path pointer BEFORE atpath dereferences it. inotify_add_watch(fd, NULL,
+        // mask) and a wild/unmapped path return -EFAULT on Linux; without this guard atpath reads the
+        // unmapped guest address and the engine child SIGSEGVs, killing the guest with signal 11 instead
+        // (guest-triggerable crash). Mirrors the guarded sibling path syscalls (nr 78 below, fs.c openat).
+        if (!a1 || !host_range_mapped((uintptr_t)a1, 1)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            return 1;
+        }
         const char *resolved = atpath(-100, (const char *)(uintptr_t)a1, path, sizeof(path), 0);
         if (resolved == NULL) result = -errno;
         else result = hl_linux_inotify_add(g_linux_box, source.fd, resolved, strlen(resolved), (uint32_t)a2);
