@@ -354,14 +354,22 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir e2e-mac-gates \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 # A mac bridge launch owns a remote process group and a shared capture mount.
 # Concurrent suites can starve a launch past the transport deadline and overlap
 # remote cleanup with the next case. Keep the release gate sequential even when
 # its caller requests parallel make.
-.NOTPARALLEL: e2e-compat e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir
+# Each gate uses per-process isolation (unique /tmp/<pid> paths + mkdtemp, per-child signals; bridge_runner
+# has no sockets/fixed paths), so the six mac gates are safe to run concurrently under `make -j`. Only
+# e2e-compat keeps its sequential remote-bridge serialization.
+.NOTPARALLEL: e2e-compat
+
+# Aggregate that builds+runs all six mac gates under one `make -j` invocation. Their prerequisites already
+# pull every tool/guest binary each gate needs, so no separate build step is required.
+e2e-mac-gates: e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene \
+	e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir
 
 all: $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-fake.a $(LINUX_HOST_PRODUCTS) $(BUILD)/bin/hl-engine-runner
