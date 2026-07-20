@@ -1224,14 +1224,17 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (oldlen > sizeof sb) oldlen = sizeof sb;
         if (oldlen) memcpy(sb, g_fd_pushback[fin], oldlen);
         size_t pos = oldlen;
+        ssize_t kn = 0;
         if (oldlen < len) {
-            ssize_t kn = read(fin, sb + oldlen, len - oldlen);
+            kn = read(fin, sb + oldlen, len - oldlen);
             if (kn > 0) pos += (size_t)kn;
         }
         if (pos == 0) {
-            G_RET(c) = (uint64_t)(int64_t)(-EAGAIN);
+            // Nothing buffered: distinguish EOF (write end closed -> tee returns 0, like Linux)
+            // from an empty nonblocking pipe (read failed with EAGAIN -> propagate the errno).
+            G_RET(c) = kn == 0 ? 0 : (uint64_t)(int64_t)(-errno);
             break;
-        } // nothing available (nonblocking)
+        }
         size_t dup = pos < len ? pos : len;
         ssize_t w = write(fout, sb, dup);
         // tee never consumes the source: restore the whole peeked front as pushback.
