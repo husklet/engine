@@ -180,11 +180,16 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             passed++;
             continue;
         }
-        if (strncmp(fields[11], "excluded-", 9) == 0 || !has_token(fields[4], architecture)) {
+        /* `excluded-macos` is a PER-ENGINE disposition: the case is skipped only on the Mach-O macOS
+           engine (matrix_runner.c). This runner always drives the ELF Linux production engine, so it must
+           RUN excluded-macos rows as active -- otherwise Linux would silently lose coverage of them. Every
+           other excluded-* disposition drops out on both engines. */
+        int macos_only = strcmp(fields[11], "excluded-macos") == 0;
+        if ((strncmp(fields[11], "excluded-", 9) == 0 && !macos_only) || !has_token(fields[4], architecture)) {
             excluded++;
             continue;
         }
-        if (strcmp(fields[11], "active") != 0 || parse_exit(fields[8], &expected_exit) != 0) {
+        if ((strcmp(fields[11], "active") != 0 && !macos_only) || parse_exit(fields[8], &expected_exit) != 0) {
             fprintf(stderr, "linux-matrix: invalid active row %s\n", fields[0]);
             free(line);
             fclose(file);

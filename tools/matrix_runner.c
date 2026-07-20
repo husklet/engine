@@ -163,7 +163,26 @@ static int valid_environment(const char *text) {
     return 1;
 }
 
-static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *case_count, size_t *excluded) {
+/* The compat matrix runs against two production engines: the ELF Linux engine (test-linux-production-typed)
+   and the Mach-O macOS engine (e2e-compat). A handful of cases exercise behavior the macOS engine cannot
+   emulate (deliberate PROT_NONE non-enforcement, Darwin-absent child-subreaper, netns bridging, deep JIT
+   re-translate). Those are marked `excluded-macos` so they are skipped ONLY when the engine binary under
+   test is Mach-O, while the Linux engine still runs and enforces them -- no Linux coverage is lost. */
+static int engine_is_macho(const char *engine_path) {
+    unsigned char magic[4] = {0};
+    int fd = open(engine_path, O_RDONLY);
+    ssize_t got;
+    if (fd < 0) return 0;
+    got = read(fd, magic, sizeof(magic));
+    (void)close(fd);
+    if (got != (ssize_t)sizeof(magic)) return 0;
+    /* ELF -> Linux engine; anything else (Mach-O 0xFEEDFACF / fat 0xCAFEBABE) -> treat as macOS. */
+    if (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') return 0;
+    return 1;
+}
+
+static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *case_count, size_t *excluded,
+                         int host_macho) {
     char path[1024];
     char *line = NULL;
     size_t capacity = 0;
@@ -210,11 +229,14 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (*case_count)++;
             continue;
         }
-        if (strncmp(fields[11], "excluded-", 9) == 0) {
+        /* excluded-macos is per-engine: it drops out only on the Mach-O (macOS) engine; on the ELF
+           (Linux) engine it is parsed and run exactly like an active case so Linux keeps enforcing it. */
+        int macos_only = strcmp(fields[11], "excluded-macos") == 0;
+        if (strncmp(fields[11], "excluded-", 9) == 0 && !(macos_only && !host_macho)) {
             (*excluded)++;
             continue;
         }
-        if (strcmp(fields[11], "active") != 0 || *case_count == CASE_MAX || !relative_path(fields[2]) ||
+        if ((strcmp(fields[11], "active") != 0 && !macos_only) || *case_count == CASE_MAX || !relative_path(fields[2]) ||
             !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
             (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
             parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
@@ -870,7 +892,7 @@ usage:
             "[--repeat N] [CASE]\n");
         return 2;
     }
-    if (load_manifest(argv[6], cases, &count, &excluded) != 0) return 1;
+    if (load_manifest(argv[6], cases, &count, &excluded, engine_is_macho(argv[2])) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {
         if (interrupted_signal != 0) return 128 + interrupted_signal;
