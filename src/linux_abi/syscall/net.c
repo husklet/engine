@@ -500,6 +500,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_lo_v6[(int)a0] = (uint8_t)is_lo6; // remember family for getsockname/accept
                 g_lo_v6only[(int)a0] = (uint8_t)(is_lo6 && v6only);
                 netns_tcp_port_note((int)a0, p); // surface the resolved (ephemeral) port in /proc/net/tcp
+                // Own the rendezvous inode with the refcounted-unlink mechanism (shared with UDP): unlike a
+                // real INADDR_ANY TCP bind whose port is freed by the kernel on last close, this AF_UNIX
+                // inode would otherwise linger on the fs and EADDRINUSE the next bind of the same ip:port
+                // (fixed HL_IP -> deterministic path). udp_ref_drop (fd_reset_emul) unlinks it on the LAST
+                // reference's close; seq_ref_fork_prepare bumps the ref across fork so a client child that
+                // inherits the listener does not orphan it.
+                udp_ref_create((int)a0, up);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
@@ -545,6 +552,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_br_ip[(int)a0] = g_netif[bridge_interface].ip;
                 g_br_interface[(int)a0] = (uint8_t)(bridge_interface + 1);
                 netns_tcp_port_note((int)a0, p); // surface the resolved (ephemeral) port in /proc/net/tcp
+                // Own the bridge rendezvous inode with the refcounted-unlink mechanism (shared with UDP) so
+                // it is removed on the LAST reference's close instead of lingering to EADDRINUSE the next
+                // bind of the same ip:port (see the private-loopback path above for the full rationale).
+                udp_ref_create((int)a0, up);
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;

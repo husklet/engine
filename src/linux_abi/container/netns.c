@@ -1032,6 +1032,18 @@ static void udp_ref_drop(int fd) {
     }
 }
 
+// exit_group(2) tears the whole process down with a raw _exit() that never runs fd_reset_emul, so any
+// rendezvous inode still owned by an un-closed descriptor (e.g. a fork()ed client child that inherits the
+// server's listening fd and _exit()s without closing it) would keep its refcount pinned above zero and
+// orphan the AF_UNIX inode on the fs. Drop this process's remaining udp/bridge refs at exit so the LAST
+// reference across the whole process tree unlinks the inode -- mirroring the kernel freeing an INET port
+// when its last owning process dies. Per-fd and idempotent: fds already closed carry no ref.
+static void udp_ref_process_exit(void) {
+    if (!g_udp_refs) return;
+    for (int fd = 0; fd < HL_NFD; fd++)
+        if (g_udp_ref[fd]) udp_ref_drop(fd);
+}
+
 static int seq_ref_pair(int first, int second) {
     if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD || g_seq_refs == NULL) return -1;
     for (uint32_t i = 0; i < SEQ_REF_N; i++) {
