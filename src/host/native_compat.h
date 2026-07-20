@@ -533,7 +533,13 @@ static inline int hl_native_removexattr(const char *path, const char *name, int 
 #define ENOATTR ENODATA
 #endif
 #ifndef O_SYMLINK
-#define O_SYMLINK O_PATH
+/* macOS O_SYMLINK opens the SYMLINK NODE itself (not its target). Linux has no such flag: an O_PATH
+ * open follows a final symlink to its target, and only O_PATH|O_NOFOLLOW yields a handle that names
+ * the link node (so readlinkat(fd,"",..) / fstatat(fd,"",AT_EMPTY_PATH) operate on the link). The
+ * container-vfs open path uses O_SYMLINK for exactly the O_PATH|O_NOFOLLOW-on-a-symlink case, so the
+ * Linux emulation must carry O_NOFOLLOW alongside O_PATH -- otherwise the bound/overlay open follows
+ * the link and the empty-path readlink names the target. */
+#define O_SYMLINK (O_PATH | O_NOFOLLOW)
 #endif
 
 static inline int renameatx_np(int old_directory, const char *old_path, int new_directory, const char *new_path,
