@@ -1185,14 +1185,17 @@ static int jit_after_fork(void) {
     // is covered too.
     pthread_mutex_init(&g_jit_lock, NULL);
     pthread_mutex_init(&g_cache_lock, NULL);
-#if defined(__linux__) && G_GPC_HASH_SHIFT == 2
-    /* The native AArch64 Linux child must not resume the parent's copied
-       translations.  A second fork after any completed child otherwise
-       executes a corrupted libc return path and trips __stack_chk_fail.  The
-       failure persists with direct chaining disabled and with the entire
-       arena copied, so it is not a short-copy or shadow-RAS artifact.  Start
-       this frontend with a private empty cache; x86 Linux and the proven
-       fixed-address macOS repair path retain warm-cache preservation. */
+#if defined(__linux__)
+    /* A Linux fork child must not resume the parent's copied translations.  A
+       second fork after any completed child otherwise executes a corrupted libc
+       return path and trips __stack_chk_fail (or the middle generation dies and
+       orphans the grandchild).  On aarch64 the failure persists even with direct
+       chaining disabled; on x86 it is carried by the inherited direct block
+       chains (a nested fork's parent continuation resolves through a sibling
+       generation's baked `b body` edge instead of its own return address), so it
+       reproduces on x86 too.  Both arches are cured the same way: start the child
+       with a private empty cache and re-translate on demand.  Only the proven
+       fixed-address macOS repair path retains warm-cache preservation. */
     preserve = 0;
 #else
     preserve = !g_threaded || !g_dualmap;
