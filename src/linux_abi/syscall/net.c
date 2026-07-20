@@ -2021,6 +2021,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)-EINVAL;
             break;
         }
+        // The mmsghdr array itself is read AND written (msg_len/msg_namelen) per submessage; a straddling or
+        // unmapped vec would fault the engine on the very first field access below. Validate the whole array up
+        // front so a bad pointer yields EFAULT (like the kernel's copy_from_user) instead of a guest-crashes-engine
+        // SIGSEGV. Each mmsghdr is 64 bytes (msghdr 56 + msg_len 4 + pad).
+        if (vlen && guest_bad_ptr((uintptr_t)vec, (size_t)vlen * 64)) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         // mmsghdr = msghdr(56) + msg_len(4) + pad
         // Container DNS: glibc's default parallel A+AAAA lookup sends BOTH queries to the nameserver in one
         // sendmmsg. Answer each submessage via the host resolver; the responses are drained by recvfrom (207).

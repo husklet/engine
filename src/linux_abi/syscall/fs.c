@@ -512,6 +512,21 @@ static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
     ssize_t n = hl_native_listxattr(host, raw, sizeof raw, opt);
     if (n < 0) return -errno;
     size_t need = 0, pl = strlen(HL_GUEST_XATTR_PREFIX);
+    // First pass: size only. The kernel compares the required length to `size` BEFORE any copy_to_user,
+    // and faults the WHOLE destination atomically (nothing is copied on EFAULT), so mirror that order:
+    // ERANGE before EFAULT, and validate the entire output range up front instead of copying into a
+    // straddling/unmapped guest buffer (which memcpy would fault the engine on -- a guest-crashes-engine break).
+    for (ssize_t i = 0; i < n;) {
+        const char *nm = raw + i;
+        size_t l = strlen(nm);
+        i += l + 1;
+        if (l > pl && !strncmp(nm, HL_GUEST_XATTR_PREFIX, pl)) need += strlen(nm + pl) + 1;
+    }
+    if (sz == 0) return (long)need;
+    if (need > sz) return -ERANGE;
+    if (need && !host_range_mapped((uintptr_t)out, need)) return -EFAULT;
+    // Second pass: the destination is sized and fully mapped, so the copy cannot fault.
+    size_t off = 0;
     for (ssize_t i = 0; i < n;) {
         const char *nm = raw + i;
         size_t l = strlen(nm);
@@ -519,11 +534,8 @@ static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
         if (l > pl && !strncmp(nm, HL_GUEST_XATTR_PREFIX, pl)) {
             const char *g = nm + pl;
             size_t gl = strlen(g) + 1;
-            if (sz) {
-                if (need + gl > sz) return -ERANGE;
-                memcpy(out + need, g, gl);
-            }
-            need += gl;
+            memcpy(out + off, g, gl);
+            off += gl;
         }
     }
     return (long)need;

@@ -27,7 +27,14 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
         size_t drem = dst[di].iov_len - doff, srem = src[si].iov_len - soff;
         size_t n = drem < srem ? drem : srem;
         if (n) {
-            memcpy((char *)dst[di].iov_base + doff, (char *)src[si].iov_base + soff, n);
+            // Either endpoint may be an unmapped/straddling guest buffer. A raw memcpy would fault the ENGINE
+            // (a guest-crashes-engine isolation break); mirror the kernel's copy_{to,from}_user instead --
+            // stop at the first inaccessible byte, returning the bytes already transferred, or -EFAULT if none.
+            char *dp = (char *)dst[di].iov_base + doff;
+            char *sp = (char *)src[si].iov_base + soff;
+            if (!host_range_mapped((uintptr_t)dp, n) || !host_range_mapped((uintptr_t)sp, n))
+                return total > 0 ? total : -EFAULT;
+            memcpy(dp, sp, n);
             total += (ssize_t)n;
             doff += n;
             soff += n;
@@ -1257,6 +1264,17 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // host address space, so a direct memcpy would read OUR own COW copy). ptrace_pvm returns >=0 bytes /
     // -errno when it owns the call, or INT_MIN to say "not a traced remote -> use the same-space memcpy".
     case 270: {
+        // The iovec arrays themselves are guest buffers the kernel reads via copy_from_user: cap the count at
+        // UIO_MAXIOV (EINVAL) and reject an unmapped array (EFAULT) so a bad pointer never faults the engine.
+        if ((unsigned long)a2 > 1024 || (unsigned long)a4 > 1024) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            break;
+        }
+        if ((a2 && guest_bad_ptr((uintptr_t)a1, (size_t)a2 * sizeof(struct iovec))) ||
+            (a4 && guest_bad_ptr((uintptr_t)a3, (size_t)a4 * sizeof(struct iovec)))) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         long pr = ptrace_pvm(c, 0, (pid_t)(int)a0, (const struct iovec *)a1, (unsigned long)a2,
                              (const struct iovec *)a3, (unsigned long)a4);
         if (pr != PT_PVM_LOCAL) {
@@ -1269,6 +1287,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // process_vm_writev: the mirror -- copy FROM the local iovecs (a1/a2) INTO the remote iovecs (a3/a4).
     case 271: {
+        if ((unsigned long)a2 > 1024 || (unsigned long)a4 > 1024) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            break;
+        }
+        if ((a2 && guest_bad_ptr((uintptr_t)a1, (size_t)a2 * sizeof(struct iovec))) ||
+            (a4 && guest_bad_ptr((uintptr_t)a3, (size_t)a4 * sizeof(struct iovec)))) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         long pr = ptrace_pvm(c, 1, (pid_t)(int)a0, (const struct iovec *)a1, (unsigned long)a2,
                              (const struct iovec *)a3, (unsigned long)a4);
         if (pr != PT_PVM_LOCAL) {
