@@ -1105,6 +1105,17 @@ static void emit_fast_syscall(uint64_t next) {
         e_subi_s(16, 0, 14, 1); // subs x16, x0, #14
         uint32_t *spm_miss = (uint32_t *)g_cp;
         e_bcond(1, 0); // b.ne -> sched_yield
+        if (g_nonpie_lo) {
+            // A non-PIE ET_EXEC hands rt_sigprocmask the low static link addresses of its .bss/.data
+            // sigsets (set=rsi, oldset=rdx); the inline path dereferences them directly, but those
+            // pointers require nonpie_p() rebasing before the bytes are reachable in the high-mapped
+            // image. Route fixed-layout guests to the canonical dispatch path (case 135), exactly like
+            // the clock_gettime/gettimeofday arms above -- otherwise a perfectly valid static sigset
+            // faults the guarded load/store and returns EFAULT. Inert for PIE/static-PIE (g_nonpie_lo==0,
+            // the common case), so the inline mask update is unchanged there.
+            to_slow[nsl++] = (uint32_t *)g_cp;
+            e_bcond(14, 0); // b.al -> slow
+        }
         // Preserve the Linux ABI validation performed by the shared slow path: kernel sigset size is
         // exactly 8, and a non-NULL set accepts only BLOCK/UNBLOCK/SETMASK (0..2). Invalid calls must not
         // mutate the mask or report inline success.
