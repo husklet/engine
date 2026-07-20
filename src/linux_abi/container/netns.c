@@ -267,6 +267,7 @@ static uint8_t g_seq_end[HL_NFD];
 #define LX_SOL_SOCKET 1
 #define HL_CMSG_EVENTFD_MAGIC 0xddefd001u
 #define HL_CMSG_SEQ_MAGIC 0xdd5e9001u
+#define HL_CMSG_TIMERFD_MAGIC 0xdd71e001u
 
 struct hl_cmsg_eventfd_meta {
     uint32_t magic;
@@ -280,6 +281,21 @@ struct hl_cmsg_seq_meta {
     uint32_t ordinal;
     uint32_t slot;
     uint32_t end;
+};
+// A timerfd is an engine-emulated object (kqueue-shim host fd + per-fd deadline/interval/clock
+// bookkeeping the timerfd read/gettime paths consult, keyed by fd number). Passing one over SCM_RIGHTS
+// dups the shared host object into the receiver, but the receiver's fd number carries none of the
+// routing state, so its read/poll would miss the timerfd path entirely. Carry that scalar state in a
+// hidden trailer marker (mirroring the eventfd/seq trailers) so the received fd behaves like a dup.
+struct hl_cmsg_timerfd_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    uint32_t first_oneshot;
+    int32_t clock;
+    int64_t deadline;
+    int64_t interval;
+    int32_t source_fd;  // sender's fd number (valid only within source_pid)
+    int32_t source_pid; // sender engine pid: re-alias the host kqueue only when the receiver shares it
 };
 
 static __thread int g_cmsg_tmpfds[1024];
@@ -366,6 +382,55 @@ static int cmsg_seq_marker(const struct hl_cmsg_seq_meta *m) {
         return -1;
     }
     return fd;
+}
+
+static int cmsg_timerfd_marker(const struct hl_cmsg_timerfd_meta *m) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char tn[] = "/tmp/.hl-tfdXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd < 0) return -1;
+    unlink(tn);
+    if (write(fd, m, sizeof *m) != (ssize_t)sizeof *m) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Peel trailing timerfd markers (LIFO; appended last by cmsg_l2m so imported first), restoring the
+// emulation state onto the received fd so its read/poll/gettime route through the timerfd path.
+static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_timerfd_meta m;
+        int marker = fds[visible - 1];
+        memset(&m, 0, sizeof m);
+        if (pread(marker, &m, sizeof m, 0) != (ssize_t)sizeof m || m.magic != HL_CMSG_TIMERFD_MAGIC) break;
+        if (m.ordinal >= (uint32_t)(visible - 1)) break;
+        int fd = fds[m.ordinal];
+        if (fd >= 0 && fd < HL_NFD) {
+            g_timerfd[fd] = 1;
+            g_tfd_deadline[fd] = m.deadline;
+            g_tfd_interval[fd] = m.interval;
+            g_tfd_clock[fd] = m.clock;
+            g_tfd_first_oneshot[fd] = (uint8_t)(m.first_oneshot != 0);
+            // The timer is armed on the host kqueue registry keyed by fd number. Within the sending
+            // engine process the received fd is a live dup of that kqueue, so alias it onto the same
+            // queue (exactly as dup() does). Across processes the registry is not shared; the pid guard
+            // skips the alias, leaving the received fd inert as before (no cross-process regression).
+            if (m.source_pid == (int32_t)getpid())
+                hl_native_kqueue_duplicate(m.source_fd, fd);
+        }
+        close(marker);
+        visible--;
+    }
+    return visible;
 }
 
 static int cmsg_import_seq_trailer(int *fds, int nfds) {
@@ -576,6 +641,32 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 combo[combo_n++] = hidden;
                 combo[combo_n++] = marker;
             }
+            for (int i = 0; i < nfds; i++) {
+                int fd = fds[i];
+                if (fd < 0 || fd >= HL_NFD || !g_timerfd[fd]) continue;
+                if (combo_n + 1 > combo_cap) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                struct hl_cmsg_timerfd_meta tm = {
+                    .magic = HL_CMSG_TIMERFD_MAGIC,
+                    .ordinal = (uint32_t)i,
+                    .first_oneshot = (uint32_t)(g_tfd_first_oneshot[fd] != 0),
+                    .clock = g_tfd_clock[fd],
+                    .deadline = g_tfd_deadline[fd],
+                    .interval = g_tfd_interval[fd],
+                    .source_fd = fd,
+                    .source_pid = (int32_t)getpid(),
+                };
+                int marker = cmsg_timerfd_marker(&tm);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = marker;
+            }
             dlen = (size_t)combo_n * sizeof(int);
         }
         size_t need = CMSG_SPACE(dlen);
@@ -613,7 +704,8 @@ static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t 
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && dlen >= sizeof(int)) {
             int nfds = (int)(dlen / sizeof(int));
             int *fds = (int *)CMSG_DATA(c);
-            int visible = cmsg_import_eventfd_trailer(fds, nfds);
+            int visible = cmsg_import_timerfd_trailer(fds, nfds);
+            visible = cmsg_import_eventfd_trailer(fds, visible);
             visible = cmsg_import_seq_trailer(fds, visible);
             for (int i = 0; i < visible; i++) {
                 cmsg_note_recv_sock_fd(fds[i]);
