@@ -1277,6 +1277,16 @@ static int64_t bound_relocate_lowest(int64_t opened) {
         snprintf(guest_path, sizeof guest_path, "%s", g_fdpath[(int)opened]);
     shadow = bound_shadow_reserve(0);
     if (shadow < 0) return opened;
+    /* `opened` already holds a descriptor, so bound_shadow_reserve()'s lowest-free scan can never return
+     * opened's own number -- it returns the lowest OTHER free slot. When that slot is ABOVE opened, opened
+     * is itself the lowest number the guest can be handed (e.g. it reused a just-closed low fd), so
+     * relocating to `shadow` would drift the descriptor UPWARD, breaking Linux's lowest-free-fd contract
+     * (a close(N)+reopen must return N). Keep opened in place; its fdvis view + path were already published
+     * by bound_adopt_handle and the caller. Only relocate when a strictly-lower free slot exists. */
+    if (shadow > opened) {
+        close(shadow);
+        return opened;
+    }
     if (proc_fdvis_reserve(&fdvis) != 0) {
         close(shadow);
         return opened;
