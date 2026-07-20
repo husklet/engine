@@ -100,10 +100,26 @@ static int jit_cache_init(void) {
     hl_fatal_context_init(&g_jit_fatal, &g_jit_services);
     // Dual aliases avoid global W^X flips. Hosts that cannot create them still have a correct MAP_JIT
     // path; this is a capability fallback, not a user-facing mode switch.
+#if defined(__APPLE__)
+    // Apple hardened runtime: the dual-alias RX mapping is *non*-MAP_JIT executable memory
+    // (mach_vm_remap + VM_PROT_EXECUTE). Under strict AMFI that alias is only tolerated with the
+    // restricted `com.apple.security.cs.disable-executable-page-protection` entitlement, which is NOT
+    // honored for an ad-hoc signature — the kernel SIGKILLs the engine the moment it executes the
+    // alias (fine on SIP-disabled/VM macs, lethal on stock macos-26 CI runners). The single-MAP_JIT
+    // W^X path (dual_alias=0, g_rw2rx==0, pthread_jit_write_protect flips) needs only `allow-jit` and
+    // works on every mac, so select it by default here. Reserving with dual_alias=0 keeps g_dualmap
+    // consistent for later flush re-reserves (code_mapping_reserve(&mapping, g_dualmap)) and matches
+    // the historical fork-preserving path (see notes at the !g_dualmap fork sites).
+    if (code_mapping_reserve(&g_code_mapping, 0) != 0) {
+        (void)cache_oom_fail();
+        return -1;
+    }
+#else
     if (code_mapping_reserve(&g_code_mapping, 1) != 0 && code_mapping_reserve(&g_code_mapping, 0) != 0) {
         (void)cache_oom_fail();
         return -1;
     }
+#endif
     hl_arena_bind(&g_emit, &g_code_mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache reserve rw=%p rx=%p bytes=%u dual=%d", (void *)g_cache, J_RX(g_cache),
             CACHE_SZ, g_dualmap);
