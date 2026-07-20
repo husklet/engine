@@ -39,6 +39,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # The typed compat scratch is mapped as the guest's /tmp; on this ext4
+          # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
+          sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
+          export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
           if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-linux-production-typed' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}

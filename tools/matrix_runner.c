@@ -545,9 +545,26 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     result->output = malloc(OUTPUT_MAX);
     result->error = malloc(ERROR_MAX);
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
-    if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", binary_root) >= (int)sizeof scratch ||
-        mkdtemp(scratch) == NULL)
-        return 1;
+    {
+        /*
+         * The guest scratch is mapped as the guest's /tmp volume, so its backing
+         * filesystem determines whether statx-btime, memfd seals, and related
+         * tmpfs-only behaviour are observable. By default we place it under
+         * binary_root (the case dir in the build tree), which keeps local `make`
+         * on a tmpfs tree correct. On CI where the build tree lives on ext4, the
+         * scratch base can be overridden with HL_MATRIX_SCRATCH_DIR pointing at a
+         * mounted tmpfs. The override is a HOST path; the engine's guest-side
+         * special-casing of /tmp and /dev/shm does not apply to it.
+         */
+        const char *scratch_base = getenv("HL_MATRIX_SCRATCH_DIR");
+        struct stat base_stat;
+        if (scratch_base == NULL || scratch_base[0] == 0 || stat(scratch_base, &base_stat) != 0 ||
+            !S_ISDIR(base_stat.st_mode) || access(scratch_base, W_OK) != 0)
+            scratch_base = binary_root;
+        if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", scratch_base) >= (int)sizeof scratch ||
+            mkdtemp(scratch) == NULL)
+            return 1;
+    }
     if (snprintf(capture_output, sizeof capture_output, "%s/stdout", scratch) >= (int)sizeof capture_output ||
         snprintf(capture_error, sizeof capture_error, "%s/stderr", scratch) >= (int)sizeof capture_error) {
         remove_tree(scratch);
