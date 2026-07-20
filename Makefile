@@ -214,7 +214,9 @@ $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
-		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -lm -o $@
+		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a \
+		$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
+		$(BUILD)/lib/libhl-host-fake.a -lm -o $@
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 
@@ -549,13 +551,17 @@ $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-engine.a \
-		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -lm -o $@
+		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a \
+		$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
+		$(BUILD)/lib/libhl-host-fake.a -lm -o $@
 
 $(BUILD)/tests/test_linux_abi: tests/unit/test_linux_abi.c $(BUILD)/lib/libhl-engine.a \
 	$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) -pthread $< $(BUILD)/lib/libhl-engine.a \
-		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a -o $@
+		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a \
+		$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
+		$(BUILD)/lib/libhl-host-fake.a -o $@
 
 $(BUILD)/tests/test_watch: tests/unit/test_watch.c $(BUILD)/lib/libhl-linux-abi.a
 	@mkdir -p $(@D)
@@ -604,10 +610,10 @@ $(BUILD)/tests/test_linux_fork: tests/unit/test_linux_fork.c $(BUILD)/lib/libhl-
 		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_pipe_linux: tests/unit/test_pipe_linux.c $(BUILD)/lib/libhl-linux-abi.a \
-	$(BUILD)/lib/libhl-host-linux.a
+	$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-host-linux.a
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Isrc/linux_abi -Itests/unit $(ENGINE_CFLAGS) $< $(BUILD)/lib/libhl-linux-abi.a \
-		$(BUILD)/lib/libhl-host-linux.a -pthread -o $@
+		$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-linux.a -pthread -o $@
 
 $(BUILD)/tests/test_eventfd_fork: tests/unit/test_eventfd_fork.c $(BUILD)/lib/libhl-linux-abi.a \
 	$(BUILD)/lib/libhl-host-linux.a
