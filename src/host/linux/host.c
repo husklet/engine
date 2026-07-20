@@ -79,7 +79,6 @@ typedef struct hl_linux_timer_entry {
 } hl_linux_timer_entry;
 
 typedef struct hl_linux_watch {
-    int watched_descriptor;
     int watch_id;
     uint64_t delivered_generation;
     uint64_t modified_ns;
@@ -2362,9 +2361,12 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
     return close(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
-static int hl_linux_watch_refresh(hl_linux_watch *watch) {
+// `descriptor` is the live watched fd held by the owning handle entry (entry->wake_descriptor). The watch
+// struct must NOT cache the fd it was opened with: hl_linux_allocate_handle privatizes (relocates + closes)
+// the passed descriptor via hl_host_process_fd_private_adopt, so any pre-adoption copy is a stale, closed fd.
+static int hl_linux_watch_refresh(hl_linux_watch *watch, int descriptor) {
     struct stat status;
-    if (fstat(watch->watched_descriptor, &status) != 0) return -1;
+    if (fstat(descriptor, &status) != 0) return -1;
     uint64_t modified = (uint64_t)status.st_mtim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtim.tv_nsec;
     uint64_t changed = (uint64_t)status.st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_ctim.tv_nsec;
     uint64_t size = status.st_size < 0 ? 0 : (uint64_t)status.st_size;
@@ -2415,7 +2417,6 @@ static hl_host_result hl_linux_watch_open(void *context, hl_host_handle file) {
         close(watched);
         return hl_linux_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
     }
-    watch->watched_descriptor = watched;
     watch->watch_id = watch_id;
     watch->record = (hl_host_watch_record){
         1, (uint64_t)status.st_dev, (uint64_t)status.st_ino, status.st_size < 0 ? 0 : (uint64_t)status.st_size, 0, 0};
@@ -2438,7 +2439,7 @@ static hl_host_result hl_linux_watch_query(void *context, hl_host_handle handle,
     pthread_mutex_lock(&host->lock);
     hl_linux_handle_entry *entry = hl_linux_lookup_locked(host, handle, HL_LINUX_HANDLE_WATCH);
     hl_linux_watch *watch = entry == NULL ? NULL : entry->address;
-    int result = watch == NULL ? -2 : hl_linux_watch_refresh(watch);
+    int result = watch == NULL ? -2 : hl_linux_watch_refresh(watch, entry->wake_descriptor);
     if (result == 0) *record = watch->record;
     pthread_mutex_unlock(&host->lock);
     if (result == -2) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -2477,7 +2478,7 @@ static hl_host_result hl_linux_watch_drain(void *context, hl_host_handle handle,
         if (native_changes & IN_MOVE_SELF) watch->record.changes |= HL_HOST_WATCH_IDENTITY;
         if (native_changes & (IN_DELETE_SELF | IN_IGNORED)) watch->record.changes |= HL_HOST_WATCH_DELETED;
     }
-    int refreshed = hl_linux_watch_refresh(watch);
+    int refreshed = hl_linux_watch_refresh(watch, entry->wake_descriptor);
     int available = refreshed == 0 && watch->record.generation != watch->delivered_generation;
     if (available) {
         records[0] = watch->record;
