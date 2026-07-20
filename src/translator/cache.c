@@ -1197,6 +1197,21 @@ static int jit_after_fork(void) {
        with a private empty cache and re-translate on demand.  Only the proven
        fixed-address macOS repair path retains warm-cache preservation. */
     preserve = 0;
+#if G_GPC_HASH_SHIFT == 0
+    /* x86 guest exception: with the persistent translated-code cache active, the
+       fresh-arena rebuild leaves a SINGLE-THREADED fork child resuming on incoherent
+       guest state -- a re-translated `rep movs` reads a garbage RCX/RSI and runs a
+       512 MiB copy off the end of guest memory (guest __stack_chk_fail / SIGSEGV in
+       the child only).  The cache forces the image + arena onto fixed bases and
+       records baked host-pointer slots, and that bookkeeping does not survive the
+       preserve=0 arena move intact.  Restore the proven warm-arena hand-off for this
+       path exactly as before the nested-fork fix (single-threaded parent: re-couple
+       the dual map's RX alias to the child's COW pages at the same VA).  The
+       nested-fork double-fork repro runs WITHOUT the cache and keeps preserve=0, so
+       its cure is unaffected.  A threaded parent still rebuilds (a torn arena snapshot
+       is never preservable). */
+    if (g_pcache && !g_threaded && g_dualmap) preserve = 1;
+#endif
 #else
     preserve = !g_threaded || !g_dualmap;
 #endif
