@@ -145,19 +145,35 @@ static int hl_flock(int fd, int op) {
 #endif
 }
 
+// Take/drop the whole-file advisory lock on the COMPANION fd (a distinct vnode keyed by the target's
+// dev/ino). On Linux we use flock(2) on the companion, NOT fcntl POSIX record locks: flock ownership is
+// scoped to the OPEN FILE DESCRIPTION, so a fork child inheriting the (CLOEXEC) companion fd SHARES the
+// parent's lock exactly as the real flock semantics require -- whereas a per-process fcntl record lock is
+// NOT inherited across fork and would make the child's flock through an inherited descriptor spuriously
+// conflict with the still-holding parent (fork-shares). Independent open()s of the target still contend
+// because each process caches its OWN companion fd (a distinct OFD). On a non-Linux (macOS) host flock and
+// fcntl share one per-vnode lock list, so we keep the fcntl-on-companion emulation there.
+static int flock_companion_set(int comp, int base, int nonblock) {
+#if defined(__linux__)
+    return flock(comp, base == LOCK_UN ? LOCK_UN : base | (nonblock ? LOCK_NB : 0));
+#else
+    struct flock fl = {.l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+    fl.l_type = base == LOCK_UN ? F_UNLCK : base == LOCK_SH ? F_RDLCK : F_WRLCK;
+    return fcntl(comp, base == LOCK_UN || nonblock ? F_SETLK : F_SETLKW, &fl);
+#endif
+}
+
 static int hl_flock_identity(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int op) {
     if (flock_broker_apply(source, device, object, op) != 0) return -1;
     int fd = (int)source->fd;
     int idx = flock_companion_identity(device, object);
     if (idx < 0) return -1;
     int comp = g_flkcomp[idx].fd, base = op & ~LOCK_NB;
-    struct flock fl = {.l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
     if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) {
         errno = EINVAL;
         return -1;
     }
-    fl.l_type = base == LOCK_UN ? F_UNLCK : base == LOCK_SH ? F_RDLCK : F_WRLCK;
-    int r = fcntl(comp, base == LOCK_UN || (op & LOCK_NB) ? F_SETLK : F_SETLKW, &fl);
+    int r = flock_companion_set(comp, base, op & LOCK_NB);
     if (r == 0 && fd >= 0 && fd < HL_NFD) {
         if (base == LOCK_UN) {
             if (g_flock_type[fd] && --g_flkcomp[idx].refs < 0) g_flkcomp[idx].refs = 0;
@@ -177,8 +193,7 @@ static void flock_on_close_identity(int fd, uint64_t device, uint64_t object) {
     if (idx < 0) return;
     if (--g_flkcomp[idx].refs <= 0) {
         g_flkcomp[idx].refs = 0;
-        struct flock fl = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
-        (void)fcntl(g_flkcomp[idx].fd, F_SETLK, &fl);
+        (void)flock_companion_set(g_flkcomp[idx].fd, LOCK_UN, 1);
     }
 }
 
