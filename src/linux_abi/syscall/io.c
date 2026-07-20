@@ -1578,6 +1578,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             memfd_ensure_fd(fd);
             if (fd < 0 || fd >= HL_NFD || !g_memfd_is[fd]) {
 #if defined(__linux__) && defined(F_ADD_SEALS)
+                // A memfd not tracked here (e.g. a real host memfd whose host fd landed >= HL_NFD) would
+                // otherwise let the HOST KERNEL decide the F_SEAL_WRITE-while-mapped verdict. That verdict
+                // depends on whether the ENGINE happens to hold a writable host-side MAP_SHARED alias of the
+                // object, which varies by host kernel/fs -- EBUSY on this VM but 0 on the CI runner (the
+                // memfd-seal-busy divergence). Make F_SEAL_WRITE (0x8) deterministic from the engine's OWN
+                // mapping registry, exactly like the emulated branch below: if a live MAP_SHARED mapping of
+                // this object exists, refuse with EBUSY (Linux mm/shmem.c writable-mapping guard), host
+                // independent. With no outstanding shared mapping, forward so the host still applies the seal
+                // and reports the real seal state (F_GET_SEALS / a later writable-shared-mmap EPERM keep working).
+                if (((int)a2 & 0x8) && filemap_has_shared_mapping(fd)) {
+                    G_RET(c) = (uint64_t)(-EBUSY);
+                    break;
+                }
                 int r = fcntl(fd, F_ADD_SEALS, (int)a2);
                 G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
 #else
