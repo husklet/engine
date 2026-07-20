@@ -129,6 +129,20 @@ static void aio_eventfd_kick(int fd) {
     pthread_mutex_unlock(&g_eventfd_lock);
 }
 
+// True for the opcodes aio_do_one can execute. Linux validates aio_lio_opcode synchronously inside
+// io_submit, so an unsupported opcode must fail the syscall (EINVAL) rather than queue a completion.
+static int aio_opcode_supported(uint16_t op) {
+    switch (op) {
+    case IOCB_CMD_PREAD:
+    case IOCB_CMD_PWRITE:
+    case IOCB_CMD_FSYNC:
+    case IOCB_CMD_FDSYNC:
+    case IOCB_CMD_PREADV:
+    case IOCB_CMD_PWRITEV: return 1;
+    default: return 0;
+    }
+}
+
 // Perform ONE iocb synchronously; returns the io_event.res value (bytes transferred, 0 for fsync, or a
 // negative Linux errno). `iocb` is an already-validated 64-byte guest struct.
 static int64_t aio_do_one(const uint8_t *iocb) {
@@ -269,11 +283,19 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         const uint64_t *pp = (const uint64_t *)a2;
         long done = 0;
+        int64_t sync_err = -EFAULT; // errno reported if NOTHING submits (EFAULT for a bad iocb pointer)
         for (long i = 0; i < count; i++) {
             uint64_t iocb = pp[i];
             if (!iocb || !host_range_mapped((uintptr_t)iocb, 64))
                 break; // stop; report count so far (or EFAULT if first)
             const uint8_t *cb = (const uint8_t *)iocb;
+            // Linux validates aio_lio_opcode INSIDE io_submit: an unsupported opcode fails the syscall
+            // synchronously with EINVAL and queues no completion, instead of surfacing it via io_getevents.
+            uint16_t aio_op = *(const uint16_t *)(cb + 16);
+            if (!aio_opcode_supported(aio_op)) {
+                sync_err = -EINVAL;
+                break; // stop; report count so far (or EINVAL if first)
+            }
             uint64_t aio_data = *(const uint64_t *)(cb + 0);
             uint32_t aio_flags = *(const uint32_t *)(cb + 56);
             uint32_t aio_resfd = *(const uint32_t *)(cb + 60);
@@ -283,7 +305,7 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             done++;
         }
         // Linux io_submit returns the number of iocbs submitted, or -errno only if NONE were.
-        G_RET(c) = done > 0 ? (uint64_t)done : (uint64_t)(-EFAULT);
+        G_RET(c) = done > 0 ? (uint64_t)done : (uint64_t)sync_err;
         break;
     }
     case 3: // io_cancel(aio_context_t ctx, struct iocb *, struct io_event *)

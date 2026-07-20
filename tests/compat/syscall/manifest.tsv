@@ -1,6 +1,7 @@
 # case	group	source	legacy_source	isas	cflags	defines	env	exit	stdout	dependencies	disposition	note
 aio-pread	events	aio_pread.c	ext_linuxsys/aio_pread.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/aio_pread.out	linux-libc	active	exact source and behavioral registration transfer
 aio-persist	events	aio_persist.c	focused-production-regression	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/aio_persist.out	linux-libc,aio,eventfd,filesystem,exec	active	batch completion identities and resfd count; pwrite persistence across fsync, rename, close, and exec-reopen
+aio-bad-opcode	events	aio_bad_opcode.c	focused-production-regression	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/aio_bad_opcode.out	linux-libc,aio,syscall-edges	active	unsupported aio_lio_opcode fails io_submit synchronously with EINVAL and queues no completion
 clock-linux	misc	clock_linux.c	ext_linuxsys/clock_linux.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/clock_linux.out	linux-libc	active	exact source and behavioral registration transfer
 copy-file-range	filesystem	copy_file_range.c	ext_linuxsys/copy_file_range.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/copy_file_range.out	linux-libc	active	exact source and behavioral registration transfer
 epoll-et	epoll	epoll_et.c	ext_linuxsys/epoll_et.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread	-	-	0	expected/epoll_et.out	linux-libc	active	exact source and behavioral registration transfer
