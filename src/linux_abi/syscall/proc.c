@@ -328,8 +328,11 @@ static int bound_fork_prepare(bound_fork_state *state) {
         return 0;
     }
     state->watch_plan.capacity = bound_mapping_watch_capacity();
+    // Records are populated only up to plan->count (each written via a fully-designated compound literal) and
+    // read only over [0,count); the tail is never inspected, so the worst-case-sized buffer needs no zero-fill.
+    // malloc avoids the per-fork memset of a capacity-sized (ofd_capacity) block that calloc would perform.
     state->watch_plan.records =
-        state->watch_plan.capacity == 0 ? NULL : calloc(state->watch_plan.capacity, sizeof(*state->watch_plan.records));
+        state->watch_plan.capacity == 0 ? NULL : malloc((size_t)state->watch_plan.capacity * sizeof(*state->watch_plan.records));
     if (state->watch_plan.capacity != 0 && state->watch_plan.records == NULL) { return -ENOMEM; }
     if (bound_mapping_fork_prepare(&state->watch_plan) != 0) {
         free(state->watch_plan.records);
@@ -340,7 +343,10 @@ static int bound_fork_prepare(bound_fork_state *state) {
     state->plan.abi = HL_LINUX_ABI_VERSION;
     state->plan.size = sizeof(state->plan);
     state->plan.capacity = g_linux_box->ofd_capacity;
-    state->plan.records = calloc(state->plan.capacity, sizeof(*state->plan.records));
+    // hl_linux_abi_fork_prepare writes each record with a fully-designated compound literal and all consumers
+    // iterate only [0,count); the unused tail is never read, so no zero-fill is required. malloc avoids the
+    // per-fork memset of the capacity-sized (ofd_capacity) records block that calloc would perform.
+    state->plan.records = malloc((size_t)state->plan.capacity * sizeof(*state->plan.records));
     if (state->plan.records == NULL) {
         (void)bound_mapping_fork_complete(&state->watch_plan, 0);
         state->watch_prepared = 0;

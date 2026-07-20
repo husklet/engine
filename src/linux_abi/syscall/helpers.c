@@ -387,14 +387,23 @@ static void flock_broker_detach(const hl_linux_fd_snapshot *source) {
 static void flock_broker_after_fork(void) {
     if (g_poslk == NULL || g_linux_box == NULL) return;
     poslk_lock();
-    for (uint32_t fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
-        hl_linux_fd_snapshot source;
-        if (hl_linux_fd_snapshot_get(g_linux_box, fd, &source) != HL_STATUS_OK || source.flock_token == 0) continue;
-        for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
-            struct flock_broker_record *record = &g_poslk->flock[index];
-            if (record->active && record->token == source.flock_token) (void)flock_holder_add(record, getpid());
+    // The per-fd scan only ever calls flock_holder_add on ACTIVE broker records: with no active record
+    // anywhere in the container it is a pure no-op. Skip the full fd_capacity walk (an inherited flock is
+    // rare, the table is large) after a cheap FLOCK_BROKER_MAX (512) probe; the generation bump is
+    // unconditional exactly as before so any observer's re-read semantics are unchanged.
+    int any_active = 0;
+    for (int index = 0; index < FLOCK_BROKER_MAX; ++index)
+        if (g_poslk->flock[index].active) { any_active = 1; break; }
+    if (any_active)
+        for (uint32_t fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
+            hl_linux_fd_snapshot source;
+            if (hl_linux_fd_snapshot_get(g_linux_box, fd, &source) != HL_STATUS_OK || source.flock_token == 0)
+                continue;
+            for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
+                struct flock_broker_record *record = &g_poslk->flock[index];
+                if (record->active && record->token == source.flock_token) (void)flock_holder_add(record, getpid());
+            }
         }
-    }
     atomic_fetch_add_explicit(&g_poslk->flock_generation, 1, memory_order_release);
     poslk_unlock();
 }
