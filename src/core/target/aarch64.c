@@ -202,7 +202,7 @@ static int aarch64_image_read(const char *path, hl_linux_image *image) {
         if (realpath(path, canonical) != NULL && strcmp(canonical, g_authorized_executable_path) == 0)
             return hl_linux_image_read_bytes(g_authorized_executable_image, g_authorized_executable_size, image);
     }
-    if (g_rootfs == NULL) return -1;
+    if (g_rootfs == NULL) return hl_linux_image_read(effective_host_services(), path, image);
     char guest[4200];
     const char *request = path;
     if (path != NULL && path[0] == '/') {
@@ -888,7 +888,12 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     const char *prog_host =
         // resolve through the overlay (upper, then lowers) + follow the entry symlink (/bin/sh->busybox)
         xresolve_overlay(prog, pb, sizeof pb);
-    if (g_initial_executable_image != NULL && !g_authorized_executable_path[0]) {
+    // Authorize the launched image for the bare-mode execve gate (proc.c) and the by-path image reader.
+    // This must be set even when no executable image was embedded (the macOS embedding/bridge path launches
+    // the guest purely by path): otherwise a guest re-exec of /proc/self/exe fails the authorized-target
+    // check with ENOENT. In the normal production path g_initial_executable_image is always set, so only the
+    // embedded by-path case changes here.
+    if (!g_authorized_executable_path[0]) {
         if (realpath(prog_host, g_authorized_executable_path) == NULL)
             snprintf(g_authorized_executable_path, sizeof g_authorized_executable_path, "%s", prog_host);
     }

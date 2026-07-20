@@ -32,7 +32,7 @@ static int x86_image_read(const char *path, hl_linux_image *image) {
         if (realpath(path, canonical) != NULL && strcmp(canonical, g_authorized_executable_path) == 0)
             return hl_linux_image_read_bytes(g_authorized_executable_image, g_authorized_executable_size, image);
     }
-    if (g_rootfs == NULL) return -1;
+    if (g_rootfs == NULL) return hl_linux_image_read(effective_host_services(), path, image);
     char guest[4200];
     const char *request = path;
     if (path != NULL && path[0] == '/') {
