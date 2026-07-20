@@ -59,7 +59,7 @@
             checkPhase = ''
               runHook preCheck
               make unit
-              make package-test ${pkgs.lib.optionalString (system == "aarch64-darwin") "CODESIGN=:"}
+              make package-test ${pkgs.lib.optionalString (system == "aarch64-darwin") "CODESIGN=/usr/bin/codesign"}
               runHook postCheck
             '';
 
