@@ -2903,7 +2903,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // fd 0/1/2 here (open-only; their readlink stays the on-disk symlink so `ls -l /dev` works).
             char special_path[4200];
             const char *special = guest_symlink_target((const char *)a1, special_path, sizeof special_path);
-            int pfn = procfd_num(special);
+            // Detect /proc/self/fd/N (and /dev/fd/N) from the GUEST path first: guest_symlink_target follows
+            // the host's real /proc/self/fd/N symlink to the backing file, which for an O_TMPFILE/memf-backed
+            // fd resolves to the unlinked "(deleted)" scratch inode -- losing the fd number, so the reopen
+            // fell through to a plain open of an empty/absent file and the RAM-cached writes vanished (freopen
+            // read back nothing). Recovering the fd here lets the reopen alias the descriptor (memf flushed),
+            // so the reopened stream sees the written data.
+            int pfn = procfd_num_at((int)a0, (const char *)a1);
+            if (pfn < 0) pfn = procfd_num(special);
             if (pfn < 0) pfn = dev_std_fd(special);
             if (pfn >= 0) {
                 hl_linux_fd_snapshot typed;
