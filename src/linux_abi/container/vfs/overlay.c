@@ -675,26 +675,47 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
 // "strip g_rootfs_canon" form silently left g_cwd stale for a dir that lives only in a lower). Boundary
 // check ('/' or end) avoids a prefix collision between sibling layer roots. Unknown -> "/" (fail safe).
 static void guest_from_host_raw(const char *host, char *out, size_t n) {
+    // Mounts nest: a bound volume can back a directory that lives INSIDE another mapped layer (the matrix
+    // harness backs guest /tmp with a scratch dir under the binary_root volume; Docker likewise permits a
+    // bind mount under an existing mount). The kernel resolves such a host path to its MOST-SPECIFIC mount,
+    // so map by the LONGEST matching host prefix -- not the first layer in declaration order, which for a
+    // scratch dir under binary_root wrongly returned the (identity-mapped) host path and leaked it through
+    // /proc/self/fd. Scan every candidate (rootfs, lowers, volumes) and keep the longest host-prefix hit.
+    size_t best_len = 0;
+    const char *best_suffix = NULL; // host tail after the matched prefix
+    const char *best_guest = NULL;  // guest base ("" for rootfs/lower which are 1:1, else the volume's guest mount)
+    int have = 0;
     if (g_rootfs && !strncmp(host, g_rootfs_canon, g_rootfs_canon_len) &&
         (host[g_rootfs_canon_len] == '/' || host[g_rootfs_canon_len] == 0)) {
-        const char *g = host + g_rootfs_canon_len;
-        snprintf(out, n, "%s", g[0] ? g : "/");
-        return;
+        best_len = g_rootfs_canon_len;
+        best_suffix = host + g_rootfs_canon_len;
+        best_guest = "";
+        have = 1;
     }
     for (int i = 0; i < g_nlower; i++)
         if (!strncmp(host, g_lower[i].canon, g_lower[i].clen) &&
-            (host[g_lower[i].clen] == '/' || host[g_lower[i].clen] == 0)) {
-            const char *g = host + g_lower[i].clen;
-            snprintf(out, n, "%s", g[0] ? g : "/");
-            return;
+            (host[g_lower[i].clen] == '/' || host[g_lower[i].clen] == 0) && (!have || g_lower[i].clen > best_len)) {
+            best_len = g_lower[i].clen;
+            best_suffix = host + g_lower[i].clen;
+            best_guest = "";
+            have = 1;
         }
     for (int i = 0; i < g_nvols; i++)
-        if (!strncmp(host, g_vols[i].hcanon, g_vols[i].hlen) &&
-            (host[g_vols[i].hlen] == '/' || host[g_vols[i].hlen] == 0)) {
-            snprintf(out, n, "%s%s", g_vols[i].guest, host + g_vols[i].hlen);
-            return;
+        if (!g_vols[i].dead && !strncmp(host, g_vols[i].hcanon, g_vols[i].hlen) &&
+            (host[g_vols[i].hlen] == '/' || host[g_vols[i].hlen] == 0) && (!have || g_vols[i].hlen > best_len)) {
+            best_len = g_vols[i].hlen;
+            best_suffix = host + g_vols[i].hlen;
+            best_guest = g_vols[i].guest;
+            have = 1;
         }
-    snprintf(out, n, "/");
+    if (!have) {
+        snprintf(out, n, "/");
+        return;
+    }
+    if (best_guest[0])
+        snprintf(out, n, "%s%s", best_guest, best_suffix);
+    else
+        snprintf(out, n, "%s", best_suffix[0] ? best_suffix : "/");
 }
 
 // Map a canonical HOST dir to the GUEST path, then fold it into the active chroot frame: under a chroot,
