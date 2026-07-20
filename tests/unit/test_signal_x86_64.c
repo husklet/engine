@@ -82,13 +82,13 @@ int main(void) {
     int codes[65] = {0};
     hl_x86_signal_queue queue = {handler, &installed, codes, addresses, &pending};
     cpu.rip = UINT64_C(0x1234); cpu.sigmask = UINT64_MAX;
-    HL_CHECK(hl_x86_signal_raise_divide(&cpu, &queue) == 1);
+    HL_CHECK(hl_x86_signal_raise_divide(&cpu, &queue, 1 /* FPE_INTDIV */) == 1);
     HL_CHECK(codes[8] == 1 && addresses[8] == cpu.rip && (pending & (UINT64_C(1) << 8)));
     cpu.divop = 4 | (2 << 8); pending = 0;
     HL_CHECK(hl_x86_signal_raise_trap(&cpu, &queue) == 1);
     HL_CHECK(codes[4] == 2 && addresses[4] == cpu.rip && (pending & (UINT64_C(1) << 4)));
     installed = 1;
-    HL_CHECK(hl_x86_signal_raise_divide(&cpu, &queue) == 0);
+    HL_CHECK(hl_x86_signal_raise_divide(&cpu, &queue, 1 /* FPE_INTDIV */) == 0);
 
     uint64_t flags = hl_x86_signal_nzcv_to_eflags(UINT64_C(0xb0000000));
     HL_CHECK(hl_x86_signal_eflags_to_nzcv(flags) == UINT64_C(0xb0000000));

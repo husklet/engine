@@ -75,7 +75,13 @@ int main(void) {
     hl_x86_x87_anchor(0);
     reset_calls();
     hl_x86_x87_round();
-    HL_CHECK(seen.loads == 1 && seen.stores == 1 && seen.runtime_loads == 0 && seen.raw == 3);
+    // raw == 7: static load (1) + round body (1) + static store (1) is the old
+    // count of 3; the body now emits 5 (ubfx to extract the x87 RC, mrs to save
+    // the live FPCR, msr to install the x87 rounding mode, frinti, msr to restore
+    // the saved SSE FPCR), so 1 + 5 + 1 = 7. The four ops over a bare frinti are
+    // the rounding-mode extraction plus the FPCR save/restore that keeps SSE
+    // rounding untouched (see hl_x86_x87_round in lower/x87.c).
+    HL_CHECK(seen.loads == 1 && seen.stores == 1 && seen.runtime_loads == 0 && seen.raw == 7);
 
     reset_calls();
     hl_x86_x87_function(X87_FSIN, UINT64_C(0x1234));

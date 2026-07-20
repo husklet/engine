@@ -22,7 +22,7 @@ int main(void) {
     HL_CHECK(descriptor >= 0);
     close(descriptor);
     HL_CHECK(link(file, hard) == 0);
-    HL_CHECK(hl_owner_seed(root, "file\t12\t34\n") == 0);
+    HL_CHECK(hl_owner_seed(root, "file\t12\t34\n", NULL, 0) == 0);
     HL_CHECK(lstat(file, &status) == 0);
     HL_CHECK(hl_owner_get(file, -1, &status, 1, &uid, &gid));
     HL_CHECK(uid == 12 && gid == 34);

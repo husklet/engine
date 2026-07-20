@@ -35,6 +35,7 @@ int main(void) {
         .hostname_capacity = sizeof(hostname),
         .memory_limit = 1024,
         .memory_used = 256,
+        .process_count = 64,
         .machine = "aarch64",
         .mapped = mapped,
         .random = random_bytes,
@@ -94,7 +95,9 @@ int main(void) {
         HL_CHECK(info[81] == 64 && info[105] == 1);
         context.memory_used = 2048;
         HL_CHECK(hl_linux_misc_dispatch(&context, 179, arguments, &result) == 1 && result == 0);
-        HL_CHECK(load_u64(info + 41) == 256);
+        // Usage above the cgroup limit reports freeram == 0 (a cap cannot show
+        // negative/quarter-of-total free memory), matching /proc/meminfo MemFree.
+        HL_CHECK(load_u64(info + 41) == 0);
     }
 
     {
