@@ -1829,6 +1829,8 @@ static hl_host_result hl_macos_stream_move(void *context, hl_host_handle source,
             result = hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
             goto done;
         }
+        input = descriptors[0];
+        output = descriptors[1];
     }
     if (input < 0 || output < 0 || (locked < 2 && locks[locked] != NULL)) {
         result = hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -3109,6 +3111,9 @@ static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_co
             pthread_mutex_unlock(&host->lock);
             return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
         }
+        object->readable = descriptors[0];
+        object->signal = descriptors[1];
+        object->backing = descriptors[2];
         registered = 1;
     }
     for (index = 0; index < host->counter_capacity; ++index) {
@@ -3454,6 +3459,10 @@ static hl_host_result hl_macos_counter_subscribe(void *context, hl_host_handle c
             pthread_mutex_unlock(&host->lock);
             return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
         }
+        subscription->descriptor = descriptors[0];
+        subscription->wake[0] = descriptors[1];
+        subscription->wake[1] = descriptors[2];
+        descriptor = descriptors[0];
     }
     if (pthread_create(&subscription->thread, NULL, hl_macos_counter_subscription_main, subscription) != 0) {
         hl_host_process_fd_private_remove(subscription->descriptor);
