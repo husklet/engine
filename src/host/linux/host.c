@@ -1312,7 +1312,20 @@ static hl_host_result hl_linux_file_readlink(void *context, hl_host_handle file,
     do
         count = readlinkat(descriptor, "", output.data, output.size);
     while (count < 0 && errno == EINTR);
-    return count < 0 ? hl_linux_errno_result() : hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0);
+    if (count < 0) {
+        /* An empty-path readlinkat only names the link node when the fd is an O_PATH|O_NOFOLLOW handle on a
+           SYMLINK; on a regular file / directory the kernel returns ENOENT for the empty path, but Linux's
+           readlink(2) contract is EINVAL ("not a symbolic link"). Distinguish the two so a readlinkat on a
+           non-symlink reports EINVAL, matching native. */
+        int saved = errno;
+        struct stat metadata;
+        if ((saved == ENOENT || saved == EINVAL) && fstatat(descriptor, "", &metadata, AT_EMPTY_PATH) == 0 &&
+            !S_ISLNK(metadata.st_mode))
+            return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+        errno = saved;
+        return hl_linux_errno_result();
+    }
+    return hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0);
 }
 
 static hl_host_result hl_linux_file_set_owner(void *context, hl_host_handle file, uint32_t uid, uint32_t gid) {
