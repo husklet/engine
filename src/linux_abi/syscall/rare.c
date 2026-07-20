@@ -1150,6 +1150,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (a1) {
             size_t sz = (size_t)a2;
             if (sz == 0 || sz > 48) sz = 48; // kernel struct sched_attr is 48+ bytes; cap to a sane size
+            // The struct is written straight into the guest buffer below; a bad/unmapped attr pointer must
+            // EFAULT like the kernel's copy_to_user, not fault the engine on the memset/field stores.
+            if (guest_bad_ptr((uintptr_t)a1, sz)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
             memset((void *)a1, 0, sz);
             if (sz >= 4) *(uint32_t *)(a1 + 0) = (uint32_t)sz;                  // sched_attr.size
             if (sz >= 8) *(uint32_t *)(a1 + 4) = (uint32_t)g_sched_policy;      // sched_policy (live)

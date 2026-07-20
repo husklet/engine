@@ -1134,13 +1134,27 @@ static void emit_fast_syscall(uint64_t next) {
         e_ldr(19, 28, OFF_SM); // x19 = c->sigmask (old)
         e_subi_s(20, 2, 0, 1); // rdx == 0 ?  (no oldset)
         uint32_t *no_old = (uint32_t *)g_cp;
-        e_bcond(0, 0);   // b.eq -> skip oldset store
-        e_str(19, 2, 0); // *(uint64_t*)oldset = old mask
+        e_bcond(0, 0); // b.eq -> skip oldset store
+        // The oldset store writes straight into the guest buffer (rdx). A bad/unmapped rdx must EFAULT like
+        // the kernel's copy_to_user, not fault the engine: arm the fastclk fault window (fastclk_fault_fixup,
+        // sigframe.c, run first by jit86_lazyguard) so a faulting store sets rax=-EFAULT and resumes at
+        // L_efault, exactly like the guarded fast-clock stores above.
+        e_str(2, 28, OFF_FCPTR); // cpu->fastclk_ptr = oldset (rdx)
+        e_adr(20, L_efault);
+        e_str(20, 28, OFF_FCRES); // cpu->fastclk_resume = &L_efault  (window armed)
+        e_str(19, 2, 0);          // *(uint64_t*)oldset = old mask   [guarded]
+        e_str(31, 28, OFF_FCRES); // cpu->fastclk_resume = 0  (window disarmed; xzr)
         *no_old = (*no_old & 0xFF00001Fu) | ((uint32_t)(((uint32_t *)g_cp - no_old) & 0x7FFFF) << 5);
         e_subi_s(20, 6, 0, 1); // rsi == 0 ?  (no new set -> mask unchanged)
         uint32_t *no_set = (uint32_t *)g_cp;
-        e_bcond(0, 0);         // b.eq -> store (writes old back: no-op, matches service())
-        e_ldr(22, 6, 0);       // x22 = set = *(uint64_t*)rsi
+        e_bcond(0, 0); // b.eq -> store (writes old back: no-op, matches service())
+        // The set load dereferences the guest buffer (rsi); a bad/unmapped rsi must EFAULT like the kernel's
+        // copy_from_user. Guard it with the same fault window.
+        e_str(6, 28, OFF_FCPTR); // cpu->fastclk_ptr = set (rsi)
+        e_adr(20, L_efault);
+        e_str(20, 28, OFF_FCRES); // window armed
+        e_ldr(22, 6, 0);          // x22 = set = *(uint64_t*)rsi     [guarded]
+        e_str(31, 28, OFF_FCRES); // window disarmed
         e_subi_s(20, 7, 0, 1); // how == 0 (SIG_BLOCK) ?
         uint32_t *not_block = (uint32_t *)g_cp;
         e_bcond(1, 0);                  // b.ne -> check unblock

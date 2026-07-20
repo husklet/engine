@@ -668,6 +668,18 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        // The kernel copy_from_user()s `set` and copy_to_user()s `old`, so a bad/unmapped `set` or `old`
+        // pointer is -EFAULT (like rt_sigpending case 136), not an engine fault writing/reading the mask.
+        // guest_bad_ptr (not host_range_mapped) so a PROT_NONE guard page is caught too. Validate both
+        // before mutating the mask so no partial state is left behind.
+        if (a1 && guest_bad_ptr((uintptr_t)a1, 8)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        if (a2 && guest_bad_ptr((uintptr_t)a2, 8)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (a2) *(uint64_t *)a2 = c->sigmask;
         if (a1) {
             uint64_t set = *(uint64_t *)a1;
