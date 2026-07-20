@@ -111,7 +111,11 @@ void hl_gmap_add_physical(uint64_t address, uint64_t length, uint64_t physical_a
 }
 
 void hl_gmap_set_guest_length(uint64_t address, uint64_t guest_length) {
-    for (size_t index = 0; index < g_gmap.mapping_count; index++)
+    // Callers set the guest length immediately after hl_gmap_add appends the mapping, so the target is
+    // the most recently added entry. Scan from the tail: O(1) for that append pattern, avoiding an O(n)
+    // front-to-back scan on every mmap (which made an N-mapping guest O(n^2)). Behavior is identical --
+    // a live mapping's start address is unique, so tail-first finds the same entry a front scan would.
+    for (size_t index = g_gmap.mapping_count; index-- > 0;)
         if (g_gmap.mappings[index].address == address) {
             g_gmap.mappings[index].guest_length = guest_length;
             return;

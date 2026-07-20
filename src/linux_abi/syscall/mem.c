@@ -853,8 +853,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // overlapped subrange in place -- appending alone leaves the stale PROT_NONE record
                 // shadowing it, and a later MADV_DONTNEED re-establishes the live heap as an
                 // inaccessible reservation (the Go memclr SIGSEGV class). Mirrors the mprotect-commit
-                // path above (mozjs/V8 GC chunks).
-                anon_update_prot((uint64_t)r, (uint64_t)a1 + guard, prot);
+                // path above (mozjs/V8 GC chunks). Only a MAP_FIXED map can land inside an EXISTING
+                // reservation and therefore need the in-place rewrite: a non-fixed map returns a
+                // kernel-placed address that never overlaps a live (hence tracked) mapping, so its
+                // update_prot is a pure no-op scan -- skip it. Gating on MAP_FIXED (0x10) keeps the
+                // documented Go/V8 re-commit behavior byte-identical while removing the O(n) scan that
+                // ran on every anon mmap and made an N-mapping guest O(n^2).
+                if (a3 & 0x10) anon_update_prot((uint64_t)r, (uint64_t)a1 + guard, prot);
                 anon_track((uint64_t)r, (uint64_t)a1 + guard, prot);
             } else
                 anon_untrack((uint64_t)r, (uint64_t)a1 + guard);
