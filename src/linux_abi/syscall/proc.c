@@ -742,6 +742,20 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // set) so a later getaffinity reflects the pin; -EINVAL if it selects no online CPU, as on Linux.
     case 122: {
         size_t n = (size_t)a1;
+        // Linux get_user_cpu_mask() copy_from_user()s min(len, cpumask_size) bytes FIRST -> a bad mask pointer
+        // (with len>0) is -EFAULT before anything else. The old handler read the guest mask straight through in
+        // hl_linux_affinity_set(), so an unmapped pointer SEGV'd the engine instead of returning EFAULT. len==0
+        // copies nothing (no fault) and falls through to the empty-mask -EINVAL below.
+        if (n && !host_range_mapped((uintptr_t)a2, n < 128 ? n : 128)) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        // Then, like sched_getaffinity, the target task must exist: find_task_by_vpid() -> -ESRCH for a pid that
+        // names no live task. The old handler skipped this and "succeeded" (returned 0) for any pid.
+        if (sched_pid_live((int)(int32_t)a0) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
+            break;
+        }
         if (!hl_linux_affinity_set(&g_affinity, (const uint8_t *)a2, n, linux_online_cpus())) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;

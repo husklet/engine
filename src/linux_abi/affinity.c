@@ -19,20 +19,20 @@ const uint8_t *hl_linux_affinity_get(struct hl_linux_affinity *affinity, int onl
 
 int hl_linux_affinity_set(struct hl_linux_affinity *affinity, const uint8_t *mask, size_t size, int online_cpus) {
     if (size > sizeof affinity->mask) size = sizeof affinity->mask;
-    if (mask && size) {
-        uint8_t online[HL_LINUX_AFFINITY_BYTES];
-        uint8_t wanted[HL_LINUX_AFFINITY_BYTES];
-        int any = 0;
-        hl_linux_affinity_online(online, sizeof online, online_cpus);
-        for (size_t i = 0; i < size; i++) {
-            wanted[i] = mask[i] & online[i];
-            if (wanted[i]) any = 1;
-        }
-        if (!any) return 0;
-        memset(affinity->mask, 0, sizeof affinity->mask);
-        memcpy(affinity->mask, wanted, size);
-        affinity->set = 1;
+    // Linux clears the mask then intersects it with cpu_active_mask; a request that selects no online CPU --
+    // including a zero-length mask, which clears to empty -- is rejected with -EINVAL. Return 0 in that case.
+    uint8_t online[HL_LINUX_AFFINITY_BYTES];
+    uint8_t wanted[HL_LINUX_AFFINITY_BYTES];
+    int any = 0;
+    hl_linux_affinity_online(online, sizeof online, online_cpus);
+    for (size_t i = 0; i < size; i++) {
+        wanted[i] = (mask ? mask[i] : 0u) & online[i];
+        if (wanted[i]) any = 1;
     }
+    if (!any) return 0;
+    memset(affinity->mask, 0, sizeof affinity->mask);
+    memcpy(affinity->mask, wanted, size);
+    affinity->set = 1;
     return 1;
 }
 
