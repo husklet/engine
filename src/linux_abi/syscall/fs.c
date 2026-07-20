@@ -3336,6 +3336,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
+        // The link target is written straight into the guest buffer by the branches below (memcpy / host
+        // readlink), so a bad/unmapped destination must EFAULT like Linux, not fault the engine. A symlink
+        // is at most PATH_MAX bytes, so validating the first min(bufsiz, PATH_MAX) bytes bounds every write.
+        {
+            size_t chk = bs > 4096 ? 4096 : bs;
+            if (buf && !host_range_mapped((uintptr_t)buf, chk)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
         // AT_EMPTY_PATH form: readlinkat(dirfd, "", buf, sz) with an EMPTY pathname operates on the file the
         // DIRFD itself names -- an O_PATH|O_NOFOLLOW fd opened directly on a symlink. macOS has no
         // AT_EMPTY_PATH (and passing "" to host readlinkat yields ENOTDIR/ENOENT), so recover the fd's own

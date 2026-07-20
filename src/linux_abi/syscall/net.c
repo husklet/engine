@@ -360,6 +360,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (f0 >= 0) fcntl(sv[0], F_SETFL, f0 | O_NONBLOCK);
                 if (f1 >= 0) fcntl(sv[1], F_SETFL, f1 | O_NONBLOCK);
             }
+            // The fd pair is written straight into the guest array; a bad/unmapped destination must EFAULT
+            // (and leak no fds) like Linux, not fault the engine writing the pair.
+            if (!host_range_mapped((uintptr_t)a3, 2 * sizeof(int))) {
+                close(sv[0]);
+                close(sv[1]);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
             ((int *)a3)[0] = sv[0];
             ((int *)a3)[1] = sv[1];
             if ((int)a0 == AF_UNIX) {
@@ -1030,6 +1038,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 204: {
         // getsockname
         int fd = (int)a0;
+        // The addrlen pointer (a2) is dereferenced and the sockaddr buffer (a1) written directly by every
+        // branch below; a bad/unmapped pointer must EFAULT like Linux, not fault the engine. Validate the
+        // addrlen cell first, then the declared (clamped) sockaddr capacity.
+        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        if (a1) {
+            size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
+            if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
+            if (alc && !host_range_mapped((uintptr_t)a1, alc)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
         // Abstract-namespace local name: echo the guest name, not the engine's HL_NETNS-keyed backing fs path.
         if (fd >= 0 && fd < HL_NFD && g_unix_bind[fd][0] == '@' && a1) {
             socklen_t gl = 0;
