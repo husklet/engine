@@ -1,6 +1,8 @@
 // syscall-compat regression: scatter/gather I/O boundary errnos. writev with iovcnt > IOV_MAX(1024) ->
-// EINVAL; writev with a negative iovcnt -> EINVAL; readv on a bad fd -> EBADF; preadv with a negative
-// offset on a seekable file -> EINVAL; a normal writev/readv round-trips the bytes. Arch-neutral.
+// EINVAL; writev with a negative iovcnt -> EINVAL; writev with an unmapped iov_base -> EFAULT; readv on a
+// bad fd -> EBADF; preadv with a negative offset on a seekable file -> EINVAL; a normal writev/readv
+// round-trips the bytes. Arch-neutral. Note: /tmp is RAM(memf)-backed in the engine, so these exercise the
+// scatter/gather validation on the RAM-backed-file path (iovcnt bound + per-segment EFAULT), not just host.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +28,9 @@ int main(void) {
     printf("writev_toobig_errno=%d\n", writev(fd, iov, 2000) == -1 ? errno : 0);
     // negative iovcnt -> EINVAL.
     printf("writev_neg_errno=%d\n", writev(fd, iov, -1) == -1 ? errno : 0);
+    // an unmapped iov_base -> EFAULT (the vector count is valid, so the kernel faults on the buffer).
+    struct iovec badbase = {(void *)0x1, 8};
+    printf("writev_badbase_errno=%d\n", writev(fd, &badbase, 1) == -1 ? errno : 0);
     // readv on a bad fd -> EBADF.
     printf("readv_badfd_errno=%d\n", readv(4096, iov, 2) == -1 ? errno : 0);
     // preadv with a negative offset -> EINVAL.
