@@ -17,6 +17,7 @@ struct gtimer {
     int clockid;                // guest clockid (only used to read "now" for a TIMER_ABSTIME arm)
     int notify;                 // sigev_notify: SIGEV_SIGNAL(0)/SIGEV_NONE(1)/SIGEV_THREAD(2)/SIGEV_THREAD_ID(4)
     int signo;                  // Linux signal number to raise on expiry (SIGEV_SIGNAL/_THREAD_ID)
+    int target_tid;             // SIGEV_THREAD_ID(4): the thread the expiry signal is directed at (0 otherwise)
     uint64_t sigval;            // sigev_value (carried into the delivered siginfo si_value)
     uint64_t interval_ns;       // it_interval (0 => one-shot)
     uint64_t next_ns;           // absolute CLOCK_MONOTONIC ns of the next expiry (0 => disarmed)
@@ -212,6 +213,7 @@ static void *gtimer_loop(void *arg) {
         }
         int signo = t->signo;
         int notify = t->notify;
+        int target_tid = t->target_tid;
         uint64_t sv = t->sigval;
         pthread_mutex_unlock(&g_gtimer_lk);
         // SIGEV_NONE: pollable only (timer_gettime/_getoverrun) -- the bookkeeping above is enough.
@@ -220,6 +222,15 @@ static void *gtimer_loop(void *arg) {
             // carry SI_TIMER + sigev_value into the handler's siginfo (consumed on delivery)
             g_sigcode[signo] = HL_SI_TIMER;
             g_sigval[signo] = sv;
+            // SIGEV_THREAD_ID(4): deliver to EXACTLY the addressed thread (Linux delivers a THREAD-directed
+            // timer signal only to that thread). glibc's SIGEV_THREAD helper blocks the timer signal and
+            // reaps it with sigwaitinfo; the signal has no guest handler and is UNBLOCKED in the main thread,
+            // so a process-directed g_pending raise races the main thread's dispatcher, which discards the
+            // handler-less pending signal before the helper's rt_sigtimedwait poll claims it -- dropping a
+            // one-shot expiry (flaky timerthread oneshot=0 on x86_64). thread_target_signal sets the target
+            // thread's tpending (which rt_sigtimedwait also scans) and wakes it. Fall back to the
+            // process-directed path if the tid is unknown/dead so no expiry is silently lost.
+            if (notify == 4 && target_tid > 0 && thread_target_signal(target_tid, signo)) continue;
             __atomic_or_fetch(&g_pending, 1ull << signo, __ATOMIC_SEQ_CST);
             sfd_deliver(signo); // wake signalfd/epoll (per-OFD mask)
         }
@@ -665,6 +676,14 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             t->sigval = sigval;
             t->signo = signo;
             t->notify = notify;
+            // SIGEV_THREAD_ID(4) directs the expiry signal at ONE specific thread (sigev_notify_thread_id,
+            // the union _tid at struct-sigevent offset 16). glibc's SIGEV_THREAD lowers to exactly this,
+            // targeting its internal timer-helper thread which consumes the signal via sigwaitinfo. Record
+            // the tid so gtimer_loop can deliver thread-directed (see below); a process-directed g_pending
+            // raise would let the main thread's dispatcher discard the (handler-less, unblocked-there)
+            // signal before the helper's rt_sigtimedwait poll claims it -- losing a one-shot expiry.
+            if (notify == 4 && !guest_bad_ptr((uintptr_t)(a1 + 16), 4))
+                memcpy(&t->target_tid, (void *)(a1 + 16), 4);
         } else {
             // POSIX default: SIGEV_SIGNAL, SIGALRM(14), si_value = timer id
             t->notify = 0;
