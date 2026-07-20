@@ -2719,13 +2719,22 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 68:
         if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
             result = -EFAULT;
-        else {
+        else if (source.status_flags & HL_LINUX_O_APPEND) {
+            // Linux quirk: pwrite() on an O_APPEND fd IGNORES the supplied offset and appends at EOF (the
+            // append is atomic, driven by the file's O_APPEND status flag, not the position argument). The
+            // typed path honored a3 and overwrote, so route an O_APPEND pwrite through the appending write.
+            int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2);
+            result = allowed < 0
+                         ? allowed
+                         : hl_linux_write(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed);
+            if (result > 0) bound_mapping_file_written(&source, source.offset, (uint64_t)result);
+        } else {
             int64_t allowed = bound_fsize_gate(c, &source, a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
             result = allowed < 0
                          ? allowed
                          : hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed, a3);
+            if (result > 0) bound_mapping_file_written(&source, a3, (uint64_t)result);
         }
-        if (result > 0) bound_mapping_file_written(&source, a3, (uint64_t)result);
         break;
     case 65:
     case 66:
