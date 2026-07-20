@@ -39,5 +39,19 @@ int main(void) {
     // pointer straight to its path resolver faults the engine and kills the guest with sig=11 instead.
     int ino = syscall(SYS_inotify_init1, 0);
     printf("inotify_add_watch=%d\n", probe(SYS_inotify_add_watch, ino, BAD, 2 /*IN_MODIFY*/, 0, 0));
+    // xattr family: the path (arg0) and the attribute name (arg1) are C strings the handler resolves/copies
+    // before any host syscall. A wild pointer to either must surface the kernel's EFAULT, not fault the
+    // engine's own path walker / name snprintf (which killed the guest with sig=11 before the guard). A real
+    // backing file makes the name-pointer probe reach the copy step. The value buffer (arg2) is checked by
+    // the host set/get, so its bad-pointer case is already EFAULT and is covered by setxattr_badval.
+    int xf = open("/tmp/.efault_xattr_probe", O_CREAT | O_RDWR, 0644);
+    (void)xf;
+    printf("setxattr_badpath=%d\n", probe(SYS_setxattr, BAD, (long)"user.x", (long)"v", 1, 0));
+    printf("setxattr_badname=%d\n", probe(SYS_setxattr, (long)"/tmp/.efault_xattr_probe", BAD, (long)"v", 1, 0));
+    printf("setxattr_badval=%d\n",
+           probe(SYS_setxattr, (long)"/tmp/.efault_xattr_probe", (long)"user.x", BAD, 4, 0));
+    printf("getxattr_badname=%d\n",
+           probe(SYS_getxattr, (long)"/tmp/.efault_xattr_probe", BAD, (long)"v", 4, 0));
+    printf("removexattr_badname=%d\n", probe(SYS_removexattr, (long)"/tmp/.efault_xattr_probe", BAD, 0, 0, 0));
     return 0;
 }
