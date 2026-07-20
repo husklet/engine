@@ -41,18 +41,26 @@
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             enableParallelBuilding = true;
 
-            # The macOS host file-service unit tests (tests/unit/macos.c) open the
-            # filesystem root ("/") as a PATH_ONLY directory handle. Opening a
-            # directory only requires `file-read-metadata`, and the Nix darwin
-            # build sandbox grants no rule for the root vnode, so `(deny default)`
-            # rejects the open (EPERM) and the test sees root.status != HL_STATUS_OK.
-            # This only bites when the daemon builds with `sandbox = true` (e.g. the
-            # macos-26 CI runner); it is invisible on hosts with sandboxing off.
-            # No open flag (O_EVTONLY included) can bypass a metadata denial, so the
-            # fix belongs in the sandbox profile: grant read on the root vnode only
-            # (the `(literal "/")` matches just "/", not its children).
+            # The macOS host file-service unit tests (tests/unit/macos.c) touch two
+            # filesystem locations the Nix darwin build sandbox does not grant under
+            # its `(deny default)` policy, so each open fails with EPERM and the test
+            # sees status != HL_STATUS_OK. This only bites when the daemon builds with
+            # `sandbox = true` (e.g. the macos-26 CI runner); it is invisible on hosts
+            # with sandboxing off.
+            #   1. It opens the filesystem root ("/") as a PATH_ONLY directory handle
+            #      (line 166). Opening a directory needs only `file-read-metadata`,
+            #      which no open flag (O_EVTONLY included) can bypass, so the grant
+            #      must live here. `(literal "/")` matches just "/", not its children.
+            #   2. It creates/reads/renames/symlinks scratch files under /tmp
+            #      (canonicalising to /private/tmp), starting at line 185. The build's
+            #      own TMPDIR is allowed, but these tests use a fixed /tmp path that
+            #      the sandbox rejects unless /private/tmp is granted.
+            # Grants are minimal: read on the root vnode, and file access confined to
+            # the temp directory the tests write into.
             sandboxProfile = pkgs.lib.optionalString (system == "aarch64-darwin") ''
               (allow file-read* (literal "/"))
+              (allow file* (subpath "/private/tmp"))
+              (allow file* (subpath "/tmp"))
             '';
 
             buildPhase = ''
