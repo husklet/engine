@@ -2310,7 +2310,14 @@ perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 
 MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
 	run-unit-pipe_linux run-unit-private run-unit-process run-unit-range run-unit-resolve_services run-unit-system
 ifeq ($(HOST),macos)
-unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS)) test-macos
+# test-macos (host-service integration tests: they open "/", "/tmp", and resolve
+# localhost DNS) is intentionally NOT part of `unit` here: `unit` runs inside the
+# sandboxed `nix build .#checks` derivation, whose darwin build sandbox denies
+# those host resources. Those tests run unsandboxed as a dedicated mac.yml step
+# (`make test-macos`), mirroring how Linux runs its compat suite outside the
+# build sandbox. Keeping them here would fail the package check on a sandboxed
+# runner for reasons unrelated to the code under test.
+unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS))
 else
 unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity
 endif

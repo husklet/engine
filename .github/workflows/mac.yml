@@ -33,6 +33,11 @@ jobs:
       - name: Test Rust package
         run: nix build --print-build-logs .#checks.aarch64-darwin.rust
 
+      - name: Test macOS host services
+        # Runs unsandboxed (unlike the `nix build` package check) so the host-service
+        # integration tests can open "/", "/tmp", and resolve localhost DNS.
+        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-macos'
+
       - name: Test macOS compatibility
         shell: bash
         run: |
