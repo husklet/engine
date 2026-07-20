@@ -41,6 +41,20 @@
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             enableParallelBuilding = true;
 
+            # The macOS host file-service unit tests (tests/unit/macos.c) open the
+            # filesystem root ("/") as a PATH_ONLY directory handle. Opening a
+            # directory only requires `file-read-metadata`, and the Nix darwin
+            # build sandbox grants no rule for the root vnode, so `(deny default)`
+            # rejects the open (EPERM) and the test sees root.status != HL_STATUS_OK.
+            # This only bites when the daemon builds with `sandbox = true` (e.g. the
+            # macos-26 CI runner); it is invisible on hosts with sandboxing off.
+            # No open flag (O_EVTONLY included) can bypass a metadata denial, so the
+            # fix belongs in the sandbox profile: grant read on the root vnode only
+            # (the `(literal "/")` matches just "/", not its children).
+            sandboxProfile = pkgs.lib.optionalString (system == "aarch64-darwin") ''
+              (allow file-read* (literal "/"))
+            '';
+
             buildPhase = ''
               runHook preBuild
               make all
