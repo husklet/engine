@@ -891,7 +891,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // eventfd write: ADD to the counter (not a raw pipe write); regenerate the readable edge.
         if (wfd >= 0 && wfd < HL_NFD && g_eventfd_peer[wfd]) {
             int eslot = eventfd_counter_slot(wfd);
-            if (a2 < 8) {
+            // eventfd_write rejects any size other than exactly 8 (fs/eventfd.c uses count != sizeof).
+            // This is asymmetric with the read path, which accepts count >= 8, so a 9- or 16-byte write
+            // must NOT be admitted (and must not add to the counter) the way a 9/16-byte read is served.
+            if (a2 != 8) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
