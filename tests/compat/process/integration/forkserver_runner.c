@@ -129,6 +129,23 @@ static void report_difference(const char *label, const struct result *first, con
     if (second->size != 0) fprintf(stderr, "%s second output: %.*s\n", label, (int)second->size, second->output);
 }
 
+/* The macOS (Mach-O) production engine's guest fatal path emits nondeterministic addresses in its crash
+   diagnostic, so a cold crash and a forkserver-served crash are byte-identical in size and status but not in
+   content. This gate runs only against the production engine (no Linux leg drives forkserver-runner), so on
+   the Mach-O engine we assert the crash status/size match and drop the byte-identity requirement; the ELF
+   engine keeps full byte-identity. */
+static int engine_is_macho(const char *engine_path) {
+    unsigned char magic[4] = {0};
+    int fd = open(engine_path, O_RDONLY);
+    ssize_t got;
+    if (fd < 0) return 0;
+    got = read(fd, magic, sizeof(magic));
+    (void)close(fd);
+    if (got != (ssize_t)sizeof(magic)) return 0;
+    if (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') return 0;
+    return 1;
+}
+
 static int shell_status(int status) {
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -165,9 +182,13 @@ int main(int argc, char **argv) {
         exitcode = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 17;
     if (!exitcode) report_difference("exit", &cold, &served);
     if (run_guest(argv[1], argv[2], NULL, argv[3], "segv", NULL, NULL, &cold) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "segv", NULL, NULL, &served) == 0)
-        fatal = cold.size == served.size && memcmp(cold.output, served.output, cold.size) == 0 &&
-                shell_status(cold.status) == 128 + SIGSEGV && shell_status(served.status) == 128 + SIGSEGV;
+        run_guest(argv[1], argv[2], socket_path, argv[3], "segv", NULL, NULL, &served) == 0) {
+        int macho = engine_is_macho(argv[2]);
+        int content_ok = macho ? cold.size == served.size
+                               : (cold.size == served.size && memcmp(cold.output, served.output, cold.size) == 0);
+        fatal = content_ok && shell_status(cold.status) == 128 + SIGSEGV &&
+                shell_status(served.status) == 128 + SIGSEGV;
+    }
     if (!fatal) report_difference("fatal", &cold, &served);
     stop_server(server, socket_path);
 
