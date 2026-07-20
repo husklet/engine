@@ -940,11 +940,25 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
 #if defined(__linux__)
         ssize_t r = pwritev2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
 #else
-        if (a5) {
+        // macOS lacks pwritev2. RWF_APPEND (0x10) is a semantic requirement: ignore the supplied offset
+        // and land the write at end-of-file. Emulate it via fstat + pwritev at st_size; reject any other
+        // RWF_* flag we cannot honor. (Linux keeps the native pwritev2 path above.)
+        off_t hl_off = (off_t)a3;
+        unsigned hl_rwf = (unsigned)a5;
+        if (hl_rwf & 0x10u) { // RWF_APPEND
+            struct stat hl_st;
+            if (fstat((int)a0, &hl_st) < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            hl_off = hl_st.st_size;
+            hl_rwf &= ~0x10u;
+        }
+        if (hl_rwf) {
             G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
             break;
         }
-        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, hl_off);
 #endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
