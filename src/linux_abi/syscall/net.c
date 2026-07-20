@@ -720,6 +720,23 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } while (r < 0 && SVC_EINTR_RESTART(c));
         r = nofile_gate(r); // accepted fd past the guest's soft RLIMIT_NOFILE -> EMFILE (host table is larger)
         if (r >= 0) {
+            // The peer sockaddr (a1) + addrlen (a2) are written straight into the guest buffer by the
+            // writeback below; a bad/unmapped destination must EFAULT like Linux -- consuming the accepted
+            // connection but not leaking its fd -- not fault the engine. Validate the addrlen cell then the
+            // declared (clamped) sockaddr capacity before any writeback; close the accepted fd on failure.
+            if (a1) {
+                int bad = (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t)));
+                if (!bad) {
+                    size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
+                    if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
+                    if (alc && !host_range_mapped((uintptr_t)a1, alc)) bad = 1;
+                }
+                if (bad) {
+                    close(r);
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    break;
+                }
+            }
             // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
             (void)hl_native_set_no_sigpipe(r);
@@ -1123,6 +1140,21 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
+        // The addrlen pointer (a2) is dereferenced and the sockaddr buffer (a1) written directly by every
+        // branch below; a bad/unmapped pointer must EFAULT like Linux, not fault the engine. Validate the
+        // addrlen cell first, then the declared (clamped) sockaddr capacity.
+        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        if (a1) {
+            size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
+            if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
+            if (alc && !host_range_mapped((uintptr_t)a1, alc)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
         // Abstract-namespace peer name: echo the guest name recorded on connect, not the backing fs path.
         if (fd >= 0 && fd < HL_NFD && g_unix_peer[fd][0] == '@' && a1) {
             socklen_t gl = 0;
