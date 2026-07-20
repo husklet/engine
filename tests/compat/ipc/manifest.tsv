@@ -3,6 +3,7 @@ mq-lifecycle	ipc	ipc_mq_lifecycle.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pth
 pipe	pipe	ipc_pipe.c	ext_ipc/ipc_pipe.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe.out	linux-libc,threads,ipc	active	byte-preserving transfer
 pipe-poll	pipe	ipc_pipe_poll.c	ext_ipc/ipc_pipe_poll.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe_poll.out	linux-libc,threads,ipc	active	byte-preserving transfer
 pipe-eof	pipe	ipc_pipe_eof.c	ext_ipc/ipc_pipe_eof.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_pipe_eof.out	linux-libc,threads,ipc	active	byte-preserving transfer
+splice-tee	pipe	ipc_splice_tee.c	-	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_splice_tee.out	linux-libc,ipc	active	tee non-consuming duplicate, tee EOF returns 0, splice consumes source
 fifo-nonblock	fifo	ipc_fifo_nonblock.c	ext_ipc/ipc_fifo_nonblock.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_fifo_nonblock.out	linux-libc,threads,ipc	active	byte-preserving transfer
 fifo-multi-writer	fifo	ipc_fifo_multi_writer.c	ext_ipc/ipc_fifo_multi_writer.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_fifo_multi_writer.out	linux-libc,threads,ipc	active	byte-preserving transfer
 fifo-twoway	fifo	ipc_fifo_twoway.c	ext_ipc/ipc_fifo_twoway.c	aarch64,x86_64	-static -O2 -std=gnu11 -pthread -lrt	-	-	0	expected/shared/ipc_fifo_twoway.out	linux-libc,threads,ipc	active	byte-preserving transfer
