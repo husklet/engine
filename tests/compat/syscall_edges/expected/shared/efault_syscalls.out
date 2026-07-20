@@ -4,3 +4,4 @@ gettimeofday=14
 times=14
 read=14
 pipe2=14
+inotify_add_watch=14

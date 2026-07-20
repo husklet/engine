@@ -35,5 +35,9 @@ int main(void) {
     printf("times=%d\n", probe(SYS_times, BAD, 0, 0, 0, 0));
     printf("read=%d\n", probe(SYS_read, fd, BAD, 16, 0, 0));
     printf("pipe2=%d\n", probe(SYS_pipe2, BAD, 0, 0, 0, 0));
+    // inotify_add_watch with a wild path pointer: the kernel returns EFAULT; a handler that hands the
+    // pointer straight to its path resolver faults the engine and kills the guest with sig=11 instead.
+    int ino = syscall(SYS_inotify_init1, 0);
+    printf("inotify_add_watch=%d\n", probe(SYS_inotify_add_watch, ino, BAD, 2 /*IN_MODIFY*/, 0, 0));
     return 0;
 }
