@@ -420,7 +420,15 @@ static _Noreturn void guest_group_fatal(struct cpu *c, int sig) {
 static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
     (void)uc;
     int ls = sig_m2l(sig);
-    if (si && si->si_pid > 0) {
+    // Linux coalesces a standard (non-realtime) signal that is ALREADY pending: the first siginfo is
+    // retained and any later instance is dropped (kernel legacy_queue()). SIGCHLD depends on this -- a child
+    // that is continued (CLD_CONTINUED, from SIGCONT) and then exits (CLD_EXITED) in quick succession must
+    // deliver the FIRST (continued) siginfo to the parent, not have it overwritten by the exit. Our
+    // single-slot g_sig* store would otherwise clobber the still-pending continued notification with the
+    // exit on a fast host (deterministically flaky on native aarch64), so keep the first while the pending
+    // bit is set. (A realtime signal keeps every instance via sigq_push and is unaffected.)
+    int chld_keep_first = (ls == 17) && ((__atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) >> 17) & 1);
+    if (si && si->si_pid > 0 && !chld_keep_first) {
         g_sigpid[ls] = (int)si->si_pid;
         g_siguid[ls] = (int)si->si_uid;
     }
@@ -443,7 +451,7 @@ static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
     // (exit code or terminating signal). On a Linux host the host siginfo already carries the Linux CLD_*
     // code and status, so forward them into the single-slot siginfo the frame builder reads (si_status
     // aliases si_value at offset 24). Leaving these zero made a guest handler see code==0/status==0.
-    if (ls == 17 && si) {
+    if (ls == 17 && si && !chld_keep_first) {
         g_sigcode[17] = si->si_code;
         g_sigval[17] = (uint64_t)(uint32_t)si->si_status;
     }
