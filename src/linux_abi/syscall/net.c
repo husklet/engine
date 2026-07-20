@@ -273,8 +273,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        int virtual_icmp = (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP &&
-                           (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)) && br_on();
+        int icmp_ty = ty & 0xf;
+        int is_icmp = (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP &&
+                      ((icmp_ty == SOCK_DGRAM) || (icmp_ty == SOCK_RAW));
+        // The unprivileged ICMP *datagram* ping socket (`ping localhost` healthcheck) is synthesized from an
+        // AF_UNIX socket and its loopback (127/8) echo reflected locally (see icmp_try_send). Gating only on
+        // br_on() left the no-bridge / loopback-only case falling through to a real host
+        // socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP), which needs net.ipv4.ping_group_range / CAP_NET_RAW and
+        // EACCES's on a locked-down host (e.g. the CI runner's default empty ping_group_range). lo_on() is
+        // true whenever the private loopback namespace is active, so synthesize the datagram ping there too.
+        // SOCK_RAW ICMP stays gated on br_on() only: a raw socket is privileged, and under loopback-only
+        // isolation the host must still enforce EPERM (see the socket-matrix raw_icmp=EPERM oracle).
+        int virtual_icmp = is_icmp && (br_on() || (icmp_ty == SOCK_DGRAM && lo_on()));
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged). Gate the new fd
         // against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the host table is far larger).
         // Bridge ICMP is synthesized below and must not depend on the host's privileged ping-socket policy.
