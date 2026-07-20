@@ -869,7 +869,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
-    size_t count, excluded, index, selected = 0;
+    size_t count, excluded, index, selected = 0, failures = 0;
     const char *only = NULL;
     unsigned long repetitions = 1;
     unsigned long repetition;
@@ -901,32 +901,38 @@ usage:
         for (repetition = 0; repetition < repetitions; ++repetition) {
             if (interrupted_signal != 0) return 128 + interrupted_signal;
             capture a = {0}, x = {0};
+            // Keep-going: a failing case emits its own ::error diagnostic (above, in run_one) but does not
+            // abort the run -- record it and move to the next case so ONE run reports every failure, not just
+            // the first. The run still exits non-zero when any case failed (checked after the loop).
+            int case_failed = 0;
             if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
-                run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0) {
-                capture_free(&a);
-                return 1;
-            }
-            if ((cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
-                run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0) {
-                capture_free(&a);
-                capture_free(&x);
-                return 1;
-            }
-            if (cases[index].isa == ISA_BOTH &&
+                run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0)
+                case_failed = 1;
+            if (!case_failed && (cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
+                run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0)
+                case_failed = 1;
+            if (!case_failed && cases[index].isa == ISA_BOTH &&
                 (a.output_size != x.output_size || memcmp(a.output, x.output, a.output_size) != 0)) {
                 diagnostic(&cases[index], "cross-ISA", "stdout mismatch", &x);
-                capture_free(&a);
-                capture_free(&x);
-                return 1;
+                case_failed = 1;
             }
             capture_free(&a);
             capture_free(&x);
-            if (!resources_restored(baseline, &cases[index])) return 1;
+            if (!case_failed && !resources_restored(baseline, &cases[index])) case_failed = 1;
+            if (case_failed) {
+                failures++;
+                break; // stop repeating this case; continue with the rest of the suite
+            }
         }
     }
     if (only != NULL && selected == 0) {
         fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
         return 2;
+    }
+    if (failures != 0) {
+        fprintf(stderr, "matrix-runner: %zu of %zu selected case(s) FAILED; %zu excluded\n", failures, selected,
+                excluded);
+        return 1;
     }
     printf("matrix-runner: %zu active cases passed with %lu repetition(s); %zu manifest cases excluded\n", selected,
            repetitions, excluded);
