@@ -18,71 +18,11 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-26, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: DeterminateSystems/nix-installer-action@v20
-
-      - uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Test engine
-        run: nix flake check --print-build-logs
-
-      - name: Test Linux compatibility
-        if: runner.os == 'Linux'
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-linux-production-typed'
-
-      - name: Test macOS compatibility
-        if: runner.os == 'macOS'
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-compat'
-
-      - name: Package Rust crate
-        run: nix develop --command cargo package --manifest-path pkgs/rust/Cargo.toml --locked --no-verify
-
-  mac-gates:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - build: e2e-mac-build-signal
-            test: e2e-lifecycle-signal
-          - build: e2e-mac-build-control
-            test: e2e-lifecycle-control
-          - build: e2e-mac-build-hygiene
-            test: e2e-lifecycle-hygiene
-          - build: e2e-mac-build-fd
-            test: e2e-embedding-fd
-          - build: e2e-mac-build-stdio
-            test: e2e-embedding-stdio
-          - build: e2e-mac-build-dir
-            test: e2e-embedding-dir
-    name: macOS ${{ matrix.test }}
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
-      - uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-      - name: Build and sign artifacts
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" ${{ matrix.build }}'
-      - name: Run isolated firewall gate
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" ${{ matrix.test }}'
+  tests:
+    uses: ./.github/workflows/_engine-tests.yml
 
   publish:
-    needs: [test, mac-gates]
+    needs: [tests]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
