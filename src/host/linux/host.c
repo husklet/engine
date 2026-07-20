@@ -1800,6 +1800,21 @@ static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle f
     output->modified_ns = (uint64_t)status.st_mtim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_mtim.tv_nsec;
     output->accessed_ns = (uint64_t)status.st_atim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_atim.tv_nsec;
     output->changed_ns = (uint64_t)status.st_ctim.tv_sec * UINT64_C(1000000000) + (uint64_t)status.st_ctim.tv_nsec;
+    /* A plain fstat() carries no birth time, so consult statx() for it: a filesystem that tracks
+       creation time (tmpfs/ext4) reports STATX_BTIME, and leaving created_ns non-zero here lets an
+       AT_EMPTY_PATH statx advertise the mask bit honestly -- byte-identical to native and to the
+       path-based statx (fs.c hl_statx_host_btime). Filesystems that do not track it (procfs) leave
+       the bit clear, so created_ns stays 0. Only statx consumes created_ns; plain stat ignores it. */
+#if defined(SYS_statx) && defined(STATX_BTIME)
+    {
+        struct statx birth;
+        memset(&birth, 0, sizeof birth);
+        if (syscall(SYS_statx, descriptor, "", AT_EMPTY_PATH, STATX_BTIME, &birth) == 0 &&
+            (birth.stx_mask & STATX_BTIME) != 0)
+            output->created_ns =
+                (uint64_t)birth.stx_btime.tv_sec * UINT64_C(1000000000) + (uint64_t)birth.stx_btime.tv_nsec;
+    }
+#endif
     output->device = (uint64_t)status.st_rdev;
     output->link_count = (uint64_t)status.st_nlink;
     output->user = (uint32_t)status.st_uid;
