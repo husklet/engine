@@ -703,6 +703,7 @@ static size_t proc_fdvis_list(int pid, struct fdvis_view *views, size_t capacity
 
 static int proc_fdvis_fork_prepare(struct fdvis_fork_plan *plan) {
     size_t count = 0;
+    size_t capacity = 0;
     size_t reserved = 0;
     struct fdvis_fork_entry *entries = NULL;
     g_fdvis_fork_parent = (int)getpid();
@@ -711,15 +712,36 @@ static int proc_fdvis_fork_prepare(struct fdvis_fork_plan *plan) {
     if (!g_fdvis || !g_fdvis_control) return -ENOSPC;
 
     fdvis_lock();
-    fdvis_sweep_stale_locked();
-    for (unsigned index = 0; index < FDVIS_N; ++index)
-        if ((int)(uint32_t)(g_fdvis[index].key >> 32) == g_fdvis_fork_parent &&
-            g_fdvis[index].owner_start_ns == g_fdvis_fork_parent_start)
+    /* One pass fuses the stale sweep with the parent-descriptor collect. A parent-owned live slot is
+     * never stale (its owner is us and owner_start_ns matches), so the "collect" and "sweep" categories
+     * are disjoint: the result is byte-identical to sweeping the whole table first and then counting +
+     * copying the parent's slots. Collecting the fd identity here also folds the old separate fill pass
+     * away, since the reserve pass below never touches occupied parent slots. */
+    for (unsigned index = 0; index < FDVIS_N; ++index) {
+        struct fdvis_slot *slot = &g_fdvis[index];
+        int owner = (int)(uint32_t)(slot->key >> 32);
+        if (owner <= 0) continue;
+        if (owner == g_fdvis_fork_parent && slot->owner_start_ns == g_fdvis_fork_parent_start) {
+            if (count == capacity) {
+                size_t next = capacity ? capacity * 2 : 16;
+                struct fdvis_fork_entry *grown = realloc(entries, next * sizeof *grown);
+                if (grown == NULL) {
+                    fdvis_unlock();
+                    free(entries);
+                    return -ENOMEM;
+                }
+                entries = grown;
+                capacity = next;
+            }
+            entries[count].guest_fd = (int)(uint32_t)slot->key - 1;
+            entries[count].kind = slot->kind;
+            entries[count].device = slot->device;
+            entries[count].object = slot->object;
             ++count;
-    if (count != 0) entries = calloc(count, sizeof *entries);
-    if (count != 0 && entries == NULL) {
-        fdvis_unlock();
-        return -ENOMEM;
+            continue;
+        }
+        uint64_t live_start = fdvis_process_token(owner);
+        if (live_start == 0 || live_start != slot->owner_start_ns) memset(slot, 0, sizeof *slot);
     }
     for (unsigned index = 0; index < FDVIS_N && reserved < count; ++index) {
         if (g_fdvis[index].key != 0) continue;
@@ -731,18 +753,6 @@ static int proc_fdvis_fork_prepare(struct fdvis_fork_plan *plan) {
         fdvis_unlock();
         free(entries);
         return -ENOSPC;
-    }
-    reserved = 0;
-    for (unsigned index = 0; index < FDVIS_N; ++index) {
-        struct fdvis_slot *slot = &g_fdvis[index];
-        if ((int)(uint32_t)(slot->key >> 32) != g_fdvis_fork_parent ||
-            slot->owner_start_ns != g_fdvis_fork_parent_start)
-            continue;
-        entries[reserved].guest_fd = (int)(uint32_t)slot->key - 1;
-        entries[reserved].kind = slot->kind;
-        entries[reserved].device = slot->device;
-        entries[reserved].object = slot->object;
-        ++reserved;
     }
     fdvis_unlock();
     plan->entries = entries;
