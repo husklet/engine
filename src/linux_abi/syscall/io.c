@@ -347,6 +347,18 @@ static int64_t memf_fsize_gate(struct cpu *c, off_t pos, uint64_t count) {
 
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
+    // Scatter/gather iovcnt bound (readv/writev/preadv/pwritev). Linux (fs/read_write.c) rejects nr_segs
+    // above UIO_MAXIOV(1024) with -EINVAL before touching the iovec array. The plain host path delegates
+    // this check to the kernel, but the engine's RAM-backed-file (memf) and emulated-socket paths read the
+    // iovec array directly and would otherwise walk past its end -- a >IOV_MAX or negative iovcnt (which
+    // arrives as a huge unsigned value) then sums wild lengths and mis-reports EFBIG/0 instead of EINVAL.
+    // nr_segs is an unsigned long in the kernel, so the unsigned `a2 > 1024` test also captures negatives.
+    // The kernel looks up the fd first, so a bad fd must still win with EBADF: gate on the fd being open.
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 1024 &&
+        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
+        G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+        return svc_done(c);
+    }
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
     // with EBADF (fs/read_write.c). It stays valid as a dirfd for *at() and for fstat/fchdir (served by
     // svc_fs), so only the I/O syscalls are gated here.
@@ -1038,6 +1050,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             const struct iovec *iv = (const struct iovec *)a1;
+            // memf_pwritev dereferences each iov_base directly (the host writev would fault -EFAULT on a bad
+            // buffer). Validate every segment up front so an unmapped iov_base yields -EFAULT like Linux
+            // rather than crashing the engine or copying garbage into the file.
+            for (int i = 0; i < (int)a2; i++)
+                if (iv[i].iov_len && !host_range_mapped((uintptr_t)iv[i].iov_base, iv[i].iov_len)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    return svc_done(c);
+                }
             off_t start = g_memf[(int)a0]->pos;
             off_t end = start;
             for (int i = 0; i < (int)a2; i++)
