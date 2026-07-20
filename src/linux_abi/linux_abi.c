@@ -1906,8 +1906,12 @@ int64_t hl_linux_fcntl(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t command,
     case HL_LINUX_F_GETFL: argument = ofd_entry->status_flags; break;
     case HL_LINUX_F_SETFL: {
         hl_linux_ofd_entry *ofd = &linux_abi->ofds[fd_entry->ofd];
+        // F_SETFL settable status flags: Linux lets a caller toggle O_APPEND, O_NONBLOCK and O_DIRECT (and
+        // O_ASYNC/O_NOATIME) on an open description; accmode + creation flags are fixed. O_DIRECT was
+        // previously dropped from the mask, so a F_SETFL(O_DIRECT) reported success yet F_GETFL never showed
+        // it -- an inconsistent round-trip. Keep it so the get reflects the set (fcntl-cmds direct.consistent).
         uint32_t flags = (ofd_entry->status_flags & HL_LINUX_O_ACCMODE) |
-                         ((uint32_t)argument & (HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK));
+                         ((uint32_t)argument & (HL_LINUX_O_APPEND | HL_LINUX_O_NONBLOCK | HL_LINUX_O_DIRECT));
         if (ofd->object_ops != NULL && ofd->object_ops->set_status_flags != NULL) {
             int64_t result;
             ofd->active_operations++;

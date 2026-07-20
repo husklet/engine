@@ -3389,8 +3389,37 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             /* poslk_apply is shared with the legacy Darwin syscall path and therefore reports native
              * errno numbers. This typed route bypasses svc_done(), so translate at this boundary. */
             result = lock_result < 0 ? -hl_linux_errno_from_macos(-lock_result) : lock_result;
-        } else {
+        } else if ((int32_t)a1 == HL_LINUX_F_SETFL) {
+            // O_DIRECT is a settable status flag whose bit is arch-specific (G_O_DIRECT: aarch64 0x10000 --
+            // which aliases HL_LINUX_O_DIRECTORY -- vs x86-64 0x4000). Normalize the guest's arch bit to the
+            // canonical arch-neutral HL_LINUX_O_DIRECT before the arch-neutral core stores it, so F_GETFL
+            // reflects it (fcntl-cmds direct.consistent) instead of it being silently dropped.
+            uint64_t normalized = a2 & ~(uint64_t)G_O_DIRECT;
+            if (a2 & G_O_DIRECT) normalized |= HL_LINUX_O_DIRECT;
+            result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, normalized);
+        } else if ((int32_t)a1 == HL_LINUX_F_GETFL) {
             result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
+            if (result >= 0 && (result & HL_LINUX_O_DIRECT)) // map the canonical bit back to the guest arch bit
+                result = (result & ~(int64_t)HL_LINUX_O_DIRECT) | (int64_t)(uint64_t)G_O_DIRECT;
+        } else if ((int32_t)a1 == HL_LINUX_F_GETFD || (int32_t)a1 == HL_LINUX_F_SETFD) {
+            // Descriptor flags (FD_CLOEXEC) live in the virtual descriptor table, not the backing host fd.
+            result = hl_linux_fcntl(g_linux_box, source.fd, (int32_t)a1, a2);
+        } else {
+            // Every remaining fcntl command -- F_SETOWN/F_GETOWN, F_SETSIG/F_GETSIG, the F_OFD_* open-file
+            // description locks, F_SETLEASE/F_GETLEASE, F_NOTIFY, F_SET/GETPIPE_SZ, F_ADD/GET_SEALS, the
+            // RW_HINT family -- operates on the real open file description, not the virtual fd table (which
+            // only knows FD/FL/DUPFD/POSIX-lock). The arch-neutral core answered EINVAL for all of them, so
+            // a bound (typed) descriptor lost OFD locks, memfd seals, owner/signal ownership, etc. The host
+            // is Linux and the bound descriptor has a same-number native shadow, so forward the command
+            // verbatim to that real host fd; pointer args (OFD flock, rw_hint u64) are already host-mapped.
+            int native_fd = -1;
+            int borrowed = bound_attachment_borrow((int)source.fd, &native_fd);
+            if (borrowed < 0) {
+                result = borrowed;
+                break;
+            }
+            long r = fcntl(native_fd, (int)a1, (unsigned long)a2);
+            result = r < 0 ? -(int64_t)errno : (int64_t)r;
         }
         break;
     case 285: {
