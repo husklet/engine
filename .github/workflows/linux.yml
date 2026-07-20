@@ -1,0 +1,54 @@
+name: Linux
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v20
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Test C package
+        run: nix build --print-build-logs .#checks.aarch64-linux.package
+
+      - name: Test Rust package
+        run: nix build --print-build-logs .#checks.aarch64-linux.rust
+
+      - name: Test Linux compatibility
+        shell: bash
+        run: |
+          set -o pipefail
+          # The typed compat scratch is mapped as the guest's /tmp; on this ext4
+          # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
+          sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
+          export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
+          if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-linux-production-typed' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+            message=$(tail -c 1500 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=Linux runtime compatibility failed::$message"
+            exit 1
+          fi
+
+      - name: Package Rust crate
+        run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
