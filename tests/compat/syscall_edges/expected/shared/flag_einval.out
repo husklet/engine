@@ -5,3 +5,5 @@ setns_badfd_errno=9
 inotify_init1_badflag_errno=22
 epoll_pwait_zero_errno=22 neg_errno=22
 signalfd4_badsize_errno=22
+accept4_badflag_errno=22
+accept4_goodflag_errno=11

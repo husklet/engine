@@ -1,9 +1,12 @@
 // syscall-compat regression: bad-flag / bad-fd arg validation must return the Linux errno, not a
 // blanket success. Each line prints the raw errno so the native oracle self-defines the expectation.
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #ifndef __NR_close_range
@@ -46,5 +49,18 @@ int main(void) {
     // signalfd4: sizemask must equal sizeof(sigset_t)=8; sizemask 0 -> EINVAL.
     unsigned long mask = 0;
     printf("signalfd4_badsize_errno=%d\n", ec(SYS_signalfd4, -1, (long)&mask, 0, 0, 0));
+
+    // accept4: only SOCK_CLOEXEC(0x80000)/SOCK_NONBLOCK(0x800) are valid flags. A junk bit (0x1) -> EINVAL,
+    // and Linux checks it BEFORE consulting the listen fd -- so it wins even on a nonblocking listener whose
+    // accept would otherwise EAGAIN. A valid flag on that same nonblocking listener yields EAGAIN.
+    int ls = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in sa;
+    __builtin_memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)bind(ls, (struct sockaddr *)&sa, sizeof sa);
+    (void)listen(ls, 1);
+    printf("accept4_badflag_errno=%d\n", ec(SYS_accept4, ls, 0, 0, 0x1, 0));
+    printf("accept4_goodflag_errno=%d\n", ec(SYS_accept4, ls, 0, 0, 0x800, 0));
     return 0;
 }
