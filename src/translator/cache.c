@@ -175,6 +175,13 @@ static int g_threaded;
 
 typedef struct {
     uint64_t gpc;
+    // Liveness generation folded INTO the entry (was a parallel g_map_generation[] array). map_idx/map_body
+    // and map_put previously touched TWO large sparse arrays per probe -- the 20MB entry table AND a
+    // separate 2MB generation array -- costing two independent cache misses per lookup step. gpc and
+    // generation now share the entry's first 16 bytes (one cache line), halving the per-probe miss count on
+    // the hot lookup (map_body runs inside the decode loop's stitch checks) and on map_put. Semantics are
+    // unchanged: an entry is live iff generation == g_map_epoch.
+    uint32_t generation;
     uint64_t guest_start;
     uint64_t guest_end;
     void *host;
@@ -187,7 +194,6 @@ typedef struct {
 // unchanged while reset sites can treat this as one coherent translation index.
 typedef struct {
     hl_translation_map_entry map[JIT_MAP_N];
-    uint32_t map_generation[JIT_MAP_N];
     uint64_t pages[TXPG_N];
     uint64_t lines[TXLN_N];
     uint64_t hashes[TXLN_N];
@@ -195,7 +201,6 @@ typedef struct {
 
 static hl_translation_index g_translation_index;
 #define g_map g_translation_index.map
-#define g_map_generation g_translation_index.map_generation
 #define g_txpg g_translation_index.pages
 #define g_txln g_translation_index.lines
 #define g_txlh g_translation_index.hashes
@@ -246,13 +251,15 @@ static int jit_instruction_guest_pc(uint64_t host_pc, uint64_t *guest_pc) {
     return jit_instruction_map_lookup(rwpc, guest_pc);
 }
 
-static int map_live(uint32_t index) { return g_map_generation[index] == g_map_epoch; }
+static int map_live(uint32_t index) { return g_map[index].generation == g_map_epoch; }
 
 static void map_clear(void) {
     g_live_map_count = 0;
     g_map_epoch++;
     if (g_map_epoch == 0) {
-        memset(g_map_generation, 0, sizeof g_map_generation);
+        // Epoch wrapped (2^32 flushes -- effectively never): no valid entry may carry generation 0, so
+        // clear every entry's generation before restarting at 1. Cold path; correctness over speed.
+        for (uint32_t i = 0; i < JIT_MAP_N; i++) g_map[i].generation = 0;
         g_map_epoch = 1;
     }
 }
@@ -466,7 +473,7 @@ static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void
             g_map[j].guest_end = guest_end;
             g_map[j].host = host;
             g_map[j].body = body;
-            g_map_generation[j] = g_map_epoch;
+            g_map[j].generation = g_map_epoch;
             g_live_map_indices[g_live_map_count++] = j;
             return;
         }
