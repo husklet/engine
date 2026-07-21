@@ -78,8 +78,16 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             if (bycl) {
                 e_rot_flags_cl(16, k, width);
             } else {
-                int ce = ((((by1 ? 1 : (int)I->imm) % width) + width) % width);
-                if (ce) e_rot_flags_const(16, k, width, ce);
+                int rc = by1 ? 1 : (int)I->imm;
+                int ce = (((rc % width) + width) % width);
+                // x86 masks the rotate count to 5 bits for byte/word; CF is set whenever that masked
+                // count (mc) is nonzero, EVEN when the rotate amount (ce = mc MOD width) is 0. E.g.
+                // `rolb $8` rotates by 8%8==0 (value unchanged) but still sets CF=LSB(result). Gating on
+                // ce alone left CF stale for immediate multiples of the width (the CL path already fixes
+                // this via the true cmask in e_rot_flags_cl). Pass width (>1) as the count when ce==0 so
+                // OF stays untouched (undefined for a multi-bit rotate; it can never be a 1-bit rotate).
+                int mc = rc & 0x1f;
+                if (mc) e_rot_flags_const(16, k, width, ce ? ce : width);
             }
             rm_store(I, w, 16); // stores low w bytes
             return TX_NEXT;
