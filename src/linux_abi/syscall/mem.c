@@ -1269,6 +1269,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // host address space, so a direct memcpy would read OUR own COW copy). ptrace_pvm returns >=0 bytes /
     // -errno when it owns the call, or INT_MIN to say "not a traced remote -> use the same-space memcpy".
     case 270: {
+        // flags (a5) must be 0 -- no process_vm_readv flags are defined, and the kernel rejects any non-zero
+        // value with EINVAL BEFORE it touches the iovecs (mm/process_vm_access.c). A silent accept here let a
+        // probe with a junk flag read as supported.
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            break;
+        }
         // The iovec arrays themselves are guest buffers the kernel reads via copy_from_user: cap the count at
         // UIO_MAXIOV (EINVAL) and reject an unmapped array (EFAULT) so a bad pointer never faults the engine.
         if ((unsigned long)a2 > 1024 || (unsigned long)a4 > 1024) {
@@ -1292,6 +1299,11 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // process_vm_writev: the mirror -- copy FROM the local iovecs (a1/a2) INTO the remote iovecs (a3/a4).
     case 271: {
+        // flags (a5) must be 0, rejected with EINVAL before the iovecs are read (mirrors process_vm_readv).
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            break;
+        }
         if ((unsigned long)a2 > 1024 || (unsigned long)a4 > 1024) {
             G_RET(c) = (uint64_t)(int64_t)-EINVAL;
             break;
