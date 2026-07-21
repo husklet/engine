@@ -1184,10 +1184,15 @@ static hl_host_result hl_macos_file_open(void *context, hl_host_handle directory
         if (directory_fd < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     if ((access & HL_HOST_FILE_PATH_ONLY) != 0)
+        // PATH_ONLY models Linux O_PATH: a path/metadata handle that must NOT require read permission on the
+        // target (Linux O_PATH opens "/" for a process with no read access). O_RDONLY needed read access,
+        // which a hardened macos-26 runner denies for some paths (e.g. "/"), failing open_relative there
+        // while a SIP-off dev host allowed it. O_EVTONLY is macOS's metadata-only handle (the O_PATH analogue):
+        // fstat / F_GETPATH / FD_CLOEXEC / dup all work on it, matching what PATH_ONLY consumers need.
 #ifdef O_SYMLINK
-        flags = (access & HL_HOST_FILE_NOFOLLOW) != 0 ? O_SYMLINK : O_RDONLY | O_NONBLOCK;
+        flags = (access & HL_HOST_FILE_NOFOLLOW) != 0 ? O_SYMLINK : O_EVTONLY;
 #else
-        flags = O_RDONLY | O_NONBLOCK;
+        flags = O_EVTONLY;
 #endif
     else if ((access & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)) == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE))
         flags = O_RDWR;

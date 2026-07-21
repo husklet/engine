@@ -163,6 +163,9 @@ int main(void) {
                                                             HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
         struct stat status;
         hl_host_result borrowed;
+        if (root.status != HL_STATUS_OK)
+            fprintf(stderr, "macos.c:166 open_relative(\"/\") PATH_ONLY status=%d errno=%d\n", (int)root.status,
+                    errno);
         HL_CHECK(root.status == HL_STATUS_OK);
         borrowed = services.posix_attachment->borrow_file_at_least(services.context, root.value, 64);
         HL_CHECK(borrowed.status == HL_STATUS_OK && borrowed.value >= 64 && borrowed.value <= INT_MAX);
