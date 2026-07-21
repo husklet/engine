@@ -1827,6 +1827,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             rebased_iov[i] = guest_iov[i];
             rebased_iov[i].iov_base = (void *)net_nonpie_p((uint64_t)(uintptr_t)guest_iov[i].iov_base);
         }
+        // msg_name is a guest pointer INSIDE the (already-validated) msghdr; the DNS/icmp classifiers and the
+        // sockaddr translator below all deref it directly. A wild pointer (e.g. (void*)-1) must yield EFAULT,
+        // not fault the engine -- validate it once here, before any of those derefs (dns_dest_is reads 8 B).
+        {
+            uint8_t *mn = (uint8_t *)net_nonpie_p(*(uint64_t *)(g + 0));
+            socklen_t mnl = *(uint32_t *)(g + 8);
+            if (mn && mnl && guest_bad_ptr((uintptr_t)mn, mnl)) {
+                G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+                break;
+            }
+        }
         // Oversized UDP datagram -> EMSGSIZE, before routing (see udp_dgram_maxlen).
         if (nr == 211) {
             size_t udp_cap = udp_dgram_maxlen((int)a0);
@@ -2083,6 +2094,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint8_t *nm0 = (uint8_t *)net_nonpie_p(*(uint64_t *)(g0 + 0));
             socklen_t nml0 = *(uint32_t *)(g0 + 8);
             int is_dns = (dfd >= 0 && dfd < HL_NFD && g_dns_sock[dfd]);
+            // nm0 is submessage 0's guest msg_name; dns_dest_is derefs it (8 B). A wild pointer must not fault
+            // the engine here -- if unreadable, skip DNS classification and let the main loop below return
+            // EFAULT for this submessage (its per-iter msg_name guard). See the sendmsg guard above.
+            if (nm0 && nml0 && guest_bad_ptr((uintptr_t)nm0, nml0)) { nm0 = NULL; nml0 = 0; }
             if (!is_dns && dns_dest_is(nm0, nml0) &&
                 dns_swap(dfd, (dfd >= 0 && dfd < HL_NFD) ? g_sock_stream[dfd] : 0) == 0)
                 is_dns = 1;
@@ -2153,6 +2168,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             struct sockaddr_storage nss;
             uint8_t *gname = (uint8_t *)mh.msg_name;
             socklen_t gnamelen = mh.msg_namelen;
+            // Wild per-submessage msg_name must yield EFAULT for this submessage, not fault the engine (the
+            // family probe / udp_switch_destination / sa_l2m below all deref gname). Mirrors the iov guard.
+            if (gname && gnamelen && guest_bad_ptr((uintptr_t)gname, gnamelen)) {
+                err = EFAULT;
+                break;
+            }
             char ud_host[1200];
             int ud_route = 0; // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
             if (nr == 269 && gname && gnamelen) { // sendmmsg: guest -> host

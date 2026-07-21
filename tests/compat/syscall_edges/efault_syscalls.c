@@ -9,8 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,6 +104,24 @@ int main(void) {
     printf("sendmsg_badhdr=%d\n", probe(SYS_sendmsg, sk, BAD, 0, 0, 0));
     printf("recvmsg_nullhdr=%d\n", probe(SYS_recvmsg, sk, 0, 0, 0, 0));
     printf("recvmsg_badhdr=%d\n", probe(SYS_recvmsg, sk, BAD, 0, 0, 0));
+    // sendmsg/sendmmsg with a VALID msghdr but a WILD msg_name pointer. The msghdr struct itself is readable,
+    // so the engine passes its up-front msghdr guard and reaches the DNS/icmp destination classifiers and the
+    // sockaddr Linux<->host translator -- all of which deref msg_name directly. A wild msg_name must surface
+    // EFAULT for the (sub)message, not fault the engine (sig=11). A valid 1-byte iov keeps the fault on the
+    // name, not the payload. (Regression: sendmmsg's DNS pre-scan derefed submessage-0 msg_name unguarded.)
+    char payload = 'x';
+    struct iovec iov = {.iov_base = &payload, .iov_len = 1};
+    struct msghdr smsg;
+    memset(&smsg, 0, sizeof smsg);
+    smsg.msg_name = (void *)BAD;
+    smsg.msg_namelen = 16;
+    smsg.msg_iov = &iov;
+    smsg.msg_iovlen = 1;
+    printf("sendmsg_badname=%d\n", probe(SYS_sendmsg, sk, (long)&smsg, 0, 0, 0));
+    struct mmsghdr mmsg;
+    memset(&mmsg, 0, sizeof mmsg);
+    mmsg.msg_hdr = smsg;
+    printf("sendmmsg_badname=%d\n", probe(SYS_sendmmsg, sk, (long)&mmsg, 1, 0, 0));
     // rt-signal family with a wild siginfo/sigset/timeout pointer: these handlers are serviced IN the engine
     // (they read the sigset/siginfo/timeout struct through the guest pointer directly), so a wild pointer
     // must surface the kernel's copy_{from,to}_user EFAULT rather than faulting the engine (sig=11). The
