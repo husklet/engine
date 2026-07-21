@@ -654,13 +654,51 @@ static struct {
 
 static int g_npend;
 
+// Index the pending back-patch links by target guest-PC. patch_links_to() used to linear-scan the ENTIRE
+// g_pend array for every newly-translated block: with thousands of never-resolved links accumulating
+// (indirect/data targets that are never reached), that is O(blocks * npend) -- the dominant cold-translation
+// cost on branchy workloads (sqlite: ~11M compares, ~1us/block). A per-target bucket chain over the SAME
+// compact g_pend array (swap-remove preserved, so pcache serialization and the array layout are unchanged)
+// turns each patch into a walk of just the colliding entries. Buckets are epoch-tagged so a wholesale cache
+// flush (pend_reset -> g_npend=0) invalidates every stale head in O(1) instead of memset-ing the table.
+#define PEND_CAP (1 << 16)
+#define PBUCKET_N (1 << 16)
+static int32_t g_pnext[PEND_CAP];  // intrusive doubly-linked bucket chain over g_pend indices
+static int32_t g_pprev[PEND_CAP];
+static int32_t g_pbhead[PBUCKET_N];   // bucket head index (valid only when g_pbepoch == g_pend_epoch)
+static uint32_t g_pbepoch[PBUCKET_N]; // zero-init: reads as "empty" against g_pend_epoch (starts at 1)
+static uint32_t g_pend_epoch = 1;     // never 0 in use, so zero-init buckets always read empty
+static inline uint32_t pbucket_of(uint64_t target) { return (uint32_t)((target >> 2) & (PBUCKET_N - 1)); }
+static inline int32_t pbucket_head(uint32_t h) { return g_pbepoch[h] == g_pend_epoch ? g_pbhead[h] : -1; }
+static inline void pbucket_link(int32_t i, uint64_t target) {
+    uint32_t h = pbucket_of(target);
+    int32_t head = pbucket_head(h);
+    g_pbepoch[h] = g_pend_epoch;
+    g_pprev[i] = -1;
+    g_pnext[i] = head;
+    if (head != -1) g_pprev[head] = i;
+    g_pbhead[h] = i;
+}
+static inline void pbucket_unlink(int32_t i, uint64_t target) {
+    if (g_pprev[i] != -1)
+        g_pnext[g_pprev[i]] = g_pnext[i];
+    else
+        g_pbhead[pbucket_of(target)] = g_pnext[i];
+    if (g_pnext[i] != -1) g_pprev[g_pnext[i]] = g_pprev[i];
+}
+static void pend_reset(void) {
+    g_npend = 0;
+    if (++g_pend_epoch == 0) g_pend_epoch = 1; // skip 0 so zero-init buckets never alias a live epoch
+}
+
 static void add_pend3(uint32_t *slot, uint64_t target, int is_bl, int fwd) {
-    if (g_npend < (1 << 16)) {
-        g_pend[g_npend].slot = slot;
-        g_pend[g_npend].target = target;
-        g_pend[g_npend].is_bl = is_bl;
-        g_pend[g_npend].fwd = fwd;
-        g_npend++;
+    if (g_npend < PEND_CAP) {
+        int32_t i = g_npend++;
+        g_pend[i].slot = slot;
+        g_pend[i].target = target;
+        g_pend[i].is_bl = is_bl;
+        g_pend[i].fwd = fwd;
+        pbucket_link(i, target);
     }
 }
 
@@ -673,7 +711,11 @@ static void patch_links_to(uint64_t gpc, void *body) {
     // Patching `b (body - slot)` would then bake a wild branch; leave the pends unresolved so they keep
     // taking the safe dispatcher round-trip until gpc is (re)registered with a real body.
     if (!body) return;
-    for (int i = 0; i < g_npend;) {
+    uint32_t h = pbucket_of(gpc);
+    if (g_pbepoch[h] != g_pend_epoch) return; // no pends hash to this target
+    int32_t i = g_pbhead[h];
+    while (i != -1) {
+        int32_t next = g_pnext[i];
         if (g_pend[i].target == gpc) {
             uint8_t *entry = (uint8_t *)body + (g_pend[i].fwd ? g_fwdskip : 0);
             int64_t d = (entry - (uint8_t *)g_pend[i].slot) / 4;
@@ -681,10 +723,23 @@ static void patch_links_to(uint64_t gpc, void *body) {
                 // bl / b target.body (+8: forward edge skips the entry poll under IRQSLIM)
                 (g_pend[i].is_bl ? 0x94000000u : 0x14000000u) | ((uint32_t)d & 0x3FFFFFFu);
             if (!jit_publish_code(g_pend[i].slot, 4)) return;
-            // swap-remove
-            g_pend[i] = g_pend[--g_npend];
-        } else
-            i++;
+            // swap-remove keeps g_pend compact (pcache/layout unchanged); fix up the bucket chains.
+            pbucket_unlink(i, gpc);
+            int32_t last = --g_npend;
+            if (i != last) {
+                g_pend[i] = g_pend[last];
+                int32_t p = g_pprev[last], n = g_pnext[last];
+                g_pprev[i] = p;
+                g_pnext[i] = n;
+                if (p != -1)
+                    g_pnext[p] = i;
+                else
+                    g_pbhead[pbucket_of(g_pend[i].target)] = i;
+                if (n != -1) g_pprev[n] = i;
+                if (next == last) next = i; // the node we were about to visit was relocated into slot i
+            }
+        }
+        i = next;
     }
 }
 
@@ -1096,7 +1151,7 @@ static int jit_flush_to_fresh(void) {
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
-    g_npend = 0;
+    pend_reset();
     return 1;
 }
 
@@ -1151,7 +1206,7 @@ static int stw_flush(void) {
 static void smc_inplace_drop(void) {
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
-    g_npend = 0;
+    pend_reset();
     txpg_clear();
 }
 
@@ -1265,7 +1320,7 @@ static int jit_after_fork(void) {
     if (!preserve) {
         map_clear();
         memset(g_ibtc, 0, sizeof g_ibtc);
-        g_npend = 0;
+        pend_reset();
     }
     HL_LOGF(&g_jit_log, HL_LOG_TAG_PROCESS, "fork cache preserve=%d rw=%p rx=%p", preserve, (void *)g_cache,
             J_RX(g_cache));

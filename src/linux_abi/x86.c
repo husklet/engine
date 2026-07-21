@@ -946,7 +946,7 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
         // still fires -> PyPy re-bridges the same guard -> `assert adr_jump_offset != 0` (assemble_bridge/
         // patch_jump_for_descr) fatals. The wholesale flush drops it via G_SHADOW_CLEAR; mirror that here.
         memset(g_xibtc, 0, sizeof g_xibtc);
-        g_npend = 0;
+        pend_reset();
         return;
     }
     // A genuine guest fault (isolated wild pointer / null deref) with a registered handler is the guest's

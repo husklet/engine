@@ -379,7 +379,7 @@ static int pcache_load(uint64_t entry_jump) {
     for (uint64_t i = 0; i < h.n_mapent; i++)
         map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
                 g_cache + me[i].host_off, g_cache + me[i].body_off);
-    g_npend = 0;
+    pend_reset();
     for (uint64_t i = 0; i < h.n_pend; i++) // fwd restored too: a forward pend must patch to body+8 (IRQSLIM)
         add_pend3((uint32_t *)(g_cache + pe[i].slot_off), pe[i].target, (int)pe[i].is_bl, (int)pe[i].fwd);
     g_t2n = (int)h.n_t2;

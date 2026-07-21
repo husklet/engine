@@ -2055,7 +2055,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
            lets the new exec image observe zero/stale translation records. */
         map_clear();
         // flush old translations
-        g_npend = 0;
+        pend_reset();
         memset(g_ibtc, 0, sizeof g_ibtc);
 #ifdef PCACHE_EXEC_HOOKS
         // the new image is loaded + the arena is flushed -> try to restore its warm translated arena

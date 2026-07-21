@@ -236,7 +236,7 @@ static void run_guest(struct cpu *c) {
                     /* Map visibility is generation-tagged; clearing only the payload leaves
                        old generation slots live and publishes zeroed translation records. */
                     map_clear();
-                    g_npend = 0;
+                    pend_reset();
                     // IBTC bodies point into the cache we just dropped
                     memset(g_ibtc, 0, sizeof g_ibtc);
                     // §B: shadow host_rets point into the dropped cache too -> clear (frontend hook)

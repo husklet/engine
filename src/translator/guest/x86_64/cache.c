@@ -432,7 +432,7 @@ static int pcache_load(uint64_t entry_jump) {
                 if (!pc_gpc_fixed(me[i].gpc) && pc_gpc_in_lib(me[i].gpc)) g_pc_defer[g_pc_ndefer++] = me[i];
         }
     }
-    g_npend = 0;
+    pend_reset();
     for (uint64_t i = 0; i < h.n_pend; i++)
         add_pend2((uint32_t *)(g_cache + pe[i].slot_off), pe[i].target, (int)pe[i].is_bl);
     g_cp = g_cache + h.arena_used;

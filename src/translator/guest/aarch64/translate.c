@@ -1672,7 +1672,7 @@ static int smc_commit(struct cpu *c) {
     stw_mapping_begin();
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
-    g_npend = 0;
+    pend_reset();
     txpg_clear();
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&

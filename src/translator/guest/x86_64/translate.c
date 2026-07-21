@@ -974,7 +974,7 @@ static void jit86_drop_range_translations(uint64_t lo, uint64_t hi) {
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     memset(g_xibtc, 0, sizeof g_xibtc);
-    g_npend = 0;
+    pend_reset();
 }
 
 // Integer DIV/IDIV by zero raises #DE (SIGFPE) on x86, but ARM sdiv/udiv quietly return 0 -- a guest
