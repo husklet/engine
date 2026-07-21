@@ -1124,17 +1124,46 @@ static int memf_room_or_spill(int fd, off_t end) {
 // EXACTLY ONE open fd now holds the last (zero) link to that regular file -- i.e. it is now anonymous and
 // privately owned by this one description. More than one matching fd (a dup) shares an offset we don't
 // model, so we leave those as a plain host file.
+// Defined later in the same unity TU (syscall/binding.c): true when the bound fd source is the raw native
+// host table rather than the typed box, in which case fdvis is not authoritative for open regular files.
+static int bound_source_is_native(void);
+
+// Probe a single candidate fd for the just-unlinked (dev,ino); update *found (>=0), return 1 if a second
+// distinct match was seen (a duped description -> caller must bail without adopting).
+static int memf_adopt_probe(int fd, uint64_t dev, uint64_t ino, int *found) {
+    struct stat s;
+    if (fd < 0 || fd >= HL_NFD || g_memf[fd]) return 0;
+    if (fstat(fd, &s) != 0) return 0;
+    if ((uint64_t)s.st_dev != dev || (uint64_t)s.st_ino != ino) return 0;
+    if (*found >= 0) return 1; // duped: shared description -> don't risk it
+    *found = fd;
+    return 0;
+}
+
 static void memf_try_adopt(uint64_t dev, uint64_t ino) {
     if (memf_disabled() || !ino) return;
     int found = -1;
-    for (int fd = 0; fd < HL_NFD; fd++) {
-        if (g_memf[fd]) continue;
-        struct stat s;
-        if (fstat(fd, &s) != 0) continue;
-        if ((uint64_t)s.st_dev == dev && (uint64_t)s.st_ino == ino) {
-            if (found >= 0) return; // duped: shared description -> don't risk it
-            found = fd;
-        }
+    // The adoptable fd is a still-open regular file the guest just unlinked. Rather than fstat all
+    // HL_NFD (65536) descriptors -- a multi-millisecond storm on a WAL/journal-heavy server that unlinks
+    // open temp files -- probe only the process's PUBLISHED fd set (fdvis). In bound-source mode EVERY guest
+    // open is published to fdvis with its identity, so that set is authoritative for open regular files; use
+    // it to bound the probe. Fall back to the full scan when the published set is unavailable (native source,
+    // fdvis off, or a count that overflows the snapshot) so behavior is otherwise byte-for-byte unchanged.
+    struct fdvis_view *views = NULL;
+    size_t nviews = bound_source_is_native() ? 0 : proc_fdvis_list((int)getpid(), NULL, 0);
+    if (nviews > 0 && (views = malloc(nviews * sizeof *views)) != NULL) {
+        size_t got = proc_fdvis_list((int)getpid(), views, nviews);
+        if (got > nviews) got = nviews;
+        for (size_t i = 0; i < got; i++)
+            if (memf_adopt_probe(views[i].guest_fd, dev, ino, &found)) {
+                free(views);
+                return;
+            }
+        free(views);
+    } else {
+        free(views); // (NULL if the malloc failed; harmless)
+        for (int fd = 0; fd < HL_NFD; fd++)
+            if (memf_adopt_probe(fd, dev, ino, &found)) return;
     }
     if (found < 0) return;
     struct stat s;
