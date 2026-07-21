@@ -29,6 +29,43 @@ static int probe(long nr, long a, long b, long c, long d, long e) {
     return WEXITSTATUS(st);
 }
 
+// PAGE-STRADDLE variant of the bad-pointer probe. The BAD=(void*)-1 probes above catch handlers that skip
+// validation entirely (the pointer is wholly unmapped). They do NOT catch the subtler failure mode where a
+// handler validates a multi-byte output object with a SINGLE-PAGE / first-byte-only check
+// (host_addr_mapped(ptr)) and then reads/writes the whole object: a pointer whose object STRADDLES a page
+// boundary into an inaccessible page passes the first-page check but faults the engine on the copy, where
+// the kernel returns EFAULT. (This is exactly the get_mempolicy case-236 bug: it validated `mode` with a
+// single-page probe, then wrote all 4 bytes.) We reproduce it deterministically with a PROT_NONE guard page:
+// map two pages, mprotect the SECOND PROT_NONE, and place the object `off` bytes before the guard so it
+// straddles into the inaccessible page. hl force-maps guest anon memory host-RW, so PROT_NONE is the one
+// guest access class whose "inaccessible" intent lives only in the engine's own registry (the LTP
+// tst_get_bad_addr idiom) -- a handler that consults it via host_range_mapped(ptr, sizeof obj) EFAULTs; one
+// that uses host_addr_mapped(ptr) writes into the guard page and wrongly succeeds. Each output syscall below
+// copies a fixed-size struct straight into the guest buffer, so the correct answer is uniformly EFAULT(14).
+static long straddle_ptr(size_t off) {
+    long ps = sysconf(_SC_PAGESIZE);
+    char *b = mmap(NULL, (size_t)ps * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (b == MAP_FAILED) _exit(97);
+    if (mprotect(b + ps, (size_t)ps, PROT_NONE) != 0) _exit(96); // second page inaccessible
+    return (long)(b + ps - off);                                 // object of size > off straddles the guard
+}
+
+// Like probe(), but arg index `ai` (0..4) is replaced with a straddling output pointer built in the child so
+// each probe gets a fresh guard mapping. `off` is how many bytes of the object sit in the mapped page.
+static int straddle(long nr, size_t off, int ai, long a, long b, long c, long d, long e) {
+    pid_t p = fork();
+    if (p == 0) {
+        long args[5] = {a, b, c, d, e};
+        args[ai] = straddle_ptr(off);
+        long r = syscall(nr, args[0], args[1], args[2], args[3], args[4]);
+        _exit(r == -1 ? (errno & 0x7f) : 0);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    if (WIFSIGNALED(st)) return -WTERMSIG(st);
+    return WEXITSTATUS(st);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     int fd = open("/dev/zero", O_RDONLY);
@@ -113,5 +150,21 @@ int main(void) {
         waitpid(p, &st, 0);
         printf("get_mempolicy_straddle=%d\n", WIFSIGNALED(st) ? -WTERMSIG(st) : WEXITSTATUS(st));
     }
+    // Page-straddle probes: a fixed-size output object placed a few bytes before a PROT_NONE guard page.
+    // Each must EFAULT(14) -- a single-page-validated handler would instead fault the engine (sig=11) or
+    // silently write into the guard page (=0). getresuid/getresgid write three uid_t; the time/resource
+    // copyout syscalls write a 16..struct-sized object; uname/sysinfo write a large struct. `off` keeps the
+    // start of the object in the mapped page so the check must span the object to see the guard.
+    printf("straddle_getresuid=%d\n", straddle(SYS_getresuid, 2, 0, 0, 0, 0, 0, 0));
+    printf("straddle_getresgid=%d\n", straddle(SYS_getresgid, 2, 0, 0, 0, 0, 0, 0));
+    printf("straddle_gettimeofday=%d\n", straddle(SYS_gettimeofday, 8, 0, 0, 0, 0, 0, 0));
+    printf("straddle_clock_gettime=%d\n", straddle(SYS_clock_gettime, 8, 1, 0, 0, 0, 0, 0));
+    printf("straddle_clock_getres=%d\n", straddle(SYS_clock_getres, 8, 1, 0, 0, 0, 0, 0));
+    printf("straddle_times=%d\n", straddle(SYS_times, 8, 0, 0, 0, 0, 0, 0));
+    printf("straddle_getrusage=%d\n", straddle(SYS_getrusage, 8, 1, 0, 0, 0, 0, 0));
+    printf("straddle_uname=%d\n", straddle(SYS_uname, 8, 0, 0, 0, 0, 0, 0));
+    printf("straddle_sysinfo=%d\n", straddle(SYS_sysinfo, 8, 0, 0, 0, 0, 0, 0));
+    printf("straddle_prlimit64=%d\n", straddle(SYS_prlimit64, 8, 3, 0, 7 /*RLIMIT_NOFILE*/, 0, 0, 0));
+    printf("straddle_rt_sigpending=%d\n", straddle(SYS_rt_sigpending, 4, 0, 0, 8, 0, 0, 0));
     return 0;
 }
