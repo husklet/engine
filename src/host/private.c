@@ -14,6 +14,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 
 #define HL_PRIVATE_PROCESSES 1024u
@@ -217,27 +220,26 @@ int hl_host_process_fd_private_floor(void) {
     struct rlimit limit;
     if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -errno;
 #if defined(__APPLE__)
-    /* macOS defaults RLIMIT_NOFILE's soft limit to 256 -- far below the engine's private-fd reserve, so the
-     * host fd table exhausts and open() fails EMFILE, surfacing as HL_STATUS_RESOURCE_LIMIT (e.g. a fresh
-     * macos runner failed open_relative("/")). An fd-hoisting runtime must raise its own soft limit. macOS
-     * rejects RLIM_INFINITY for NOFILE, so aim at a high finite target and back off until the kernel accepts
-     * it. Idempotent: a later call already sees the raised soft limit and does nothing. Kept macOS-only so
-     * the Linux guest-visible fd limit (derived from this floor) is unchanged. */
-    if (limit.rlim_cur != RLIM_INFINITY) {
-        rlim_t target = (limit.rlim_max == RLIM_INFINITY || limit.rlim_max > (rlim_t)(1u << 18))
-                            ? (rlim_t)(1u << 18)
-                            : limit.rlim_max;
-        while (target > limit.rlim_cur) {
-            struct rlimit raised = limit;
-            raised.rlim_cur = target;
-            if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
-                limit.rlim_cur = target;
-                break;
-            }
-            rlim_t next = target / 2;
-            if (next <= limit.rlim_cur) break;
-            target = next;
+    /* macOS enforces kern.maxfilesperproc (commonly 10240-24576) as the REAL per-process descriptor ceiling,
+     * independent of -- and often far below -- RLIMIT_NOFILE's soft limit (a fresh macos-26 runner reports a
+     * 1048576 soft limit, capped here to HL_LINUX_FD_LIMIT=65536). The private-fd floor would then sit above
+     * that real ceiling; F_DUPFD_CLOEXEC to it fails EINVAL, so hl_host_process_fd_private_adopt failed for
+     * every host descriptor and open_relative("/") returned HL_STATUS_RESOURCE_LIMIT on the runner (a dev
+     * host whose maxfilesperproc >= the floor passed). Anchor the private interval just under the real kernel
+     * ceiling: floor = maxfilesperproc - reserve, keeping `reserve` slots that F_DUPFD will accept. This can
+     * be below the generous HL_HOST_GUEST_DESCRIPTOR_MINIMUM, which is fine -- it is the true ceiling. */
+    {
+        int maxfiles = 0;
+        size_t maxfiles_size = sizeof(maxfiles);
+        if (sysctlbyname("kern.maxfilesperproc", &maxfiles, &maxfiles_size, NULL, 0) == 0 && maxfiles > 0 &&
+            (rlim_t)maxfiles < limit.rlim_cur)
+            limit.rlim_cur = (rlim_t)maxfiles;
+        if (limit.rlim_cur > HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM + 1u) {
+            rlim_t mac_guest = limit.rlim_cur - HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM;
+            if (mac_guest > HL_LINUX_FD_LIMIT) mac_guest = HL_LINUX_FD_LIMIT;
+            return (int)mac_guest;
         }
+        return -EMFILE;
     }
 #endif
     /* Split the native descriptor namespace into a low guest interval and a high private interval.  The

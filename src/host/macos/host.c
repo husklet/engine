@@ -4496,39 +4496,7 @@ static hl_host_result hl_macos_file_validate_private_directory(void *context, hl
                : hl_macos_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
 }
 
-/* macOS defaults RLIMIT_NOFILE's soft limit to 256, below the engine's fd needs, so the host fd table
- * exhausts and open() fails EMFILE. Raise the soft limit toward the hard limit (macOS rejects RLIM_INFINITY
- * for NOFILE, so target a high finite value and back off until accepted). Runs at host creation, before any
- * fd work, so it covers pure host-service paths too. Emits the before/after soft + hard to stderr for CI. */
-static void hl_macos_raise_fd_limit(void) {
-    struct rlimit limit;
-    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
-        fprintf(stderr, "hl_macos_raise_fd_limit: getrlimit failed errno=%d\n", errno);
-        return;
-    }
-    rlim_t before = limit.rlim_cur;
-    if (limit.rlim_cur != RLIM_INFINITY) {
-        rlim_t target = (limit.rlim_max == RLIM_INFINITY || limit.rlim_max > (rlim_t)(1u << 18))
-                            ? (rlim_t)(1u << 18)
-                            : limit.rlim_max;
-        while (target > limit.rlim_cur) {
-            struct rlimit raised = limit;
-            raised.rlim_cur = target;
-            if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
-                limit.rlim_cur = target;
-                break;
-            }
-            rlim_t next = target / 2;
-            if (next <= limit.rlim_cur) break;
-            target = next;
-        }
-    }
-    fprintf(stderr, "hl_macos_raise_fd_limit: NOFILE soft %llu->%llu hard %llu\n", (unsigned long long)before,
-            (unsigned long long)limit.rlim_cur, (unsigned long long)limit.rlim_max);
-}
-
 hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_services) {
-    hl_macos_raise_fd_limit();
     static const hl_host_memory_services memory = {
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
