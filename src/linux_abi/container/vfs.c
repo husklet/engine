@@ -831,14 +831,23 @@ static struct ts_slot *ts_slot_for(int pid, int claim) {
     }
     return NULL; // table full: caller falls back to pbi_status
 }
-// This thread's/process's own slot, cached. getpid() is libc-cached and re-derived after fork(), so a
-// child that inherited the parent's ts_self value transparently re-claims a fresh slot on its first use.
+// This thread's/process's own slot, cached. Once resolved, the cached slot is reused with NO per-call
+// getpid(): current glibc (>=2.25) no longer caches getpid(), so calling it on every syscall issued a
+// real host getpid() -- ~88ns of pure overhead on the gettid-loop fast path. Fork safety instead rides on
+// ts_after_fork(), which drops this cache in the child; every host fork() that goes on to run guest
+// syscalls (guest fork/vfork/clone in proc.c, the fork-server runner, checkpoint restore) is a glibc
+// fork(), so registering ts_after_fork() as a pthread_atfork child handler resets the cache on ALL of
+// them -- the child then re-derives its own pid once, exactly as the old per-call getpid() did lazily.
 static _Thread_local struct ts_slot *ts_self;
 static _Thread_local int ts_self_pid;
+static void ts_after_fork(void); // pthread_atfork child handler: drops the inherited slot cache
+static pthread_once_t ts_atfork_once = PTHREAD_ONCE_INIT;
+static void ts_atfork_install(void) { (void)pthread_atfork(NULL, NULL, ts_after_fork); }
 
 static struct ts_slot *ts_mine(void) {
+    if (__builtin_expect(ts_self != NULL, 1)) return ts_self;
+    (void)pthread_once(&ts_atfork_once, ts_atfork_install);
     int pid = (int)getpid();
-    if (ts_self && ts_self_pid == pid) return ts_self;
     ts_self = ts_slot_for(pid, 1);
     ts_self_pid = pid;
     return ts_self;
