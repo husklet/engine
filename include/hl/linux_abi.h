@@ -197,6 +197,16 @@ typedef struct hl_linux_abi {
     uint32_t fd_capacity;
     hl_linux_ofd_entry *ofds;
     uint32_t ofd_capacity;
+    /* Monotonic high-water mark: one past the highest OFD index ever allocated (0 when none). Every live
+     * OFD index is < ofd_watermark, so fork_prepare's live-OFD snapshot scans [1, ofd_watermark) instead of
+     * the whole ofd_capacity table -- a fork-heavy guest whose live descriptor set is tiny no longer pays a
+     * full 65536-slot scan per fork. Maintained solely in hl_linux_find_ofd (the one allocation choke point);
+     * never decreases, so a since-closed slot only makes the bound a harmless over-estimate. */
+    uint32_t ofd_watermark;
+    /* Count of fds currently in the transient RESERVED state (reserve_at .. commit/cancel). fork_prepare must
+     * fail BUSY while any descriptor install is mid-flight; this replaces a full fd_capacity scan for RESERVED
+     * with an O(1) check. Maintained under table_lock at the three reserve/cancel/commit transitions. */
+    uint32_t reserved_fds;
     /* Private, dynamically sized virtual-mapping ledger owned by this instance. */
     void *vma_state;
     /*

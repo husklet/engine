@@ -216,12 +216,14 @@ static hl_status hl_linux_find_fd_at_least(const hl_linux_abi *linux_abi, hl_lin
     return HL_STATUS_RESOURCE_LIMIT;
 }
 
-static hl_status hl_linux_find_ofd(const hl_linux_abi *linux_abi, hl_linux_ofd *out_ofd) {
+static hl_status hl_linux_find_ofd(hl_linux_abi *linux_abi, hl_linux_ofd *out_ofd) {
     uint32_t ofd;
     for (ofd = 1; ofd < linux_abi->ofd_capacity; ++ofd) {
         if (linux_abi->ofds[ofd].references == 0 && linux_abi->ofds[ofd].active_operations == 0 &&
             linux_abi->ofds[ofd].closing == 0 && linux_abi->ofds[ofd].io_mutex == HL_HOST_HANDLE_INVALID) {
             *out_ofd = ofd;
+            /* Extend the live-OFD high-water mark so fork_prepare's snapshot scan reaches this slot. */
+            if (ofd + 1 > linux_abi->ofd_watermark) linux_abi->ofd_watermark = ofd + 1;
             return HL_STATUS_OK;
         }
     }
@@ -311,13 +313,11 @@ retry_snapshot:
     plan->host_completed = 0;
     topology_changed = 0;
     hl_linux_lock(linux_abi);
-    for (index = 0; index < linux_abi->fd_capacity; ++index) {
-        if (linux_abi->fds[index].ofd == HL_LINUX_FD_RESERVED) {
-            hl_linux_unlock(linux_abi);
-            return HL_STATUS_BUSY;
-        }
+    if (linux_abi->reserved_fds != 0) {
+        hl_linux_unlock(linux_abi);
+        return HL_STATUS_BUSY;
     }
-    for (index = 1; index < linux_abi->ofd_capacity; ++index) {
+    for (index = 1; index < linux_abi->ofd_watermark; ++index) {
         hl_linux_ofd_entry *entry = &linux_abi->ofds[index];
         if (entry->references == 0) continue;
         /* A live operation retains the OFD and its host handle.  Host fork
@@ -971,6 +971,7 @@ hl_status hl_linux_fd_reserve_at(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_lin
     linux_abi->fds[fd].generation++;
     linux_abi->fds[fd].ofd = HL_LINUX_FD_RESERVED;
     linux_abi->fds[fd].descriptor_flags = 0;
+    linux_abi->reserved_fds++;
     *reservation = (hl_linux_fd_reservation){fd, linux_abi->fds[fd].generation};
     hl_linux_unlock(linux_abi);
     return HL_STATUS_OK;
@@ -987,6 +988,7 @@ hl_status hl_linux_fd_cancel(hl_linux_abi *linux_abi, const hl_linux_fd_reservat
         return HL_STATUS_NOT_FOUND;
     }
     linux_abi->fds[reservation->fd].ofd = 0;
+    if (linux_abi->reserved_fds != 0) linux_abi->reserved_fds--;
     hl_linux_unlock(linux_abi);
     return HL_STATUS_OK;
 }
@@ -1020,6 +1022,7 @@ static hl_status hl_linux_fd_commit(hl_linux_abi *linux_abi, const hl_linux_fd_r
     linux_abi->ofds[ofd].flock_token = hl_linux_new_ofd_token();
     linux_abi->fds[reservation->fd].ofd = ofd;
     linux_abi->fds[reservation->fd].descriptor_flags = descriptor_flags;
+    if (linux_abi->reserved_fds != 0) linux_abi->reserved_fds--; /* RESERVED -> committed */
 done:
     hl_linux_unlock(linux_abi);
     if (status != HL_STATUS_OK) (void)sync->mutex_close(linux_abi->host->context, created.value);
