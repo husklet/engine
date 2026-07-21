@@ -1148,23 +1148,41 @@ static void memf_try_adopt(uint64_t dev, uint64_t ino) {
     // open temp files -- probe only the process's PUBLISHED fd set (fdvis). In bound-source mode EVERY guest
     // open is published to fdvis with its identity, so that set is authoritative for open regular files; use
     // it to bound the probe. Fall back to the full scan when the published set is unavailable (native source,
-    // fdvis off, or a count that overflows the snapshot) so behavior is otherwise byte-for-byte unchanged.
-    struct fdvis_view *views = NULL;
-    size_t nviews = bound_source_is_native() ? 0 : proc_fdvis_list((int)getpid(), NULL, 0);
-    if (nviews > 0 && (views = malloc(nviews * sizeof *views)) != NULL) {
-        size_t got = proc_fdvis_list((int)getpid(), views, nviews);
-        if (got > nviews) got = nviews;
+    // fdvis off) so behavior is otherwise byte-for-byte unchanged.
+    //
+    // A generous on-stack buffer captures the published set in a SINGLE table walk: proc_fdvis_list already
+    // returns the true total (including any entries past the buffer), so the old count-then-fill idiom walked
+    // the whole FDVIS_N (131072-slot, multi-MB) table TWICE on every unlink of an open temp file (WAL/journal
+    // churn). Only a pathological overflow (>256 live published fds) re-scans into an exact heap buffer; a
+    // heap-alloc failure there falls back to the exhaustive fstat scan, so the candidate set is never smaller
+    // than before -- adoption behavior stays identical, and the duped-description bail is order-independent.
+    if (!bound_source_is_native()) {
+        struct fdvis_view inl[256];
+        struct fdvis_view *views = inl, *heap = NULL;
+        size_t cap = sizeof inl / sizeof *inl;
+        size_t got = proc_fdvis_list((int)getpid(), inl, cap);
+        if (got > cap) {
+            heap = malloc(got * sizeof *heap);
+            if (heap == NULL) {
+                for (int fd = 0; fd < HL_NFD; fd++)
+                    if (memf_adopt_probe(fd, dev, ino, &found)) return;
+                goto adopt_decide;
+            }
+            size_t refill = proc_fdvis_list((int)getpid(), heap, got);
+            views = heap;
+            if (refill < got) got = refill;
+        }
         for (size_t i = 0; i < got; i++)
             if (memf_adopt_probe(views[i].guest_fd, dev, ino, &found)) {
-                free(views);
+                free(heap);
                 return;
             }
-        free(views);
+        free(heap);
     } else {
-        free(views); // (NULL if the malloc failed; harmless)
         for (int fd = 0; fd < HL_NFD; fd++)
             if (memf_adopt_probe(fd, dev, ino, &found)) return;
     }
+adopt_decide:
     if (found < 0) return;
     struct stat s;
     if (fstat(found, &s) != 0 || !S_ISREG(s.st_mode) || s.st_nlink != 0) return;
