@@ -782,7 +782,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 236: {
         int *mode = (int *)a0;
         if (mode) {
-            if (!host_addr_mapped((uintptr_t)mode)) {
+            // Validate the WHOLE 4-byte int, not just its first page: the store below is a full int write, so
+            // a mode pointer straddling a page boundary into an unmapped page (host_addr_mapped only probes the
+            // start) would fault the engine instead of returning -EFAULT. Mirror the sibling getcpu (case 168),
+            // which range-checks its cpu/node out-pointers.
+            if (!host_range_mapped((uintptr_t)mode, sizeof(int))) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
