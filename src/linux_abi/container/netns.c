@@ -2013,6 +2013,8 @@ struct udp_peer {
     socklen_t calen;
     int gs; // guest-facing AF_UNIX/SOCK_DGRAM socket (bound to its own path,
             // connected to the guest switch socket) -- this client's identity
+    unsigned pathid; // the pseq used to build this peer's bound socket path (pdir/<pathid>); kept so the
+                     // on-disk inode can be unlink'd when the peer is evicted or the forwarder tears down
     int used;
 };
 
@@ -2027,6 +2029,16 @@ struct udp_fwd {
     unsigned pseq; // monotonic id for unique synthetic peer paths (+ ring eviction)
 };
 
+// Remove a peer's bound AF_UNIX socket inode (pdir/<pathid>) from the host filesystem. Without this every
+// distinct host UDP client leaves a socket file behind forever -> unbounded on-disk inode growth over a
+// UDP-heavy container's life (only 64 peers are ever live, but eviction used to close the fd and orphan the
+// file). Safe to call for any recorded peer; a missing file just makes unlink() a no-op.
+static void udp_peer_unlink(const struct udp_fwd *f, unsigned pathid) {
+    char path[sizeof f->pdir + 24];
+    snprintf(path, sizeof path, "%s/%u", f->pdir, pathid);
+    unlink(path);
+}
+
 // Find the peer slot for host client (sa,sl), or create one (its own AF_UNIX dgram socket bound to a
 // fresh synthetic path and connected to the guest switch socket). Returns the guest-facing fd or -1.
 static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t sl) {
@@ -2039,25 +2051,27 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
         appended = 1;
     } else { // table full: evict a slot round-robin (oldest-ish) so new clients still work
         slot = (int)(f->pseq % UDP_FWD_MAXPEERS);
-        if (f->peers[slot].used) close(f->peers[slot].gs);
+        if (f->peers[slot].used) {
+            close(f->peers[slot].gs);
+            udp_peer_unlink(f, f->peers[slot].pathid); // drop the evicted client's on-disk socket inode
+        }
         f->peers[slot].used = 0;
     }
-    // On any failure after an eviction (!appended) we already cleared peers[slot].used above; also drop the
-    // slot from npeers so we don't leave a permanently-dead slot in the table (F5). (Append never bumped
-    // npeers yet -- it is incremented only on success below -- so its failures need no adjustment.)
+    // On an eviction failure the slot is already cleared (used=0) above and stays reusable in place; we must
+    // NOT decrement npeers here. !appended means the table was full (npeers==UDP_FWD_MAXPEERS), so lowering it
+    // would drop the LAST slot out of the poll + teardown-close loops -> that peer's fd + inode would leak and
+    // its forwarding would silently stop. Append failures never bumped npeers (done only on success below), so
+    // they need no adjustment either. (Supersedes the earlier F5 npeers-- which caused exactly that hide/leak.)
     int gs = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (gs < 0) {
-        if (!appended) f->npeers--;
-        return -1;
-    }
+    if (gs < 0) return -1;
+    unsigned pathid = f->pseq++;
     struct sockaddr_un un;
     memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof un.sun_path, "%s/%u", f->pdir, f->pseq++);
+    snprintf(un.sun_path, sizeof un.sun_path, "%s/%u", f->pdir, pathid);
     unlink(un.sun_path);
     if (bind(gs, (struct sockaddr *)&un, sizeof un) < 0) {
         close(gs);
-        if (!appended) f->npeers--;
         return -1;
     }
     struct sockaddr_un gu;
@@ -2067,7 +2081,6 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
     if (upath_len >= sizeof gu.sun_path) {
         close(gs);
         unlink(un.sun_path);
-        if (!appended) f->npeers--;
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -2075,12 +2088,12 @@ static int udp_peer_get(struct udp_fwd *f, const struct sockaddr *sa, socklen_t 
     if (connect(gs, (struct sockaddr *)&gu, sizeof gu) < 0) {
         close(gs);
         unlink(un.sun_path);
-        if (!appended) f->npeers--;
         return -1;
     }
     if (appended) f->npeers++;
     f->peers[slot].used = 1;
     f->peers[slot].gs = gs;
+    f->peers[slot].pathid = pathid;
     f->peers[slot].calen = sl;
     memcpy(&f->peers[slot].caddr, sa, sl < sizeof f->peers[slot].caddr ? sl : sizeof f->peers[slot].caddr);
     return gs;
@@ -2155,8 +2168,12 @@ static void *udp_fwd_thread(void *p) {
         }
     }
     for (int i = 0; i < f->npeers; i++)
-        if (f->peers[i].used) close(f->peers[i].gs);
+        if (f->peers[i].used) {
+            close(f->peers[i].gs);
+            udp_peer_unlink(f, f->peers[i].pathid); // release each live peer's socket inode on teardown
+        }
     close(hs);
+    rmdir(f->pdir); // all peer inodes are gone -> drop the now-empty per-forwarder dir
     free(f);
     return NULL;
 }
