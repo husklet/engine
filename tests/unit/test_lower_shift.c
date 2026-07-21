@@ -88,6 +88,24 @@ int main(void) {
     HL_CHECK(hl_x86_lower_shift(&i, 100, &state) == TX_NEXT);
     HL_CHECK(seen.shifts == 1 && seen.flags == 0 && seen.parity == 0 && seen.stores == 1);
 
+    /* Immediate byte ROL by a nonzero multiple of the width rotates by 0 but STILL sets CF
+       (x86 masks the count to 5 bits; mc = imm & 0x1f != 0). Regression for stale-CF on `rolb $8`.
+       Count passed to the flag helper is the width (>1) so OF is left untouched (multi-bit rotate). */
+    reset(); state.output_flags_dead = 0; i.op = 0xc0; i.reg = 0; i.imm = 8; i.opsize = 1;
+    i.is_mem = 0; memory = 0; i.rm_reg = 0; i.has_rex = 1;
+    HL_CHECK(hl_x86_lower_shift(&i, 100, &state) == TX_NEXT);
+    HL_CHECK(seen.flags == 1 && seen.kind == 0 && seen.count == 8);
+
+    /* Immediate word ROR by 16: same 0-rotate-but-CF-set case. */
+    reset(); i.op = 0xc1; i.reg = 1; i.imm = 16; i.opsize = 2; i.rm_reg = 0; i.has_rex = 1;
+    HL_CHECK(hl_x86_lower_shift(&i, 100, &state) == TX_NEXT);
+    HL_CHECK(seen.flags == 1 && seen.kind == 1 && seen.count == 16);
+
+    /* A count that masks to 0 (imm=32 on a byte) changes no flags. */
+    reset(); i.op = 0xc0; i.reg = 0; i.imm = 32; i.opsize = 1; i.rm_reg = 0; i.has_rex = 1;
+    HL_CHECK(hl_x86_lower_shift(&i, 100, &state) == TX_NEXT);
+    HL_CHECK(seen.flags == 0);
+
     /* Memory CL shifts preserve the EA path and use scratch storage. */
     reset(); state.output_flags_dead = 0; i.op = 0xd3; i.reg = 5; i.opsize = 8; i.is_mem = 1; memory = 1;
     HL_CHECK(hl_x86_lower_shift(&i, 100, &state) == TX_NEXT);
