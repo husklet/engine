@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -93,6 +94,24 @@ int main(void) {
         int st = 0;
         waitpid(w, &st, 0);
         printf("wait4_badstatus=%d\n", WIFSIGNALED(st) ? -WTERMSIG(st) : WEXITSTATUS(st));
+    }
+    // get_mempolicy(mode*, ...) with the mode int STRADDLING a page boundary into an unmapped page: the
+    // kernel's put_user of the full int returns EFAULT. A handler that validates only the pointer's FIRST
+    // page (not the whole int write) faults the engine (sig=11) instead -- the exact gap getcpu already
+    // guards against. Two mapped pages, the second unmapped, the int placed 2 bytes before the hole.
+    {
+        pid_t p = fork();
+        if (p == 0) {
+            long pg = sysconf(_SC_PAGESIZE);
+            char *m = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m == MAP_FAILED) _exit(99);
+            munmap(m + pg, pg);
+            long r = syscall(SYS_get_mempolicy, m + pg - 2, 0, 0, 0, 0);
+            _exit(r == -1 ? (errno & 0x7f) : 0);
+        }
+        int st = 0;
+        waitpid(p, &st, 0);
+        printf("get_mempolicy_straddle=%d\n", WIFSIGNALED(st) ? -WTERMSIG(st) : WEXITSTATUS(st));
     }
     return 0;
 }
