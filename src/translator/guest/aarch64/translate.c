@@ -1940,11 +1940,29 @@ static void *translate_block(uint64_t gpc) {
     if (g_stitch < 0) g_stitch = 1;
     uint64_t seen[TRACE_MAX_BLK];
     int nseen = 0, trace_blk = 0;
+    // SMC precise gate (line-granular source set): record every 64B guest line this block is actually
+    // decoded from, AS WE DECODE, instead of marking the whole contiguous [start,guest_end) hull after the
+    // loop (see txpg_mark). For an opt4-stitched superblock the hull also spans the address GAPS between
+    // the scattered inlined sub-blocks -- lines that hold no translated code -- so the post-loop hull
+    // marked ~15x more lines than the block truly sourced (measured ~29 vs ~2 per block on sqlite), and
+    // each txln_put is a cache miss into the 16MB line set. Marking only the decoded lines is a strict
+    // subset of the hull yet still a complete superset of the REAL source lines (every translated byte came
+    // from a decoded instruction), so txln_flush_class stays correct -- it can never miss a genuinely
+    // self-modified source line. Skipped under g_tier2_build (the promoter never marks), matching the
+    // post-loop guard.
+    uint64_t tx_last_line = ~UINT64_C(0);
 #define STITCH_OK                                                                                                      \
     (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 &&                                          \
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
+        if (!g_tier2_build) {
+            uint64_t tx_ln = gpc >> 6;
+            if (tx_ln != tx_last_line) {
+                txln_put(tx_ln);
+                tx_last_line = tx_ln;
+            }
+        }
         if (gpc < guest_start) guest_start = gpc;
         if (gpc + 4 > guest_end) guest_end = gpc + 4;
         if (provenance_fault_capable)
@@ -1968,6 +1986,11 @@ static void *translate_block(uint64_t gpc) {
         if (!in_excl) {
             int n = try_lse_atomic(gpc);
             if (n) {
+                // try_lse_atomic consumes n bytes (a whole ldxr..stxr sequence) without re-entering the
+                // loop top, so mark every source line it spans -- not just gpc's -- keeping the line set a
+                // complete superset of the decoded bytes.
+                if (!g_tier2_build)
+                    for (uint64_t ll = gpc >> 6; ll <= (gpc + n - 1) >> 6; ll++) txln_put(ll);
                 gpc += n;
                 continue;
             }

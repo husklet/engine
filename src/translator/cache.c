@@ -412,8 +412,11 @@ static void txpg_mark(uint64_t lo, uint64_t hi) {
     if (hi <= lo) hi = lo + 1;
     for (uint64_t p = lo >> 12; p <= ((hi - 1) >> 12); p++)
         txpg_put(p);
-    for (uint64_t l = lo >> 6; l <= ((hi - 1) >> 6); l++) // finer line-granular set (see txln_has)
-        txln_put(l);
+    // The finer 64B line-granular source set (g_txln) is now populated incrementally during the decode
+    // loop in translate_block -- marking only the lines actually decoded rather than the whole contiguous
+    // [lo,hi) hull, which over-counted the address gaps between opt4-stitched sub-blocks and made each
+    // block's translation do ~15x the necessary (cache-missing) txln_put work. txln_flush_class stays
+    // correct: the incremental set is still a complete superset of every real source line.
 }
 
 static int txpg_has(uint64_t addr) {
