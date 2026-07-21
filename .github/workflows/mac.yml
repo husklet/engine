@@ -21,6 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
+        with:
+          # Disable the post-run install-diagnostic upload: it periodically hangs
+          # for tens of minutes on the runner, stalling the whole job past its
+          # timeout even though every test step already passed.
+          diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
@@ -72,6 +77,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
+        with:
+          # Disable the post-run install-diagnostic upload: it periodically hangs
+          # for tens of minutes on the runner, stalling the whole job past its
+          # timeout even though every test step already passed.
+          diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
