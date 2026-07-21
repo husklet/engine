@@ -416,6 +416,7 @@ static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
         int fd = fds[m.ordinal];
         if (fd >= 0 && fd < HL_NFD) {
             g_timerfd[fd] = 1;
+            g_epoll_family_seen = 1;
             g_tfd_deadline[fd] = m.deadline;
             g_tfd_interval[fd] = m.interval;
             g_tfd_clock[fd] = m.clock;

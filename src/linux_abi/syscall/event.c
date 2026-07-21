@@ -253,6 +253,10 @@ static void ep_submit_changes(int ep) {
 // that are actually dead are rebuilt -- a stale marker on an fd the parent closed and reused for a live
 // (inherited) file leaves that file untouched. Called from the fork child in proc.c, before the guest runs.
 static void kqueue_rebuild_after_fork(void) {
+    // Nothing to rebuild, re-arm, or clear unless this lineage ever created an epoll/timerfd/inotify
+    // instance (every watched/armed fd lives behind one). Skip the O(HL_NFD) scans + full-array memsets in
+    // that common case; the fork-unsafe mutex re-init at the bottom still runs unconditionally.
+    if (!g_epoll_family_seen) goto reinit_ep_mtx;
     for (int fd = 0; fd < HL_NFD; fd++) {
         if (!(g_epoll[fd] || g_timerfd[fd] || g_inotify[fd])) continue;
         if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue; // still a live inherited fd -> leave it
@@ -343,6 +347,7 @@ static void kqueue_rebuild_after_fork(void) {
     // time the child inherits it LOCKED with no owner, so its next svc_event ep_lock() deadlocks forever
     // (the go-build compile child hit exactly this after the g_jit_lock fix). The child is single-threaded
     // now, so reinitialising it to unlocked is always correct. (Same fork-unsafe-mutex class as g_jit_lock.)
+reinit_ep_mtx:
     pthread_mutex_init(&g_ep_mtx, NULL);
 }
 
@@ -737,6 +742,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
+            g_epoll_family_seen = 1;
             ep_mem_clear(r);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -989,6 +995,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (r >= 0) {
             if (r < HL_NFD) {
                 g_inotify[r] = 1;
+                g_epoll_family_seen = 1;
                 g_inotify_nb[r] = (a0 & 0x800) ? 1 : 0; // remember IN_NONBLOCK for the fork-child kqueue rebuild
             }
             if (a0 & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
@@ -1388,6 +1395,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if (r >= 0) {
             if (r < HL_NFD) {
                 g_timerfd[r] = 1;
+                g_epoll_family_seen = 1;
                 g_tfd_clock[r] = (int)a0; // remember the clockid for TFD_TIMER_ABSTIME conversion
             }
             if (a1 & 0x800) fcntl(r, F_SETFL, O_NONBLOCK); // TFD_NONBLOCK

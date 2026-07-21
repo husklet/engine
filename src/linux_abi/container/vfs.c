@@ -1178,6 +1178,12 @@ static void memf_try_adopt(uint64_t dev, uint64_t ino) {
 // absolute jump there, the dispatcher redirects pc into the biased image (pc += bias) instead of faulting
 // on the unmapped low address. [lo,hi) is the un-biased link span of the current main image (0 if PIE).
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+// Sticky (never-cleared, COW-inherited across fork) flag: set the first time THIS process lineage creates or
+// receives an epoll / timerfd / inotify instance. kqueue_rebuild_after_fork -- an O(HL_NFD) scan + several
+// full-array memsets run in every fork child -- is a guaranteed no-op when this is unset (a watched/armed fd
+// can only exist behind an instance, whose creation sets this), so the child can skip the whole sweep. It is
+// only an UPPER BOUND: once set it stays set even after all such fds close, so the sweep then runs unchanged.
+static uint8_t g_epoll_family_seen;
 // fd is a timerfd (a kqueue with an EVFILT_TIMER) -> read() drains it
 static uint8_t g_timerfd[HL_NFD];
 // fd is an inotify (a kqueue with EVFILT_VNODE watches) -> read() drains it
