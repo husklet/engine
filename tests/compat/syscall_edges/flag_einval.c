@@ -62,5 +62,12 @@ int main(void) {
     (void)listen(ls, 1);
     printf("accept4_badflag_errno=%d\n", ec(SYS_accept4, ls, 0, 0, 0x1, 0));
     printf("accept4_goodflag_errno=%d\n", ec(SYS_accept4, ls, 0, 0, 0x800, 0));
+
+    // socket/socketpair: a junk bit outside SOCK_TYPE_MASK(0xf)|SOCK_CLOEXEC(0x80000)|SOCK_NONBLOCK(0x800)
+    // is EINVAL BEFORE the family is consulted -- the type must not silently mask down to SOCK_STREAM.
+    int spair[2] = {-1, -1};
+    long spr = syscall(SYS_socketpair, AF_UNIX, SOCK_STREAM | 0x10, 0, (long)spair);
+    printf("socketpair_badtype_errno=%d socket_badtype_errno=%d\n",
+           spr == -1 ? errno : 0, ec(SYS_socket, AF_UNIX, SOCK_STREAM | 0x10, 0, 0, 0));
     return 0;
 }

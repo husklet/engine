@@ -7,3 +7,4 @@ epoll_pwait_zero_errno=22 neg_errno=22
 signalfd4_badsize_errno=22
 accept4_badflag_errno=22
 accept4_goodflag_errno=11
+socketpair_badtype_errno=22 socket_badtype_errno=22

@@ -339,6 +339,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     case 199: {
         int sv[2];
+        // Linux rejects a type carrying bits outside SOCK_TYPE_MASK(0xf) other than SOCK_CLOEXEC(0x80000)
+        // and SOCK_NONBLOCK(0x800) with EINVAL, before consulting the family (net/socket.c __sys_socketpair
+        // strips the flag bits and validates them exactly like __sys_socket). Mirror the case 198 check so a
+        // junk-bit type does not silently mask down to a valid type and wrongly succeed.
+        if ((int)a1 & ~(0xf | 0x80000 | 0x800)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         // socketpair (translate Linux domain -> macOS). macOS AF_UNIX has no SOCK_SEQPACKET socketpair;
         // emulate it with SOCK_DGRAM, which over a local AF_UNIX pair is reliable, ordered, and preserves
         // message boundaries -- exactly the SEQPACKET guarantees the guest relies on.
