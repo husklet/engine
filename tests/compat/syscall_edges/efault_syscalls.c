@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -53,5 +54,14 @@ int main(void) {
     printf("getxattr_badname=%d\n",
            probe(SYS_getxattr, (long)"/tmp/.efault_xattr_probe", BAD, (long)"v", 4, 0));
     printf("removexattr_badname=%d\n", probe(SYS_removexattr, (long)"/tmp/.efault_xattr_probe", BAD, 0, 0, 0));
+    // sendmsg/recvmsg with a NULL or wild msghdr pointer: on a real socket fd the kernel reaches the
+    // copy_from_user of the msghdr and returns EFAULT. A handler that dereferences the msghdr struct
+    // (iov ptr/count, control, flags) before validating it faults the engine (sig=11) instead. Uses a
+    // datagram socket so the fd passes sockfd_lookup and the EFAULT is on the msghdr, not ENOTSOCK/EBADF.
+    int sk = socket(AF_INET, SOCK_DGRAM, 0);
+    printf("sendmsg_nullhdr=%d\n", probe(SYS_sendmsg, sk, 0, 0, 0, 0));
+    printf("sendmsg_badhdr=%d\n", probe(SYS_sendmsg, sk, BAD, 0, 0, 0));
+    printf("recvmsg_nullhdr=%d\n", probe(SYS_recvmsg, sk, 0, 0, 0, 0));
+    printf("recvmsg_badhdr=%d\n", probe(SYS_recvmsg, sk, BAD, 0, 0, 0));
     return 0;
 }

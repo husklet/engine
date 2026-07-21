@@ -10,3 +10,7 @@ setxattr_badname=14
 setxattr_badval=14
 getxattr_badname=14
 removexattr_badname=14
+sendmsg_nullhdr=14
+sendmsg_badhdr=14
+recvmsg_nullhdr=14
+recvmsg_badhdr=14
