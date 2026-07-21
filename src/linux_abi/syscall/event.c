@@ -695,18 +695,25 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // g_eventfd_gnb note in vfs.c.
         fcntl(fds[0], F_SETFL, O_NONBLOCK);
         // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
-        if (fds[0] >= 0 && fds[0] < HL_NFD) {
-            g_eventfd_peer[fds[0]] = peer + 1;
-            g_eventfd_cslot[fds[0]] = fds[0] + 1;
-            g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
-            g_eventfd_gnb[fds[0]] = (a1 & 0x800) != 0; // EFD_NONBLOCK -> guest wants non-blocking reads
-            g_eventfd_count[fds[0]] = a0;              // initval
-            g_eventfd_refs[fds[0]] = 1;                // one alias (this fd); dup() bumps it (fd_carry_virt)
-            if (a0 > 0) {
-                char b = 1;
-                if (write(peer, &b, 1) < 0) {}
-            } // make it readable
+        if (fds[0] < 0 || fds[0] >= HL_NFD) {
+            // No per-fd tracking slot for a host fd past the table: the eventfd would be untrackable AND the
+            // dup'd `peer` write end (not stored in g_eventfd_peer) would leak. Close both and report EMFILE,
+            // matching the fd-past-cap convention used across io.c/fs.c (host fd table is far larger).
+            close(fds[0]);
+            close(peer);
+            G_RET(c) = (uint64_t)(int64_t)(-EMFILE);
+            break;
         }
+        g_eventfd_peer[fds[0]] = peer + 1;
+        g_eventfd_cslot[fds[0]] = fds[0] + 1;
+        g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
+        g_eventfd_gnb[fds[0]] = (a1 & 0x800) != 0; // EFD_NONBLOCK -> guest wants non-blocking reads
+        g_eventfd_count[fds[0]] = a0;              // initval
+        g_eventfd_refs[fds[0]] = 1;                // one alias (this fd); dup() bumps it (fd_carry_virt)
+        if (a0 > 0) {
+            char b = 1;
+            if (write(peer, &b, 1) < 0) {}
+        } // make it readable
         G_RET(c) = (uint64_t)fds[0];
         break;
     }

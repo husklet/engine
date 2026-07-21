@@ -376,7 +376,13 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
     result = munmap(entry->address, (size_t)entry->size);
     if (result == 0 && entry->executable_address != NULL && entry->executable_address != entry->address)
         result = munmap(entry->executable_address, (size_t)entry->size);
-    if (result == 0 && entry->descriptor >= 0) result = close(entry->descriptor);
+    if (result == 0 && entry->descriptor >= 0) {
+        // A dual-alias code mapping's fd was privatized (adopted) by hl_linux_memory_reserve_code; drop its
+        // private-registry cell before closing (mirrors hl_linux_memory_repair_code). No-op for a plain
+        // mapping whose fd was never adopted, so it is safe for every mapping kind.
+        hl_host_process_fd_private_remove(entry->descriptor);
+        result = close(entry->descriptor);
+    }
     if (result == 0) {
         entry->kind = HL_LINUX_HANDLE_NONE;
         entry->address = NULL;
@@ -2386,6 +2392,10 @@ static hl_host_result hl_linux_directory_close(void *context, hl_host_handle ins
         free(object);
     }
     pthread_mutex_unlock(&host->lock);
+    // The dir fd was privatized (relocated + registered) by hl_linux_allocate_handle; drop its private-registry
+    // cell before closing, exactly as hl_linux_close_descriptor_kind does -- otherwise the cell leaks and, once
+    // the OS reuses this fd number, hl_host_process_fd_private_is() misclassifies a guest fd as engine-private.
+    hl_host_process_fd_private_remove(descriptor);
     return close(descriptor) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 

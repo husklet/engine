@@ -961,15 +961,25 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         pthread_mutex_lock(&g_ipc_local_m);
+        int tracked = 0;
         for (int i = 0; i < HL_SHMAT_MAX; i++)
             if (!g_shmat[i].used) {
                 g_shmat[i].used = 1;
                 g_shmat[i].addr = p;
                 g_shmat[i].idx = idx;
                 g_shmat[i].len = len;
+                tracked = 1;
                 break;
             }
         pthread_mutex_unlock(&g_ipc_local_m);
+        if (!tracked) {
+            // Attach table full: an untracked mapping can never be found by shmdt -> its munmap AND the
+            // matching nattch-- both leak (the segment then never reaches nattch==0 to be freed on RMID).
+            // Undo the map and report ENOMEM (a valid shmat failure) instead of returning a leaking pointer.
+            munmap(p, len);
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
         hl_ipc_lock(&C->lock);
         s = shm_by_id(C, id);
         if (s) {
