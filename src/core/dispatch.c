@@ -4,7 +4,17 @@
 
 static int bus_activate(void *p) {
     (void)p;
-    return stw_force_dispatch_flush();
+    int ok = stw_force_dispatch_flush();
+#ifdef PCACHE_FLUSH_HOOK
+    // A guest-bus activation forces a flush-to-fresh (jit_flush_to_fresh): the arena is rotated to a new
+    // generation and every prior translation is discarded. The persistent-cache reloc bookkeeping described
+    // the OLD arena, so it must be reset in lockstep here -- exactly as the cache-full wholesale flush does
+    // in the dispatch loop below. Without this, stale reloc offsets survive into the fresh arena and a later
+    // pcache_save() persists offsets outside the live arena, so every warm load fails the bounds check (the
+    // feature silently never loads); worse, a passing bounds check would relocate writes over live code.
+    if (ok) PCACHE_FLUSH_HOOK;
+#endif
+    return ok;
 }
 
 static void bus_begin(void *p) {
