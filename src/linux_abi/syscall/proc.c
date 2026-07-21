@@ -289,6 +289,8 @@ static void fork_child_hooks(struct cpu *c) {
     thread_after_fork();         // reset process-private thread/futex locks a dead peer may have held at fork
     sysv_after_fork();           // reset the SysV-shm lock (same fork-unsafe-mutex class)
     eventfd_after_fork();        // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
+    anon_after_fork();           // reset the private-anon registry lock (fork-unsafe-mutex class); must precede
+                                 // wipefork/dontfork_apply_child below, which mutate the registry in this child
     ts_after_fork();             // drop the inherited task-state slot cache so the child re-claims its own
     container_pid_after_fork();  // child has a new host pid -> drop the cached getpid() so it re-reads its own
     poslk_after_fork();          // re-cache pid; child inherits NONE of the parent's fcntl record locks

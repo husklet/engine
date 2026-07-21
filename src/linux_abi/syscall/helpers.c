@@ -1010,6 +1010,20 @@ static struct anon_mapping *g_anonmap;
 static int g_nanonmap;
 static int g_anonmap_capacity;
 
+// The registry grows/reallocs and is mutated by mmap/mprotect/munmap/madvise from every guest thread
+// concurrently, so a lock is mandatory: a lock-free reader can see a torn entry, and a realloc racing a
+// reader can free the array out from under it (use-after-free). One mutex serializes every g_anonmap
+// access. It is a fork-unsafe mutex (a peer thread can hold it at fork) -- fork_child_hooks() calls
+// anon_after_fork() to re-init it in the child, mirroring eventfd_after_fork/sysv_after_fork.
+static pthread_mutex_t g_anonmap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void anon_lock(void) { pthread_mutex_lock(&g_anonmap_lock); }
+static void anon_unlock(void) { pthread_mutex_unlock(&g_anonmap_lock); }
+
+// Called in the fork CHILD (from fork_child_hooks): a peer thread may have held g_anonmap_lock at the
+// instant of fork, leaving the inherited copy permanently locked. Re-init to a fresh unlocked mutex.
+static void anon_after_fork(void) { pthread_mutex_init(&g_anonmap_lock, NULL); }
+
 static void anon_reserve_one(void) {
     if (g_nanonmap < g_anonmap_capacity) return;
     int capacity = g_anonmap_capacity ? g_anonmap_capacity * 2 : 256;
@@ -1020,7 +1034,9 @@ static void anon_reserve_one(void) {
     g_anonmap_capacity = capacity;
 }
 
-static void anon_track(uint64_t addr, uint64_t len, int prot) {
+// Core append; caller MUST hold g_anonmap_lock (used both by the public wrapper and by
+// anon_update_prot_locked, which appends head/tail remainders while already holding the lock).
+static void anon_track_locked(uint64_t addr, uint64_t len, int prot) {
     if (!addr) return;
     anon_reserve_one();
     g_anonmap[g_nanonmap].addr = addr;
@@ -1029,10 +1045,16 @@ static void anon_track(uint64_t addr, uint64_t len, int prot) {
     g_nanonmap++;
 }
 
+static void anon_track(uint64_t addr, uint64_t len, int prot) {
+    anon_lock();
+    anon_track_locked(addr, len, prot);
+    anon_unlock();
+}
+
 // Forget any tracked anon coverage overlapping [addr,addr+len) -- on munmap, or when a non-anon
 // mapping is laid over the range. Err toward forgetting (whole-entry drop) so a stale entry can never
-// cause a wrong anon-remap of what is now a file mapping.
-static void anon_untrack(uint64_t addr, uint64_t len) {
+// cause a wrong anon-remap of what is now a file mapping. Caller MUST hold g_anonmap_lock.
+static void anon_untrack_locked(uint64_t addr, uint64_t len) {
     uint64_t end = addr + len;
     for (int i = 0; i < g_nanonmap;) {
         uint64_t a = g_anonmap[i].addr, e = a + g_anonmap[i].len;
@@ -1043,14 +1065,20 @@ static void anon_untrack(uint64_t addr, uint64_t len) {
     }
 }
 
+static void anon_untrack(uint64_t addr, uint64_t len) {
+    anon_lock();
+    anon_untrack_locked(addr, len);
+    anon_unlock();
+}
+
 // A successful guest mprotect changes the CURRENT protection of tracked private-anon pages, and a
 // later MADV_DONTNEED must re-establish the range with THAT protection -- re-mapping with the stale
 // mmap-time prot (PROT_NONE for a reserve-then-commit arena, the mozjs/V8 GC-chunk pattern) turns the
 // committed pages back into an inaccessible reservation and the guest's next store faults. Split any
 // tracked record around [addr,addr+len) so the subrange records the new prot while the head/tail keep
-// theirs. Same lock-free discipline as the registry: a racing reader can only miss an entry (safe
-// no-op fallback to the advisory passthrough).
-static void anon_update_prot(uint64_t addr, uint64_t len, int prot) {
+// theirs. The whole split (rewrite + head/tail appends) runs under g_anonmap_lock so a concurrent
+// reader never sees a partially-split registry. Caller MUST hold the lock.
+static void anon_update_prot_locked(uint64_t addr, uint64_t len, int prot) {
     uint64_t end = addr + len;
     if (!addr || end <= addr) return;
     int n = g_nanonmap;
@@ -1064,18 +1092,31 @@ static void anon_update_prot(uint64_t addr, uint64_t len, int prot) {
         g_anonmap[i].addr = lo;
         g_anonmap[i].len = hi - lo;
         g_anonmap[i].prot = prot;
-        if (a < lo) anon_track(a, lo - a, old);
-        if (hi < e) anon_track(hi, e - hi, old);
+        if (a < lo) anon_track_locked(a, lo - a, old);
+        if (hi < e) anon_track_locked(hi, e - hi, old);
     }
+}
+
+static void anon_update_prot(uint64_t addr, uint64_t len, int prot) {
+    anon_lock();
+    anon_update_prot_locked(addr, len, prot);
+    anon_unlock();
 }
 
 // prot of the tracked private-anon region fully containing [addr,addr+len), else -1 (unknown -> do
 // not remap). Full containment guarantees the range is anon, so the remap cannot corrupt a file map.
+// Read the verdict into a local under the lock, then unlock and return it (never hold across return).
 static int anon_prot_if_contained(uint64_t addr, uint64_t len) {
     uint64_t end = addr + len;
+    int prot = -1;
+    anon_lock();
     for (int i = 0; i < g_nanonmap; i++)
-        if (g_anonmap[i].addr <= addr && end <= g_anonmap[i].addr + g_anonmap[i].len) return g_anonmap[i].prot;
-    return -1;
+        if (g_anonmap[i].addr <= addr && end <= g_anonmap[i].addr + g_anonmap[i].len) {
+            prot = g_anonmap[i].prot;
+            break;
+        }
+    anon_unlock();
+    return prot;
 }
 
 // MADV_WIPEONFORK(18) ranges: PRIVATE-ANON regions the guest asked to be presented ZERO-FILLED to a

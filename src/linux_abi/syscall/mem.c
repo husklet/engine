@@ -51,6 +51,7 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
 // left untouched. hl_gmap_add/anon_track append to their registries, and the appended tail starts at
 // uend so it never re-overlaps [ustart,uend) -- the loop terminates.
 static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
+    anon_lock();
     for (int i = 0; i < g_nanonmap;) {
         uint64_t base = g_anonmap[i].addr, end = base + g_anonmap[i].len;
         if (ustart >= end || uend <= base) {
@@ -66,9 +67,12 @@ static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
             g_anonmap[i].len = ustart - base;
         else
             g_anonmap[i].addr = uend, g_anonmap[i].len = end - uend;
-        if (keep_head && keep_tail) anon_track(uend, end - uend, prot);
+        // Already holding g_anonmap_lock -> append the surviving tail via the _locked core, not the
+        // self-locking wrapper (the mutex is non-recursive).
+        if (keep_head && keep_tail) anon_track_locked(uend, end - uend, prot);
         i++;
     }
+    anon_unlock();
 }
 
 // emulate a MAP_FIXED mapping of [a0, a0+a1) -- anon-zero when `anon`, else the file bytes at
