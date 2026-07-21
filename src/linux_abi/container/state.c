@@ -270,9 +270,25 @@ static int ckpt_pending(void) {
 static int g_self_gpid = 0;
 static int g_self_gppid = -1; // this restored process's guest PARENT pid (-1 => unset, use the real getppid)
 
+// Host getpid() is a real kernel syscall, but a process's host pid is invariant for its whole lifetime.
+// container_pid() sits on the hot syscall-dispatch path -- gettid(178)/getpid(172)/cpu_tid() (consulted by
+// the futex/signal/kill routing) and capget all resolve the container pid every call -- so caching the host
+// pid drops one getpid() per crossing (the same class of fixed per-syscall tax as the ts_self task-state
+// cache). A fork gives the child a NEW host pid, so container_pid_after_fork() (called from the child-side
+// fork hook next to ts_after_fork) clears the cache; the child then re-reads getpid() once on its next call.
+static int g_hostpid_cache; // 0 = unset; a live process's getpid() is never 0, so 0 is a safe "empty" sentinel
+
+static void container_pid_after_fork(void) {
+    g_hostpid_cache = 0;
+}
+
 static int container_pid(void) {
     if (g_self_gpid) return g_self_gpid;
-    int h = getpid();
+    int h = g_hostpid_cache;
+    if (__builtin_expect(h == 0, 0)) {
+        h = getpid();
+        g_hostpid_cache = h;
+    }
     return (g_init_hostpid && h == g_init_hostpid) ? 1 : h;
 }
 

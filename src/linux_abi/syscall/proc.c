@@ -290,6 +290,7 @@ static void fork_child_hooks(struct cpu *c) {
     sysv_after_fork();           // reset the SysV-shm lock (same fork-unsafe-mutex class)
     eventfd_after_fork();        // reset the eventfd counter+pipe lock (fork-unsafe-mutex class)
     ts_after_fork();             // drop the inherited task-state slot cache so the child re-claims its own
+    container_pid_after_fork();  // child has a new host pid -> drop the cached getpid() so it re-reads its own
     poslk_after_fork();          // re-cache pid; child inherits NONE of the parent's fcntl record locks
     flock_broker_after_fork();   // flock ownership is OFD-scoped and IS inherited across fork
     proc_reg_after_fork();       // publish the fork child in /proc and stop it inheriting the parent's registry path
