@@ -354,6 +354,39 @@ static void txpg_put(uint64_t p) { // insert one guest page (addr>>12) into the 
 // lockstep with g_txln (txln_clear) so a slot's hash always matches the line living in that slot.
 // g_txlh stores the 64-bit content hash at the SAME slot as g_txln (0 = unrecorded).
 
+// ---- lazy line-set population (translation-throughput) ----
+// Populating g_txln during EVERY block's decode is the single largest cold-translation bookkeeping cost
+// (~27% of translate_block on sqlite/luajit: ~2 cache-missing inserts into the 16MB line set per block),
+// yet the line set is ONLY ever read by txln_flush_class -- i.e. only when the guest issues `ic ivau`
+// (self-modifying/JIT code). The overwhelming majority of guests (a normal binary: sqlite, a server, a
+// CLI) never self-modify and never read this set at all, so recording it eagerly is pure waste for them.
+//
+// So defer it: while g_txln_active == 0 the decode loop skips txln_put entirely. Emitted host code is
+// byte-identical either way -- g_txln is read ONLY by txln_flush_class and never by any emitter -- so this
+// changes only WHEN bookkeeping is recorded, never what is translated.
+//
+// Activation (txln_activate) is a one-way switch flipped the instant the line set can first be needed.
+// Because the blocks translated BEFORE activation have no recorded lines, the FIRST SMC event after the flip
+// cannot be classified from the set -- so it takes a conservative WHOLESALE invalidation (g_txln_prime,
+// honoured by smc_commit). Re-translation then re-records EXACT lines (stitching is off once g_smc_seen, so
+// a block's decoded set is complete), and every later flush is classified byte-for-byte as in the
+// always-eager engine. (An earlier variant that instead RECONSTRUCTED the set from live-block [start,end]
+// hulls was measured to mis-drop benign flushes for a real guest JIT -- luajit_trace regressed ~20%; the
+// single priming invalidation avoids that while still charging a non-self-modifying guest nothing.)
+//
+// Activation points (all reached while single-threaded, so this races nothing):
+//   * first real SMC event (smc_commit / smc_icflush) -- before any txln_flush_class read;
+//   * first guest thread spawn -- so a peer that later self-modifies records from a complete set;
+//   * pcache warm-load -- restored blocks keep the historical page-fallback path (no prime needed: those
+//     blocks were never line-recorded even by the eager engine).
+static int g_txln_active;
+static int g_txln_prime; // first SMC after activation must invalidate wholesale (no lines recorded yet)
+static void txln_activate(void) {
+    if (g_txln_active) return;
+    g_txln_active = 1;
+    g_txln_prime = 1;
+}
+
 static void txln_put(uint64_t l) {
     uint32_t h = (uint32_t)(l * 2654435761u) & (TXLN_N - 1);
     for (uint32_t i = 0; i < TXLN_PROBE_CAP; i++) { // bounded probe: see TXLN_PROBE_CAP

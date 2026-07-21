@@ -2301,6 +2301,9 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     child->alt_sp = 0;
     child->alt_size = 0;
     child->alt_flags = 2; /* SS_DISABLE */
+    // A peer thread may self-modify code; arm eager line-set recording (and back-fill the lines of every
+    // block translated so far) NOW, while still single-threaded, so the set is complete before any peer runs.
+    txln_activate();
     g_threaded = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, thread_trampoline, child) != 0) {

@@ -409,6 +409,10 @@ static int pcache_load(uint64_t entry_jump) {
     memset(g_ibtc, 0, sizeof g_ibtc); // shared IBTC data table: refills lazily
     free(abuf);
     g_pcache_loaded = 1;
+    // Restored blocks carry page info only (their lines were not decoded here); keep the historical
+    // page-fallback path for them by arming eager line recording for every block translated from now on,
+    // matching the pre-lazy behaviour for a warm-loaded arena.
+    g_txln_active = 1;
     if (g_coldprof)
         fprintf(stderr, "[pcache] load %llu B arena, %llu blocks, %llu reloc in %.3f ms\n",
                 (unsigned long long)h.arena_used, (unsigned long long)h.n_mapent, (unsigned long long)h.n_reloc,

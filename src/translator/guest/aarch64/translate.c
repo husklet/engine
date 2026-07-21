@@ -1627,9 +1627,12 @@ static void smc_queue_line(struct cpu *c, uint64_t address) {
 }
 
 static int smc_commit(struct cpu *c) {
-    if (!c->smc_range_count && !c->smc_range_overflow) return 1;
+    txln_activate();                // arm eager line recording; may request a priming wholesale drop
+    int force_whole = g_txln_prime; // first SMC after lazy activation: no lines recorded -> can't classify
+    g_txln_prime = 0;
+    if (!force_whole && !c->smc_range_count && !c->smc_range_overflow) return 1;
     g_smc_seen = 1;
-    if (!c->smc_range_overflow) {
+    if (!c->smc_range_overflow && !force_whole) {
         pthread_mutex_lock(&g_jit_lock);
         uint32_t retained = 0;
         for (uint32_t i = 0; i < c->smc_range_count; i++) {
@@ -1718,7 +1721,11 @@ static void smc_icflush(struct cpu *c, uint64_t va) {
     //   class 0 -> line never translated: nothing stale (fall back to the coarse pcache page gate below).
     //   class 2 -> translated but UNCHANGED: benign icache maintenance -> keep the valid translation, skip.
     //   class 1 -> translated AND (first flush | genuinely rewritten): take the real drop (soak_smc/V8 patch).
-    int cls = txln_flush_class(va);
+    txln_activate(); // arm eager line recording (the priming wholesale drop is applied in smc_commit)
+    // First SMC after lazy activation: blocks translated before now have no recorded lines, so this flush
+    // cannot be classified from the line set. Queue the line unconditionally; smc_commit then forces the
+    // conservative wholesale drop (g_txln_prime) and re-translation re-records exact lines afterwards.
+    int cls = g_txln_prime ? 1 : txln_flush_class(va);
     if (cls == 0) {
         // pcache warm-load restores blocks with page info but no line info -> for a restored arena fall
         // back to the coarse page gate (conservative: may over-drop, never misses stale restored code).
@@ -1968,7 +1975,7 @@ static void *translate_block(uint64_t gpc) {
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
-        if (!g_tier2_build) {
+        if (!g_tier2_build && g_txln_active) {
             uint64_t tx_ln = gpc >> 6;
             if (tx_ln != tx_last_line) {
                 txln_put(tx_ln);
@@ -2001,7 +2008,7 @@ static void *translate_block(uint64_t gpc) {
                 // try_lse_atomic consumes n bytes (a whole ldxr..stxr sequence) without re-entering the
                 // loop top, so mark every source line it spans -- not just gpc's -- keeping the line set a
                 // complete superset of the decoded bytes.
-                if (!g_tier2_build)
+                if (!g_tier2_build && g_txln_active)
                     for (uint64_t ll = gpc >> 6; ll <= (gpc + n - 1) >> 6; ll++) txln_put(ll);
                 gpc += n;
                 continue;
