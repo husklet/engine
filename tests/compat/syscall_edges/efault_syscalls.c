@@ -63,5 +63,22 @@ int main(void) {
     printf("sendmsg_badhdr=%d\n", probe(SYS_sendmsg, sk, BAD, 0, 0, 0));
     printf("recvmsg_nullhdr=%d\n", probe(SYS_recvmsg, sk, 0, 0, 0, 0));
     printf("recvmsg_badhdr=%d\n", probe(SYS_recvmsg, sk, BAD, 0, 0, 0));
+    // wait4 with a wild status pointer: the kernel reaps the zombie, THEN faults on the put_user of the
+    // status word (a re-wait returns ECHILD -- the child is already gone), so the syscall returns EFAULT.
+    // A handler that writes the status through the guest pointer without validating it faults the engine
+    // (sig=11) instead. Needs a real reapable child, so this probe forks a grandchild rather than using
+    // the shared helper (whose child has none to wait on -> ECHILD, not EFAULT).
+    {
+        pid_t w = fork();
+        if (w == 0) {
+            pid_t g = fork();
+            if (g == 0) _exit(3);
+            long r = syscall(SYS_wait4, g, BAD, 0, 0, 0);
+            _exit(r == -1 ? (errno & 0x7f) : 0);
+        }
+        int st = 0;
+        waitpid(w, &st, 0);
+        printf("wait4_badstatus=%d\n", WIFSIGNALED(st) ? -WTERMSIG(st) : WEXITSTATUS(st));
+    }
     return 0;
 }

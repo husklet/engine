@@ -14,3 +14,4 @@ sendmsg_nullhdr=14
 sendmsg_badhdr=14
 recvmsg_nullhdr=14
 recvmsg_badhdr=14
+wait4_badstatus=14
