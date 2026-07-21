@@ -257,9 +257,21 @@ int hl_host_process_fd_private_floor(void) {
 }
 
 uint32_t hl_engine_guest_fd_limit(void) {
-    int floor = hl_host_process_fd_private_floor();
-    if (floor <= 0) return 0;
-    return (uint32_t)floor;
+    // The guest-visible fd ceiling (RLIMIT_NOFILE, /proc/self/limits) must be STABLE across hosts --
+    // HL_LINUX_FD_LIMIT-capped, derived only from the host RLIMIT_NOFILE -- so goldens match on every runner.
+    // It deliberately does NOT apply the macOS kern.maxfilesperproc clamp that hl_host_process_fd_private_floor
+    // uses: that clamp only bounds where the engine hoists its OWN host descriptors (F_DUPFD target), a
+    // host-side concern invisible to the guest. Decoupling keeps getrlimit/proc consistent with the Linux
+    // engine (65536) on a macos runner whose real per-process fd ceiling is lower, while adopt still lands
+    // its private fds under that ceiling. (Guest fd numbers stay low in practice, far below the private band.)
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return 0;
+    const rlim_t reserve = HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM;
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT32_MAX) limit.rlim_cur = INT32_MAX;
+    if (limit.rlim_cur <= HL_HOST_GUEST_DESCRIPTOR_MINIMUM + reserve) return 0;
+    rlim_t guest = limit.rlim_cur - reserve;
+    if (guest > HL_LINUX_FD_LIMIT) guest = HL_LINUX_FD_LIMIT;
+    return (uint32_t)guest;
 }
 
 int hl_host_process_fd_private_adopt(int fd) {
