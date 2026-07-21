@@ -40,6 +40,41 @@ int main(void) {
     HL_CHECK(process.state != '\0' && process.name[0] != '\0');
     HL_CHECK(!hl_host_process_read(-1, &process));
     HL_CHECK(!hl_host_process_read((int64_t)getpid(), NULL));
+
+    /* boot-time consistency: start_time must be built from the same btime that
+     * hl_host_system_read reports, and must be stable across repeated reads. */
+    {
+        hl_host_process_info again;
+        HL_CHECK(hl_host_process_read((int64_t)getpid(), &again));
+        HL_CHECK(again.start_time_seconds == process.start_time_seconds);
+        HL_CHECK(again.start_time_ns == process.start_time_ns);
+        HL_CHECK(process.start_time_seconds >= second.boot_time_seconds);
+        /* start_time = btime + starttime_ticks/CLK_TCK, so start_seconds - btime
+         * equals the seconds truncation and start_ns must agree with start_seconds. */
+        HL_CHECK(process.start_time_ns / UINT64_C(1000000000) == process.start_time_seconds);
+    }
+
+    /* independent parse of /proc/self/stat to cross-check field decoding. */
+    {
+        FILE *self = fopen("/proc/self/stat", "r");
+        char raw[8192];
+        HL_CHECK(self != NULL && fgets(raw, sizeof raw, self) != NULL);
+        fclose(self);
+        char *tail = strrchr(raw, ')');
+        HL_CHECK(tail != NULL && tail[1] == ' ');
+        long long ppid = 0, sid = 0;
+        unsigned long long threads_raw = 0, starttime_raw = 0;
+        int scanned = sscanf(tail + 2,
+                             "%*c %lld %*d %lld %*d %*d %*u %*u %*u %*u %*u %*u %*u %*u %*u"
+                             " %*d %*d %llu %*d %llu",
+                             &ppid, &sid, &threads_raw, &starttime_raw);
+        HL_CHECK(scanned == 4);
+        HL_CHECK(process.parent_pid == ppid);
+        HL_CHECK(process.session == sid);
+        HL_CHECK(process.threads == threads_raw && process.threads > 0);
+        HL_CHECK(process.start_time_seconds >= first.boot_time_seconds &&
+                 process.start_time_seconds <= (uint64_t)time(NULL));
+    }
     char temporary[] = "/tmp/hl-system-XXXXXX";
     int file = mkstemp(temporary);
     int pipes[2];
@@ -82,6 +117,16 @@ int main(void) {
     }
     HL_CHECK(hl_host_process_read(child, &process));
     HL_CHECK(process.parent_pid == getpid() && process.threads > 0);
+    {
+        /* child started no earlier than the parent, and its start time is stable. */
+        hl_host_process_info self_now;
+        hl_host_process_info child_again;
+        HL_CHECK(hl_host_process_read((int64_t)getpid(), &self_now));
+        HL_CHECK(process.start_time_seconds >= self_now.start_time_seconds);
+        HL_CHECK(hl_host_process_read(child, &child_again));
+        HL_CHECK(child_again.start_time_seconds == process.start_time_seconds);
+        HL_CHECK(child_again.start_time_ns == process.start_time_ns);
+    }
     HL_CHECK(hl_host_process_fd_read(child, file, &descriptor, target, sizeof target, &target_size));
     HL_CHECK(descriptor.kind == HL_HOST_FD_FILE && target_size > 0);
     HL_CHECK(hl_host_process_fd_read(child, pipes[1], &descriptor, NULL, 0, &target_size));

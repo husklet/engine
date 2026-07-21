@@ -72,6 +72,23 @@ int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, siz
     return 1;
 }
 
+static uint64_t hl_linux_boot_time(void) {
+    static uint64_t cached = 0;
+    FILE *file;
+    char line[512];
+    if (cached != 0) return cached;
+    if ((file = fopen("/proc/stat", "r")) == NULL) return 0;
+    while (fgets(line, sizeof line, file) != NULL) {
+        unsigned long long boot;
+        if (sscanf(line, "btime %llu", &boot) == 1) {
+            cached = boot;
+            break;
+        }
+    }
+    fclose(file);
+    return cached;
+}
+
 int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     char path[64];
     char line[8192];
@@ -83,7 +100,7 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     uint64_t fields[25] = {0};
     long ticks;
     long page_size;
-    hl_host_system_info system;
+    uint64_t boot_time_seconds;
     if (info == NULL || pid <= 0) return 0;
     snprintf(path, sizeof path, "/proc/%lld/stat", (long long)pid);
     if ((file = fopen(path, "r")) == NULL) return 0;
@@ -118,9 +135,10 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     if (ticks <= 0) ticks = 100;
     info->user_time_ns = fields[14] * UINT64_C(1000000000) / (uint64_t)ticks;
     info->system_time_ns = fields[15] * UINT64_C(1000000000) / (uint64_t)ticks;
-    if (hl_host_system_read(&system, NULL, 0)) {
-        info->start_time_seconds = system.boot_time_seconds + fields[22] / (uint64_t)ticks;
-        info->start_time_ns = system.boot_time_seconds * UINT64_C(1000000000) +
+    boot_time_seconds = hl_linux_boot_time();
+    if (boot_time_seconds != 0) {
+        info->start_time_seconds = boot_time_seconds + fields[22] / (uint64_t)ticks;
+        info->start_time_ns = boot_time_seconds * UINT64_C(1000000000) +
                               fields[22] * UINT64_C(1000000000) / (uint64_t)ticks;
     }
     info->virtual_bytes = fields[23];
