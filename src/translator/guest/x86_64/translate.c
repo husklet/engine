@@ -3817,7 +3817,11 @@ static void *translate_block(uint64_t gpc) {
                         e_rrr(A_SUBS, 31, 31, 24, 1, 0);
                         e_nzcv_save(); // ARM C = !bit -> x86 CF, atomically consistent with the RMW above
                     } else {
-                        int o = mem ? 16 : I.rm_reg;
+                        // A 16-bit register dest must preserve bits 63:16 (x86 word ops leave the upper
+                        // 48 bits untouched), but a 32-bit ARM op writing the guest home zeroes 63:32.
+                        // Route w<4 through the x16 scratch so rm_store's bfi merges only the low `w`
+                        // bytes; w>=4 writes the home directly (a 32-bit zero-extend is x86-correct there).
+                        int o = (mem || w < 4) ? 16 : I.rm_reg;
                         if (sub == 5)
                             e_rrr(A_ORR, o, val, 22, sf, 0); // BTS
                         else if (sub == 6)
