@@ -1901,6 +1901,16 @@ static struct {
     pthread_mutex_t *waitm;
 } g_threg[THREAD_REG_MAX];
 
+// O(1) live-thread count, maintained under g_threg_m by thread_register/thread_unregister. Lets
+// thread_after_fork() detect a SINGLE-THREADED parent (count <= 1) and skip the phantom-registry rebuild
+// and the private-futex table reset -- both exist ONLY to repair state a vanished PEER thread could have
+// left inconsistent across the guest fork (a held lock, a phantom tid entry, a stale parked-waiter slot).
+// With no peer, none of those can occur: the inherited registry already holds only the calling thread and
+// every private-futex bucket lock is unlocked with empty waiter slots, so the reset is pure overhead
+// (~130us/fork: 256 bucket mutex+cond re-inits plus a 128KB registry memset). A threaded parent (count > 1)
+// still takes the full reset. Correctness gate mirrors jit_after_fork's own single-threaded fast path.
+static int g_threg_live;
+
 static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
 
 // fork() only clones the calling thread. Any process-PRIVATE engine mutex a dead peer held at the instant
@@ -1914,11 +1924,19 @@ static void thread_after_fork(void) {
     pthread_mutex_init(&g_threg_m, NULL); // thread registry (tkill/tgkill lookup, thread_register)
     pthread_mutex_init(&g_futex_m, NULL); // legacy global futex lock (NOFUTEXQ path)
     pthread_cond_init(&g_futex_c, NULL);
-    futex_private_table_after_fork();
-    // Shared-futex-key registry lock: a private (process-shared? no -- plain) mutex that a dead peer could
-    // have held across the guest fork; the child inherits the VA->object-identity entries (its mappings are
-    // the parent's, at the same VAs) but must reset the lock, exactly as the futex/threg locks above.
+    // SINGLE-THREADED-PARENT FAST PATH: with no peer thread at fork, no private-futex bucket lock could have
+    // been held (bucket locks are taken only transiently by the holder, never across a guest fork) and no
+    // waiter could be parked, and the tid registry already lists only the calling thread. The entire reset
+    // below (256 bucket re-inits + a 128KB registry memset, ~130us) exists solely to repair peer-induced
+    // damage, so a lone forker can skip all of it -- the inherited state is already exactly correct. The
+    // g_shkey_m lock re-init is likewise unnecessary (no peer to hold it), but it is O(1) so we keep it
+    // unconditionally rather than reason about it per branch.
     pthread_mutex_init(&g_shkey_m, NULL);
+    if (g_threg_live <= 1) {
+        g_fbk_active = g_fbk_private; // the child's __thread active pointer must still select the private table
+        return;
+    }
+    futex_private_table_after_fork();
     // fork() clones ONLY the calling thread, but the tid->thread registry still lists every PARENT thread.
     // Those phantom entries never unregister (no thread backs them in the child), so they (1) poison
     // tgkill/tkill routing -- thread_target_signal matches a phantom by tid (or pid 1 for the main thread)
@@ -1934,8 +1952,10 @@ static void thread_after_fork(void) {
         g_threg[0].c = self;
         g_threg[0].th = pthread_self();
         g_my_threg = 0;
+        g_threg_live = 1; // only the calling thread survives the fork
     } else {
         g_my_threg = -1;
+        g_threg_live = 0;
     }
 }
 
@@ -2005,6 +2025,7 @@ static void thread_register(struct cpu *c) {
             g_threg[i].th = pthread_self();
             __atomic_store_n(&g_threg[i].waitc, NULL, __ATOMIC_SEQ_CST);
             g_my_threg = i;
+            g_threg_live++;
             break;
         }
     pthread_mutex_unlock(&g_threg_m);
@@ -2016,6 +2037,7 @@ static void thread_unregister(struct cpu *c) {
         if (g_threg[i].c == c) {
             __atomic_store_n(&g_threg[i].waitc, NULL, __ATOMIC_SEQ_CST);
             g_threg[i].c = NULL;
+            if (g_threg_live > 0) g_threg_live--;
             break;
         }
     pthread_mutex_unlock(&g_threg_m);
