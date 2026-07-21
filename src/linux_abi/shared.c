@@ -20,7 +20,11 @@ hl_status hl_linux_memory_create(const hl_host_services *host, uint64_t size, ui
         if (mapping.handle != HL_HOST_HANDLE_INVALID) (void)host->memory->release(host->context, mapping.handle);
         return mapped.status == HL_STATUS_OK ? HL_STATUS_PLATFORM_FAILURE : (hl_status)mapped.status;
     }
-    memset((void *)(uintptr_t)mapping.address, 0, (size_t)size);
+    // Freshly created backing (memfd for SHARED, MAP_ANONYMOUS for PRIVATE) is guaranteed
+    // zero-filled by the kernel, and the discard() below immediately drops any resident pages
+    // (MADV_DONTNEED) so first access re-faults zero on demand. An eager memset here only faults
+    // in the whole arena (e.g. 6MB / 1536 pages for the fdvis table) to write zeros that are both
+    // redundant and instantly discarded -- pure startup page-fault cost. Rely on the kernel zero.
     discarded = host->memory->discard(host->context, mapping.handle);
     if (discarded.status != HL_STATUS_OK) {
         (void)host->memory->release(host->context, mapping.handle);

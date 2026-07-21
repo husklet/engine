@@ -214,7 +214,11 @@ typedef struct hl_host_memory_services {
     hl_host_result (*sync)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
     /* Unmap a page-aligned subrange. A full-range unmap consumes the mapping handle. */
     hl_host_result (*unmap_range)(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size);
-    /* Create an anonymous private or fork-shared mapping, optionally at an exact address. */
+    /* Create an anonymous private or fork-shared mapping, optionally at an exact address.
+     * The returned pages are zero-filled: private mappings are fresh anonymous memory and
+     * fork-shared mappings are a freshly sized memfd, both of which the kernel guarantees to
+     * read as zero. Callers (e.g. hl_linux_memory_create) rely on this instead of eagerly
+     * memset()ing the whole region, which would only fault in pages that discard() then drops. */
     hl_host_result (*map_anonymous)(void *context, uint64_t requested_address, uint64_t size,
                                     uint32_t protection, uint32_t flags, hl_host_memory_mapping *output);
     /* Retire an ownership handle without changing the process address space. */

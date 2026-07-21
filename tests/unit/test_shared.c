@@ -42,7 +42,10 @@ static hl_host_result map_shared(void *opaque, uint64_t requested, uint64_t size
     if (host->fault == FAULT_NO_HANDLE) return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
     host->address = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     assert(host->address != MAP_FAILED);
-    memset(host->address, 0xa5, (size_t)size);
+    /* A conforming map_anonymous returns zero-filled memory (fresh anon / memfd -- see the seam
+     * contract in host_services.h). hl_linux_memory_create relies on that instead of memset()ing
+     * the region itself, so model a zeroing host here. MAP_ANON already reads as zero. */
+    memset(host->address, 0x00, (size_t)size);
     host->handle++;
     host->size = size;
     host->owned = 1;
