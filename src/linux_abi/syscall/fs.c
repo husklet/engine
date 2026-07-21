@@ -3349,6 +3349,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 g_ndirs++;
             }
         }
+        // Cache full (>64 concurrent directory streams): this DIR* was never stored in g_dirs[], so
+        // dirs_drop() on the guest's later close(fd) can't release it. Close it after this single call
+        // instead of leaking the DIR* + its dup'd host fd on every getdents64 to an untracked dir fd.
+        int dir_cached = 0;
+        for (int i = 0; i < g_ndirs; i++)
+            if (g_dirs[i].fd == fd && g_dirs[i].d == dir) {
+                dir_cached = 1;
+                break;
+            }
         uint8_t *out = (uint8_t *)a1;
         size_t o = 0;
         struct dirent *de;
@@ -3385,6 +3394,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = einval > 0 ? (uint64_t)(int64_t)(-EINVAL)
                    : einval < 0 ? (uint64_t)(int64_t)(-EFAULT)
                    : (uint64_t)o;
+        if (!dir_cached) closedir(dir); // untracked (cache-full) stream: release it, else DIR* + fd leak
         break;
     }
     // readlinkat(dirfd, path, buf, bufsiz)

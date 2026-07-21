@@ -2094,8 +2094,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         uint64_t sp = build_stack(ac, argv, &lm, at_base);
         proc_reg_publish(gexe, ac, argv); // republish the process table entry (comm/argv changed on exec)
         free(xpath);
-        for (int i = 0; i < ac && i < 255; i++)
-            free(xargv[i]);
+        for (int i = 0; i < ac && i < HL_MAXARGV - 1; i++) // mirror the strdup loop bound above; a 255 cap
+            free(xargv[i]);                                 // leaked xargv[255..ac-1] on every argc>255 execve
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;

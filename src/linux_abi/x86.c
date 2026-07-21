@@ -580,6 +580,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         memcpy(top, estr[i], l);
         envp_[i] = (uint64_t)top;
     }
+    free(gecopy); // the HL_GUEST_ENV tokens (estr[..]) were copied onto the stack above; safe to release now
     // AT_EXECFN string: Linux copies the execve PATHNAME (not argv[0]) near the stack top and points
     // AT_EXECFN at it. Rust std / uutils' multicall read it; a relative argv[0] (fork+exec'd `./x` or
     // execve("/proc/self/exe")) diverged from the native absolute path. g_exe_path holds the canonical
