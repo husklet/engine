@@ -182,8 +182,6 @@ typedef struct {
     // the hot lookup (map_body runs inside the decode loop's stitch checks) and on map_put. Semantics are
     // unchanged: an entry is live iff generation == g_map_epoch.
     uint32_t generation;
-    uint64_t guest_start;
-    uint64_t guest_end;
     void *host;
     void *body;
 } hl_translation_map_entry;
@@ -199,7 +197,11 @@ typedef struct {
     uint64_t hashes[TXLN_N];
 } hl_translation_index;
 
-static hl_translation_index g_translation_index;
+// Cache-line align the index so map[0] starts on a 64B boundary. With a 32B entry that guarantees every
+// entry lies wholly within one cache line (map[j] at base+32*j, base%64==0 -> offset 0 or 32, never
+// straddling). Without this the array's natural 8B alignment left ~half the 32B entries straddling two
+// lines, doubling the cold-miss traffic the smaller entry was meant to remove.
+static _Alignas(64) hl_translation_index g_translation_index;
 #define g_map g_translation_index.map
 #define g_txpg g_translation_index.pages
 #define g_txln g_translation_index.lines
@@ -497,13 +499,19 @@ static void *map_body(uint64_t gpc) {
 }
 
 static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void *host, void *body) {
+    // guest_start/guest_end are the block's guest SOURCE range. They are never read back from a live map
+    // entry on the hot path (map_idx/map_host/map_body key on gpc only) nor consumed by pcache restore (it
+    // serializes them but load discards them; the SMC page set is serialized independently). Keeping them
+    // in the entry only bloated it to 48B, so ~79% of entries straddled a 64B cache line -> the cold insert
+    // (and the cold lookup probe) paid ~1.8 line misses each into the 25MB sparse table. Dropping them makes
+    // the entry a cache-line-friendly 32B, so entries never straddle and the table shrinks to ~16.7MB.
+    (void)guest_start;
+    (void)guest_end;
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
         if (!map_live(j)) {
             g_map[j].gpc = gpc;
-            g_map[j].guest_start = guest_start;
-            g_map[j].guest_end = guest_end;
             g_map[j].host = host;
             g_map[j].body = body;
             g_map[j].generation = g_map_epoch;

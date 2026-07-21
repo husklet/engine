@@ -470,7 +470,10 @@ static void pcache_save(void) {
         w += (size_t)g_nreloc * sizeof(hl_reloc);
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
             if (!map_live(i)) continue;
-            struct pc_mapent e = {g_map[i].gpc, g_map[i].guest_start, g_map[i].guest_end,
+            // guest_start/guest_end are vestigial in the on-disk record (restore discards them; the SMC page
+            // set is serialized separately). The live map entry no longer stores them, so emit 0 placeholders
+            // and keep the pc_mapent layout + PC_VERSION unchanged.
+            struct pc_mapent e = {g_map[i].gpc, 0, 0,
                                   (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
