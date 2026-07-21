@@ -177,7 +177,20 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL)) return 0;
     uint64_t exact_pc;
     uint64_t host_pc = (uint64_t)HL_HOST_UC_PC((ucontext_t *)native_context);
-    if (jit_instruction_guest_pc(host_pc, &exact_pc)) c->pc = exact_pc;
+    if (jit_instruction_guest_pc(host_pc, &exact_pc)) {
+        c->pc = exact_pc;
+        // Folded-fault register reconstruction: when guestbase is on, a synchronous fault on a folded memory
+        // instruction lands while the fold's scratch host registers (Sb,T,T2,Tm) hold translator temporaries,
+        // not the guest values. hl_aarch64_signal_capture copied those clobbered host regs into c->x[], so the
+        // guest handler would see STALE registers. The live guest values were spilled to cpu->mscratch[4..7]
+        // (emit_fold_mem, OFF_MSCRATCH+32); replay the emitter's exact slot mapping to restore them.
+        uint32_t insn = *(const uint32_t *)(uintptr_t)exact_pc;
+        int base = (int)((insn >> 5) & 31);
+        if (guestbase_on() && is_foldable_mem(insn) && base != 31) {
+            int slots[4], nsl = fold_mem_scratch(insn, slots);
+            for (int i = 0; i < nsl; i++) c->x[slots[i]] = c->mscratch[4 + i];
+        }
+    }
     return 1;
 }
 

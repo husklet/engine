@@ -651,6 +651,26 @@ static void emit_a64_bus_guard_instruction(uint32_t in, uint64_t pc) {
     emit_a64_bus_guard(16, a64_mem_bytes(in), pc);
 }
 
+// Scratch-slot assignment for a folded memory op. Picks the non-stolen host GP registers whose live guest
+// values emit_fold_mem spills to cpu->mscratch[4..7] (Sb,T,T2,Tm). Factored out so fault-time register
+// reconstruction (sigframe_capture_fault) uses the EXACT same slot mapping the emitter chose. Fills
+// slots[0..n-1] with the chosen register numbers (Sb=slots[0], T=slots[1], T2=slots[2], Tm=slots[3] for the
+// register-offset form) and returns the count: 4 for register-offset, else 3. Mirrors gpr_field_mask + the
+// LSE-Rs (bit2) fixup so the "used" set matches the emitter exactly.
+static int fold_mem_scratch(uint32_t insn, int slots[4]) {
+    int mask = gpr_field_mask(insn);
+    if ((insn & 0x3B200C00u) == 0x38200000u) mask |= 4; // LSE atomic value operand Rs[20:16]
+    int regoff = (insn & 0x3B200C00u) == 0x38200800u;
+    int used = 0;
+    static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if (mask & mbits[k]) used |= 1u << ((insn >> shifts[k]) & 31);
+    int need = regoff ? 4 : 3, n = 0;
+    for (int r = 0; r <= 30 && n < need; r++)
+        if (!(used & (1u << r)) && !is_stolen(r)) slots[n++] = r;
+    return n;
+}
+
 // Emit a folded memory op: compute the guest effective address into a scratch Sb, add g_nonpie_bias iff
 // that address is a LOW image address (< 4GiB; everything else -- stack/heap/mmap/libs -- is >= the
 // engine's 4GiB __PAGEZERO), then the access re-pointed at Sb. Flag-free (loads/stores must not disturb the
@@ -673,13 +693,8 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         wb = (o == 3) ? 1 : (o == 1) ? 2 : 0;
         if (wb) wbimm = sext((uint64_t)((in >> 12) & 0x1FF), 9);
     }
-    int used = 0;
-    static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
-    for (int k = 0; k < 4; k++)
-        if (mask & mbits[k]) used |= 1u << ((in >> shifts[k]) & 31);
-    int need = regoff ? 4 : 3, sc[4], n = 0;
-    for (int r = 0; r <= 30 && n < need; r++)
-        if (!(used & (1u << r)) && !is_stolen(r)) sc[n++] = r;
+    int sc[4];
+    fold_mem_scratch(in, sc); // shared with fault-time reconstruction: same slot mapping
     int Sb = sc[0], T = sc[1], T2 = sc[2], Tm = regoff ? sc[3] : -1;
     // Spill scratch originals to cpu->mscratch[4..7], NOT the stack: the fold runs on EVERY guest memory op,
     // and an async host signal (e.g. Go's SIGURG preemption) would clobber a [sp,#-N] red-zone slot. This

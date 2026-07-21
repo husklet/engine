@@ -899,6 +899,17 @@ $(BUILD)/compat/signals/x86_64/%: tests/compat/signals/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
 
+# Folded-fault register reconstruction is a guest_base (non-PIE ET_EXEC) path: build this case static
+# non-PIE so the translator actually folds the faulting load. The generic signals recipe forces -static-pie
+# (guest_base inert), which would make the case pass trivially without exercising the fix.
+$(BUILD)/compat/signals/aarch64/synchronous_fault_registers: tests/compat/signals/synchronous_fault_registers.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -std=gnu11 $< -pthread -o $@
+
+$(BUILD)/compat/signals/x86_64/synchronous_fault_registers: tests/compat/signals/synchronous_fault_registers.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -fno-pie -no-pie -std=gnu11 $< -pthread -o $@
+
 $(BUILD)/compat/filesystem/aarch64/dentry/%: tests/compat/filesystem/dentry/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -pthread -o $@
