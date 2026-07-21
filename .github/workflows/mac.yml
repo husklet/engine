@@ -16,7 +16,7 @@ concurrency:
 jobs:
   mac:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -41,24 +41,28 @@ jobs:
       # the linux cross-ar for the guest engine builds, which would otherwise archive
       # build/lib as a linux object and break linking of the host unit/package binaries.
       - name: Test C unit suite
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" AR=ar unit'
+        timeout-minutes: 15
+        run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
 
       - name: Test C package integration
+        timeout-minutes: 15
         run: nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
 
       - name: Test Rust package
         run: nix build --print-build-logs .#checks.aarch64-darwin.rust
 
       - name: Test macOS host services
+        timeout-minutes: 15
         # Runs unsandboxed (unlike the `nix build` package check) so the host-service
         # integration tests can open "/", "/tmp", and resolve localhost DNS.
-        run: nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" test-macos'
+        run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos'
 
       - name: Test macOS compatibility
+        timeout-minutes: 20
         shell: bash
         run: |
           set -o pipefail
-          if ! nix develop --command sh -c 'make -s -j2 CC="$NATIVE_CC" e2e-compat' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+          if ! nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-compat' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}
             message=${message//$'\n'/'%0A'}
@@ -68,7 +72,9 @@ jobs:
           fi
 
       - name: Run e2e gates
-        run: nix develop --command sh -c 'make -j3 CC="$NATIVE_CC" e2e-mac-gates'
+        timeout-minutes: 15
+        run: nix develop --command sh -c 'make -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-mac-gates'
 
       - name: Package Rust crate
+        timeout-minutes: 15
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
