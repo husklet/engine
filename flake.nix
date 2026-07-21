@@ -41,35 +41,6 @@
             X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
             enableParallelBuilding = true;
 
-            # The macOS host unit tests (the `test-macos` suite in `make unit`) exercise
-            # filesystem and DNS behaviour that the Nix darwin build sandbox rejects
-            # under its `(deny default)` policy. This only bites when the daemon builds
-            # with `sandbox = true` (e.g. the macos-26 CI runner); it is invisible on
-            # hosts with sandboxing off. Two independent grants are needed:
-            #
-            # (a) sandboxProfile — filesystem paths the tests open:
-            #   1. tests/unit/macos.c opens the filesystem root ("/") as a PATH_ONLY
-            #      directory handle (line 166). Opening a directory needs only
-            #      `file-read-metadata`, which no open flag (O_EVTONLY included) can
-            #      bypass, so the grant must live here. `(literal "/")` matches just "/".
-            #   2. Several tests (macos, directory, directory-services, system, native,
-            #      native-capacity, resolve-services, dns-objc-fork) create scratch
-            #      files/dirs under a fixed /tmp path (canonicalising to /private/tmp).
-            #      The build's own TMPDIR is allowed, but these fixed /tmp paths are not
-            #      unless /private/tmp (and its /tmp symlink) are granted.
-            #
-            # (b) __darwinAllowLocalNetworking — tests/unit/test_dns_fork_macos.c calls
-            #     getaddrinfo("localhost") across fork/threads. Loopback resolution needs
-            #     mDNSResponder, /etc/hosts and /etc/resolv.conf, which the sandbox blocks
-            #     unless local networking is permitted. Without this the whole test-macos
-            #     step fails at dns-fork-macos even after the filesystem grants above.
-            sandboxProfile = pkgs.lib.optionalString (system == "aarch64-darwin") ''
-              (allow file-read* (literal "/"))
-              (allow file* (subpath "/private/tmp"))
-              (allow file* (subpath "/tmp"))
-            '';
-            __darwinAllowLocalNetworking = system == "aarch64-darwin";
-
             buildPhase = ''
               runHook preBuild
               make all
@@ -84,11 +55,21 @@
               runHook postBuild
             '';
 
-            doCheck = true;
+            # The runtime test suites (`make unit`, `make package-test`) run the engine
+            # and its host-service tests, which need resources the Nix darwin build
+            # sandbox denies under `(deny default)`: opening "/", scratch files under a
+            # fixed /tmp path, JIT execution of guest binaries, and localhost DNS. On
+            # macos-26 the sandbox is active and these fail. Rather than widen the build
+            # sandbox for genuine runtime behaviour, darwin builds+installs only here and
+            # runs `make unit` + `make package-test` as unsandboxed steps in mac.yml
+            # (mirroring how test-macos and the compat suite already run there, and how
+            # Linux runs its compat suite outside the sandbox). Linux keeps the full
+            # in-sandbox check, which passes.
+            doCheck = system != "aarch64-darwin";
             checkPhase = ''
               runHook preCheck
               make unit
-              make package-test ${pkgs.lib.optionalString (system == "aarch64-darwin") "CODESIGN=/usr/bin/codesign"}
+              make package-test
               runHook postCheck
             '';
 

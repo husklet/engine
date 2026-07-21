@@ -30,6 +30,23 @@ jobs:
       - name: Test C package
         run: nix build --print-build-logs .#checks.aarch64-darwin.package
 
+      - name: Test C unit and package suites
+        # The darwin `nix build` check above builds+installs only (doCheck = false in
+        # flake.nix). The `make unit` and `make package-test` suites run the engine and
+        # its host-service tests, which need resources the Nix build sandbox denies
+        # (opening "/", scratch files under a fixed /tmp path, JIT execution of guest
+        # binaries, and localhost DNS). Run them here, outside the sandbox, exactly like
+        # the test-macos and compat steps below.
+        # AR=ar forces the host (macOS) archiver: the dev shell exports AR pointing at
+        # the linux cross-ar for the guest engine builds, which would otherwise archive
+        # build/lib as a linux object and break linking of the host unit/package binaries.
+        run: |
+          nix develop --command sh -c '
+            set -e
+            make -s -j2 CC="$NATIVE_CC" AR=ar unit
+            make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test
+          '
+
       - name: Test Rust package
         run: nix build --print-build-logs .#checks.aarch64-darwin.rust
 
