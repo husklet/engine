@@ -196,7 +196,17 @@ static int forward_signal(const char *self, const char *guest, int signal_number
     }
     while (used < 5) {
         ssize_t count = read(descriptors[0], output + used, 5 - used);
-        if (count <= 0) { close(descriptors[0]); hl_activation_process_destroy(process); return 8; }
+        if (count <= 0) {
+            int read_errno = errno;
+            hl_engine_exit early = {.abi = HL_ENGINE_ABI, .size = sizeof(early)};
+            hl_status wait_status = hl_activation_wait(process, &early);
+            fprintf(stderr,
+                    "external-term diag: read=%ld errno=%d used=%zu wait_status=%d kind=%u guest_status=%d\n",
+                    (long)count, read_errno, used, (int)wait_status, (unsigned)early.kind, early.guest_status);
+            close(descriptors[0]);
+            hl_activation_process_destroy(process);
+            return 8;
+        }
         used += (size_t)count;
     }
     if (memcmp(output, "READY", 5) != 0) {
