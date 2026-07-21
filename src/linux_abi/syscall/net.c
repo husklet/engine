@@ -1791,6 +1791,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // sendmsg/recvmsg -- translate Linux msghdr -> macOS
     case 212: {
         uint8_t *g = (uint8_t *)a1;
+        // The msghdr struct itself is read (iov ptr/count, name, control, flags) AND written back (recvmsg's
+        // namelen/controllen/flags) directly through `g`; a NULL or unmapped msghdr pointer would fault the
+        // engine on the very first field access below. Validate it up front so a bad pointer yields EFAULT
+        // (like the kernel's copy_from_user), matching the sendmmsg/recvmmsg array guard. Linux msghdr is 56 B.
+        if (guest_bad_ptr((uintptr_t)a1, 56)) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         uint64_t giov_count = *(uint64_t *)(g + 24);
         struct iovec rebased_iov[1024];
         struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
