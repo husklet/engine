@@ -1940,6 +1940,18 @@ static void *translate_block(uint64_t gpc) {
     if (g_stitch < 0) g_stitch = 1;
     uint64_t seen[TRACE_MAX_BLK];
     int nseen = 0, trace_blk = 0;
+    // opt4 conditional-stitch budget: each conditional fall-through laid inline is a SPECULATION -- the
+    // guest may instead take the (chain-exit) branch, leaving the inlined tail dead. Deadness compounds
+    // per conditional passed (measured on sqlite: depth-1 fall-throughs 28% never-executed, rising to
+    // >85% by the 6th). Unconditional `b` edges follow the guaranteed path and are NOT budgeted, so
+    // straight-line/loop-body traces still stitch freely; only chains of hard-to-predict conditionals are
+    // cut. Ending a region early is always semantics-preserving: intermediate block-starts are never
+    // registered in g_map, so the truncated successor self-heals as an on-demand fresh translation via the
+    // ordinary chain-exit path (identical to the NOSTITCH baseline, just re-anchored deeper).
+    int ncond = 0;
+#ifndef STITCH_MAX_COND
+#define STITCH_MAX_COND 3
+#endif
     // SMC precise gate (line-granular source set): record every 64B guest line this block is actually
     // decoded from, AS WE DECODE, instead of marking the whole contiguous [start,guest_end) hull after the
     // loop (see txpg_mark). For an opt4-stitched superblock the hull also spans the address GAPS between
@@ -1952,7 +1964,7 @@ static void *translate_block(uint64_t gpc) {
     // post-loop guard.
     uint64_t tx_last_line = ~UINT64_C(0);
 #define STITCH_OK                                                                                                      \
-    (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 &&                                          \
+    (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&              \
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
@@ -2126,6 +2138,7 @@ static void *translate_block(uint64_t gpc) {
                 stitch_cond(in ^ 1u, taken);
                 seen[nseen++] = fall;
                 trace_blk++;
+                ncond++;
                 gpc = fall;
                 continue;
             }
@@ -2178,6 +2191,7 @@ static void *translate_block(uint64_t gpc) {
                 stitch_cond(in ^ (1u << 24), taken);
                 seen[nseen++] = fall;
                 trace_blk++;
+                ncond++;
                 gpc = fall;
                 continue;
             }
@@ -2249,6 +2263,7 @@ static void *translate_block(uint64_t gpc) {
                 stitch_cond(in ^ (1u << 24), taken);
                 seen[nseen++] = fall;
                 trace_blk++;
+                ncond++;
                 gpc = fall;
                 continue;
             }
