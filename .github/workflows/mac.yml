@@ -14,14 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Core build + host-service + gates. Fast (~30-40min); no compat corpus here.
   mac:
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: DeterminateSystems/nix-installer-action@v20
-
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
@@ -30,16 +29,8 @@ jobs:
       - name: Test C package
         run: nix build --print-build-logs .#checks.aarch64-darwin.package
 
-      # The darwin `nix build` check above builds+installs only (doCheck = false in
-      # flake.nix). The `make unit` and `make package-test` suites run the engine and
-      # its host-service tests, which need resources the Nix build sandbox denies
-      # (opening "/", scratch files under a fixed /tmp path, JIT execution of guest
-      # binaries, and localhost DNS). Run them here, outside the sandbox, exactly like
-      # the test-macos and compat steps below. Split into two steps so a failure's step
-      # name identifies which suite regressed.
-      # AR=ar forces the host (macOS) archiver: the dev shell exports AR pointing at
-      # the linux cross-ar for the guest engine builds, which would otherwise archive
-      # build/lib as a linux object and break linking of the host unit/package binaries.
+      # doCheck=false on darwin, so run the runtime suites unsandboxed here (they need "/",
+      # "/tmp", JIT, localhost DNS). AR=ar forces the host archiver over the dev-shell cross-ar.
       - name: Test C unit suite
         timeout-minutes: 25
         run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
@@ -53,23 +44,7 @@ jobs:
 
       - name: Test macOS host services
         timeout-minutes: 30
-        # Runs unsandboxed (unlike the `nix build` package check) so the host-service
-        # integration tests can open "/", "/tmp", and resolve localhost DNS.
         run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos'
-
-      - name: Test macOS compatibility
-        timeout-minutes: 70
-        shell: bash
-        run: |
-          set -o pipefail
-          if ! nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-compat' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
-            message=$(tail -c 1500 runtime.log)
-            message=${message//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            echo "::error title=macOS runtime compatibility failed::$message"
-            exit 1
-          fi
 
       - name: Run e2e gates
         timeout-minutes: 30
@@ -78,3 +53,40 @@ jobs:
       - name: Package Rust crate
         timeout-minutes: 20
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
+
+  # Runtime compatibility suites, split across parallel runners so wall-clock is the
+  # slowest bucket (~20-25min) instead of the ~70min sequential `make e2e-compat`.
+  # Each bucket builds compat-engines (a prereq of every compat-* target) then its suites.
+  mac-compat:
+    runs-on: macos-26
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        bucket:
+          - compat-abi-corpus
+          - compat-abi compat-core compat-isa-x86-64 compat-completeness
+          - compat-network compat-ipc compat-syscall compat-syscall-edges compat-libc
+          - compat-filesystem compat-threads compat-memory compat-process compat-procfs
+          - compat-isolation compat-posix compat-signals compat-soak compat-time
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compat suites
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" ${{ matrix.bucket }}' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+            message=$(tail -c 1500 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            echo "::error title=macOS compat (${{ matrix.bucket }}) failed::$message"
+            exit 1
+          fi
