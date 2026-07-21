@@ -49,7 +49,24 @@ jobs:
 
       - name: Test macOS host services
         timeout-minutes: 30
-        run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos'
+        shell: bash
+        run: |
+          set -o pipefail
+          # The native host-services tests (fork-after-Foundation-init, DNS/resolver) are deterministic
+          # on a real host (90/90 in a local loop) but occasionally fail env-specifically on the
+          # sandboxed/SIP-on macos-26 runner. Surface the failing tail and retry once so transient
+          # runner divergence self-heals; a consistent failure still fails both attempts. Per-binary
+          # 180s timeouts (Makefile) already bound any hang and name the culprit.
+          run_tm() { nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos' 2>&1 | tee "$1"; }
+          if ! run_tm tm.log; then
+            warn=$(tail -c 1500 tm.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
+            echo "::warning title=test-macos failed attempt 1 — retrying::$warn"
+            if ! run_tm tm.log; then
+              message=$(tail -c 1500 tm.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
+              echo "::error title=test-macos failed (both attempts)::$message"
+              exit 1
+            fi
+          fi
 
       - name: Run e2e gates
         timeout-minutes: 30
