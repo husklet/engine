@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -63,6 +64,19 @@ int main(void) {
     printf("sendmsg_badhdr=%d\n", probe(SYS_sendmsg, sk, BAD, 0, 0, 0));
     printf("recvmsg_nullhdr=%d\n", probe(SYS_recvmsg, sk, 0, 0, 0, 0));
     printf("recvmsg_badhdr=%d\n", probe(SYS_recvmsg, sk, BAD, 0, 0, 0));
+    // rt-signal family with a wild siginfo/sigset/timeout pointer: these handlers are serviced IN the engine
+    // (they read the sigset/siginfo/timeout struct through the guest pointer directly), so a wild pointer
+    // must surface the kernel's copy_{from,to}_user EFAULT rather than faulting the engine (sig=11). The
+    // kernel copies the struct in/out before it does anything else, so a bad pointer EFAULTs regardless of
+    // the tgid/sig args. A real sigset backs the timeout probe so the fault is on the timeout, not the set.
+    sigset_t rtset;
+    sigemptyset(&rtset);
+    sigaddset(&rtset, SIGRTMIN);
+    long self = getpid();
+    printf("rt_sigqueueinfo_badinfo=%d\n", probe(SYS_rt_sigqueueinfo, self, SIGRTMIN, BAD, 0, 0));
+    printf("rt_tgsigqueueinfo_badinfo=%d\n", probe(SYS_rt_tgsigqueueinfo, self, self, SIGRTMIN, BAD, 0));
+    printf("rt_sigtimedwait_badset=%d\n", probe(SYS_rt_sigtimedwait, BAD, 0, 0, 8, 0));
+    printf("rt_sigtimedwait_badtimeout=%d\n", probe(SYS_rt_sigtimedwait, (long)&rtset, 0, BAD, 8, 0));
     // wait4 with a wild status pointer: the kernel reaps the zombie, THEN faults on the put_user of the
     // status word (a re-wait returns ECHILD -- the child is already gone), so the syscall returns EFAULT.
     // A handler that writes the status through the guest pointer without validating it faults the engine
