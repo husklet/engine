@@ -216,6 +216,30 @@ int hl_host_process_fd_private_add(int fd) {
 int hl_host_process_fd_private_floor(void) {
     struct rlimit limit;
     if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -errno;
+#if defined(__APPLE__)
+    /* macOS defaults RLIMIT_NOFILE's soft limit to 256 -- far below the engine's private-fd reserve, so the
+     * host fd table exhausts and open() fails EMFILE, surfacing as HL_STATUS_RESOURCE_LIMIT (e.g. a fresh
+     * macos runner failed open_relative("/")). An fd-hoisting runtime must raise its own soft limit. macOS
+     * rejects RLIM_INFINITY for NOFILE, so aim at a high finite target and back off until the kernel accepts
+     * it. Idempotent: a later call already sees the raised soft limit and does nothing. Kept macOS-only so
+     * the Linux guest-visible fd limit (derived from this floor) is unchanged. */
+    if (limit.rlim_cur != RLIM_INFINITY) {
+        rlim_t target = (limit.rlim_max == RLIM_INFINITY || limit.rlim_max > (rlim_t)(1u << 18))
+                            ? (rlim_t)(1u << 18)
+                            : limit.rlim_max;
+        while (target > limit.rlim_cur) {
+            struct rlimit raised = limit;
+            raised.rlim_cur = target;
+            if (setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+                limit.rlim_cur = target;
+                break;
+            }
+            rlim_t next = target / 2;
+            if (next <= limit.rlim_cur) break;
+            target = next;
+        }
+    }
+#endif
     /* Split the native descriptor namespace into a low guest interval and a high private interval.  The
      * old `host_limit - 4096` floor accidentally capped all typed host handles at 4096 even when the host
      * offered hundreds of thousands of descriptors; MySQL's table cache can legitimately cross that
