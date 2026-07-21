@@ -722,6 +722,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     case 202:
     case 242: {
+        // accept4 flags: only SOCK_CLOEXEC(0x80000) | SOCK_NONBLOCK(0x800) are defined. Linux
+        // (__sys_accept4) rejects any other bit with EINVAL as its FIRST check -- before the listen
+        // fd is even looked up (so EINVAL wins over EBADF and over a would-be EAGAIN on a nonblocking
+        // listener). Validate here so a junk-bit accept4 doesn't slip through to a real accept().
+        if (nr == 242 && ((int)a3 & ~(0x80000 | 0x800))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         int lfd = (int)a0;
         // accept / accept4
         int pl = (lfd >= 0 && lfd < HL_NFD) ? g_lo_port[lfd] : 0;
