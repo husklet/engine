@@ -2429,20 +2429,26 @@ $(BUILD)/tests/dns-objc-fork-macos: tests/unit/test_dns_objc_fork_macos.m src/li
 test-dns-objc-fork-macos: $(BUILD)/tests/dns-objc-fork-macos
 	$(MAC) $(abspath $<)
 
+# Per-binary wall-clock cap: any single host-services test that hangs (e.g. a fork-after-Foundation-init
+# deadlock, or a blocked DNS/resolver syscall on the CI runner) must fail fast AND name itself, instead of
+# stalling until the job's 30-min step timeout kills the whole suite with no attribution. `timeout` comes
+# from the nix devshell's coreutils (both CI and local host runs go through `nix develop`). Exit 124 = hung.
+MACOS_TEST_TIMEOUT ?= 180
+MACTEST = $(MAC) timeout $(MACOS_TEST_TIMEOUT)
 test-macos: $(BUILD)/tests/macos $(BUILD)/tests/child-macos $(BUILD)/tests/directory-macos $(BUILD)/tests/directory-services-macos $(BUILD)/tests/private-macos $(BUILD)/tests/process-macos $(BUILD)/tests/range-macos $(BUILD)/tests/system-macos $(BUILD)/tests/native-macos $(BUILD)/tests/native-capacity-macos $(BUILD)/tests/resolve-services-macos $(BUILD)/tests/dns-fork-macos $(BUILD)/tests/dns-objc-fork-macos
-	$(MAC) $(abspath $<)
-	$(MAC) $(abspath $(BUILD)/tests/child-macos)
-	$(MAC) $(abspath $(BUILD)/tests/directory-macos)
-	$(MAC) $(abspath $(BUILD)/tests/directory-services-macos)
-	$(MAC) $(abspath $(BUILD)/tests/private-macos)
-	$(MAC) $(abspath $(BUILD)/tests/process-macos)
-	$(MAC) $(abspath $(BUILD)/tests/range-macos)
-	$(MAC) $(abspath $(BUILD)/tests/system-macos)
-	$(MAC) $(abspath $(BUILD)/tests/native-macos)
-	$(MAC) $(abspath $(BUILD)/tests/native-capacity-macos)
-	$(MAC) $(abspath $(BUILD)/tests/resolve-services-macos)
-	$(MAC) $(abspath $(BUILD)/tests/dns-fork-macos)
-	$(MAC) $(abspath $(BUILD)/tests/dns-objc-fork-macos)
+	$(MACTEST) $(abspath $<)
+	$(MACTEST) $(abspath $(BUILD)/tests/child-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/directory-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/directory-services-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/private-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/process-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/range-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/system-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/native-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/native-capacity-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/resolve-services-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/dns-fork-macos)
+	$(MACTEST) $(abspath $(BUILD)/tests/dns-objc-fork-macos)
 
 $(BUILD)/tests/test-log-debug: tests/unit/test_log.c src/core/log.c
 	@mkdir -p $(@D)
