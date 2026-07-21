@@ -1267,6 +1267,16 @@ static int memfd_reg_get_fd(int fd, int *seals) {
 static int memfd_ensure_fd(int fd) {
     if (fd < 0 || fd >= HL_NFD) return 0;
     if (g_memfd_is[fd]) return 1;
+    // Not flagged as a memfd on this fd yet. The only way an unflagged fd can still BE a memfd is if it was
+    // received (SCM_RIGHTS) or inherited (fork/exec) after being created+sealed elsewhere -- and every such
+    // memfd is recorded (dev/ino) in the fork-shared registry by memfd_create / F_ADD_SEALS. So if the
+    // registry is empty (or not yet mapped in this process), no fd anywhere can match the dev/ino lookup
+    // below: skip the per-write fstat(2) probe entirely. This is a pure fast path -- memfd_reg_get_fd would
+    // return "not found" (0) in exactly these states -- and it makes every write(2)/pwrite/writev/ftruncate
+    // to a NON-memfd fd (pipe/socket/file) one host fstat cheaper. A sealed memfd that is SCM-passed must
+    // have been created+sealed before the fork that shares it, so the receiver sees a NON-empty registry and
+    // still runs the full lookup below -- F_SEAL_WRITE stays enforced (see ipc_scm_memfd_seal).
+    if (g_memfd_reg == NULL || g_memfd_reg->n == 0) return 0;
     int seals = 0;
     if (!memfd_reg_get_fd(fd, &seals)) return 0;
     g_memfd_is[fd] = 1;
