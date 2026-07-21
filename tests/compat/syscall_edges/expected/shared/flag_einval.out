@@ -8,3 +8,4 @@ signalfd4_badsize_errno=22
 accept4_badflag_errno=22
 accept4_goodflag_errno=11
 socketpair_badtype_errno=22 socket_badtype_errno=22
+pvm_readv_ok=1 pvm_readv_badflag_errno=22 pvm_writev_badflag_errno=22

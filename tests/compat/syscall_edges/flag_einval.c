@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #ifndef __NR_close_range
 #define __NR_close_range 436
@@ -69,5 +70,16 @@ int main(void) {
     long spr = syscall(SYS_socketpair, AF_UNIX, SOCK_STREAM | 0x10, 0, (long)spair);
     printf("socketpair_badtype_errno=%d socket_badtype_errno=%d\n",
            spr == -1 ? errno : 0, ec(SYS_socket, AF_UNIX, SOCK_STREAM | 0x10, 0, 0, 0));
+
+    // process_vm_readv/writev: the 6th arg `flags` must be 0 -- no flags are defined, so any non-zero value is
+    // EINVAL, and the kernel checks it before importing the iovecs (so even valid iovecs still fail). A valid
+    // flags==0 call round-trips the bytes.
+    char pvm_src[8] = "abcd", pvm_dst[8] = {0};
+    struct iovec lv = {pvm_dst, 4}, rv = {pvm_src, 4};
+    long pg = syscall(SYS_process_vm_readv, getpid(), (long)&lv, 1L, (long)&rv, 1L, 0L);
+    long pb = syscall(SYS_process_vm_readv, getpid(), (long)&lv, 1L, (long)&rv, 1L, 1L);
+    long pw = syscall(SYS_process_vm_writev, getpid(), (long)&lv, 1L, (long)&rv, 1L, 7L);
+    printf("pvm_readv_ok=%d pvm_readv_badflag_errno=%d pvm_writev_badflag_errno=%d\n",
+           pg == 4 && __builtin_memcmp(pvm_dst, "abcd", 4) == 0, pb == -1 ? errno : 0, pw == -1 ? errno : 0);
     return 0;
 }
