@@ -1205,6 +1205,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // Carry si_code + si_value to the guest handler's siginfo, then raise the signal to the guest.
     case 240: {
         int sig = (int)a2;
+        // The kernel copy_from_user()s the whole siginfo up front, so a bad (or NULL) user pointer is
+        // -EFAULT, never a fault in the engine -- guard the direct deref below to match (as case 138 does).
+        if (!host_range_mapped((uintptr_t)a3, 128)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (sig >= 1 && sig <= 64 && a3) {
             g_sigcode[sig] = *(int *)(a3 + 8);      // siginfo.si_code
             g_sigval[sig] = *(uint64_t *)(a3 + 24); // siginfo.si_value (sival_int/ptr)

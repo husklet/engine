@@ -231,6 +231,13 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 // QUEUE every instance for a realtime signal (glibc sigqueue). The user siginfo already
                 // holds si_code (SI_QUEUE), si_pid/si_uid (the sender), and si_value.
         int sig = (int)a1;
+        // The kernel copy_from_user()s the whole siginfo before it does anything else, so a bad (or NULL)
+        // user pointer is -EFAULT (never a fault in the caller). Guard the direct deref below to match --
+        // guest_bad_ptr also catches a guest PROT_NONE guard page, as sigaltstack (case 132) does.
+        if (guest_bad_ptr((uintptr_t)a2, 128)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (sig >= 1 && sig <= 64 && a2) {
             int code = *(int *)(a2 + 8);            // siginfo.si_code
             int pid = *(int *)(a2 + 16);            // siginfo.si_pid
@@ -386,6 +393,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
     // -EAGAIN on timeout. Poll g_pending against `set` in short slices (the in-process model has no
     // single host primitive that covers both host-delivered and raise_guest_signal-injected pendings).
     case 137: {
+        // The kernel copies the sigset and (if present) the timeout in from userspace up front, and writes
+        // the dequeued siginfo out on success -- a bad pointer to any of the three is -EFAULT, never a fault
+        // in the caller. Guard the direct derefs below to match (guest_bad_ptr also catches a PROT_NONE guard
+        // page, as sigaltstack/rt_sigqueueinfo do). A NULL set is not a valid mask (kernel copy_from_user).
+        if (guest_bad_ptr((uintptr_t)a0, 8) || (a1 && guest_bad_ptr((uintptr_t)a1, 128)) ||
+            (a2 && guest_bad_ptr((uintptr_t)a2, 16))) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
         uint64_t set = a0 ? *(uint64_t *)a0 : 0; // guest sigset_t (bit signo-1)
         struct timespec *to = (struct timespec *)a2;
         const hl_host_services *host = effective_host_services();
