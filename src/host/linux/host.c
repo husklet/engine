@@ -2260,6 +2260,7 @@ static hl_host_result hl_linux_directory_remove(void *context, hl_host_handle in
     }
     result = inotify_rm_watch(entry->descriptor, slot->watch);
     slot->active = 0;
+    slot->watch = -1; /* free the slot so the `watch < 0` scan in add_watch reuses it */
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
