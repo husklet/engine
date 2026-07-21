@@ -2139,6 +2139,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     G_RET(c) = (uint64_t)(int64_t)pr;
                     break;
                 } // -errno / -EINTR
+                if (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    break;
+                }
                 if (a1) *(int *)a1 = st;
                 G_RET(c) = (uint64_t)pr;
                 break;
@@ -2185,6 +2189,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     ts_wait_leave();
                     if (pr < 0) {
                         G_RET(c) = (uint64_t)(int64_t)pr;
+                        goto wait_done;
+                    }
+                    if (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         goto wait_done;
                     }
                     if (a1) *(int *)a1 = st;
@@ -2235,7 +2243,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // Fill the guest's Linux-layout rusage from the reaped child's host accounting (kilobyte-scaled).
         if (a3 && r > 0) rusage_to_linux((uint8_t *)a3, &ruloc);
-        if (a1) *(int *)a1 = st;
+        // status copy_to_user: a non-NULL but unwritable status pointer is -EFAULT, exactly as the kernel's
+        // put_user(status, stat_addr) after the child is already reaped (native wait4 releases the zombie THEN
+        // faults, leaving nothing to re-reap -- verified on aarch64). Guard the direct guest write so a bad
+        // pointer returns EFAULT instead of faulting the engine; the reap-side bookkeeping below still runs.
+        int status_efault = (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int)));
+        if (a1 && !status_efault) *(int *)a1 = st;
         // guest-pid namespace: a reaped child that TERMINATED (exited or signalled -- not merely stopped
         // 0x7f / continued 0xffff) leaves the pid table; drop its container-registry record here so a
         // signal-killed child (which never ran its own exit cleanup) can't leave a stale membership marker
@@ -2251,7 +2264,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 r = (pid_t)gp;
             }
         }
-        G_RET(c) = (uint64_t)r;
+        G_RET(c) = status_efault ? (uint64_t)(int64_t)(-EFAULT) : (uint64_t)r;
     wait_done:; // the EINTR reroute jumps here (G_RET + *status already set)
         break;
     }
