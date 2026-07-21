@@ -449,14 +449,29 @@ static void fdvis_init(const hl_host_services *host) {
     g_fdvis = arena;
     g_fdvis_control = (void *)((unsigned char *)arena + sizeof(struct fdvis_slot) * FDVIS_N);
     (void)atexit(proc_fdvis_cleanup);
+    // Enumerate this process's open descriptors ONCE and publish the non-engine-private ones. Each
+    // hl_host_process_fds() call is a full /proc/self/fd getdents scan whose kernel cost is O(highest open
+    // fd); the engine keeps its internal descriptors at the high private floor (65536+), so a scan is ~1.2ms.
+    // The prior count-then-fill idiom paid that scan TWICE. A generous on-stack buffer captures every real
+    // descriptor in a single scan (an engine launch has a handful of inherited fds, far below the floor);
+    // only a pathological overflow falls back to the exact two-pass path, so behavior is unchanged.
+    hl_host_process_fd inline_entries[128];
     size_t count = 0;
-    if (hl_host_process_fds(getpid(), NULL, 0, &count)) {
-        hl_host_process_fd *entries = count ? calloc(count, sizeof(*entries)) : NULL;
-        if ((!count || entries) && hl_host_process_fds(getpid(), entries, count, &count))
-            for (size_t index = 0; index < count; ++index)
-                if ((entries[index].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) == 0)
-                    (void)proc_fdvis_publish_native_fd(entries[index].descriptor);
-        free(entries);
+    if (hl_host_process_fds(getpid(), inline_entries, sizeof inline_entries / sizeof *inline_entries, &count)) {
+        hl_host_process_fd *entries = inline_entries;
+        hl_host_process_fd *heap = NULL;
+        if (count > sizeof inline_entries / sizeof *inline_entries) {
+            // Rare: more open descriptors than the inline buffer. Re-scan into an exact heap buffer.
+            heap = calloc(count, sizeof(*heap));
+            if (heap && hl_host_process_fds(getpid(), heap, count, &count))
+                entries = heap;
+            else
+                count = sizeof inline_entries / sizeof *inline_entries; // publish what the inline scan captured
+        }
+        for (size_t index = 0; index < count; ++index)
+            if ((entries[index].flags & HL_HOST_PROCESS_FD_ENGINE_PRIVATE) == 0)
+                (void)proc_fdvis_publish_native_fd(entries[index].descriptor);
+        free(heap);
     }
 }
 
