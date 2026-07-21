@@ -1152,6 +1152,7 @@ static void *translate_block(uint64_t gpc) {
     // W3-A superblock state: guest block-starts already laid in this region + region budget.
     uint64_t seen[HL_X86_TRACE_MAX_BLOCKS];
     int nseen = 0, trace_blk = 0;
+    int ncond = 0; /* opt4: conditional-jcc fall-throughs stitched inline so far in this region */
     seen[nseen++] = start;
     // Exact fault-PC provenance: record, per memory-accessing guest instruction, the host code range it
     // compiled to and its guest RIP, so a synchronous SIGSEGV/SIGBUS inside translated code recovers the
@@ -1160,9 +1161,20 @@ static void *translate_block(uint64_t gpc) {
     // range at the next loop top, once g_cp has advanced past its emitted code); flushed after the loop.
     uint64_t prov_host = 0, prov_guest = 0;
     int prov_mem = 0;
+    // opt4 conditional-stitch budget (mirrors the aarch64 translator): each conditional-jcc fall-through
+    // laid inline is a SPECULATION -- the guest may instead take the (chain-exit) branch, leaving the
+    // inlined tail dead. Deadness compounds per conditional passed (measured on x86 translation-heavy
+    // workloads: 22-36% of decoded instructions sit at stitch-depth >= 3). Unconditional `jmp` edges follow
+    // the guaranteed path and are NOT budgeted, so straight-line/loop-body traces still stitch freely; only
+    // chains of hard-to-predict conditionals are cut. Ending a region early is always semantics-preserving:
+    // intermediate block-starts are never registered in g_map, so the truncated successor self-heals as an
+    // on-demand fresh translation via the ordinary chain-exit path (identical to NOSTITCH, re-anchored).
+#ifndef STITCH_MAX_COND
+#define STITCH_MAX_COND 3
+#endif
 #define STITCH_OK                                                                                                    \
     (stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < HL_X86_TRACE_MAX_BLOCKS - 1 &&                               \
-     (size_t)((uint8_t *)g_cp - (uint8_t *)host) < HL_X86_TRACE_MAX_BYTES)
+     ncond < STITCH_MAX_COND && (size_t)((uint8_t *)g_cp - (uint8_t *)host) < HL_X86_TRACE_MAX_BYTES)
     for (;;) {
         if (g_itrace && gpc != start) {
             if (g_fl_pending) flags_materialize(); // materialize before boundary
@@ -1846,6 +1858,7 @@ static void *translate_block(uint64_t gpc) {
                     if (parity) e_nzcv_load(); // inline fall: restore before continuing
                     seen[nseen++] = fall;
                     trace_blk++;
+                    ncond++;
                     gpc = fall;
                     continue;
                 }
@@ -3930,6 +3943,7 @@ static void *translate_block(uint64_t gpc) {
                     if (parity) e_nzcv_load(); // inline fall: restore before continuing
                     seen[nseen++] = fall;
                     trace_blk++;
+                    ncond++;
                     gpc = fall;
                     continue;
                 }
