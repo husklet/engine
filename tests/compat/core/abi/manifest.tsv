@@ -16,6 +16,7 @@ fpdnan	compat	fpdnan.c	fpdnan.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expect
 repmovsdf	compat	repmovsdf.c	repmovsdf.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/repmovsdf.out	x86-df,rep-movs	active	exact x86-only source; deterministic replacement for native oracle
 x87m80	compat	x87m80.c	x87m80.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/x87m80.out	x87,m80	active	exact x86-only source; deterministic replacement for native oracle
 shldflags	compat	shldflags.c	shldflags.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/shldflags.out	x86-shld-shrd,flags	active	exact x86-only source; deterministic replacement for native oracle
+btwidth	compat	btwidth.c	btwidth.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/btwidth.out	x86-bt-bts-btr-btc	active	exact x86-only source; BT-family register-dest width preservation (16-bit keeps bits 63:16)
 stolen-regs	compat	stolen_regs.c	stolen_regs.c	aarch64	-static-pie -O2 -pthread -lm	-	-	0	expected/stolen_regs.out	aarch64-register-mangling	active	exact AArch64-only source; deterministic replacement for native oracle
 heap	libc	heap.c	heap.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/heap.out	linux-libc,heap	active	exact source; deterministic replacement for native oracle
 qsort	libc	qsort.c	qsort.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/qsort.out	linux-libc,qsort	active	exact source; deterministic replacement for native oracle

@@ -319,7 +319,7 @@ CORE_ABI_BOTH := hello math strings bitops varargs longjmp recursion fnptr jumpt
 	heap qsort files statfile pipe mmapanon munmap_partial regex globmatch strtod timefmt environ atexit \
 	sigaction2 sigjmp sortbig
 CORE_ABI_AARCH64 := $(CORE_ABI_BOTH) stolen_regs
-CORE_ABI_X86_64 := $(CORE_ABI_BOTH) moffs fpedge fpdnan repmovsdf x87m80 shldflags
+CORE_ABI_X86_64 := $(CORE_ABI_BOTH) moffs fpedge fpdnan repmovsdf x87m80 shldflags btwidth
 CORE_ABI_BINS := $(CORE_ABI_AARCH64:%=$(BUILD)/compat/core/abi/aarch64/%) \
 	$(CORE_ABI_X86_64:%=$(BUILD)/compat/core/abi/x86_64/%)
 CORE_WORKLOAD_BOTH := busyloop ibtc_dispatch bigmem bigarr soak_codecache soak_indirect soak_threadchurn \
