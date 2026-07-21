@@ -54,7 +54,9 @@ int main(void) {
         HL_CHECK(process.start_time_ns / UINT64_C(1000000000) == process.start_time_seconds);
     }
 
-    /* independent parse of /proc/self/stat to cross-check field decoding. */
+    /* independent parse of /proc/self/stat to cross-check field decoding (Linux procfs only;
+     * macOS has no /proc, and its hl_host_process_read derives the same fields from libproc). */
+#if defined(__linux__)
     {
         FILE *self = fopen("/proc/self/stat", "r");
         char raw[8192];
@@ -75,6 +77,7 @@ int main(void) {
         HL_CHECK(process.start_time_seconds >= first.boot_time_seconds &&
                  process.start_time_seconds <= (uint64_t)time(NULL));
     }
+#endif
     char temporary[] = "/tmp/hl-system-XXXXXX";
     int file = mkstemp(temporary);
     int pipes[2];
