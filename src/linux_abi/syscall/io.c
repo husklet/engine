@@ -820,6 +820,62 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 64: {
         int wfd = (int)a0;
+        // eventfd write is hoisted to the very top of the write handler: an eventfd fd is disjoint from every
+        // fd type the checks below probe (oom_score_adj text file, memfd, netlink, dns, icmp, udp, memf), so
+        // routing it here changes no behavior -- but it skips the memfd_seals_fd() probe further down, which
+        // fstat(2)s the fd on EVERY write to detect a memfd (an eventfd is never cached as one, so it paid a
+        // full host fstat per write). This is the eventfd write hot path's dominant non-syscall overhead.
+        if (wfd >= 0 && wfd < HL_NFD && g_eventfd_peer[wfd]) {
+            int eslot = eventfd_counter_slot(wfd);
+            // eventfd_write rejects any size other than exactly 8 (fs/eventfd.c uses count != sizeof).
+            // This is asymmetric with the read path, which accepts count >= 8, so a 9- or 16-byte write
+            // must NOT be admitted (and must not add to the counter) the way a 9/16-byte read is served.
+            if (a2 != 8) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            // a1 is a raw guest pointer we read directly -> validate before the deref (covers NULL too)
+            if (!host_range_mapped((uintptr_t)a1, 8)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            uint64_t add = *(uint64_t *)a1;
+            if (add == 0xffffffffffffffffULL) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            // Counter bump + pipe re-signal held together under g_eventfd_lock so a concurrent read()'s
+            // drain (or a peer write) can never strand the pipe readable-with-count-0 / empty-with-count>0
+            // (the event-loop spin / lost-wakeup root cause -- see the _eventfd-atomicity_ note in vfs.c).
+            pthread_mutex_lock(&g_eventfd_lock);
+            // Linux caps the counter at ULLONG_MAX-1 (0xfffffffffffffffe). A write that would overflow that
+            // maximum does NOT wrap: a nonblocking eventfd returns EAGAIN and leaves the counter unchanged
+            // (a blocking one sleeps until a reader makes room -- an extreme edge hl does not model, so it
+            // also returns EAGAIN rather than silently wrapping the counter to zero and losing wake state).
+            if (add > 0xfffffffffffffffeULL - g_eventfd_count[eslot]) {
+                pthread_mutex_unlock(&g_eventfd_lock);
+                G_RET(c) = (uint64_t)(-EAGAIN);
+                break;
+            }
+            g_eventfd_count[eslot] += add;
+            // Linux wakes epoll edge-triggered waiters on EVERY write, not just the 0->positive transition.
+            // A waker eventfd that is never drained (mio/tokio's cross-thread wakeup) would otherwise lose
+            // its 2nd and later wakeups: the backing pipe already holds a byte, so an EV_CLEAR kqueue filter
+            // never re-fires and a blocked epoll_wait hangs forever. Drain the pipe to exactly one fresh byte
+            // so each write produces a new readable edge, bounded even when the reader never keeps up.
+            if (add > 0) {
+                // The read end is permanently O_NONBLOCK, so drain to exactly one fresh byte with no flag
+                // toggle. The old toggle mutated the cross-process-shared fd flags and a concurrent reader in
+                // another process observed the transient O_NONBLOCK -> spurious EAGAIN.
+                char buf[64];
+                while (read(wfd, buf, sizeof buf) > 0) {}
+                char b = 1;
+                if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {}
+            }
+            pthread_mutex_unlock(&g_eventfd_lock);
+            G_RET(c) = 8;
+            break;
+        }
         // /proc/self/oom_score_adj is guest-visible process state, not a
         // writable view of the host process. Parse the complete decimal value
         // and update the synthetic file so reads through this open description
@@ -898,58 +954,6 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)allowed);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-            break;
-        }
-        // eventfd write: ADD to the counter (not a raw pipe write); regenerate the readable edge.
-        if (wfd >= 0 && wfd < HL_NFD && g_eventfd_peer[wfd]) {
-            int eslot = eventfd_counter_slot(wfd);
-            // eventfd_write rejects any size other than exactly 8 (fs/eventfd.c uses count != sizeof).
-            // This is asymmetric with the read path, which accepts count >= 8, so a 9- or 16-byte write
-            // must NOT be admitted (and must not add to the counter) the way a 9/16-byte read is served.
-            if (a2 != 8) {
-                G_RET(c) = (uint64_t)(-EINVAL);
-                break;
-            }
-            // a1 is a raw guest pointer we read directly -> validate before the deref (covers NULL too)
-            if (!host_range_mapped((uintptr_t)a1, 8)) {
-                G_RET(c) = (uint64_t)(-EFAULT);
-                break;
-            }
-            uint64_t add = *(uint64_t *)a1;
-            if (add == 0xffffffffffffffffULL) {
-                G_RET(c) = (uint64_t)(-EINVAL);
-                break;
-            }
-            // Counter bump + pipe re-signal held together under g_eventfd_lock so a concurrent read()'s
-            // drain (or a peer write) can never strand the pipe readable-with-count-0 / empty-with-count>0
-            // (the event-loop spin / lost-wakeup root cause -- see the _eventfd-atomicity_ note in vfs.c).
-            pthread_mutex_lock(&g_eventfd_lock);
-            // Linux caps the counter at ULLONG_MAX-1 (0xfffffffffffffffe). A write that would overflow that
-            // maximum does NOT wrap: a nonblocking eventfd returns EAGAIN and leaves the counter unchanged
-            // (a blocking one sleeps until a reader makes room -- an extreme edge hl does not model, so it
-            // also returns EAGAIN rather than silently wrapping the counter to zero and losing wake state).
-            if (add > 0xfffffffffffffffeULL - g_eventfd_count[eslot]) {
-                pthread_mutex_unlock(&g_eventfd_lock);
-                G_RET(c) = (uint64_t)(-EAGAIN);
-                break;
-            }
-            g_eventfd_count[eslot] += add;
-            // Linux wakes epoll edge-triggered waiters on EVERY write, not just the 0->positive transition.
-            // A waker eventfd that is never drained (mio/tokio's cross-thread wakeup) would otherwise lose
-            // its 2nd and later wakeups: the backing pipe already holds a byte, so an EV_CLEAR kqueue filter
-            // never re-fires and a blocked epoll_wait hangs forever. Drain the pipe to exactly one fresh byte
-            // so each write produces a new readable edge, bounded even when the reader never keeps up.
-            if (add > 0) {
-                // The read end is permanently O_NONBLOCK, so drain to exactly one fresh byte with no flag
-                // toggle. The old toggle mutated the cross-process-shared fd flags and a concurrent reader in
-                // another process observed the transient O_NONBLOCK -> spurious EAGAIN.
-                char buf[64];
-                while (read(wfd, buf, sizeof buf) > 0) {}
-                char b = 1;
-                if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {}
-            }
-            pthread_mutex_unlock(&g_eventfd_lock);
-            G_RET(c) = 8;
             break;
         }
         hl_fdcache_fd_evict(wfd);
