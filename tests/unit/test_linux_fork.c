@@ -100,8 +100,8 @@ int main(void) {
     hl_host_services services;
     hl_host_file_services files;
     hl_linux_abi abi;
-    hl_linux_fd_entry fds[16];
-    hl_linux_ofd_entry ofds[16];
+    hl_linux_fd_entry fds[16] = {0};
+    hl_linux_ofd_entry ofds[16] = {0};
     hl_linux_fork_record records[16];
     hl_linux_fork_plan plan = {
         .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};

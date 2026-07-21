@@ -182,8 +182,8 @@ int main(void) {
     hl_fake_host fake;
     hl_host_services services;
     hl_linux_abi abi;
-    hl_linux_fd_entry fds[16];
-    hl_linux_ofd_entry ofds[16];
+    hl_linux_fd_entry fds[16] = {0};
+    hl_linux_ofd_entry ofds[16] = {0};
     provider_root root = {0};
     provider *state = calloc(1, sizeof(*state));
     int64_t fd;

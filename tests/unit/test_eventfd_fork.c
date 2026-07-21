@@ -33,8 +33,8 @@ int main(void) {
     hl_test_host *host;
     hl_host_services services;
     hl_linux_abi linux_abi;
-    hl_linux_fd_entry fds[32];
-    hl_linux_ofd_entry ofds[32];
+    hl_linux_fd_entry fds[32] = {0};
+    hl_linux_ofd_entry ofds[32] = {0};
     child_context context;
     hl_host_handle process;
     hl_host_result waited;

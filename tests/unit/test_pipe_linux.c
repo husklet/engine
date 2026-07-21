@@ -34,8 +34,8 @@ int main(void) {
     hl_host_linux *host;
     hl_host_services services;
     hl_linux_abi linux_abi;
-    hl_linux_fd_entry fds[32];
-    hl_linux_ofd_entry ofds[32];
+    hl_linux_fd_entry fds[32] = {0};
+    hl_linux_ofd_entry ofds[32] = {0};
     hl_linux_fd pipe[2];
     char bytes[8] = {0};
     int64_t writer;

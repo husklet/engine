@@ -427,8 +427,8 @@ static void *read_one_byte(void *opaque) {
 int main(void) {
     hl_host_services services;
     hl_linux_abi linux_abi;
-    hl_linux_fd_entry fds[8];
-    hl_linux_ofd_entry ofds[8];
+    hl_linux_fd_entry fds[8] = {0};
+    hl_linux_ofd_entry ofds[8] = {0};
     hl_linux_fd original;
     hl_linux_fd duplicate;
     hl_linux_fd_snapshot snapshot;

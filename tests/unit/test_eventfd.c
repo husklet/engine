@@ -9,8 +9,8 @@ int main(void) {
     hl_fake_host fake;
     hl_host_services services;
     hl_linux_abi linux_abi;
-    hl_linux_fd_entry fds[32];
-    hl_linux_ofd_entry ofds[32];
+    hl_linux_fd_entry fds[32] = {0};
+    hl_linux_ofd_entry ofds[32] = {0};
     uint64_t value;
     int64_t fd;
     int64_t copy;
