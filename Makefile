@@ -12,6 +12,20 @@ DEBUG ?= 0
 MAC ?= $(if $(filter Darwin,$(shell uname -s)),env,mac)
 CODESIGN ?= codesign
 PERF_WARMUPS ?= 3
+
+# The engine JIT uses a dual-mapped cache (a plain anon RW region with an RX alias
+# made executable via mach_vm_remap + VM_PROT_EXECUTE, see jit/cache.c). On macOS
+# that RX alias is non-MAP_JIT executable memory, so a full-security (SIP-on /
+# hardened) mac -- e.g. the macos-26 CI runner -- SIGKILLs any process that runs
+# the engine unless it is codesigned with packaging/macos/jit.entitlements
+# (allow-jit + allow-unsigned-executable-memory + disable-executable-page-protection).
+# The e2e gate binaries are already signed this way; the unit test binaries link the
+# same engine and JIT, so they need the same signature. No-op off macOS.
+ifeq ($(HOST),macos)
+JIT_SIGN = $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f
+else
+JIT_SIGN = true
+endif
 PERF_SAMPLES ?= 25
 PERF_HEAVY_SAMPLES ?= 7
 PERF_OP_SAMPLES ?= 7
@@ -2324,6 +2338,7 @@ endif
 
 define HL_UNIT_RULE
 run-unit-$(1): $(BUILD)/tests/test_$(1)
+	$(JIT_SIGN) $$<
 	$$<
 endef
 
