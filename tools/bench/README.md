@@ -158,3 +158,26 @@ translator, so Rosetta beating hl there is expected. Read amd64 only as
 "hl vs qemu vs Rosetta at x86 translation".
 
 `results/` is generated output and is gitignored.
+
+## Caveat: "beats native" is a kernel-shortcut artifact, not faster code
+
+Some phases show hl **faster than native** (ratio < 1 vs native). This is NOT
+"translated code runs faster than native code" — it is hl doing *less work* by
+servicing the operation in userspace and avoiding the kernel round-trip native
+pays. These are **not representative** of real workloads:
+
+- **syscall** (gettid loop): hl answers from cached thread identity in-engine —
+  no kernel trap. Only trivially-cacheable syscalls (gettid/getpid) benefit.
+- **file** (pwrite/pread on an unlinked temp): the unlink-while-open makes it an
+  anonymous RAM-backed memf, so read/write become memcpy — the real VFS/
+  page-cache/kernel path is skipped. A real on-disk file would not beat native.
+- **signal** (self-raised SIGALRM): delivered via hl's in-engine machinery,
+  lighter than the full kernel signal path.
+
+Real work — an actual disk write, real cross-process IPC, a syscall hl must
+forward to the host kernel — cannot be short-circuited and will NOT beat native.
+
+**The honest "runs at native speed" result is the CPU-bound rows**
+(compute/intdiv/atomics/memory/tlb ≈ 1.0x native): once translated, the emitted
+code executes at native speed. Read the syscall/signal/file sub-1.0 numbers as
+"in-process emulation shortcut," not as a translation-speed win.
