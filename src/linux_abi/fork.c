@@ -226,14 +226,21 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     // stale/empty RX. Same hook a guest fork runs (proc.c fork_child_hooks); inheriting these warm
     // translations intact is the whole point of a warm worker. Also sheds the parent's thread registry
     // + reinits the engine locks a dead peer could have held (jit_after_fork).
-    if (!jit_after_fork()) _exit(70);
+    // Only a WARM runner (same binary as the prewarm) may inherit the parent's block map: a cold
+    // runner running a DIFFERENT guest would mis-dispatch the prewarmed binary's cached blocks at
+    // colliding guest PCs. Warm runners get preserve=1 (inherit the prewarmed arena, skip re-translate);
+    // cold runners keep the proven preserve=0 fresh-arena path.
+    int warm = g_warm_ready && argc >= 1 && strcmp(argv[0], g_wprog) == 0;
+    g_fsrv_preserve = warm;    // inherit the resident parent's prewarmed arena (warm fork-server runner only)
+    int fsrv_pres_ok = jit_after_fork();
+    g_fsrv_preserve = 0;       // a GUEST fork inside this runner must use the preserve=0 nested-fork cure
+    if (!fsrv_pres_ok) _exit(70);
     // wave-2 discipline: this process is a fork child on a COW copy of the PARENT's arena +
     // recording state -- it must NEVER pcache_save under the request binary's identity. A guest
     // execve re-keys + lifts the bar (pcache_exec_reload), same as any other fork child.
     g_pcache_forked = 1;
     g_noexit = 0; // the parent's prewarm shim must not leak in: guest exit_group _exits normally
 
-    int warm = g_warm_ready && argc >= 1 && strcmp(argv[0], g_wprog) == 0;
     if (warm) {
         // Restore the pristine writable image over the COW-inherited (prewarm-dirtied) copy, so the
         // guest starts from byte-identical initial memory -- then re-run from the same entry/base.
