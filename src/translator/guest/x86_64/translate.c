@@ -822,6 +822,101 @@ static int emit_parity_jcc_cond(int lo) {
 
 #include "lower/sse4x.h"
 
+// Gather the 16 byte-MSBs of vm into the low 16 bits of GPR `dst` (the proven sse2neon
+// _mm_movemask_epi8 cascade). Scratch: host v17 and GPR x16 -- so `dst` must not be 16 and the
+// caller must not need v17 preserved. Used by the PCMP*STR* fast path below (movemask of the
+// pcmpeqb / cmeq-zero lanes) and mirrors the pmovmskb lowering.
+static void emit_pmovmask(int vm, int dst) {
+    e_vshr_imm(17, vm, 8, 7, 0);                        // ushr v17.16b, vm.16b, #7
+    emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17); // usra v17.8h, v17.8h, #7
+    emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17); // usra v17.4s, v17.4s, #14
+    emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17); // usra v17.2d, v17.2d, #28
+    emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);   // umov w16, v17.b[0]
+    emit32(0x0E003C00u | (17u << 16) | (17 << 5) | dst);  // umov wdst, v17.b[8]
+    e_rrr(A_ORR, dst, 16, dst, 0, 8);                     // orr wdst, w16, wdst, lsl #8
+}
+
+// PCMPISTRI (0F3A 63), implicit-length EQUAL-EACH byte form -- the exact idiom glibc's SSE4.2
+// strcmp/strncmp run once per 16 bytes. Emitting it inline (no dispatcher round-trip, no C
+// softmulator, no full spill/reload) is ~20x faster than the R_SSE3B exit on the same data.
+// Bit-for-bit mirror of avx.c's sse42_ilen/sse42_intres(agg=2)/sse42_index/sse42_flags, with the
+// imm8 control (polarity bits [5:4], index-direction bit 6) resolved at TRANSLATE time. `av`/`bv`
+// are the host vector regs holding operand1/operand2 (guest xmm == host v). Writes guest RCX (host
+// x1), ARM NZCV (+ cpu->nzcv membank), and cpu->pf/af. Scratch: x16,x17,x19..x26,x20; v17..v21.
+static void emit_pcmpistri_eqeach_byte(int av, int bv, int imm) {
+    int neg = imm & 0x10, masked = imm & 0x20, msb = imm & 0x40;
+    // per-byte comparisons into vector scratch v18/v19/v21 (v17 is the movemask scratch)
+    emit32(0x6E208C00u | (bv << 16) | (av << 5) | 18); // cmeq v18.16b, av, bv  -> op1[i]==op2[i]
+    emit32(0x4E209800u | (av << 5) | 19);              // cmeq v19.16b, av, #0  -> op1[i]==0 (nulls)
+    emit32(0x4E209800u | (bv << 5) | 21);              // cmeq v21.16b, bv, #0  -> op2[i]==0 (nulls)
+    emit_pmovmask(18, 19);                             // w19 = eqmask
+    emit_pmovmask(19, 21);                             // w21 = op1 null mask
+    emit_pmovmask(21, 24);                             // w24 = op2 null mask
+    // la/lb = index of first null (implicit length), or 16 when none: ctz(mask | 0x10000)
+    e_movz(16, 1, 1);               // x16 = 0x10000 (sentinel bit @16)
+    e_rrr(A_ORR, 17, 21, 16, 0, 0); // w17 = op1nulls | 0x10000
+    e_rbit(17, 17, 0);
+    e_clz(22, 17, 0); // la = ctz(...) -> w22
+    e_rrr(A_ORR, 17, 24, 16, 0, 0); // w17 = op2nulls | 0x10000
+    e_rbit(17, 17, 0);
+    e_clz(23, 17, 0); // lb -> w23
+    // valid-lane masks va=(1<<la)-1, vb=(1<<lb)-1  (la,lb in [0,16] -> fits 32-bit, 16 -> 0xFFFF)
+    e_movz(16, 1, 0); // w16 = 1
+    e_shv(S_LSLV, 25, 16, 22, 0);
+    e_subi(25, 25, 1, 0); // va -> w25
+    e_shv(S_LSLV, 26, 16, 23, 0);
+    e_subi(26, 26, 1, 0); // vb -> w26
+    // equal-each IntRes1 = (eqmask & va & vb) | ~(va|vb)   (both-valid: use eq; both-invalid: 1; else 0)
+    e_rrr(A_AND, 17, 19, 25, 0, 0); // w17 = eqmask & va
+    e_rrr(A_AND, 17, 17, 26, 0, 0); // w17 = eqmask & (va&vb)
+    e_rrr(A_ORR, 16, 25, 26, 0, 0); // w16 = va | vb
+    e_rrr(A_ORN, 17, 17, 16, 0, 0); // w17 = (eq & both_valid) | ~(va|vb)
+    e_uxt(17, 17, 2);               // IntRes1 &= 0xFFFF (uxth: width in BYTES)
+    // polarity (imm[5:4]) -> IntRes2 (w17); imm resolved at translate time
+    if (neg) {
+        if (masked)
+            e_rrr(A_EOR, 17, 17, 26, 0, 0); // negate only valid op2 lanes (^ vb)
+        else {
+            e_movz(16, 0xFFFF, 0);
+            e_rrr(A_EOR, 17, 17, 16, 0, 0); // negate all 16 lanes
+        }
+        e_uxt(17, 17, 2); // uxth: mask IntRes2 to 16 bits
+    }
+    // index (imm[6]) -> guest RCX (host x1), zero-extended
+    if (!msb) {                       // least-significant set bit, else n(=16)
+        e_movz(16, 1, 1);             // x16 = 0x10000
+        e_rrr(A_ORR, 16, 17, 16, 0, 0);
+        e_rbit(16, 16, 0);
+        e_clz(1, 16, 0); // RCX = ctz(IntRes2 | 0x10000) -> 16 when IntRes2==0
+    } else {             // most-significant set bit, else n
+        e_clz(16, 17, 0);
+        e_movz(25, 31, 0);
+        e_rrr(A_SUB, 16, 25, 16, 0, 0); // w16 = 31 - clz (msb index; -1 when IntRes2==0)
+        e_subi_s(31, 17, 0, 0);         // cmp IntRes2, #0
+        e_movz(25, 16, 0);
+        e_csel(1, 25, 16, 0, 0); // RCX = (IntRes2==0) ? 16 : msb
+    }
+    // flags: N=SF=(la<16), Z=ZF=(lb<16), C=(NOT x86CF)=(IntRes2==0), V=OF=IntRes2&1; PF=0, AF=0
+    e_movz(20, 0, 0);
+    e_subi_s(31, 22, 16, 0);
+    e_cset(16, 3, 0);
+    e_rrr(A_ORR, 20, 20, 16, 0, 31); // SF<<31 (LO: la<16)
+    e_subi_s(31, 23, 16, 0);
+    e_cset(16, 3, 0);
+    e_rrr(A_ORR, 20, 20, 16, 0, 30); // ZF<<30 (lb<16)
+    e_subi_s(31, 17, 0, 0);
+    e_cset(16, 0, 0);
+    e_rrr(A_ORR, 20, 20, 16, 0, 29); // (NOT CF)<<29 (EQ: IntRes2==0)
+    e_movz(25, 1, 0);
+    e_rrr(A_AND, 16, 17, 25, 0, 0);
+    e_rrr(A_ORR, 20, 20, 16, 0, 28); // OF<<28 (IntRes2 bit0)
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20);        // msr nzcv, x20
+    e_movz(16, 1, 0);
+    e_str(16, 28, OFF_PF); // cpu->pf = 1  => x86 PF = 0 (matches sse42_flags)
+    e_str(31, 28, OFF_AF); // cpu->af = 0
+}
+
 // SSE2 variable-count packed shift (PSLLW/D/Q, PSRLW/D/Q, PSRAW/D by xmm/m): shift every
 // `esize`-bit lane of `vn` by the SCALAR count held in the low 64 bits of `vs`, result -> `vd`.
 // x86 saturates the count: any count >= esize yields 0 (logical) or the sign bit replicated
@@ -1230,6 +1325,25 @@ static void *translate_block(uint64_t gpc) {
             // per-block exits in openssl's stitched CTR loop. AESKEYGENASSIST is handled by crypto.c.
             const hl_x86_sse4x_state sse4x_state = {.optimize = !nosseopt()};
             if (hl_x86_lower_sse4x(&I, next, &sse4x_state) == TX_NEXT) {
+                gpc = next;
+                continue;
+            }
+            // perf: PCMPISTRI (0F3A 63) in its implicit-length EQUAL-EACH byte form is the SSE4.2 strcmp
+            // hot loop (one `pcmpistri` per 16 bytes). The generic R_SSE3B exit below softmulates it via a
+            // full dispatcher round-trip PER INSTRUCTION -- measured ~20x slower than glibc's SSE2 fallback
+            // on identical data (the single biggest x86 string pathology). Emit it inline instead (native
+            // NEON cmeq + movemask + bit math), bit-for-bit identical to the C reference. Only this exact
+            // shape is lowered (agg==equal-each, byte, implicit length); every other PCMP*STR* form falls
+            // through to the correctness-first C path. imm[0]=0 (byte), imm[3:2]=10b (equal-each); imm[1]
+            // (signed/unsigned) is masked out -- it does not affect an equality comparison.
+            if (I.map3 == 3 && I.op == 0x63 && !nosseopt() && (I.imm & 0x0D) == 0x08) {
+                int bv = 16;
+                if (I.is_mem) {
+                    emit_ea(&I, next);
+                    g_ldr_q(16, 17, 0); // op2 (r/m128) -> v16
+                } else
+                    bv = I.rm_reg; // op2 = guest xmm (host v)
+                emit_pcmpistri_eqeach_byte(I.reg, bv, (int)I.imm);
                 gpc = next;
                 continue;
             }
