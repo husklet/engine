@@ -87,7 +87,12 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                 // this via the true cmask in e_rot_flags_cl). Pass width (>1) as the count when ce==0 so
                 // OF stays untouched (undefined for a multi-bit rotate; it can never be a 1-bit rotate).
                 int mc = rc & 0x1f;
-                if (mc) e_rot_flags_const(16, k, width, ce ? ce : width);
+                // Dead-flag elision: an IMMEDIATE ROL/ROR only ever writes CF (and OF for a 1-bit
+                // rotate) -- SF/ZF/PF/AF are left untouched. When the whole architectural flag output
+                // is provably dead before any read at every successor (state->output_flags_dead, the
+                // same guest-byte liveness scan the SHL/SHR path uses), skip the CF/OF synthesis
+                // entirely; the rotated value in x16 is final. NOSHIFTFLAGELIDE=1 forces the gate off.
+                if (mc && !state->output_flags_dead) e_rot_flags_const(16, k, width, ce ? ce : width);
             }
             rm_store(I, w, 16); // stores low w bytes
             return TX_NEXT;
@@ -180,7 +185,11 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             int rwidth = ssf ? 64 : 32;
             if (bycl)
                 e_rot_flags_cl(16, k, rwidth);
-            else if (cnt != 0)
+            // Dead-flag elision (immediate ROL/ROR, widths 32/64): CF (and OF for a 1-bit rotate) are
+            // the only flags written; when the whole flag output is provably dead at every successor
+            // (state->output_flags_dead) skip the CF/OF synthesis -- the value in x16 is final. This is
+            // the hot path for `rol $imm, r64` in tight compute loops. NOSHIFTFLAGELIDE=1 gates it off.
+            else if (cnt != 0 && !state->output_flags_dead)
                 e_rot_flags_const(16, k, rwidth, cnt);
             rm_store(I, w, 16);
             return TX_NEXT;
