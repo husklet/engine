@@ -1310,7 +1310,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     if (!(f == f) || f >= 2147483648.0f || f < -2147483648.0f)
                         r = (int32_t)0x80000000; // integer indefinite
                     else
-                        r = (int32_t)(pp == 3 ? __builtin_truncf(f) : __builtin_rintf(f));
+                        r = (int32_t)(pp == 2 ? __builtin_truncf(f) : __builtin_rintf(f)); // F3(pp==2)=truncate, 66(pp==1)=round
                     memcpy(d + i, &r, 4);
                 }
             }

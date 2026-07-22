@@ -1386,6 +1386,48 @@ static void emit_vcmp_lane(int out, int a, int b, int p, int dbl) {
     }
 }
 
+// ---- packed float32 (.4s) -> int32 (.4s) with x86 out-of-range/NaN "integer indefinite" (0x80000000).
+// ARM FCVTZS saturates (NaN->0, +ovf->INT_MAX, -ovf->INT_MIN); x86 yields 0x80000000 for NaN and ANY
+// overflow. -ovf already lands on INT_MIN==0x80000000 (matches), so only NaN and +ovf (f>=2^31) need
+// fixing. Compute the NEON result, then blend 0x80000000 into every lane where (f>=2^31 OR f is NaN).
+// `trunc`=1 truncates (FCVTZS direct); trunc=0 rounds under the current FPCR.RMode (== guest MXCSR.RC,
+// threaded by ldmxcsr) via FRINTI, then FCVTZS the now-integral value.
+//   c2p31 = 2^31 as f32 (0x4F000000) broadcast; cindef = 0x80000000 broadcast; t1,t2 scratch.
+static void emit_ps2dq_128(int out, int sf, int trunc, int c2p31, int cindef, int t1, int t2) {
+    if (trunc) {
+        emit32(0x4EA1B800u | (sf << 5) | out); // FCVTZS.4s out, sf   (round toward zero)
+    } else {
+        emit32(0x6EA19800u | (sf << 5) | out);  // FRINTI.4s out, sf  (round to integral, current mode)
+        emit32(0x4EA1B800u | (out << 5) | out); // FCVTZS.4s out, out (integral value -> exact)
+    }
+    emit32(0x6E20E400u | (c2p31 << 16) | (sf << 5) | t1); // FCMGE.4s t1, sf, 2^31   (all-ones where f>=2^31)
+    emit32(0x4E20E400u | (sf << 16) | (sf << 5) | t2);    // FCMEQ.4s t2, sf, sf      (all-ones where NOT NaN)
+    emit32(0x6E205800u | (t2 << 5) | t2);                 // MVN t2                   (all-ones where NaN)
+    e_v3(0x4EA01C00u, t1, t1, t2);                        // ORR t1 = fixup mask (>=2^31 OR NaN)
+    e_v3(0x6E601C00u, t1, cindef, out);                   // BSL t1 = mask ? 0x80000000 : out
+    e_vmov(out, t1);
+}
+
+// ---- packed float64 (.2d) -> int32, one 128-bit source (2 doubles). Produces r = FCVTZS.2d int64 lanes
+// and m = per-64-bit fixup mask (all-ones where the x86 result must be 0x80000000: f>=2^31 OR f<-2^31 OR
+// NaN). Unlike the ps case BOTH overflow directions need the fixup, because the subsequent int64->int32
+// narrowing (XTN) would otherwise wrap a saturated INT64 bound to garbage. `trunc`=1 truncates, else
+// rounds under current FPCR.RMode. c2p31d/cneg2p31d = +/-2^31 as f64 broadcast; t1 scratch.
+static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int cneg2p31d, int t1) {
+    if (trunc) {
+        emit32(0x4EE1B800u | (sd << 5) | r); // FCVTZS.2d r, sd
+    } else {
+        emit32(0x6EE19800u | (sd << 5) | r); // FRINTI.2d r, sd
+        emit32(0x4EE1B800u | (r << 5) | r);  // FCVTZS.2d r, r
+    }
+    emit32(0x6E60E400u | (c2p31d << 16) | (sd << 5) | m);      // FCMGE.2d m, sd, 2^31       (f>=2^31)
+    emit32(0x6EE0E400u | (sd << 16) | (cneg2p31d << 5) | t1);  // FCMGT.2d t1, -2^31, sd     (-2^31 > f)
+    e_v3(0x4EA01C00u, m, m, t1);                               // ORR m |= (f < -2^31)
+    emit32(0x4E60E400u | (sd << 16) | (sd << 5) | t1);         // FCMEQ.2d t1, sd, sd        (NOT NaN)
+    emit32(0x6E205800u | (t1 << 5) | t1);                      // MVN t1                     (NaN)
+    e_v3(0x4EA01C00u, m, m, t1);                               // ORR m |= NaN
+}
+
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
 // to the R_AVX do_avx exit). Correctness-first: only a vetted, bit-exact-vs-qemu subset is claimed here.
 static int avx_lower(struct insn *I, uint64_t next) {
@@ -1868,6 +1910,206 @@ static int avx_lower(struct insn *I, uint64_t next) {
             emit32(0x6E202800u | (24 << 5) | 24);
             emit32(0x6E602800u | (24 << 5) | 24);
             emit32(0x6EA02800u | (24 << 5) | 24);
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vcvtdq2ps(NP) / vcvtps2dq(66,round) / vcvttps2dq(F3,trunc): packed 32-bit int<->float, same lane
+    // count. NP -> SCVTF.4s (rounds under current FPCR.RMode == guest MXCSR.RC, matching x86/qemu). The
+    // float->int forms saturate on ARM but x86 yields 0x80000000 for NaN/overflow -- emit_ps2dq_128 blends
+    // that in. 2-operand (src = r/m; vvvv unused). Verified bit-exact vs qemu over normal/rounding/negative/
+    // zero/>INT_MAX/<INT_MIN/NaN/+-inf, 128 and 256, reg and mem. (pp==3/F2 is not a valid 0x5B -> do_avx.)
+    if (map == 1 && op == 0x5B && pp <= 2) {
+        mark_vdirty();
+        int src = s2r, srch = 20;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        if (l256) { if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); }
+        if (pp == 0) { // cvtdq2ps
+            emit32(0x4E21D800u | (src << 5) | 23);                  // SCVTF.4s v23, src
+            if (l256) emit32(0x4E21D800u | (srch << 5) | 24);      // SCVTF.4s v24, src.hi
+        } else {       // cvtps2dq(pp==1 round) / cvttps2dq(pp==2 trunc)
+            int trunc = (pp == 2);
+            e_movconst(16, 0x4F000000u); emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 2^31 (f32)
+            e_movconst(16, 0x80000000u); emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x80000000
+            emit_ps2dq_128(23, src, trunc, 25, 26, 27, 28);
+            if (l256) emit_ps2dq_128(24, srch, trunc, 25, 26, 27, 28);
+        }
+        e_vmov(d, 23);
+        if (l256) avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vcvtps2pd(NP, widen 4f32->4f64) / vcvtpd2ps(66, narrow 4f64->4f32): packed float widen/narrow.
+    // FCVTL/FCVTL2 (single->double is always exact) and FCVTN/FCVTN2 (double->single rounds under current
+    // FPCR.RMode, and inf/overflow saturate to inf exactly as x86). 2-operand (src=r/m). The scalar ss/sd
+    // forms (F3/F2, pp>=2) fall to do_avx. Verified bit-exact vs qemu, 128 and 256, reg and mem.
+    if (map == 1 && op == 0x5A && pp < 2) {
+        mark_vdirty();
+        int src = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        if (pp == 0) { // ps->pd: low 2 floats (and, for 256, high 2) widen to doubles
+            emit32(0x0E617800u | (src << 5) | 23);              // FCVTL.2d  v23, src.2s
+            if (l256) emit32(0x4E617800u | (src << 5) | 24);   // FCVTL2.2d v24, src.4s
+            e_vmov(d, 23);
+            if (l256) avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {       // pd->ps: 2 (or 4 for 256) doubles narrow to floats, all landing in the low 128
+            emit32(0x0E616800u | (src << 5) | 23);             // FCVTN.2s v23, src.2d  (low 2 floats)
+            if (l256) {
+                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // src.hi
+                emit32(0x4E616800u | (20 << 5) | 23);          // FCVTN2.4s v23, src.hi.2d (high 2 floats)
+            }
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vcvtdq2pd(F3, int32->f64 widen) / vcvttpd2dq(66,trunc) / vcvtpd2dq(F2,round): 32-bit int <-> f64.
+    // dq2pd: SXTL/SXTL2 int32->int64 then SCVTF.2d (exact). pd2dq: round/trunc to int64 then narrow to int32
+    // (XTN/XTN2), with x86's 0x80000000 indefinite blended per emit_pd2i32_pieces. 2-operand (src=r/m).
+    // Verified bit-exact vs qemu over the same corner set (incl overflow/NaN), 128 and 256, reg and mem.
+    // (pp==0/NP is not a valid 0xE6 -> do_avx.)
+    if (map == 1 && op == 0xE6 && pp >= 1) {
+        mark_vdirty();
+        int src = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        if (pp == 2) { // cvtdq2pd: int32 -> double (exact widen)
+            emit32(0x0F20A400u | (src << 5) | 23);   // SXTL.2d  v23, src.2s
+            emit32(0x4E61D800u | (23 << 5) | 23);    // SCVTF.2d v23, v23
+            if (l256) {
+                emit32(0x4F20A400u | (src << 5) | 24); // SXTL2.2d v24, src.4s (high 2 int32)
+                emit32(0x4E61D800u | (24 << 5) | 24); // SCVTF.2d v24, v24
+            }
+            e_vmov(d, 23);
+            if (l256) avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else { // pd->dq: cvttpd2dq(pp==1 trunc) / cvtpd2dq(pp==3 round)
+            int trunc = (pp == 1);
+            e_movconst(16, 0x41E0000000000000ull); emit32(0x4E080C00u | (16 << 5) | 25); // v25.2d = 2^31 (f64)
+            e_movconst(16, 0xC1E0000000000000ull); emit32(0x4E080C00u | (16 << 5) | 26); // v26.2d = -2^31
+            e_movconst(16, 0x80000000u);           emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x80000000
+            // Compute the int64 results + per-64 fixup masks for BOTH halves first (they consume the +/-2^31
+            // consts in v25/v26), THEN narrow -- the narrow step reuses v25 for the packed 32-bit mask.
+            emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28); // lo: r=v22, mask=v18
+            if (l256) {
+                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // src.hi
+                emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28); // hi: r=v23, mask=v19
+            }
+            emit32(0x0EA12800u | (22 << 5) | 24);   // XTN.2s  v24, v22  (low 2 int32)
+            emit32(0x0EA12800u | (18 << 5) | 25);   // XTN.2s  v25, v18  (low 2 mask lanes)
+            if (l256) {
+                emit32(0x4EA12800u | (23 << 5) | 24); // XTN2.4s v24, v23 (high 2 int32)
+                emit32(0x4EA12800u | (19 << 5) | 25); // XTN2.4s v25, v19 (high 2 mask lanes)
+            }
+            e_v3(0x6E601C00u, 25, 27, 24);          // BSL v25 = mask ? 0x80000000 : result
+            e_vmov(d, 25);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpermilps imm (VEX.66.0F3A.W0 04 /r ib): per-128-lane dword permute, dst.dword[j] <-
+    // src.dword[imm[2j+1:2j]]. Single source (r/m); same imm applied to both 128-bit lanes. Resolved to 4
+    // INS.s per lane (== the vpshufd lowering, float lanes). Verified bit-exact vs qemu, 128+256, reg+mem.
+    if (map == 3 && op == 0x04 && pp == 1) {
+        int imm = I->imm & 0xFF;
+        mark_vdirty();
+        int src = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        for (int j = 0; j < 4; j++) e_ins_s(23, j, src, (imm >> (2 * j)) & 3);
+        if (l256) {
+            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            for (int j = 0; j < 4; j++) e_ins_s(24, j, 20, (imm >> (2 * j)) & 3);
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpermilpd imm (VEX.66.0F3A.W0 05 /r ib): per-128-lane qword permute; dst.qword[k] <-
+    // src.qword[imm bit], consecutive imm bits across the (up to 4) qwords. Single source. 2 INS.d per lane.
+    if (map == 3 && op == 0x05 && pp == 1) {
+        int imm = I->imm & 0xFF;
+        mark_vdirty();
+        int src = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        e_ins_d(23, 0, src, imm & 1);
+        e_ins_d(23, 1, src, (imm >> 1) & 1);
+        if (l256) {
+            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            e_ins_d(24, 0, 20, (imm >> 2) & 1);
+            e_ins_d(24, 1, 20, (imm >> 3) & 1);
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpermilps var (VEX.66.0F38.W0 0C /r): per-128-lane dword permute by a vector control. data=vvvv,
+    // control=r/m; dst.dword[j] = data.dword[ctrl.dword[j] & 3] within each 128-bit lane. Lowered to a
+    // per-lane TBL over the lane's 16-byte data: idx = (ctrl&3)*4 + {0,1,2,3} byte pattern. Verified vs qemu.
+    if (map == 2 && pp == 1 && op == 0x0C) {
+        mark_vdirty();
+        int ctl = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); ctl = 16; }
+        e_movconst(16, 3);          emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 3
+        e_movconst(16, 0x01010101); emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x01010101
+        e_movconst(16, 0x03020100); emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x03020100
+        e_v3(0x4E201C00u, 28, ctl, 25);                    // sel = ctrl & 3
+        e_vshl_imm(28, 28, 32, 2);                         // base = sel*4
+        e_v3(0x4EA09C00u, 28, 28, 26);                     // rep  = base*0x01010101
+        e_v3(0x4E208400u, 28, 28, 27);                     // idx  = rep + {0,1,2,3}
+        emit32(0x4E000000u | (28 << 16) | (s1 << 5) | 23); // TBL v23.16b, {data.lo}, idx
+        if (l256) {
+            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);          // data.hi
+            e_v3(0x4E201C00u, 28, 20, 25);
+            e_vshl_imm(28, 28, 32, 2);
+            e_v3(0x4EA09C00u, 28, 28, 26);
+            e_v3(0x4E208400u, 28, 28, 27);
+            emit32(0x4E000000u | (28 << 16) | (21 << 5) | 24); // TBL v24, {data.hi}, idx
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpermilpd var (VEX.66.0F38.W0 0D /r): per-128-lane qword permute by a vector control. data=vvvv,
+    // control=r/m; dst.qword[k] = data.qword[(ctrl.qword[k]>>1)&1] within each 128-bit lane. Only two source
+    // qwords, so lower as: A=dup(data.q0), B=dup(data.q1), mask = sign-replicate(ctrl bit1) per 64, BSL.
+    if (map == 2 && pp == 1 && op == 0x0D) {
+        mark_vdirty();
+        int ctl = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); ctl = 16; }
+        emit32(0x4E080400u | (s1 << 5) | 25);   // DUP v25.2d, data.d[0]  (A = both lanes = q0)
+        emit32(0x4E180400u | (s1 << 5) | 26);   // DUP v26.2d, data.d[1]  (B = both lanes = q1)
+        e_vshl_imm(28, ctl, 64, 62);            // bring ctrl bit1 to bit63 of each qword
+        e_vshr_imm(28, 28, 64, 63, 1);          // SSHR -> all-ones where bit1 set
+        e_v3(0x6E601C00u, 28, 26, 25);          // BSL v28 = mask ? B(q1) : A(q0)
+        e_vmov(23, 28);
+        if (l256) {
+            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);   // data.hi
+            emit32(0x4E080400u | (21 << 5) | 25);
+            emit32(0x4E180400u | (21 << 5) | 26);
+            e_vshl_imm(28, 20, 64, 62);
+            e_vshr_imm(28, 28, 64, 63, 1);
+            e_v3(0x6E601C00u, 28, 26, 25);
+            e_vmov(24, 28);
             e_vmov(d, 23);
             avx_cpu_str_q(24, OFF_VHI + 16 * d);
         } else {
