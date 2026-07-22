@@ -2166,9 +2166,30 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie $< -o $@
 
+# combined-bench: single-process, self-timing multi-phase guest. The SAME
+# source builds for both arches (portable timer picks cntvct on aarch64,
+# CLOCK_MONOTONIC elsewhere). The sqlite phase is opt-in per arch via
+# COMBINED_BENCH_SQLITE_<arch> (needs a static libsqlite3 for that arch); it is
+# on for aarch64 (host has libsqlite3.a) and off for the x86_64 cross build.
+# A native x86_64 cell can enable it with COMBINED_BENCH_SQLITE_x86_64=1.
+COMBINED_BENCH_SQLITE_aarch64 ?= 1
+COMBINED_BENCH_SQLITE_x86_64 ?= 0
+COMBINED_SQLITE_CPP_1 := -DHL_BENCH_SQLITE
+COMBINED_SQLITE_CPP_0 :=
+COMBINED_SQLITE_LIBS_1 := -lsqlite3 -lm -ldl -lpthread
+COMBINED_SQLITE_LIBS_0 :=
+
 $(BUILD)/perf/combined-bench-aarch64: tests/perf/combined_bench.c
 	@mkdir -p $(@D)
-	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -o $@
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 \
+		$(COMBINED_SQLITE_CPP_$(COMBINED_BENCH_SQLITE_aarch64)) \
+		$< -o $@ $(COMBINED_SQLITE_LIBS_$(COMBINED_BENCH_SQLITE_aarch64))
+
+$(BUILD)/perf/combined-bench-x86_64: tests/perf/combined_bench.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 \
+		$(COMBINED_SQLITE_CPP_$(COMBINED_BENCH_SQLITE_x86_64)) \
+		$< -o $@ $(COMBINED_SQLITE_LIBS_$(COMBINED_BENCH_SQLITE_x86_64))
 
 $(BUILD)/perf/translate-aarch64: tests/perf/translate.c
 	@mkdir -p $(@D)
@@ -2348,6 +2369,39 @@ perf-native-aarch64: $(BUILD)/tools/perf-runner $(BUILD)/e2e/guest-exit-aarch64 
 	$(call HL_PERF_NATIVE,ipc-throughput,$(PERF_WARMUPS),$(PERF_OP_SAMPLES),$(BUILD)/perf/ipc-throughput-aarch64,0)
 	$(BUILD)/perf/resource-aarch64
 
+# ---------------------------------------------------------------------------
+# Fair combined benchmark: one self-timing guest driven identically across
+# backends (orbstack/native, qemu-user, single hl-engine worker, docker). The
+# runner is a pure-C tool (tools/bench_runner.c). Per-phase us are self-timed
+# INSIDE the guest, so process/startup/isolation cost is excluded and the
+# numbers are directly comparable across backends. See tools/bench/README.md.
+# -Wconversion is dropped here: the tool does many benign width conversions.
+$(BUILD)/tools/bench-runner: tools/bench_runner.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -std=gnu11 -Wall -Wextra $< -o $@
+
+BENCH_ARCH ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),arm64,amd64)
+BENCH_REPEATS ?= 5
+BENCH_ENVS ?= orbstack qemu hl-engine
+
+# `make bench`: build both-arch guests + the production engine + the runner,
+# then run the available local backends and print the phase x backend table.
+# docker is left to the Manager (needs a reachable daemon): add it with
+#   make bench BENCH_ENVS='orbstack qemu hl-engine docker' DOCKER='mac docker'
+.PHONY: bench
+bench: $(BUILD)/perf/combined-bench-aarch64 $(BUILD)/perf/combined-bench-x86_64 \
+	$(BUILD)/linux-production/hl-engine-linux-$(if $(filter arm64,$(BENCH_ARCH)),aarch64,x86_64) \
+	$(BUILD)/tools/bench-runner
+	@mkdir -p $(BUILD)/bench
+	@for env in $(BENCH_ENVS); do \
+		$(BUILD)/tools/bench-runner run --env $$env --arch $(BENCH_ARCH) \
+			--repeats $(BENCH_REPEATS) \
+			--engine $(abspath $(BUILD)/linux-production/hl-engine-linux-$(if $(filter arm64,$(BENCH_ARCH)),aarch64,x86_64)) \
+			--out $(BUILD)/bench/$$env-$(BENCH_ARCH).csv || true; \
+	done
+	@echo
+	@$(BUILD)/tools/bench-runner report $(foreach e,$(BENCH_ENVS),$(BUILD)/bench/$(e)-$(BENCH_ARCH).csv)
+
 MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
 	run-unit-pipe_linux run-unit-private run-unit-process run-unit-range run-unit-resolve_services run-unit-system
 ifeq ($(HOST),macos)
@@ -2518,6 +2572,7 @@ help:
 	@echo 'make perf-compat   report repeated end-to-end baseline distributions in C'
 	@echo 'make perf-macos    measure macOS-host startup, compute, syscall, fork, OS-operation, and resource baselines'
 	@echo 'make perf-native-aarch64  measure matching native and resource fixtures on Linux AArch64'
+	@echo 'make bench                fair combined self-timing bench across backends (see tools/bench/README.md)'
 	@echo 'make format-check  enforce the repository clang-format policy'
 
 # Compiler-generated prerequisites keep standalone objects synchronized with public and private headers.

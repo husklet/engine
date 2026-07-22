@@ -1,22 +1,30 @@
 /*
  * combined_bench.c - single-process, self-timing multi-phase benchmark.
  *
- * Runs several workload phases sequentially in ONE process. Each phase is
- * timed FROM INSIDE THE GUEST with the ARM generic timer (cntvct_el0 /
- * cntfrq_el0), so the reported per-phase microseconds reflect only in-guest
- * execution. Engine startup and worker fork are paid once, before any phase
- * runs, and are therefore excluded from every phase measurement.
- *
- * The per-phase logic is ported from tests/perf/{syscall,ops}.c so the work is
- * identical to the existing standalone perf guests.
+ * Runs many workload phases sequentially in ONE process. Each phase is timed
+ * FROM INSIDE THE GUEST: on aarch64 with the ARM generic timer (cntvct_el0 /
+ * cntfrq_el0), and on every other arch (x86_64) with clock_gettime(
+ * CLOCK_MONOTONIC). The SAME source therefore builds and self-times on both
+ * aarch64 and x86_64 cells. The reported per-phase microseconds reflect only
+ * in-guest execution: engine startup and worker fork are paid once, before any
+ * phase runs, and are excluded from every phase measurement. Because the timing
+ * is inside the guest, the per-phase us are directly comparable across backends
+ * (native / qemu-user / hl-engine / docker) -- process/startup/isolation cost is
+ * automatically excluded.
  *
  * Output: one line per phase, e.g.  "PHASE compute us=1234 ok=1"
- * Deterministic, fixed iteration counts, each phase warmed before timing.
+ * Deterministic, fixed iteration counts, each phase warmed before timing. The
+ * "ok" checksum for every phase is deterministic and must be identical across
+ * native/qemu/hl for the same arch, so the comparison is valid.
+ *
+ * The sqlite phase is compiled only when HL_BENCH_SQLITE is defined (it needs a
+ * static libsqlite3 for the target arch); the runner tolerates its absence.
  */
 #define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,19 +33,35 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/* ---- in-guest cycle-counter timing (ARM generic timer) ---- */
+#ifdef HL_BENCH_SQLITE
+#include <sqlite3.h>
+#endif
 
+/* ---- portable in-guest timing ------------------------------------------- *
+ * aarch64: ARM generic timer (cntvct_el0 ticks, cntfrq_el0 Hz).
+ * else   : CLOCK_MONOTONIC nanoseconds (freq == 1e9), so the same source
+ *          self-times on x86_64 too.
+ */
+#if defined(__aarch64__)
 static inline uint64_t timer_count(void) {
     uint64_t v;
     __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
     return v;
 }
-
 static inline uint64_t timer_freq(void) {
     uint64_t v;
     __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(v));
     return v;
 }
+#else
+#include <time.h>
+static inline uint64_t timer_count(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+static inline uint64_t timer_freq(void) { return UINT64_C(1000000000); }
+#endif
 
 static uint64_t g_freq;
 
@@ -66,13 +90,203 @@ static uint64_t phase_compute(void) {
     return acc ^ (uint64_t)f;
 }
 
-/* ---------------- phase: syscall (gettid loop, 1M) ---------------- */
+/* ---------------- phase: integer div/mul-heavy ---------------- */
+
+static uint64_t phase_intdiv(unsigned iters) {
+    uint64_t acc = 0xdeadbeefcafef00dULL;
+    for (unsigned i = 0; i < iters; ++i) {
+        uint64_t x = acc + i + 1;
+        acc += x / (((uint64_t)(i % 1000)) + 3);
+        acc ^= x * UINT64_C(2654435761);
+        acc += x % (((uint64_t)(i % 777)) + 5);
+        acc = acc * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
+    return acc;
+}
+
+/* ---------------- phase: float / SIMD (auto-vectorizes to NEON / SSE) ------- */
+
+static uint64_t phase_float_simd(unsigned iters) {
+    enum { N = 4096 };
+    static float a[N], b[N], c[N];
+    for (int i = 0; i < N; ++i) {
+        a[i] = (float)i * 0.5f + 1.0f;
+        b[i] = (float)i * 0.25f + 2.0f;
+    }
+    uint64_t acc = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        float bias = (float)(it % 1000) * 0.001f;
+        for (int i = 0; i < N; ++i) {
+            c[i] = a[i] * b[i] + bias;
+        }
+        /* Truncate to integer so the checksum is bit-stable across backends. */
+        for (int i = 0; i < N; i += 512) acc += (uint64_t)c[i];
+    }
+    return acc;
+}
+
+/* ---------------- phase: atomics / CAS loop ---------------- */
+
+static uint64_t phase_atomics(unsigned iters) {
+    uint64_t v = 0;
+    for (unsigned i = 0; i < iters; ++i) {
+        uint64_t old, neu;
+        do {
+            old = __atomic_load_n(&v, __ATOMIC_RELAXED);
+            neu = old + ((i & 7) + 1);
+        } while (!__atomic_compare_exchange_n(&v, &old, neu, 0, __ATOMIC_SEQ_CST,
+                                              __ATOMIC_RELAXED));
+        __atomic_fetch_add(&v, 1, __ATOMIC_SEQ_CST);
+    }
+    return v;
+}
+
+/* ---------------- phase: malloc / free churn ---------------- */
+
+static uint64_t phase_malloc(unsigned iters) {
+    enum { SLOTS = 64 };
+    unsigned char *p[SLOTS];
+    memset(p, 0, sizeof(p));
+    uint64_t acc = 0;
+    for (unsigned i = 0; i < iters; ++i) {
+        unsigned s = i % SLOTS;
+        free(p[s]);
+        size_t sz = ((size_t)(i * 37U) % 4096U) + 16U;
+        unsigned char *q = malloc(sz);
+        if (q) {
+            q[0] = (unsigned char)i;
+            q[sz - 1] = (unsigned char)(i >> 3);
+            acc += (uint64_t)q[0] + q[sz - 1];
+        }
+        p[s] = q;
+    }
+    for (int s = 0; s < SLOTS; ++s) free(p[s]);
+    return acc;
+}
+
+/* ---------------- phase: string (strlen / strcmp / memmove) ---------------- */
+
+static uint64_t phase_string(unsigned iters) {
+    enum { LEN = 1024 };
+    static char buf[LEN + 1], buf2[LEN + 1];
+    for (int i = 0; i < LEN; ++i) buf[i] = (char)('a' + (i % 26));
+    buf[LEN] = '\0';
+    uint64_t acc = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        acc += strlen(buf);
+        memmove(buf2, buf, LEN + 1);
+        buf2[it % LEN] = (char)('A' + (it % 26)); /* force a difference */
+        int r = strcmp(buf, buf2);
+        acc += (r > 0) ? 1U : (r < 0) ? 2U : 0U; /* sign only: portable */
+        acc += (unsigned char)buf2[(it * 13U) % LEN];
+    }
+    return acc;
+}
+
+/* ---------------- phase: branch-heavy (unpredictable) ---------------- */
+
+static uint64_t phase_branch(unsigned iters) {
+    uint64_t acc = 0, x = 0x9e3779b97f4a7c15ULL;
+    for (unsigned i = 0; i < iters; ++i) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17; /* xorshift64: data-dependent, unpredictable */
+        if (x & 1) acc += 3;
+        else acc -= 1;
+        if (x & 2) acc ^= x;
+        if ((x & 0xff) > 128) acc += x >> 3;
+        else acc += x >> 5;
+        switch (x & 7) {
+            case 0: acc++; break;
+            case 3: acc += 2; break;
+            case 5: acc += x & 0xf; break;
+            default: acc ^= 1; break;
+        }
+    }
+    return acc;
+}
+
+/* ---------------- phase: function-call-heavy (recursion + indirect) --------- *
+ * Deep recursion stresses return prediction / the engine's stolen-x30 handling,
+ * and the per-iter indirect call stresses the IBTC dispatch path.
+ */
+static uint64_t fib_rec(unsigned n) {
+    if (n < 2) return n;
+    return fib_rec(n - 1) + fib_rec(n - 2);
+}
+typedef uint64_t (*op_fn)(uint64_t, uint64_t);
+static uint64_t op_add(uint64_t a, uint64_t b) { return a + b; }
+static uint64_t op_xor(uint64_t a, uint64_t b) { return a ^ (b << 1); }
+static uint64_t op_mul(uint64_t a, uint64_t b) { return a * (b | 1); }
+static uint64_t op_rot(uint64_t a, uint64_t b) {
+    unsigned s = (unsigned)(b & 63);
+    return (a << s) | (a >> ((64 - s) & 63));
+}
+static op_fn const OPS[4] = {op_add, op_xor, op_mul, op_rot};
+
+static uint64_t phase_calls(unsigned iters) {
+    uint64_t acc = 0;
+    for (unsigned i = 0; i < iters; ++i) {
+        acc += fib_rec(18); /* ~8361 calls each iter */
+        op_fn f = OPS[i & 3]; /* indirect call, rotating target */
+        acc = f(acc, i);
+    }
+    return acc;
+}
+
+/* ---------------- phase: TLB / page-walk (large stride over big array) ------ */
+
+static uint64_t phase_tlb(unsigned iters) {
+    enum { PAGES = 8192 };
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (page == 0) page = 4096;
+    size_t sz = (size_t)PAGES * page;
+    unsigned char *m = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return 0;
+    for (size_t i = 0; i < PAGES; ++i) m[i * page] = (unsigned char)i; /* fault in */
+    uint64_t acc = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        for (size_t i = 0; i < PAGES; ++i) {
+            /* Stride 4099 pages (coprime with PAGES) defeats the TLB. */
+            size_t idx = ((i * 4099U) % PAGES) * page;
+            acc += m[idx];
+            m[idx] = (unsigned char)acc;
+        }
+    }
+    (void)munmap(m, sz);
+    return acc;
+}
+
+/* ---------------- phase: syscall (gettid loop) ---------------- */
 
 static uint64_t phase_syscall(unsigned iters) {
     uint64_t checksum = 0;
     for (unsigned i = 0; i < iters; ++i)
         checksum += (uint64_t)syscall(SYS_gettid);
     return checksum;
+}
+
+/* ---------------- phase: signal delivery (SIGALRM handler count) ------------ *
+ * raise(SIGALRM) synchronously delivers to a counting handler. The count is
+ * deterministic (== iters), and each delivery exercises the engine's full
+ * signal-frame build/restore path -- a real engine cost surface.
+ */
+static volatile sig_atomic_t g_sig_count;
+static void on_sigalrm(int signo) {
+    (void)signo;
+    g_sig_count++;
+}
+
+static uint64_t phase_signal(unsigned iters) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigalrm;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGALRM, &sa, NULL) != 0) return 0;
+    g_sig_count = 0;
+    for (unsigned i = 0; i < iters; ++i) raise(SIGALRM);
+    return (uint64_t)g_sig_count;
 }
 
 /* ---------------- phase: mmap (map / touch / mprotect / unmap) ---------------- */
@@ -159,7 +373,7 @@ static uint64_t phase_pipe(unsigned iters) {
     return ok;
 }
 
-/* ---------------- phase: memory (memcpy + strcmp bandwidth) ---------------- */
+/* ---------------- phase: memory (memcpy + memcmp bandwidth) ---------------- */
 
 static uint64_t phase_memory(unsigned iters) {
     enum { BUF = 1 << 20 }; /* 1 MiB */
@@ -176,13 +390,47 @@ static uint64_t phase_memory(unsigned iters) {
     for (unsigned i = 0; i < iters; ++i) {
         memcpy(b, a, BUF);
         b[i % BUF] = (unsigned char)i; /* defeat memcpy elision */
-        acc += (uint64_t)memcmp(a, b, BUF);
+        int m = memcmp(a, b, BUF);
+        acc += (m > 0) ? 1U : (m < 0) ? 2U : 0U; /* sign only: arch-stable */
         acc += b[(i * 7) % BUF];
     }
     free(a);
     free(b);
     return acc;
 }
+
+/* ---------------- phase: sqlite (in-memory insert/select) ---------------- */
+
+#ifdef HL_BENCH_SQLITE
+static uint64_t phase_sqlite(unsigned iters) {
+    sqlite3 *db;
+    if (sqlite3_open(":memory:", &db)) return 0;
+    char *err = NULL;
+    sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, s TEXT);",
+                 0, 0, &err);
+    sqlite3_exec(db, "BEGIN;", 0, 0, &err);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "INSERT INTO t(v,s) VALUES(?,?)", -1, &st, 0);
+    for (unsigned i = 1; i <= iters; ++i) {
+        char s[32];
+        snprintf(s, sizeof(s), "row-%u", (i * 7U) % 100U);
+        sqlite3_bind_int(st, 1, (int)((i * i) % 1000003U));
+        sqlite3_bind_text(st, 2, s, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "COMMIT;", 0, 0, &err);
+    sqlite3_stmt *q;
+    sqlite3_prepare_v2(db, "SELECT COUNT(*), SUM(v) FROM t", -1, &q, 0);
+    sqlite3_step(q);
+    uint64_t acc = (uint64_t)sqlite3_column_int(q, 0) ^
+                   (uint64_t)sqlite3_column_int64(q, 1);
+    sqlite3_finalize(q);
+    sqlite3_close(db);
+    return acc;
+}
+#endif
 
 /* ---------------- driver ---------------- */
 
@@ -210,7 +458,7 @@ static uint64_t compute_wrap(unsigned iters) {
 int main(void) {
     g_freq = timer_freq();
     if (g_freq == 0) {
-        fprintf(stderr, "cntfrq_el0 is zero\n");
+        fprintf(stderr, "timer freq is zero\n");
         return 1;
     }
     printf("cntfrq=%llu\n", (unsigned long long)g_freq);
@@ -219,10 +467,25 @@ int main(void) {
     /* compute appears twice to expose cold-translation vs warm delta. */
     run_phase("compute_cold", compute_wrap, 0, 0);
     run_phase("compute", compute_wrap, 0, 1);
+    /* CPU / ALU surface */
+    run_phase("intdiv", phase_intdiv, 20000000, 1);
+    run_phase("float_simd", phase_float_simd, 20000, 2);
+    run_phase("atomics", phase_atomics, 5000000, 2);
+    run_phase("branch", phase_branch, 20000000, 1);
+    run_phase("calls", phase_calls, 1500, 1);
+    /* memory / allocator surface */
+    run_phase("malloc", phase_malloc, 2000000, 2);
+    run_phase("string", phase_string, 200000, 2);
+    run_phase("memory", phase_memory, 256, 2);
+    run_phase("tlb", phase_tlb, 200, 1);
+    /* OS / kernel surface */
     run_phase("syscall", phase_syscall, 1000000, 2);
+    run_phase("signal", phase_signal, 200000, 2);
     run_phase("mmap", phase_mmap, 10000, 2);
     run_phase("file", phase_file, 4096, 2);
     run_phase("pipe", phase_pipe, 100000, 2);
-    run_phase("memory", phase_memory, 256, 2);
+#ifdef HL_BENCH_SQLITE
+    run_phase("sqlite", phase_sqlite, 5000, 1);
+#endif
     return 0;
 }
