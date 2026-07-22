@@ -975,6 +975,42 @@ static void emit_dnan_post(int vd, int dbl) {
     e_v3(0x4EA01C00u, vd, vd, 20);            // vd |= sign mask  (ORR.16b)
 }
 
+// ---- AVX2 FMA (vfmadd/vfmsub/vfnmadd/vfnmsub) -> NEON FMLA/FMLS ----
+// x86 FMA computes  result = (+/-)(A*B) (+/-) C  with a SINGLE rounding (fused). ARM FMLA/FMLS are
+// equally fused, so mapping the four sign variants onto FMLA/FMLS with an exact-negated addend keeps
+// bit-exact results for finite inputs:
+//   acc = neg ? -C : C   (FNEG is exact); then FMLA (acc += A*B) or FMLS (acc -= A*B).
+//     fmadd : neg=0,fmls=0  -> A*B + C     fmsub : neg=1,fmls=0  -> A*B - C
+//     fnmadd: neg=0,fmls=1  -> C - A*B     fnmsub: neg=1,fmls=1  -> -C - A*B
+// Result is left in `acc`. Generated-NaN sign fixup (0*inf, inf-inf: x86 yields the negative QNaN
+// indefinite, ARM the positive default NaN -- same payload, opposite sign) is applied over the THREE
+// inputs exactly like the SSE emit_dnan_pre/post, keyed on "result is NaN AND no input was NaN".
+// rA/rB are the multiplicands, rC the addend (all distinct host vregs); acc/mt1/mt2 are scratch vregs
+// distinct from the sources. dbl: 1 -> .2d (pd), 0 -> .4s (ps).
+static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, int neg, int fmls, int dbl) {
+    int fixnan = fpdnan_on();
+    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;         // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
+    unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
+    if (fixnan) {                                           // mt1 = PRESIGN on lanes with all inputs non-NaN
+        emit32(EQ | (rA << 16) | (rA << 5) | mt1);         // mt1 = (A==A)
+        emit32(EQ | (rB << 16) | (rB << 5) | mt2);         // mt2 = (B==B)
+        e_v3(0x4E201C00u, mt1, mt1, mt2);                  // mt1 &= mt2  (AND.16b)
+        emit32(EQ | (rC << 16) | (rC << 5) | mt2);         // mt2 = (C==C)
+        e_v3(0x4E201C00u, mt1, mt1, mt2);                  // mt1 = all-inputs-notnan
+        emit32(0x4F005400u | (immhb << 16) | (mt1 << 5) | mt1); // mt1 = SHL #(esize-1) -> sign bit per lane
+    }
+    if (neg) emit32((dbl ? 0x6EE0F800u : 0x6EA0F800u) | (rC << 5) | acc); // FNEG acc.T, C  (exact)
+    else e_vmov(acc, rC);                                                  // acc = C
+    uint32_t fm = fmls ? (dbl ? 0x4EE0CC00u : 0x4EA0CC00u)                 // FMLS acc -= A*B
+                       : (dbl ? 0x4E60CC00u : 0x4E20CC00u);                // FMLA acc += A*B
+    e_v3(fm, acc, rA, rB);                                                 // fused multiply-add/sub
+    if (fixnan) {
+        emit32(EQ | (acc << 16) | (acc << 5) | mt2); // mt2 = (res==res) (all-ones where result NOT NaN)
+        e_v3(0x4E601C00u, mt1, mt1, mt2);            // mt1 = PRESIGN & ~res_notnan (sign on generated-NaN)
+        e_v3(0x4EA01C00u, acc, acc, mt1);            // acc |= sign  (ORR.16b)
+    }
+}
+
 // Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD2 -> SIGILL) by EXITING the block to the dispatcher with
 // R_TRAP, rather than emitting a host BRK/UDF. On Apple Silicon a JIT'd BRK/UDF raises a Mach exception the
 // x86 engine does not catch, so the host BSD SIGTRAP/SIGILL never reaches jit86_syncguard and the process
@@ -1287,6 +1323,86 @@ static int avx_lower(struct insn *I, uint64_t next) {
             avx_zero_upper(dst, l256);
         }
         return 1;
+    }
+
+    // ---- AVX2 FMA: 0F38 (map 2), 66 (pp 1), packed ps(W0)/pd(W1). Native FMLA/FMLS, fused = bit-exact.
+    // Only the plain packed even opcodes (fmadd/fmsub/fnmadd/fnmsub x 132/213/231); the fmaddsub/fmsubadd
+    // (0x96/97,A6/A7,B6/B7) and scalar ss/sd (odd opcodes) forms fall through to do_avx.
+    if (map == 2 && pp == 1) {
+        int role = 0, ok = 1;
+        switch (op) {
+        case 0x98: case 0x9A: case 0x9C: case 0x9E: role = 132; break;
+        case 0xA8: case 0xAA: case 0xAC: case 0xAE: role = 213; break;
+        case 0xB8: case 0xBA: case 0xBC: case 0xBE: role = 231; break;
+        default: ok = 0; break;
+        }
+        if (ok) {
+            int dbl = I->vex_w;      // W1 -> pd (.2d), W0 -> ps (.4s)
+            int nib = op & 0x0F;
+            int fmls = (nib == 0x0C || nib == 0x0E); // fnmadd/fnmsub: negate the product (FMLS)
+            int neg = (nib == 0x0A || nib == 0x0E);  // fmsub/fnmsub: subtract C (FNEG the addend)
+            mark_vdirty();
+            int s2 = s2r;
+            if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // op3 low -> v16
+            // High halves of the three inputs (256-bit) live in cpu->vhi (or mem+16). Load them once,
+            // BEFORE the NaN gate, so both the gate predicate and the fast arithmetic reuse them.
+            if (l256) {
+                avx_cpu_ldr_q(18, OFF_VHI + 16 * d);   // d.hi
+                avx_cpu_ldr_q(19, OFF_VHI + 16 * s1);  // s1.hi
+                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // s2.hi
+            }
+            // ---- NaN-input gate ----
+            // Native FMLA/FMLS is bit-exact to x86 FMA for finite inputs and for GENERATED NaNs (fixed
+            // up below), but a PROPAGATED NaN diverges: with a single NaN input only the sign differs
+            // (x86 keeps the input NaN's sign; ARM's product/addend negation flips it), and with two or
+            // three NaN inputs the SELECTED NaN payload differs (x86 and ARM use different NaN priority).
+            // Reproducing x86's 3-operand NaN priority + quieting inline is not worth it, so when ANY
+            // input lane is a NaN we bail to the correctness-first do_avx path. NaN is absent from real
+            // float kernels, so the fast path carries the hot traffic. Predicate: v24 = AND over all
+            // inputs of FCMEQ(x,x) (all-ones per non-NaN lane); any zero bit => some NaN => exit.
+            uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
+            emit32(EQ | (d << 16) | (d << 5) | 24);         // v24 = (d==d)
+            emit32(EQ | (s1 << 16) | (s1 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (s1==s1)
+            emit32(EQ | (s2 << 16) | (s2 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (op3==op3)
+            if (l256) {
+                emit32(EQ | (18 << 16) | (18 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= d.hi
+                emit32(EQ | (19 << 16) | (19 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
+                emit32(EQ | (20 << 16) | (20 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= op3.hi
+            }
+            e_ext(25, 24, 24, 8);              // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
+            e_v3(0x4E201C00u, 24, 24, 25);     // v24.d[0] = lane0 & lane1
+            e_fmov_from_d(16, 24);             // x16 = combined mask (all-ones iff NO input NaN)
+            e_rrr(A_ORN, 16, 31, 16, 1, 0);    // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
+            uint32_t *p_cbz = (uint32_t *)g_cp;
+            emit32(0);                          // cbz x16, Lfast  (patched below)
+            emit_exit_const(next - (uint64_t)I->len, R_AVX); // NaN present -> emulate this insn in C (this insn's rip)
+            uint8_t *Lfast = (uint8_t *)g_cp;
+            *p_cbz = 0xB4000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
+
+            // ---- fast path: no input NaN ----
+            // operand roles: dest(d)=op1, vvvv(s1)=op2, r/m(op3=s2)=op3.
+            //   132: d = d*op3 + s1   -> mul={d,op3},  C=s1
+            //   213: d = s1*d + op3   -> mul={s1,d},   C=op3
+            //   231: d = s1*op3 + d   -> mul={s1,op3}, C=d
+            int rA, rB, rC;
+            if (role == 132) { rA = d; rB = s2; rC = s1; }
+            else if (role == 213) { rA = s1; rB = d; rC = s2; }
+            else { rA = s1; rB = s2; rC = d; }
+            emit_fma_group(rA, rB, rC, 23, 24, 25, neg, fmls, dbl); // low 128 -> v23
+            if (l256) {                                             // high 128 (highs already in v18/19/20)
+                int hA, hB, hC;
+                if (role == 132) { hA = 18; hB = 20; hC = 19; }
+                else if (role == 213) { hA = 19; hB = 18; hC = 20; }
+                else { hA = 19; hB = 20; hC = 18; }
+                emit_fma_group(hA, hB, hC, 21, 22, 25, neg, fmls, dbl); // high 128 -> v21
+                e_vmov(d, 23);
+                avx_cpu_str_q(21, OFF_VHI + 16 * d);
+            } else {
+                e_vmov(d, 23);
+            }
+            avx_zero_upper(d, l256);
+            return 1;
+        }
     }
 
     // ---- 3-operand arithmetic / logical ----
