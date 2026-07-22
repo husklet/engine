@@ -2150,6 +2150,14 @@ $(BUILD)/tools/perf-runner: tools/perf_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
+# Fair-comparison harness: wraps a payload (native / qemu / hl) in the same
+# parent->supervisor->runner fork+waitpid+status-pipe structure hl uses
+# internally (src/linux_abi/fork.c), so the two-process isolation cost cancels
+# across all three targets and only translation+execution differs.
+$(BUILD)/tools/fair-worker-wrapper: tools/fair_worker_wrapper.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
 $(BUILD)/perf/syscall-aarch64: tests/perf/syscall.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie $< -o $@
