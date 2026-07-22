@@ -1327,6 +1327,15 @@ static int loop_has_rmw_hazard(uint64_t start, uint64_t endpc) {
     return 0;
 }
 
+// W4E tier-2: when a hot self-loop's FIRST instruction writes a vector register (the memcpy/memcmp
+// stream loops), the once-per-region cpu->vdirty-set store lands at the loop top and, under the folded
+// back-edge, re-executes every iteration (measured ~1.7x on a 1 MiB memcpy vs native). The store is
+// idempotent -- vdirty is a sticky flag cleared only by a full spill -- so it need run only ONCE per
+// loop ENTRY. During the tier-2 recompile the store is hoisted above a fresh async poll placed at the
+// loop top; this holds the loop re-entry point (after the store, at that poll) so emit_selfloop folds
+// the back-edge to it instead of to `body`. NULL when no hoist applies (fall back to `body`).
+static uint8_t *g_t2_loop_top;
+
 // W4E tier-2: emit a single-block self-loop's terminating conditional (taken target == block start).
 //   tier-1 build: cond -> Lcnt (counter) ; fall-through = loop exit. The counter promotes when hot.
 //   tier-2 build: cond -> body DIRECTLY (the fold) ; fall-through = loop exit. One taken branch/iter
@@ -1338,7 +1347,10 @@ static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body
     emit32(0);
     emit_chain_exit(fall);
     if (g_tier2_build) {
-        int64_t d = ((uint8_t *)body - (uint8_t *)patch) / 4;
+        // Fold the back-edge past the hoisted vdirty store when one was emitted at the loop top
+        // (g_t2_loop_top); the store then runs once per entry, never per iteration.
+        uint8_t *tgt = g_t2_loop_top ? g_t2_loop_top : (uint8_t *)body;
+        int64_t d = (tgt - (uint8_t *)patch) / 4;
         *patch = recode_cond(in, d);
         return;
     }
@@ -1960,6 +1972,7 @@ static void *translate_block(uint64_t gpc) {
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
     g_blk_vdirty = 0; // reset per block; set below when a V-writing insn is emitted
+    g_t2_loop_top = NULL; // reset per block; set only in the tier-2 vdirty-hoist path below
     void *host = g_cp;
     emit_prologue();
     // chained jumps land here (regs already live)
@@ -2042,6 +2055,22 @@ static void *translate_block(uint64_t gpc) {
         if (!g_blk_vdirty && insn_touches_vreg(in)) {
             e_str(CPUREG, CPUREG, (int)OFF_VDIRTY);
             g_blk_vdirty = 1;
+            // W4E tier-2 vdirty hoist: only in the promoter recompile, and only when this V-writing
+            // insn is the block's FIRST (== the self-loop top). Emit a fresh inline async poll right
+            // after the store and record its address so the folded back-edge lands here -- skipping the
+            // idempotent store while still polling cpu->irq every iteration (IRQSLIM back-edge invariant).
+            // Every block ENTRY still runs the store first: the header poll path (body+0) falls straight
+            // in, and a forward chain (body+g_fwdskip) lands exactly on the store. Non-self-loop V-first
+            // blocks harmlessly gain one extra entry poll; g_t2_loop_top then goes unused.
+            if (g_tier2_build && gpc == start) {
+                g_t2_loop_top = g_cp;
+                e_ldr(16, CPUREG, OFF_IRQ); // ldr x16, [cpu, #irq]
+                uint32_t *p = (uint32_t *)g_cp;
+                emit32(0); // cbz x16, Lcont
+                emit_exit_const(start, R_BRANCH);
+                uint8_t *cont = g_cp;
+                *p = 0xB4000000u | (((uint32_t)(((uint8_t *)cont - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+            }
         }
 
         if (!in_excl) {
