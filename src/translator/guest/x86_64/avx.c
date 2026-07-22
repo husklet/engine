@@ -192,8 +192,35 @@ static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn
 // CLEAR (0x7FC00000 / 0x7FF8000000000000) -- identical payload, opposite sign. A NaN PROPAGATED from an
 // input keeps that input's sign on both ISAs, so only the generated case (result NaN AND neither input
 // NaN) is fixed up here. Matches the legacy-SSE inline fixup (translate.c emit_dnan_pre/post).
+// NaN classification (exponent all-ones, mantissa nonzero; QNaN = mantissa MSB set).
+static int nan32(uint32_t u) { return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0; }
+static int qnan32(uint32_t u) { return nan32(u) && (u & 0x00400000u) != 0; }
+static int nan64(uint64_t u) {
+    return (u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull) != 0;
+}
+static int qnan64(uint64_t u) { return nan64(u) && (u & 0x0008000000000000ull) != 0; }
+
+// x86 add/sub/mul/div result NaN handling. Two distinct rules, both of which the host NEON FADD/FMUL/FSUB/
+// FDIV that computed `r` gets WRONG, so we recompute from the operands here:
+//   (1) INPUT NaN: x86 returns the second operand's NaN quieted, UNLESS the first is a QNaN and the second
+//       an SNaN (then the first) -- i.e. QNaN-priority, else src2. (ARM does SNaN-priority, else src1 --
+//       the exact mirror.) A single NaN input returns that operand quieted. The chosen NaN is quieted by
+//       setting its mantissa MSB (payload+sign preserved).
+//   (2) GENERATED NaN (result NaN, NO input NaN: 0/0, inf/inf, 0*inf, inf-inf): x86 yields the QNaN
+//       floating-point INDEFINITE with the sign bit SET (0xFFC00000 / 0xFFF8000000000000); ARM yields the
+//       positive default NaN. Same payload, opposite sign.
 static float avx_dnan_f32(float r, float x, float y) {
-    if (r != r && x == x && y == y) {
+    uint32_t xb, yb;
+    memcpy(&xb, &x, 4);
+    memcpy(&yb, &y, 4);
+    int xn = nan32(xb), yn = nan32(yb);
+    if (xn || yn) {
+        uint32_t w = (xn && yn) ? ((qnan32(xb) && !qnan32(yb)) ? xb : yb) : (xn ? xb : yb);
+        w |= 0x00400000u; // quiet the selected NaN (x86)
+        memcpy(&r, &w, 4);
+        return r;
+    }
+    if (r != r) {
         uint32_t u = 0xFFC00000u;
         memcpy(&r, &u, 4);
     }
@@ -201,7 +228,17 @@ static float avx_dnan_f32(float r, float x, float y) {
 }
 
 static double avx_dnan_f64(double r, double x, double y) {
-    if (r != r && x == x && y == y) {
+    uint64_t xb, yb;
+    memcpy(&xb, &x, 8);
+    memcpy(&yb, &y, 8);
+    int xn = nan64(xb), yn = nan64(yb);
+    if (xn || yn) {
+        uint64_t w = (xn && yn) ? ((qnan64(xb) && !qnan64(yb)) ? xb : yb) : (xn ? xb : yb);
+        w |= 0x0008000000000000ull; // quiet the selected NaN (x86)
+        memcpy(&r, &w, 8);
+        return r;
+    }
+    if (r != r) {
         uint64_t u = 0xFFF8000000000000ull;
         memcpy(&r, &u, 8);
     }
@@ -2611,6 +2648,38 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
     xs_note(0, map, op, c->rip);              // EXITSTAT diagnostic (no-op unless env set)
     uint8_t *D = (uint8_t *)&c->v[2 * I.reg]; // dst xmm == src1 (destructive)
     uint8_t s[16], r[16];
+
+    // ---- Legacy (non-VEX) SSE packed/scalar FP add/mul/sub/div (0F 58/59/5C/5E) --------------------------
+    // The JIT fast path (translate.c) inlines these as NEON FADD/FMUL/FSUB/FDIV but GATES OUT any NaN input
+    // to here: x86's per-lane two-NaN operand selection (QNaN-priority, else src2) is the mirror of ARM's
+    // (SNaN-priority, else src1), a silent divergence. avx_fp_arith_* / avx_dnan_* reproduce x86 exactly.
+    // src1 == dst (destructive); prefix picks type (none=ps, 66=pd, F3=ss, F2=sd). Legacy SSE PRESERVES the
+    // upper (VEX/AVX) bits of the register, so we write only the low 128 bits (D), never avx_put's zero-fill.
+    if (I.two && map == 0 && (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E)) {
+        int packed = !I.repne && !I.rep;
+        int dbl = packed ? I.p66 : I.repne;
+        int es = dbl ? 8 : 4;
+        uint8_t b[64];
+        avx_get_rm(state, c, &I, next, packed ? 16 : es, b); // src2 (r/m)
+        int n = packed ? 16 : es;                            // scalar: low element only, rest of dst kept
+        for (int i = 0; i < n; i += es) {
+            if (dbl) {
+                double x, y;
+                memcpy(&x, D + i, 8);
+                memcpy(&y, b + i, 8);
+                double z = avx_fp_arith_f64(op, x, y);
+                memcpy(D + i, &z, 8);
+            } else {
+                float x, y;
+                memcpy(&x, D + i, 4);
+                memcpy(&y, b + i, 4);
+                float z = avx_fp_arith_f32(op, x, y);
+                memcpy(D + i, &z, 4);
+            }
+        }
+        c->rip = next;
+        return;
+    }
 
     // ---- CRC32 (F2 0F38 F0/F1) and MOVBE (no-F2 0F38 F0/F1): GENERAL-register / memory ops -----------
     if (map == 2 && (op == 0xF0 || op == 0xF1)) {

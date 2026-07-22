@@ -3657,6 +3657,35 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
+                    if (op != 0x51) {
+                        // ---- NaN-input gate ----
+                        // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
+                        // GENERATED NaN (fixed up below), and for a SINGLE NaN input (propagated + quieted,
+                        // sign preserved -- both ISAs agree). But when a lane has TWO NaN inputs, x86 selects
+                        // QNaN-priority-else-src2 while ARM selects SNaN-priority-else-src1 -- the exact
+                        // mirror, a silent wrong result. Rather than reproduce x86's per-lane priority inline
+                        // on the hot path, gate: if ANY checked input lane is a NaN, exit to the x86-exact C
+                        // softmulator (R_SSE3B -> hl_x86_sse_run). Real FP kernels have no NaN inputs, so the
+                        // fast path below is unaffected. src1 is still live in vd (arith not emitted yet),
+                        // src2 in s. Scalar ss/sd check ONLY the low lane; packed checks all lanes.
+                        uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ .2d/.4s (all-ones per non-NaN lane)
+                        emit32(EQ | (vd << 16) | (vd << 5) | 24);      // v24 = (src1==src1)
+                        emit32(EQ | (s << 16) | (s << 5) | 25);        // v25 = (src2==src2)
+                        e_v3(0x4E201C00u, 24, 24, 25);                 // v24 = src1nn & src2nn (AND.16b)
+                        if (packed) {                                  // fold both 64-bit halves -> low 64 = all lanes
+                            e_ext(25, 24, 24, 8);
+                            e_v3(0x4E201C00u, 24, 24, 25);
+                        }
+                        e_fmov_from_d(16, 24);          // x16 = lane mask (all-ones iff no NaN in checked lanes)
+                        e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~mask (0 iff clean; nonzero iff a NaN input)
+                        uint32_t *p_cbz = (uint32_t *)g_cp;
+                        emit32(0);                      // cbz {w,x}16, Lfast (patched below)
+                        emit_exit_const(gpc, R_SSE3B);  // NaN present -> x86-exact C emulation of this insn
+                        uint8_t *Lfast = (uint8_t *)g_cp;
+                        // scalar single checks only the low 32 bits (cbz w16); packed / scalar double check 64 (cbz x16)
+                        uint32_t cbz = (!packed && !dbl) ? 0x34000000u : 0xB4000000u;
+                        *p_cbz = cbz | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
+                    }
                     int fixnan = fpdnan_on();
                     if (fixnan) emit_dnan_pre(vd, s, op != 0x51, dbl); // capture "no input NaN" (uses v20/v21)
                     if (packed) { // vector FP: 66 -> .2d (sz bit), none -> .4s
