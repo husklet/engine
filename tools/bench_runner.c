@@ -39,8 +39,68 @@
  *
  * Output is CSV: env,arch,phase,us,ok,us_min,us_max,repeats
  * `report` pivots one-or-more CSVs into a phase x (env,arch) table with
- * x-native ratios, and flags any checksum divergence (except the tid-based
+ * x-<baseline> ratios, and flags any checksum divergence (except the tid-based
  * syscall phase, whose ok= legitimately differs by thread id).
+ *
+ * ============================================================================
+ * EXAMPLE -- reproduce the ARM64 + AMD64 comparison tables (run from repo root)
+ * ============================================================================
+ * Each cell is one CSV; you generate one per (arch,env) by running the guest in
+ * that env, then `report` merges them. On an OrbStack arm64 Linux machine:
+ *
+ *   # build the guests (both arches), engine (both arches), and this runner
+ *   nix develop -c bash -c 'CC=cc make build/perf/combined-bench-aarch64 \
+ *       build/perf/combined-bench-x86_64 build/tools/bench-runner \
+ *       build/linux-production/hl-engine-linux-aarch64 \
+ *       build/linux-production/hl-engine-linux-x86_64'
+ *   R=build/tools/bench-runner; mkdir -p results
+ *   # arm64 cells (native is the true baseline here):
+ *   $R run --env native    --arch arm64 --repeats 4 --out results/native-arm64.csv
+ *   $R run --env qemu      --arch arm64 --repeats 4 --out results/qemu-arm64.csv
+ *   $R run --env hl-engine --arch arm64 --repeats 4 --out results/hl-arm64.csv
+ *   DOCKER='mac docker' $R run --env docker --arch arm64 --out results/docker-arm64.csv
+ *   # amd64 cells (all emulated on an arm host -- no native amd cell):
+ *   $R run --env qemu      --arch amd64 --repeats 4 --out results/qemu-amd64.csv
+ *   $R run --env hl-engine --arch amd64 --repeats 4 --out results/hl-amd64.csv
+ *   DOCKER='mac docker' $R run --env docker --arch amd64 --out results/docker-amd64.csv
+ *   # native-mac cell (the 2nd native-arm point): build+run on the mac host --
+ *   # NOTE Apple clang != gcc, so treat its absolute us as compiler-comparable
+ *   # only, not a drop-in for the gcc-built linux cells.
+ *   # the two tables, each column as a multiple of hl-engine for its arch:
+ *   $R report --baseline hl-engine results/*.csv
+ *   # (or --baseline native to read everything relative to native arm.)
+ *
+ * On an actual amd64 host, run the same with --arch amd64 and --env native to
+ * fill the real native-amd64 baseline. `make bench` runs the locally-reachable
+ * cells for you.
+ *
+ * ============================================================================
+ * HOW TO READ THE TABLES
+ * ============================================================================
+ * Rows = benchmark phase; columns = env/arch. Each phase self-times INSIDE the
+ * guest, so startup/process/isolation cost is excluded -- the us are pure
+ * execution and comparable across envs. With --baseline hl-engine every cell is
+ * a MULTIPLE of the hl-engine cell OF THE SAME ARCH:
+ *     ratio > 1  -> that env is SLOWER than hl on that phase
+ *     ratio < 1  -> that env is FASTER than hl on that phase   (hl overhead)
+ *     ratio = 1.00 -> the hl-engine reference column itself
+ *
+ * ARM64 is the trustworthy comparison: `native` is a REAL native run, so
+ * native<1 marks hl's genuine execution overhead (the attack targets), and
+ * docker/arm64 (native-in-a-linux-container) should sit ~=native as a sanity
+ * check. hl at ~1.0 vs native means "runs at native speed"; hl>1 vs native
+ * (e.g. syscall/signal/file) means hl is FASTER than native (in-engine
+ * syscall shortcuts). qemu columns show how far hl beats qemu-user.
+ *
+ * AMD64 on an arm host is an EMULATOR SHOOTOUT, not a native comparison: there
+ * is NO native cell (needs real amd hardware). hl-engine and qemu both do
+ * x86->arm translation; docker/amd64 is Apple's Rosetta 2 (Docker Desktop on
+ * Apple Silicon), a heavily silicon-assisted x86 translator -- so Rosetta
+ * beating hl there is expected and is NOT a native number. Read amd64 only as
+ * "hl vs qemu vs Rosetta at x86 translation".
+ *
+ * `results/` is generated output and is gitignored; only this tool + the guest
+ * source are tracked. Re-run the EXAMPLE any time to regenerate both tables.
  */
 #define _GNU_SOURCE
 #include <errno.h>

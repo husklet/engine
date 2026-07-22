@@ -104,3 +104,57 @@ linux/amd64`); a `--sock /path/docker.sock` routes to a specific daemon socket.
   `build/linux-production/hl-engine-linux-x86_64`.
 - Merge results from every cell with
   `build/tools/bench-runner report build/bench/*.csv`.
+
+## Reproduce the two comparison tables (example)
+
+Each cell is one CSV (rows = benchmark phase, columns = result); you generate
+one per (arch, env), then `report` merges them into the phase × (env, arch)
+table. From the repo root on an OrbStack arm64 Linux machine:
+
+```sh
+nix develop -c bash -c 'CC=cc make build/perf/combined-bench-aarch64 \
+    build/perf/combined-bench-x86_64 build/tools/bench-runner \
+    build/linux-production/hl-engine-linux-aarch64 \
+    build/linux-production/hl-engine-linux-x86_64'
+R=build/tools/bench-runner; mkdir -p results
+# arm64 (native = the real baseline)
+$R run --env native    --arch arm64 --repeats 4 --out results/native-arm64.csv
+$R run --env qemu      --arch arm64 --repeats 4 --out results/qemu-arm64.csv
+$R run --env hl-engine --arch arm64 --repeats 4 --out results/hl-arm64.csv
+DOCKER='mac docker' $R run --env docker --arch arm64 --out results/docker-arm64.csv
+# amd64 (all emulated on an arm host — no native amd cell)
+$R run --env qemu      --arch amd64 --repeats 4 --out results/qemu-amd64.csv
+$R run --env hl-engine --arch amd64 --repeats 4 --out results/hl-amd64.csv
+DOCKER='mac docker' $R run --env docker --arch amd64 --out results/docker-amd64.csv
+# both tables, every column as a multiple of hl-engine for its arch:
+$R report --baseline hl-engine results/*.csv
+```
+
+`make bench` runs the locally-reachable cells automatically. On a real amd64
+host add `--env native --arch amd64` for the true native-amd baseline.
+
+## How to read
+
+Rows = phase, columns = env/arch. Timing is **inside the guest**, so startup /
+process / isolation cost is excluded — the µs are pure execution. With
+`--baseline hl-engine` each cell is a multiple of the hl-engine cell **of the
+same arch**:
+
+- `> 1` — that env is **slower** than hl on that phase
+- `< 1` — that env is **faster** than hl on that phase (i.e. hl's overhead)
+- `1.00` — the hl-engine reference column
+
+**ARM64 is the trustworthy comparison** — `native` is a real native run, so
+`native < 1` marks hl's genuine execution overhead (the attack targets), and
+`docker/arm64` (native-in-container) should sit ≈ native as a sanity check.
+`hl ≈ native` = runs at native speed; `hl > native` on syscall/signal/file =
+hl is *faster* than native (in-engine syscall shortcuts). `qemu` shows how far
+hl beats qemu-user.
+
+**AMD64 on an arm host is an emulator shootout, not native** — there is no
+native cell (needs real amd hardware). hl-engine and qemu both do x86→arm
+translation; `docker/amd64` is Apple's **Rosetta 2**, a silicon-assisted x86
+translator, so Rosetta beating hl there is expected. Read amd64 only as
+"hl vs qemu vs Rosetta at x86 translation".
+
+`results/` is generated output and is gitignored.
