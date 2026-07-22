@@ -1480,6 +1480,36 @@ static int avx_lower(struct insn *I, uint64_t next) {
         return 1;
     }
 
+    // ---- VPBLENDVB (VEX.128/.256.66.0F3A.W0 4C /r /is4): variable per-BYTE blend. 4-operand:
+    // dst=reg, src1=vvvv, src2=r/m, mask=is4 (imm[7:4]). dst[byte i] = (mask[i]&0x80)?src2[i]:src1[i].
+    // NEON: sel = SSHR(mask,#7) -> 0xFF per byte where the MSB is set; BSL sel, src2, src1 (bit-select:
+    // where sel bit=1 take src2, else src1). Byte-exact vs qemu (pure integer byte select, verified over
+    // random + MSB-corner mask patterns, 128 and 256). vblendvps/pd (0x4A/0x4B) still fall to do_avx.
+    if (map == 3 && op == 0x4C && pp == 1) {
+        int mreg = (I->imm >> 4) & 0xF;
+        if (mreg > 15) return 0;
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
+        if (l256) { // load the three high halves BEFORE writing d.hi (d may alias src1/src2/mask)
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * mreg);                                             // mask.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);                                               // src1.hi
+            if (I->is_mem) g_ldr_q(22, 17, 16); else avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r);     // src2.hi
+        }
+        e_vshr_imm(18, mreg, 8, 7, 1);  // v18 = sshr mask.16b,#7  (0xFF where mask MSB set)
+        e_v3(0x6E601C00u, 18, s2, s1);  // BSL v18.16b, src2.16b, src1.16b -> mask?src2:src1
+        if (l256) {
+            e_vshr_imm(19, 20, 8, 7, 1);       // v19 = sshr mask.hi,#7
+            e_v3(0x6E601C00u, 19, 22, 21);     // BSL v19.16b, src2.hi, src1.hi
+            e_vmov(d, 18);
+            avx_cpu_str_q(19, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 18);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
     // ---- 3-operand arithmetic / logical ----
     uint32_t base = 0;
     int swap = 0; // operands reversed (pandn/andn: dst = ~src1 & src2 = BIC(vn=src2, vm=src1))
