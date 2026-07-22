@@ -1085,6 +1085,68 @@ static void emit_mxcsr_to_fpsr(int src) { // set the host FPSR sticky flags from
     emit32(0xD51B4420u | 22); // msr fpsr, x22
 }
 
+// ldmxcsr (0F AE /2): load MXCSR from memory and thread MXCSR.RC (bits 14:13) -> ARM FPCR.RMode (23:22),
+// MXCSR.FTZ(15)|DAZ(6) -> FPCR.FZ(24), and the sticky exception flags -> host FPSR. Shared by the legacy
+// and VEX (VEX.LZ.0F.WIG AE /2) encodings (semantically identical). Memory operand only.
+static void emit_ldmxcsr(struct insn *I, uint64_t next) {
+    if (!I->is_mem) return;
+    emit_ea(I, next);
+    e_load(4, 23, 17);      // x23 = MXCSR (full, kept for the sticky-flag projection)
+    e_lsr_i(16, 23, 13, 0); // x16 = MXCSR >> 13
+    e_movconst(19, 3);
+    e_rrr(A_AND, 16, 16, 19, 0, 0); // x16 = RC (0..3): 00 nearest,01 down,10 up,11 zero
+    // ARM RMode swaps the two RC bits: 00 RN,01 RP(up),10 RM(down),11 RZ -> arm = bitrev2(RC)
+    e_movconst(19, 1);
+    e_rrr(A_AND, 20, 16, 19, 0, 0); // x20 = RC&1
+    e_lsr_i(21, 16, 1, 0);          // x21 = RC>>1
+    e_rrr(A_ORR, 20, 21, 20, 0, 1); // x20 = x21 | (RC&1)<<1  = ARM RMode
+    emit32(0xD53B4400u | 19);       // mrs x19, fpcr
+    e_movconst(21, 3u << 22);
+    e_rrr(A_BIC, 19, 19, 21, 1, 0);  // clear RMode
+    e_rrr(A_ORR, 19, 19, 20, 1, 22); // FPCR.RMode = ARM RMode
+    // MXCSR.FTZ(15)|DAZ(6) -> host FPCR.FZ(24). ARM FPCR.FZ flushes both
+    // denormal inputs and outputs, so the common FTZ+DAZ pair maps exactly;
+    // a lone FTZ/DAZ over-flushes the other direction (documented approximation)
+    // -- strictly better than the prior behavior of never flushing at all.
+    e_lsr_i(16, 23, 15, 0);          // x16 = MXCSR>>15 (FTZ -> bit0)
+    e_lsr_i(20, 23, 6, 0);           // x20 = MXCSR>>6  (DAZ -> bit0)
+    e_rrr(A_ORR, 16, 16, 20, 0, 0);  // x16 = FTZ|DAZ (junk in high bits)
+    e_movconst(20, 1);
+    e_rrr(A_AND, 16, 16, 20, 0, 0);  // x16 = (FTZ|DAZ)&1
+    e_movconst(20, 1u << 24);
+    e_rrr(A_BIC, 19, 19, 20, 1, 0);  // clear FPCR.FZ
+    e_rrr(A_ORR, 19, 19, 16, 1, 24); // FPCR.FZ = (FTZ|DAZ)
+    emit32(0xD51B4400u | 19);        // msr fpcr, x19
+    emit_mxcsr_to_fpsr(23);          // MXCSR sticky flags -> host FPSR (so feclearexcept clears)
+}
+
+// stmxcsr (0F AE /3): store MXCSR (default control + live rounding mode from FPCR.RMode + sticky flags +
+// FTZ/DAZ from FPCR.FZ) to memory. Shared by the legacy and VEX (VEX.LZ.0F.WIG AE /3) encodings.
+static void emit_stmxcsr(struct insn *I, uint64_t next) {
+    if (!I->is_mem) return;
+    emit_ea(I, next);
+    emit32(0xD53B4400u | 19); // mrs x19, fpcr
+    e_lsr_i(19, 19, 22, 0);   // x19 = FPCR >> 22
+    e_movconst(20, 3);
+    e_rrr(A_AND, 19, 19, 20, 0, 0); // x19 = ARM RMode
+    e_movconst(20, 1);
+    e_rrr(A_AND, 21, 19, 20, 0, 0);
+    e_lsr_i(22, 19, 1, 0);
+    e_rrr(A_ORR, 19, 22, 21, 0, 1);  // x19 = x86 RC (swap back)
+    e_movconst(16, 0x1f80);          // default MXCSR (all exceptions masked, RC=00)
+    e_rrr(A_ORR, 16, 16, 19, 0, 13); // MXCSR |= RC << 13
+    emit_fpsr_to_mxcsr(16);          // + live sticky exception flags (IE/DE/ZE/OE/UE/PE)
+    // reflect host FPCR.FZ(24) back to MXCSR FTZ(15)+DAZ(6) so a guest that
+    // saves/restores the control word preserves flush-to-zero mode.
+    emit32(0xD53B4400u | 19);        // mrs x19, fpcr
+    e_lsr_i(19, 19, 24, 0);          // x19 = FPCR>>24 (FZ -> bit0)
+    e_movconst(20, 1);
+    e_rrr(A_AND, 19, 19, 20, 0, 0);  // x19 = FZ&1
+    e_rrr(A_ORR, 16, 16, 19, 0, 15); // MXCSR |= FZ<<15 (FTZ)
+    e_rrr(A_ORR, 16, 16, 19, 0, 6);  // MXCSR |= FZ<<6  (DAZ)
+    e_store(4, 16, 17);
+}
+
 // x87 fist/fistp round ST0 (already in d16) to an integral double using the CURRENT x87 rounding control
 // (cpu->fpcw bits[11:10]), so the caller's FCVTZS then converts it exactly. x86 x87 defaults to round-to-
 // NEAREST-even (not toward-zero) and honors fldcw's RC, but the old code emitted a bare FCVTZS (truncate) --
@@ -1435,6 +1497,43 @@ static int avx_lower(struct insn *I, uint64_t next) {
     int l256 = (I->vex_l == 1);
     int d = I->reg, s1 = I->vvvv, s2r = I->rm_reg, pp = I->vex_pp, map = I->vex_map, op = I->op;
     if (d > 15 || s1 > 15 || s2r > 15) return 0;
+
+    // ---- VEX vldmxcsr (VEX.LZ.0F.WIG AE /2) / vstmxcsr (/3): semantically identical to the legacy
+    // ldmxcsr/stmxcsr. Route to the same emit so a guest using the VEX encoding does not fall through to
+    // the do_avx unimplemented path (which aborts the engine with exit 70). Memory operand, no vvvv. ----
+    if (map == 1 && op == 0xAE && pp == 0 && !l256 && I->is_mem) {
+        int sub = I->reg & 7;
+        if (sub == 2) { emit_ldmxcsr(I, next); return 1; }
+        if (sub == 3) { emit_stmxcsr(I, next); return 1; }
+    }
+
+    // ---- vperm2i128 (46) / vperm2f128 (06) (VEX.256.66.0F3A.W0 /r ib): select each output 128-bit lane
+    // from {src1.lo, src1.hi, src2.lo, src2.hi} per imm nibble. Low half uses imm[1:0] (imm[3]=1 -> zero),
+    // high half uses imm[5:4] (imm[7]=1 -> zero). 256-bit only. Resolve imm8 at translate time -> two
+    // 128-bit selections. Materialize all 4 candidate halves into scratch first so dest may alias a source.
+    if (map == 3 && (op == 0x46 || op == 0x06) && pp == 1 && l256) {
+        int imm = I->imm & 0xFF;
+        mark_vdirty();
+        e_vmov(20, s1);                          // v20 = src1.lo (host xmm)
+        avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);    // v21 = src1.hi
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(22, 17, 0);                  // v22 = src2.lo (mem)
+            g_ldr_q(23, 17, 16);                 // v23 = src2.hi (mem+16)
+        } else {
+            e_vmov(22, s2r);                     // v22 = src2.lo (host xmm)
+            avx_cpu_ldr_q(23, OFF_VHI + 16 * s2r); // v23 = src2.hi
+        }
+        static const int srcreg[4] = {20, 21, 22, 23};
+        // low output -> host v[d]
+        if (imm & 0x08) e_v3(0x6E201C00u, d, d, d);        // EOR d,d,d = zero
+        else e_vmov(d, srcreg[imm & 3]);
+        // high output -> cpu->vhi[d]
+        if (imm & 0x80) { e_v3(0x6E201C00u, 24, 24, 24); avx_cpu_str_q(24, OFF_VHI + 16 * d); }
+        else avx_cpu_str_q(srcreg[(imm >> 4) & 3], OFF_VHI + 16 * d);
+        avx_zero_upper(d, l256);
+        return 1;
+    }
 
     // ---- moves (2-operand: no vvvv) ----
     int is_load = 0, is_store = 0;
@@ -4755,64 +4854,13 @@ static void *translate_block(uint64_t gpc) {
                     gpc = next;
                     continue;
                 } // *fence -> dmb ish
-                if (sub == 2) { // ldmxcsr: thread MXCSR.RC (bits 14:13) -> ARM FPCR.RMode (bits 23:22)
-                    if (I.is_mem) {
-                        emit_ea(&I, next);
-                        e_load(4, 23, 17);      // x23 = MXCSR (full, kept for the sticky-flag projection)
-                        e_lsr_i(16, 23, 13, 0); // x16 = MXCSR >> 13
-                        e_movconst(19, 3);
-                        e_rrr(A_AND, 16, 16, 19, 0, 0); // x16 = RC (0..3): 00 nearest,01 down,10 up,11 zero
-                        // ARM RMode swaps the two RC bits: 00 RN,01 RP(up),10 RM(down),11 RZ -> arm = bitrev2(RC)
-                        e_movconst(19, 1);
-                        e_rrr(A_AND, 20, 16, 19, 0, 0); // x20 = RC&1
-                        e_lsr_i(21, 16, 1, 0);          // x21 = RC>>1
-                        e_rrr(A_ORR, 20, 21, 20, 0, 1); // x20 = x21 | (RC&1)<<1  = ARM RMode
-                        emit32(0xD53B4400u | 19);       // mrs x19, fpcr
-                        e_movconst(21, 3u << 22);
-                        e_rrr(A_BIC, 19, 19, 21, 1, 0);  // clear RMode
-                        e_rrr(A_ORR, 19, 19, 20, 1, 22); // FPCR.RMode = ARM RMode
-                        // MXCSR.FTZ(15)|DAZ(6) -> host FPCR.FZ(24). ARM FPCR.FZ flushes both
-                        // denormal inputs and outputs, so the common FTZ+DAZ pair maps exactly;
-                        // a lone FTZ/DAZ over-flushes the other direction (documented approximation)
-                        // -- strictly better than the prior behavior of never flushing at all.
-                        e_lsr_i(16, 23, 15, 0);          // x16 = MXCSR>>15 (FTZ -> bit0)
-                        e_lsr_i(20, 23, 6, 0);           // x20 = MXCSR>>6  (DAZ -> bit0)
-                        e_rrr(A_ORR, 16, 16, 20, 0, 0);  // x16 = FTZ|DAZ (junk in high bits)
-                        e_movconst(20, 1);
-                        e_rrr(A_AND, 16, 16, 20, 0, 0);  // x16 = (FTZ|DAZ)&1
-                        e_movconst(20, 1u << 24);
-                        e_rrr(A_BIC, 19, 19, 20, 1, 0);  // clear FPCR.FZ
-                        e_rrr(A_ORR, 19, 19, 16, 1, 24); // FPCR.FZ = (FTZ|DAZ)
-                        emit32(0xD51B4400u | 19);        // msr fpcr, x19
-                        emit_mxcsr_to_fpsr(23);          // MXCSR sticky flags -> host FPSR (so feclearexcept clears)
-                    }
+                if (sub == 2) { // ldmxcsr
+                    emit_ldmxcsr(&I, next);
                     gpc = next;
                     continue;
                 }
-                if (sub == 3) { // stmxcsr: report MXCSR default + current rounding mode (from FPCR.RMode)
-                    if (I.is_mem) {
-                        emit_ea(&I, next);
-                        emit32(0xD53B4400u | 19); // mrs x19, fpcr
-                        e_lsr_i(19, 19, 22, 0);   // x19 = FPCR >> 22
-                        e_movconst(20, 3);
-                        e_rrr(A_AND, 19, 19, 20, 0, 0); // x19 = ARM RMode
-                        e_movconst(20, 1);
-                        e_rrr(A_AND, 21, 19, 20, 0, 0);
-                        e_lsr_i(22, 19, 1, 0);
-                        e_rrr(A_ORR, 19, 22, 21, 0, 1);  // x19 = x86 RC (swap back)
-                        e_movconst(16, 0x1f80);          // default MXCSR (all exceptions masked, RC=00)
-                        e_rrr(A_ORR, 16, 16, 19, 0, 13); // MXCSR |= RC << 13
-                        emit_fpsr_to_mxcsr(16);          // + live sticky exception flags (IE/DE/ZE/OE/UE/PE)
-                        // reflect host FPCR.FZ(24) back to MXCSR FTZ(15)+DAZ(6) so a guest that
-                        // saves/restores the control word preserves flush-to-zero mode.
-                        emit32(0xD53B4400u | 19);        // mrs x19, fpcr
-                        e_lsr_i(19, 19, 24, 0);          // x19 = FPCR>>24 (FZ -> bit0)
-                        e_movconst(20, 1);
-                        e_rrr(A_AND, 19, 19, 20, 0, 0);  // x19 = FZ&1
-                        e_rrr(A_ORR, 16, 16, 19, 0, 15); // MXCSR |= FZ<<15 (FTZ)
-                        e_rrr(A_ORR, 16, 16, 19, 0, 6);  // MXCSR |= FZ<<6  (DAZ)
-                        e_store(4, 16, 17);
-                    }
+                if (sub == 3) { // stmxcsr
+                    emit_stmxcsr(&I, next);
                     gpc = next;
                     continue;
                 }
