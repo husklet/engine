@@ -326,6 +326,37 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
             emit32(A_SHA256SU1 | (crypto_reg(s) << 16) | (16 << 5) | crypto_reg(D));
             return TX_NEXT;
         }
+        // ---- SSE4.1 packed integer MIN/MAX + 32-bit MUL: each is a single lane-wise NEON op, bit-exact
+        // with the C softmulator (do_sse3b). These fire heavily in autovectorized integer loops (pmulld) and
+        // SIMD min/max reductions -- 20M+ per-insn C round-trips each in a real SSE4 workload. D = ModRM.reg
+        // is src1 = dst (destructive); s = ModRM.r/m. Gated by state->optimize (NOSSEOPT -> do_sse3b A/B).
+        case 0x38:   // PMINSB  d,s   (signed byte)
+        case 0x39:   // PMINSD  d,s   (signed dword)
+        case 0x3A:   // PMINUW  d,s   (unsigned word)
+        case 0x3B:   // PMINUD  d,s   (unsigned dword)
+        case 0x3C:   // PMAXSB  d,s   (signed byte)
+        case 0x3D:   // PMAXSD  d,s   (signed dword)
+        case 0x3E:   // PMAXUW  d,s   (unsigned word)
+        case 0x3F:   // PMAXUD  d,s   (unsigned dword)
+        case 0x40: { // PMULLD  d,s   (32-bit low product)
+            if (!state->optimize) return TX_FALL;
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
+            int s = crypto_rm_vec(I, next);
+            uint32_t enc;
+            switch (op) {
+            case 0x38: enc = 0x4E206C00u; break; // SMIN .16B
+            case 0x3C: enc = 0x4E206400u; break; // SMAX .16B
+            case 0x3A: enc = 0x6E606C00u; break; // UMIN .8H
+            case 0x3E: enc = 0x6E606400u; break; // UMAX .8H
+            case 0x39: enc = 0x4EA06C00u; break; // SMIN .4S
+            case 0x3D: enc = 0x4EA06400u; break; // SMAX .4S
+            case 0x3B: enc = 0x6EA06C00u; break; // UMIN .4S
+            case 0x3F: enc = 0x6EA06400u; break; // UMAX .4S
+            default:   enc = 0x4EA09C00u; break; // 0x40 MUL .4S (low 32-bit product)
+            }
+            hl_x86_emit_vector3(enc, D, D, s);
+            return TX_NEXT;
+        }
         case 0x00: { // PSHUFB d, s: d[i] = (s[i] & 0x80) ? 0 : d[s[i] & 0x0f]  (byte permute, hi-bit zeroes)
             if (!state->optimize) return TX_FALL;
             if (hl_x86_x87_known()) hl_x86_x87_drop();
