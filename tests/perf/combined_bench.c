@@ -33,6 +33,19 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
+
+/* Compiler barrier: force VAL to be treated as opaque (its value unknown to the
+ * optimizer), preventing constant-folding / elision of work that produces it.
+ * Portable across gcc and clang on Linux and Darwin. */
+#if defined(__GNUC__) || defined(__clang__)
+#define HL_OPAQUE(val) __asm__ __volatile__("" : "+r"(val))
+#else
+#define HL_OPAQUE(val) ((void)(val))
+#endif
+
 #ifdef HL_BENCH_SQLITE
 #include <sqlite3.h>
 #endif
@@ -227,7 +240,12 @@ static op_fn const OPS[4] = {op_add, op_xor, op_mul, op_rot};
 static uint64_t phase_calls(unsigned iters) {
     uint64_t acc = 0;
     for (unsigned i = 0; i < iters; ++i) {
-        acc += fib_rec(18); /* ~8361 calls each iter */
+        unsigned n = 18; /* ~8361 calls each iter */
+        /* Make n opaque so clang/gcc cannot constant-fold fib_rec(18) to a
+         * compile-time value and elide the recursion (~1us artifact on clang).
+         * The value is still 18, so the checksum is unchanged. */
+        HL_OPAQUE(n);
+        acc += fib_rec(n);
         op_fn f = OPS[i & 3]; /* indirect call, rotating target */
         acc = f(acc, i);
     }
@@ -258,12 +276,30 @@ static uint64_t phase_tlb(unsigned iters) {
     return acc;
 }
 
-/* ---------------- phase: syscall (gettid loop) ---------------- */
+/* ---------------- phase: syscall (thread-id loop) ---------------- *
+ * Portable per-OS thread-id read that actually enters the kernel / libc each
+ * call (an external, non-inlinable call), so the phase does real syscall-shaped
+ * work on both Linux and Darwin:
+ *   Linux : gettid (via SYS_gettid; the raw syscall the engine must translate).
+ *   Darwin: pthread_threadid_np (SYS_gettid is deprecated/unsupported there).
+ * The ok= checksum is thread-id-based and so legitimately differs across OSes;
+ * the summary excludes the syscall phase from checksum-divergence checks. */
+static uint64_t read_thread_id(void) {
+#if defined(__APPLE__)
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    return tid;
+#elif defined(__linux__) && defined(SYS_gettid)
+    return (uint64_t)syscall(SYS_gettid);
+#else
+    return (uint64_t)getpid();
+#endif
+}
 
 static uint64_t phase_syscall(unsigned iters) {
     uint64_t checksum = 0;
     for (unsigned i = 0; i < iters; ++i)
-        checksum += (uint64_t)syscall(SYS_gettid);
+        checksum += read_thread_id();
     return checksum;
 }
 

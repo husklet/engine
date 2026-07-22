@@ -234,19 +234,19 @@ static int docker_reach(const ctx_t *c, char *r, size_t n) {
     return 1;
 }
 static int docker_cmd_build(const ctx_t *c, char *out, size_t n) {
-    /* mount the dir holding the binary read-only at /b, run /b/<basename> */
-    char dir[LINE];
-    snprintf(dir, sizeof(dir), "%s", c->binary);
-    char *slash = strrchr(dir, '/');
-    const char *base = slash ? slash + 1 : dir;
-    if (slash) *slash = '\0';
-    else snprintf(dir, sizeof(dir), ".");
+    /* Stream the guest binary in over stdin (no bind-mount). On OrbStack the
+     * host `mac docker` daemon rewrites bind-mount paths (the Linux path does
+     * not exist on the mac side), so `-v <linux-dir>:/b` silently mounts the
+     * wrong thing. Piping the binary via stdin sidesteps the mount boundary
+     * entirely: `cat` writes it to /b inside the container, chmod +x, run it.
+     * The guest is a static-PIE binary, so it needs no libs from the image. */
     const char *hopt1 = c->sock ? " -H unix://" : "";
     const char *hopt2 = c->sock ? c->sock : "";
     return snprintf(out, n,
-                    "%s%s%s run --rm --platform linux/%s -v %s:/b:ro %s /b/%s",
-                    docker_cmd(), hopt1, hopt2, arch_to_docker(c->arch), dir,
-                    docker_image(c), base) < (int)n
+                    "%s%s%s run --rm -i --platform linux/%s %s "
+                    "sh -c 'cat >/b && chmod +x /b && /b' < %s",
+                    docker_cmd(), hopt1, hopt2, arch_to_docker(c->arch),
+                    docker_image(c), c->binary) < (int)n
                ? 0
                : -1;
 }
