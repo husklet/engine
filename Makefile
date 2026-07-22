@@ -354,7 +354,7 @@ PURPOSE_PROCESS_PIE := execfault forkserver_probe forkstorm forkwait ltp_checkpo
 	pipeproc procreap sentry_exec_proc sentry_fork sysinfo thrfork waitcore
 PURPOSE_NETWORK_PIE := ltp_neterr net_nonblock net_sendmsg net_sockopt net_tcp net_udp net_unix sentry_net
 PURPOSE_IPC_PIE := msg neonshm sem shm shmposix sysvshm
-PURPOSE_THREADS_PIE := threads_basic threads_many threads_mutex_queue
+PURPOSE_THREADS_PIE := threads_basic threads_many threads_mutex_queue atomics_outline_pie
 ISOLATION_CASE_SOURCES := $(sort $(wildcard tests/compat/isolation/*.c))
 ISOLATION_CASE_NAMES := $(basename $(notdir $(ISOLATION_CASE_SOURCES)))
 ISOLATION_CASE_BINS := $(ISOLATION_CASE_NAMES:%=$(BUILD)/compat/isolation/aarch64/%) \

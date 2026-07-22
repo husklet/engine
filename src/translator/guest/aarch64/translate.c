@@ -1518,6 +1518,48 @@ static int try_lse_atomic(uint64_t gpc) {
     return 0;
 }
 
+// ---- LSE outline-atomic call inlining ----
+// GCC/LLVM emit every C atomic as a `bl __aarch64_<op><sz>_<order>` outline helper (the distro/musl and
+// -mno-outline-atomics-ignored toolchains still do). The helper is a fixed 5-insn leaf:
+//     adrp x16,#page ; ldrb w16,[x16,#off] ; cbz w16, Lfallback ; <host LSE op> ; ret   Lfallback: ldxr/stxr..
+// The gated byte is __aarch64_have_lse_atomics -- ALWAYS 1 here (we advertise HWCAP_ATOMICS and the host
+// has FEAT_LSE), so the fast-path single LSE op IS the architectural effect of the call. Inline that one
+// op at the call site: elide the bl + adrp/ldrb/cbz + ret AND the block-split/return dispatch (the call
+// idiom is ~2 helper round-trips per atomic in tight code -- the dominant hl-vs-native atomics tax, since
+// the LSE op itself already lowers 1:1). The op reads/writes guest memory with its native [Xn] base, so
+// inline ONLY when an in-stream copy of that op would be emitted verbatim too: guestbase off (PIE/static-
+// PIE) and BUS inactive. Otherwise fall through to the normal call (the helper still runs correctly).
+// Returns 1 if it inlined (caller advances past the bl and keeps the block going), else 0.
+static int try_inline_outline_atomic(uint64_t gpc, uint64_t target) {
+    if (guestbase_on() || jit_guest_bus_active()) return 0;
+    uint32_t i0 = *(uint32_t *)target, i1 = *(uint32_t *)(target + 4);
+    uint32_t i2 = *(uint32_t *)(target + 8), i3 = *(uint32_t *)(target + 12);
+    uint32_t i4 = *(uint32_t *)(target + 16);
+    // adrp x16, #page
+    if ((i0 & 0x9F00001Fu) != 0x90000010u) return 0;
+    // ldrb w16, [x16, #imm12]
+    if ((i1 & 0xFFC003FFu) != 0x39400210u) return 0;
+    // cbz w16, Lfallback  (byte==0 -> ldxr/stxr fallback; byte!=0 falls through to the LSE op i3)
+    if ((i2 & 0xFF00001Fu) != 0x34000010u) return 0;
+    // the cbz must jump PAST i3 (forward, skipping the fast-path op) so the fall-through reaches i3
+    if ((int64_t)(sext((i2 >> 5) & 0x7FFFF, 19) << 2) < 8) return 0;
+    // i4 = ret x30 (the helper is a leaf; x30 is preserved across it)
+    if (i4 != 0xD65F03C0u) return 0;
+    // i3 must be a single-[Xn]-base LSE atomic memory op (LDADD/SWP/LDSET/...) or a CAS (single).
+    int is_lse = (i3 & 0x3F200C00u) == 0x38200000u;
+    int is_cas = (i3 & 0x3FA07C00u) == 0x08A07C00u;
+    if (!is_lse && !is_cas) return 0;
+    // no stolen operand (Rs[20:16], Rn[9:5], Rt[4:0]) -> the op is safe to copy verbatim
+    if (is_stolen(i3 & 31) || is_stolen((i3 >> 5) & 31) || is_stolen((i3 >> 16) & 31)) return 0;
+    // architectural x30 after the (elided) bl+ret is the return address; set it so a later reader / signal
+    // / unwinder sees exactly what the real call would have left. (Un-biased low vaddr for non-PIE; identity
+    // for PIE -- but guestbase is off here anyway.)
+    emit_set_x30(pcrel_base(gpc) + 4);
+    emit32(i3);
+    g_lse_n++;
+    return 1;
+}
+
 // ---- tier-2 substrate: the purity gate (the analyze() of trace_pipeline.c) ----
 // Given a formed trace's instructions, return 1 only if it is safe to MEMOIZE:
 // no syscall (svc) and no memory access at all -- so the result is fully determined
@@ -2070,6 +2112,12 @@ static void *translate_block(uint64_t gpc) {
         // bl
         if ((in & 0xFC000000u) == 0x94000000u) {
             int64_t off = sext(in & 0x3FFFFFF, 26) << 2;
+            // Inline an LSE outline-atomic helper call to a single host atomic op (elides the call +
+            // return dispatch, the dominant atomics tax); only fires in the verbatim-safe regime.
+            if (try_inline_outline_atomic(gpc, gpc + off)) {
+                gpc += 4;
+                continue;
+            }
             emit_bl_ras(gpc, gpc + off);
             // §B: shadow push + host bl (RAS) + Lcont continuation
             break;
