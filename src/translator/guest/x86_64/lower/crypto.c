@@ -2,6 +2,9 @@
 
 #include "x87.h"
 
+#include "../cpu.h"
+#include "../encoding.h"
+
 #include <stdint.h>
 
 // translator/guest/x86_64 -- crypto instruction class: map the x86 AES-NI / PCLMULQDQ /
@@ -355,6 +358,40 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
             default:   enc = 0x4EA09C00u; break; // 0x40 MUL .4S (low 32-bit product)
             }
             hl_x86_emit_vector3(enc, D, D, s);
+            return TX_NEXT;
+        }
+        case 0x17: { // PTEST d, s (SSE4.1): read-only flag-setter feeding a Jcc/setcc/cmov.
+            // ZF = ((d & s) == 0); CF = ((s & ~d) == 0); SF = OF = AF = PF = 0.  D = ModRM.reg (xmm1),
+            // s = ModRM.r/m. Autovectorized all-zero / all-ones tests (`ptest x,x; jz/jnz`) fire it 50M+
+            // times in an SSE4 workload, each a full R_SSE3B dispatcher round-trip. Bit-exact with the C
+            // softmulator (avx.c do_sse3b PTEST): the x86 flag substrate stores ARM Z for x86 ZF and ARM C
+            // = NOT x86 CF (bit29); SF(bit31)/OF(bit28) stay 0; PF/AF live in cpu->pf / cpu->af. Because we
+            // write cpu->nzcv AND the live ARM NZCV here (and set no g_fl_pending), the immediately
+            // following Jcc reads the correct flags off live NZCV, exactly as pcmpistri does.
+            if (!state->optimize) return TX_FALL;
+            if (hl_x86_x87_known()) hl_x86_x87_drop();
+            int s = crypto_rm_vec(I, next);
+            // ZF: is (D & s) all-zero?  AND -> v16; UMAXV reduces to the max byte (== 0 iff every bit is 0).
+            hl_x86_emit_vector3(0x4E201C00u, 16, D, s); // AND   v16.16b, D.16b, s.16b   = D & s
+            emit32(0x6E30A800u | (16 << 5) | 16);       // UMAXV b16, v16.16b
+            emit32(0x0E013C00u | (16 << 5) | 18);       // UMOV  w18, v16.b[0]   x18 = max byte of (D & s)
+            // CF: is (s & ~D) all-zero?  BIC v17 = s AND NOT D.
+            hl_x86_emit_vector3(0x4E601C00u, 17, s, D); // BIC   v17.16b, s.16b, D.16b   = s & ~D
+            emit32(0x6E30A800u | (17 << 5) | 17);       // UMAXV b17, v17.16b
+            emit32(0x0E013C00u | (17 << 5) | 19);       // UMOV  w19, v17.b[0]   x19 = max byte of (s & ~D)
+            // ZF = (x18 == 0) -> ARM Z (bit30); stored C (bit29) = NOT x86 CF = (x19 != 0).
+            e_subi_s(31, 18, 0, 0);          // subs wzr, w18, #0
+            e_cset(20, 0, 1);                // x20 = (AND all-zero) = ZF          (EQ)
+            e_subi_s(31, 19, 0, 0);          // subs wzr, w19, #0
+            e_cset(21, 1, 1);                // x21 = (s & ~D nonzero) = NOT CF = stored C   (NE)
+            e_lsl_i(20, 20, 30, 1);          // ZF -> bit30
+            e_rrr(A_ORR, 20, 20, 21, 1, 29); // | (stored C << 29)   (N/V stay 0 -> SF=OF=0)
+            e_str(20, 28, OFF_NZCV);         // spill x86 flag substrate for a later boundary
+            emit32(0xD51B4200u | 20);        // msr nzcv, x20   (live flags for the following Jcc)
+            e_movconst(18, 1);               // PF source byte = 1 (odd popcount) -> x86 PF = 0
+            e_str(18, 28, OFF_PF);
+            e_movconst(18, 0);
+            e_str(18, 28, OFF_AF);           // AF = 0
             return TX_NEXT;
         }
         case 0x00: { // PSHUFB d, s: d[i] = (s[i] & 0x80) ? 0 : d[s[i] & 0x0f]  (byte permute, hi-bit zeroes)
