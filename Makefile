@@ -2380,27 +2380,34 @@ $(BUILD)/tools/bench-runner: tools/bench_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -std=gnu11 -Wall -Wextra $< -o $@
 
-BENCH_ARCH ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),arm64,amd64)
-BENCH_REPEATS ?= 5
-BENCH_ENVS ?= orbstack qemu hl-engine
+BENCH_ARCHES ?= arm64 amd64
+BENCH_REPEATS ?= 4
+BENCH_ENVS ?= native qemu hl-engine
 
-# `make bench`: build both-arch guests + the production engine + the runner,
-# then run the available local backends and print the phase x backend table.
-# docker is left to the Manager (needs a reachable daemon): add it with
-#   make bench BENCH_ENVS='orbstack qemu hl-engine docker' DOCKER='mac docker'
+# `make bench`: build both-arch guests + engines + the runner, run every
+# locally-reachable (arch,env) cell (unreachable ones self-skip -- e.g.
+# native amd64 on an arm host), and print the phase x (env,arch) table with
+# each column as a multiple of hl-engine for its arch (>1 slower than hl,
+# <1 faster). See tools/bench_runner.c header / tools/bench/README.md for how
+# to read it. Add docker (needs a reachable daemon) with:
+#   make bench BENCH_ENVS='native qemu hl-engine docker' DOCKER='mac docker'
 .PHONY: bench
 bench: $(BUILD)/perf/combined-bench-aarch64 $(BUILD)/perf/combined-bench-x86_64 \
-	$(BUILD)/linux-production/hl-engine-linux-$(if $(filter arm64,$(BENCH_ARCH)),aarch64,x86_64) \
+	$(BUILD)/linux-production/hl-engine-linux-aarch64 \
+	$(BUILD)/linux-production/hl-engine-linux-x86_64 \
 	$(BUILD)/tools/bench-runner
 	@mkdir -p $(BUILD)/bench
-	@for env in $(BENCH_ENVS); do \
-		$(BUILD)/tools/bench-runner run --env $$env --arch $(BENCH_ARCH) \
-			--repeats $(BENCH_REPEATS) \
-			--engine $(abspath $(BUILD)/linux-production/hl-engine-linux-$(if $(filter arm64,$(BENCH_ARCH)),aarch64,x86_64)) \
-			--out $(BUILD)/bench/$$env-$(BENCH_ARCH).csv || true; \
+	@for arch in $(BENCH_ARCHES); do \
+		gnu=$$( [ $$arch = arm64 ] && echo aarch64 || echo x86_64 ); \
+		for env in $(BENCH_ENVS); do \
+			$(BUILD)/tools/bench-runner run --env $$env --arch $$arch \
+				--repeats $(BENCH_REPEATS) \
+				--engine $(abspath $(BUILD))/linux-production/hl-engine-linux-$$gnu \
+				--out $(BUILD)/bench/$$env-$$arch.csv 2>/dev/null || true; \
+		done; \
 	done
 	@echo
-	@$(BUILD)/tools/bench-runner report $(foreach e,$(BENCH_ENVS),$(BUILD)/bench/$(e)-$(BENCH_ARCH).csv)
+	@$(BUILD)/tools/bench-runner report --baseline hl-engine $(BUILD)/bench/*.csv
 
 MAC_EXCLUDED_UNIT_TARGETS := run-unit-directory run-unit-directory_services run-unit-eventfd_fork run-unit-linux_fork run-unit-native \
 	run-unit-pipe_linux run-unit-private run-unit-process run-unit-range run-unit-resolve_services run-unit-system
