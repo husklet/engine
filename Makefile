@@ -2166,6 +2166,10 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static-pie $< -o $@
 
+$(BUILD)/perf/combined-bench-aarch64: tests/perf/combined_bench.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=gnu11 $< -o $@
+
 $(BUILD)/perf/translate-aarch64: tests/perf/translate.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static-pie -std=c11 $< -o $@
