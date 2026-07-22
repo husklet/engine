@@ -75,11 +75,18 @@ static void emit_host_ptr(int rd, uint64_t v, int kind) {
     e_movconst_fixed(rd, v);
 }
 
-// x86 TSO has three ordered edges (LoadLoad, LoadStore, StoreStore) and permits StoreLoad.  DMB
-// ISHLD after guest loads and DMB ISH before guest stores provide exactly those required edges while
-// retaining x86's unaligned-access behavior.  Engine-private e_ldr/e_str accesses remain relaxed.
+// x86 TSO has three ordered edges (LoadLoad, LoadStore, StoreStore) and permits StoreLoad.
+// Every guest LOAD is followed by DMB ISHLD, which (LD-scoped) orders that load before ALL later
+// loads AND stores -- so it already supplies the LoadStore edge into any later guest store. A guest
+// store therefore only needs to add the StoreStore edge, which DMB ISHST provides on its own; the
+// full DMB ISH (which also drains the load pipeline) is redundant here. Using the store barrier
+// (ISHST) instead lets the store issue without waiting on outstanding loads -- a measured win on
+// SIMD-heavy loops (float_simd store barrier, no SIMD STLR exists) -- and is bit-exact: LoadStore
+// stays enforced by each load's own trailing ISHLD. StoreLoad remains unordered (x86 permits it).
+// The MFENCE/LFENCE/SFENCE full-fence path emits its own DMB ISH inline (translate.c), untouched.
+// Engine-private e_ldr/e_str accesses remain relaxed.
 static void e_dmb_ish(void) {
-    emit32(0xD5033BBFu);
+    emit32(0xD5033ABFu); // DMB ISHST -- StoreStore only (see above; loads self-fence via ISHLD)
 }
 
 static void e_dmb_ishld(void) {

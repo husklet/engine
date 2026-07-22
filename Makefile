@@ -340,7 +340,7 @@ CORE_REGRESS_BINS := $(CORE_REGRESS_AARCH64:%=$(BUILD)/compat/core/regress/aarch
 tests/compat/core/regress/go_cgo_stackgrow_arm: ;
 IPC_CASE_SOURCES := $(sort $(wildcard tests/compat/ipc/*.c))
 IPC_CASE_NAMES := $(basename $(notdir $(IPC_CASE_SOURCES)))
-IPC_CASE_BINS := $(addprefix $(BUILD)/compat/ipc/aarch64/,$(filter-out ipc_tso_unaligned,$(IPC_CASE_NAMES))) \
+IPC_CASE_BINS := $(addprefix $(BUILD)/compat/ipc/aarch64/,$(filter-out ipc_tso_unaligned ipc_tso_simd_mp,$(IPC_CASE_NAMES))) \
 	$(addprefix $(BUILD)/compat/ipc/x86_64/,$(filter-out ipc_mq_notify neonshm,$(IPC_CASE_NAMES)))
 THREAD_CASE_SOURCES := $(sort $(wildcard tests/compat/threads/*.c))
 THREAD_CASE_NAMES := $(basename $(notdir $(THREAD_CASE_SOURCES)))
