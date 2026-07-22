@@ -84,9 +84,21 @@ static uint64_t g_smc_flushes;
                     /* ic_site is the RX address of the literal pair (from a runtime adr); write via RW. */            \
                     uint64_t *site = (uint64_t *)J_RW((c)->ic_site);                                                   \
                     if (jit_wprot(0)) {                                                                                \
-                        site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                                \
-                        site[0] = (c)->pc;        /* Lsite_tgt       */                                                \
-                        (void)jit_wprot(1);                                                                            \
+                        if (g_steal1617) {                                                                             \
+                            /* steal path: Lb (site[1]) holds the hit branch's arena offset -> patch `b bind`.  \
+                             * Drops the ldr+indirect-br hit tail to one direct branch. */                          \
+                            uint32_t *brw = (uint32_t *)(g_cache + site[1]);                                          \
+                            uint32_t *brx = (uint32_t *)J_RX(brw);                                                    \
+                            int64_t bd_d = ((uint8_t *)bind - (uint8_t *)brx) / 4;                                    \
+                            *brw = 0x14000000u | ((uint32_t)bd_d & 0x3FFFFFFu); /* b bind */                          \
+                            site[0] = (c)->pc; /* Lsite_tgt guard */                                                  \
+                            (void)jit_wprot(1);                                                                        \
+                            (void)jit_publish_code(brw, 4); /* branch is code -> flush I-cache */                     \
+                        } else {                                                                                       \
+                            site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                            \
+                            site[0] = (c)->pc;        /* Lsite_tgt       */                                            \
+                            (void)jit_wprot(1);                                                                        \
+                        }                                                                                              \
                     }                                                                                                  \
                 }                                                                                                      \
             }                                                                                                          \

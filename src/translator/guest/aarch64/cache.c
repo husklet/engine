@@ -272,10 +272,13 @@ static void pcache_relocate(void) {
         case RK_T2CNT: v = (uint64_t)&g_t2cnt[slot]; break;
         case RK_BUSFAULT: v = (uint64_t)jit_guest_bus_fault; break;
         case RK_ICSITE:
-            // zero both cached literals (target at +0, body at +8): the body is a stale arena pointer, and
-            // a zeroed target makes the site's equality guard miss so the dispatcher re-resolves + refills.
+            // Zero the guard target literal (+0): a zeroed target makes the site's equality guard miss so
+            // the dispatcher re-resolves + refills. Under the x16/x17 steal the +8 slot (Lb) is not a stale
+            // arena pointer but the hit branch's arena OFFSET (stable across reload) -> keep it so the refill
+            // can re-find the branch; the stale direct branch stays unreachable (guard misses) until then.
+            // Legacy (non-steal) still stores a stale body pointer at +8 -> zero it.
             *(uint64_t *)(g_cache + off) = 0;
-            *(uint64_t *)(g_cache + off + 8) = 0;
+            if (!g_steal1617) *(uint64_t *)(g_cache + off + 8) = 0;
             continue;
         default: continue;
         }

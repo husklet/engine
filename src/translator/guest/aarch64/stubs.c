@@ -177,11 +177,13 @@ static void emit_ibranch_steal(int rn) {
     uint32_t *p_cbslow = (uint32_t *)g_cp;
     // cbnz x16, Lhash
     emit32(0);
-    uint32_t *p_ldrb = (uint32_t *)g_cp;
-    // ldr x16, Lsite_body
-    emit32(0);
-    // HIT -> body (no restore stub)
-    e_br(16);
+    uint32_t *p_bhit = (uint32_t *)g_cp;
+    // HIT -> body via a DIRECT branch the dispatcher patches on fill (`b body`). Both the site and the
+    // body live in the same 64MB (CACHE_SZ) arena, so the +/-128MB `b` range always reaches. This drops
+    // the `ldr x16,Lsite_body; br x16` pair (1 load + 1 INDIRECT branch) to a single direct branch --
+    // fewer insns AND statically predicted (no BTB entry) on the monomorphic hit. NOP until filled ->
+    // falls through to Lhash (the shared hash), exactly like a target-literal miss.
+    emit32(0xD503201Fu); // nop
     uint32_t *Lhash = (uint32_t *)g_cp;
     // --- shared hash IBTC ---
     // ubfx x16, xTreg, #2, #16  ((xTreg>>2) & (IBTC_N-1), IBTC_N=64Ki)
@@ -217,16 +219,18 @@ static void emit_ibranch_steal(int rn) {
     uint8_t *Lt = g_cp;
     *(uint64_t *)g_cp = 0;
     g_cp += 8;
-    uint8_t *Lb = g_cp;
-    *(uint64_t *)g_cp = 0;
+    // Lb slot no longer holds the body pointer; it carries the branch's ARENA OFFSET (p_bhit - g_cache) so the
+    // dispatcher can find and patch the direct branch on fill. An offset (not an absolute arena pointer)
+    // stays valid across a persisted-cache reload into a fresh process, so it is NOT neutralized.
+    *(uint64_t *)g_cp = (uint64_t)((uint8_t *)p_bhit - g_cache);
     g_cp += 8;
     *p_ldrt = 0x58000000u | (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFF) << 5) | 16;
     *p_cbslow = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhash - (uint8_t *)p_cbslow) / 4) & 0x7FFFF) << 5) | 16;
-    *p_ldrb = 0x58000000u | (((uint32_t)((Lb - (uint8_t *)p_ldrb) / 4) & 0x7FFFF) << 5) | 16;
     *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 17;
     int64_t ao = Lt - (uint8_t *)p_adr;
     *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)(ao >> 2) & 0x7FFFF) << 5) | 9;
-    pc_record_icsite(Lt); // {target,body} cache holds an arena body ptr -> neutralize on reload
+    pc_record_icsite(Lt); // Lt (guard target) is an arena-relative guest PC guard -> zero on reload; the
+                          // stale direct branch is then unreachable (guard always misses) until refill
 }
 
 static void emit_ibranch(int rn) {
