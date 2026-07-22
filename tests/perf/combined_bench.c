@@ -503,25 +503,30 @@ int main(void) {
     /* compute appears twice to expose cold-translation vs warm delta. */
     run_phase("compute_cold", compute_wrap, 0, 0);
     run_phase("compute", compute_wrap, 0, 1);
+    /* Iteration counts are sized so every phase runs long enough (~150-500ms
+     * on native arm64) to give stable medians and swamp per-call timer/OS
+     * noise -- the sub-10ms phases in the first cut were dominated by jitter.
+     * Checksums change with the counts but stay consistent across envs (same
+     * binary, same iters), so cross-env divergence detection is unaffected. */
     /* CPU / ALU surface */
-    run_phase("intdiv", phase_intdiv, 20000000, 1);
-    run_phase("float_simd", phase_float_simd, 20000, 2);
-    run_phase("atomics", phase_atomics, 5000000, 2);
-    run_phase("branch", phase_branch, 20000000, 1);
-    run_phase("calls", phase_calls, 1500, 1);
+    run_phase("intdiv", phase_intdiv, 60000000, 1);
+    run_phase("float_simd", phase_float_simd, 500000, 3);
+    run_phase("atomics", phase_atomics, 50000000, 3);
+    run_phase("branch", phase_branch, 60000000, 1);
+    run_phase("calls", phase_calls, 60000, 2);
     /* memory / allocator surface */
-    run_phase("malloc", phase_malloc, 2000000, 2);
-    run_phase("string", phase_string, 200000, 2);
-    run_phase("memory", phase_memory, 256, 2);
-    run_phase("tlb", phase_tlb, 200, 1);
+    run_phase("malloc", phase_malloc, 12000000, 2);
+    run_phase("string", phase_string, 5000000, 2);
+    run_phase("memory", phase_memory, 8000, 2);
+    run_phase("tlb", phase_tlb, 3000, 2);
     /* OS / kernel surface */
-    run_phase("syscall", phase_syscall, 1000000, 2);
-    run_phase("signal", phase_signal, 200000, 2);
-    run_phase("mmap", phase_mmap, 10000, 2);
-    run_phase("file", phase_file, 4096, 2);
-    run_phase("pipe", phase_pipe, 100000, 2);
+    run_phase("syscall", phase_syscall, 10000000, 2);
+    run_phase("signal", phase_signal, 1000000, 2);
+    run_phase("mmap", phase_mmap, 150000, 2);
+    run_phase("file", phase_file, 400000, 2);
+    run_phase("pipe", phase_pipe, 1500000, 2);
 #ifdef HL_BENCH_SQLITE
-    run_phase("sqlite", phase_sqlite, 5000, 1);
+    run_phase("sqlite", phase_sqlite, 300000, 1);
 #endif
     return 0;
 }
