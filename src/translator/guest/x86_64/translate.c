@@ -1011,6 +1011,34 @@ static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, in
     }
 }
 
+// ---- VEX packed FP add/sub/mul/div (vaddps/pd, vsubps/pd, vmulps/pd, vdivps/pd) -> NEON ----
+// The fast-path arithmetic once the caller's NaN-input gate has proven NO input lane is a NaN. Emits the
+// native NEON FADD/FMUL/FSUB/FDIV (Vn=src1, Vm=src2) plus the emit_dnan x86-negative-QNaN-indefinite sign
+// fixup for GENERATED NaNs (0*inf, inf-inf, 0/0, inf/inf from finite inputs: x86 yields the negative QNaN
+// indefinite, ARM the positive default NaN -- same payload, opposite sign). A NaN INPUT never reaches here
+// (the gate falls back to do_avx) because x86 and ARM diverge on two-NaN-per-lane operand selection; that
+// path is left to the correctness-first do_avx. Scratch: v23 (presign), v24 (tmp).
+static void emit_vex_fp(int vd, int src1, int src2, int op, int dbl) {
+    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;              // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
+    unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
+    uint32_t szb = dbl ? 0x00400000u : 0;
+    uint32_t base = op == 0x58   ? 0x4E20D400u   // FADD
+                    : op == 0x59 ? 0x6E20DC00u   // FMUL
+                    : op == 0x5C ? 0x4EA0D400u   // FSUB
+                                 : 0x6E20FC00u;  // FDIV (0x5E)
+    base |= szb;                                               // bit22 = sz: 0 -> .4s (ps), 1 -> .2d (pd)
+    // PRE: v23 = presign (x86 indefinite sign bit) on lanes whose BOTH inputs are non-NaN, else 0.
+    emit32(EQ | (src1 << 16) | (src1 << 5) | 23);              // v23 = (src1==src1)
+    emit32(EQ | (src2 << 16) | (src2 << 5) | 24);              // v24 = (src2==src2)
+    e_v3(0x4E201C00u, 23, 23, 24);                             // v23 = src1nn & src2nn  (AND.16b)
+    emit32(0x4F005400u | (immhb << 16) | (23 << 5) | 23);      // v23 = SHL #(esize-1) -> sign bit per lane
+    e_v3(base, vd, src1, src2);                                // vd = src1 OP src2  (Vn=src1, Vm=src2)
+    // POST: OR the x86 indefinite sign into lanes that are a GENERATED default NaN (result NaN, inputs not).
+    emit32(EQ | (vd << 16) | (vd << 5) | 24);                  // v24 = (vd==vd)
+    e_v3(0x4E601C00u, 23, 23, 24);                             // v23 = presign & ~res_notnan (BIC.16b)
+    e_v3(0x4EA01C00u, vd, vd, 23);                             // vd |= sign  (ORR.16b)
+}
+
 // Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD2 -> SIGILL) by EXITING the block to the dispatcher with
 // R_TRAP, rather than emitting a host BRK/UDF. On Apple Silicon a JIT'd BRK/UDF raises a Mach exception the
 // x86 engine does not catch, so the host BSD SIGTRAP/SIGILL never reaches jit86_syncguard and the process
@@ -1405,6 +1433,53 @@ static int avx_lower(struct insn *I, uint64_t next) {
         }
     }
 
+    // ---- VEX packed FP add/sub/mul/div: map 1, ps(pp==0)/pd(pp==1). Native NEON FADD/FMUL/FSUB/FDIV +
+    // generated-NaN sign fixup (emit_vex_fp), behind a NaN-INPUT GATE. Scalar ss(pp==2)/sd(pp==3) -> do_avx.
+    if (map == 1 && (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E) && pp < 2) {
+        int dbl = (pp == 1); // 66 -> pd (.2d), none -> ps (.4s)
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // op2 low -> v16
+        // High halves (256-bit) loaded once, BEFORE the gate, so gate predicate + fast arith reuse them.
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                        // s1.hi -> v20
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // s2.hi -> v21
+        }
+        // ---- NaN-input gate ----
+        // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs and for GENERATED NaNs
+        // (fixed up below), and for a SINGLE NaN input (propagated, quieted, sign preserved -- both ISAs
+        // agree). But when a lane has TWO NaN inputs, x86 selects the SECOND operand's NaN while ARM selects
+        // the FIRST -- a divergence do_avx also mishandles. Rather than reproduce x86's two-NaN priority
+        // inline, gate: v24 = AND over the two (or four, for 256) input lanes of FCMEQ(x,x); any zero bit =>
+        // some NaN input => exit to do_avx (correctness-first; == prior behavior). Real float kernels have no
+        // NaN inputs, so the hot path is unaffected. Inputs are src1(s1)/src2(s2) only -- dest(d) is write-only.
+        uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
+        emit32(EQ | (s1 << 16) | (s1 << 5) | 24);         // v24 = (s1==s1)
+        emit32(EQ | (s2 << 16) | (s2 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (s2==s2)
+        if (l256) {
+            emit32(EQ | (20 << 16) | (20 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
+            emit32(EQ | (21 << 16) | (21 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s2.hi
+        }
+        e_ext(25, 24, 24, 8);              // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
+        e_v3(0x4E201C00u, 24, 24, 25);     // v24.d[0] = lane0 & lane1
+        e_fmov_from_d(16, 24);             // x16 = combined mask (all-ones iff NO input NaN)
+        e_rrr(A_ORN, 16, 31, 16, 1, 0);    // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
+        uint32_t *p_cbz = (uint32_t *)g_cp;
+        emit32(0);                          // cbz x16, Lfast  (patched below)
+        emit_exit_const(next - (uint64_t)I->len, R_AVX); // NaN present -> emulate this insn in C (this rip)
+        uint8_t *Lfast = (uint8_t *)g_cp;
+        *p_cbz = 0xB4000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
+
+        // ---- fast path: no input NaN ----
+        emit_vex_fp(d, s1, s2, op, dbl);                                  // low 128 -> host v[d]
+        if (l256) {
+            emit_vex_fp(22, 20, 21, op, dbl);                            // high 128 -> v22 (highs in v20/v21)
+            avx_cpu_str_q(22, OFF_VHI + 16 * d);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
     // ---- 3-operand arithmetic / logical ----
     uint32_t base = 0;
     int swap = 0; // operands reversed (pandn/andn: dst = ~src1 & src2 = BIC(vn=src2, vm=src1))
@@ -1434,10 +1509,8 @@ static int avx_lower(struct insn *I, uint64_t next) {
         case 0x66: base = 0x4EA03400u; break;                            // vpcmpgtd
         default: break;
         }
-        // NOTE: packed FP add/sub/mul/div (0x58/0x5C/0x59/0x5E) are deliberately NOT lowered here.
-        // ARM NEON FADD/FSUB/FMUL/FDIV are not bit-exact to x86 on NaN/edge inputs (x86 quiets and
-        // selects a specific NaN payload, which do_avx reproduces via avx_dnan_f32/f64); a differential
-        // test vs qemu-x86_64 diverges on NaN/Inf data. Left to the correctness-first do_avx path.
+        // NOTE: packed FP add/sub/mul/div (0x58/0x59/0x5C/0x5E) are lowered above (emit_vex_fp), before
+        // this generic base path, since they need the generated-NaN sign fixup the plain integer ops don't.
     } else if (map == 2 && op == 0x40 && pp == 1) {
         base = 0x4EA09C00u; // vpmulld (MUL.4s)
     }
