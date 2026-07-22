@@ -1209,6 +1209,143 @@ static void emit_irq_check(uint64_t rip) {
     *p = 0xB4000000u | (((uint32_t)(((uint8_t *)cont - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
 }
 
+// ---- AVX/AVX2 VEX.128/.256 inline lowering (perf: avoid the per-insn do_avx round-trip) ----
+// Guest ymm N (N<16): low 128 = host v[N] (== xmm; spilled by mark_vdirty at block exit); high 128 =
+// cpu->vhi[2N] (memory); bits[511:256] = cpu->vz[4N] (memory). VEX zeroes every bit above the operation
+// width (the AVX upper-zeroing rule), which avx_zero_upper reproduces. 3-operand non-destructive form:
+// dest = ModRM.reg, src1 = VEX.vvvv, src2 = r/m (reg or mem). VEX.256 does the op on BOTH 128-bit halves
+// (low in host regs, high round-tripped through cpu->vhi via scratch). Scratch host V: v16 (mem low),
+// v20/v21/v22 (high halves); scratch GPR: x16 (cpu-rel address), x17 (guest EA from emit_ea).
+static void avx_cpu_addr16(int off) { // x16 = x28 + off   (off < 4096)
+    emit32(0x91000000u | ((unsigned)off << 10) | (28u << 5) | 16u);
+}
+static void avx_cpu_ldr_q(int t, int off) {
+    avx_cpu_addr16(off);
+    e_ldr_q(t, 16, 0);
+}
+static void avx_cpu_str_q(int t, int off) {
+    avx_cpu_addr16(off);
+    e_str_q(t, 16, 0);
+}
+static void avx_zero_upper(int d, int l256) { // zero destination bits above the written width
+    if (!l256) {                              // VEX.128 wrote 128 -> also clear vhi (bits[255:128])
+        e_str(31, 28, OFF_VHI + 16 * d);
+        e_str(31, 28, OFF_VHI + 16 * d + 8);
+    }
+    for (int k = 0; k < 4; k++) e_str(31, 28, OFF_VZ + 32 * d + 8 * k); // clear vz (bits[511:256])
+}
+
+// Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
+// to the R_AVX do_avx exit). Correctness-first: only a vetted, bit-exact-vs-qemu subset is claimed here.
+static int avx_lower(struct insn *I, uint64_t next) {
+    if (!I->vex || I->evex || I->vex_l > 1) return 0; // 512-bit / EVEX (masks, zmm16..31): leave to do_avx
+    int l256 = (I->vex_l == 1);
+    int d = I->reg, s1 = I->vvvv, s2r = I->rm_reg, pp = I->vex_pp, map = I->vex_map, op = I->op;
+    if (d > 15 || s1 > 15 || s2r > 15) return 0;
+
+    // ---- moves (2-operand: no vvvv) ----
+    int is_load = 0, is_store = 0;
+    if (map == 1) {
+        if ((op == 0x6F && (pp == 1 || pp == 2)) || ((op == 0x10 || op == 0x28) && pp < 2)) is_load = 1;
+        else if ((op == 0x7F && (pp == 1 || pp == 2)) || ((op == 0x11 || op == 0x29) && pp < 2)) is_store = 1;
+    }
+    if (is_load) {
+        mark_vdirty();
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(d, 17, 0);
+            if (l256) {
+                g_ldr_q(20, 17, 16);
+                avx_cpu_str_q(20, OFF_VHI + 16 * d);
+            }
+        } else {
+            if (d != s2r) e_vmov(d, s2r);
+            if (l256) {
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+                avx_cpu_str_q(20, OFF_VHI + 16 * d);
+            }
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+    if (is_store) {
+        mark_vdirty();
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_str_q(d, 17, 0);
+            if (l256) {
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * d);
+                g_str_q(20, 17, 16);
+            }
+        } else {
+            int dst = s2r; // r/m register is the destination
+            if (dst != d) e_vmov(dst, d);
+            if (l256) {
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * d);
+                avx_cpu_str_q(20, OFF_VHI + 16 * dst);
+            }
+            avx_zero_upper(dst, l256);
+        }
+        return 1;
+    }
+
+    // ---- 3-operand arithmetic / logical ----
+    uint32_t base = 0;
+    int swap = 0; // operands reversed (pandn/andn: dst = ~src1 & src2 = BIC(vn=src2, vm=src1))
+    if (map == 1) {
+        switch (op) {
+        // bitwise (element-agnostic .16b); unique opcodes -> no pp gate needed
+        case 0xEF: case 0x57: base = 0x6E201C00u; break;                 // vpxor / vxorps,pd
+        case 0xDB: case 0x54: base = 0x4E201C00u; break;                 // vpand / vandps,pd
+        case 0xEB: case 0x56: base = 0x4EA01C00u; break;                 // vpor  / vorps,pd
+        case 0xDF: case 0x55: base = 0x4E601C00u; swap = 1; break;       // vpandn / vandnps,pd (BIC)
+        default: break;
+        }
+        if (!base && pp == 1) switch (op) { // 66-prefixed packed integer
+        case 0xFC: base = 0x4E208400u; break;                            // vpaddb
+        case 0xFD: base = 0x4E608400u; break;                            // vpaddw
+        case 0xFE: base = 0x4EA08400u; break;                            // vpaddd
+        case 0xD4: base = 0x4EE08400u; break;                            // vpaddq
+        case 0xF8: base = 0x6E208400u; break;                            // vpsubb
+        case 0xF9: base = 0x6E608400u; break;                            // vpsubw
+        case 0xFA: base = 0x6EA08400u; break;                            // vpsubd
+        case 0xFB: base = 0x6EE08400u; break;                            // vpsubq
+        case 0x74: base = 0x6E208C00u; break;                            // vpcmpeqb (CMEQ)
+        case 0x75: base = 0x6E608C00u; break;                            // vpcmpeqw
+        case 0x76: base = 0x6EA08C00u; break;                            // vpcmpeqd
+        case 0x64: base = 0x4E203400u; break;                            // vpcmpgtb (CMGT signed)
+        case 0x65: base = 0x4E603400u; break;                            // vpcmpgtw
+        case 0x66: base = 0x4EA03400u; break;                            // vpcmpgtd
+        default: break;
+        }
+        // NOTE: packed FP add/sub/mul/div (0x58/0x5C/0x59/0x5E) are deliberately NOT lowered here.
+        // ARM NEON FADD/FSUB/FMUL/FDIV are not bit-exact to x86 on NaN/edge inputs (x86 quiets and
+        // selects a specific NaN payload, which do_avx reproduces via avx_dnan_f32/f64); a differential
+        // test vs qemu-x86_64 diverges on NaN/Inf data. Left to the correctness-first do_avx path.
+    } else if (map == 2 && op == 0x40 && pp == 1) {
+        base = 0x4EA09C00u; // vpmulld (MUL.4s)
+    }
+    if (!base) return 0;
+
+    mark_vdirty();
+    int s2 = s2r;
+    if (I->is_mem) {
+        emit_ea(I, next);
+        g_ldr_q(16, 17, 0);
+        s2 = 16;
+    }
+    if (swap) e_v3(base, d, s2, s1); else e_v3(base, d, s1, s2); // low 128 -> host v[d]
+    if (l256) {                                                  // high 128 via cpu->vhi
+        if (I->is_mem) g_ldr_q(21, 17, 16);
+        else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
+        avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);
+        if (swap) e_v3(base, 22, 21, 20); else e_v3(base, 22, 20, 21);
+        avx_cpu_str_q(22, OFF_VHI + 16 * d);
+    }
+    avx_zero_upper(d, l256);
+    return 1;
+}
+
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
     /* Observe writes made through another MAP_SHARED alias before decoding
@@ -1300,6 +1437,13 @@ static void *translate_block(uint64_t gpc) {
                 break;
             }
             if (g_fl_pending) flags_materialize();
+            // perf: lower the common VEX.128/.256 AVX2 ops (moves, packed int/fp arith, logical, compare)
+            // to native NEON inline instead of the per-instruction do_avx dispatcher round-trip. Only a
+            // vetted bit-exact-vs-qemu subset is claimed; everything else falls through to R_AVX.
+            if (!nosseopt() && avx_lower(&I, next)) {
+                gpc = next;
+                continue;
+            }
             emit_exit_const(gpc, R_AVX);
             break;
         }

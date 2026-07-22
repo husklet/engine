@@ -144,6 +144,8 @@ _Static_assert(__builtin_offsetof(struct cpu, vdirty) % 8 == 0 && __builtin_offs
 #define OFF_HSAVE 176
 #define OFF_HOSTV 272
 #define OFF_V 400
+#define OFF_VHI ((int)__builtin_offsetof(struct cpu, vhi)) // bits[128:256) of ymm0..15
+#define OFF_VZ ((int)__builtin_offsetof(struct cpu, vz))   // bits[256:512) of zmm0..15
 #define OFF_MM 656
 // async-poll flag offset (non-baked -> real offset, computed after the struct).
 #define OFF_IRQ __builtin_offsetof(struct cpu, irq)
