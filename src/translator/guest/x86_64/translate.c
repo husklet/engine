@@ -1790,6 +1790,93 @@ static int avx_lower(struct insn *I, uint64_t next) {
         return 1;
     }
 
+    // ---- vpackusdw (VEX.128/.256.66.0F38.W0 2B): pack 2x4 signed dwords -> 8 UNSIGNED words with unsigned
+    // saturation, WITHIN each 128-bit lane. x86: value<0 -> 0, >0xFFFF -> 0xFFFF; dst.lane = {sat(src1.lane),
+    // sat(src2.lane)}. NEON SQXTUN (signed 32 -> unsigned 16 saturating) reproduces x86's saturation exactly.
+    // src1=vvvv, src2=rm. SQXTUN fills the low 4h (and zeroes bits[127:64]); SQXTUN2 fills the high 4h. Per-128
+    // lane packing (low result = sat(src1), high result = sat(src2)) matches x86's per-128-lane pack order for
+    // 256-bit. Verified bit-exact vs qemu (neg / in-range / >0xFFFF / boundaries, 128+256, reg+mem).
+    if (map == 2 && pp == 1 && op == 0x2B) {
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // src1.hi
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // src2.hi
+        }
+        emit32(0x2E612800u | (s1 << 5) | 23);   // sqxtun  v23.4h, src1.4s  (low 4 words = sat(src1))
+        emit32(0x6E612800u | (s2 << 5) | 23);   // sqxtun2 v23.8h, src2.4s  (high 4 words = sat(src2))
+        if (l256) {
+            emit32(0x2E612800u | (20 << 5) | 24);
+            emit32(0x6E612800u | (21 << 5) | 24);
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpshufb VEX (VEX.128/.256.66.0F38.W0 00): byte shuffle WITHIN each 128-bit lane. dst[i] =
+    // (idx[i] & 0x80) ? 0 : data[idx[i] & 0x0F]; the index's low 4 bits select within the SAME 128-bit lane.
+    // data=vvvv(src1), idx=rm(src2). Mirrors the legacy PSHUFB lowering (lower/crypto.c): AND the control with
+    // 0x8f so ARM TBL (which zeroes for index >= 16) reproduces x86's bit7-zeroing exactly; TBL each 128-bit
+    // lane separately since indices are lane-local. Verified vs qemu (MSB-set -> 0, in-lane select, 128+256, reg+mem).
+    if (map == 2 && pp == 1 && op == 0x00) {
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // data.hi
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // idx.hi
+        }
+        emit32(0x4F04E5E0u | 25);                          // movi v25.16b, #0x8f
+        e_v3(0x4E201C00u, 18, s2, 25);                     // v18 = idx & 0x8f
+        emit32(0x4E000000u | (18 << 16) | (s1 << 5) | 23); // tbl v23.16b, {data.16b}, v18
+        if (l256) {
+            e_v3(0x4E201C00u, 18, 21, 25);                     // v18 = idx.hi & 0x8f
+            emit32(0x4E000000u | (18 << 16) | (20 << 5) | 24); // tbl v24.16b, {data.hi.16b}, v18
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpsadbw (VEX.128/.256.66.0F.WIG F6): sum of absolute differences. For each 64-bit lane, sum |a[i]-b[i]|
+    // over its 8 unsigned bytes -> a 16-bit result in bits[15:0] of that qword (bits[63:16] = 0). NEON: UABD
+    // (unsigned |a-b| per byte), then a 3-step UADDLP pairwise-widening reduction (16b->8h->4s->2d) sums each
+    // group of 8 bytes into the low 16 bits of its 64-bit lane, zero-extended -- exactly x86's layout (max sum
+    // 8*255=2040 fits in 16 bits). src1=vvvv, src2=rm. Verified vs qemu (max diffs, result placement + zeros, 128+256).
+    if (map == 1 && pp == 1 && op == 0xF6) {
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // src1.hi
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // src2.hi
+        }
+        emit32(0x6E207400u | (s2 << 16) | (s1 << 5) | 23); // uabd   v23.16b, src1.16b, src2.16b
+        emit32(0x6E202800u | (23 << 5) | 23);              // uaddlp v23.8h, v23.16b
+        emit32(0x6E602800u | (23 << 5) | 23);              // uaddlp v23.4s, v23.8h
+        emit32(0x6EA02800u | (23 << 5) | 23);              // uaddlp v23.2d, v23.4s
+        if (l256) {
+            emit32(0x6E207400u | (21 << 16) | (20 << 5) | 24);
+            emit32(0x6E202800u | (24 << 5) | 24);
+            emit32(0x6E602800u | (24 << 5) | 24);
+            emit32(0x6EA02800u | (24 << 5) | 24);
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
     // ---- 3-operand arithmetic / logical ----
     uint32_t base = 0;
     int swap = 0; // operands reversed (pandn/andn: dst = ~src1 & src2 = BIC(vn=src2, vm=src1))
