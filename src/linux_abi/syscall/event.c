@@ -54,6 +54,30 @@ static void ep_prime_if_ready(int ep, int fd, int16_t filt, void *udata) {
         ep_prime_push(ep, (uintptr_t)fd, filt, udata);
 }
 
+// LEVEL-triggered counterpart to the edge prime, for a fd that is ALREADY ready when its knote is
+// (re)armed under a multi-threaded guest. A level knote needs no synthetic prime -- once it is on the
+// kqueue, kevent() reports the current readiness naturally. The hazard is purely SUBMISSION: the W3E fast
+// path DEFERS the EV_ADD into the per-instance changelist and only flushes it as one batched kevent()
+// (ep_flush). Under concurrent epoll_ctl churn that batch routinely carries an EV_ADD/EV_DELETE for an fd a
+// peer just closed/re-cycled; macOS kevent() stops applying the changelist at the first erroring element
+// when the eventlist has no room for the EV_ERROR echo, STRANDING every change queued behind it -- including
+// this ready fd's EV_ADD. The knote then never arms, the parked pump never sees the ready socket, and its
+// readiness is lost (the level-triggered pump-primary-channel stall). Fix: for a ready-at-arm level fd, arm
+// its knote in ITS OWN isolated kevent() here, so an unrelated churn error can't strand it. The batched copy
+// in the changelist is left in place (an EV_ADD of an already-armed knote is idempotent); the subsequent
+// ep_flush wake then makes a peer already blocked in kevent() return and re-scan, at which point the knote is
+// armed and the socket's level readiness is delivered. Threaded only -- single-threaded the same thread
+// issues the next epoll_wait and submits the changelist itself, so its fast path stays byte-unchanged.
+static void ep_submit_ready_level(int ep, int fd, int16_t filt, uint16_t xf, void *udata) {
+    if (ep < 0 || ep >= HL_NFD || fd < 0) return;
+    short want = (filt == EVFILT_READ) ? POLLIN : POLLOUT;
+    struct pollfd pfd = {.fd = fd, .events = want, .revents = 0};
+    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & (want | POLLHUP | POLLERR))) return;
+    struct kevent kv;
+    EV_SET(&kv, (uintptr_t)fd, filt, EV_ADD | xf, 0, 0, udata);
+    kevent(ep, &kv, 1, NULL, 0, NULL); // isolated arm: a churn EV_ERROR in the batch can't strand it
+}
+
 // --- cross-thread readiness wakeup (EVFILT_USER) --------------------------------------------------
 // A Go netpoller (and node's worker-thread pool) shares ONE epoll instance across several OS threads
 // (Go Ms): one M blocks in epoll_wait while ANOTHER M accepts a connection and registers it on the same
@@ -861,6 +885,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data);
                 g_ep_rd[fd] = 1;
                 if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_READ, (void *)data);
+                else if (lk) ep_submit_ready_level(ep, fd, EVFILT_READ, xf, (void *)data);
             } else if (g_ep_rd[fd]) {
                 ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data);
                 g_ep_rd[fd] = 0;
@@ -869,6 +894,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data);
                 g_ep_wr[fd] = 1;
                 if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_WRITE, (void *)data);
+                else if (lk) ep_submit_ready_level(ep, fd, EVFILT_WRITE, xf, (void *)data);
             } else if (g_ep_wr[fd]) {
                 ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data);
                 g_ep_wr[fd] = 0;
