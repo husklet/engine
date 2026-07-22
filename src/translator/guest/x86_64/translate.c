@@ -1556,11 +1556,77 @@ static int avx_lower(struct insn *I, uint64_t next) {
         return 1;
     }
 
+    // ---- vpmovmskb (VEX.128/.256.66.0F.D7 /r): GPR(reg) <- byte-MSB mask of ymm/xmm(r/m). Source is a
+    // register only (no memory form). Reuse the legacy pmovmskb NEON cascade (translate.c:4277); for VEX.256
+    // run it twice, folding the high 16 bytes (cpu->vhi[s2r]) into result bits[31:16]. Result is 16 bits
+    // (L=0) or 32 bits (L=1) in the dest GPR, upper bits zeroed by the W-form (32-bit) ORR/UMOV. ----
+    if (map == 1 && op == 0xD7 && pp == 1 && !I->is_mem) {
+        e_vshr_imm(17, s2r, 8, 7, 0);                        // ushr v17.16b, src.16b, #7
+        emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17); // usra v17.8h, v17.8h, #7
+        emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17); // usra v17.4s, v17.4s, #14
+        emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17);// usra v17.2d, v17.2d, #28
+        emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);  // umov w16, v17.b[0]  (bytes 0..7)
+        emit32(0x0E003C00u | (17u << 16) | (17 << 5) | d);  // umov wD,  v17.b[8]  (bytes 8..15)
+        e_rrr(A_ORR, d, 16, d, 0, 8);                       // wD = w16 | (wD<<8)  -> bits[15:0]
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);           // v20 = src.hi (bytes 16..31)
+            e_vshr_imm(18, 20, 8, 7, 0);                     // ushr v18.16b, v20.16b, #7
+            emit32(0x6F001400u | (25u << 16) | (18 << 5) | 18);
+            emit32(0x6F001400u | (50u << 16) | (18 << 5) | 18);
+            emit32(0x6F001400u | (100u << 16) | (18 << 5) | 18);
+            emit32(0x0E003C00u | (1u << 16) | (18 << 5) | 16);  // umov w16, v18.b[0] (bytes 16..23)
+            e_rrr(A_ORR, d, d, 16, 0, 16);                      // wD |= w16<<16
+            emit32(0x0E003C00u | (17u << 16) | (18 << 5) | 16); // umov w16, v18.b[8] (bytes 24..31)
+            e_rrr(A_ORR, d, d, 16, 0, 24);                      // wD |= w16<<24
+        }
+        return 1;
+    }
+
+    // ---- vmovd/vmovq (scalar, 128-bit only; VEX.256 form is #UD -> leave to do_avx). W0=32-bit, W1=64-bit.
+    // Mirror the legacy movd/movq lowering; the VEX form additionally zeroes ymm bits above the written 128
+    // (avx_zero_upper). 66.0F.6E = load GPR/mem -> xmm; F3.0F.7E = movq xmm/m64 -> xmm; 66.0F.7E = store
+    // xmm -> GPR/mem. ----
+    if (map == 1 && !l256 && (op == 0x6E || op == 0x7E)) {
+        int w = I->vex_w;
+        if (op == 0x6E && pp == 1) {           // 66.0F.6E: (v)movd/q GPR|mem -> xmm, zero-extend to ymm width
+            mark_vdirty();
+            if (I->is_mem) { emit_ea(I, next); if (w) g_ldr_d(d, 17); else g_ldr_s(d, 17); }
+            else if (w) e_fmov_to_d(d, s2r); else e_fmov_to_s(d, s2r);
+            avx_zero_upper(d, 0);
+            return 1;
+        }
+        if (op == 0x7E && pp == 2) {           // F3.0F.7E: vmovq xmm/m64 -> xmm (low 64, zero upper)
+            mark_vdirty();
+            if (I->is_mem) { emit_ea(I, next); g_ldr_d(d, 17); }
+            else e_vmov8(d, s2r);
+            avx_zero_upper(d, 0);
+            return 1;
+        }
+        if (op == 0x7E && pp == 1) {           // 66.0F.7E: (v)movd/q xmm -> GPR|mem
+            if (I->is_mem) { emit_ea(I, next); if (w) g_str_d(d, 17); else g_str_s(d, 17); }
+            else if (w) e_fmov_from_d(s2r, d); else e_fmov_from_s(s2r, d);
+            return 1;
+        }
+    }
+
+    // ---- vzeroupper (VEX.128.0F.WIG 77) / vzeroall (VEX.256.0F.WIG 77): no operands. vzeroupper clears
+    // bits[MAX:128] of all ymm0..15 (== avx_zero_upper for each: clears vhi + vz); vzeroall additionally
+    // clears the low 128 (host v[n]). ----
+    if (map == 1 && op == 0x77 && pp == 0) {
+        if (l256) {                                              // vzeroall: also zero the low 128 lanes
+            mark_vdirty();
+            for (int n = 0; n < 16; n++) e_v3(0x6E201C00u, n, n, n); // eor vn.16b -> 0
+        }
+        for (int n = 0; n < 16; n++) avx_zero_upper(n, 0);       // clear vhi[n] and vz[n]
+        return 1;
+    }
+
     // ---- moves (2-operand: no vvvv) ----
     int is_load = 0, is_store = 0;
     if (map == 1) {
         if ((op == 0x6F && (pp == 1 || pp == 2)) || ((op == 0x10 || op == 0x28) && pp < 2)) is_load = 1;
         else if ((op == 0x7F && (pp == 1 || pp == 2)) || ((op == 0x11 || op == 0x29) && pp < 2)) is_store = 1;
+        else if (op == 0xE7 && pp == 1 && I->is_mem) is_store = 1; // vmovntdq store xmm/ymm -> mem (plain STR)
     }
     if (is_load) {
         mark_vdirty();
