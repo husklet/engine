@@ -1345,6 +1345,47 @@ static void emit_avx_varshift_lane(int out, int val, int cnt, int op, int es) {
     e_v3(0x4E601C00u, out, out, 25);                             // bic out, out, mask
 }
 
+// Emit ONE 128-bit lane of a VCMPPS/VCMPPD packed FP compare (op 0xC2). a=src1, b=src2 (host V regs),
+// out=result mask (all-ones/all-zero per lane; may alias a/b). p = predicate (imm8 & 0x1F). dbl selects
+// .2d (pd) vs .4s (ps). Scratch: v26/v27. Each predicate reproduces x86's NaN result exactly:
+//   FCMEQ/FCMGE/FCMGT return false for any NaN operand; ORD = FCMEQ(a,a)&FCMEQ(b,b); UNORD = NOT ORD.
+// Predicates 0x10-0x1F have the same relational result as 0x00-0x0F (they differ only in signaling), so
+// only the low nibble selects the operation.
+static void emit_vcmp_lane(int out, int a, int b, int p, int dbl) {
+    uint32_t FCMEQ = dbl ? 0x4E60E400u : 0x4E20E400u;
+    uint32_t FCMGE = dbl ? 0x6E60E400u : 0x6E20E400u;
+    uint32_t FCMGT = dbl ? 0x6EE0E400u : 0x6EA0E400u;
+    const uint32_t AND = 0x4E201C00u, ORR = 0x4EA01C00u, EOR = 0x6E201C00u;
+    uint32_t MVN = 0x6E205800u; // NOT vd.16b, vn.16b
+    switch (p & 0x0F) {
+    case 0x0: e_v3(FCMEQ, out, a, b); break;                                  // EQ_OQ:  a==b (false on NaN)
+    case 0x1: e_v3(FCMGT, out, b, a); break;                                  // LT_OS:  a<b  = b>a
+    case 0x2: e_v3(FCMGE, out, b, a); break;                                  // LE_OS:  a<=b = b>=a
+    case 0x3: // UNORD_Q: either NaN  = NOT(ord)
+        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, out, 26, 27);
+        emit32(MVN | (out << 5) | out); break;
+    case 0x4: e_v3(FCMEQ, out, a, b); emit32(MVN | (out << 5) | out); break;  // NEQ_UQ: !(a==b) (true on NaN)
+    case 0x5: e_v3(FCMGT, out, b, a); emit32(MVN | (out << 5) | out); break;  // NLT_US: !(a<b)  (true on NaN)
+    case 0x6: e_v3(FCMGE, out, b, a); emit32(MVN | (out << 5) | out); break;  // NLE_US: !(a<=b) (true on NaN)
+    case 0x7: // ORD_Q: neither NaN
+        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, out, 26, 27); break;
+    case 0x8: // EQ_UQ: a==b OR unordered
+        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, 26, 26, 27);
+        emit32(MVN | (26 << 5) | 26);                                        // v26 = unord
+        e_v3(FCMEQ, 27, a, b); e_v3(ORR, out, 26, 27); break;
+    case 0x9: e_v3(FCMGE, out, a, b); emit32(MVN | (out << 5) | out); break;  // NGE_US: !(a>=b) (true on NaN)
+    case 0xA: e_v3(FCMGT, out, a, b); emit32(MVN | (out << 5) | out); break;  // NGT_US: !(a>b)  (true on NaN)
+    case 0xB: e_v3(EOR, out, a, a); break;                                    // FALSE_OQ: all zero
+    case 0xC: // NEQ_OQ: a!=b AND ordered
+        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, 26, 26, 27); // ord
+        e_v3(FCMEQ, 27, a, b); emit32(MVN | (27 << 5) | 27);                 // !eq
+        e_v3(AND, out, 26, 27); break;
+    case 0xD: e_v3(FCMGE, out, a, b); break;                                  // GE_OS
+    case 0xE: e_v3(FCMGT, out, a, b); break;                                  // GT_OS
+    case 0xF: e_v3(EOR, out, a, a); emit32(MVN | (out << 5) | out); break;    // TRUE_UQ: all ones
+    }
+}
+
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
 // to the R_AVX do_avx exit). Correctness-first: only a vetted, bit-exact-vs-qemu subset is claimed here.
 static int avx_lower(struct insn *I, uint64_t next) {
@@ -1526,14 +1567,20 @@ static int avx_lower(struct insn *I, uint64_t next) {
         return 1;
     }
 
-    // ---- VPBLENDVB (VEX.128/.256.66.0F3A.W0 4C /r /is4): variable per-BYTE blend. 4-operand:
-    // dst=reg, src1=vvvv, src2=r/m, mask=is4 (imm[7:4]). dst[byte i] = (mask[i]&0x80)?src2[i]:src1[i].
-    // NEON: sel = SSHR(mask,#7) -> 0xFF per byte where the MSB is set; BSL sel, src2, src1 (bit-select:
-    // where sel bit=1 take src2, else src1). Byte-exact vs qemu (pure integer byte select, verified over
-    // random + MSB-corner mask patterns, 128 and 256). vblendvps/pd (0x4A/0x4B) still fall to do_avx.
-    if (map == 3 && op == 0x4C && pp == 1) {
+    // ---- VPBLENDVB / VBLENDVPS / VBLENDVPD (VEX.128/.256.66.0F3A.W0 4C/4A/4B /r /is4): variable blend
+    // by the mask's per-lane sign bit. 4-operand: dst=reg, src1=vvvv, src2=r/m, mask=is4 (imm[7:4]).
+    //   4C vpblendvb  -> per BYTE   (sign bit = bit 7)   dst[i] = mask[i].signbit ? src2 : src1
+    //   4A vblendvps  -> per 32-bit lane (sign bit = bit 31)
+    //   4B vblendvpd  -> per 64-bit lane (sign bit = bit 63)
+    // NEON: sel = SSHR(mask, #esize-1) replicates each lane's sign across the whole lane (all-ones/all-zero);
+    // BSL sel, src2, src1 (where sel bit=1 take src2, else src1). The BSL is byte-granular but sel is uniform
+    // per lane, so 32/64-bit selection is exact. Verified bit-exact vs qemu over random + sign-corner masks,
+    // 128 and 256, reg and mem src2. (vblendps/pd immediate forms 0x0C/0x0D still fall to do_avx.)
+    if (map == 3 && (op == 0x4A || op == 0x4B || op == 0x4C) && pp == 1) {
         int mreg = (I->imm >> 4) & 0xF;
         if (mreg > 15) return 0;
+        int esz = (op == 0x4C) ? 8 : (op == 0x4A) ? 32 : 64; // lane bit-width; sign shift = esz-1
+        int msh = esz - 1;
         mark_vdirty();
         int s2 = s2r;
         if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
@@ -1542,15 +1589,70 @@ static int avx_lower(struct insn *I, uint64_t next) {
             avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);                                               // src1.hi
             if (I->is_mem) g_ldr_q(22, 17, 16); else avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r);     // src2.hi
         }
-        e_vshr_imm(18, mreg, 8, 7, 1);  // v18 = sshr mask.16b,#7  (0xFF where mask MSB set)
+        e_vshr_imm(18, mreg, esz, msh, 1);  // v18 = sshr mask, #esz-1 (lane all-ones where sign set)
         e_v3(0x6E601C00u, 18, s2, s1);  // BSL v18.16b, src2.16b, src1.16b -> mask?src2:src1
         if (l256) {
-            e_vshr_imm(19, 20, 8, 7, 1);       // v19 = sshr mask.hi,#7
+            e_vshr_imm(19, 20, esz, msh, 1);   // v19 = sshr mask.hi, #esz-1
             e_v3(0x6E601C00u, 19, 22, 21);     // BSL v19.16b, src2.hi, src1.hi
             e_vmov(d, 18);
             avx_cpu_str_q(19, OFF_VHI + 16 * d);
         } else {
             e_vmov(d, 18);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- VPBLENDW (VEX.128/.256.66.0F3A.W0 0E /r ib): blend 16-bit words by imm8. 3-operand non-destructive:
+    // dst=reg, src1=vvvv, src2=r/m. For each word i in 0..7: imm8 bit i set -> take src2.word[i] else
+    // src1.word[i]. For 256-bit the same imm8 is applied to BOTH 128-bit lanes (words 0..7 within each lane).
+    // Lowered at translate time: start from src1, then INS dst.h[i] <- src2.h[i] for each set imm bit. Exact
+    // (pure word select). Verified vs qemu over a representative imm8 set, 128 and 256, reg and mem src2.
+    if (map == 3 && op == 0x0E && pp == 1) {
+        int imm = I->imm & 0xFF;
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
+        if (l256) { // load highs before writing d (d may alias src1/src2)
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);                                             // src1.hi
+            if (I->is_mem) g_ldr_q(22, 17, 16); else avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r);   // src2.hi
+        }
+        e_vmov(23, s1);                     // low  = src1
+        for (int i = 0; i < 8; i++) if (imm & (1 << i))
+            emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (s2 << 5) | 23); // INS v23.h[i], src2.h[i]
+        if (l256) {
+            e_vmov(24, 21);                 // high = src1.hi
+            for (int i = 0; i < 8; i++) if (imm & (1 << i))
+                emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (22 << 5) | 24); // INS v24.h[i], src2.hi.h[i]
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- VCMPPS / VCMPPD (VEX.128/.256.0F.WIG C2 /r ib): packed FP compare, imm8 = predicate. Produces an
+    // all-ones/all-zero mask per lane. ps -> no prefix (pp==0, .4s); pd -> 66 (pp==1, .2d). Scalar ss/sd
+    // (F3/F2, pp>=2) fall to do_avx. a=src1(vvvv), b=src2(r/m). NEON FCMEQ/FCMGE/FCMGT (+ negate / swap /
+    // ordered-test) reproduce each predicate's NaN result exactly (FCMGT/FCMGE are false for any NaN operand;
+    // FCMEQ(x,x) is false iff x is NaN). Predicates 0x00-0x0F implemented; 0x10-0x1F share the same relational
+    // result (they differ only in signaling behavior) so are mapped identically via imm&0x0F. Verified
+    // bit-exact vs qemu incl equal/less/greater/-0/inf/QNaN/SNaN(both signs), 128 and 256, reg and mem.
+    if (map == 1 && op == 0xC2 && pp < 2) {
+        int p = I->imm & 0x1F, dbl = (pp == 1);
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // a.hi
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // b.hi
+        }
+        emit_vcmp_lane(d, s1, s2, p, dbl);  // low 128 -> host v[d]
+        if (l256) {
+            emit_vcmp_lane(22, 20, 21, p, dbl);
+            avx_cpu_str_q(22, OFF_VHI + 16 * d);
         }
         avx_zero_upper(d, l256);
         return 1;
