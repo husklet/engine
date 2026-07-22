@@ -872,7 +872,53 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     return 1;
 }
 
+// x86-TSO LDAPR alignment-fault fixup. Guest loads are emitted as LDAPR (Load-AcquirePC) to supply the
+// x86-TSO LoadLoad+LoadStore ordering in one instruction (emit.c). On a FEAT_LSE2 host an unaligned LDAPR
+// that crosses a 16-byte granule raises SIGBUS/BUS_ADRALN. x86 permits every unaligned normal load, and a
+// guest load is never emitted as any OTHER alignment-checked host instruction (plain LDR does not
+// alignment-fault on Normal cacheable memory) -- therefore a BUS_ADRALN at an engine-emitted LDAPR host PC
+// is ALWAYS this synthetic case, NEVER a guest-visible fault. Emulate the load with a plain unaligned read
+// plus DMB ISHLD (the exact LoadLoad+LoadStore acquire edges LDAPR provides -- identical to the old
+// LDR+DMB ISHLD sequence), write the zero-extended value into Rt, and step the host PC past the LDAPR.
+// Returns 1 iff handled; declines (0) for anything that is not one of our LDAPRs so real faults flow on.
+static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
+    extern int g_host_lrcpc;                     // set from host AT_HWCAP (emit.c); 0 => no LDAPR emitted
+    if (!g_host_lrcpc || sig != SIGBUS || !si || !ucv) return 0; // inert on the LDR+DMB fallback path
+#ifdef BUS_ADRALN
+    if (si->si_code != BUS_ADRALN) return 0;
+#else
+    if (si->si_code != 1) return 0;
+#endif
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
+    // The faulting instruction must live inside the live RX code arena, else it is not one we emitted.
+    extern int jit_pc_in_cache(uint64_t pc, uint64_t *base);
+    if (!jit_pc_in_cache(hpc, NULL)) return 0;
+    uint32_t insn = *(uint32_t *)hpc;
+    // LDAPR{B,H,,} <Rt>,[<Xn>]: mask out size[31:30], Rn[9:5], Rt[4:0].
+    if ((insn & 0x3FFFFC00u) != 0x38BFC000u) return 0;
+    uint64_t *X = HL_HOST_UC_REGS(uc);
+    int size = insn >> 30; // 0=B 1=H 2=W 3=X -> 1/2/4/8 bytes
+    int rn = (insn >> 5) & 0x1F;
+    int rt = insn & 0x1F;
+    uint64_t addr = (rn == 31) ? (uint64_t)HL_HOST_UC_SP(uc) : X[rn];
+    unsigned width = 1u << size;
+    // A crossing access could span into an unmapped page (a genuine guest #PF on x86). Only emulate when
+    // the whole access is mapped; otherwise decline so the normal fault path delivers the real fault.
+    if (!hl_host_range_mapped((uintptr_t)addr, width)) return 0;
+    uint64_t val = 0;
+    memcpy(&val, (const void *)addr, width);        // little-endian host==guest; zero-extends to 64 bits
+    __asm__ __volatile__("dmb ishld" ::: "memory"); // acquire: order the load before later loads/stores
+    if (rt != 31) X[rt] = val;                       // Rt==31 would be ZR (discard); never emitted for a load
+    HL_HOST_UC_PC(uc) += 4;
+    return 1;
+}
+
 void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
+    // x86-TSO LDAPR unaligned-crossing alignment fault -> emulate + resume. First, before any classifier:
+    // this synthetic BUS_ADRALN is neither a guest fault nor a lazy-map candidate. (No-op unless the fault
+    // is a BUS_ADRALN at an engine LDAPR host PC.)
+    if (ldapr_align_fixup(sig, si, uc)) return;
     // host_range_mapped's fault-guarded probe (thread.c): a probe load on an unmapped guest page long-jumps
     // back to report "unmapped" -> -EFAULT. MUST run first: the lazy zero-page mapper below would otherwise
     // serve the probe fault with a fresh mapping, flipping a correct EFAULT into a bogus success (and
