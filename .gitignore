@@ -17,3 +17,4 @@ hl-arm-image-fixed.a
 pkgs/*/assets/lib/
 pkgs/*/assets/**/*.tar.gz
 pkgs/*/assets/**/*.a
+results/
