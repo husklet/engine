@@ -968,11 +968,32 @@ static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
 // sign bit must be set. Critical path from the result is just 2 ops: FCMEQ then BIC (the ORR is off the
 // vd->vd forwarding path only by the OR itself). BIC(PRESIGN, res_notnan) keeps the sign bit only on
 // lanes where the result IS NaN (res_notnan==0), i.e. exactly the freshly generated default-NaN lanes.
-static void emit_dnan_post(int vd, int dbl) {
+static void emit_dnan_post(int vd, int dbl, int packed) {
     uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
-    emit32(EQ | (vd << 16) | (vd << 5) | 21); // v21 = (res == res)  (all-ones where result NOT NaN)
-    e_v3(0x4E601C00u, 20, 20, 21);            // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
-    e_v3(0x4EA01C00u, vd, vd, 20);            // vd |= sign mask  (ORR.16b)
+    if (packed) {
+        // Packed: keep the branchless per-lane fixup (a generated NaN can appear in any lane, and a
+        // scalar FCMP cannot gate all lanes). Unchanged this round.
+        emit32(EQ | (vd << 16) | (vd << 5) | 21); // v21 = (res == res)  (all-ones where result NOT NaN)
+        e_v3(0x4E601C00u, 20, 20, 21);            // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
+        e_v3(0x4EA01C00u, vd, vd, 20);            // vd |= sign mask  (ORR.16b)
+        return;
+    }
+    // Scalar: the branchless ORR sat on the loop-carried vd->vd FP forwarding chain (~+12 cyc/iter). A
+    // NaN input already routes to the C softmulator (NaN-INPUT gate above), so on this inline path a NaN
+    // result can ONLY be a GENERATED NaN (0*inf, inf-inf, ...) -- extremely rare. Hoist the whole fixup
+    // behind a predicted-not-taken branch keyed on the scalar result: FCMP dst,dst sets V iff dst is NaN.
+    // The common (non-NaN) path is now just FCMP+b.vc, neither of which writes vd, so the fixup is off the
+    // forwarding chain entirely. The taken (rare) path runs the ORIGINAL 3-op sequence verbatim, so it is
+    // bit-for-bit identical to the old branchless output (which was a no-op whenever the result was not NaN,
+    // and stamped the sign -- masking the always-zero scalar upper lane via ~res_notnan -- when it was).
+    emit32((dbl ? 0x1E602000u : 0x1E202000u) | (vd << 16) | (vd << 5)); // FCMP dst,dst  (V=1 iff dst is NaN)
+    uint32_t *p_bvc = (uint32_t *)g_cp;
+    emit32(0);                                 // b.vc Lok  (NOT NaN -> skip fixup; patched below)
+    emit32(EQ | (vd << 16) | (vd << 5) | 21);  // v21 = (res == res)  (all-ones where result NOT NaN)
+    e_v3(0x4E601C00u, 20, 20, 21);             // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
+    e_v3(0x4EA01C00u, vd, vd, 20);             // vd |= sign mask  (ORR.16b)
+    uint8_t *Lok = (uint8_t *)g_cp;
+    *p_bvc = 0x54000000u | ((uint32_t)(((Lok - (uint8_t *)p_bvc) / 4) & 0x7FFFF) << 5) | 7; // b.vc (cond VC=7)
 }
 
 // ---- AVX2 FMA (vfmadd/vfmsub/vfnmadd/vfnmsub) -> NEON FMLA/FMLS ----
@@ -4433,7 +4454,7 @@ static void *translate_block(uint64_t gpc) {
                         else
                             emit32(b | ty | (s << 16) | (vd << 5) | vd); // FADD/.../FMAX sd/ss
                     }
-                    if (fixnan) emit_dnan_post(vd, dbl); // stamp x86's negative default-NaN sign on generated NaNs
+                    if (fixnan) emit_dnan_post(vd, dbl, packed); // stamp x86's negative default-NaN sign on generated NaNs
                 } else if (op == 0x5A) { // cvtsd2ss(F2) / cvtss2sd(F3)
                     int s = vm;
                     if (I.is_mem) {
