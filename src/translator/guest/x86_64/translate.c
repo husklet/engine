@@ -1299,6 +1299,52 @@ static void avx_zero_upper(int d, int l256) { // zero destination bits above the
     for (int k = 0; k < 4; k++) e_str(31, 28, OFF_VZ + 32 * d + 8 * k); // clear vz (bits[511:256])
 }
 
+// Emit ONE 128-bit lane of an AVX2 variable shift (VPSLLV/VPSRLV/VPSRAV). op: 0x47 sllv (logical left),
+// 0x45 srlv (logical right), 0x46 sravd (arithmetic right, dword only). val=data, cnt=UNSIGNED per-lane
+// count, out=result (may alias val/cnt). es=4 (dword) or 8 (qword). Scratch: x16, v24, v25.
+//
+// x86 saturates the count PER LANE: for a count >= element-bit-width the logical result is 0 and the
+// arithmetic result is the sign bit replicated. NEON USHL/SSHL instead read the low SIGNED byte of each
+// count lane, so a raw USHL diverges for counts >= esize (or with high count bytes). Reproduce x86 exactly:
+//   - dword (es=4): UMIN.4s the count with esize (32) [arith: 31], so the clamped amount is a small
+//     positive value < 128 (valid signed byte); USHL by 32 gives 0, SSHL by -31 gives the sign fill --
+//     both the exact x86 saturated result. (UMIN.4s exists for 32-bit lanes.)
+//   - qword (es=8): NEON has no UMIN.2d, so USHL with the raw count and then BIC (zero) every lane whose
+//     count is unsigned >= 64 (CMHS mask). The mask is built BEFORE OUT is written so OUT may alias cnt.
+static void emit_avx_varshift_lane(int out, int val, int cnt, int op, int es) {
+    uint32_t sz = (es == 8) ? 3u : 2u;
+    uint32_t USHL = 0x6E204400u | (sz << 22);
+    uint32_t SSHL = 0x4E204400u | (sz << 22);
+    uint32_t NEG = 0x6E20B800u | (sz << 22);
+    if (op == 0x46) {                                              // arithmetic right (dword only)
+        e_movconst(16, 31);
+        emit32(0x4E040C00u | (16 << 5) | 24);                      // dup v24.4s, w16 (=31)
+        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24);      // umin v24.4s, cnt, 31
+        emit32(NEG | (24 << 5) | 24);                              // neg v24 -> -min(cnt,31)
+        emit32(SSHL | (24 << 16) | (val << 5) | out);              // sshl out, val, v24 (sign fill)
+        return;
+    }
+    if (es == 4) {                                                 // logical dword: clamp via UMIN.4s
+        e_movconst(16, 32);
+        emit32(0x4E040C00u | (16 << 5) | 24);                      // dup v24.4s, w16 (=32)
+        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24);      // umin v24.4s = min(cnt,32)
+        if (op == 0x45) emit32(NEG | (24 << 5) | 24);              // right shift -> negate amount
+        emit32(USHL | (24 << 16) | (val << 5) | out);              // ushl out, val, v24
+        return;
+    }
+    // logical qword: mask lanes with count >= 64 to 0 (build mask first so out may alias cnt).
+    e_movconst(16, 64);
+    emit32(0x4E080C00u | (16 << 5) | 24);                         // dup v24.2d, x16 (=64)
+    emit32((0x6EE03C00u) | (24 << 16) | (cnt << 5) | 25);         // cmhs v25.2d = (cnt u>= 64)
+    if (op == 0x45) {                                             // logical right
+        emit32(NEG | (cnt << 5) | 24);                           // v24 = -cnt
+        emit32(USHL | (24 << 16) | (val << 5) | out);
+    } else {                                                     // logical left
+        emit32(USHL | (cnt << 16) | (val << 5) | out);
+    }
+    e_v3(0x4E601C00u, out, out, 25);                             // bic out, out, mask
+}
+
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
 // to the R_AVX do_avx exit). Correctness-first: only a vetted, bit-exact-vs-qemu subset is claimed here.
 static int avx_lower(struct insn *I, uint64_t next) {
@@ -1506,6 +1552,138 @@ static int avx_lower(struct insn *I, uint64_t next) {
         } else {
             e_vmov(d, 18);
         }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- broadcasts (map 2, pp 1): DUP element 0 across the whole vector. reg source (xmm low element)
+    // or a memory scalar. vpbroadcastb/w/d/q (0x78/0x79/0x58/0x59), vbroadcastss/sd (0x18/0x19). Both
+    // 128-bit lanes of a 256-bit dst are identical, so the high half is just a copy of the low. ----
+    if (map == 2 && pp == 1 &&
+        (op == 0x78 || op == 0x79 || op == 0x58 || op == 0x59 || op == 0x18 || op == 0x19)) {
+        int es = (op == 0x78) ? 1 : (op == 0x79) ? 2 : (op == 0x18 || op == 0x58) ? 4 : 8;
+        int imm5 = es; // DUP element selector: b=1,h=2,s=4,d=8 (index 0)
+        mark_vdirty();
+        if (I->is_mem) {
+            emit_ea(I, next);
+            e_load(es, 16, 17);                                  // x16 = zero-extended es-byte scalar
+            emit32(0x4E000C00u | (imm5 << 16) | (16 << 5) | d);  // dup d.T, w16/x16
+        } else {
+            emit32(0x4E000400u | (imm5 << 16) | (s2r << 5) | d); // dup d.T, src.T[0]
+        }
+        if (l256) avx_cpu_str_q(d, OFF_VHI + 16 * d);            // high lane == low lane
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- AVX2 variable shift (map 2, pp 1): 0x47 vpsllvd/q, 0x45 vpsrlvd/q, 0x46 vpsravd. Per-lane
+    // USHL/SSHL with x86's >=esize saturation reproduced exactly (see emit_avx_varshift_lane). count = rm,
+    // data = vvvv. VEX.W selects dword(0)/qword(1); 0x46 is dword-only. ----
+    if (map == 2 && pp == 1 && (op == 0x45 || op == 0x46 || op == 0x47)) {
+        int es = I->vex_w ? 8 : 4;
+        if (op == 0x46 && es != 4) return 0; // vpsravq is AVX-512-only; leave to do_avx
+        mark_vdirty();
+        int s2 = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // count.lo -> v16
+        if (l256) {                                                       // load highs before writing d
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                         // data.hi
+            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // count.hi
+        }
+        emit_avx_varshift_lane(d, s1, s2, op, es); // low -> v[d]
+        if (l256) {
+            emit_avx_varshift_lane(22, 20, 21, op, es);
+            avx_cpu_str_q(22, OFF_VHI + 16 * d);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpshufd (map 1, 66, 0x70): per-128-lane dword shuffle by imm8 (dword j <- src.dword[imm[2j+1:2j]]).
+    // Resolve the lane selection at translate time into 4 INS.s per 128-bit lane. 2-operand (rm=src). The
+    // F2/F3 forms (vpshuflw/hw) have pp!=1 and fall to do_avx. ----
+    if (map == 1 && op == 0x70 && pp == 1) {
+        int imm = I->imm & 0xFF;
+        mark_vdirty();
+        int src = s2r;
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        for (int j = 0; j < 4; j++) e_ins_s(23, j, src, (imm >> (2 * j)) & 3); // low -> v23
+        if (l256) {
+            int srch = 20;
+            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            for (int j = 0; j < 4; j++) e_ins_s(24, j, srch, (imm >> (2 * j)) & 3); // high -> v24
+            e_vmov(d, 23);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else {
+            e_vmov(d, 23);
+        }
+        avx_zero_upper(d, l256);
+        return 1;
+    }
+
+    // ---- vpunpckl/h bw/wd/dq/qdq (map 1, 66): per-128-lane interleave -> NEON ZIP1/ZIP2. src1=vvvv, src2=rm.
+    // x86 interleaves within each 128-bit lane, exactly ZIP1/ZIP2 on the two 128-bit Q inputs. ----
+    if (map == 1 && pp == 1) {
+        int zip2 = -1, zsz = -1;
+        switch (op) {
+        case 0x60: zsz = 0; zip2 = 0; break; // vpunpcklbw
+        case 0x61: zsz = 1; zip2 = 0; break; // vpunpcklwd
+        case 0x62: zsz = 2; zip2 = 0; break; // vpunpckldq
+        case 0x6C: zsz = 3; zip2 = 0; break; // vpunpcklqdq
+        case 0x68: zsz = 0; zip2 = 1; break; // vpunpckhbw
+        case 0x69: zsz = 1; zip2 = 1; break; // vpunpckhwd
+        case 0x6A: zsz = 2; zip2 = 1; break; // vpunpckhdq
+        case 0x6D: zsz = 3; zip2 = 1; break; // vpunpckhqdq
+        default: break;
+        }
+        if (zsz >= 0) {
+            uint32_t zbase = (zip2 ? 0x4E007800u : 0x4E003800u) | ((uint32_t)zsz << 22);
+            mark_vdirty();
+            int s2 = s2r;
+            if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+            if (l256) {
+                if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);
+                e_v3(zbase, 22, 20, 21);              // high = zip(s1.hi, s2.hi)
+                e_v3(zbase, d, s1, s2);               // low
+                avx_cpu_str_q(22, OFF_VHI + 16 * d);
+            } else {
+                e_v3(zbase, d, s1, s2);
+            }
+            avx_zero_upper(d, l256);
+            return 1;
+        }
+    }
+
+    // ---- vpermd / vpermps (map 2, 66, 0x36 / 0x16): full cross-lane 32-bit permute across the whole 256
+    // bits: dst.dword[i] = data.dword[ctrl.dword[i] & 7]. data=rm, ctrl=vvvv. Lowered as a TBL over the
+    // 32-byte table {data.lo, data.hi}: build a per-output byte index = (ctrl.dword[i]&7)*4 + {0,1,2,3}.
+    //   sel  = ctrl & 7            (AND.4s)          -- x86's index&7, exact for any control value
+    //   base = sel << 2            (SHL.4s #2)       -- byte offset of the selected dword (0..28)
+    //   rep  = base * 0x01010101   (MUL.4s)          -- replicate the byte across the dword (no carry, <256)
+    //   idx  = rep + 0x03020100    (ADD.16b)         -- the 4 consecutive source bytes of that dword
+    //   out  = TBL {data.lo,data.hi}, idx            -- gather. VEX.256 only (no 128-bit encoding). ----
+    if (map == 2 && pp == 1 && (op == 0x36 || op == 0x16) && l256) {
+        mark_vdirty();
+        if (I->is_mem) { emit_ea(I, next); g_ldr_q(20, 17, 0); g_ldr_q(21, 17, 16); } // table {lo,hi}
+        else { e_vmov(20, s2r); avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); }
+        avx_cpu_ldr_q(25, OFF_VHI + 16 * s1); // ctrl.hi (ctrl.lo stays in v[s1])
+        e_movconst(16, 7);          emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 7
+        e_movconst(16, 0x01010101); emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x01010101
+        e_movconst(16, 0x03020100); emit32(0x4E040C00u | (16 << 5) | 28); // v28.4s = 0x03020100
+        // low output dwords 0..3 (from ctrl.lo = v[s1]) -> v22
+        e_v3(0x4E201C00u, 24, s1, 26);                  // sel = ctrl.lo & 7
+        e_vshl_imm(24, 24, 32, 2);                      // base = sel*4
+        e_v3(0x4EA09C00u, 24, 24, 27);                  // rep  = base*0x01010101
+        e_v3(0x4E208400u, 24, 24, 28);                  // idx  = rep + {0,1,2,3}
+        emit32(0x4E002000u | (24 << 16) | (20 << 5) | 22); // tbl v22.16b, {v20,v21}, v24
+        // high output dwords 4..7 (from ctrl.hi = v25) -> v23
+        e_v3(0x4E201C00u, 24, 25, 26);
+        e_vshl_imm(24, 24, 32, 2);
+        e_v3(0x4EA09C00u, 24, 24, 27);
+        e_v3(0x4E208400u, 24, 24, 28);
+        emit32(0x4E002000u | (24 << 16) | (20 << 5) | 23);
+        e_vmov(d, 22);
+        avx_cpu_str_q(23, OFF_VHI + 16 * d);
         avx_zero_upper(d, l256);
         return 1;
     }
