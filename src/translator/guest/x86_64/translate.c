@@ -1715,12 +1715,26 @@ static int avx_lower(struct insn *I, uint64_t next) {
         case 0x64: base = 0x4E203400u; break;                            // vpcmpgtb (CMGT signed)
         case 0x65: base = 0x4E603400u; break;                            // vpcmpgtw
         case 0x66: base = 0x4EA03400u; break;                            // vpcmpgtd
+        // integer min/max (bit-exact: NEON SMIN/UMIN/SMAX/UMAX == x86, no NaN concerns). map1 legacy forms.
+        case 0xDA: base = 0x6E206C00u; break;                            // vpminub (UMIN.16b)
+        case 0xDE: base = 0x6E206400u; break;                            // vpmaxub (UMAX.16b)
+        case 0xEA: base = 0x4E606C00u; break;                            // vpminsw (SMIN.8h)
+        case 0xEE: base = 0x4E606400u; break;                            // vpmaxsw (SMAX.8h)
         default: break;
         }
         // NOTE: packed FP add/sub/mul/div (0x58/0x59/0x5C/0x5E) are lowered above (emit_vex_fp), before
         // this generic base path, since they need the generated-NaN sign fixup the plain integer ops don't.
-    } else if (map == 2 && op == 0x40 && pp == 1) {
-        base = 0x4EA09C00u; // vpmulld (MUL.4s)
+    } else if (map == 2 && pp == 1) switch (op) { // 0F38 SSE4.1 integer min/max + multiply
+        case 0x40: base = 0x4EA09C00u; break;                            // vpmulld (MUL.4s)
+        case 0x38: base = 0x4E206C00u; break;                            // vpminsb (SMIN.16b)
+        case 0x39: base = 0x4EA06C00u; break;                            // vpminsd (SMIN.4s)
+        case 0x3A: base = 0x6E606C00u; break;                            // vpminuw (UMIN.8h)
+        case 0x3B: base = 0x6EA06C00u; break;                            // vpminud (UMIN.4s)
+        case 0x3C: base = 0x4E206400u; break;                            // vpmaxsb (SMAX.16b)
+        case 0x3D: base = 0x4EA06400u; break;                            // vpmaxsd (SMAX.4s)
+        case 0x3E: base = 0x6E606400u; break;                            // vpmaxuw (UMAX.8h)
+        case 0x3F: base = 0x6EA06400u; break;                            // vpmaxud (UMAX.4s)
+        default: break;
     }
     if (!base) return 0;
 
