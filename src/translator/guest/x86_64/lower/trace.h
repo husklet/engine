@@ -20,6 +20,11 @@ enum {
     HL_X86_PENDING_SUB = 1,
     HL_X86_PENDING_ADD = 2,
     HL_X86_PENDING_LOGIC = 3,
+    // Per-edge spill kind reported by hl_x86_trace_jcc_flags via *save_taken/*save_fall: which finalizer
+    // the caller must emit inside the (flag-live) edge stub. NONE = elide (successor overwrites first).
+    HL_X86_JCC_SPILL_NONE = 0,
+    HL_X86_JCC_SPILL_SUB = 1,   // e_nzcv_save   (SUBS: live NZCV already borrow-canonical)
+    HL_X86_JCC_SPILL_LOGIC = 2, // e_nzcv_save_c1 (ANDS: canonicalize x86 CF=0/OF=0 before the store)
 };
 
 typedef struct hl_x86_trace_state {
@@ -44,7 +49,7 @@ int hl_x86_trace_flags_livein(hl_x86_trace_state *state, uint64_t pc, uint64_t a
 int hl_x86_trace_pfaf_dead(hl_x86_trace_state *state, const struct insn *insn, uint64_t pc, uint64_t anchor);
 void hl_x86_trace_flags_edge(hl_x86_trace_state *state, uint64_t target, uint64_t anchor);
 void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor,
-                            int stitch_fall, int *save_taken, int *save_fall);
+                            int stitch_fall, int arm_cc, int *save_taken, int *save_fall);
 void hl_x86_trace_self_loop(hl_x86_trace_state *state, int condition, uint64_t start, uint64_t fall, void *body,
                             int slot);
 

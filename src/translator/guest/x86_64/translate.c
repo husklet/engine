@@ -2374,6 +2374,16 @@ static int avx_lower(struct insn *I, uint64_t next) {
     return 1;
 }
 
+// Emit the per-edge deferred-flag spill hl_x86_trace_jcc_flags requested for one Jcc edge stub:
+// SUB -> e_nzcv_save (live NZCV already borrow-canonical); LOGIC -> e_nzcv_save_c1 (recompute x86
+// CF=0/OF=0 from the live N/Z before the store); NONE -> nothing (successor overwrites first).
+static void emit_jcc_edge_spill(int kind) {
+    if (kind == HL_X86_JCC_SPILL_LOGIC)
+        e_nzcv_save_c1();
+    else if (kind != HL_X86_JCC_SPILL_NONE)
+        e_nzcv_save();
+}
+
 // Translate the basic block at guest address gpc; returns host entry pointer.
 static void *translate_block(uint64_t gpc) {
     /* Observe writes made through another MAP_SHARED alias before decoding
@@ -3125,7 +3135,7 @@ static void *translate_block(uint64_t gpc) {
                     // onto only the flag-live edge(s) (save_taken/save_fall, emitted below), a stitched
                     // fall keeps g_fl_pending for the inline continuation, and FL_ADD/FL_LOGIC drop the
                     // dead store after the mandatory msr fixup. FL_NONE reloads membank as before.
-                    hl_x86_trace_jcc_flags(&trace_state, taken, fall, gpc, stitch_fall, &save_taken, &save_fall);
+                    hl_x86_trace_jcc_flags(&trace_state, taken, fall, gpc, stitch_fall, cc, &save_taken, &save_fall);
                 }
                 // STITCH: lay the fall-through (`next`) inline; the taken side becomes a tiny
                 // out-of-line exit reached by the INVERTED condition. Both arms see canonical live
@@ -3137,7 +3147,7 @@ static void *translate_block(uint64_t gpc) {
                     uint32_t *patch = (uint32_t *)g_cp;
                     emit32(0);                     // b.inv -> fall (inline)
                     if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                    if (save_taken) e_nzcv_save(); // FL_SUB spill on the (flag-live) taken edge only
+                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the flag-live taken edge only
                     emit_chain_exit(taken);
                     int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                     *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
@@ -3151,12 +3161,12 @@ static void *translate_block(uint64_t gpc) {
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0);                    // b.cond -> taken
                 if (parity) e_nzcv_load();    // fall edge: restore canonical live NZCV
-                if (save_fall) e_nzcv_save(); // FL_SUB spill for a flag-live fall successor
+                emit_jcc_edge_spill(save_fall); // FL_SUB/FL_LOGIC spill for a flag-live fall successor
                 emit_chain_exit(next);
                 int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                 *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (cc & 0xF);
                 if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                if (save_taken) e_nzcv_save(); // FL_SUB spill for a flag-live taken successor
+                emit_jcc_edge_spill(save_taken); // FL_SUB/FL_LOGIC spill for a flag-live taken successor
                 emit_chain_exit(taken);
                 break;
             }
@@ -5191,7 +5201,7 @@ static void *translate_block(uint64_t gpc) {
                     // live ARM Z already holds (PF==0) from emit_parity_jcc_cond; flags spilled there.
                 } else {
                     // x86-xflags edge-aware flag handling -- see jcc rel8 (identical semantics).
-                    hl_x86_trace_jcc_flags(&trace_state, taken, fall, gpc, stitch_fall, &save_taken, &save_fall);
+                    hl_x86_trace_jcc_flags(&trace_state, taken, fall, gpc, stitch_fall, cc, &save_taken, &save_fall);
                 }
                 // STITCH (see jcc rel8): inline the fall-through, invert the cond, taken exit OOL.
                 // Parity jcc: restore the canonical live NZCV on every edge (parity-edge fix).
@@ -5200,7 +5210,7 @@ static void *translate_block(uint64_t gpc) {
                     uint32_t *patch = (uint32_t *)g_cp;
                     emit32(0);                     // b.inv -> fall (inline)
                     if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                    if (save_taken) e_nzcv_save(); // FL_SUB spill on the (flag-live) taken edge only
+                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the flag-live taken edge only
                     emit_chain_exit(taken);
                     int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                     *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
@@ -5214,12 +5224,12 @@ static void *translate_block(uint64_t gpc) {
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0);
                 if (parity) e_nzcv_load();    // fall edge: restore canonical live NZCV
-                if (save_fall) e_nzcv_save(); // FL_SUB spill for a flag-live fall successor
+                emit_jcc_edge_spill(save_fall); // FL_SUB/FL_LOGIC spill for a flag-live fall successor
                 emit_chain_exit(next);
                 int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                 *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (cc & 0xF);
                 if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                if (save_taken) e_nzcv_save(); // FL_SUB spill for a flag-live taken successor
+                emit_jcc_edge_spill(save_taken); // FL_SUB/FL_LOGIC spill for a flag-live taken successor
                 emit_chain_exit(taken);
                 break;
             }

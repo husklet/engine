@@ -422,13 +422,34 @@ void hl_x86_trace_flags_edge(hl_x86_trace_state *state, uint64_t target, uint64_
 //    reported via *save_taken/*save_fall, emitted by the caller inside the per-edge stubs. When the
 //    fall side is being stitched inline (stitch_fall), (*state->pending_flags) is KEPT: the continuation is the
 //    same host block and its own consumers handle the deferral exactly as intra-block code.
-//  - TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC: the msr fixup must precede the b.cond either way; only the membank str can be
-//    elided, and only when BOTH edges are provably dead. Otherwise materialize (pre-change bytes).
+//  - TRACE_FLAGS_LOGIC feeding an N/Z-only ARM condition (EQ/NE/MI/PL): mirror the SUB elide. ANDS already
+//    sets N,Z canonically and the b.cond reads ONLY N/Z, so branch straight off the raw ANDS NZCV and DROP the
+//    e_nzcv_fix_c1 msr. The x86 CF=0/OF=0 canonicalization is deferred onto the flag-live edge(s) only, where the
+//    caller emits e_nzcv_save_c1 (HL_X86_JCC_SPILL_LOGIC) -- which recomputes canonical C/V from the live N/Z. A
+//    dead edge elides entirely; a stitched fall keeps g_fl_pending==LOGIC (the raw ANDS NZCV IS the intra-block
+//    deferred state its own consumers expect). Any C/V-reading condition, or !flag_elision, keeps the old fixup.
+//  - TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC (otherwise): the msr fixup must precede the b.cond either way; only the
+//    membank str can be elided, and only when BOTH edges are provably dead. Otherwise materialize (pre-change bytes).
 //  - TRACE_FLAGS_NONE: reload the canonical membank flags (unchanged consumer path).
-void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor, int stitch_fall, int *save_taken,
-                           int *save_fall) {
-    *save_taken = 0;
-    *save_fall = 0;
+//
+// arm_cc reads ONLY N and/or Z iff it is EQ(0)/NE(1) [read Z] or MI(4)/PL(5) [read N]. Every other ARM cond
+// (CS/CC/HI/LS read C, VS/VC/GE/LT/GT/LE read V) needs canonical C/V at the branch -> excluded from the fast path.
+static int arm_cc_reads_only_nz(int cc) {
+    switch (cc & 0xF) {
+    case 0:  // EQ (Z)
+    case 1:  // NE (Z)
+    case 4:  // MI (N)
+    case 5:  // PL (N)
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor, int stitch_fall, int arm_cc,
+                           int *save_taken, int *save_fall) {
+    *save_taken = HL_X86_JCC_SPILL_NONE;
+    *save_fall = HL_X86_JCC_SPILL_NONE;
     if (!(*state->pending_flags)) {
         hl_x86_emit_flags_load();
         return;
@@ -438,10 +459,19 @@ void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t 
         return;
     }
     if ((*state->pending_flags) == HL_X86_PENDING_SUB) {
-        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) != 0;
+        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB : HL_X86_JCC_SPILL_NONE;
         if (!*save_taken) (*state->flag_elisions)++;
         if (stitch_fall) return; // keep (*state->pending_flags) live for the inline continuation
-        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) != 0;
+        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB : HL_X86_JCC_SPILL_NONE;
+        if (!*save_fall) (*state->flag_elisions)++;
+        (*state->pending_flags) = HL_X86_PENDING_NONE;
+        return;
+    }
+    if ((*state->pending_flags) == HL_X86_PENDING_LOGIC && arm_cc_reads_only_nz(arm_cc)) {
+        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC : HL_X86_JCC_SPILL_NONE;
+        if (!*save_taken) (*state->flag_elisions)++;
+        if (stitch_fall) return; // keep (*state->pending_flags) live: raw ANDS NZCV is the intra-block LOGIC state
+        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC : HL_X86_JCC_SPILL_NONE;
         if (!*save_fall) (*state->flag_elisions)++;
         (*state->pending_flags) = HL_X86_PENDING_NONE;
         return;
