@@ -18,7 +18,7 @@
  * emits PHASE lines", so `run` popen()s that command; setup/teardown are
  * available for providers that need provisioning.
  *
- *   orbstack   native run inside this OrbStack Linux machine (host arch only)
+ *   native     direct run on this host (host arch only; orbstack = alias)
  *   qemu       qemu-<arch> <binary>                          (qemu-user)
  *   hl-engine  hl-engine-linux-<arch> <binary>              (single hl worker = DEFAULT)
  *   docker     docker run --platform linux/<arch> ... /b     (native-in-container)
@@ -142,12 +142,18 @@ typedef struct provider {
     int (*teardown)(const ctx_t *); /* optional, may be NULL */
 } provider_t;
 
-/* ---- orbstack (native) ---- */
-static int orb_reach(const ctx_t *c, char *r, size_t n) {
+/* ---- native (direct run on this host) ----
+ * Runs the guest straight on whatever machine you are on -- no container, no
+ * qemu, no engine. Reachable only when the requested arch equals the host arch
+ * (you cannot run amd64 natively on an arm64 host: use qemu/docker-emulation
+ * for the cross-arch cell, or run --env native on an amd64 host). This is the
+ * "native" baseline; on an OrbStack Linux machine it IS the OrbStack cell, so
+ * "orbstack" is registered as an alias of this same provider. */
+static int native_reach(const ctx_t *c, char *r, size_t n) {
     if (strcmp(c->arch, host_arch()) != 0) {
         snprintf(r, n,
-                 "host arch is %s; to bench %s natively run this on an OrbStack "
-                 "%s machine",
+                 "host arch is %s; native can only run the host arch -- run "
+                 "--env native on a %s host, or use qemu/docker for the %s cell",
                  host_arch(), c->arch, c->arch);
         return 0;
     }
@@ -155,10 +161,10 @@ static int orb_reach(const ctx_t *c, char *r, size_t n) {
         snprintf(r, n, "guest binary missing: %s", c->binary);
         return 0;
     }
-    snprintf(r, n, "native run on this OrbStack %s machine", c->arch);
+    snprintf(r, n, "native run on this %s host", c->arch);
     return 1;
 }
-static int orb_cmd(const ctx_t *c, char *out, size_t n) {
+static int native_cmd(const ctx_t *c, char *out, size_t n) {
     return snprintf(out, n, "%s", c->binary) < (int)n ? 0 : -1;
 }
 
@@ -246,7 +252,8 @@ static int docker_cmd_build(const ctx_t *c, char *out, size_t n) {
 }
 
 static const provider_t PROVIDERS[] = {
-    {"orbstack", orb_reach, orb_cmd, NULL, NULL},
+    {"native", native_reach, native_cmd, NULL, NULL},
+    {"orbstack", native_reach, native_cmd, NULL, NULL}, /* alias: native on an OrbStack machine */
     {"docker", docker_reach, docker_cmd_build, NULL, NULL},
     {"qemu", qemu_reach, qemu_cmd, NULL, NULL},
     {"hl-engine", hl_reach, hl_cmd, NULL, NULL},
@@ -505,14 +512,16 @@ static int cmd_report(int argc, char **argv) {
                 snprintf(order[norder++], 64, "%s", cols[c].phase[i]);
         }
 
-    /* baseline column per arch: orbstack if present else first of arch */
+    /* baseline column per arch: native (or its orbstack alias) if present,
+     * else first column of that arch. */
     int base_of[MAX_COLS];
     for (int c = 0; c < ncol; ++c) {
         int b = -1;
         for (int k = 0; k < ncol; ++k)
             if (!strcmp(cols[k].arch, cols[c].arch)) {
                 if (b < 0) b = k;
-                if (!strcmp(cols[k].env, "orbstack")) { b = k; break; }
+                if (!strcmp(cols[k].env, "native") ||
+                    !strcmp(cols[k].env, "orbstack")) { b = k; break; }
             }
         base_of[c] = b;
     }
@@ -568,7 +577,7 @@ static int cmd_report(int argc, char **argv) {
             }
         }
     }
-    printf("ratios are x-native (baseline: orbstack per arch, else first column of that arch).\n");
+    printf("ratios are x-native (baseline: native per arch, else first column of that arch).\n");
     printf("note: 'syscall' ok= is tid-dependent; divergence there is expected.\n");
     if (diverged) {
         fprintf(stderr, "WARNING: checksum divergence in phases:%s\n", divlist);
@@ -583,7 +592,7 @@ static int usage(void) {
     fprintf(stderr,
             "usage:\n"
             "  bench-runner list\n"
-            "  bench-runner run --env <orbstack|docker|qemu|hl-engine> "
+            "  bench-runner run --env <native|orbstack|docker|qemu|hl-engine> "
             "--arch <arm64|amd64>\n"
             "                   [--repeats N] [--out F.csv] [--binary B] "
             "[--engine E]\n"

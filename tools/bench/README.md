@@ -40,7 +40,7 @@ pointers; adding a backend = add one struct to `PROVIDERS[]`.
 
 | env         | what it measures            | command shape                                   |
 |-------------|-----------------------------|-------------------------------------------------|
-| `orbstack`  | native (host arch only)     | `<binary>`                                       |
+| `native`  | native (host arch only)     | `<binary>`                                       |
 | `qemu`      | qemu-user                   | `qemu-<arch> <binary>`                           |
 | `hl-engine` | single hl worker (DEFAULT)  | `hl-engine-linux-<arch> <binary>`               |
 | `docker`    | native-in-container         | `docker run --platform linux/<arch> -v …:/b …`  |
@@ -67,7 +67,7 @@ Builds both-arch guests + the production engine + the runner, runs the local
 backends, and prints the table:
 
 ```sh
-make bench                                   # orbstack + qemu + hl-engine (local arch)
+make bench                                   # native + qemu + hl-engine (local arch)
 make bench BENCH_ARCH=amd64                  # x86_64 guests
 make bench BENCH_REPEATS=9
 ```
@@ -80,11 +80,11 @@ command itself (multi-word ok), and `DOCKER_IMAGE` the default image.
 
 ### Docker / remote daemon (Manager)
 
-Docker is left to the Manager because it needs a reachable daemon. On OrbStack
+Docker is left to the Manager because it needs a reachable daemon. On host (native)
 the host docker is reached with `DOCKER="mac docker"`:
 
 ```sh
-make bench BENCH_ENVS='orbstack qemu hl-engine docker' DOCKER='mac docker'
+make bench BENCH_ENVS='native qemu hl-engine docker' DOCKER='mac docker'
 # or directly:
 DOCKER='mac docker' build/tools/bench-runner run --env docker --arch arm64 \
     --image debian:stable-slim --out build/bench/docker-arm64.csv
@@ -97,7 +97,7 @@ linux/amd64`); a `--sock /path/docker.sock` routes to a specific daemon socket.
 
 - **docker** cell: `DOCKER="mac docker"` (host daemon) + `--arch {arm64,amd64}`
   + `--image`. Runs the SAME static-PIE guest binary inside the container.
-- **mac / host** commands: prefix with `mac` (OrbStack) as needed.
+- **mac / host** commands: prefix with `mac` (host (native)) as needed.
 - **x86_64 build**: `make build/perf/combined-bench-x86_64` (sqlite off by
   default on the aarch64 cross host; a native amd64 cell can enable it with
   `COMBINED_BENCH_SQLITE_x86_64=1`). Engine:
