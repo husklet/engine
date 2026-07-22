@@ -8,6 +8,35 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdint.h>
+#include <sys/eventfd.h>
+
+// Exercise the eventfd + pipe syscalls the way the perf event/pipe workloads do. This runs in the "id"
+// command, so it also fires during the fork-server PREWARM run (which invokes the prewarm binary with a
+// bare argv -> "id"). Two regressions this pins: (1) the prewarm parent ran guests without binding the
+// per-guest host-service tables, so an eventfd guest NULL-dereferenced g_eventfd_count and SIGSEGV'd the
+// resident server; (2) the warm runner (inherited prewarmed arena + pristine restore) mis-ran a fresh
+// pipe/eventfd. On any failure the "id" command returns non-42 so the golden identity/warm gate catches it.
+static int io_selfcheck(void) {
+    int efd = eventfd(0, EFD_CLOEXEC);
+    if (efd < 0) return -1;
+    uint64_t v = 1;
+    if (write(efd, &v, sizeof v) != (ssize_t)sizeof v || read(efd, &v, sizeof v) != (ssize_t)sizeof v || v != 1) {
+        close(efd);
+        return -1;
+    }
+    if (close(efd) != 0) return -1;
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    uint64_t token = UINT64_C(0x0123456789abcdef), got = 0;
+    if (write(fds[1], &token, sizeof token) != (ssize_t)sizeof token ||
+        read(fds[0], &got, sizeof got) != (ssize_t)sizeof got || got != token) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    return (close(fds[0]) != 0 || close(fds[1]) != 0) ? -1 : 0;
+}
 
 static void on_term(int s) {
     (void)s;
@@ -20,6 +49,7 @@ static void on_term(int s) {
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "id";
     if (strcmp(cmd, "id") == 0) {
+        if (io_selfcheck() != 0) return 1; // eventfd/pipe must work cold, served, and warm (see io_selfcheck)
         printf("argc=%d\n", argc);
         for (int i = 0; i < argc; i++)
             printf("argv[%d]=%s\n", i, argv[i]);

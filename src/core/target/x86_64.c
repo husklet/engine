@@ -740,6 +740,17 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
             if (chdir(g_rootfs)) {}                                                                                    \
         }                                                                                                              \
     } while (0)
+// Bind the same per-guest host-service tables a cold hl_run_linux_guest() would, so the fork-server prewarm
+// parent (which runs guests via run_loaded()) allocates them once and every warm COW worker inherits them.
+#define FSRV_GUEST_HOST_INIT()                                                                                          \
+    do {                                                                                                               \
+        const hl_host_services *fsrv_host_ = hl_target_services_effective(&g_target_services);                        \
+        futex_table_init(fsrv_host_);                                                                                  \
+        seq_ref_arena_init(fsrv_host_);                                                                                \
+        eventfd_count_init(fsrv_host_);                                                                                \
+        fdvis_init(fsrv_host_);                                                                                        \
+        ts_init(fsrv_host_);                                                                                           \
+    } while (0)
 #include "../../linux_abi/fork.c"
 
 void hl_target_runtime_init(void) {

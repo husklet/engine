@@ -700,6 +700,15 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // g_eventfd_gnb note in vfs.c.
         fcntl(fds[0], F_SETFL, O_NONBLOCK);
         // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
+        // Defensive: the accumulating-counter arena is bound once per process (eventfd_count_init, from a
+        // cold hl_run_linux_guest or the fork-server prewarm parent). If it is somehow still NULL, indexing
+        // it would SIGSEGV the process (fatal in a resident fork-server parent) -- report ENOMEM instead.
+        if (!g_eventfd_count) {
+            close(fds[0]);
+            close(peer);
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
         if (fds[0] < 0 || fds[0] >= HL_NFD) {
             // No per-fd tracking slot for a host fd past the table: the eventfd would be untrackable AND the
             // dup'd `peer` write end (not stored in g_eventfd_peer) would leak. Close both and report EMFILE,

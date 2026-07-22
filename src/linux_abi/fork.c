@@ -112,6 +112,16 @@ static uint64_t loaded_span(const struct loaded *L) {
 #ifndef FSRV_RESTORE_DONE
 #define FSRV_RESTORE_DONE(L, span) ((void)0)
 #endif
+// Per-guest host-service table init that hl_run_linux_guest() performs before it runs a guest (the
+// futex / seq-ref / eventfd-counter / fdvis / task-state SHARED arenas). The prewarm path runs guests via
+// run_loaded() directly and thus BYPASSES that init; without it an eventfd guest dereferences the still-NULL
+// g_eventfd_count and SIGSEGVs the resident parent (and other table-consulting paths silently misbehave in a
+// warm runner). These arenas are process-shared (MAP_SHARED) and each init is idempotent (early-returns once
+// bound), so binding them ONCE in the parent -- exactly the constructor model the tables document -- lets
+// every COW worker inherit the same physical arenas. Defined by the including target TU (aarch64/x86_64).
+#ifndef FSRV_GUEST_HOST_INIT
+#define FSRV_GUEST_HOST_INIT() ((void)0)
+#endif
 
 // ---- warm preload state (parent-side; inherited COW by every worker) ----
 static int g_warm_ready;                      // set once the parent has pre-loaded + pre-translated g_wprog
@@ -313,6 +323,12 @@ static int hl_server_main(int argc, char **argv) {
 
     if (prewarm && prewarm[0]) {
         snprintf(g_wprog, sizeof g_wprog, "%s", prewarm);
+        // Bind the per-guest host-service tables (eventfd counter, futex, seq-ref, fdvis, task-state) in
+        // the resident parent BEFORE running any guest. The prewarm run below goes through run_loaded()
+        // rather than hl_run_linux_guest(), which is where a cold launch does this init -- so without it an
+        // eventfd guest NULL-derefs g_eventfd_count and crashes the parent. The arenas are MAP_SHARED and
+        // created once, so every warm COW worker inherits them.
+        FSRV_GUEST_HOST_INIT();
         // Load the guest image (this fixes the base every COW worker will share).
         load_program(prewarm, &g_wmain, &g_winterp, &g_wjump, &g_wat_base, &g_whave_interp);
         g_wmain_span = loaded_span(&g_wmain);
