@@ -850,10 +850,15 @@ static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int ari
 // "result is NaN AND no input is NaN". Branchless: v20/v21 scratch, per-lane so scalar and packed share
 // one path (scalar upper lanes are 0.0 in the result -> never flagged). Set NOXFPDNAN to disable (A/B).
 static int fpdnan_on(void) { return 1; }
-// PRE (emit BEFORE the arithmetic, while vd still holds src1): v20 <- "no input is NaN" lane mask.
-// two_in: 1 for add/sub/mul/div (src1=vd, src2=s); 0 for sqrt (single operand s, vd is not an input).
+// PRE (emit BEFORE the arithmetic, while vd still holds src1): v20 <- per-lane PRESIGN mask =
+// (x86 indefinite sign bit) on lanes whose inputs are ALL non-NaN, else 0. Building the sign here
+// (off the arithmetic's result-dependency chain, overlapped with the long FP-op latency) shortens
+// POST to a 2-op chain from the result. two_in: 1 for add/sub/mul/div (src1=vd, src2=s); 0 for sqrt.
+// SHL.T #(esize-1) turns an all-ones "not-NaN" lane into exactly the sign bit (0x8000...), a 0 lane
+// stays 0 -- no constant/DUP needed.
 static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
     uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ Vd.2d/.4s (all-ones per lane where NOT NaN)
+    unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
     if (two_in) {
         emit32(EQ | (vd << 16) | (vd << 5) | 20); // v20 = (src1 == src1)
         emit32(EQ | (s << 16) | (s << 5) | 21);   // v21 = (src2 == src2)
@@ -861,23 +866,18 @@ static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
     } else {
         emit32(EQ | (s << 16) | (s << 5) | 20); // v20 = (src == src)
     }
+    emit32(0x4F005400u | (immhb << 16) | (20 << 5) | 20); // v20 = PRESIGN (SHL v20.T, v20, #esize-1)
 }
 // POST (emit AFTER the arithmetic; vd = result): OR the x86 indefinite sign into lanes that are a
 // GENERATED default NaN (result is NaN AND no input was NaN). Payload already matches x86, so only the
-// sign bit must be set.
+// sign bit must be set. Critical path from the result is just 2 ops: FCMEQ then BIC (the ORR is off the
+// vd->vd forwarding path only by the OR itself). BIC(PRESIGN, res_notnan) keeps the sign bit only on
+// lanes where the result IS NaN (res_notnan==0), i.e. exactly the freshly generated default-NaN lanes.
 static void emit_dnan_post(int vd, int dbl) {
     uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
     emit32(EQ | (vd << 16) | (vd << 5) | 21); // v21 = (res == res)  (all-ones where result NOT NaN)
-    e_v3(0x4E601C00u, 20, 20, 21);            // v20 = gen = in_notnan & ~res_notnan  (BIC.16b)
-    if (dbl) {
-        e_movconst(16, 0x8000000000000000ull);
-        emit32(0x4E080C00u | (16 << 5) | 21); // DUP v21.2d, x16   (per-lane sign const)
-    } else {
-        e_movconst(16, 0x80000000ull);
-        emit32(0x4E040C00u | (16 << 5) | 21); // DUP v21.4s, w16
-    }
-    e_v3(0x4E201C00u, 21, 21, 20); // v21 = signbits & gen  (AND.16b)
-    e_v3(0x4EA01C00u, vd, vd, 21); // vd |= signbits        (ORR.16b)
+    e_v3(0x4E601C00u, 20, 20, 21);            // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
+    e_v3(0x4EA01C00u, vd, vd, 20);            // vd |= sign mask  (ORR.16b)
 }
 
 // Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD2 -> SIGILL) by EXITING the block to the dispatcher with
