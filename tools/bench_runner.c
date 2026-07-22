@@ -494,10 +494,19 @@ static int col_ok(const col_t *c, const char *ph, uint64_t *out) {
 
 static int cmd_report(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "report: need CSV file(s)\n"); return 2; }
+    /* --baseline <env>: which env's column is the 1.00x reference per arch
+     * (default native). e.g. --baseline hl-engine shows every column as a
+     * multiple of hl-engine, so you read "how does X compare to hl". */
+    const char *baseline_env = "native";
     static col_t cols[MAX_COLS];
     int ncol = 0;
-    for (int i = 0; i < argc && ncol < MAX_COLS; ++i)
+    for (int i = 0; i < argc && ncol < MAX_COLS; ++i) {
+        if (!strcmp(argv[i], "--baseline") && i + 1 < argc) {
+            baseline_env = argv[++i];
+            continue;
+        }
         if (read_csv(argv[i], &cols[ncol]) == 0) ncol++;
+    }
     if (ncol == 0) { fprintf(stderr, "report: no valid CSV\n"); return 1; }
 
     /* union of phase names, first-seen order */
@@ -512,18 +521,19 @@ static int cmd_report(int argc, char **argv) {
                 snprintf(order[norder++], 64, "%s", cols[c].phase[i]);
         }
 
-    /* baseline column per arch: native (or its orbstack alias) if present,
-     * else first column of that arch. */
+    /* baseline column per arch: the --baseline env if present for that arch,
+     * else native (or its orbstack alias), else the first column of that arch. */
     int base_of[MAX_COLS];
     for (int c = 0; c < ncol; ++c) {
-        int b = -1;
+        int b = -1, want = -1, nat = -1;
         for (int k = 0; k < ncol; ++k)
             if (!strcmp(cols[k].arch, cols[c].arch)) {
                 if (b < 0) b = k;
-                if (!strcmp(cols[k].env, "native") ||
-                    !strcmp(cols[k].env, "orbstack")) { b = k; break; }
+                if (!strcmp(cols[k].env, baseline_env) && want < 0) want = k;
+                if ((!strcmp(cols[k].env, "native") ||
+                     !strcmp(cols[k].env, "orbstack")) && nat < 0) nat = k;
             }
-        base_of[c] = b;
+        base_of[c] = want >= 0 ? want : (nat >= 0 ? nat : b);
     }
 
     /* header */
@@ -577,7 +587,8 @@ static int cmd_report(int argc, char **argv) {
             }
         }
     }
-    printf("ratios are x-native (baseline: native per arch, else first column of that arch).\n");
+    printf("ratios are x-%s per arch (each column vs the %s cell of the same "
+           "arch; missing -> first column).\n", baseline_env, baseline_env);
     printf("note: 'syscall' ok= is tid-dependent; divergence there is expected.\n");
     if (diverged) {
         fprintf(stderr, "WARNING: checksum divergence in phases:%s\n", divlist);
