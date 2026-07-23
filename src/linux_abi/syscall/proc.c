@@ -209,7 +209,16 @@ static void exec_close_cloexec(void) {
         exec_close_cloexec_scan(getdtablesize());
         return;
     }
-    if (got > cap) got = cap;
+    // Truncated listing: more fds were open than the sized buffer could hold (they can be opened between
+    // the sizing call and this one, which is why cap was over-allocated in the first place). Clamping
+    // `got` here silently dropped the tail, leaving those CLOEXEC descriptors OPEN across the exec -- the
+    // exact leak this sweep exists to prevent, and one that only shows up when the process is busy enough
+    // to win that race. Fall back to the exhaustive scan, which cannot miss.
+    if (got > cap) {
+        free(fds);
+        exec_close_cloexec_scan(getdtablesize());
+        return;
+    }
     for (size_t i = 0; i < got; i++) {
         int fd = fds[i].descriptor;
         if (exec_fd_is_bound(fd)) continue;

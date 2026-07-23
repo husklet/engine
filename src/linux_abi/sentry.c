@@ -537,6 +537,7 @@ struct sentry_proc {
     uint8_t cloexec[SENTRY_VFD_MAX];  // 1 = FD_CLOEXEC set (O_CLOEXEC open / F_SETFD): swept on guest execve
     uint8_t typed[SENTRY_VFD_MAX];    // 1 = real[] names an opaque ABI descriptor shadow, not a native fd
     uint8_t procfd_dir[SENTRY_VFD_MAX]; // 1 = open description is the synthetic /proc/self/fd directory
+    uint8_t cloned;                     // 1 = a fork clone already populated this table (see sentry_proc_fork)
 };
 static struct sentry_proc g_proc[SENTRY_NPROC];
 static pthread_mutex_t g_fd_lock = PTHREAD_MUTEX_INITIALIZER; // guards g_proc[] (alloc / lookup / map)
@@ -556,6 +557,7 @@ static void proc_init_table(struct sentry_proc *p, pid_t wpid) {
         p->real[i] = i;
         p->borrowed[i] = 1;
     }
+    p->cloned = 0;
 }
 
 // Find a worker process's table WITHOUT creating one (NULL if it has none yet).
@@ -661,18 +663,31 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
     pthread_mutex_lock(&g_fd_lock);
     struct sentry_proc *pp = proc_lookup_locked(parent);
     struct sentry_proc *cp = proc_find_locked(child); // default (stdio) table for the child
+    // EXACTLY ONE clone per child. A guest fork issues SENTRY_OP_FORK from BOTH sides -- the child
+    // registers its own table, and the parent registers one for it -- so the two race for this lock and
+    // both would otherwise run the clone below. The guard used to INFER "already cloned" from the child
+    // table holding some fd >= 3, which is not equivalent: a clone whose dup()s all failed, or which
+    // copied only borrowed/stdio slots, leaves that test false. When it did, the second clone re-dup()ed
+    // every parent fd over the first clone's real[] entries, and those first descriptors became
+    // untracked -- open in the worker, absent from the table, therefore invisible to
+    // sentry_proc_exec_sweep. A CLOEXEC pipe write end orphaned that way survived the child's execve and
+    // its peer never saw EOF (compat case sc-sentry-cloexec-exec, intermittent under load).
+    //
+    // An explicit flag is exact, and does not care what the clone produced or which side won the race.
     if (cp) {
-        int already = 0;
-        for (uint32_t v = 3; v < SENTRY_VFD_MAX; v++)
-            if (cp->real[v] >= 0) {
-                already = 1;
-                break;
-            }
+        int already = cp->cloned;
+        if (!already)
+            for (uint32_t v = 3; v < SENTRY_VFD_MAX; v++)
+                if (cp->real[v] >= 0) { // table already populated by some other path
+                    already = 1;
+                    break;
+                }
         if (already) {
             pthread_mutex_unlock(&g_fd_lock);
             return;
         }
     }
+    if (cp) cp->cloned = 1;
     if (cp && pp)
         for (uint32_t v = 0; v < SENTRY_VFD_MAX; v++) {
             if (pp->real[v] < 0) continue;

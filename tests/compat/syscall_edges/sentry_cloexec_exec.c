@@ -149,11 +149,22 @@ static void child_mode(int argc, char **argv) {
     _exit(0);
 }
 
-// Nonblocking read of a pipe read end, polled for up to ~600ms. Returns 1 iff EOF (every write end is
-// closed), 0 if a write end is still open (EAGAIN throughout) or unexpected data arrived.
+// Nonblocking read of a pipe read end, polled until EOF or the budget runs out. Returns 1 iff EOF (every
+// write end is closed), 0 if a write end is still open (EAGAIN throughout) or unexpected data arrived.
+//
+// The budget is deliberately enormous relative to the work. What is being waited for is the child's
+// execve completing so the engine sweeps its CLOEXEC descriptors; that takes ~10ms here, so the previous
+// 600ms reads like a comfortable 60x margin while really being an unbounded wall-clock deadline.
+//
+// Widening it does NOT by itself make this case reliable, and should not be mistaken for a fix: under
+// heavy parallel load the case still fails with parts=01111 after the full budget, which is a genuine
+// unswept descriptor rather than a slow exec (the sentry trace shows the poll loop burning every
+// iteration). What the wider budget buys is separation of the two failure modes -- anything that fails
+// now has actually leaked. A leaked write end never yields EOF, so a real leak still fails; it just
+// takes the full budget to say so.
 static int drained_to_eof(int rfd) {
     char b[8];
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 1000; i++) { // 1000 * 10ms = 10s
         ssize_t r = read(rfd, b, sizeof b);
         if (r == 0) return 1;
         if (r < 0 && errno == EAGAIN) {
