@@ -589,15 +589,20 @@ mod tests {
     }
 
     #[test]
-    fn overlay_paths_are_ordered_nul_records_in_abi_twelve() {
+    fn overlay_paths_are_ordered_nul_records() {
         let config = Config::new().overlay(
             vec!["/lower/high".into(), "/lower/low".into()],
             "/overlay/upper",
             "/overlay/work",
         );
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
-        assert_eq!(word(&wire, ABI_OFFSET), 12);
-        assert_eq!(word(&wire, HEADER_SIZE_OFFSET), 200);
+        // Overlay arrived in HL_CONFIG_ABI_OVERLAY (12), but the encoder only ever emits the
+        // current HL_CONFIG_ABI. That constant moved to 13 when checkpoint_policy was added, and
+        // the overlay layout is unchanged by it: lower_layer_count/overlay_work_offset keep their
+        // offsets and the checkpoint words are appended after them. src/core/config.c accepts 12
+        // and 13 alike, so pinning 12 here only asserted "nothing newer was ever added".
+        assert_eq!(word(&wire, ABI_OFFSET), ABI);
+        assert_eq!(word(&wire, HEADER_SIZE_OFFSET), HEADER_SIZE_U32);
         assert_eq!(word(&wire, LOWER_COUNT_OFFSET), 2);
         assert_eq!(string(&wire, ROOTFS_OFFSET), Some("/overlay/upper"));
         assert_eq!(string(&wire, OVERLAY_WORK_OFFSET), Some("/overlay/work"));
