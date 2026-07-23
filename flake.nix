@@ -25,9 +25,20 @@
 
       # Guest ISAs the engine translates. Adding one is a single entry here:
       # every *_LINUX_CC / *_STATIC_CC / *_DYNAMIC_* variable below is derived.
+      #
+      # testNeedsSqlite says whether a TEST for this ISA links -lsqlite3, and it is
+      # the difference between a fast CI run and a 25-minute one. Static sqlite comes
+      # from pkgsStatic, a MUSL stdenv, so asking for it drags in a musl cross
+      # toolchain for that ISA -- and nixpkgs serves no prebuilt x86_64 musl gcc for
+      # an aarch64 builder, so that one is compiled from source whenever the cache
+      # misses. Only the aarch64 dbserver/sqlite compat-core workloads (Makefile:1113)
+      # need it; the x86_64 use is combined-bench alone, a benchmark. So x86_64 gets
+      # it in the `bench` shell and nowhere else.
       guestISAs = [
-        { isa = "aarch64"; crossAttr = "aarch64-multiplatform"; loader = "ld-linux-aarch64.so.1"; }
-        { isa = "x86_64"; crossAttr = "gnu64"; loader = "ld-linux-x86-64.so.2"; }
+        { isa = "aarch64"; crossAttr = "aarch64-multiplatform"; loader = "ld-linux-aarch64.so.1";
+          testNeedsSqlite = true; }
+        { isa = "x86_64"; crossAttr = "gnu64"; loader = "ld-linux-x86-64.so.2";
+          testNeedsSqlite = false; }
       ];
 
       # Host backends implementing the hl_host_services contract, one per
@@ -59,27 +70,16 @@
           ccFor = g:
             let p = pkgsFor g;
             in if isNative g then nativeCC else "${p.stdenv.cc}/bin/${p.stdenv.cc.targetPrefix}cc";
-          # Guest binaries link a STATIC sqlite and glibc for their own ISA; the
-          # -I/-L pair is what the compat-core dbserver/sqlite workloads and the
-          # combined-bench sqlite phase need.
-          #
-          # This deliberately uses the STOCK pkgsStatic.sqlite even though that is
-          # a musl stdenv and therefore implies a musl cross toolchain per guest
-          # ISA. Two alternatives were tried and are worse:
-          #   * moving the -I/-L pair to a separate perf-only shell -- wrong,
-          #     because the aarch64 dbserver/sqlite workloads are compat-core
-          #     cases that CI builds, not perf targets;
-          #   * overriding the ordinary glibc sqlite to build a static archive --
-          #     leaves the binary cache, forcing a from-source rebuild of the
-          #     whole chain including tcl, which does not cross-compile for
-          #     x86_64 (implicit strlen declaration is an error on modern gcc).
-          # The stock path is cached. A long musl toolchain build usually means
-          # the nix/CI cache key changed (it hashes flake.nix), not a new
-          # dependency.
-          staticCCFor = g:
+          # Guest binaries link a STATIC glibc for their own ISA, plus a static sqlite
+          # only where something actually links -lsqlite3 -- gated on the ISA's
+          # testNeedsSqlite (see guestISAs). staticCCWithSqlite forces it on for
+          # every ISA and is what the perf `bench` shell uses.
+          sqliteFlagsFor = g:
             let p = pkgsFor g;
-            in "${ccFor g} -I${lib.getDev p.pkgsStatic.sqlite}/include"
-               + " -L${lib.getLib p.pkgsStatic.sqlite}/lib -L${p.glibc.static}/lib";
+            in " -I${lib.getDev p.pkgsStatic.sqlite}/include -L${lib.getLib p.pkgsStatic.sqlite}/lib";
+          staticCCBase = g: "${ccFor g} -L${(pkgsFor g).glibc.static}/lib";
+          staticCCFor = g: staticCCBase g + lib.optionalString g.testNeedsSqlite (sqliteFlagsFor g);
+          staticCCWithSqlite = g: staticCCBase g + sqliteFlagsFor g;
           # The compiler *packages* (not paths) that belong on PATH in a shell.
           ccPkgFor = g: if isNative g then pkgs.gcc else (pkgsFor g).stdenv.cc;
 
@@ -109,6 +109,13 @@
             { CC = nativeCC; NATIVE_CC = nativeCC; }
             guestISAs;
 
+          # Perf overlay: the same variables, but every ISA gets its static
+          # sqlite and the x86_64 combined-bench sqlite phase is switched back on
+          # (the Makefile defaults it off so a default-shell bench still links).
+          benchEnv = env // lib.foldl'
+            (acc: g: acc // { "${upper g}_LINUX_STATIC_CC" = staticCCWithSqlite g; })
+            { COMBINED_BENCH_SQLITE_x86_64 = "1"; }
+            guestISAs;
         };
 
       # Source for the C build. `cleanSource` drops VCS noise; the build trees
@@ -289,6 +296,18 @@
             '';
           } // lib.optionalAttrs tc.canBuildGuests tc.env);
 
+          # Perf shell: adds the static sqlite for EVERY guest ISA. Separate from
+          # the default shell because the x86_64 one implies a musl cross gcc that
+          # nixpkgs does not serve prebuilt for an aarch64 builder -- a ~25 minute
+          # from-source build that no test needs.
+          bench = pkgs.mkShell ({
+            packages = [ pkgs.gnumake pkgs.pkg-config ]
+              ++ lib.optionals tc.canBuildGuests tc.crossCompilers;
+            shellHook = lib.optionalString tc.canBuildGuests ''
+              export CC="${tc.nativeCC}"
+              export NATIVE_CC="${tc.nativeCC}"
+            '';
+          } // lib.optionalAttrs tc.canBuildGuests tc.benchEnv);
         });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);

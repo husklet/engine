@@ -63,10 +63,10 @@ jobs:
           sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
           export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
           # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
-          # Output goes to a FILE, never a pipe -- the compat suite deliberately leaves processes alive
-          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived),
-          # they inherit this step's stdout, and a pipe would then never reach EOF: one run sat wedged in
-          # `tee` for over nine hours. A file has no reader to block. Returns 124 on expiry.
+          # Output goes to a FILE, never a pipe. The compat suite deliberately leaves processes alive
+          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived) and
+          # they inherit this step's stdout, so with `| tee` the reader can wait on an EOF that never
+          # comes. A file has no reader to block. Returns 124 on expiry.
           run_bounded() {
             local secs="$1" log="$2"; shift 2
             "$@" >"$log" 2>&1 </dev/null &

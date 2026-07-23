@@ -2495,7 +2495,12 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 # linuxX86Sqlite in flake.nix). It is therefore on for both arches by default;
 # a cell can still opt out per arch via COMBINED_BENCH_SQLITE_<arch>=0.
 COMBINED_BENCH_SQLITE_aarch64 ?= 1
-COMBINED_BENCH_SQLITE_x86_64 ?= 1
+# x86_64 defaults OFF: its static sqlite comes from pkgsStatic (a musl stdenv), and
+# nixpkgs serves no prebuilt x86_64 musl gcc for an aarch64 builder, so requiring it
+# costs a ~25 minute from-source compiler build that nothing but this benchmark wants.
+# The default dev shell therefore omits the x86_64 sqlite -I/-L pair; `nix develop
+# .#bench` supplies it and sets this back to 1.
+COMBINED_BENCH_SQLITE_x86_64 ?= 0
 COMBINED_SQLITE_CPP_1 := -DHL_BENCH_SQLITE
 COMBINED_SQLITE_CPP_0 :=
 COMBINED_SQLITE_LIBS_1 := -lsqlite3 -lm

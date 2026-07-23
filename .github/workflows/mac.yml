@@ -64,10 +64,10 @@ jobs:
           # runner divergence self-heals; a consistent failure still fails both attempts. Per-binary
           # 180s timeouts (Makefile) already bound any hang and name the culprit.
           # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
-          # Output goes to a FILE, never a pipe -- the compat suite deliberately leaves processes alive
-          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived),
-          # they inherit this step's stdout, and a pipe would then never reach EOF: one run sat wedged in
-          # `tee` for over nine hours. A file has no reader to block. Returns 124 on expiry.
+          # Output goes to a FILE, never a pipe. The compat suite deliberately leaves processes alive
+          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived) and
+          # they inherit this step's stdout, so with `| tee` the reader can wait on an EOF that never
+          # comes. A file has no reader to block. Returns 124 on expiry.
           run_bounded() {
             local secs="$1" log="$2"; shift 2
             "$@" >"$log" 2>&1 </dev/null &
@@ -162,10 +162,10 @@ jobs:
           # failure is surfaced as a ::warning (never silently swallowed) so a real intermittent bug
           # stays visible for follow-up even when the retry greens the job.
           # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
-          # Output goes to a FILE, never a pipe -- the compat suite deliberately leaves processes alive
-          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived),
-          # they inherit this step's stdout, and a pipe would then never reach EOF: one run sat wedged in
-          # `tee` for over nine hours. A file has no reader to block. Returns 124 on expiry.
+          # Output goes to a FILE, never a pipe. The compat suite deliberately leaves processes alive
+          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived) and
+          # they inherit this step's stdout, so with `| tee` the reader can wait on an EOF that never
+          # comes. A file has no reader to block. Returns 124 on expiry.
           run_bounded() {
             local secs="$1" log="$2"; shift 2
             "$@" >"$log" 2>&1 </dev/null &
