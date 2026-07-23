@@ -13,6 +13,33 @@
 // ---------------- the translator ----------------
 static void report_unimpl(uint64_t pc, struct insn *I);
 
+// Single-threaded -> multi-threaded transition flush (x86 barrier-elision hook).
+//
+// While the guest is single-threaded, emit.c elides the x86-TSO DMB on every guest load/store
+// (e_dmb_ish/e_dmb_ishld gate on g_threaded). Those barrier-free blocks are correct only as long as no
+// second thread can observe guest memory. The clone service (linux_abi/thread.c) calls this via the
+// G_THREAD_START_FLUSH hook exactly on the g_threaded 0->1 transition, while STILL single-threaded and
+// BEFORE the first peer thread is created, so every barrier-elided block is discarded and re-translated
+// WITH barriers under g_threaded == 1 before any peer executes a memory op.
+//
+// This is byte-for-byte the single-threaded wholesale cache-full flush from core/dispatch.c (reuse the
+// 64MB arena in place: reset the bump pointer, drop the block map + both IBTCs + pending chains). It is
+// race-free here because a guest `syscall` ALWAYS ends its translation block (emit_exit_const R_SYSCALL):
+// at the clone service the parent holds no live PC in the arena, so resetting g_cp cannot pull the rug
+// from under executing code, and no peer exists yet. The parent's next dispatcher round-trip misses the
+// cleared map and re-translates with barriers; the peer starts on the same flushed cache. Returns 0 only
+// on a host W^X reprotect failure (treated as clone failure by the caller). Never call once g_threaded is
+// already 1 -- a live peer could be executing in the arena being reset.
+static int hl_x86_flush_for_thread_start(void) {
+    if (!jit_wprot(0)) return 0;
+    g_cp = g_cache;
+    map_clear();
+    pend_reset();
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    memset(g_xibtc, 0, sizeof g_xibtc); // opt2 2-way IBTC bodies point into the arena we just dropped
+    return jit_wprot(1);
+}
+
 // MUL/IMUL (group3 F6/F7 /4,/5) set x86 CF=OF when the high half of the product is significant
 // (MUL: high half != 0; IMUL: high half != sign-extension of the low half); SF/ZF/AF/PF are
 // x86-undefined. cfreg holds the computed CF/OF as 0/1. Write the stored NZCV using the engine's

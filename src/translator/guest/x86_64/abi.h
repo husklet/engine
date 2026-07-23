@@ -45,6 +45,11 @@
 // Child thread resume PC: x86 pre-advances rip past `syscall` before servicing, so the copy is correct.
 #define G_THREAD_RESUME(child, parent) ((void)0)
 
+// Clone/thread-start hook: flush the code cache on the single->multi-threaded transition so x86-TSO-
+// barrier-elided (single-threaded) blocks are re-translated WITH barriers before any peer runs. Evaluates
+// to nonzero on success, 0 on host W^X failure. See hl_x86_flush_for_thread_start (translate.c).
+#define G_THREAD_START_FLUSH() hl_x86_flush_for_thread_start()
+
 // Syscall normalization: x86 rewrites legacy syscalls to their *at form (frontend/x86_64/legacy.c).
 #define G_NORMALIZE(c)                                                                                                 \
     hl_x86_legacy_normalize((c),                                                                                       \

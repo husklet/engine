@@ -103,11 +103,25 @@ static void emit_host_ptr(int rd, uint64_t v, int kind) {
 // stays enforced by each load's own trailing ISHLD. StoreLoad remains unordered (x86 permits it).
 // The MFENCE/LFENCE/SFENCE full-fence path emits its own DMB ISH inline (translate.c), untouched.
 // Engine-private e_ldr/e_str accesses remain relaxed.
+// x86-TSO cross-thread ordering barriers (the DMB emitted on every guest load/store) are ONLY observable
+// by ANOTHER guest thread. While the guest is single-threaded (g_threaded == 0) no peer can observe
+// load/store ordering, so the barrier is dead weight -- and on a load/store-bound SSE loop it is the
+// dominant cost (float_simd emitted 3 DMB/iter). The elision is made SAFE by the clone service: the instant
+// a guest goes multi-threaded it flushes the whole code cache (hl_x86_flush_for_thread_start, invoked via
+// G_THREAD_START_FLUSH in linux_abi/thread.c) BEFORE the first peer thread is created, so every
+// barrier-elided block is discarded and re-translated WITH barriers under g_threaded == 1 before any peer
+// can execute a guest memory op. A guest `syscall` always ENDS its block (emit_exit_const R_SYSCALL), so at
+// the flush point the parent holds no live arena PC and the in-place flush is race-free. g_threaded is read
+// at TRANSLATE time; the flush guarantees re-translation on the 0->1 transition. The threaded path (below,
+// when g_threaded != 0) stays byte-identical to before. MFENCE/LFENCE/SFENCE emit their own DMB inline in
+// translate.c and are NOT routed through these helpers, so full-fence semantics are unaffected.
 static void e_dmb_ish(void) {
+    if (!g_threaded) return; // single-threaded: no peer observer -> omit the StoreStore barrier
     emit32(0xD5033ABFu); // DMB ISHST -- StoreStore only (see above; loads self-fence via ISHLD)
 }
 
 static void e_dmb_ishld(void) {
+    if (!g_threaded) return; // single-threaded: no peer observer -> omit the LoadLoad/LoadStore barrier
     emit32(0xD50339BFu);
 }
 
