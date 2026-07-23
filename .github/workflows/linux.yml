@@ -56,5 +56,25 @@ jobs:
             exit 1
           fi
 
+      # The CMake build is being brought up as the standard build path to replace
+      # the hand-written Makefile. Gating it here keeps it honest: it must
+      # configure, build, pass the unit suite via CTest, and produce an
+      # installable SDK on every push, so it cannot silently rot while `make`
+      # remains authoritative. The source lists are duplicated between the two
+      # builds today, so this step is what catches drift.
+      - name: Test CMake build (configure, build, ctest, install)
+        timeout-minutes: 30
+        run: |
+          nix develop --command sh -c '
+            set -e
+            cmake -G Ninja -B build-ci -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake
+            ninja -C build-ci
+            ctest --test-dir build-ci -L unit --output-on-failure
+            cmake --install build-ci --prefix "$PWD/build-ci-sdk"
+            test -f build-ci-sdk/lib/libhl-engine.a
+            test -f build-ci-sdk/lib/pkgconfig/hl-engine.pc
+            test -x build-ci-sdk/bin/hl-engine-runner
+          '
+
       - name: Package Rust crate
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml

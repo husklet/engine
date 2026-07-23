@@ -342,9 +342,43 @@ Logs are diagnostic evidence, never a synchronization mechanism or an API result
 
 ## 7. Build and run
 
-The normal workflow uses Make and C tools. It does not require Python or Bash test scripts.
+Two build systems are present while the project migrates to CMake. Neither requires Python or Bash test
+scripts.
 
-### 7.1 Build libraries and runner
+* **CMake (preferred, standard flow).** Covers the core libraries, the production engines and embedded
+  activation archive, the unit/compat/e2e matrix as CTest cases, codesigning, and `install`. This is the
+  path new work should use.
+* **Make (still authoritative).** The historical build; CI continues to gate on it until the CMake path has
+  soaked. Both are exercised on every push, so the two cannot silently diverge.
+
+### 7.0 CMake: the standard flow
+
+```text
+cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake
+ninja -C build
+ctest --test-dir build -L unit          # or -L compat-ipc, etc. -- one label per suite
+cmake --install build --prefix /usr/local
+```
+
+Installing yields a usable SDK: headers under `include/hl`, the static archives (including
+`libhl-engine-activation.a`), both pkg-config files, and `bin/hl-engine-runner`. Set
+`-DCMAKE_INSTALL_PREFIX` at configure time if you need the generated `.pc` files to carry a different
+prefix, since they bake it in.
+
+Cross/host toolchain files live in `cross/`:
+
+| file | builds |
+|---|---|
+| `cross/aarch64-linux.cmake` | native aarch64 Linux |
+| `cross/x86_64-linux.cmake`  | x86_64 guest fixtures |
+| `cross/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). This replaces the Makefile's `MAC=mac` recipe prefix. The build directory must live inside the repo, because only that path is shared with the macOS side. |
+
+Nix remains the toolchain authority: the toolchain files read the same `AARCH64_LINUX_CC` /
+`X86_64_LINUX_CC` the devShell exports and the Makefile consumes. Note the devShell's `$CC` is deliberately
+poisoned to the x86_64 cross compiler, so never rely on it — the toolchain files use the explicit variables,
+and Make invocations need `CC=cc`.
+
+### 7.1 Build libraries and runner (Make)
 
 ```text
 make all
