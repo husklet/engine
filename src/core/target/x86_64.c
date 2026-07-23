@@ -365,6 +365,27 @@ static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining
 static char g_authorized_executable_path[4200];
 #include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
 #include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
+static void ckpt_poll(struct cpu *c);
+#define G_CKPT_POLL(c) ckpt_poll(c)
+#define G_CKPT_ARCH 1
+#define G_CKPT_CPU_SANITIZE(c)                                                                                         \
+    do {                                                                                                               \
+        (c)->dbg_ibsrc = 0;                                                                                            \
+        (c)->ic_miss = 0;                                                                                              \
+        (c)->x87_ea = 0;                                                                                               \
+        (c)->divop = 0;                                                                                                \
+        (c)->ibtc_base = 0;                                                                                            \
+        (c)->vdirty = 0;                                                                                               \
+        (c)->fastclk_ptr = 0;                                                                                          \
+        (c)->fastclk_resume = 0;                                                                                       \
+        (c)->fault_addr = 0;                                                                                           \
+        (c)->bus_ea = 0;                                                                                               \
+        (c)->bus_filter = 0;                                                                                           \
+        (c)->bus_force = 0;                                                                                            \
+        memset((c)->bus_scratch, 0, sizeof (c)->bus_scratch);                                                          \
+    } while (0)
+static int container_init(const char *rootfs);
+static int engine_global_init(void);
 #include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 static const void *g_initial_executable_image;
@@ -372,6 +393,7 @@ static size_t g_initial_executable_size;
 static const void *g_authorized_executable_image;
 static size_t g_authorized_executable_size;
 #include "../../linux_abi/x86.c" // Linux x86-64 ELF loader + stack + fault handlers
+#include "../../linux_abi/checkpoint.c"
 
 // ---- entry + main ----
 // ---------------- entry ----------------
@@ -539,6 +561,7 @@ static int engine_global_init(void) {
     // ptrace tracer/tracee coordination arena -- mmap the shared region ONCE here, BEFORE any guest
     // fork, so every descendant guest process inherits the same physical pages. Inert until a guest ptraces.
     ptrace_arena_init();
+    if (ckpt_control_init() != 0) return 70;
     g_engine_inited = 1;
     return 0;
 }
@@ -574,7 +597,7 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     }
     // opt8: load the guest image + interp at FIXED VAs so the translated arena is byte-identical across
     // runs (one-shot g_force_base, cleared inside load_elf). Only when the persistent cache is enabled.
-    if (g_pcache) g_force_base = PC_IMG_BASE;
+    if (g_pcache || hl_option_get("HL_CHECKPOINT_DIR")) g_force_base = PC_IMG_BASE;
     load_elf(prog_host, lm);
     g_loadbase = lm->base;
     *jump = lm->entry;
@@ -588,7 +611,7 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     if (has_interp) {
         static char ib[4200];
         interp_host = xresolve_overlay(interp, ib, sizeof ib);
-        if (g_pcache) g_force_base = PC_INTERP_BASE;
+        if (g_pcache || hl_option_get("HL_CHECKPOINT_DIR")) g_force_base = PC_INTERP_BASE;
         load_elf(interp_host, li);
         *jump = li->entry;
         *at_base = li->base;
@@ -608,7 +631,9 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 // behavior is byte-identical.
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     uint64_t heap;
-    if (hl_gmap_map_anonymous(0, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+    uint64_t heap_address = hl_option_get("HL_CHECKPOINT_DIR") ? UINT64_C(0x0000050000000000) : 0;
+    if (hl_gmap_map_anonymous(heap_address, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                              HL_HOST_MEMORY_PRIVATE,
                               &heap) != HL_STATUS_OK)
         return 70;
     brk_lo = brk_cur = heap;
@@ -665,6 +690,8 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         g_host_launch_monotonic_ns = now.value;
     }
     if (bound_shadow_activate() != 0) return 70;
+    const char *rdir = hl_option_get("HL_RESTORE_DIR");
+    if (rdir && rdir[0]) return ckpt_restore_tree(rootfs, rdir);
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
@@ -795,6 +822,12 @@ int hl_engine_entry(int argc, char **argv) {
         if (strcmp(argv[ai], "--rootfs") == 0) {
             rootfs = argv[ai + 1];
             ai += 2;
+        } else if (strcmp(argv[ai], "--checkpoint") == 0) {
+            hl_option_set("HL_CHECKPOINT_DIR", argv[ai + 1], 1);
+            ai += 2;
+        } else if (strcmp(argv[ai], "--restore") == 0) {
+            hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1);
+            ai += 2;
         } else if (strcmp(argv[ai], "--vol") == 0) {
             add_vol(argv[ai + 1]);
             ai += 2;
@@ -825,6 +858,7 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
+    if (hl_option_get("HL_RESTORE_DIR")) return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL);
     if (ai >= argc) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;

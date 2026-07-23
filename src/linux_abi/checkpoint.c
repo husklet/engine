@@ -56,7 +56,21 @@
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
 #define CKPT_VERSION 1 // public v1.0: full-or-refuse whole-container checkpoint image
+#define CKPT_ARCH_X86_64 1
 #define CKPT_ARCH_AARCH64 2
+#define CKPT_CPU_MAGIC UINT64_C(0x31305550434c4848) // "HHLCPU01" (LE)
+
+#ifndef G_CKPT_ARCH
+#error "checkpoint target must define G_CKPT_ARCH"
+#endif
+
+struct ckpt_cpu_header {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t arch;
+    uint64_t count;
+    uint64_t payload_size;
+};
 
 #define CKF_TTY 1  // controlling terminal / any tty -- inherited down the restore fork from the launcher pty
 #define CKF_FILE 2 // path-backed regular file -- reopened by host path + lseek to the saved offset
@@ -1770,7 +1784,7 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
     memset(&m, 0, sizeof m);
     m.magic = CKPT_MAGIC;
     m.version = CKPT_VERSION;
-    m.arch = CKPT_ARCH_AARCH64;
+    m.arch = G_CKPT_ARCH;
     m.engine_id = pcache_engine_id();
     m.cpu_sz = sizeof(struct cpu);
     m.pagesz = pagesz;
@@ -1798,8 +1812,18 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
     if (ckpt_close_sync(&fp) != 0) goto done;
 
     snprintf(pf, sizeof pf, "%s/cpu", tmp);
-    if (ckpt_store_sync(pf, g_ckpt_cpu_images, (size_t)g_ckpt_cpu_count * sizeof *g_ckpt_cpu_images) != 0)
-        goto done;
+    {
+        size_t payload = (size_t)g_ckpt_cpu_count * sizeof *g_ckpt_cpu_images;
+        size_t total = sizeof(struct ckpt_cpu_header) + payload;
+        struct ckpt_cpu_header *cpu_file = malloc(total);
+        if (!cpu_file) goto done;
+        *cpu_file = (struct ckpt_cpu_header){CKPT_CPU_MAGIC, CKPT_VERSION, G_CKPT_ARCH,
+                                             (uint64_t)g_ckpt_cpu_count, sizeof(struct cpu)};
+        memcpy(cpu_file + 1, g_ckpt_cpu_images, payload);
+        int cpu_rc = ckpt_store_sync(pf, cpu_file, total);
+        free(cpu_file);
+        if (cpu_rc != 0) goto done;
+    }
 
     snprintf(pf, sizeof pf, "%s/fds", tmp);
     ff = fopen(pf, "wb");
@@ -1969,7 +1993,7 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     memset(&man, 0, sizeof man);
     man.magic = CKPT_MANIFEST_MAGIC;
     man.version = CKPT_VERSION;
-    man.arch = CKPT_ARCH_AARCH64;
+    man.arch = G_CKPT_ARCH;
     man.n_procs = (uint64_t)nproc;
     man.root_gpid = 1;
     // Record which group owns the controlling terminal's foreground (in guest terms). The init is the tty's
@@ -2006,7 +2030,7 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
         fprintf(stderr, "[restore] %s: bad manifest magic\n", dir);
         return -1;
     }
-    if (man->version != CKPT_VERSION || man->arch != CKPT_ARCH_AARCH64) {
+    if (man->version != CKPT_VERSION || man->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] manifest version/arch mismatch\n");
         return -1;
     }
@@ -2028,7 +2052,7 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
         fprintf(stderr, "[restore] %s is not a checkpoint (bad magic/short read)\n", procdir);
         return -1;
     }
-    if (m->version != CKPT_VERSION || m->arch != CKPT_ARCH_AARCH64) {
+    if (m->version != CKPT_VERSION || m->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] version/arch mismatch (file v%llu arch %llu)\n", (unsigned long long)m->version,
                 (unsigned long long)m->arch);
         return -1;
@@ -3262,12 +3286,26 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/cpu", procdir);
     size_t bytes = (size_t)m->n_threads * sizeof(struct cpu);
-    struct cpu *images = malloc(bytes);
-    if (!images || hl_host_file_load(effective_host_services(), pf, images, bytes) != 0) {
-        free(images);
+    size_t file_bytes = sizeof(struct ckpt_cpu_header) + bytes;
+    struct ckpt_cpu_header *cpu_file = malloc(file_bytes);
+    if (!cpu_file || hl_host_file_load(effective_host_services(), pf, cpu_file, file_bytes) != 0) {
+        free(cpu_file);
         fprintf(stderr, "[restore] cannot read cpu state\n");
         return -1;
     }
+    if (cpu_file->magic != CKPT_CPU_MAGIC || cpu_file->version != CKPT_VERSION || cpu_file->arch != G_CKPT_ARCH ||
+        cpu_file->count != m->n_threads || cpu_file->payload_size != sizeof(struct cpu)) {
+        fprintf(stderr, "[restore] cpu image version/architecture/layout mismatch\n");
+        free(cpu_file);
+        return -1;
+    }
+    struct cpu *images = malloc(bytes);
+    if (!images) {
+        free(cpu_file);
+        return -1;
+    }
+    memcpy(images, cpu_file + 1, bytes);
+    free(cpu_file);
     // Zero host-transient fields (meaningful only WHILE a block runs; run_block re-populates them). The
     // architectural state (x[],sp,pc,tls,nzcv,v[],sigmask,tpending,alt_*,tid,ctid) + shadow stack are verbatim.
     for (uint64_t i = 0; i < m->n_threads; i++) {
@@ -3276,11 +3314,11 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
         memset(c->host_v, 0, sizeof c->host_v);
         c->host_sp = 0;
         c->reason = 0;
-        c->ic_site = 0;
         c->irq = 0;
         c->in_service = 0;
         c->exited = 0;
         c->redirect = 0;
+        G_CKPT_CPU_SANITIZE(c);
     }
     *out = images;
     return 0;
@@ -3549,17 +3587,26 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
                 return -1;
             int pair[2];
             if (pipe(pair) != 0) return -1;
-            int reader = hl_host_process_fd_private_adopt(pair[0]);
-            int writer = reader >= 0 ? hl_host_process_fd_private_adopt(pair[1]) : -1;
+            int seed_reader = fcntl(pair[0], F_DUPFD_CLOEXEC, HL_NFD);
+            int seed_writer = fcntl(pair[1], F_DUPFD_CLOEXEC, HL_NFD);
+            close(pair[0]);
+            close(pair[1]);
+            if (seed_reader < 0 || seed_writer < 0) {
+                if (seed_reader >= 0) close(seed_reader);
+                if (seed_writer >= 0) close(seed_writer);
+                return -1;
+            }
+            int reader = hl_host_process_fd_private_adopt(seed_reader);
+            int writer = reader >= 0 ? hl_host_process_fd_private_adopt(seed_writer) : -1;
             if (reader < 0 || writer < 0) {
                 if (reader >= 0) {
                     hl_host_process_fd_private_remove(reader);
                     close(reader);
-                } else close(pair[0]);
+                } else close(seed_reader);
                 if (writer >= 0) {
                     hl_host_process_fd_private_remove(writer);
                     close(writer);
-                } else close(pair[1]);
+                } else close(seed_writer);
                 return -1;
             }
             int writer_flags = fcntl(writer, F_GETFL);

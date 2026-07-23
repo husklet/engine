@@ -837,6 +837,26 @@ $(BUILD)/e2e/checkpoint-connecting-refusal-aarch64: tests/e2e/checkpoint_connect
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
+define checkpoint_x86_fixture
+$(BUILD)/e2e/checkpoint-$(1)-x86_64: tests/e2e/$(2).c
+	@mkdir -p $$(@D)
+	$$(X86_64_LINUX_STATIC_CC) -O0 -static $(3) $$< -o $$@
+endef
+$(eval $(call checkpoint_x86_fixture,tree,checkpoint_tree,))
+$(eval $(call checkpoint_x86_fixture,signal,checkpoint_signal_state,))
+$(eval $(call checkpoint_x86_fixture,pipe,checkpoint_pipe,))
+$(eval $(call checkpoint_x86_fixture,deleted,checkpoint_deleted,))
+$(eval $(call checkpoint_x86_fixture,threads,checkpoint_threads,-pthread))
+$(eval $(call checkpoint_x86_fixture,memfd,checkpoint_memfd,))
+$(eval $(call checkpoint_x86_fixture,eventfd,checkpoint_eventfd,))
+$(eval $(call checkpoint_x86_fixture,timerfd,checkpoint_timerfd,))
+$(eval $(call checkpoint_x86_fixture,inotify,checkpoint_inotify,))
+$(eval $(call checkpoint_x86_fixture,epoll,checkpoint_epoll,))
+$(eval $(call checkpoint_x86_fixture,socketpair,checkpoint_socketpair,))
+$(eval $(call checkpoint_x86_fixture,socket-state,checkpoint_socket_state,))
+$(eval $(call checkpoint_x86_fixture,connected-socket,checkpoint_connected_socket,))
+$(eval $(call checkpoint_x86_fixture,connecting-refusal,checkpoint_connecting_refusal,))
+
 $(BUILD)/e2e/guest-domain-aarch64: tests/e2e/guest_domain.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
@@ -1966,6 +1986,28 @@ e2e-checkpoint-corrupt-truncated: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)
 	$(BUILD)/production/hl-engine-linux-aarch64
 	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-truncated
+
+CHECKPOINT_X86_FIXTURES := tree signal pipe deleted threads memfd eventfd timerfd inotify epoll socketpair \
+	socket-state connected-socket connecting-refusal
+CHECKPOINT_X86_BINARIES := $(addprefix $(BUILD)/e2e/checkpoint-,$(addsuffix -x86_64,$(CHECKPOINT_X86_FIXTURES)))
+
+e2e-checkpoint-x86_64: $(BUILD)/tools/checkpoint-tree-runner $(CHECKPOINT_X86_BINARIES) \
+	$(BUILD)/production/hl-engine-linux-x86_64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-x86_64)
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-signal-x86_64) signal-state
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-pipe-x86_64) pipe
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-deleted-x86_64) deleted
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-threads-x86_64) threads
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-memfd-x86_64) memfd
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-eventfd-x86_64) eventfd
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-timerfd-x86_64) timerfd
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-inotify-x86_64) inotify
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-epoll-x86_64) epoll-checkpoint
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-socketpair-x86_64) socketpair
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-socket-state-x86_64) socket-state
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-connected-socket-x86_64) connected-socket
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-connecting-refusal-x86_64) connecting-refusal
 
 e2e-embedding-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \

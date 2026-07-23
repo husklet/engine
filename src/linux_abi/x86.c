@@ -495,7 +495,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // with 16-byte SSE loads -> those over-read past the top. Keep that region mapped.
     const hl_host_services *host = effective_host_services();
     hl_host_memory_mapping stack_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(stack_mapping), 0, 0, 0, 0};
-    hl_host_result stack_result = host->memory->map_anonymous(host->context, 0, LOGUARD + SZ + GUARD,
+    uint64_t stack_address = hl_option_get("HL_CHECKPOINT_DIR") ? UINT64_C(0x0000058000000000) : 0;
+    hl_host_result stack_result = host->memory->map_anonymous(host->context, stack_address, LOGUARD + SZ + GUARD,
                                                               HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                                                               HL_HOST_MEMORY_PRIVATE, &stack_mapping);
     if (stack_result.status != HL_STATUS_OK) {

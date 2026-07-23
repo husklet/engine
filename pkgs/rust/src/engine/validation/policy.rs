@@ -162,11 +162,11 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
             "checkpoint directory must name a non-root destination",
         ));
     }
-    if spec.guest.architecture != crate::Guest::Aarch64 {
+    if !matches!(spec.guest.architecture, crate::Guest::Aarch64 | crate::Guest::X86_64) {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
             "checkpoint",
-            "native checkpoint/restore currently supports AArch64 guests only",
+            "native checkpoint/restore supports AArch64 and x86_64 guests",
         ));
     }
     if checkpoint.mode != crate::spec::CheckpointMode::Full

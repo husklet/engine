@@ -658,7 +658,10 @@ static void service(struct cpu *c) {
     // the number. Preserve the entry number register so the SA_RESTART restart re-executes the SAME syscall.
     uint64_t _svc_nrreg = G_RET(c);
     g_syscall_restart = 0;
-    uint64_t _rnr = g_systrace ? G_NR(c) : 0;
+    // Preserve the canonical syscall number across dispatch. x86 aliases the syscall-number and return-value
+    // register (RAX), so G_NR(c) after service_local() would translate the result instead of identifying the
+    // completed syscall. Post-dispatch FD publication and restart bookkeeping must never depend on tracing.
+    uint64_t _rnr = G_NR(c);
     // seccomp gate: run the guest's installed cBPF filter(s) / STRICT policy against this syscall BEFORE it
     // is routed anywhere. On an intercepted syscall (ERRNO/TRAP/TRACE/KILL/strict-violation) the result is
     // already set in G_RET / a signal is queued / the process is killed, so we must NOT service it. Inert
@@ -685,22 +688,23 @@ static void service(struct cpu *c) {
     }
     if (!g_untrusted && (int64_t)G_RET(c) >= 0) {
         int fd = (int)G_RET(c);
-        switch (_rnr ? _rnr : G_NR(c)) {
+        switch (_rnr) {
         case 19:  /* eventfd2 */
         case 20:  /* epoll_create1 */
         case 23:  /* dup */
         case 26:  /* inotify_init1 */
         case 56:  /* openat */
+        case 74:  /* signalfd4 */
         case 85:  /* timerfd_create */
         case 198: /* socket */
         case 202: /* accept */
         case 242: /* accept4 */
         case 437: /* openat2 */
-            if ((_rnr ? _rnr : G_NR(c)) == 85) {
+            if (_rnr == 85) {
                 timerfd_object_assign(fd);
                 if (fd >= 0 && fd < HL_NFD) g_tfd_nb[fd] = (G_A1(c) & 0x800) != 0;
             }
-            if ((_rnr ? _rnr : G_NR(c)) == 26) inotify_object_assign(fd);
+            if (_rnr == 26) inotify_object_assign(fd);
             (void)proc_fdvis_publish_native_fd(fd);
             break;
         case 24: /* dup3: result is the requested target descriptor */

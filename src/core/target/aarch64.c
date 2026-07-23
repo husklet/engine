@@ -278,6 +278,8 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 // DEFINED in os/linux/checkpoint.c below (a forward-declared static call is legal).
 static void ckpt_poll(struct cpu *c);
 #define G_CKPT_POLL(c) ckpt_poll(c)
+#define G_CKPT_ARCH 2
+#define G_CKPT_CPU_SANITIZE(c) ((c)->ic_site = 0)
 // checkpoint.c's restore driver (included below) rebuilds the container from these, defined later in this TU.
 static int container_init(const char *rootfs);
 static int engine_global_init(void);
