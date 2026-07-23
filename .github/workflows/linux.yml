@@ -62,12 +62,31 @@ jobs:
           # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
           sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
           export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
-          if ! nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" test-linux-production-typed' 2>&1 | tee runtime.log "$GITHUB_STEP_SUMMARY"; then
+          # Redirect to a FILE, never through a pipe, and bound the run with `timeout`.
+          #
+          # This used to be `... | tee runtime.log "$GITHUB_STEP_SUMMARY"`. tee reads until EOF on that
+          # pipe, and EOF only arrives once EVERY process holding its write end exits. The compat suite
+          # deliberately leaves such processes alive -- pc-forkoutlive exists precisely to have a child
+          # outlive its parent, and the fork-server/supervisor are long-lived -- and they inherit this
+          # step's stdout. So make would finish and tee would keep waiting: one run sat in this step for
+          # over NINE HOURS. `timeout-minutes` did not save it because GitHub enforces that runner-side.
+          # A file has no reader to block, so an orphan holding the fd costs nothing.
+          status=0
+          timeout --signal=TERM --kill-after=60s 25m \
+            nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" test-linux-production-typed' \
+            >runtime.log 2>&1 </dev/null || status=$?
+          tail -c 200000 runtime.log >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 60 runtime.log
+          if [ "$status" -ne 0 ]; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}
             message=${message//$'\n'/'%0A'}
             message=${message//$'\r'/'%0D'}
-            echo "::error title=Linux runtime compatibility failed::$message"
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+              echo "::error title=Linux runtime compatibility TIMED OUT after 25m::$message"
+            else
+              echo "::error title=Linux runtime compatibility failed::$message"
+            fi
             exit 1
           fi
 
