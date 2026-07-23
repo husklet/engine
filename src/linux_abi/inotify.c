@@ -544,7 +544,7 @@ hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void 
         return buffer == NULL ? HL_STATUS_OK : HL_STATUS_OUT_OF_MEMORY;
     }
     header = (inotify_image_header){INOTIFY_IMAGE_MAGIC, INOTIFY_IMAGE_VERSION, object->watch_count,
-                                    object->next_wd, object->nonblocking, object->queue_size};
+                                    object->next_wd,     object->nonblocking,   object->queue_size};
     memcpy(cursor, &header, sizeof(header));
     cursor += sizeof(header);
     for (index = 0; index < object->watch_count; ++index) {
@@ -563,18 +563,17 @@ hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void 
 
 int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
                                    const hl_linux_inotify_provider_ops *provider, void *provider_context,
-                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer,
-                                   size_t size) {
+                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer, size_t size) {
     const unsigned char *cursor = buffer;
     const unsigned char *end = cursor + size;
     inotify_image_header header;
     inotify_object *object = NULL;
     uint32_t index;
     hl_status status = HL_STATUS_INVALID_ARGUMENT;
-    if (linux_abi == NULL || provider == NULL || buffer == NULL || size < sizeof(header) ||
-        provider->add == NULL || provider->modify == NULL || provider->remove == NULL || provider->drain == NULL ||
-        provider->wait == NULL || provider->wait_handle == NULL || provider->readiness == NULL ||
-        provider->clone == NULL || provider->close == NULL)
+    if (linux_abi == NULL || provider == NULL || buffer == NULL || size < sizeof(header) || provider->add == NULL ||
+        provider->modify == NULL || provider->remove == NULL || provider->drain == NULL || provider->wait == NULL ||
+        provider->wait_handle == NULL || provider->readiness == NULL || provider->clone == NULL ||
+        provider->close == NULL)
         goto fail_provider;
     memcpy(&header, cursor, sizeof(header));
     cursor += sizeof(header);
@@ -649,14 +648,14 @@ fail_object:
             (void)provider->remove(provider_context, object->watches[index].token);
             free(object->watches[index].path);
         }
-        if (object->watch_count < object->watch_capacity)
-            free(object->watches[object->watch_count].path);
+        if (object->watch_count < object->watch_capacity) free(object->watches[object->watch_count].path);
         free(object->watches);
         free(object->queue);
         pthread_mutex_destroy(&object->snapshot_lock);
         free(object);
     }
 fail_provider:
-    if (provider != NULL && provider->close != NULL && provider_context != NULL) (void)provider->close(provider_context);
+    if (provider != NULL && provider->close != NULL && provider_context != NULL)
+        (void)provider->close(provider_context);
     return inotify_error(status);
 }

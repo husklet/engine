@@ -3,6 +3,7 @@
 #include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
 #include "../shared.h"
+#include "../checkpoint.h"
 
 // Build a pathname AF_UNIX address without ever accepting the silent truncation performed by snprintf.
 // Callers must do this before replacing a guest socket so ENAMETOOLONG leaves the original fd untouched.
@@ -369,12 +370,9 @@ struct hl_cmsg_epoll_watch {
 };
 static int kqueue_scm_export(int fd, struct hl_cmsg_kqueue_meta *metadata);
 static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
-static int typed_inotify_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker);
-static int typed_inotify_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
-static int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker);
-static int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
 static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fds, int capacity);
 static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int marker, const int *fds);
+
 
 static __thread int g_cmsg_tmpfds[1024];
 static __thread uint8_t g_cmsg_tmpfd_borrowed[1024];

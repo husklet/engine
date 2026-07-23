@@ -2,6 +2,8 @@
 // kqueue/pipes. Returns 1 if nr was handled, 0 otherwise. Included by service.c after service/net.c,
 // before service() -- same TU scope (shares io.c/signal.c fd-redirection state).
 
+#include "../checkpoint.h"
+
 // struct epoll_event has a DIFFERENT layout per guest arch: x86-64 forces __attribute__((packed)) so it
 // is 12 bytes with `data` at offset 4; every other arch (aarch64/asm-generic) leaves it naturally aligned
 // at 16 bytes (4 bytes pad after the u32 events, then `data` at offset 8). Derive both from the same
@@ -283,7 +285,7 @@ static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata,
     return -1;
 }
 
-static int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
+int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
     if (metadata == NULL || metadata->kind != 1) return 0;
     int slot = metadata->canonical_fd;
     uint32_t count = 0;
@@ -345,7 +347,7 @@ static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int
     return 0;
 }
 
-static int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker) {
+int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker) {
     if (metadata == NULL || metadata->kind != 1 || metadata->image_size < sizeof(uint32_t) ||
         metadata->image_size > 64u * 1024u * 1024u || metadata->image_size > SIZE_MAX)
         return -1;

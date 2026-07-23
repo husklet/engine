@@ -14,13 +14,11 @@
 #include <string.h>
 #include <unistd.h>
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs,
-                       hl_host_handle executable, const void *executable_image, size_t executable_size,
-                       uint32_t argc, char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs,
-                       hl_host_handle executable, const void *executable_image, size_t executable_size,
-                       uint32_t argc, char *const argv[]) {
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]) {
     (void)host;
     (void)box;
     (void)rootfs;
@@ -64,8 +62,7 @@ static int write_launch(const char *path) {
     config.lower_layer_count = 2;
     config.overlay_work_offset = add_string(pool, &cursor, "/overlay/work");
     config.network_namespace_offset = add_string(pool, &cursor, "box-network");
-    config.network_interfaces_offset =
-        add_string(pool, &cursor, "front=172.29.0.2\nback=172.29.1.2");
+    config.network_interfaces_offset = add_string(pool, &cursor, "front=172.29.0.2\nback=172.29.1.2");
     config.pool_size = (uint32_t)cursor;
     fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd < 0) return -1;
@@ -76,8 +73,8 @@ static int write_launch(const char *path) {
     return close(fd);
 }
 
-static int inspect_launch(const char *rootfs, const char *executable_host, uint32_t argc,
-                          char *const argv[], const hl_options *options, const char *result_path) {
+static int inspect_launch(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
+                          const hl_options *options, const char *result_path) {
     (void)rootfs;
     HL_CHECK(strcmp(executable_host, "/authorized/guest") == 0);
     HL_CHECK(result_path == NULL);
@@ -89,8 +86,7 @@ static int inspect_launch(const char *rootfs, const char *executable_host, uint3
     HL_CHECK(strcmp(hl_options_get(options, "HL_LOWER"), "/lower/one\n/lower/two") == 0);
     HL_CHECK(strcmp(hl_options_get(options, "HL_OVERLAY_WORK"), "/overlay/work") == 0);
     HL_CHECK(strcmp(hl_options_get(options, "HL_NETNS"), "box-network") == 0);
-    HL_CHECK(strcmp(hl_options_get(options, "HL_NETIFS"),
-                    "front=172.29.0.2\nback=172.29.1.2") == 0);
+    HL_CHECK(strcmp(hl_options_get(options, "HL_NETIFS"), "front=172.29.0.2\nback=172.29.1.2") == 0);
     return 37;
 }
 

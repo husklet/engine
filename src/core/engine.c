@@ -77,6 +77,7 @@ const char *hl_engine_version(void) {
 }
 
 enum { HL_ENGINE_STRING_LIMIT = 64 * 1024 * 1024 };
+
 enum { HL_ENGINE_EXECUTABLE_LIMIT = 64 * 1024 * 1024 };
 
 static hl_status hl_engine_read_executable(hl_engine *engine, hl_host_handle handle) {
@@ -90,9 +91,9 @@ static hl_status hl_engine_read_executable(hl_engine *engine, hl_host_handle han
     engine->owned_executable_image = malloc((size_t)before.size);
     if (engine->owned_executable_image == NULL) return HL_STATUS_OUT_OF_MEMORY;
     while (offset < before.size) {
-        hl_host_result read = engine->host.file->read_at(
-            engine->host.context, handle, offset,
-            (hl_host_bytes){engine->owned_executable_image + offset, before.size - offset});
+        hl_host_result read =
+            engine->host.file->read_at(engine->host.context, handle, offset,
+                                       (hl_host_bytes){engine->owned_executable_image + offset, before.size - offset});
         if (read.status != HL_STATUS_OK || read.value == 0 || read.value > before.size - offset)
             return HL_STATUS_PLATFORM_FAILURE;
         offset += read.value;
@@ -141,7 +142,8 @@ static int hl_engine_environment_valid(const char *environment) {
         } while (offset < HL_ENGINE_STRING_LIMIT && hl_engine_name_continue((unsigned char)environment[offset]));
         if (offset == HL_ENGINE_STRING_LIMIT) return 0;
         if (environment[offset++] != '=') return 0;
-        while (offset < HL_ENGINE_STRING_LIMIT && environment[offset] != 0 && environment[offset] != '\n') ++offset;
+        while (offset < HL_ENGINE_STRING_LIMIT && environment[offset] != 0 && environment[offset] != '\n')
+            ++offset;
         if (offset == HL_ENGINE_STRING_LIMIT) return 0;
         if (environment[offset] == '\n' && environment[++offset] == 0) return 0;
     }
@@ -153,8 +155,7 @@ static int hl_engine_hostname_valid(const char *hostname) {
     if (hostname == NULL) return 1;
     while (length <= 64 && hostname[length] != 0) {
         unsigned char c = (unsigned char)hostname[length];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
-            return 0;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return 0;
         ++length;
     }
     return length != 0 && length <= 64 && hostname[0] != '-' && hostname[length - 1] != '-';
@@ -163,7 +164,8 @@ static int hl_engine_hostname_valid(const char *hostname) {
 static int hl_engine_nonempty_string(const char *value) {
     size_t length = 0;
     if (value == NULL) return 1;
-    while (length < HL_ENGINE_STRING_LIMIT && value[length] != 0) ++length;
+    while (length < HL_ENGINE_STRING_LIMIT && value[length] != 0)
+        ++length;
     return length != 0 && length < HL_ENGINE_STRING_LIMIT;
 }
 
@@ -190,12 +192,13 @@ static int hl_engine_volumes_valid(const char *spec) {
         const char *colon;
         if (end == NULL) end = entry + strlen(entry);
         if (++count > 32) return 0;
-        if ((size_t)(end - entry) > 3 &&
-            ((entry[0] == 'r' && entry[1] == 'o' && entry[2] == ':') ||
-             (entry[0] == 'r' && entry[1] == 'w' && entry[2] == ':'))) entry += 3;
+        if ((size_t)(end - entry) > 3 && ((entry[0] == 'r' && entry[1] == 'o' && entry[2] == ':') ||
+                                          (entry[0] == 'r' && entry[1] == 'w' && entry[2] == ':')))
+            entry += 3;
         colon = memchr(entry, ':', (size_t)(end - entry));
         if (colon == NULL || entry == colon || colon + 1 == end || entry[0] != '/' || colon[1] != '/' ||
-            memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL) return 0;
+            memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL)
+            return 0;
         if (*end == 0) return 1;
         entry = end + 1;
     }
@@ -226,8 +229,9 @@ static int hl_engine_limits_valid(const char *spec) {
         equals = memchr(entry, '=', (size_t)(end - entry));
         if (equals == NULL || equals == entry || equals + 1 == end) return 0;
         colon = memchr(equals + 1, ':', (size_t)(end - equals - 1));
-        if (colon != NULL && (colon == equals + 1 || colon + 1 == end ||
-                             memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL)) return 0;
+        if (colon != NULL &&
+            (colon == equals + 1 || colon + 1 == end || memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL))
+            return 0;
         {
             const char *value = equals + 1;
             const char *value_end = colon == NULL ? end : colon;
@@ -237,7 +241,8 @@ static int hl_engine_limits_valid(const char *spec) {
                 if (!special && (size_t)(value_end - value) == 2 && value[0] == '-' && value[1] == '1') special = 1;
                 if (!special) {
                     if (cursor == value_end) return 0;
-                    while (cursor != value_end && *cursor >= '0' && *cursor <= '9') ++cursor;
+                    while (cursor != value_end && *cursor >= '0' && *cursor <= '9')
+                        ++cursor;
                     if (cursor != value_end) return 0;
                 }
                 if (colon == NULL || value == colon + 1) break;
@@ -269,8 +274,11 @@ static int hl_engine_ip_valid(const char *value) {
             part = part * 10u + (unsigned)(*value - '0');
             if (++digits > 3 || part > 255) return 0;
         } else if (*value == '.' && digits != 0 && separators < 3) {
-            ++separators; part = 0; digits = 0;
-        } else return 0;
+            ++separators;
+            part = 0;
+            digits = 0;
+        } else
+            return 0;
         ++value;
     }
     return separators == 3 && digits != 0;
@@ -283,18 +291,18 @@ static int hl_engine_proxy_valid(const char *value) {
     return colon != NULL && colon != value && hl_engine_uint_range(colon + 1, value + strlen(value), 65535);
 }
 
-#define HL_BOX_STRING_FIELDS(X)                                                                                     \
-    X(lower_layers, "HL_LOWER") X(volumes, "HL_VOLUMES") X(limits, "HL_ULIMITS")                               \
-    X(network_namespace, "HL_NETNS") X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR")         \
-    X(ip, "HL_IP") X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                  \
-    X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")             \
-    X(file_owners, "HL_FILE_OWNERS")
+#define HL_BOX_STRING_FIELDS(X)                                                                                        \
+    X(lower_layers, "HL_LOWER")                                                                                        \
+    X(volumes, "HL_VOLUMES") X(limits, "HL_ULIMITS") X(network_namespace, "HL_NETNS")                                  \
+        X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR") X(ip, "HL_IP")                             \
+            X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                               \
+                X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")                    \
+                    X(file_owners, "HL_FILE_OWNERS")
 
 static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
     char number[32];
     char publish[1024];
-    uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX |
-                           HL_ENGINE_BOX_NETWORK_ISOLATED;
+    uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_NETWORK_ISOLATED;
     const size_t abi1_size = offsetof(hl_engine_box_config, lower_layers);
     const size_t abi3_size = offsetof(hl_engine_box_config, file_owners);
     int has_v2;
@@ -302,32 +310,33 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI) ||
         (box->abi == HL_ENGINE_BOX_ABI_1 && box->size != abi1_size) ||
         (box->abi == HL_ENGINE_BOX_ABI_3 && box->size < abi3_size) ||
-        (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box))) return HL_STATUS_ABI_MISMATCH;
+        (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box)))
+        return HL_STATUS_ABI_MISMATCH;
     has_v2 = box->abi >= HL_ENGINE_BOX_ABI;
-    if (has_v2) known_flags |= HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED |
-                               HL_ENGINE_BOX_SENTRY_ONLY;
+    if (has_v2)
+        known_flags |=
+            HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
     if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1)
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
         return HL_STATUS_INVALID_ARGUMENT;
     if (has_v2) {
-#define VALIDATE_BOX_STRING(field, option) if (!hl_engine_nonempty_string(box->field)) return HL_STATUS_INVALID_ARGUMENT;
+#define VALIDATE_BOX_STRING(field, option)                                                                             \
+    if (!hl_engine_nonempty_string(box->field)) return HL_STATUS_INVALID_ARGUMENT;
         HL_BOX_STRING_FIELDS(VALIDATE_BOX_STRING)
 #undef VALIDATE_BOX_STRING
         if (!hl_engine_absolute_string(box->translation_cache) ||
             !hl_engine_absolute_string(box->filesystem_generation) ||
             !hl_engine_absolute_string(box->checkpoint_directory) ||
-            !hl_engine_absolute_string(box->restore_directory) ||
-            !hl_engine_lower_valid(box->lower_layers) || box->publish_count > 32 ||
-            ((box->publish_count == 0) != (box->publish == NULL)) ||
-            !hl_engine_volumes_valid(box->volumes) ||
-            !hl_engine_limits_valid(box->limits) || !hl_engine_identity_valid(box->network_namespace, 39) ||
+            !hl_engine_absolute_string(box->restore_directory) || !hl_engine_lower_valid(box->lower_layers) ||
+            box->publish_count > 32 || ((box->publish_count == 0) != (box->publish == NULL)) ||
+            !hl_engine_volumes_valid(box->volumes) || !hl_engine_limits_valid(box->limits) ||
+            !hl_engine_identity_valid(box->network_namespace, 39) ||
             !hl_engine_identity_valid(box->network_bridge, 40) || !hl_engine_ip_valid(box->ip) ||
             !hl_engine_proxy_valid(box->egress_proxy) ||
             ((box->flags & HL_ENGINE_BOX_SANDBOX) && (box->flags & HL_ENGINE_BOX_SENTRY_ONLY)) ||
             ((box->flags & HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED) && box->translation_cache != NULL) ||
-            (box->checkpoint_directory != NULL && box->restore_directory != NULL) ||
             (box->ip != NULL && box->network_bridge == NULL) ||
             ((box->flags & HL_ENGINE_BOX_PUBLISH_EXTERNAL) && box->publish_count == 0) ||
             ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) &&
@@ -346,16 +355,18 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         return HL_STATUS_OUT_OF_MEMORY;
     memset(&engine->box_config, 0, sizeof(engine->box_config));
     memcpy(&engine->box_config, box,
-           box->abi == HL_ENGINE_BOX_ABI_1 ? abi1_size : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size : sizeof(*box));
+           box->abi == HL_ENGINE_BOX_ABI_1   ? abi1_size
+           : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size
+                                             : sizeof(*box));
     engine->box_config.working_directory = engine->owned_working_directory;
     engine->box_config.hostname = engine->owned_hostname;
     engine->box_config.environment = engine->owned_environment;
     if (has_v2) {
         size_t string_index = 0;
-#define COPY_BOX_STRING(field, option)                                                                              \
-        engine->owned_box_strings[string_index] = hl_engine_copy_string(box->field);                                \
-        if (box->field != NULL && engine->owned_box_strings[string_index] == NULL) return HL_STATUS_OUT_OF_MEMORY;  \
-        engine->box_config.field = engine->owned_box_strings[string_index++];
+#define COPY_BOX_STRING(field, option)                                                                                 \
+    engine->owned_box_strings[string_index] = hl_engine_copy_string(box->field);                                       \
+    if (box->field != NULL && engine->owned_box_strings[string_index] == NULL) return HL_STATUS_OUT_OF_MEMORY;         \
+    engine->box_config.field = engine->owned_box_strings[string_index++];
         HL_BOX_STRING_FIELDS(COPY_BOX_STRING)
 #undef COPY_BOX_STRING
         if (box->publish_count != 0) {
@@ -379,15 +390,17 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         if (hl_options_set(&engine->options, "HL_GID", number, 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
     }
     if ((box->flags & HL_ENGINE_BOX_ROOTFS_READ_ONLY) != 0 &&
-        hl_options_set(&engine->options, "HL_ROOTFS_RO", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
-    if ((box->flags & HL_ENGINE_BOX_SANDBOX) != 0 &&
-        (hl_options_set(&engine->options, "HL_SANDBOX", "1", 1) != 0 ||
-         hl_options_set(&engine->options, "HL_UNTRUSTED", "1", 1) != 0)) return HL_STATUS_OUT_OF_MEMORY;
+        hl_options_set(&engine->options, "HL_ROOTFS_RO", "1", 1) != 0)
+        return HL_STATUS_OUT_OF_MEMORY;
+    if ((box->flags & HL_ENGINE_BOX_SANDBOX) != 0 && (hl_options_set(&engine->options, "HL_SANDBOX", "1", 1) != 0 ||
+                                                      hl_options_set(&engine->options, "HL_UNTRUSTED", "1", 1) != 0))
+        return HL_STATUS_OUT_OF_MEMORY;
     if ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) != 0 &&
-        hl_options_set(&engine->options, "HL_NET_ISOLATE", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+        hl_options_set(&engine->options, "HL_NET_ISOLATE", "1", 1) != 0)
+        return HL_STATUS_OUT_OF_MEMORY;
     if (has_v2) {
-#define APPLY_BOX_STRING(field, option)                                                                              \
-        if (hl_engine_set_option(&engine->options, option, engine->box_config.field) != 0) return HL_STATUS_OUT_OF_MEMORY;
+#define APPLY_BOX_STRING(field, option)                                                                                \
+    if (hl_engine_set_option(&engine->options, option, engine->box_config.field) != 0) return HL_STATUS_OUT_OF_MEMORY;
         HL_BOX_STRING_FIELDS(APPLY_BOX_STRING)
 #undef APPLY_BOX_STRING
         {
@@ -396,30 +409,32 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
             publish[0] = 0;
             for (index = 0; index < box->publish_count; ++index) {
                 const uint8_t *address = (const uint8_t *)&box->publish[index].host_ipv4_be;
-                int written = box->publish[index].host_ipv4_be == 0
-                                  ? snprintf(publish + used, sizeof publish - used, "%s%u:%u", index ? "," : "",
-                                             (unsigned)box->publish[index].host_port,
-                                             (unsigned)box->publish[index].guest_port)
-                                  : snprintf(publish + used, sizeof publish - used, "%s%u.%u.%u.%u:%u:%u",
-                                             index ? "," : "", (unsigned)address[0], (unsigned)address[1],
-                                             (unsigned)address[2], (unsigned)address[3],
-                                             (unsigned)box->publish[index].host_port,
-                                             (unsigned)box->publish[index].guest_port);
+                int written =
+                    box->publish[index].host_ipv4_be == 0
+                        ? snprintf(publish + used, sizeof publish - used, "%s%u:%u", index ? "," : "",
+                                   (unsigned)box->publish[index].host_port, (unsigned)box->publish[index].guest_port)
+                        : snprintf(publish + used, sizeof publish - used, "%s%u.%u.%u.%u:%u:%u", index ? "," : "",
+                                   (unsigned)address[0], (unsigned)address[1], (unsigned)address[2],
+                                   (unsigned)address[3], (unsigned)box->publish[index].host_port,
+                                   (unsigned)box->publish[index].guest_port);
                 if (written < 0 || (size_t)written >= sizeof publish - used) return HL_STATUS_INVALID_ARGUMENT;
                 used += (size_t)written;
             }
             if (box->publish_count != 0 && hl_engine_set_option(&engine->options, "HL_PUBLISH", publish) != 0)
                 return HL_STATUS_OUT_OF_MEMORY;
         }
-        if (box->translation_cache != NULL &&
-            hl_options_set(&engine->options, "HL_PCACHE", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+        if (box->translation_cache != NULL && hl_options_set(&engine->options, "HL_PCACHE", "1", 1) != 0)
+            return HL_STATUS_OUT_OF_MEMORY;
         if ((box->flags & HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED) != 0 &&
             (hl_options_unset(&engine->options, "HL_PCACHE") != 0 ||
-             hl_options_unset(&engine->options, "HL_PCACHE_DIR") != 0)) return HL_STATUS_OUT_OF_MEMORY;
+             hl_options_unset(&engine->options, "HL_PCACHE_DIR") != 0))
+            return HL_STATUS_OUT_OF_MEMORY;
         if ((box->flags & HL_ENGINE_BOX_PUBLISH_EXTERNAL) != 0 &&
-            hl_options_set(&engine->options, "HL_PUBLISH_DAEMON", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+            hl_options_set(&engine->options, "HL_PUBLISH_DAEMON", "1", 1) != 0)
+            return HL_STATUS_OUT_OF_MEMORY;
         if ((box->flags & HL_ENGINE_BOX_SENTRY_ONLY) != 0 &&
-            hl_options_set(&engine->options, "HL_UNTRUSTED", "1", 1) != 0) return HL_STATUS_OUT_OF_MEMORY;
+            hl_options_set(&engine->options, "HL_UNTRUSTED", "1", 1) != 0)
+            return HL_STATUS_OUT_OF_MEMORY;
     }
     return HL_STATUS_OK;
 }
@@ -468,8 +483,8 @@ hl_status hl_engine_create_with_options(const hl_engine_config *config, const hl
             goto fail;
         }
         engine->executable = cloned.value;
-        engine->executable_config = (hl_engine_executable){HL_ENGINE_ABI, sizeof(engine->executable_config),
-                                                          HL_ENGINE_FD_BORROW, 0, cloned.value, NULL, 0};
+        engine->executable_config = (hl_engine_executable){
+            HL_ENGINE_ABI, sizeof(engine->executable_config), HL_ENGINE_FD_BORROW, 0, cloned.value, NULL, 0};
         status = hl_engine_read_executable(engine, cloned.value);
         if (status != HL_STATUS_OK) goto fail;
         (void)engine->host.file->close(engine->host.context, cloned.value);
@@ -648,9 +663,9 @@ hl_status hl_engine_run(hl_engine *engine, int argc, const char *const argv[], h
         hl_engine_unlock(engine);
         return HL_STATUS_NOT_SUPPORTED;
     }
-    status = engine->backend->start_process(&engine->host, engine->box_initialized ? &engine->box : NULL,
-                                            &engine->options,
-                                            &engine->config, (uint32_t)argc, argv, &process, &process_result);
+    status =
+        engine->backend->start_process(&engine->host, engine->box_initialized ? &engine->box : NULL, &engine->options,
+                                       &engine->config, (uint32_t)argc, argv, &process, &process_result);
     if (status != HL_STATUS_OK) {
         hl_engine_lock(engine);
         engine->state = HL_ENGINE_FINISHED;

@@ -80,10 +80,10 @@ static int check_fd_import_rollback(uint32_t invalid_result) {
 }
 
 static const char *const extended_option_names[16] = {
-    "HL_LOWER", "HL_PUBLISH", "HL_VOLUMES", "HL_ULIMITS", "HL_NETNS", "HL_PCACHE_DIR", "HL_NETBR", "HL_IP",
-    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS", "HL_CHECKPOINT_DIR", "HL_RESTORE_DIR", "HL_PCACHE", "HL_PUBLISH_DAEMON",
-    "HL_UNTRUSTED", "HL_SANDBOX"
-};
+    "HL_LOWER",      "HL_PUBLISH",        "HL_VOLUMES",        "HL_ULIMITS",
+    "HL_NETNS",      "HL_PCACHE_DIR",     "HL_NETBR",          "HL_IP",
+    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS",   "HL_CHECKPOINT_DIR", "HL_RESTORE_DIR",
+    "HL_PCACHE",     "HL_PUBLISH_DAEMON", "HL_UNTRUSTED",      "HL_SANDBOX"};
 
 static int option_matches(const hl_options *options, const char *name, const char *expected) {
     const char *actual = hl_options_get(options, name);
@@ -120,7 +120,8 @@ static hl_status fake_start_common(const hl_host_services *host, hl_linux_abi *b
          !option_matches(options, "HL_ROOTFS_RO", (expected_box_flags & HL_ENGINE_BOX_ROOTFS_READ_ONLY) ? "1" : NULL) ||
          !option_matches(options, "HL_SANDBOX", (expected_box_flags & HL_ENGINE_BOX_SANDBOX) ? "1" : NULL) ||
          !option_matches(options, "HL_UNTRUSTED", (expected_box_flags & HL_ENGINE_BOX_SANDBOX) ? "1" : NULL) ||
-         !option_matches(options, "HL_NET_ISOLATE", (expected_box_flags & HL_ENGINE_BOX_NETWORK_ISOLATED) ? "1" : NULL)))
+         !option_matches(options, "HL_NET_ISOLATE",
+                         (expected_box_flags & HL_ENGINE_BOX_NETWORK_ISOLATED) ? "1" : NULL)))
         return HL_STATUS_CORRUPT;
     if (expected_rootfs != NULL && (config->rootfs == NULL || strcmp(config->rootfs, expected_rootfs) != 0))
         return HL_STATUS_CORRUPT;
@@ -206,6 +207,7 @@ static int check_concurrent_stop(hl_fake_host *fake, hl_host_services *services,
 
 static int check_concurrent_destroy(hl_fake_host *fake, hl_host_services *services, hl_engine_config *config) {
     enum { REPEATS = 100 };
+
     uint32_t iteration;
     for (iteration = 0; iteration < REPEATS; ++iteration) {
         run_context context;
@@ -487,7 +489,9 @@ int main(void) {
     box.flags = 0;
     box.checkpoint_directory = "/checkpoint";
     box.restore_directory = "/restore";
-    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
+    hl_engine_destroy(engine);
+    engine = NULL;
     box.checkpoint_directory = NULL;
     box.restore_directory = NULL;
     box.ip = "10.0.0.2";

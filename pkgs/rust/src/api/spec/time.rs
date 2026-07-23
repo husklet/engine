@@ -74,6 +74,10 @@ pub struct CacheIdentity {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CheckpointSpec {
     pub enabled: bool,
+    /// Arm this launch to write a native whole-process-tree checkpoint here.
+    pub capture_directory: Option<PathBuf>,
+    /// Restore a native whole-process-tree checkpoint from this directory.
+    pub restore_directory: Option<PathBuf>,
     pub mode: CheckpointMode,
     pub maximum_pause_ms: Option<u64>,
     pub incompatible_resources: IncompatibleResourcePolicy,

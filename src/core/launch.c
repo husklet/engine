@@ -22,8 +22,8 @@
 #include "options.h"
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argc,
-                       char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
 
 // Read exactly `n` bytes from `fd` into `buf`, looping over short reads. Returns 0 on success, -1 on
 // EOF/error -- a truncated buffer is a hard failure (a partial config must never launch a container).
@@ -90,13 +90,13 @@ static int launch_publish(const hl_launch_config *config, const char *pool, char
     if (hl_launch_config_publish(config, pool, &rules) != HL_STATUS_OK) return -1;
     for (index = 0; index < config->publish_count; ++index) {
         const uint8_t *address = (const uint8_t *)&rules[index].host_ipv4_be;
-        int written = rules[index].host_ipv4_be == 0
-                          ? snprintf(output + used, capacity - used, "%s%u:%u", index ? "," : "",
-                                     (unsigned)rules[index].host_port, (unsigned)rules[index].guest_port)
-                          : snprintf(output + used, capacity - used, "%s%u.%u.%u.%u:%u:%u", index ? "," : "",
-                                     (unsigned)address[0], (unsigned)address[1], (unsigned)address[2],
-                                     (unsigned)address[3], (unsigned)rules[index].host_port,
-                                     (unsigned)rules[index].guest_port);
+        int written =
+            rules[index].host_ipv4_be == 0
+                ? snprintf(output + used, capacity - used, "%s%u:%u", index ? "," : "",
+                           (unsigned)rules[index].host_port, (unsigned)rules[index].guest_port)
+                : snprintf(output + used, capacity - used, "%s%u.%u.%u.%u:%u:%u", index ? "," : "",
+                           (unsigned)address[0], (unsigned)address[1], (unsigned)address[2], (unsigned)address[3],
+                           (unsigned)rules[index].host_port, (unsigned)rules[index].guest_port);
         if (written < 0 || (size_t)written >= capacity - used) return -1;
         used += (size_t)written;
     }
@@ -149,8 +149,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     memcpy(&abi, prefix + 12, 4);
     if (magic != HL_CONFIG_MAGIC ||
         (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_NETWORK_TRANSPORT && abi != HL_CONFIG_ABI_LEGACY) ||
-        header_size < offsetof(hl_launch_config, network_transport) ||
-        header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
+        header_size < offsetof(hl_launch_config, network_transport) || header_size > HL_LAUNCH_HEADER_LIMIT ||
+        pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
     }
@@ -212,8 +212,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
         snprintf(num, sizeof num, "%d", cfg.gid);
         APPLY_OPTION("HL_GID", num);
     }
-    snprintf(process_domain, sizeof process_domain, "%016llx%016llx",
-             (unsigned long long)cfg.process_domain[0], (unsigned long long)cfg.process_domain[1]);
+    snprintf(process_domain, sizeof process_domain, "%016llx%016llx", (unsigned long long)cfg.process_domain[0],
+             (unsigned long long)cfg.process_domain[1]);
     APPLY_OPTION("HL_PROCESS_DOMAIN", process_domain);
 
     // Pooled strings are copied by hl_option_set; an empty field leaves the option unset.
@@ -274,7 +274,7 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // mode additionally confines the worker. Value 1 retains the ABI4 public behavior, while value 2 selects
     // sentry-only routing without applying a Seatbelt profile to paths supplied by a developer harness.
     if (cfg.sandbox) {
-    APPLY_OPTION("HL_UNTRUSTED", "1");
+        APPLY_OPTION("HL_UNTRUSTED", "1");
         if (cfg.sandbox == HL_CONFIG_SANDBOX_ENABLED) APPLY_OPTION("HL_SANDBOX", "1");
     }
 
@@ -303,9 +303,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     hl_options *previous_options = hl_options_bind_process(&options);
     const char *result_path = launch_string(&cfg, pool, cfg.result_path_offset);
     const char *executable_host = launch_string(&cfg, pool, cfg.executable_host_offset);
-    int rc = runner(rootfs[0] ? rootfs : NULL, executable_host[0] ? executable_host : NULL,
-                    (uint32_t)argument_count, argv2, &options,
-                    result_path[0] ? result_path : NULL);
+    int rc = runner(rootfs[0] ? rootfs : NULL, executable_host[0] ? executable_host : NULL, (uint32_t)argument_count,
+                    argv2, &options, result_path[0] ? result_path : NULL);
     (void)hl_options_bind_process(previous_options);
     // Single-shot process: the guest usually exits the worker; if it returns, release temporary storage.
     free(argv2);
@@ -321,8 +320,8 @@ option_failure:
     return 78;
 }
 
-static int hl_legacy_launch(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
-                            const char *result_path) {
+static int hl_legacy_launch(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
+                            const hl_options *options, const char *result_path) {
     (void)options;
     (void)result_path;
     (void)executable_host;

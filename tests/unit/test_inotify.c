@@ -165,10 +165,8 @@ static void *fork_stress_thread(void *opaque) {
     fork_stress *stress = opaque;
     hl_linux_fork_record records[16];
     for (uint32_t index = 0; index < 200; ++index) {
-        hl_linux_fork_plan plan = {.abi = HL_LINUX_ABI_VERSION,
-                                   .size = sizeof(plan),
-                                   .records = records,
-                                   .capacity = HL_ARRAY_COUNT(records)};
+        hl_linux_fork_plan plan = {
+            .abi = HL_LINUX_ABI_VERSION, .size = sizeof(plan), .records = records, .capacity = HL_ARRAY_COUNT(records)};
         if (hl_linux_abi_fork_prepare(stress->abi, &plan) != HL_STATUS_OK ||
             hl_linux_abi_fork_parent(stress->abi, &plan) != HL_STATUS_OK) {
             atomic_store_explicit(&stress->failed, 1, memory_order_release);
@@ -276,10 +274,10 @@ int main(void) {
     {
         uint32_t clones_before = atomic_load_explicit(&root.clones, memory_order_acquire);
         uint32_t closes_before = atomic_load_explicit(&root.closes, memory_order_acquire);
-    root.clone_status = HL_STATUS_OUT_OF_MEMORY;
+        root.clone_status = HL_STATUS_OUT_OF_MEMORY;
         HL_CHECK(hl_linux_abi_fork_prepare(&abi, &plan) == HL_STATUS_OUT_OF_MEMORY &&
                  root.clones == clones_before + 1u);
-    root.clone_status = HL_STATUS_OK;
+        root.clone_status = HL_STATUS_OK;
         HL_CHECK(hl_linux_close(&abi, (hl_linux_fd)alias) == 0 && root.closes == closes_before + 1u);
     }
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);

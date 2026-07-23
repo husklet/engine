@@ -244,64 +244,6 @@ static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *rec
     return marker;
 }
 
-static int typed_inotify_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
-    if (metadata == NULL || metadata->kind != 3) return 0;
-    size_t size = 0;
-    if (metadata->source_fd < 0 || g_linux_box == NULL ||
-        hl_linux_inotify_export(g_linux_box, (hl_linux_fd)metadata->source_fd, NULL, 0, &size) != HL_STATUS_OK ||
-        size == 0 || size > 64u * 1024u * 1024u)
-        return -1;
-    void *image = malloc(size);
-    size_t actual = 0;
-    if (image == NULL ||
-        hl_linux_inotify_export(g_linux_box, (hl_linux_fd)metadata->source_fd, image, size, &actual) != HL_STATUS_OK ||
-        actual != size || pwrite(marker, image, size, (off_t)sizeof *metadata) != (ssize_t)size) {
-        free(image);
-        return -1;
-    }
-    free(image);
-    metadata->image_size = size;
-    return 0;
-}
-
-static int typed_inotify_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker) {
-    if (metadata == NULL || metadata->kind != 3 || metadata->image_size == 0 ||
-        metadata->image_size > 64u * 1024u * 1024u || metadata->image_size > SIZE_MAX || g_linux_box == NULL) {
-        fprintf(stderr, "[scm-inotify] invalid image metadata kind=%u size=%llu box=%p\n",
-                metadata ? metadata->kind : 0, (unsigned long long)(metadata ? metadata->image_size : 0),
-                (void *)g_linux_box);
-        return -1;
-    }
-    size_t size = (size_t)metadata->image_size;
-    void *image = malloc(size);
-    if (image == NULL || pread(marker, image, size, (off_t)sizeof *metadata) != (ssize_t)size ||
-        bound_shadow_install(fd) != fd) {
-        fprintf(stderr, "[scm-inotify] cannot load/install fd=%d marker=%d size=%zu errno=%d\n", fd, marker,
-                size, errno);
-        free(image);
-        return -1;
-    }
-    void *provider = bound_inotify_provider_create(g_host_services);
-    int64_t imported = provider == NULL
-                           ? -HL_LINUX_ENOMEM
-                           : hl_linux_inotify_import_at(g_linux_box, (hl_linux_fd)fd, &bound_inotify_ops, provider,
-                                                        metadata->descriptor_flags, metadata->nonblock ? O_NONBLOCK : 0,
-                                                        image, size);
-    free(image);
-    if (imported < 0) {
-        fprintf(stderr, "[scm-inotify] typed import fd=%d failed=%lld\n", fd, (long long)imported);
-        close(fd);
-        return -1;
-    }
-    hl_linux_fd_snapshot snapshot;
-    if (!bound_snapshot((uint64_t)(uint32_t)fd, &snapshot) || bound_fdvis_publish_snapshot(fd, &snapshot) != 0) {
-        fprintf(stderr, "[scm-inotify] typed publication fd=%d failed errno=%d\n", fd, errno);
-        close(fd);
-        return -1;
-    }
-    return 0;
-}
-
 static int ckpt_dump_signal_state(const char *path) {
     struct ckpt_signal_state *state = calloc(1, sizeof *state);
     if (state == NULL) return -1;
