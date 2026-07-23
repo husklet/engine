@@ -136,3 +136,20 @@ endif()
 
 # --- Phase 2: Linux production engines + dual embedded activation archive ----
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase2Production.cmake)
+
+# --- Phase 3/4 -------------------------------------------------------------
+option(HL_BUILD_TESTS "build the unit + compat + e2e test matrix" ON)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Codesign.cmake)
+
+if(HL_BUILD_TESTS)
+  enable_testing()
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Units.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GuestFixtures.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
+endif()
+
+# --- Phase 4: install rules, pkg-config, packaging smoke tests -------------
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Install.cmake)

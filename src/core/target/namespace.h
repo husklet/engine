@@ -51,6 +51,19 @@
 #define jit_hostpc_lookup HL_TARGET_LOCAL(jit_hostpc_lookup)
 #define jit_pc_in_cache HL_TARGET_LOCAL(jit_pc_in_cache)
 #define jit_pc_in_retained_cache HL_TARGET_LOCAL(jit_pc_in_retained_cache)
+
+/*
+ * Checkpoint SCM image helpers (src/linux_abi/syscall/{event,inotify}.c).
+ * These are non-static and declared in src/linux_abi/checkpoint.h; without a
+ * rename both unity translators export the same four symbols and the dual
+ * embedded archive fails to link with "multiple definition".  namespace.h is
+ * the first include of every unity TU, so the rename covers both the
+ * declaration in checkpoint.h and the definitions.
+ */
+#define epoll_scm_image_export HL_TARGET_LOCAL(epoll_scm_image_export)
+#define epoll_scm_image_import HL_TARGET_LOCAL(epoll_scm_image_import)
+#define typed_inotify_scm_image_export HL_TARGET_LOCAL(typed_inotify_scm_image_export)
+#define typed_inotify_scm_image_import HL_TARGET_LOCAL(typed_inotify_scm_image_import)
 #endif
 
 #endif
