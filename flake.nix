@@ -135,6 +135,7 @@
           linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
           linuxX86 = pkgs.pkgsCross.gnu64;
           linuxArmSqlite = linuxArm.pkgsStatic.sqlite;
+          linuxX86Sqlite = linuxX86.pkgsStatic.sqlite;
           linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
           linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
         in {
@@ -158,7 +159,7 @@
             AARCH64_LINUX_CC = linuxArmCompiler;
             X86_64_LINUX_CC = linuxX86Compiler;
             AARCH64_LINUX_STATIC_CC = "${linuxArmCompiler} -I${nixpkgs.lib.getDev linuxArmSqlite}/include -L${nixpkgs.lib.getLib linuxArmSqlite}/lib -L${linuxArm.glibc.static}/lib";
-            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
+            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -I${nixpkgs.lib.getDev linuxX86Sqlite}/include -L${nixpkgs.lib.getLib linuxX86Sqlite}/lib -L${linuxX86.glibc.static}/lib";
             AARCH64_DYNAMIC_LOADER = "${linuxArm.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${linuxArm.glibc}/lib/libc.so.6";
             X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
@@ -169,7 +170,7 @@
             AARCH64_LINUX_CC = "${pkgs.stdenv.cc}/bin/cc";
             X86_64_LINUX_CC = linuxX86Compiler;
             AARCH64_LINUX_STATIC_CC = "${pkgs.stdenv.cc}/bin/cc -I${nixpkgs.lib.getDev pkgs.pkgsStatic.sqlite}/include -L${nixpkgs.lib.getLib pkgs.pkgsStatic.sqlite}/lib -L${pkgs.glibc.static}/lib";
-            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -L${linuxX86.glibc.static}/lib";
+            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -I${nixpkgs.lib.getDev linuxX86Sqlite}/include -L${nixpkgs.lib.getLib linuxX86Sqlite}/lib -L${linuxX86.glibc.static}/lib";
             AARCH64_DYNAMIC_LOADER = "${pkgs.glibc}/lib/ld-linux-aarch64.so.1";
             AARCH64_DYNAMIC_LIBC = "${pkgs.glibc}/lib/libc.so.6";
             X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";

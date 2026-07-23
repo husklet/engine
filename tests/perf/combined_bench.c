@@ -17,8 +17,9 @@
  * "ok" checksum for every phase is deterministic and must be identical across
  * native/qemu/hl for the same arch, so the comparison is valid.
  *
- * The sqlite phase is compiled only when HL_BENCH_SQLITE is defined (it needs a
- * static libsqlite3 for the target arch); the runner tolerates its absence.
+ * The sqlite phase is compiled only when HL_BENCH_SQLITE is defined (it links a
+ * static libsqlite3 for the target arch, supplied by nix for both arches); the
+ * runner tolerates its absence.
  */
 #define _GNU_SOURCE
 
@@ -137,6 +138,108 @@ static uint64_t phase_float_simd(unsigned iters) {
     }
     return acc;
 }
+
+/* ---------------- phase: crypto (AES-128 block encryption) ----------------
+ * Exercises the guest's AES instructions -- x86 AES-NI (aesenc/aesenclast),
+ * aarch64 (AESE/AESMC) -- which the engine inlines to the host crypto
+ * extension. A CBC-style chain (output feeds the next block's input) blocks
+ * the compiler from hoisting the work. The checksum is stable across envs for
+ * a given arch (same binary). If the toolchain lacks crypto intrinsics the
+ * phase degrades to a portable scalar mix so the bench still builds/runs. */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <wmmintrin.h>
+#include <emmintrin.h>
+__attribute__((target("aes,sse2")))
+static uint64_t phase_crypto(unsigned iters) {
+    enum { BLK = 1024 };
+    static __m128i buf[BLK];
+    __m128i rk[11];
+    for (int r = 0; r < 11; ++r)
+        rk[r] = _mm_set_epi32(0x01020304 + r, 0x05060708 + r, 0x090a0b0c + r, 0x0d0e0f10 + r);
+    __m128i seed = _mm_set_epi32((int)0xdeadbeef, 0x12345678, (int)0x9abcdef0, 0x0f1e2d3c);
+    for (int i = 0; i < BLK; ++i) {
+        buf[i] = seed;
+        seed = _mm_add_epi32(seed, _mm_set1_epi32((int)0x9e3779b9));
+    }
+    __m128i chain = _mm_setzero_si128();
+    for (unsigned it = 0; it < iters; ++it) {
+        for (int i = 0; i < BLK; ++i) {
+            __m128i b = _mm_xor_si128(_mm_xor_si128(buf[i], chain), rk[0]);
+            b = _mm_aesenc_si128(b, rk[1]);
+            b = _mm_aesenc_si128(b, rk[2]);
+            b = _mm_aesenc_si128(b, rk[3]);
+            b = _mm_aesenc_si128(b, rk[4]);
+            b = _mm_aesenc_si128(b, rk[5]);
+            b = _mm_aesenc_si128(b, rk[6]);
+            b = _mm_aesenc_si128(b, rk[7]);
+            b = _mm_aesenc_si128(b, rk[8]);
+            b = _mm_aesenc_si128(b, rk[9]);
+            b = _mm_aesenclast_si128(b, rk[10]);
+            buf[i] = b;
+            chain = b;
+        }
+    }
+    uint64_t acc = 0;
+    for (int i = 0; i < BLK; i += 64) acc += (uint64_t)_mm_cvtsi128_si64(buf[i]);
+    return acc;
+}
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_neon.h>
+__attribute__((target("arch=armv8-a+crypto")))
+static uint64_t phase_crypto(unsigned iters) {
+    enum { BLK = 1024 };
+    static uint8x16_t buf[BLK];
+    uint8x16_t rk[11];
+    for (int r = 0; r < 11; ++r) {
+        uint8_t k[16];
+        for (int j = 0; j < 16; ++j) k[j] = (uint8_t)(r * 16 + j + 1);
+        rk[r] = vld1q_u8(k);
+    }
+    for (int i = 0; i < BLK; ++i) {
+        uint8_t s[16];
+        for (int j = 0; j < 16; ++j) s[j] = (uint8_t)(i * 7 + j * 13 + 1);
+        buf[i] = vld1q_u8(s);
+    }
+    uint8x16_t chain = vdupq_n_u8(0);
+    for (unsigned it = 0; it < iters; ++it) {
+        for (int i = 0; i < BLK; ++i) {
+            uint8x16_t b = veorq_u8(buf[i], chain);
+            b = vaesmcq_u8(vaeseq_u8(b, rk[0]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[1]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[2]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[3]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[4]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[5]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[6]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[7]));
+            b = vaesmcq_u8(vaeseq_u8(b, rk[8]));
+            b = vaeseq_u8(b, rk[9]);
+            b = veorq_u8(b, rk[10]);
+            buf[i] = b;
+            chain = b;
+        }
+    }
+    uint64_t acc = 0;
+    for (int i = 0; i < BLK; i += 64) acc += vgetq_lane_u64(vreinterpretq_u64_u8(buf[i]), 0);
+    return acc;
+}
+#else
+static uint64_t phase_crypto(unsigned iters) {
+    enum { BLK = 1024 };
+    static uint64_t buf[BLK * 2];
+    for (int i = 0; i < BLK * 2; ++i) buf[i] = (uint64_t)(i * 0x9e3779b97f4a7c15ULL + 1);
+    uint64_t chain = 0;
+    for (unsigned it = 0; it < iters; ++it)
+        for (int i = 0; i < BLK * 2; ++i) {
+            uint64_t x = buf[i] ^ chain;
+            x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+            buf[i] = x; chain = x;
+        }
+    uint64_t acc = 0;
+    for (int i = 0; i < BLK * 2; i += 128) acc += buf[i];
+    return acc;
+}
+#endif
 
 /* ---------------- phase: atomics / CAS loop ---------------- */
 
@@ -511,6 +614,7 @@ int main(void) {
     /* CPU / ALU surface */
     run_phase("intdiv", phase_intdiv, 60000000, 1);
     run_phase("float_simd", phase_float_simd, 500000, 3);
+    run_phase("crypto", phase_crypto, 120000, 2);
     run_phase("atomics", phase_atomics, 50000000, 3);
     run_phase("branch", phase_branch, 60000000, 1);
     run_phase("calls", phase_calls, 60000, 2);
