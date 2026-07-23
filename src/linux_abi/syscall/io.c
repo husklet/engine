@@ -119,6 +119,18 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
 
+// Guest O_LARGEFILE, likewise per-arch (x86-64 = 0100000 = 0x8000, aarch64/asm-generic = 0400000 =
+// 0x20000). A 64-bit Linux kernel FORCES this bit on in every open(): do_dentry_open() sets
+// FMODE_LARGEFILE unconditionally on 64-bit and force_o_largefile() makes O_LARGEFILE part of f_flags,
+// so F_GETFL on ANY fd reports it. The engine rebuilt the flag word from scratch and never set it, so
+// fcntl(fd, F_GETFL) returned 2 where Linux returns 0x20002 -- a mismatch for anything that round-trips
+// F_GETFL/F_SETFL or compares the word against O_ACCMODE|O_LARGEFILE.
+#if G_O_DIRECTORY == 0x10000
+#define G_O_LARGEFILE 0x8000 // x86-64
+#else
+#define G_O_LARGEFILE 0x20000 // aarch64 / asm-generic
+#endif
+
 
 /* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
  * available there by finding logical zero/data runs; native filesystem extents remain preferred. */
@@ -1271,6 +1283,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EPERM);
             break;
         } // F_SEAL_WRITE
+        // O_APPEND beats the explicit pwrite offset on Linux: generic_write_checks() moves ki_pos to i_size
+        // for ANY write to an O_APPEND file, pwrite64 included, so pwrite(fd, b, n, 0) on an O_APPEND fd
+        // APPENDS. The host-fd path below inherits that from the real host fd; the RAM-cached (memf) path
+        // did not -- it honoured the caller's offset and overwrote the head of the file (silent data
+        // corruption: "AAAA" + pwrite("B",0) became "BAAA" instead of "AAAAB"). Redirect the offset to EOF
+        // for the memf path only, so nothing changes for plain host-fd pwrites (no extra syscall there).
+        {
+            struct memf *am = memf_get((int)a0);
+            if (am) {
+                int aflags = fcntl((int)a0, F_GETFL);
+                if (aflags >= 0 && (aflags & O_APPEND)) a3 = (uint64_t)(off_t)am->size;
+            }
+        }
         if (memf_get((int)a0) && memf_room_or_spill((int)a0, (off_t)a3 + (off_t)a2)) {
             int64_t allowed = memf_fsize_gate(c, (off_t)a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
             if (allowed < 0) {
@@ -1303,6 +1328,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         memf_materialize(infd);
         off_t *po = (off_t *)a2;
         size_t cnt = (size_t)a3;
+        // Linux runs the count through rw_verify_area(), which rejects a count that is negative when read
+        // as ssize_t with -EINVAL. The engine looped on the raw size_t, so sendfile(out, in, NULL, SIZE_MAX)
+        // copied until EOF and returned a 32-bit-truncated byte count instead of failing.
+        if ((ssize_t)cnt < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // po (the in/out file offset) is read AND written directly -> validate before the copy loop so a bad
         // pointer returns -EFAULT instead of faulting the engine (and before any bytes move).
         if (po && !host_range_mapped((uintptr_t)a2, sizeof(off_t))) {
@@ -1345,6 +1377,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int vfd = (int)a0;
         const struct iovec *iv = (const struct iovec *)a1;
         int niov = (int)a2;
+        // SPLICE_F_MOVE(1)/NONBLOCK(2)/MORE(4)/GIFT(8) are the only defined bits; Linux rejects any other
+        // bit with -EINVAL before touching the iovec. The engine ignored `flags` entirely.
+        if (a3 & ~(uint64_t)0xf) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
@@ -1360,6 +1398,27 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // splice(fd_in,off_in,fd_out,off_out,len,fl): move bytes between two fds (consumes the source).
     case 76: {
         int fin = (int)a0, fout = (int)a2;
+        // SPLICE_F_MOVE(1)/NONBLOCK(2)/MORE(4)/GIFT(8) are the only defined bits -> any other bit is
+        // -EINVAL (Linux do_splice() -> SPLICE_F_ALL check). And splice REQUIRES at least one pipe
+        // endpoint: file->file is -EINVAL in Linux, but the engine happily read+wrote the bytes.
+        if (a5 & ~(uint64_t)0xf) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        {
+            struct stat si, so;
+            int in_pipe = fstat(fin, &si) == 0 && S_ISFIFO(si.st_mode);
+            int out_pipe = fstat(fout, &so) == 0 && S_ISFIFO(so.st_mode);
+            if (!in_pipe && !out_pipe) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            // An offset may only be supplied for the NON-pipe side; Linux -ESPIPEs a pipe with an offset.
+            if ((in_pipe && a1) || (out_pipe && a3)) {
+                G_RET(c) = (uint64_t)(int64_t)(-ESPIPE);
+                break;
+            }
+        }
         // splice reads/writes the optional off_in (a1) / off_out (a3) pointers directly; validate them
         // before moving any bytes so a bad pointer returns -EFAULT instead of faulting the engine.
         if (a1 && !host_range_mapped((uintptr_t)a1, sizeof(off_t))) {
@@ -1402,6 +1461,20 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // source. macOS has no tee, so peek fd_in (drain then re-queue as read-pushback) and copy to fd_out.
     case 77: {
         int fin = (int)a0, fout = (int)a1; // tee(fd_in, fd_out, len, flags) -- NOT the splice arg layout
+        // Same SPLICE_F_* mask as splice/vmsplice, and tee needs BOTH ends to be pipes (Linux do_tee()
+        // -EINVALs otherwise). The engine validated neither and silently returned 0 for a non-pipe fd.
+        if (a3 & ~(uint64_t)0xf) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        {
+            struct stat si, so;
+            if (!(fstat(fin, &si) == 0 && S_ISFIFO(si.st_mode)) ||
+                !(fstat(fout, &so) == 0 && S_ISFIFO(so.st_mode))) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+        }
         memf_materialize(fin);
         memf_materialize(fout);
         size_t len = (size_t)a2;
@@ -1556,6 +1629,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 have_fgetpath = 1;
                 if (proc_text_host_path(fgetpath_buf)) lf &= ~0x3;
             }
+            // 64-bit Linux always reports O_LARGEFILE (see G_O_LARGEFILE above).
+            lf |= G_O_LARGEFILE;
             if (r & O_APPEND) lf |= 0x400;
             if (r & O_NONBLOCK) lf |= 0x800;
             // APPEND/NONBLOCK/ASYNC
@@ -2057,6 +2132,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // copy_file_range(fdin,offin*,fdout,offout*,len,flags)
     case 285: {
         int fdin = (int)a0, fdout = (int)a2;
+        // Linux defines NO flags for copy_file_range: SYSCALL_DEFINE6 rejects a non-zero `flags` with
+        // -EINVAL up front. The engine ignored a5 and copied the bytes anyway.
+        if (a5) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         memf_materialize(fdin); // copy_file_range moves bytes via the real fds -> flush RAM caches first
         memf_materialize(fdout);
         size_t len = (size_t)a4, done = 0;

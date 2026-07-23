@@ -840,6 +840,9 @@ static void service_local(struct cpu *c) {
         // The rebased copy lives in a per-thread scratch array consumed synchronously by svc_io below.
         case 65:   // readv(fd, IOVEC, n)
         case 66:   // writev(fd, IOVEC, n)
+        case 75:   // vmsplice(fd, IOVEC, n, flags) -- same (iov=a1, iovcnt=a2) shape; the handler feeds the
+                   //   array straight to writev/readv, so a non-PIE guest's low link-vaddr iov_base entries
+                   //   (and a low iovec array itself) made EVERY vmsplice return EFAULT before this.
         case 69:   // preadv(fd, IOVEC, n, off)
         case 286:  // preadv2(fd, IOVEC, n, off, off_hi, flags) -- same (iov=a1, iovcnt=a2) shape
         case 287:  // pwritev2(fd, IOVEC, n, off, off_hi, flags) -- same shape; inner iov_base rebased too

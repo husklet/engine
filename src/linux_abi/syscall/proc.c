@@ -786,12 +786,15 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         // The mask itself must be writable -> EFAULT on a bad pointer (matches Linux copy_to_user).
-        if (a2 && n && !host_range_mapped((uintptr_t)a2, n < 128 ? n : 128)) {
+        // NULL is not exempt: the size check above already guarantees n >= sizeof(long), so Linux always
+        // copies out and sched_getaffinity(0, sizeof(mask), NULL) is -EFAULT. The old `a2 &&` guard made a
+        // NULL mask "succeed" (returning the byte count) while writing nothing.
+        if (n && !host_range_mapped((uintptr_t)a2, n < 128 ? n : 128)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
         if (n > 128) n = 128;
-        if (a2 && n) memcpy((void *)a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), n);
+        if (n) memcpy((void *)a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), n);
         // Return the number of bytes the mask spans (glibc zeroes the remainder); 8 covers <=64 CPUs.
         G_RET(c) = n < 8 ? (uint64_t)n : 8;
         break;
@@ -1264,18 +1267,18 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // RUSAGE_THREAD(1) -> SELF (macOS has no per-thread rusage; SELF is the closest faithful account).
         int who = (who_g == -1) ? RUSAGE_CHILDREN : RUSAGE_SELF;
-        if (a1) {
-            // The 144-byte struct rusage is written directly by the engine (not via a host syscall), so a
-            // bad/unmapped pointer must return -EFAULT here rather than fault the engine (access_ok).
-            if (!host_range_mapped((uintptr_t)a1, 144)) {
-                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-                break;
-            }
-            uint8_t *d = (uint8_t *)a1;
-            // Linux struct rusage layout (18 longs)
-            memset(d, 0, 144);
-            if (getrusage(who, &ru) == 0) rusage_to_linux(d, &ru);
+        // The 144-byte struct rusage is written directly by the engine (not via a host syscall), so a
+        // bad/unmapped pointer must return -EFAULT here rather than fault the engine (access_ok).
+        // NULL is NOT exempt: Linux always copy_to_user()s the buffer, so getrusage(RUSAGE_SELF, NULL)
+        // is -EFAULT. The old `if (a1)` guard silently skipped the copy-out and returned success.
+        if (!host_range_mapped((uintptr_t)a1, 144)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
         }
+        uint8_t *d = (uint8_t *)a1;
+        // Linux struct rusage layout (18 longs)
+        memset(d, 0, 144);
+        if (getrusage(who, &ru) == 0) rusage_to_linux(d, &ru);
         G_RET(c) = 0;
         break;
     }

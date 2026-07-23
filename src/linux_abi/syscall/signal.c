@@ -344,6 +344,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // faulting per Linux), tracked in the g_gna registry -- gna_hit catches it WITHOUT a probe-read, so a
         // valid but non-host-mapped non-PIE .bss sigset (this handler reads a0 directly, unrebased) is not
         // mistaken for a fault. NULL is not a valid rt_sigsuspend mask -> EFAULT too.
+        //
+        // sigsetsize is validated FIRST, before the mask is even copied in: Linux's
+        // SYSCALL_DEFINE2(rt_sigsuspend) opens with `if (sigsetsize != sizeof(sigset_t)) return -EINVAL;`.
+        // Without this the engine ignored a2/a1 entirely and went to sleep on a call Linux rejects
+        // instantly -- rt_sigsuspend(&set, 4) HUNG the guest forever instead of returning EINVAL.
+        if (a1 != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (a0 == 0 || gna_hit((uint64_t)a0, 8)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
@@ -397,6 +406,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // the dequeued siginfo out on success -- a bad pointer to any of the three is -EFAULT, never a fault
         // in the caller. Guard the direct derefs below to match (guest_bad_ptr also catches a PROT_NONE guard
         // page, as sigaltstack/rt_sigqueueinfo do). A NULL set is not a valid mask (kernel copy_from_user).
+        //
+        // sigsetsize (a3) is checked FIRST, before any pointer is touched: Linux's
+        // SYSCALL_DEFINE4(rt_sigtimedwait) starts with `if (sigsetsize != sizeof(sigset_t)) return -EINVAL;`.
+        // The engine ignored it, so rt_sigtimedwait(&set, NULL, NULL, 4) -- which Linux rejects
+        // immediately -- instead entered the untimed poll loop and HUNG the guest forever.
+        if (a3 != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (guest_bad_ptr((uintptr_t)a0, 8) || (a1 && guest_bad_ptr((uintptr_t)a1, 128)) ||
             (a2 && guest_bad_ptr((uintptr_t)a2, 16))) {
             G_RET(c) = (uint64_t)(-EFAULT);

@@ -2937,6 +2937,14 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
+        // A mode bit outside FALLOC_FL_SUPPORTED_MASK (KEEP_SIZE|PUNCH_HOLE|COLLAPSE_RANGE|ZERO_RANGE|
+        // INSERT_RANGE|UNSHARE_RANGE == 0x7b) is -EOPNOTSUPP on Linux, not -EINVAL (do_fallocate returns
+        // -EOPNOTSUPP for anything it does not implement). Mirrors the native path in fs.c case 47.
+        if (mode & ~0x7bu) {
+            result = -95; // Linux EOPNOTSUPP; hard-coded because this result is not run through the
+                          // macOS->Linux errno map (a host EOPNOTSUPP is 102 on Darwin). Cf. time.c case 115.
+            break;
+        }
         if (a2 > INT64_MAX - a3) {
             result = -EFBIG;
             break;
@@ -3458,6 +3466,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         size_t done = 0;
         char buffer[8192];
         result = 0;
+        // copy_file_range defines NO flags: Linux rejects a non-zero `flags` with -EINVAL before copying
+        // anything. Mirrors the native path in io.c case 285.
+        if (G_A5(c)) {
+            result = -EINVAL;
+            break;
+        }
         if (!bound_snapshot(a2, &output)) {
             result = -ENOSYS;
             break;

@@ -2133,8 +2133,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         //            size-increasing one, WRITE(0x8) any data modification -> EPERM.
         int fd = (int)a0, mode = (int)a1;
         off_t off = (off_t)a2, len = (off_t)a3;
-        if (off < 0 || len <= 0 || (mode & ~0x7f)) { // negative/zero range or unknown mode bit -> EINVAL
+        if (off < 0 || len <= 0) { // negative/zero range -> EINVAL (do_fallocate's first check)
             G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        // A mode bit outside FALLOC_FL_SUPPORTED_MASK (KEEP_SIZE|PUNCH_HOLE|COLLAPSE_RANGE|ZERO_RANGE|
+        // INSERT_RANGE|UNSHARE_RANGE == 0x7b) is -EOPNOTSUPP on Linux, NOT -EINVAL: do_fallocate() returns
+        // -EOPNOTSUPP for anything it does not implement, and the range-combination checks below are what
+        // produce -EINVAL. The old `mode & ~0x7f` test both let 0x04 through and reported the wrong errno.
+        if (mode & ~0x7b) {
+            G_RET(c) = (uint64_t)(-EOPNOTSUPP);
             break;
         }
         // Linux mode-combination validity (vfs_fallocate/do_fallocate): the range ops must be used
@@ -2966,6 +2974,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int pfn = procfd_num_at((int)a0, (const char *)a1);
             if (pfn < 0) pfn = procfd_num(special);
             if (pfn < 0) pfn = dev_std_fd(special);
+            // /proc/self/fd/N only EXISTS while N is open: opening the name of a closed descriptor is
+            // -ENOENT on Linux (the magic symlink is simply absent). procfd_num() only parses the number,
+            // so the engine fell through to dup(N) and surfaced the dup's -EBADF instead.
+            if (pfn >= 0 && fcntl(pfn, F_GETFD) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+                break;
+            }
             if (pfn >= 0) {
                 hl_linux_fd_snapshot typed;
                 if (!bound_source_is_native() && g_linux_box != NULL &&

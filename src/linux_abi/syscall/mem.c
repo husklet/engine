@@ -345,6 +345,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // gmap-tracked region) and any fully-tracked PROT_NONE reservation skip the page-walk probe -- zero
         // cost and no false EFAULT there; only an untracked / partially-covered source is validated against
         // the live address space (host_range_mapped rejects both an unmapped page and a PROT_NONE page).
+        //
+        // old_size == 0 is only legal for a MAP_SHARED source (Linux mm/mremap.c: it then means "make a
+        // second mapping of the same shared object"); for a private mapping it is -EINVAL. The engine had
+        // no check at all and handed back a brand-new anonymous mapping for mremap(p, 0, n, MAYMOVE).
+        if ((uint64_t)a1 == 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (a1 && !hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
