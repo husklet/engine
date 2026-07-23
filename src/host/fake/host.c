@@ -1360,7 +1360,12 @@ void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block) {
  * The fake host is the right place to resolve it. It exists precisely to satisfy the host contract in
  * tests, it is never linked into a production engine (those link libhl-host-{linux,macos}.a, which carry
  * the real host/private.c), so these cannot shadow the real implementations. Registering a private
- * descriptor is a no-op for a fake host, which is the correct fake behaviour. */
+ * descriptor is a no-op for a fake host, which is the correct fake behaviour.
+ *
+ * ../system.h declares all three; include it so these are definitions of the declared contract rather
+ * than fresh external symbols (-Wmissing-prototypes, which this tree builds with). */
+#include "../system.h"
+
 void hl_host_private_init(void) {
 }
 

@@ -17,7 +17,20 @@
 # Off macOS the function is a no-op, matching the Makefile's `JIT_SIGN = true`.
 # ---------------------------------------------------------------------------
 
-set(HL_CODESIGN codesign CACHE STRING "codesign tool (Makefile CODESIGN)")
+# Prefer the ABSOLUTE Apple tool over a PATH lookup. A nix build (and any other environment with a
+# controlled PATH) has no `codesign` on PATH, so the install phase died with "codesign: command not
+# found" the moment it linked hl-engine-runner. /usr/bin/codesign is nonetheless visible there --
+# verified inside the darwin build sandbox -- so resolving it absolutely is both sufficient and honest.
+#
+# Do NOT substitute nixpkgs' sigtool here. Its `codesign` accepts --entitlements and silently ignores
+# it: the resulting binary carries no entitlements at all, which is precisely the SIGKILL-at-runtime,
+# no-diagnostic failure this file exists to prevent. Checked with `codesign -d --entitlements -`.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND EXISTS /usr/bin/codesign)
+  set(HL_CODESIGN_DEFAULT /usr/bin/codesign)
+else()
+  set(HL_CODESIGN_DEFAULT codesign)
+endif()
+set(HL_CODESIGN ${HL_CODESIGN_DEFAULT} CACHE STRING "codesign tool (Makefile CODESIGN)")
 set(HL_JIT_ENTITLEMENTS ${CMAKE_CURRENT_LIST_DIR}/../packaging/macos/jit.entitlements)
 
 # hl_codesign(<target>...) — ad-hoc sign with the JIT entitlements after link.

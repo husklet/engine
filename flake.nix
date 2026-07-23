@@ -139,6 +139,13 @@
                 "hl-engine-linux-x86_64"
               ];
             doCheck = false; # covered by checks.unit, which is not sandbox-hostile
+            # Every mac executable is codesigned with packaging/macos/jit.entitlements at link time,
+            # because the JIT's RX alias is non-MAP_JIT executable memory and a SIP-on host SIGKILLs an
+            # unentitled process that runs it. nixpkgs' fixupPhase strips binaries AFTER that signature
+            # exists, which invalidates it -- nix then re-signs ad-hoc, silently WITHOUT entitlements, so
+            # `codesign -d --entitlements -` on the installed runner came back empty and the binary would
+            # have died at runtime with no diagnostic. Keep the signed binary intact on darwin.
+            dontStrip = pkgs.stdenv.hostPlatform.isDarwin;
             meta = {
               description = "Userspace execution engine for Linux programs";
               homepage = "https://github.com/husklet/engine";
