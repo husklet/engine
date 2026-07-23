@@ -25,6 +25,19 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine_phase1 LANGUAGES C)
 
+# --- sanitizers -------------------------------------------------------------
+# The Makefile's `sanitize` target re-invokes make into a second BUILD dir with
+# ASan+UBSan CFLAGS and runs the unit suite. The CMake equivalent is a separate
+# configure, which is the idiomatic form and avoids a recursive build:
+#   cmake -G Ninja -B build-asan -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake -DHL_SANITIZE=ON
+#   ninja -C build-asan && ctest --test-dir build-asan -L unit
+option(HL_SANITIZE "build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+if(HL_SANITIZE)
+  # Matches the Makefile's flags exactly (-O1 -g -fno-omit-frame-pointer).
+  add_compile_options(-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 # Mirror the Makefile's DEBUG knob (CPPFLAGS: -DHL_ENABLE_LOGGING=$(DEBUG)).
 set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value (Makefile DEBUG)")
 
@@ -153,3 +166,6 @@ endif()
 
 # --- Phase 4: install rules, pkg-config, packaging smoke tests -------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Install.cmake)
+
+# --- clang-format targets ---------------------------------------------------
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)

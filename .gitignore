@@ -18,3 +18,7 @@ pkgs/*/assets/lib/
 pkgs/*/assets/**/*.tar.gz
 pkgs/*/assets/**/*.a
 results/
+
+# Test artifact: tests/compat/core/workload/sqlite.c writes this into the CWD
+# when run without an explicit path argument. It was committed by accident.
+test.db
