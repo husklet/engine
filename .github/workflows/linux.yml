@@ -140,10 +140,20 @@ jobs:
           # empty stdout while passing 8/8 locally. A genuine break still fails both attempts;
           # the first-attempt failure is surfaced as a ::warning so a real intermittent bug
           # stays visible rather than being silently greened by the retry.
+          # One make invocation PER SUITE. `make -j N goal1 goal2` builds in parallel AND runs the
+          # goals' recipes concurrently, so a bucket's suites were executing at the same time --
+          # several of them contain load-sensitive stress gates, and the symptom was cases timing
+          # out after the runner's full 120s per-case budget having produced ZERO bytes of output
+          # (mkfifoat, truncate-eof-bus). Building stays parallel; suites run one at a time.
           run_suites() {
-            local st=0
-            run_bounded 2100 "$1" \
-              nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" ${{ matrix.targets }}' || st=$?
+            local st=0 t=
+            : > "$1"
+            for t in ${{ matrix.targets }}; do
+              run_bounded 2100 "$1.part" \
+                nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || st=$?
+              cat "$1.part" >> "$1"
+              [ "$st" -ne 0 ] && break
+            done
             tail -n 60 "$1"
             return $st
           }

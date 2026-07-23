@@ -179,10 +179,19 @@ jobs:
             done
             wait "$pid"
           }
+          # One make invocation PER SUITE -- see the note in linux.yml. `make -j N goal1 goal2` runs
+          # the goals' recipes concurrently, so a bucket's suites competed with each other; the
+          # symptom is a case timing out after the runner's full 120s per-case budget with ZERO
+          # bytes of output. Building stays parallel; suites run one at a time.
           run_bucket() {
-            local st=0
-            run_bounded 2400 "$1" \
-              nix develop --command sh -c 'make -sk -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" ${{ matrix.targets }}' || st=$?
+            local st=0 t=
+            : > "$1"
+            for t in ${{ matrix.targets }}; do
+              run_bounded 2400 "$1.part" \
+                nix develop --command sh -c "make -sk -j\"\$(sysctl -n hw.ncpu)\" CC=\"\$NATIVE_CC\" $t" || st=$?
+              cat "$1.part" >> "$1"
+              [ "$st" -ne 0 ] && break
+            done
             tail -c 200000 "$1" >> "$GITHUB_STEP_SUMMARY" || true
             tail -n 60 "$1"
             return $st
