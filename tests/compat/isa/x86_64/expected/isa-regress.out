@@ -1,0 +1,68 @@
+addsd              11223344556677884008000000000000
+subss              11223344556677883ff0000000000000
+mulss              11223344556677883ff0000000000000
+divsd              11223344556677883fe0000000000000
+sqrtsd             11223344556677883ff6a09e667f3bcd
+minsd              11223344556677883ff0000000000000
+maxss              11223344556677883ff0000000000000
+cmpsd-neq          1122334455667788ffffffffffffffff
+cmpss-eq           11223344556677883ff00000ffffffff
+cvtss2sd           11223344556677880000000000000000
+cvtsd2ss           11223344556677883ff0000040000000
+cvtsi2sdq          112233445566778841f2345678900000
+cvtpd2ps           0000000000000000c3f0000042a80000
+cvtps2pd           40590000000000004024000000000000
+subps-nan0         bf800000bf800000bf800000ffffffff
+mulps-nan0         400000004000000040000000ffffffff
+subps-nan1         bf800000bf800000bf800000ffffffff
+mulps-nan1         400000004000000040000000ffffffff
+subps-nan2         bf800000bf800000bf8000007fc00001
+mulps-nan2         4000000040000000400000007fc00001
+subps-nan3         bf800000bf800000bf8000007fc00002
+mulps-nan3         4000000040000000400000007fc00002
+subps-nan4         bf800000bf800000bf800000ffc00001
+mulps-nan4         400000004000000040000000ffc00001
+subps-nan5         bf800000bf800000bf8000007fc00002
+mulps-nan5         4000000040000000400000007fc00002
+haddps-geninf      41d00000419000007f800000ffc00000
+hsubps-geninf      c0000000c0000000ffc000007f800000
+addsubps-geninf    7f8000007f800000ff8000007f800000
+addsubps-nan       7fc000047fc000037fc000027fc00001
+addsubpd-nan       7ff80000000000027ff8000000000001
+haddpd-nanpair     40080000000000007ff8000000000000
+ucomisd0           of=0 flags=0045
+ucomisd1           of=0 flags=0045
+ucomisd2           of=0 flags=0001
+ucomisd3           of=0 flags=0040
+movw-mem           aaaabbbbcccc1234
+movw-imm           aaaabbbbcccc0077
+movw-regreg        aaaabbbbcccc8888
+cmovew-mem         aaaabbbbcccc1234
+cmovew-reg         aaaabbbbcccc8888
+popcntw            aaaabbbbcccc0005
+bsfw               aaaabbbbcccc0003
+bsrw               aaaabbbbcccc000f
+xchgw-reg          aaaabbbbcccc8888
+xchgw-mem          aaaabbbbcccc1234
+leaw               aaaabbbbcccc888c
+pushpopw           aaaabbbbcccc8888
+pushw-rsp-delta    0000000000000000
+cmpxchgb-ne        aaaabbbbccccdd44 5555666677778888 1111222233334444 0084
+cmpxchgb-eq        aaaabbbbccccdd44 5555666677778888 1111222233334488 0044
+cmpxchgb-hi8       aaaabbbbccccdd88 5555666677778888 1111222233334444 0004
+cmpxchgw-ne        aaaabbbbcccc4444 5555666677778888 1111222233334444 0084
+cmpxchgw-eq        aaaabbbbcccc4444 5555666677778888 1111222233338888 0044
+cmpxchgq           1111222233334444 5555666677778888 1111222233334444 0084
+xaddb              aaaabbbbccccdddd 5555666677778844 11112222333344cc 0084
+xaddb-hi8          aaaabbbbcccc88dd 5555666677776588 1111222233334444 0815
+xaddw              aaaabbbbccccdddd 5555666677774444 111122223333cccc 0084
+xaddw-same         aaaabbbbccccbbba 5555666677778888 1111222233334444 0091
+xaddq              aaaabbbbccccdddd 1111222233334444 66668888aaaacccc 0004
+popcnt0             0 np=1 flags=0040
+popcnt1             1 np=1 flags=0000
+popcnt2             1 np=1 flags=0000
+popcnt3            64 np=1 flags=0000
+popcnt4             8 np=1 flags=0000
+adc-psraw-rcl      0000000000000088
+cmp-addsd-js       0000000000000000
+cmp-cvttsd2si-js   0000000000000000

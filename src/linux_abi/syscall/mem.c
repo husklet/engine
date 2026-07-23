@@ -837,6 +837,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // object -- skip it. Inert for every private mapping (the fast-path gate stays 0).
             if ((a3 & 0x01) && !(a3 & 0x20) && !off_emul && (int)a4 >= 0)
                 futex_shared_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5);
+            // x86-TSO ordering must hold for ANY observer, and a MAP_SHARED region (file-backed OR anon --
+            // shared anon is fork-inherited) can be read by a peer PROCESS. The translator elides guest
+            // load/store barriers while the process looks single-threaded, but g_threaded is per-process and
+            // therefore says nothing about a cross-process observer, so a shared mapping must force barriers
+            // back on permanently (and flush the barrier-elided blocks). Covers both shared cases; inert for
+            // every MAP_PRIVATE mapping and a no-op on the aarch64 frontend, which elides nothing.
+            if (a3 & 0x01) (void)G_SHARED_MAP_BARRIERS();
             // mlockall(MCL_FUTURE): a mapping created while future-locking is armed must be wired resident on
             // creation (Linux mm/mlock.c). Best-effort (a RLIMIT_MEMLOCK refusal leaves it pageable); the
             // hl_gmap_lock_add records it so /proc Locked:/VmLck: reports the range under whole-map locking too.

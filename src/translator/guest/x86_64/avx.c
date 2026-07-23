@@ -210,9 +210,12 @@ static int qnan64(uint64_t u) {
 
 // x86 add/sub/mul/div result NaN handling. Two distinct rules, both of which the host NEON FADD/FMUL/FSUB/
 // FDIV that computed `r` gets WRONG, so we recompute from the operands here:
-//   (1) INPUT NaN: x86 returns the second operand's NaN quieted, UNLESS the first is a QNaN and the second
-//       an SNaN (then the first) -- i.e. QNaN-priority, else src2. (ARM does SNaN-priority, else src1 --
-//       the exact mirror.) A single NaN input returns that operand quieted. The chosen NaN is quieted by
+//   (1) INPUT NaN: x86 selects src1 when src1 is a QNaN, otherwise src2 if src2 is a NaN, otherwise
+//       src1 -- i.e. QNaN(src1)-priority, else src2. Measured against qemu-x86_64 for all four
+//       NaN-pair kinds: (qnan,qnan)->src1, (qnan,snan)->src1, (snan,qnan)->src2, (snan,snan)->src2.
+//       The earlier condition additionally required src2 to be a non-QNaN before preferring src1, so
+//       the (qnan,qnan) pair -- by far the common one, since every propagated NaN is quiet -- wrongly
+//       returned src2. A single NaN input returns that operand quieted. The chosen NaN is quieted by
 //       setting its mantissa MSB (payload+sign preserved).
 //   (2) GENERATED NaN (result NaN, NO input NaN: 0/0, inf/inf, 0*inf, inf-inf): x86 yields the QNaN
 //       floating-point INDEFINITE with the sign bit SET (0xFFC00000 / 0xFFF8000000000000); ARM yields the
@@ -223,7 +226,7 @@ static float avx_dnan_f32(float r, float x, float y) {
     memcpy(&yb, &y, 4);
     int xn = nan32(xb), yn = nan32(yb);
     if (xn || yn) {
-        uint32_t w = (xn && yn) ? ((qnan32(xb) && !qnan32(yb)) ? xb : yb) : (xn ? xb : yb);
+        uint32_t w = (xn && yn) ? (qnan32(xb) ? xb : yb) : (xn ? xb : yb);
         w |= 0x00400000u; // quiet the selected NaN (x86)
         memcpy(&r, &w, 4);
         return r;
@@ -241,7 +244,7 @@ static double avx_dnan_f64(double r, double x, double y) {
     memcpy(&yb, &y, 8);
     int xn = nan64(xb), yn = nan64(yb);
     if (xn || yn) {
-        uint64_t w = (xn && yn) ? ((qnan64(xb) && !qnan64(yb)) ? xb : yb) : (xn ? xb : yb);
+        uint64_t w = (xn && yn) ? (qnan64(xb) ? xb : yb) : (xn ? xb : yb);
         w |= 0x0008000000000000ull; // quiet the selected NaN (x86)
         memcpy(&r, &w, 8);
         return r;

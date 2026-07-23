@@ -40,6 +40,16 @@ static int hl_x86_flush_for_thread_start(void) {
     return jit_wprot(1);
 }
 
+// The guest just established a MAP_SHARED mapping, so a peer PROCESS mapping the same object can now observe
+// this process's stores -- x86-TSO ordering must hold for it even though g_threaded may still be 0. Force
+// barriers from here on. The flag is set BEFORE the flush so any block re-translated after the flush sees it
+// (setting it after would leave a window where a block is rebuilt still barrier-free). Idempotent.
+static int hl_x86_force_barriers_for_shared(void) {
+    if (g_shared_obs) return 1;
+    g_shared_obs = 1;
+    return hl_x86_flush_for_thread_start();
+}
+
 // MUL/IMUL (group3 F6/F7 /4,/5) set x86 CF=OF when the high half of the product is significant
 // (MUL: high half != 0; IMUL: high half != sign-extension of the low half); SF/ZF/AF/PF are
 // x86-undefined. cfreg holds the computed CF/OF as 0/1. Write the stored NZCV using the engine's
@@ -955,8 +965,15 @@ static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int ari
     uint32_t imm5 = esize == 16 ? 2u : esize == 32 ? 4u : 8u;
     emit32(0x4E083C00u | (vs << 5) | 16); // umov x16, vs.d[0]   (the 64-bit count)
     e_movconst(19, esize);
+    // The count clamp needs a flag-setting compare, but the LIVE ARM NZCV may be carrying the
+    // guest's deferred x86 flags (lazy-flag producer not yet materialized) -- this instruction is
+    // not a guest flag producer and must not disturb them. Save/restore around the compare.
+    // Without this, `adcb`; `psraw %xmm,%xmm`; `rclb %cl,%bl` fed the carry consumer a carry bit
+    // manufactured by the clamp instead of the one the adcb produced.
+    emit32(0xD53B4200u | 22);                                        // mrs x22, nzcv
     e_rrr(A_SUBS, 31, 16, 19, 1, 0);                                 // cmp x16, esize
     e_csel(16, 19, 16, 8 /*HI*/, 1);                                 // x16 = (count u> esize) ? esize : count
+    emit32(0xD51B4200u | 22);                                        // msr nzcv, x22
     if (!left) e_rrr(A_SUB, 16, 31, 16, 1, 0);                       // right shift -> negative NEON amount (neg x16)
     emit32(0x4E000C00u | (imm5 << 16) | (16 << 5) | 17);             // dup v17.<T>, w16/x16
     uint32_t shl = (arith ? 0x4E204400u : 0x6E204400u) | (sz << 22); // SSHL (arith) / USHL
@@ -1013,6 +1030,11 @@ static void emit_dnan_post(int vd, int dbl, int packed) {
     // forwarding chain entirely. The taken (rare) path runs the ORIGINAL 3-op sequence verbatim, so it is
     // bit-for-bit identical to the old branchless output (which was a no-op whenever the result was not NaN,
     // and stamped the sign -- masking the always-zero scalar upper lane via ~res_notnan -- when it was).
+    // The FCMP below WRITES the ARM NZCV, which may still be carrying the guest's deferred x86
+    // flags (a scalar SSE op is not an x86 flag producer, so a later jcc/cmov/adc/rcl must see the
+    // flags of whatever integer instruction preceded it). Bracket the whole hoisted fixup with a
+    // save/restore so both the taken and the not-taken path leave NZCV exactly as they found it.
+    emit32(0xD53B4200u | 22);                                           // mrs x22, nzcv
     emit32((dbl ? 0x1E602000u : 0x1E202000u) | (vd << 16) | (vd << 5)); // FCMP dst,dst  (V=1 iff dst is NaN)
     uint32_t *p_bvc = (uint32_t *)g_cp;
     emit32(0);                                 // b.vc Lok  (NOT NaN -> skip fixup; patched below)
@@ -1021,6 +1043,7 @@ static void emit_dnan_post(int vd, int dbl, int packed) {
     e_v3(0x4EA01C00u, vd, vd, 20);             // vd |= sign mask  (ORR.16b)
     uint8_t *Lok = (uint8_t *)g_cp;
     *p_bvc = 0x54000000u | ((uint32_t)(((Lok - (uint8_t *)p_bvc) / 4) & 0x7FFFF) << 5) | 7; // b.vc (cond VC=7)
+    emit32(0xD51B4200u | 22);                                                               // msr nzcv, x22
 }
 
 // ---- AVX2 FMA (vfmadd/vfmsub/vfnmadd/vfnmsub) -> NEON FMLA/FMLS ----
@@ -2977,6 +3000,12 @@ static void *translate_block(uint64_t gpc) {
                     e_mov_rr(23, b, 0);
                     byte_wb(&I, I.reg, 23);
                     byte_wb(&I, I.rm_reg, 19);
+                } else if (w == 2) {
+                    // 16-bit register swap: only bits 15:0 move; bits 63:16 of BOTH operands are
+                    // preserved (the sf==0 full-register swap below zero-extended them away).
+                    e_mov_rr(19, I.rm_reg, 1);
+                    e_bfi(I.rm_reg, I.reg, 0, 16, 1);
+                    e_bfi(I.reg, 19, 0, 16, 1);
                 } else {
                     e_mov_rr(19, I.rm_reg, sf);
                     e_mov_rr(I.rm_reg, I.reg, sf);
@@ -3820,9 +3849,15 @@ static void *translate_block(uint64_t gpc) {
             }
             if (op >= 0x91 && op <= 0x97) {
                 int r = (op - 0x90) | (I.rexB << 3);
-                e_mov_rr(19, RAX, sf);
-                e_mov_rr(RAX, r, sf);
-                e_mov_rr(r, 19, sf);
+                if (I.opsize == 2) { // XCHG AX,r16: only bits 15:0 swap, 63:16 are preserved
+                    e_mov_rr(19, r, 1);
+                    e_bfi(r, RAX, 0, 16, 1);
+                    e_bfi(RAX, 19, 0, 16, 1);
+                } else {
+                    e_mov_rr(19, RAX, sf);
+                    e_mov_rr(RAX, r, sf);
+                    e_mov_rr(r, 19, sf);
+                }
                 gpc = next;
                 continue;
             }
@@ -4001,13 +4036,39 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     uint32_t szb = I.p66 ? 0x00400000u : 0; // 66 -> double lanes (.2d), F2 -> single (.4s)
-                    if (op == 0x7C) {                       // HADD: FADDP vd, vd, s = [d0+d1, d2+d3, s0+s1, s2+s3]
-                        e_v3(0x6E20D400u | szb, vd, vd, s);
+                    int dbl = I.p66 != 0;
+                    int fixnan = fpdnan_on();
+                    if (fixnan) {
+                        // Generated-NaN sign fixup, as for the vertical FP arithmetic: an inf-inf in
+                        // any result lane must come out as x86's NEGATIVE indefinite, not ARM's
+                        // positive default NaN. The PRESIGN mask has to follow the HORIZONTAL
+                        // pairing, so the per-lane "input not NaN" masks are deinterleaved with the
+                        // same UZP1/UZP2 the op itself uses before being ANDed together.
+                        uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
+                        unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
+                        emit32(EQ | (vd << 16) | (vd << 5) | 20); // v20 = (src1 == src1)
+                        emit32(EQ | (s << 16) | (s << 5) | 21);   // v21 = (src2 == src2)
+                        e_v3(0x4E801800u | szb, 22, 20, 21);      // uzp1 -> even lanes of the pair
+                        e_v3(0x4E805800u | szb, 21, 20, 21);      // uzp2 -> odd lanes of the pair
+                        e_v3(0x4E201C00u, 20, 22, 21);            // v20 = both-inputs-notnan per RESULT lane
+                        emit32(0x4F005400u | (immhb << 16) | (20 << 5) | 20); // -> PRESIGN
+                    }
+                    if (op == 0x7C) {
+                        // HADD is NOT a plain FADDP. x86 defines the addend order as
+                        // DEST[63:0] = SRC1[127:64] + SRC1[63:0] -- the ODD lane is the FIRST
+                        // operand -- while FADDP adds the even lane first. Addition is commutative
+                        // for values but NOT for NaN selection, so a pair holding two NaNs came out
+                        // as the wrong one (haddpd of {-QNaN, +QNaN} gave -QNaN instead of +QNaN).
+                        // Deinterleave explicitly and add odd + even, mirroring the HSUB path.
+                        e_v3(0x4E801800u | szb, 17, vd, s);  // uzp1 v17 = even lanes
+                        e_v3(0x4E805800u | szb, 18, vd, s);  // uzp2 v18 = odd lanes
+                        e_v3(0x4E20D400u | szb, vd, 18, 17); // fadd vd = odd + even
                     } else { // HSUB: even/odd deinterleave (UZP1/UZP2) then FSUB even-odd
-                        e_v3(0x4E801800u | szb, 17, vd, s); // uzp1 v17 = even lanes
-                        e_v3(0x4E805800u | szb, 18, vd, s); // uzp2 v18 = odd lanes
+                        e_v3(0x4E801800u | szb, 17, vd, s);  // uzp1 v17 = even lanes
+                        e_v3(0x4E805800u | szb, 18, vd, s);  // uzp2 v18 = odd lanes
                         e_v3(0x4EA0D400u | szb, vd, 17, 18); // fsub vd = even - odd
                     }
+                    if (fixnan) emit_dnan_post(vd, dbl, 1);
                 } else if (op == 0xD0) { // SSE3 addsubps (F2) / addsubpd (66): even lanes sub, odd lanes add
                     int s = vm;
                     if (I.is_mem) {
@@ -4015,17 +4076,28 @@ static void *translate_block(uint64_t gpc) {
                         g_ldr_q(16, 17, 0);
                         s = 16;
                     }
-                    if (I.p66) { // addsubpd: negate only the low double lane, then add
-                        e_movconst(19, 0x8000000000000000ULL);
-                        emit32(0x9E670000u | (19 << 5) | 17); // fmov d17, x19 -> v17 = [sign, 0]
-                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate low double)
-                        e_v3(0x4E60D400u, vd, vd, 17);        // fadd vd.2d = vd + v17
-                    } else {                                  // addsubps: negate even single lanes (0,2), then add
-                        e_movconst(19, 0x0000000080000000ULL);
-                        emit32(0x4E080C00u | (19 << 5) | 17); // dup v17.2d, x19 -> [0x80000000,0,0x80000000,0]
-                        e_v3(0x6E201C00u, 17, s, 17);         // eor v17 = s ^ mask (negate even lanes)
-                        e_v3(0x4E20D400u, vd, vd, 17);        // fadd vd.4s = vd + v17
+                    // Compute the sub and the add lanewise and SELECT, rather than flipping the
+                    // sign of src2's even lanes and adding. The sign-flip corrupts a NaN operand:
+                    // x86's subtract propagates an input NaN with its ORIGINAL sign, but XOR-ing the
+                    // sign bit first hands FADD a sign-flipped NaN, which it then propagates
+                    // (addsubps with a positive NaN in an even lane came out negative).
+                    int dbl = I.p66 != 0;
+                    int fixnan = fpdnan_on();
+                    if (fixnan) emit_dnan_pre(vd, s, 1, dbl);
+                    if (dbl) {
+                        e_v3(0x4EE0D400u, 17, vd, s); // fsub v17.2d = vd - s   (even/low lane)
+                        e_v3(0x4E60D400u, 18, vd, s); // fadd v18.2d = vd + s   (odd/high lane)
+                        e_movconst(19, ~0ULL);
+                        emit32(0x9E670000u | (19 << 5) | 19); // fmov d19, x19 -> [all-ones, 0]
+                    } else {
+                        e_v3(0x4EA0D400u, 17, vd, s); // fsub v17.4s = vd - s   (even lanes 0,2)
+                        e_v3(0x4E20D400u, 18, vd, s); // fadd v18.4s = vd + s   (odd lanes 1,3)
+                        e_movconst(19, 0x00000000FFFFFFFFULL);
+                        emit32(0x4E080C00u | (19 << 5) | 19); // dup v19.2d, x19 -> even-lane mask
                     }
+                    e_v3(0x6E601C00u, 19, 17, 18); // bsl v19.16b: mask ? sub : add
+                    e_vmov(vd, 19);
+                    if (fixnan) emit_dnan_post(vd, dbl, 1);
                 } else if ((op == 0x12 || op == 0x16) && I.rep) { // SSE3 movsldup/movshdup: dup even/odd single lanes
                     int s = vm;
                     if (I.is_mem) {
@@ -4414,8 +4486,14 @@ static void *translate_block(uint64_t gpc) {
                         src = 16;
                     } else
                         src = I.rm_reg;
+                    // CVTSI2SS/CVTSI2SD write ONLY the low element and preserve the rest of the
+                    // destination register, so convert into scratch v18 and merge lane 0 back.
                     emit32(0x1E220000u | (I.rexW ? 0x80000000u : 0) | (I.repne ? 0x00400000u : 0) | (src << 5) |
-                           vd);                        // scvtf vd,src
+                           18); // scvtf d18/s18, src
+                    if (I.repne)
+                        e_ins_d(vd, 0, 18, 0);
+                    else
+                        e_ins_s(vd, 0, 18, 0);
                 } else if (op == 0x2C || op == 0x2D) { // cvttsd2si(2C trunc)/cvtsd2si(2D round): xmm/m -> GPR
                     int s = vm;
                     if (I.is_mem) {
@@ -4449,10 +4527,17 @@ static void *translate_block(uint64_t gpc) {
                         if (I.repne)
                             e_fmov_to_d(19, 20);
                         else
-                            e_fmov_to_s(19, 20);                                                  // v19 = threshold
-                        emit32((I.repne ? 0x1E602000u : 0x1E202000u) | (19 << 16) | (s << 5));    // FCMP s, v19
-                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull);               // integer indefinite
+                            e_fmov_to_s(19, 20); // v19 = threshold
+                        // CVTTSD2SI is not an x86 flag producer, but this FCMP writes the ARM NZCV
+                        // -- which may still hold a deferred x86 flag producer's result. Save and
+                        // restore it, so a later jcc/setcc/cmov/adc sees the integer flags it must.
+                        // (The old comment claimed the top-of-loop had already flushed g_fl_pending
+                        // here; a `cmp`; `cvttsd2si`; `js` sequence shows that it had not.)
+                        emit32(0xD53B4200u | 21);                                              // mrs x21, nzcv
+                        emit32((I.repne ? 0x1E602000u : 0x1E202000u) | (19 << 16) | (s << 5)); // FCMP s, v19
+                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull);            // integer indefinite
                         e_csel(I.reg, 20, I.reg, 2 /*CS: s>=thr or NaN*/, sf);
+                        emit32(0xD51B4200u | 21);                                              // msr nzcv, x21
                     }
                 } else if (op == 0x5D || op == 0x5F) { // H10: minps/maxps/minpd/maxpd + scalar minss/minsd/maxss/maxsd
                     // x86 MIN(a,b) = (a<b)?a:b ; MAX(a,b) = (a>b)?a:b -- and if either operand is NaN, or they
@@ -4483,9 +4568,13 @@ static void *translate_block(uint64_t gpc) {
                         e_vmov(vd, 17);
                     } else {
                         e_v3(0x2E601C00u, 17, vd, s); // BSL v17.8b (low lane) -> mask?dst:src2
-                        // FMOV hl/Sd, v17: keep only the low lane, zero the upper bits (matches the scalar
-                        // arithmetic path's upper-lane convention).
-                        emit32((I.repne ? 0x1E604000u : 0x1E204000u) | (17 << 5) | vd);
+                        // MINSS/MINSD/MAXSS/MAXSD write ONLY the low element; bits 127:64 (127:32 for
+                        // the ss forms) of the destination are architecturally PRESERVED. Merge the
+                        // low lane back with INS rather than FMOV, which would zero the upper bits.
+                        if (I.repne)
+                            e_ins_d(vd, 0, 17, 0);
+                        else
+                            e_ins_s(vd, 0, 17, 0);
                     }
                 } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x51) {
                     // add/mul/sub/div/min/max/sqrt. Prefix selects width: F2=scalar double, F3=scalar
@@ -4552,26 +4641,55 @@ static void *translate_block(uint64_t gpc) {
                                      : op == 0x5C ? 0x1E203800u
                                      : op == 0x5E ? 0x1E201800u
                                                   : 0x1E21C000u; // FSQRT [min/max: see 0x5D/0x5F above]
+                        // ADDSS/SD, MULSS/SD, SUBSS/SD, DIVSS/SD and SQRTSS/SD write ONLY the low
+                        // element; the rest of the destination is architecturally PRESERVED. The ARM
+                        // scalar forms zero everything above the element, so land the result in
+                        // scratch v18 (which the default-NaN fixup then stamps) and INS it back.
                         if (op == 0x51)
-                            emit32(b | ty | (s << 5) | vd); // FSQRT sd/ss, s
+                            emit32(b | ty | (s << 5) | 18); // FSQRT s18/d18, s
                         else
-                            emit32(b | ty | (s << 16) | (vd << 5) | vd); // FADD/.../FMAX sd/ss
+                            emit32(b | ty | (s << 16) | (vd << 5) | 18); // FADD/... s18/d18, vd, s
                     }
-                    if (fixnan) emit_dnan_post(vd, dbl, packed); // stamp x86's negative default-NaN sign on generated NaNs
-                } else if (op == 0x5A) { // cvtsd2ss(F2) / cvtss2sd(F3)
+                    int res = packed ? vd : 18;
+                    if (fixnan) emit_dnan_post(res, dbl, packed); // stamp x86's negative default-NaN sign
+                    if (!packed) {
+                        if (dbl)
+                            e_ins_d(vd, 0, 18, 0);
+                        else
+                            e_ins_s(vd, 0, 18, 0);
+                    }
+                } else if (op == 0x5A) {
+                    // 0F 5A is FOUR instructions, selected by the mandatory prefix:
+                    //   F2 cvtsd2ss   F3 cvtss2sd   66 cvtpd2ps (PACKED)   none cvtps2pd (PACKED)
+                    // The two PACKED forms used to fall into the `else` arm and were lowered as
+                    // cvtss2sd -- i.e. legacy (non-VEX) CVTPS2PD/CVTPD2PS produced a single
+                    // converted low element and garbage everywhere else.
+                    int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (I.repne)
-                            g_ldr_d(16, 17);
+                        if (I.rep)
+                            g_ldr_s(16, 17); // cvtss2sd: m32
+                        else if (packed && I.p66)
+                            g_ldr_q(16, 17, 0); // cvtpd2ps: m128
                         else
-                            g_ldr_s(16, 17);
+                            g_ldr_d(16, 17); // cvtsd2ss: m64 ; cvtps2pd: m64 (two floats)
                         s = 16;
                     }
-                    if (I.repne)
-                        emit32(0x1E624000u | (s << 5) | vd); // FCVT Sd, Dn (double->single)
-                    else
-                        emit32(0x1E22C000u | (s << 5) | vd); // FCVT Dd, Sn (single->double)
+                    if (packed) {
+                        if (I.p66)
+                            emit32(0x0E616800u | (s << 5) | vd); // FCVTN vd.2s, s.2d -- upper 64 zeroed
+                        else
+                            emit32(0x0E617800u | (s << 5) | vd); // FCVTL vd.2d, s.2s
+                    } else if (I.repne) {
+                        // The scalar forms write ONLY the low element (32 bits for cvtsd2ss, 64 for
+                        // cvtss2sd) and preserve the rest of the destination: convert, then merge.
+                        emit32(0x1E624000u | (s << 5) | 18); // FCVT S18, Dn (double->single)
+                        e_ins_s(vd, 0, 18, 0);
+                    } else {
+                        emit32(0x1E22C000u | (s << 5) | 18); // FCVT D18, Sn (single->double)
+                        e_ins_d(vd, 0, 18, 0);
+                    }
                 } else if (op == 0xC4) { // pinsrw: insert low 16 bits of r/m16 into xmm H-lane (imm8 & 7)
                     int lane = (int)I.imm & 7;
                     int src;
@@ -4609,11 +4727,15 @@ static void *translate_block(uint64_t gpc) {
                     uint32_t GT = (packed ? 0x6EA0E400u : 0x7EA0E400u) | szb; // FCMGT
                     uint32_t ANDb = packed ? 0x4E201C00u : 0x0E201C00u;       // AND Vd.16b/8b
                     uint32_t NOTb = packed ? 0x6E205800u : 0x2E205800u;       // NOT (MVN) Vd.16b/8b
-                    if (pred == 3 || pred == 7) {                             // UNORD/ORD: ordered(a)&ordered(b)
-                        emit32(EQ | (vd << 16) | (vd << 5) | 17);             // v17 = a==a (ordered a)
-                        emit32(EQ | (s << 16) | (s << 5) | vd);               // vd  = b==b (ordered b)
-                        emit32(ANDb | (17 << 16) | (vd << 5) | vd);           // vd  = ORD
-                        if (pred == 3) emit32(NOTb | (vd << 5) | vd);         // UNORD = ~ORD
+                    // CMPSS/CMPSD write ONLY the low element and preserve the rest of the
+                    // destination, but the ARM scalar FCMxx/NOT forms zero everything above the
+                    // element. So scalar results are built in v18 and inserted back into lane 0.
+                    int res = packed ? vd : 18;
+                    if (pred == 3 || pred == 7) {                     // UNORD/ORD: ordered(a)&ordered(b)
+                        emit32(EQ | (vd << 16) | (vd << 5) | 17);     // v17 = a==a (ordered a)
+                        emit32(EQ | (s << 16) | (s << 5) | res);      // res = b==b (ordered b)
+                        emit32(ANDb | (17 << 16) | (res << 5) | res); // res = ORD
+                        if (pred == 3) emit32(NOTb | (res << 5) | res); // UNORD = ~ORD
                     } else {
                         // predicates handled here: 0 EQ, 1 LT, 2 LE, 4 NEQ, 5 NLT, 6 NLE.
                         // LT/LE/NLT/NLE build the ordered comparison a<b / a<=b via the swapped GT/GE (a<b ==
@@ -4625,8 +4747,14 @@ static void *translate_block(uint64_t gpc) {
                         int neg = (pred == 4 || pred == 5 || pred == 6);  // NEQ/NLT/NLE invert (NaN -> true)
                         int n = lt_like ? s : vd, m = lt_like ? vd : s;
                         uint32_t fc = (pred == 0 || pred == 4) ? EQ : use_ge ? GE : GT;
-                        emit32(fc | (m << 16) | (n << 5) | vd);   // FCMxx vd, n, m
-                        if (neg) emit32(NOTb | (vd << 5) | vd);   // invert -> NaN lane becomes all-ones
+                        emit32(fc | (m << 16) | (n << 5) | res);  // FCMxx res, n, m
+                        if (neg) emit32(NOTb | (res << 5) | res); // invert -> NaN lane becomes all-ones
+                    }
+                    if (!packed) { // merge the scalar lane back
+                        if (I.repne)
+                            e_ins_d(vd, 0, res, 0); // cmpsd: bits 63:0 only
+                        else
+                            e_ins_s(vd, 0, res, 0); // cmpss: bits 31:0 only
                     }
                 } else if (op == 0x2E || op == 0x2F) { // ucomisd/comisd (66=double, none=single) -> FCMP + flags
                     int s = vm;
@@ -5015,16 +5143,28 @@ static void *translate_block(uint64_t gpc) {
                     e_mov_rr(23, rmv, sf);
                     src = 23;
                 }
+                // 16-bit forms scan ONLY bits 15:0 and write ONLY bits 15:0. The register operand
+                // still carries the full 64-bit guest value, so mask the source into scratch first
+                // (`bsrw %bx,%ax` on 0x...8888 otherwise reported bit 31, not bit 15) and land the
+                // result in scratch so the destination's bits 63:16 survive.
+                int w16 = (I.opsize == 2);
+                if (w16) {
+                    e_movconst(19, 0xffff);
+                    e_rrr(A_AND, 23, src, 19, 0, 0);
+                    src = 23;
+                }
+                int dreg = w16 ? 21 : I.reg;
+                if (w16) e_mov_rr(21, I.reg, 0); // seed for the src==0 "destination unchanged" csel
                 // Legacy bsf/bsr (no F3) compute the bit INDEX into x22 first: x86 leaves the
                 // DESTINATION UNCHANGED when src==0 (real-hw behavior that glibc memrchr relies on -- its
                 // not-found tail is `bsr; je; ret <dest>`), so the index is csel'd in only when src!=0.
                 // tzcnt/lzcnt (F3) instead DEFINE src==0 -> opsize and write the dest unconditionally.
-                int bdst = cnt ? I.reg : 22;
+                int bdst = cnt ? dreg : 22;
                 if (op == 0xBC) { // tzcnt / bsf: trailing zeros = RBIT+CLZ (same value; src==0 -> opsize)
                     e_rbit(bdst, src, sf);
                     e_clz(bdst, bdst, sf);
                 } else if (cnt) { // lzcnt: leading zeros = CLZ
-                    e_clz(I.reg, src, sf);
+                    e_clz(dreg, src, sf);
                 } else { // bsr: (w-1) - clz
                     // clz lands in a scratch that can NEVER alias src: for a memory operand rm_load returns
                     // x16, so using x16 here would clobber the loaded source before the ZF test below reads
@@ -5037,13 +5177,14 @@ static void *translate_block(uint64_t gpc) {
                 if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
                     e_rrr(A_SUBS, 31, src, 31, sf, 0);
                     e_cset(19, 0 /*EQ*/, sf);               // x19 = (src==0) = x86 CF
-                    e_rrr(A_ANDS, 31, I.reg, I.reg, sf, 0); // live N/Z from the result
+                    e_rrr(A_ANDS, 31, dreg, dreg, sf, 0); // live N/Z from the result
                     e_nzcv_save_setcf(19);                  // store N/Z, stored C = NOT(src==0)
                 } else {                                    // bsf/bsr: ZF = (src==0), dest UNCHANGED if src==0
                     e_rrr(A_ANDS, 31, src, src, sf, 0);     // Z = (src == 0)
-                    e_csel(I.reg, I.reg, 22, 0 /*EQ*/, sf); // src==0 -> keep dest, else the computed index
+                    e_csel(dreg, dreg, 22, 0 /*EQ*/, sf);   // src==0 -> keep dest, else the computed index
                     e_nzcv_save();
                 }
+                if (w16) e_bfi(I.reg, dreg, 0, 16, 1);
                 gpc = next;
                 continue;
             }
@@ -5059,6 +5200,13 @@ static void *translate_block(uint64_t gpc) {
                     e_mov_rr(23, rmv, sf);
                     src = 23;
                 }
+                // POPCNT r16 counts ONLY bits 15:0 and writes ONLY bits 15:0 of the destination.
+                int w16 = (I.opsize == 2);
+                if (w16) {
+                    e_movconst(19, 0xffff);
+                    e_rrr(A_AND, 23, src, 19, 0, 0);
+                    src = 23;
+                }
                 // NEON popcount: move src into scratch v16 (upper lanes zeroed), per-byte CNT, sum via ADDV.
                 if (sf)
                     e_fmov_to_d(16, src); // fmov d16, x[src]  (zeroes bits[64:128])
@@ -5066,9 +5214,10 @@ static void *translate_block(uint64_t gpc) {
                     e_fmov_to_s(16, src);             // fmov s16, w[src] (zeroes bits[32:128])
                 emit32(0x0E205800u | (16 << 5) | 16); // cnt v16.8b, v16.8b  (per-byte popcount)
                 emit32(0x0E31B800u | (16 << 5) | 16); // addv b16, v16.8b    (sum the 8 byte counts -> 0..64)
-                e_fmov_from_s(I.reg, 16);           // dest = count; the W-write zero-extends (correct for both widths)
-                e_rrr(A_ANDS, 31, src, src, sf, 0); // N/Z from the source: ZF = (src == 0)
-                e_nzcv_save_c1();                   // store N/Z, force x86 CF=0/OF=0
+                e_fmov_from_s(w16 ? 21 : I.reg, 16); // dest = count; the W-write zero-extends
+                if (w16) e_bfi(I.reg, 21, 0, 16, 1);
+                e_rrr(A_ANDS, 31, src, src, sf, 0); // Z = (src == 0)
+                e_nzcv_save_popcnt();               // ZF from the source; SF/OF/AF/CF/PF all cleared
                 gpc = next;
                 continue;
             }
@@ -5156,19 +5305,33 @@ static void *translate_block(uint64_t gpc) {
                     emit_bus_guard(17, (uint64_t)w, gpc);
                     e_mov_rr(19, RAX, sf2);    // expected
                     e_cas(w, 19, I.reg, 17);   // x19 = old; if old==expected [m]=reg
-                    do_alu(7, -1, 19, RAX, w); // ZF = (old == rax)
+                    do_alu(7, -1, RAX, 19, w); // flags from (accumulator - dest), per the SDM
                     if (w >= 4)
                         e_mov_rr(RAX, 19, sf2);
                     else
                         e_bfi(RAX, 19, 0, 8 * w, 1); // rax = old
                 } else if (w >= 4) {
                     e_mov_rr(19, I.rm_reg, sf2);
-                    do_alu(7, -1, 19, RAX, w);
+                    do_alu(7, -1, RAX, 19, w);           // flags from (accumulator - dest)
                     e_csel(I.rm_reg, I.reg, 19, 0, sf2); // rm = ZF? reg : rm_old
                     e_csel(RAX, RAX, 19, 0, sf2);        // rax = ZF? rax : rm_old
                 } else {
-                    report_unimpl(gpc, &I);
-                    break;
+                    // 8/16-bit register forms (previously UNIMPL -> hard abort). Only the low
+                    // w bytes of the destination and of RAX are written; both new values are
+                    // selected BEFORE either write, because rm may itself be RAX.
+                    int oldv = (w == 1) ? byte_val(&I, I.rm_reg, 19) : I.rm_reg;
+                    int srcv = (w == 1) ? byte_val(&I, I.reg, 24) : I.reg;
+                    if (oldv != 19) e_mov_rr(19, oldv, 1);
+                    do_alu(7, -1, RAX, 19, w); // ZF = (AL/AX == dest)
+                    e_csel(21, srcv, 19, 0, 0);
+                    e_csel(22, RAX, 19, 0, 0);
+                    if (w == 1) {
+                        byte_wb(&I, I.rm_reg, 21);
+                        e_bfi(RAX, 22, 0, 8, 1); // AL
+                    } else {
+                        e_bfi(I.rm_reg, 21, 0, 16, 1);
+                        e_bfi(RAX, 22, 0, 16, 1);
+                    }
                 }
                 gpc = next;
                 continue;
@@ -5191,8 +5354,21 @@ static void *translate_block(uint64_t gpc) {
                     e_nzcv_save_ci();         // rm += reg (x86 add carry)
                     e_mov_rr(I.reg, 19, sf2); // reg = old
                 } else {
-                    report_unimpl(gpc, &I);
-                    break;
+                    // 8/16-bit register forms (previously UNIMPL -> hard abort). Compute the sum
+                    // into scratch, then write the narrow destination and the narrow source-swap.
+                    int oldv = (w == 1) ? byte_val(&I, I.rm_reg, 19) : I.rm_reg;
+                    int addv = (w == 1) ? byte_val(&I, I.reg, 24) : I.reg;
+                    if (oldv != 19) e_mov_rr(19, oldv, 1);
+                    if (addv != 24) e_mov_rr(24, addv, 1);
+                    do_alu(0, -1, 19, 24, w);       // x86 add flags at width w (x21/x22 scratch)
+                    e_rrr(A_ADD, 26, 19, 24, 0, 0); // x26 = old + reg
+                    if (w == 1) {                   // reg = old FIRST, then dest = sum: when the two
+                        byte_wb(&I, I.reg, 19);     // operands are the same register (`xadd %ax,%ax`)
+                        byte_wb(&I, I.rm_reg, 26);  // the sum is the surviving value
+                    } else {
+                        e_bfi(I.reg, 19, 0, 16, 1);
+                        e_bfi(I.rm_reg, 26, 0, 16, 1);
+                    }
                 }
                 gpc = next;
                 continue;
@@ -5302,8 +5478,12 @@ static void *translate_block(uint64_t gpc) {
                     e_pf_compute(19);         // x19 = x86 PF (before rm_load, which reuses x16/x17)
                     int mem;
                     int rmv = rm_load(&I, next, I.opsize, &mem);
-                    e_rrr(A_SUBS, 31, 19, 31, 0, 0);                    // Z = (PF == 0)
-                    e_csel(I.reg, rmv, I.reg, (lo == 0xA) ? 1 : 0, sf); // cmovp: NE(PF==1); cmovnp: EQ(PF==0)
+                    e_rrr(A_SUBS, 31, 19, 31, 0, 0); // Z = (PF == 0)
+                    if (I.opsize == 2) {             // 16-bit cmov writes only bits 15:0
+                        e_csel(21, rmv, I.reg, (lo == 0xA) ? 1 : 0, 0);
+                        e_bfi(I.reg, 21, 0, 16, 1);
+                    } else
+                        e_csel(I.reg, rmv, I.reg, (lo == 0xA) ? 1 : 0, sf); // cmovp: NE; cmovnp: EQ
                     // parity-edge fix: the SUBS above clobbered the live ARM NZCV; restore the
                     // canonical flags (membank is current: the top-of-loop materialized any pending
                     // producer before this consumer) so a following block exit spills true flags.
@@ -5319,7 +5499,11 @@ static void *translate_block(uint64_t gpc) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
                 e_nzcv_load();
-                e_csel(I.reg, rmv, I.reg, cc, sf);
+                if (I.opsize == 2) { // CMOVcc r16: bits 63:16 of the destination are PRESERVED
+                    e_csel(21, rmv, I.reg, cc, 0);
+                    e_bfi(I.reg, 21, 0, 16, 1);
+                } else
+                    e_csel(I.reg, rmv, I.reg, cc, sf);
                 gpc = next;
                 continue;
             }

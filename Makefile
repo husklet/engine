@@ -312,7 +312,11 @@ TIME_CASE_NAMES := $(basename $(notdir $(TIME_CASE_SOURCES)))
 TIME_CASE_BINS := $(TIME_CASE_NAMES:%=$(BUILD)/compat/time/aarch64/%) \
 	$(TIME_CASE_NAMES:%=$(BUILD)/compat/time/x86_64/%)
 ISA_X86_64_FIXTURES := ctest_x64 g_x64 go_goro_x86 go_heapgc_x86 gw hello_x86 hx
-ISA_X86_64_BINS := $(ISA_X86_64_FIXTURES:%=$(BUILD)/compat/isa/x86_64/%)
+# isa_regress is SOURCE-built (not a committed fixture): it pins the instruction lowerings the
+# differential ISA fuzzer (tests/fuzz/isa/x86_64) found diverging from qemu-x86_64.
+ISA_X86_64_SOURCES := isa_regress
+ISA_X86_64_BINS := $(ISA_X86_64_FIXTURES:%=$(BUILD)/compat/isa/x86_64/%) \
+	$(ISA_X86_64_SOURCES:%=$(BUILD)/compat/isa/x86_64/%)
 # These are committed binary inputs, not native host build targets; suppress built-in .c rules.
 $(ISA_X86_64_FIXTURES:%=tests/compat/isa/x86_64/%): ;
 CORE_ABI_BOTH := hello math strings bitops varargs longjmp recursion fnptr jumptable ibtc_dispatch floatmath \
@@ -1069,6 +1073,10 @@ $(BUILD)/compat/time/aarch64/%: tests/compat/time/%.c
 $(BUILD)/compat/time/x86_64/%: tests/compat/time/%.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -lrt -o $@
+
+$(BUILD)/compat/isa/x86_64/isa_regress: tests/compat/isa/x86_64/isa_regress.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -fno-pie -std=gnu11 $< -o $@
 
 $(BUILD)/compat/isa/x86_64/%: tests/compat/isa/x86_64/%
 	@mkdir -p $(@D)
@@ -2336,6 +2344,24 @@ compat-core-workload: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOA
 	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
 		$(abspath $(BUILD)/compat/core/workload/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/core/workload/x86_64) $(abspath tests/compat/core/workload)
+
+# ---- differential x86-64 ISA fuzzing (tests/fuzz/isa/x86_64) -------------------------------
+# Generates seeded straight-line x86-64 instruction sequences, runs the SAME guest binary under
+# qemu-x86_64 (reference) and under the engine, and diffs a canonical GPR/RFLAGS/XMM/MXCSR/memory
+# dump. LINUX-ONLY: it needs qemu-x86_64 and the linux-production engine.
+#   isa-fuzz          : campaign over ISA_FUZZ_SEEDS fresh seeds (default 200)
+#   isa-fuzz-regress  : the deterministic seed set below -- cheap, for CI
+# MXCSR is excluded from the comparison: the engine mirrors the host FPSR rather than modelling
+# x86's sticky exception-status bits, which is a known open divergence tracked separately.
+ISA_FUZZ_SEEDS ?= 200
+ISA_FUZZ_REGRESS_SEEDS := 1 17 33 50 66 83 99 116 133 149 166 185 201 218 236 253 269 285 302 320 337 354 372 388
+
+.PHONY: isa-fuzz isa-fuzz-regress
+isa-fuzz: $(BUILD)/linux-production/hl-engine-linux-x86_64
+	tests/fuzz/isa/x86_64/run.sh --seeds $(ISA_FUZZ_SEEDS) --ignore-mxcsr
+
+isa-fuzz-regress: $(BUILD)/linux-production/hl-engine-linux-x86_64
+	tests/fuzz/isa/x86_64/run.sh --list "$(ISA_FUZZ_REGRESS_SEEDS)" --ignore-mxcsr
 
 .PHONY: compat-core-workload-extended
 compat-core-workload-extended: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOAD_BINS)

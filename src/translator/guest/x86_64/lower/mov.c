@@ -20,6 +20,11 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
     // ---- mov r, imm (B8+r) ----
     if (op >= 0xB8 && op <= 0xBF) {
         int rd = (op - 0xB8) | (I->rexB << 3);
+        if (I->opsize == 2) { // mov r16, imm16 (0x66): PRESERVE bits 63:16 of the destination
+            e_movconst(16, (uint64_t)(uint16_t)I->imm);
+            e_bfi(rd, 16, 0, 16, 1);
+            return TX_NEXT;
+        }
         uint64_t v = sf ? (uint64_t)I->imm : (uint64_t)(uint32_t)I->imm;
         // bias the ONE baked immediate that materializes V8's embedded-builtins code base
         // (v8_Default_embedded_blob_code_) to the high mapping so V8's InnerPointerToCodeCache range
@@ -37,6 +42,9 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
             emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
             e_movconst(16, (uint64_t)I->imm);
             e_store(w, 16, 17);
+        } else if (op == 0xC7 && I->opsize == 2) { // mov r16, imm16: PRESERVE bits 63:16
+            e_movconst(16, (uint64_t)(uint16_t)I->imm);
+            e_bfi(I->rm_reg, 16, 0, 16, 1);
         } else {
             uint64_t v = sf ? (uint64_t)I->imm : (uint64_t)(uint32_t)I->imm;
             // the C7 /0 `mov r,imm` form of the V8 embedded-blob code-base load (see the B8-BF
@@ -84,6 +92,9 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
                 if (w == 1) { // byte dest: ah/bh/ch/dh -> bits 8-15; lo8 preserves upper
                     emit_load_mem(I, next, 1, 16);
                     byte_wb(I, I->reg, 16);
+                } else if (w == 2) {               // mov r16, m16: PRESERVE bits 63:16 (a 16-bit
+                    emit_load_mem(I, next, 2, 16); // write never zero-extends, unlike 32-bit)
+                    e_bfi(I->reg, 16, 0, 16, 1);
                 } else
                     emit_load_mem(I, next, w, I->reg);
             } else { // mov [mem], reg  -- folded into one str when [base+disp]
@@ -156,7 +167,10 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
             }
         }
         emit_ea_core(I, next, 0); // lea returns the guest (low) effective ADDRESS -> no bias-fold
-        e_mov_rr(I->reg, 17, sf);
+        if (I->opsize == 2)
+            e_bfi(I->reg, 17, 0, 16, 1); // lea r16: only bits 15:0 are written
+        else
+            e_mov_rr(I->reg, 17, sf);
         return TX_NEXT;
     }
     // ---- mov r/m16, Sreg (8C) / mov Sreg, r/m16 (8E) ----
@@ -186,16 +200,26 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
         return TX_NEXT;
     }
     // ---- push/pop r (50-5F) ----
+    // The 0x66 forms are 16-bit: they move TWO bytes and adjust RSP by 2, not 8. Treating
+    // `pushw`/`popw` as 8-byte operations desynchronizes the guest stack pointer outright
+    // (a `popw %ax` left RSP 6 bytes low and smashed the caller's frame).
     if (op >= 0x50 && op <= 0x57) {
         int r = (op - 0x50) | (I->rexB << 3);
-        e_subi(4, 4, 8, 1);
-        e_store(8, r, 4);
+        int w = (I->opsize == 2) ? 2 : 8;
+        e_subi(4, 4, w, 1);
+        e_store(w, r, 4);
         return TX_NEXT;
-    } // push (64-bit)
+    } // push
     if (op >= 0x58 && op <= 0x5F) {
         int r = (op - 0x58) | (I->rexB << 3);
-        e_load(8, r, 4);
-        e_addi(4, 4, 8, 1);
+        if (I->opsize == 2) { // pop r16: writes only bits 15:0, RSP += 2
+            e_load(2, 16, 4);
+            e_bfi(r, 16, 0, 16, 1);
+            e_addi(4, 4, 2, 1);
+        } else {
+            e_load(8, r, 4);
+            e_addi(4, 4, 8, 1);
+        }
         return TX_NEXT;
     } // pop
     // ---- movsxd (0x63): operand-size governed. REX.W -> sign-extend r/m32 to r64; no REX.W ->

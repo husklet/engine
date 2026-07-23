@@ -115,13 +115,20 @@ static void emit_host_ptr(int rd, uint64_t v, int kind) {
 // at TRANSLATE time; the flush guarantees re-translation on the 0->1 transition. The threaded path (below,
 // when g_threaded != 0) stays byte-identical to before. MFENCE/LFENCE/SFENCE emit their own DMB inline in
 // translate.c and are NOT routed through these helpers, so full-fence semantics are unaffected.
+// A peer THREAD is not the only possible observer: a guest that maps MAP_SHARED memory (memfd/shm, file or
+// anon) can be observed by another PROCESS mapping the same object, which needs x86-TSO ordering just as much
+// -- and g_threaded, being per-process, says nothing about that. So barriers are also forced, permanently,
+// from the moment the guest establishes any shared mapping (set via G_SHARED_MAP_BARRIERS from the mmap
+// service, which sets this flag BEFORE flushing so every re-translation observes it).
+static int g_shared_obs;
+
 static void e_dmb_ish(void) {
-    if (!g_threaded) return; // single-threaded: no peer observer -> omit the StoreStore barrier
+    if (!g_threaded && !g_shared_obs) return; // no peer thread AND no shared mapping -> nothing can observe
     emit32(0xD5033ABFu); // DMB ISHST -- StoreStore only (see above; loads self-fence via ISHLD)
 }
 
 static void e_dmb_ishld(void) {
-    if (!g_threaded) return; // single-threaded: no peer observer -> omit the LoadLoad/LoadStore barrier
+    if (!g_threaded && !g_shared_obs) return; // no peer thread AND no shared mapping -> nothing can observe
     emit32(0xD50339BFu);
 }
 
@@ -303,6 +310,23 @@ static void e_nzcv_save_c1(void) { // logical ops: x86 CF=0,OF=0; ARM ANDS/TST l
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
 }
 
+// POPCNT finalizer: x86 POPCNT sets ZF from the SOURCE and clears OF, SF, AF, CF and PF -- every
+// one of them, unconditionally. e_nzcv_save_c1 alone was not enough: it leaves N as whatever the
+// preceding ANDS computed (the SOURCE's sign bit, so SF leaked through) and never touches the PF
+// lane, so a `setnp`/`jp` right after a popcnt read a stale parity.
+static void e_nzcv_save_popcnt(void) {
+    emit32(0xD53B4200u | 20); // mrs x20, nzcv  (Z valid from the source ANDS)
+    e_movconst(22, (1u << 31) | (1u << 28));
+    e_rrr(A_BIC, 20, 20, 22, 1, 0); // N = 0 (SF), V = 0 (OF)
+    e_movconst(22, 1u << 29);
+    e_rrr(A_ORR, 20, 20, 22, 1, 0); // C = 1 -> stored borrow for x86 CF = 0
+    e_str(20, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 20); // sync live ARM nzcv
+    e_movconst(20, 1);
+    e_str(20, 28, OFF_PF); // odd-parity source byte -> x86 PF = 0
+    e_str(31, 28, OFF_AF); // AF = 0
+}
+
 // x86-xflags (cross-block dead-flag elimination): canonicalize ONLY the live ARM NZCV -- the exact
 // e_nzcv_save_ci / e_nzcv_save_c1 correction with the (provably dead) cpu->nzcv str elided. The live
 // NZCV must stay canonical at every block boundary regardless of elision: an immediately-following
@@ -362,25 +386,27 @@ static void e_nzcv_save_keepC(void) { // inc/dec: take new N/Z/V, KEEP stored C 
 
 void e_lsr_i(int rd, int rn, int sh, int sf); // defined below; used by the PF helpers here
 
-// COMISD/UCOMISD: x86 sets ZF=PF=CF=1 on unordered and SF=OF=0 always, but ARM FCMP encodes unordered
-// as N=0,Z=0,C=1,V=1. Our substrate maps x86 ZF->Z, x86 CF->NOT stored-C (borrow), x86 PF->V. So on
-// unordered we need stored Z=1 (Z|V), stored borrow-C=0 (C&~V, so x86 CF=1), V kept (=PF=1), and N=0
-// (x86 SF is always 0 here). The ordered cases (V=0) pass through unchanged except the N clear.
+// COMISD/UCOMISD: x86 sets ZF=PF=CF=1 on unordered and SF=OF=AF=0 always, but ARM FCMP encodes
+// unordered as N=0,Z=0,C=1,V=1. Our substrate maps x86 ZF->Z, x86 CF->NOT stored-C (borrow),
+// x86 SF->N and x86 OF->V (bit 28); x86 PF lives in its own cpu->pf byte. So on unordered we need
+// stored Z=1 (Z|V), stored borrow-C=0 (C&~V, so x86 CF=1), and then N=0 AND V=0 unconditionally.
+// The ARM V bit must NOT survive into the stored NZCV: x86 OF is architecturally 0 for every
+// (U)COMISS/(U)COMISD and fcomi/fucomi, and leaving V set made `jo`/`seto`/`cmovo` (and the
+// SF!=OF signed conditions) read OF=1 after any NaN-operand compare.
 static void e_nzcv_save_fcmp(void) {
     emit32(0xD53B4200u | 20);       // mrs x20, nzcv  (N,Z,C,V from FCMP)
     e_movconst(22, 1u << 28);       // V is bit 28
     e_rrr(A_AND, 22, 20, 22, 1, 0); // x22 = V (at bit 28)
     e_rrr(A_ORR, 20, 20, 22, 1, 2); // Z |= V   (V<<2 -> bit 30)
     e_rrr(A_BIC, 20, 20, 22, 1, 1); // C &= ~V  (V<<1 -> bit 29)
-    e_movconst(22, 1u << 31);
-    e_rrr(A_BIC, 20, 20, 22, 1, 0); // N = 0 (x86 SF always 0 for COMISD)
+    e_lsr_i(19, 22, 28, 0);         // x19 = V in {0,1} -- captured before x22 is reused
+    e_movconst(22, (1u << 31) | (1u << 28));
+    e_rrr(A_BIC, 20, 20, 22, 1, 0); // N = 0 (x86 SF), V = 0 (x86 OF) -- both always 0 here
     e_str(20, 28, OFF_NZCV);
     emit32(0xD51B4200u | 20); // sync live ARM nzcv
     // x86 PF = 1 on unordered. PF source byte: 0 (even popcount -> PF=1) if unordered (V=1), else 1.
-    e_lsr_i(22, 20, 28, 0); // x22 = V (bit 28)
-    e_movconst(20, 1);
-    e_rrr(A_AND, 22, 22, 20, 0, 0); // x22 = V (0/1)
-    e_rrr(A_EOR, 22, 22, 20, 0, 0); // x22 = NOT V  -> PF source byte
+    e_movconst(22, 1);
+    e_rrr(A_EOR, 22, 19, 22, 0, 0); // x22 = NOT V  -> PF source byte
     e_str(22, 28, OFF_PF);
     e_str(31, 28, OFF_AF); // x86 SSE compares (UCOMISS/UCOMISD/COMISS/COMISD) clear AF
 }

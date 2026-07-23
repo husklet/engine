@@ -49,6 +49,8 @@
 // barrier-elided (single-threaded) blocks are re-translated WITH barriers before any peer runs. Evaluates
 // to nonzero on success, 0 on host W^X failure. See hl_x86_flush_for_thread_start (translate.c).
 #define G_THREAD_START_FLUSH() hl_x86_flush_for_thread_start()
+// Guest established a MAP_SHARED mapping: force x86-TSO barriers (a peer PROCESS can now observe us).
+#define G_SHARED_MAP_BARRIERS() hl_x86_force_barriers_for_shared()
 
 // Syscall normalization: x86 rewrites legacy syscalls to their *at form (frontend/x86_64/legacy.c).
 #define G_NORMALIZE(c)                                                                                                 \

@@ -59,6 +59,7 @@
 // Clone/thread-start hook: the aarch64 frontend does not elide memory-ordering barriers, so no
 // transition flush is needed. Evaluates to nonzero (success) so the shared clone path is byte-identical.
 #define G_THREAD_START_FLUSH() 1
+#define G_SHARED_MAP_BARRIERS() 1 /* aarch64 frontend elides no barriers */
 
 // aarch64 guests already use canonical (*at) syscalls -> nothing to normalize.
 #define G_NORMALIZE(c) 0
