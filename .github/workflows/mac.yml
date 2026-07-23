@@ -28,7 +28,13 @@ jobs:
           diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          # Keyed on flake.lock ONLY, deliberately. The expensive content of this cache is the guest
+          # toolchains -- notably the x86_64 musl cross gcc that pkgsStatic.sqlite implies, which
+          # nixpkgs does not serve prebuilt for an aarch64 builder and which takes tens of minutes to
+          # build from source. Hashing flake.nix too meant every edit to it discarded that toolchain
+          # and rebuilt the compiler, even for edits that cannot change the toolchain at all.
+          # flake.lock is what pins the nixpkgs those toolchains come from.
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Test C package
@@ -101,7 +107,13 @@ jobs:
           diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          # Keyed on flake.lock ONLY, deliberately. The expensive content of this cache is the guest
+          # toolchains -- notably the x86_64 musl cross gcc that pkgsStatic.sqlite implies, which
+          # nixpkgs does not serve prebuilt for an aarch64 builder and which takes tens of minutes to
+          # build from source. Hashing flake.nix too meant every edit to it discarded that toolchain
+          # and rebuilt the compiler, even for edits that cannot change the toolchain at all.
+          # flake.lock is what pins the nixpkgs those toolchains come from.
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Compat suites

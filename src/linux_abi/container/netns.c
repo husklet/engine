@@ -761,6 +761,13 @@ static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
                     visible--;
                     continue;
                 }
+                // Register the alias BEFORE the source descriptor goes away. On macOS a dup'd kqueue IS
+                // the same queue and this is a no-op; on a Linux host the queue lives in a side table
+                // keyed by descriptor, so without this the queue stayed reachable only through `timer`,
+                // which is closed on the next line. The EVFILT_TIMER re-arm below then failed EBADF --
+                // and its result is deliberately discarded -- so the received timerfd was never armed:
+                // it read its pending expirations correctly but never polled ready (compat scm-timerfd).
+                if (timer != fd) hl_native_kqueue_duplicate(timer, fd);
                 if (timer != fd) close(timer);
             }
             g_timerfd[fd] = 1;
