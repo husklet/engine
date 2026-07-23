@@ -3,7 +3,7 @@
 #
 # Goal: the plain, boring, standard flow works and produces a usable SDK.
 #
-#     cmake -B build -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake
+#     cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
 #     cmake --build build
 #     cmake --install build --prefix /usr/local
 #

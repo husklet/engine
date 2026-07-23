@@ -13,7 +13,7 @@
 #
 # Usage (inside `nix develop`):
 #     cmake -G Ninja -B build-cmake-x86_64 \
-#           -DCMAKE_TOOLCHAIN_FILE=cross/x86_64-linux.cmake
+#           -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-linux.cmake
 #     ninja -C build-cmake-x86_64
 
 set(CMAKE_SYSTEM_NAME Linux)

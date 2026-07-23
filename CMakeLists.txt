@@ -18,7 +18,7 @@
 # codesigning, packaging, the Rust crate.
 #
 # Toolchain authority stays with nix: configure with one of the toolchain
-# files under cross/, which read the compiler path from the same environment
+# files under cmake/toolchains/, which read the compiler path from the same environment
 # variables the flake devShell exports and the Makefile consumes
 # (AARCH64_LINUX_CC / X86_64_LINUX_CC). Do not hardcode compiler paths here.
 # ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ project(hl_engine_phase1 LANGUAGES C)
 # The Makefile's `sanitize` target re-invokes make into a second BUILD dir with
 # ASan+UBSan CFLAGS and runs the unit suite. The CMake equivalent is a separate
 # configure, which is the idiomatic form and avoids a recursive build:
-#   cmake -G Ninja -B build-asan -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake -DHL_SANITIZE=ON
+#   cmake -G Ninja -B build-asan -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake -DHL_SANITIZE=ON
 #   ninja -C build-asan && ctest --test-dir build-asan -L unit
 option(HL_SANITIZE "build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 if(HL_SANITIZE)
@@ -157,11 +157,17 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Codesign.cmake)
 
 if(HL_BUILD_TESTS)
   enable_testing()
+  # Host-side unit tests need no guest cross compiler.
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Units.cmake)
+  # Sets HL_HAVE_GUEST_CC and returns early when the Linux cross compilers are
+  # absent (e.g. a plain `nix build`, whose sandbox exports no *_LINUX_CC).
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GuestFixtures.cmake)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
+  if(HL_HAVE_GUEST_CC)
+    # These build and run guest programs, so they depend on the fixtures above.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
+  endif()
 endif()
 
 # --- Phase 4: install rules, pkg-config, packaging smoke tests -------------

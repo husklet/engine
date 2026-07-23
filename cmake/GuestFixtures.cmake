@@ -51,13 +51,39 @@ _hl_guest_cc(HL_GUEST_DYNCC_aarch64 AARCH64_LINUX_CC AARCH64_LINUX_STATIC_CC)
 _hl_guest_cc(HL_GUEST_DYNCC_x86_64  X86_64_LINUX_CC  X86_64_LINUX_STATIC_CC)
 
 set(HL_GUEST_ARCHES aarch64 x86_64)
+# Guest fixtures are the TEST corpus: hundreds of little guest programs, each
+# needing a Linux cross compiler for its arch. Building the engine itself needs
+# none of them, so their absence must not be fatal -- otherwise `cmake && ninja`
+# only works inside the nix devShell, and a plain `nix build` (whose sandbox
+# exports no *_LINUX_CC) cannot build the library at all.
+#
+# So: auto-detect. With the compilers present (the devShell, or CI) everything
+# is built as before; without them the guest fixtures and every suite that runs
+# one are skipped, and the libraries/engines/runner still build. -DHL_GUEST_TESTS=ON
+# forces the old hard failure if you expected the corpus and want to know why
+# it vanished.
+option(HL_GUEST_TESTS "build the guest test fixtures (needs Linux cross compilers)" AUTO)
+set(HL_HAVE_GUEST_CC TRUE)
 foreach(_a ${HL_GUEST_ARCHES})
   if(NOT HL_GUEST_CC_${_a})
-    message(FATAL_ERROR
-      "No ${_a} Linux cross compiler. Enter the nix devShell first (`nix develop`); "
-      "it exports AARCH64_LINUX_CC / X86_64_LINUX_CC exactly as the Makefile expects.")
+    set(HL_HAVE_GUEST_CC FALSE)
+    set(_hl_missing_cc ${_a})
   endif()
 endforeach()
+
+if(NOT HL_HAVE_GUEST_CC)
+  if(HL_GUEST_TESTS STREQUAL "ON")
+    message(FATAL_ERROR
+      "No ${_hl_missing_cc} Linux cross compiler, but -DHL_GUEST_TESTS=ON was requested. "
+      "Enter the nix devShell first (`nix develop`); it exports AARCH64_LINUX_CC / "
+      "X86_64_LINUX_CC exactly as the Makefile expects.")
+  endif()
+  message(STATUS
+    "No ${_hl_missing_cc} Linux cross compiler -- guest test fixtures and the suites that "
+    "run them are DISABLED. The libraries, engines and runner still build. Enter the nix "
+    "devShell (`nix develop`) to get the full test corpus.")
+  return()
+endif()
 
 # Dynamic loader/libc paths, mirroring the Makefile defaults (lines 76-79).
 set(HL_AARCH64_DYNAMIC_LOADER "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"

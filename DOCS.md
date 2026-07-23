@@ -354,7 +354,7 @@ scripts.
 ### 7.0 CMake: the standard flow
 
 ```text
-cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake
+cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
 ninja -C build
 ctest --test-dir build -L unit          # or -L compat-ipc, etc. -- one label per suite
 cmake --install build --prefix /usr/local
@@ -365,13 +365,13 @@ Installing yields a usable SDK: headers under `include/hl`, the static archives 
 `-DCMAKE_INSTALL_PREFIX` at configure time if you need the generated `.pc` files to carry a different
 prefix, since they bake it in.
 
-Cross/host toolchain files live in `cross/`:
+Cross/host toolchain files live in `cmake/toolchains/`:
 
 | file | builds |
 |---|---|
-| `cross/aarch64-linux.cmake` | native aarch64 Linux |
-| `cross/x86_64-linux.cmake`  | x86_64 guest fixtures |
-| `cross/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). This replaces the Makefile's `MAC=mac` recipe prefix. The build directory must live inside the repo, because only that path is shared with the macOS side. |
+| `cmake/toolchains/aarch64-linux.cmake` | native aarch64 Linux |
+| `cmake/toolchains/x86_64-linux.cmake`  | x86_64 guest fixtures |
+| `cmake/toolchains/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). This replaces the Makefile's `MAC=mac` recipe prefix. The build directory must live inside the repo, because only that path is shared with the macOS side. |
 
 Nix remains the toolchain authority: the toolchain files read the same `AARCH64_LINUX_CC` /
 `X86_64_LINUX_CC` the devShell exports and the Makefile consumes. Note the devShell's `$CC` is deliberately

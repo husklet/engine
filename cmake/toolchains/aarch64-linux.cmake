@@ -8,7 +8,7 @@
 #
 # Usage (inside `nix develop`):
 #     cmake -G Ninja -B build-cmake-aarch64 \
-#           -DCMAKE_TOOLCHAIN_FILE=cross/aarch64-linux.cmake
+#           -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
 #     ninja -C build-cmake-aarch64
 
 set(CMAKE_SYSTEM_NAME Linux)

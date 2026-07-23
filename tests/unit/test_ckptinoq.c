@@ -26,39 +26,88 @@ typedef struct image_header {
 } image_header;
 
 static hl_status op_add(void *c, const char *p, size_t n, uint64_t t, uint32_t m) {
-    (void)c; (void)p; (void)n; (void)t; (void)m;
+    (void)c;
+    (void)p;
+    (void)n;
+    (void)t;
+    (void)m;
     return HL_STATUS_OK;
 }
-static hl_status op_modify(void *c, uint64_t t, uint32_t m) { (void)c; (void)t; (void)m; return HL_STATUS_OK; }
-static hl_status op_remove(void *c, uint64_t t) { (void)c; (void)t; return HL_STATUS_OK; }
+
+static hl_status op_modify(void *c, uint64_t t, uint32_t m) {
+    (void)c;
+    (void)t;
+    (void)m;
+    return HL_STATUS_OK;
+}
+
+static hl_status op_remove(void *c, uint64_t t) {
+    (void)c;
+    (void)t;
+    return HL_STATUS_OK;
+}
+
 static hl_status op_drain(void *c, hl_linux_inotify_provider_event *e, uint32_t cap, uint32_t *out) {
-    (void)c; (void)e; (void)cap; (void)out;
+    (void)c;
+    (void)e;
+    (void)cap;
+    (void)out;
     return HL_STATUS_WOULD_BLOCK;
 }
-static hl_status op_wait(void *c) { (void)c; return HL_STATUS_INTERRUPTED; }
+
+static hl_status op_wait(void *c) {
+    (void)c;
+    return HL_STATUS_INTERRUPTED;
+}
+
 static hl_host_result op_wait_handle(void *c) {
     (void)c;
     return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, HL_HOST_HANDLE_INVALID, 0};
 }
-static uint32_t op_ready(void *c) { (void)c; return 0; }
+
+static uint32_t op_ready(void *c) {
+    (void)c;
+    return 0;
+}
+
 static hl_status op_subscribe(void *c, void (*n)(void *, uint64_t), void *o, uint64_t t) {
-    (void)c; (void)n; (void)o; (void)t;
+    (void)c;
+    (void)n;
+    (void)o;
+    (void)t;
     return HL_STATUS_OK;
 }
-static void op_unsubscribe(void *c, void *o, uint64_t t) { (void)c; (void)o; (void)t; }
-static hl_status op_clone(void *c, void **out) { (void)c; *out = (void *)1; return HL_STATUS_OK; }
-static hl_status op_close(void *c) { (void)c; return HL_STATUS_OK; }
 
-static const hl_linux_inotify_provider_ops ops = {op_add,   op_modify,    op_remove,      op_drain,
-                                                  op_wait,  op_wait_handle, op_ready,     op_subscribe,
-                                                  op_unsubscribe, op_clone, op_close};
+static void op_unsubscribe(void *c, void *o, uint64_t t) {
+    (void)c;
+    (void)o;
+    (void)t;
+}
+
+static hl_status op_clone(void *c, void **out) {
+    (void)c;
+    *out = (void *)1;
+    return HL_STATUS_OK;
+}
+
+static hl_status op_close(void *c) {
+    (void)c;
+    return HL_STATUS_OK;
+}
+
+static const hl_linux_inotify_provider_ops ops = {op_add,         op_modify,      op_remove, op_drain,
+                                                  op_wait,        op_wait_handle, op_ready,  op_subscribe,
+                                                  op_unsubscribe, op_clone,       op_close};
 
 static hl_host_result unused_file_clone(void *context, hl_host_handle handle) {
-    (void)context; (void)handle;
+    (void)context;
+    (void)handle;
     return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, HL_HOST_HANDLE_INVALID, 0};
 }
+
 static hl_host_result unused_file_close(void *context, hl_host_handle handle) {
-    (void)context; (void)handle;
+    (void)context;
+    (void)handle;
     return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, HL_HOST_HANDLE_INVALID, 0};
 }
 
@@ -77,14 +126,14 @@ int main(void) {
 
     hl_fake_host_init(&fake, &services);
     {
-        static const hl_host_file_services files = {
-            .abi = HL_HOST_FILE_ABI, .size = sizeof(files),
-            .clone_for_fork = unused_file_clone, .close = unused_file_close};
+        static const hl_host_file_services files = {.abi = HL_HOST_FILE_ABI,
+                                                    .size = sizeof(files),
+                                                    .clone_for_fork = unused_file_clone,
+                                                    .close = unused_file_close};
         services.capabilities |= HL_HOST_CAP_FILE;
         services.file = &files;
     }
-    HL_CHECK(hl_linux_abi_init(&abi, &services, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) ==
-             HL_STATUS_OK);
+    HL_CHECK(hl_linux_abi_init(&abi, &services, fds, HL_ARRAY_COUNT(fds), ofds, HL_ARRAY_COUNT(ofds)) == HL_STATUS_OK);
 
     memset(&header, 0, sizeof header);
     header.magic = UINT64_C(0x484c494e4f544659);
@@ -96,10 +145,14 @@ int main(void) {
 
     // The single queued record CLAIMS a 4096-byte name payload that is not in the blob.
     memset(record, 0, sizeof record);
-    field = 1;    memcpy(record + 0, &field, 4);  // wd
-    field = 0x100; memcpy(record + 4, &field, 4); // mask (IN_CREATE)
-    field = 0;    memcpy(record + 8, &field, 4);  // cookie
-    field = 4096; memcpy(record + 12, &field, 4); // len  <-- lie
+    field = 1;
+    memcpy(record + 0, &field, 4); // wd
+    field = 0x100;
+    memcpy(record + 4, &field, 4); // mask (IN_CREATE)
+    field = 0;
+    memcpy(record + 8, &field, 4); // cookie
+    field = 4096;
+    memcpy(record + 12, &field, 4); // len  <-- lie
 
     memcpy(image, &header, sizeof header);
     memcpy(image + sizeof header, record, sizeof record);

@@ -21,7 +21,7 @@
 # design. See the report note: the previously observed "undefined
 # hl_host_private_init" was a toolchain mismatch (the devShell's poisoned $CC is
 # the x86_64 cross gcc while the archives are the host arch), not a missing
-# provider. CMake takes its compiler from the cross/ toolchain file, so the two
+# provider. CMake takes its compiler from the cmake/toolchains/ toolchain file, so the two
 # always agree here.
 # ---------------------------------------------------------------------------
 

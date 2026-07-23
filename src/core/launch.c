@@ -155,10 +155,10 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
     if (magic != HL_CONFIG_MAGIC ||
-         (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_OVERLAY &&
-          abi != HL_CONFIG_ABI_NETWORK_TRANSPORT && abi != HL_CONFIG_ABI_LEGACY) ||
-         header_size < offsetof(hl_launch_config, network_transport) ||
-         header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
+        (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_OVERLAY && abi != HL_CONFIG_ABI_NETWORK_TRANSPORT &&
+         abi != HL_CONFIG_ABI_LEGACY) ||
+        header_size < offsetof(hl_launch_config, network_transport) || header_size > HL_LAUNCH_HEADER_LIMIT ||
+        pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
     }

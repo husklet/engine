@@ -8,7 +8,7 @@
 #
 # Usage (build dir MUST be inside the repo -- only that path is shared with the
 # macOS host):
-#   cmake -G Ninja -B build-macos -DCMAKE_TOOLCHAIN_FILE=cross/macos-remote.cmake
+#   cmake -G Ninja -B build-macos -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/macos-remote.cmake
 #   ninja -C build-macos
 set(CMAKE_SYSTEM_NAME Darwin)
 set(CMAKE_SYSTEM_PROCESSOR arm64)

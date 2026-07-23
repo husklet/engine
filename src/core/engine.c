@@ -292,13 +292,22 @@ static int hl_engine_proxy_valid(const char *value) {
     return colon != NULL && colon != value && hl_engine_uint_range(colon + 1, value + strlen(value), 65535);
 }
 
+/* Hand-laid X-macro table: clang-format is NOT idempotent on this
+ * continuation-backslash block (formatting it twice yields different output), so
+ * `format` followed by `format-check` could never converge and the check could not
+ * be gated in CI. One field per line, by intent.
+ * NOTE: the off/on markers must be the ENTIRE comment -- trailing prose on the same
+ * line makes clang-format ignore them. */
+/* clang-format off */
 #define HL_BOX_STRING_FIELDS(X)                                                                                        \
     X(lower_layers, "HL_LOWER")                                                                                        \
-    X(volumes, "HL_VOLUMES") X(limits, "HL_ULIMITS") X(network_namespace, "HL_NETNS")                                  \
-        X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR") X(ip, "HL_IP")                             \
-            X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                               \
-                X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")                    \
-                    X(file_owners, "HL_FILE_OWNERS")
+    X(volumes, "HL_VOLUMES")                                                                                           \
+    X(limits, "HL_ULIMITS")                                                                                            \
+    X(network_namespace, "HL_NETNS") X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR")               \
+        X(ip, "HL_IP") X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                    \
+            X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")                        \
+                X(file_owners, "HL_FILE_OWNERS")
+/* clang-format on */
 
 static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
     char number[32];
@@ -310,19 +319,21 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     int has_checkpoint_policy;
     int has_v2;
     if (box == NULL) return HL_STATUS_OK;
-    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 &&
-         box->abi != HL_ENGINE_BOX_ABI_4 && box->abi != HL_ENGINE_BOX_ABI) ||
+    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI_4 &&
+         box->abi != HL_ENGINE_BOX_ABI) ||
         (box->abi == HL_ENGINE_BOX_ABI_1 && box->size != abi1_size) ||
         (box->abi == HL_ENGINE_BOX_ABI_3 && box->size < abi3_size) ||
-         (box->abi == HL_ENGINE_BOX_ABI_4 && box->size < abi4_size) ||
-         (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box))) return HL_STATUS_ABI_MISMATCH;
+        (box->abi == HL_ENGINE_BOX_ABI_4 && box->size < abi4_size) ||
+        (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box)))
+        return HL_STATUS_ABI_MISMATCH;
     has_v2 = box->abi >= HL_ENGINE_BOX_ABI_4;
     has_checkpoint_policy = box->abi >= HL_ENGINE_BOX_ABI;
-    if (has_v2) known_flags |= HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED |
-                               HL_ENGINE_BOX_SENTRY_ONLY;
+    if (has_v2)
+        known_flags |=
+            HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
     if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1 ||
-         (has_checkpoint_policy && (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL ||
-                                    box->reserved_checkpoint != 0)))
+        (has_checkpoint_policy &&
+         (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL || box->reserved_checkpoint != 0)))
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
@@ -367,9 +378,10 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         return HL_STATUS_OUT_OF_MEMORY;
     memset(&engine->box_config, 0, sizeof(engine->box_config));
     memcpy(&engine->box_config, box,
-            box->abi == HL_ENGINE_BOX_ABI_1 ? abi1_size :
-            box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size :
-            box->abi == HL_ENGINE_BOX_ABI_4 ? abi4_size : sizeof(*box));
+           box->abi == HL_ENGINE_BOX_ABI_1   ? abi1_size
+           : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size
+           : box->abi == HL_ENGINE_BOX_ABI_4 ? abi4_size
+                                             : sizeof(*box));
     engine->box_config.working_directory = engine->owned_working_directory;
     engine->box_config.hostname = engine->owned_hostname;
     engine->box_config.environment = engine->owned_environment;

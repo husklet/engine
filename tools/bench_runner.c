@@ -705,12 +705,10 @@ static int cmd_report(int argc, char **argv) {
             int bad = 0;
             for (int c = 0; c < ncol && !bad; ++c) {
                 uint64_t o;
-                if (!col_ok(&cols[c], ph, &o))
-                    continue;
+                if (!col_ok(&cols[c], ph, &o)) continue;
                 for (int d = 0; d < c; ++d) {
                     uint64_t p;
-                    if (strcmp(cols[d].arch, cols[c].arch) != 0)
-                        continue; /* different arch: not comparable */
+                    if (strcmp(cols[d].arch, cols[c].arch) != 0) continue; /* different arch: not comparable */
                     if (col_ok(&cols[d], ph, &p) && p != o) {
                         bad = 1;
                         break;
