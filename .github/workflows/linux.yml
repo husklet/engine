@@ -32,8 +32,17 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
+      # Granular steps rather than one `nix flake check` so a failure names the
+      # thing that broke instead of "check failed". Together these are exactly
+      # the four checks `nix flake check` runs.
+      - name: Check formatting
+        run: nix build --print-build-logs .#checks.aarch64-linux.format
+
       - name: Test C package
         run: nix build --print-build-logs .#checks.aarch64-linux.package
+
+      - name: Test unit suite (CMake/CTest)
+        run: nix build --print-build-logs .#checks.aarch64-linux.unit
 
       - name: Test Rust package
         run: nix build --print-build-logs .#checks.aarch64-linux.rust
@@ -67,7 +76,7 @@ jobs:
         run: |
           nix develop --command sh -c '
             set -e
-            cmake -G Ninja -B build-ci -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
+            cmake -G Ninja -B build-ci
             ninja -C build-ci
             ctest --test-dir build-ci -L unit --output-on-failure
             cmake --install build-ci --prefix "$PWD/build-ci-sdk"

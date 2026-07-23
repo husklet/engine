@@ -354,11 +354,14 @@ scripts.
 ### 7.0 CMake: the standard flow
 
 ```text
-cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
-ninja -C build
-ctest --test-dir build -L unit          # or -L compat-ipc, etc. -- one label per suite
-cmake --install build --prefix /usr/local
+cmake -G Ninja -B build-cmake
+ninja -C build-cmake
+ctest --test-dir build-cmake -L unit    # or -L compat-ipc, etc. -- one label per suite
+cmake --install build-cmake --prefix /usr/local
 ```
+
+No toolchain file is needed for a native build: inside the devShell `$CC` is the intended host compiler.
+(Use a build directory other than `build/`, which is the Makefile's output tree.)
 
 Installing yields a usable SDK: headers under `include/hl`, the static archives (including
 `libhl-engine-activation.a`), both pkg-config files, and `bin/hl-engine-runner`. Set
@@ -369,14 +372,33 @@ Cross/host toolchain files live in `cmake/toolchains/`:
 
 | file | builds |
 |---|---|
-| `cmake/toolchains/aarch64-linux.cmake` | native aarch64 Linux |
+| `cmake/toolchains/aarch64-linux.cmake` | aarch64 Linux, forcing `$AARCH64_LINUX_CC`. Only needed when `$CC` is not already the intended host compiler; a native devShell build needs no toolchain file. |
 | `cmake/toolchains/x86_64-linux.cmake`  | x86_64 guest fixtures |
 | `cmake/toolchains/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). This replaces the Makefile's `MAC=mac` recipe prefix. The build directory must live inside the repo, because only that path is shared with the macOS side. |
 
 Nix remains the toolchain authority: the toolchain files read the same `AARCH64_LINUX_CC` /
-`X86_64_LINUX_CC` the devShell exports and the Makefile consumes. Note the devShell's `$CC` is deliberately
-poisoned to the x86_64 cross compiler, so never rely on it — the toolchain files use the explicit variables,
-and Make invocations need `CC=cc`.
+`X86_64_LINUX_CC` the devShell exports and the Makefile consumes. The devShell also exports `$CC` (and
+`$NATIVE_CC`) as the **native** compiler, so a bare `cmake`/`make` in the shell targets the host. The
+per-ISA variables stay explicit because the guest ISA is not always the host ISA.
+
+### 7.0.1 Nix entry points
+
+Nix drives CMake; these are the supported top-level commands.
+
+```text
+nix develop                 # dev shell: host + guest cross compilers, $CC, $*_LINUX_CC, $*_DYNAMIC_*
+nix build                   # the CMake build, installed as an SDK (packages.default)
+nix flake check             # format + unit + package + rust
+nix run .#fmt               # apply clang-format in the working tree
+```
+
+`fmt` is the only app: it mutates the working tree, so it cannot be a derivation. Everything that merely
+verifies is a `check`, which is also why checks can compile — they get a real stdenv, whereas a
+`writeShellApplication` does not carry the cc-wrapper variables and so cannot invoke the compiler correctly.
+
+Hosts and guest ISAs are data tables in `flake.nix` (`hostBackends`, `guestISAs`), not `system == "..."`
+branches, so `x86_64-linux` is first class today and a Windows host backend is a one-entry addition once
+`src/host/windows/` has code.
 
 ### 7.1 Build libraries and runner (Make)
 

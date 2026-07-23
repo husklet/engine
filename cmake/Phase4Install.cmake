@@ -108,6 +108,19 @@ endif()
 install(TARGETS ${HL_INSTALL_LIBS} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(TARGETS hl-engine-runner RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# The per-guest-ISA production engines are the artifact an embedder actually
+# runs, and the Makefile's `install` ships them alongside the runner. Install
+# them too so `cmake --install` yields the same layout the make-based package
+# does (bin/hl-engine-linux-{aarch64,x86_64}). Linux lane only: the macOS
+# engines are built and codesigned by Phase4Mac.cmake.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  foreach(_engine_arch aarch64 x86_64)
+    if(TARGET hl-engine-linux-${_engine_arch})
+      install(TARGETS hl-engine-linux-${_engine_arch} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+  endforeach()
+endif()
+
 file(GLOB HL_PUBLIC_HEADERS ${CMAKE_SOURCE_DIR}/include/hl/*.h)
 if(NOT HL_HAVE_ACTIVATION)
   list(REMOVE_ITEM HL_PUBLIC_HEADERS ${CMAKE_SOURCE_DIR}/include/hl/activation.h)

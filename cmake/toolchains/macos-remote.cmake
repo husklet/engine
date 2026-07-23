@@ -12,7 +12,8 @@
 #   ninja -C build-macos
 set(CMAKE_SYSTEM_NAME Darwin)
 set(CMAKE_SYSTEM_PROCESSOR arm64)
-get_filename_component(_hl_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+# Two levels up: this file is cmake/toolchains/, the wrappers are tools/remote/.
+get_filename_component(_hl_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set(CMAKE_C_COMPILER "${_hl_root}/tools/remote/mac-cc" CACHE FILEPATH "remote macOS C compiler")
 # The binutils live on the macOS side too, so forward them the same way -- CMake
 # probes for ar/ranlib locally and would otherwise fail to find a usable pair.

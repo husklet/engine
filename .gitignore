@@ -25,3 +25,6 @@ test.db
 
 # Scratch dirs created in the CWD by the filesystem/error-matrix compat cases.
 hl_errmat_*/
+
+# CMake build trees
+build-*/

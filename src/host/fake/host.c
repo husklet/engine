@@ -1361,7 +1361,8 @@ void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block) {
  * tests, it is never linked into a production engine (those link libhl-host-{linux,macos}.a, which carry
  * the real host/private.c), so these cannot shadow the real implementations. Registering a private
  * descriptor is a no-op for a fake host, which is the correct fake behaviour. */
-void hl_host_private_init(void) {}
+void hl_host_private_init(void) {
+}
 
 int hl_host_process_fd_private_add(int descriptor) {
     (void)descriptor;
