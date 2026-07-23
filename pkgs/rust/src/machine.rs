@@ -136,6 +136,23 @@ impl Machine {
     /// A checkpoint-armed machine exits after capture. The destination must not already contain data;
     /// this prevents stale process records from being mistaken for members of the new checkpoint.
     ///
+    /// # Blocking
+    /// This call blocks the calling thread: it polls for manifest publication with `std::thread::sleep`
+    /// until the capture completes or `timeout` expires. Async callers must run it on a blocking
+    /// boundary (for example `tokio::task::spawn_blocking`).
+    ///
+    /// # Trigger file ownership
+    /// Capture is requested through a shared-memory generation counter kept in a **sibling** file named
+    /// `<capture-directory>.trigger`. That file is deliberately outside the capture directory so that
+    /// removing or replacing the directory never disturbs it, and every engine process in the guest tree
+    /// keeps it mapped `MAP_SHARED` for the whole run; the engine records the generation it observed at
+    /// startup so a stale trigger cannot false-fire on a later launch or restore. It is therefore **not**
+    /// deleted when capture completes.
+    ///
+    /// Ownership belongs to the caller: once the machine has exited and the checkpoint directory is no
+    /// longer in use, delete `<capture-directory>.trigger` alongside the directory itself. Deleting it
+    /// while the machine is alive is unsupported and drops checkpoint requests.
+    ///
     /// # Errors
     /// Returns a typed control error if capture was not configured, the destination is unsafe, the native
     /// interrupt fails, the process exits without publishing a manifest, or the deadline expires.
@@ -178,8 +195,8 @@ impl Machine {
         let generation = u32::from_le_bytes(bytes).wrapping_add(1).max(1);
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&generation.to_le_bytes()))
-            .and_then(|_| file.set_len(4))
-            .and_then(|_| file.sync_data())
+            .and_then(|()| file.set_len(4))
+            .and_then(|()| file.sync_data())
             .map_err(|error| checkpoint_error("publish checkpoint request", &error))?;
 
         crate::ffi::signal(self.id(), checkpoint_interrupt_signal())
