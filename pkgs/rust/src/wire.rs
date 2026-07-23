@@ -43,6 +43,8 @@ const NETWORK_BRIDGE_OFFSET: usize = 96;
 const IP_OFFSET: usize = 100;
 const FILESYSTEM_GENERATION_OFFSET: usize = 104;
 const ARGUMENTS_OFFSET: usize = 108;
+const CHECKPOINT_DIRECTORY_OFFSET: usize = 124;
+const RESTORE_DIRECTORY_OFFSET: usize = 128;
 const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
 const INTERFACES_OFFSET: usize = 140;
@@ -361,6 +363,8 @@ pub(crate) fn encode(
     let file_owners = file_owners(config)?;
     let file_owners = pool.string(file_owners.as_deref())?;
     let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
+    let checkpoint_directory = pool.path(config.checkpoint_directory.as_deref())?;
+    let restore_directory = pool.path(config.restore_directory.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
     let volumes = pool.string(volumes.as_deref())?;
@@ -416,6 +420,8 @@ pub(crate) fn encode(
     header.u32(IP_OFFSET, ipv4);
     header.u32(FILESYSTEM_GENERATION_OFFSET, filesystem_generation);
     header.u32(ARGUMENTS_OFFSET, arguments);
+    header.u32(CHECKPOINT_DIRECTORY_OFFSET, checkpoint_directory);
+    header.u32(RESTORE_DIRECTORY_OFFSET, restore_directory);
     header.u32(RESULT_OFFSET, result);
     header.u32(
         PUBLISH_COUNT_OFFSET,
@@ -617,6 +623,33 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn checkpoint_directories_use_the_c_abi_offsets() {
+        let capture = encode(
+            &Config::new().checkpoint_directory("/run/hl/checkpoints/container"),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            string(&capture, CHECKPOINT_DIRECTORY_OFFSET),
+            Some("/run/hl/checkpoints/container")
+        );
+        assert_eq!(string(&capture, RESTORE_DIRECTORY_OFFSET), None);
+
+        let restore = encode(
+            &Config::new().restore_directory("/run/hl/checkpoints/container"),
+            &[OsString::from("/bin/true")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(string(&restore, CHECKPOINT_DIRECTORY_OFFSET), None);
+        assert_eq!(
+            string(&restore, RESTORE_DIRECTORY_OFFSET),
+            Some("/run/hl/checkpoints/container")
+        );
     }
 
     #[test]

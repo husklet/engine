@@ -316,6 +316,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 tcp_shadow_clear(r);          // no shadowed IPPROTO_TCP options on a fresh fd
                 ipopt_shadow_clear(r);        // ...nor shadowed IPPROTO_IP/IPV6 options
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
+                g_sock_connecting[r] = 0;
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
                 g_lo_v6[r] = 0;
@@ -332,6 +333,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                      : 0;
                 g_icmp_sock[r] = 0;
                 g_icmp_ip[r] = 0;
+                g_sock_object[r] = sock_object_new();
+                g_sock_peer_object[r] = 0;
             }
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -405,6 +408,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     g_sock_peer_pid[sv[1]] = sock_alloc_synth_peer();
                     g_sock_passcred[sv[1]] = 0;
                 }
+                sock_pair_identity_assign(sv[0], sv[1]);
             }
             // macOS AF_UNIX has no SEQPACKET, so a SEQPACKET pair is backed by SOCK_DGRAM (above) to keep
             // message boundaries. But a connected DGRAM socket does NOT deliver EOF when its peer closes
@@ -445,6 +449,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     break;
                 }
             }
+            (void)proc_fdvis_publish_native_fd(sv[0]);
+            (void)proc_fdvis_publish_native_fd(sv[1]);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;
@@ -720,6 +726,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     case 201: {
         int lr = listen((int)a0, (int)a1);
+        if (lr == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+            g_tcp_listen[(int)a0] = 1;
+            g_sock_backlog[(int)a0] = (int)a1;
+        }
         // Published-port (`-p H:C`) host bridge: if this is a switch-backed listen on a published
         // container port, spin up a real host AF_INET listener on :H that relays into the guest.
         if (lr == 0) fwd_maybe_start((int)a0);
@@ -783,7 +793,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 tcp_shadow_clear(r); // no shadowed IPPROTO_TCP options on a fresh accepted fd
                 ipopt_shadow_clear(r);
                 g_sock_conn[r] = 1; // an accepted socket is already connected
+                g_sock_connecting[r] = 0;
                 if (lfd >= 0 && lfd < HL_NFD) g_sock_fam[r] = g_sock_fam[lfd]; // inherit listener's family
+                g_sock_object[r] = sock_object_new();
+                g_sock_peer_object[r] = 0;
+            }
+            if ((pl || pbr) && sock_internal_accept_identify(r) < 0) {
+                int error = errno;
+                close(r);
+                G_RET(c) = (uint64_t)(int64_t)(-error);
+                break;
             }
             if (nr == 242) {
                 if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
@@ -883,6 +902,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0 || errno == EINPROGRESS) {
+                g_sock_connecting[(int)a0] = r < 0;
                 g_lo_port[(int)a0] = p ? p : 1;
                 g_lo_v6[(int)a0] = (uint8_t)c_lo6;
             } else if ((errno == ENOENT || errno == ECONNREFUSED) && br_on()) {
@@ -900,6 +920,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 } else {
                     r = connect((int)a0, (struct sockaddr *)&bu, sizeof bu);
                     if (r == 0 || errno == EINPROGRESS) {
+                        g_sock_connecting[(int)a0] = r < 0;
                         g_br_port[(int)a0] = p ? p : 1;
                         g_br_ip[(int)a0] = g_netif[0].ip;
                         g_br_interface[(int)a0] = 1;
@@ -923,8 +944,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     G_RET(c) = (uint64_t)(-le);
                 }
             } else {
-                G_RET(c) = 0;
-                if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+                int identified = sock_internal_connect_identify((int)a0);
+                G_RET(c) = identified == 0 ? 0 : (uint64_t)(int64_t)(-errno);
+                if (identified == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD)
+                    g_sock_conn[(int)a0] = 1, g_sock_connecting[(int)a0] = 0; // sticky-connected
             }
             break;
         }
@@ -948,6 +971,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_udp_peer_interface[(int)a0] = 0;
                 g_udp_peer_v6[(int)a0] = 0;
                 g_sock_conn[(int)a0] = 0;
+                g_sock_connecting[(int)a0] = 0;
                 G_RET(c) = 0;
                 break;
             }
@@ -1003,12 +1027,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 nanosleep(&ts, NULL);
             }
             if (r == 0 || errno == EINPROGRESS) {
+                g_sock_connecting[(int)a0] = r < 0;
                 g_br_port[(int)a0] = p ? p : 1;
                 g_br_ip[(int)a0] = dip; // peer ip for getpeername
                 g_br_interface[(int)a0] = (uint8_t)(connect_interface + 1);
             }
+            if (r == 0 && sock_internal_connect_identify((int)a0) != 0) r = -1;
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD)
+                g_sock_conn[(int)a0] = 1, g_sock_connecting[(int)a0] = 0; // sticky-connected
             break;
         }
         // abstract AF_UNIX (sun_path[0]==0): dial the same HL_NETNS-keyed fs socket bind used. Must run
@@ -1029,6 +1056,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (r < 0 && ce != EINPROGRESS) ? (uint64_t)(-ce) : 0;
             if ((r == 0 || ce == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
                 g_sock_conn[(int)a0] = 1; // sticky-connected
+                g_sock_connecting[(int)a0] = r < 0;
                 char an[108];
                 int L = (int)a2 - 3; // sun_path[0]==0, name follows; addrlen = 2 (family) + 1 (nul) + name
                 if (L < 0) L = 0;
@@ -1054,7 +1082,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 r = unix_sock_at((int)a0, hp, 1);
             } while (r < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = (r < 0 && errno != EINPROGRESS) ? (uint64_t)(-errno) : 0;
-            if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if ((r == 0 || errno == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+                g_sock_conn[(int)a0] = r == 0;
+                g_sock_connecting[(int)a0] = r < 0;
+            }
             break;
         }
     connect_passthrough:
@@ -1070,7 +1101,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 egress_should_redirect((struct sockaddr *)&ss)) {
                 int er = egress_connect((int)a0, (struct sockaddr *)&ss, hl);
                 G_RET(c) = er < 0 ? (uint64_t)(-errno) : 0;
-                if (er == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+                if ((er == 0 || errno == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+                    g_sock_conn[(int)a0] = er == 0;
+                    g_sock_connecting[(int)a0] = er < 0;
+                }
                 break;
             }
             // #261 IPv4-only network: a genuine external IPv6 dest has no route -> ENETUNREACH *now* (not a
@@ -1085,7 +1119,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                            : connect((int)a0, (void *)a1, (socklen_t)a2);
             } while (cr < 0 && SVC_EINTR_RESTART(c));
             G_RET(c) = cr < 0 ? (uint64_t)(-errno) : 0;
-            if (cr == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD) g_sock_conn[(int)a0] = 1; // sticky-connected
+            if ((cr == 0 || errno == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
+                g_sock_conn[(int)a0] = cr == 0;
+                g_sock_connecting[(int)a0] = cr < 0;
+            }
         }
         break;
     }
@@ -1952,6 +1989,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (hn < 0) {
                 cmsg_tmpfds_close();
                 cmsg_seq_finish(0);
+                cmsg_event_finish(0);
                 if (hctl != hstack) free(hctl);
                 G_RET(c) = (uint64_t)(-(cerr ? cerr : EINVAL));
                 break;
@@ -1991,6 +2029,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (nr == 211) cmsg_tmpfds_close();
         if (nr == 211) cmsg_seq_finish(r >= 0);
+        if (nr == 211) cmsg_event_finish(r >= 0);
         if (r > 0 && peekaddr) r = 0; // guest supplied no data room; only the source address was wanted
         // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
@@ -2229,6 +2268,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 if (hn < 0) {
                     cmsg_tmpfds_close();
                     cmsg_seq_finish(0);
+                    cmsg_event_finish(0);
                     if (hctl != hstack) free(hctl);
                     err = cerr ? cerr : EINVAL;
                     break;
@@ -2248,6 +2288,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                         : sendmsg((int)a0, &mh, msgflags_l2m(rf)))
                             : recvmsg((int)a0, &mh, msgflags_l2m(rf));
             if (nr == 269) cmsg_tmpfds_close();
+            if (nr == 269) cmsg_event_finish(r >= 0);
             if (r < 0) {
                 err = errno;
                 if (hctl != hstack) free(hctl);

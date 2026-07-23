@@ -3,6 +3,8 @@
 
 #include "hl/linux_abi.h"
 
+enum { HL_LINUX_OBJECT_INOTIFY = 0x696e6f74u };
+
 enum {
     HL_LINUX_IN_ACCESS = 0x00000001u,
     HL_LINUX_IN_MODIFY = 0x00000002u,
@@ -62,5 +64,11 @@ int64_t hl_linux_inotify_create_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
 int64_t hl_linux_inotify_add(hl_linux_abi *linux_abi, hl_linux_fd fd, const char *path, size_t path_size,
                              uint32_t mask);
 int64_t hl_linux_inotify_remove(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t watch);
+hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t capacity,
+                                  size_t *out_size);
+int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
+                                   const hl_linux_inotify_provider_ops *provider, void *provider_context,
+                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer,
+                                   size_t size);
 
 #endif

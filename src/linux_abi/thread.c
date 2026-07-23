@@ -1389,7 +1389,7 @@ static int cpu_has_actionable_tsig(const struct cpu *c) {
 // either an actionable thread-directed signal arrives OR this thread has been flagged exited by a peer's
 // execve teardown (thread_exit_others) -- in both cases the dispatcher must regain control.
 static int cpu_wait_interrupted(const struct cpu *c) {
-    return __atomic_load_n(&c->exited, __ATOMIC_SEQ_CST) || cpu_has_actionable_tsig(c);
+    return ckpt_pending() || __atomic_load_n(&c->exited, __ATOMIC_SEQ_CST) || cpu_has_actionable_tsig(c);
 }
 
 // This thread's slot in g_threg (set on register), so it can publish the primitive it is about to wait on
@@ -2271,6 +2271,39 @@ static void *thread_trampoline(void *p) {
     return NULL;
 }
 
+/* Resume every saved non-leader CPU image as a peer host thread. Checkpoint restore has already sanitized
+ * host-transient fields while preserving architectural state, signal state, TLS, TID and clear-child-tid. */
+static int thread_restore_group(const struct cpu *images, int count, const struct cpu *leader) {
+    if (!images || !leader || count < 1) return -EINVAL;
+    int peers = 0;
+    int highest_tid = leader->tid;
+    for (int i = 0; i < count; i++) {
+        if (images[i].tid > highest_tid) highest_tid = images[i].tid;
+        if (images[i].tid != 0) peers++;
+    }
+    if (highest_tid > g_next_tid) g_next_tid = highest_tid;
+    if (!peers) return 0;
+    txln_activate();
+    // See spawn_thread: discard single-threaded (barrier-elided) blocks before the restored peers run.
+    if (!g_threaded && !G_THREAD_START_FLUSH()) return -EAGAIN;
+    g_threaded = 1;
+    for (int i = 0; i < count; i++) {
+        if (images[i].tid == 0) continue;
+        struct cpu *child = malloc(sizeof *child);
+        if (!child) return -ENOMEM;
+        *child = images[i];
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, thread_trampoline, child) != 0) {
+            free(child);
+            return -EAGAIN;
+        }
+        atomic_fetch_add(&g_pids_cur, 1);
+        acct_publish_tasks();
+        pthread_detach(thread);
+    }
+    return 0;
+}
+
 // Spawn a guest thread sharing this address space. stack_top is the initial sp.
 static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, uint64_t tls, uint64_t ptid,
                         uint64_t ctid) {
@@ -2326,6 +2359,15 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     // A peer thread may self-modify code; arm eager line-set recording (and back-fill the lines of every
     // block translated so far) NOW, while still single-threaded, so the set is complete before any peer runs.
     txln_activate();
+    // 0->1 transition: while STILL single-threaded (no peer exists yet), flush the code cache so any block
+    // translated under the single-threaded x86-TSO-barrier-elision regime is discarded and re-translated
+    // WITH barriers before this new peer can execute a guest memory op. Only on the transition -- a later
+    // clone (g_threaded already 1) must NOT reset the arena in place under live peers. See emit.c /
+    // hl_x86_flush_for_thread_start.
+    if (!g_threaded && !G_THREAD_START_FLUSH()) {
+        free(child);
+        return -EAGAIN;
+    }
     g_threaded = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, thread_trampoline, child) != 0) {

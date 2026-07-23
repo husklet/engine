@@ -213,15 +213,33 @@ static int activation_signal_relay_start(pthread_t *thread) {
     size_t index;
     int flags;
     if (pipe(activation_signal_pipe) != 0) return -1;
+    if (hl_host_process_fd_private_add(activation_signal_pipe[0]) != 0 ||
+        hl_host_process_fd_private_add(activation_signal_pipe[1]) != 0) {
+        hl_host_process_fd_private_remove(activation_signal_pipe[0]);
+        hl_host_process_fd_private_remove(activation_signal_pipe[1]);
+        close(activation_signal_pipe[0]);
+        close(activation_signal_pipe[1]);
+        activation_signal_pipe[0] = -1;
+        activation_signal_pipe[1] = -1;
+        return -1;
+    }
     flags = fcntl(activation_signal_pipe[1], F_GETFL);
-    if (flags < 0 || fcntl(activation_signal_pipe[1], F_SETFL, flags | O_NONBLOCK) != 0) return -1;
+    if (flags < 0 || fcntl(activation_signal_pipe[1], F_SETFL, flags | O_NONBLOCK) != 0) goto fail;
     memset(&action, 0, sizeof(action));
     action.sa_handler = activation_signal_handler;
     action.sa_flags = SA_RESTART;
     sigfillset(&action.sa_mask);
     for (index = 0; index < sizeof(forwarded) / sizeof(forwarded[0]); ++index)
-        if (sigaction(forwarded[index], &action, NULL) != 0) return -1;
-    return pthread_create(thread, NULL, activation_signal_relay, NULL);
+        if (sigaction(forwarded[index], &action, NULL) != 0) goto fail;
+    if (pthread_create(thread, NULL, activation_signal_relay, NULL) == 0) return 0;
+fail:
+    hl_host_process_fd_private_remove(activation_signal_pipe[0]);
+    hl_host_process_fd_private_remove(activation_signal_pipe[1]);
+    close(activation_signal_pipe[0]);
+    close(activation_signal_pipe[1]);
+    activation_signal_pipe[0] = -1;
+    activation_signal_pipe[1] = -1;
+    return -1;
 }
 
 static void activation_signal_relay_stop(pthread_t thread) {
@@ -229,6 +247,8 @@ static void activation_signal_relay_stop(pthread_t thread) {
     ssize_t ignored = write(activation_signal_pipe[1], &stop, sizeof(stop));
     (void)ignored;
     (void)pthread_join(thread, NULL);
+    hl_host_process_fd_private_remove(activation_signal_pipe[0]);
+    hl_host_process_fd_private_remove(activation_signal_pipe[1]);
     close(activation_signal_pipe[0]);
     close(activation_signal_pipe[1]);
     activation_signal_pipe[0] = -1;
@@ -325,6 +345,10 @@ static void hl_activation_child(void) {
      * initialization boundary, otherwise every attached provider fails with
      * ENOSPC before it can send HELLO. */
     hl_host_private_init();
+    /* The fixed activation socket remains open while the guest runs.  Keep it
+     * out of the guest descriptor registry (and therefore checkpoints); it is
+     * engine control state, not a Linux guest socket. */
+    if (hl_host_process_fd_private_add((int)descriptor) != 0) _exit(126);
     if (hl_fork_wire_receive_descriptors((int)descriptor, &request, sizeof(request), inherited,
                                          &inherited_count) != (int)sizeof(request)) _exit(126);
     if (request.reserved > 1 || inherited_count != (int)request.reserved) {
@@ -393,6 +417,7 @@ static void hl_activation_child(void) {
         hl_host_process_fd_private_remove(inherited[0]);
         (void)close(inherited[0]);
     }
+    hl_host_process_fd_private_remove((int)descriptor);
     (void)close((int)descriptor);
     _exit(status == HL_STATUS_OK ? 0 : 127);
 }

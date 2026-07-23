@@ -1,4 +1,8 @@
-//! Versioned checkpoint manifest foundation. Native capture/restore is not implemented.
+//! Versioned checkpoint metadata plus the native launch policy exposed through [`crate::MachineSpec`].
+//!
+//! The native engine currently captures and restores full AArch64 process trees. This module's bounded
+//! manifest codec is an embedding-facing metadata format; the engine's native on-disk format is versioned
+//! independently and selected with `MachineSpec::checkpoint`.
 
 const MAGIC: u32 = 0x484c_434b;
 const VERSION: u16 = 1;

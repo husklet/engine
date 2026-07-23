@@ -286,6 +286,7 @@ static int g_eventfd_peer[HL_NFD];
 // any guest fork) so every forked worker inherits the same physical array. All g_eventfd_count[fd]
 // indexing (io.c, the eventfd2 creation in service.c) is unchanged.
 static uint64_t *g_eventfd_count;
+static uint8_t *g_eventfd_nb_shared;
 // eventfd public fd -> counter slot + 1. Normally the slot is the fd number, but an eventfd imported via
 // SCM_RIGHTS may land on a different fd number while still needing to update the sender's shared counter.
 static int g_eventfd_cslot[HL_NFD];
@@ -297,9 +298,10 @@ static void eventfd_count_init(const hl_host_services *host) {
     // SCM_RIGHTS-imported eventfd's sender-fd slot), and large workloads open far more than 1024 fds — a 1024-slot
     // array is a cross-process out-of-bounds write for any eventfd whose fd number exceeds it (silent
     // counter corruption / heap clobber past the mapped page). Size it to the whole fd space.
-    size_t sz = sizeof(uint64_t) * HL_NFD;
+    size_t sz = sizeof(uint64_t) * HL_NFD + sizeof(uint8_t) * HL_NFD;
     if (hl_linux_shared_create(host, sz, &arena) != HL_STATUS_OK) abort();
     g_eventfd_count = (uint64_t *)arena;
+    g_eventfd_nb_shared = (uint8_t *)(g_eventfd_count + HL_NFD);
 }
 
 // Guest-requested O_NONBLOCK for an eventfd. The backing pipe's read end is kept PERMANENTLY O_NONBLOCK at
@@ -313,7 +315,16 @@ static void eventfd_count_init(const hl_host_services *host) {
 static uint8_t g_eventfd_gnb[HL_NFD];
 
 static int eventfd_guest_nb(int fd) {
-    return (fd >= 0 && fd < HL_NFD) ? g_eventfd_gnb[fd] : 0;
+    if (fd < 0 || fd >= HL_NFD) return 0;
+    int slot = g_eventfd_cslot[fd] > 0 ? g_eventfd_cslot[fd] - 1 : fd;
+    return g_eventfd_nb_shared ? g_eventfd_nb_shared[slot] : g_eventfd_gnb[fd];
+}
+
+static void eventfd_guest_nb_set(int fd, int nonblock) {
+    if (fd < 0 || fd >= HL_NFD) return;
+    int slot = g_eventfd_cslot[fd] > 0 ? g_eventfd_cslot[fd] - 1 : fd;
+    g_eventfd_gnb[fd] = (uint8_t)(nonblock != 0);
+    if (g_eventfd_nb_shared) g_eventfd_nb_shared[slot] = (uint8_t)(nonblock != 0);
 }
 
 // _eventfd-atomicity_: an eventfd is emulated as {accumulating counter, readiness pipe}. write() does
@@ -407,6 +418,8 @@ static struct fdvis_control *g_fdvis_control;
 static int g_fdvis_fork_parent;
 static uint64_t g_fdvis_fork_parent_start;
 static uint64_t g_pipe_identity[HL_NFD];
+// Guest-visible F_SETPIPE_SZ/F_GETPIPE_SZ state is also needed by early SCM_RIGHTS marshalling.
+static int g_pipesz[HL_NFD];
 static uint8_t g_fdvis_private[HL_NFD];
 static _Atomic uint64_t g_pipe_identity_next = 1;
 static void proc_fdvis_cleanup(void);
@@ -1215,10 +1228,61 @@ static char g_inotify_wpath[HL_NFD][512];
 static char *g_inotify_snap[HL_NFD]; // newline-joined entry names of the last snapshot (malloc'd)
 // inotify: which inotify-instance fd owns each watch fd (wd) -> read(instance) drains that wd's move queue.
 static int g_inotify_owner[HL_NFD];
+static uint32_t g_inotify_mask[HL_NFD];
+static uint32_t g_inotify_pending[HL_NFD];
+static uint8_t g_inotify_isdir[HL_NFD];
+static uint64_t g_inotify_object[HL_NFD];
+static uint32_t g_inotify_object_next;
+static uint8_t *g_inotify_raw[HL_NFD];
+static size_t g_inotify_raw_len[HL_NFD];
+static size_t g_inotify_raw_pos[HL_NFD];
+
+static void inotify_object_assign(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_inotify[fd] || g_inotify_object[fd]) return;
+    uint32_t serial = ++g_inotify_object_next;
+    if (!serial) serial = ++g_inotify_object_next;
+    g_inotify_object[fd] = ((uint64_t)(uint32_t)getpid() << 32) | serial;
+}
 // timerfd remaining-time tracking (lsys-timerfd-gettime): absolute CLOCK_MONOTONIC deadline (ns) of the
 // next expiry + the interval (ns). timerfd_settime records them so timerfd_gettime reports it_value/interval.
 static int64_t g_tfd_deadline[HL_NFD];
 static int64_t g_tfd_interval[HL_NFD];
+// timerfd aliases share pending expirations and checkpoint identity through one canonical slot.
+static int g_tfd_cslot[HL_NFD];
+static uint64_t g_tfd_pending[HL_NFD];
+static int g_tfd_refs[HL_NFD];
+static uint64_t g_tfd_object[HL_NFD];
+static uint8_t g_tfd_nb[HL_NFD];
+struct timerfd_shared_state {
+    volatile int lock;
+    int64_t deadline;
+    int64_t interval;
+    uint64_t pending;
+};
+static struct timerfd_shared_state *g_tfd_shared[HL_NFD];
+
+static void timerfd_shared_lock(struct timerfd_shared_state *state) {
+    while (__sync_lock_test_and_set(&state->lock, 1)) sched_yield();
+}
+
+static void timerfd_shared_unlock(struct timerfd_shared_state *state) {
+    __sync_lock_release(&state->lock);
+}
+static uint32_t g_tfd_object_next;
+
+static int timerfd_slot(int fd) {
+    if (fd >= 0 && fd < HL_NFD && g_tfd_cslot[fd] > 0) return g_tfd_cslot[fd] - 1;
+    return fd;
+}
+
+static void timerfd_object_assign(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_timerfd[fd] || g_tfd_object[fd]) return;
+    uint32_t serial = ++g_tfd_object_next;
+    if (!serial) serial = ++g_tfd_object_next;
+    g_tfd_object[fd] = ((uint64_t)(uint32_t)getpid() << 32) | serial;
+    g_tfd_cslot[fd] = fd + 1;
+    g_tfd_refs[fd] = 1;
+}
 // A periodic timerfd whose FIRST expiry (it_value) differs from its interval (it_interval) can't be
 // expressed in a single kqueue EVFILT_TIMER (which fires first only after its period). So we arm a
 // ONE-SHOT at the first delay and set this flag; on the first read() drain the timer is re-armed as a

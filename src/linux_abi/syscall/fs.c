@@ -320,6 +320,7 @@ static void fd_reset_emul(int fd) {
             // duplicate would break the object for the others (fd_carry_virt bumps the slot refcount on dup).
             int eslot = eventfd_counter_slot(fd);
             if (--g_eventfd_refs[eslot] <= 0) {
+                hl_host_process_fd_private_remove(g_eventfd_peer[fd] - 1);
                 close(g_eventfd_peer[fd] - 1);
                 g_eventfd_count[eslot] = 0;
                 g_eventfd_refs[eslot] = 0;
@@ -328,10 +329,33 @@ static void fd_reset_emul(int fd) {
             g_eventfd_cslot[fd] = 0;
             g_eventfd_sema[fd] = 0;
         }
+        int timer_slot = -1;
+        int timer_last = 1;
+        if (g_timerfd[fd]) {
+            timer_slot = timerfd_slot(fd);
+            if (timer_slot >= 0 && timer_slot < HL_NFD) {
+                timer_last = --g_tfd_refs[timer_slot] <= 0;
+                if (timer_last) {
+                    g_tfd_deadline[timer_slot] = 0;
+                    g_tfd_interval[timer_slot] = 0;
+                    g_tfd_first_oneshot[timer_slot] = 0;
+                    g_tfd_pending[timer_slot] = 0;
+                    g_tfd_refs[timer_slot] = 0;
+                }
+            }
+        }
         g_timerfd[fd] = 0;
-        g_tfd_deadline[fd] = 0;
-        g_tfd_interval[fd] = 0;
-        g_tfd_first_oneshot[fd] = 0;
+        if (fd != timer_slot || timer_last) {
+            g_tfd_deadline[fd] = 0;
+            g_tfd_interval[fd] = 0;
+            g_tfd_first_oneshot[fd] = 0;
+            g_tfd_pending[fd] = 0;
+        }
+        g_tfd_clock[fd] = 0;
+        g_tfd_cslot[fd] = 0;
+        g_tfd_object[fd] = 0;
+        g_tfd_nb[fd] = 0;
+        g_tfd_shared[fd] = NULL;
         g_memfd_is[fd] = 0;
         g_memfd_seal[fd] = 0;
         g_proc_text_desc[fd][0] = 0;
@@ -382,6 +406,7 @@ static void fd_reset_emul(int fd) {
         tcp_shadow_clear(fd);
         ipopt_shadow_clear(fd);
         g_sock_conn[fd] = 0;
+        g_sock_connecting[fd] = 0;
         g_sock_fam[fd] = 0;
         g_sock_dgram[fd] = 0;
         udp_ref_drop(fd);
@@ -392,6 +417,8 @@ static void fd_reset_emul(int fd) {
         seq_ref_drop(fd);
         g_sock_seqpacket[fd] = 0;
         g_sock_pair_peer[fd] = 0;
+        g_sock_object[fd] = 0;
+        g_sock_peer_object[fd] = 0;
         g_sock_peer_pid[fd] = 0;
         g_sock_passcred[fd] = 0;
         g_br_port[fd] = 0;
@@ -399,6 +426,7 @@ static void fd_reset_emul(int fd) {
         g_br_interface[fd] = 0;
         g_tcp_lport[fd] = 0; // drop a reused fd's stale listener so /proc/net/tcp doesn't show a ghost
         g_tcp_listen[fd] = 0;
+        g_sock_backlog[fd] = 0;
         if (g_dns_sock[fd] || g_icmp_sock[fd]) { // synthetic network socket: close the engine-held peer
             if (g_dns_peer[fd] >= 0) close(g_dns_peer[fd]);
             g_dns_peer[fd] = -1;

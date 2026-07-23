@@ -871,9 +871,9 @@ static int engine_global_init(void) {
     // ptrace tracer/tracee coordination arena -- mmap the shared region ONCE here, BEFORE any guest
     // fork, so every descendant guest process inherits the same physical pages. Inert until a guest ptraces.
     ptrace_arena_init();
-    // Arm the SIGUSR1 checkpoint control handler when HL_CHECKPOINT_DIR is set.
+    // Arm the generation-counter checkpoint control channel when HL_CHECKPOINT_DIR is set.
     // Runs in every process (init + forked children) so the whole tree is checkpointable.
-    ckpt_control_init();
+    if (ckpt_control_init() != 0) return 70;
     g_engine_inited = 1;
     return 0;
 }
@@ -999,12 +999,21 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     g_host_launch_monotonic_ns = 0;
     if (host != NULL) {
         hl_host_result now;
-        if (hl_host_services_validate(host, HL_HOST_CAP_CLOCK) != HL_STATUS_OK) return 70;
+        if (hl_host_services_validate(host, HL_HOST_CAP_CLOCK) != HL_STATUS_OK) {
+            fprintf(stderr, "hl-engine: restore prerequisite host clock validation failed\n");
+            return 70;
+        }
         now = host->clock->monotonic_ns(host->context);
-        if (now.status != HL_STATUS_OK) return 70;
+        if (now.status != HL_STATUS_OK) {
+            fprintf(stderr, "hl-engine: restore prerequisite monotonic clock read failed\n");
+            return 70;
+        }
         g_host_launch_monotonic_ns = now.value;
     }
-    if (bound_shadow_activate() != 0) return 70;
+    if (bound_shadow_activate() != 0) {
+        fprintf(stderr, "hl-engine: restore prerequisite shadow descriptor activation failed\n");
+        return 70;
+    }
     // Resume a previously checkpointed workspace instead of launching a program (the embedding host sets this on
     // window reopen; the container config/env is otherwise identical to the original launch).
     const char *rdir = hl_option_get("HL_RESTORE_DIR");
@@ -1175,6 +1184,9 @@ int hl_engine_entry(int argc, char **argv) {
         if (!strcmp(argv[ai], "--rootfs") && ai + 1 < argc) {
             rootfs = argv[ai + 1];
             ai += 2;
+        } else if (!strcmp(argv[ai], "--checkpoint") && ai + 1 < argc) {
+            hl_option_set("HL_CHECKPOINT_DIR", argv[ai + 1], 1);
+            ai += 2;
         } else if (!strcmp(argv[ai], "--restore") && ai + 1 < argc) {
             hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1); // guest entry dispatches to restore without an ELF arg
             ai += 2;
@@ -1212,10 +1224,12 @@ int hl_engine_entry(int argc, char **argv) {
         return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
-                "usage: %s [--rootfs DIR] [--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
+                "usage: %s [--rootfs DIR] [--checkpoint DIR] [--hostname NAME] [--mem-max BYTES] "
+                "[--pids-max N] [--publish H:C] "
                 "<aarch64-elf> [args...]\n"
                 "       %s [--rootfs DIR] --restore <checkpoint-dir>\n"
-                "  checkpoint a running guest: launch with HL_CHECKPOINT_DIR=<dir> and send it SIGUSR1\n",
+                "  checkpoint a running guest: use --checkpoint DIR, increment DIR.trigger, then send the "
+                "engine its reserved interrupt\n",
                 argv[0], argv[0]);
         return 2;
     }

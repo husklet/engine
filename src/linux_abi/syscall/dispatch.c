@@ -689,11 +689,18 @@ static void service(struct cpu *c) {
         case 19:  /* eventfd2 */
         case 20:  /* epoll_create1 */
         case 23:  /* dup */
+        case 26:  /* inotify_init1 */
         case 56:  /* openat */
+        case 85:  /* timerfd_create */
         case 198: /* socket */
         case 202: /* accept */
         case 242: /* accept4 */
         case 437: /* openat2 */
+            if ((_rnr ? _rnr : G_NR(c)) == 85) {
+                timerfd_object_assign(fd);
+                if (fd >= 0 && fd < HL_NFD) g_tfd_nb[fd] = (G_A1(c) & 0x800) != 0;
+            }
+            if ((_rnr ? _rnr : G_NR(c)) == 26) inotify_object_assign(fd);
             (void)proc_fdvis_publish_native_fd(fd);
             break;
         case 24: /* dup3: result is the requested target descriptor */

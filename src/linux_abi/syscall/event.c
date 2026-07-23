@@ -79,6 +79,9 @@ static void ep_submit_ready_level(int ep, int fd, int16_t filt, uint16_t xf, voi
 }
 
 // --- cross-thread readiness wakeup (EVFILT_USER) --------------------------------------------------
+static int bound_shadow_install(int fd);
+static int bound_snapshot(uint64_t value, hl_linux_fd_snapshot *snapshot);
+static int bound_fdvis_publish_snapshot(int fd, const hl_linux_fd_snapshot *snapshot);
 // A Go netpoller (and node's worker-thread pool) shares ONE epoll instance across several OS threads
 // (Go Ms): one M blocks in epoll_wait while ANOTHER M accepts a connection and registers it on the same
 // instance (epoll_ctl). That connection usually already has its request bytes buffered, so on Linux the
@@ -115,6 +118,317 @@ static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
 // epoll_ctl is internally serialized and close() auto-removes). Atomic OR/AND on the byte + a CAS-installed
 // bitmap close that race without a lock (the single-threaded path is unchanged: uncontended atomics).
 static uint8_t *g_ep_member[HL_NFD];
+
+#define EP_NATIVE_WATCH_LIMIT 16384
+typedef struct ep_native_watch {
+    volatile uint8_t active;
+    uint8_t owned;
+    int32_t epoll;
+    int32_t descriptor;
+    int32_t logical_descriptor;
+    uint32_t events;
+    uint32_t armed;
+    uint64_t data;
+} ep_native_watch;
+static ep_native_watch g_ep_native_watches[EP_NATIVE_WATCH_LIMIT];
+
+static ep_native_watch *ep_native_find(int epoll, int descriptor) {
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        ep_native_watch *watch = &g_ep_native_watches[index];
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) == 1 && watch->epoll == epoll &&
+            watch->descriptor == descriptor)
+            return watch;
+    }
+    return NULL;
+}
+
+static int ep_native_set(int epoll, int descriptor, int op, uint32_t events, uint64_t data) {
+    ep_native_watch *watch = ep_native_find(epoll, descriptor);
+    if (op == 2) {
+        if (watch) {
+            if (watch->owned) {
+                hl_host_process_fd_private_remove(watch->descriptor);
+                close(watch->descriptor);
+                watch->owned = 0;
+            }
+            __atomic_store_n(&watch->active, 0, __ATOMIC_RELEASE);
+        }
+        return 0;
+    }
+    if (!watch) {
+        for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+            uint8_t empty = 0;
+            if (__atomic_compare_exchange_n(&g_ep_native_watches[index].active, &empty, 2, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                watch = &g_ep_native_watches[index];
+                watch->epoll = epoll;
+                watch->descriptor = descriptor;
+                watch->logical_descriptor = descriptor;
+                watch->owned = 0;
+                break;
+            }
+        }
+    }
+    if (!watch) return -1;
+    watch->events = events;
+    watch->armed = ((events & 1u) ? 1u : 0u) | ((events & 4u) ? 2u : 0u);
+    watch->data = data;
+    __atomic_store_n(&watch->active, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static void ep_native_retire_epoll(int epoll) {
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        if (__atomic_load_n(&g_ep_native_watches[index].active, __ATOMIC_ACQUIRE) == 1 &&
+            g_ep_native_watches[index].epoll == epoll) {
+            if (g_ep_native_watches[index].owned) {
+                hl_host_process_fd_private_remove(g_ep_native_watches[index].descriptor);
+                close(g_ep_native_watches[index].descriptor);
+                g_ep_native_watches[index].owned = 0;
+            }
+            __atomic_store_n(&g_ep_native_watches[index].active, 0, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+static void ep_native_disarm(int epoll, int descriptor, int16_t filter) {
+    ep_native_watch *watch = ep_native_find(epoll, descriptor);
+    if (!watch || !(watch->events & UINT32_C(0x40000000))) return;
+    if (filter == EVFILT_READ) watch->armed &= ~1u;
+    if (filter == EVFILT_WRITE) watch->armed &= ~2u;
+}
+
+static int kqueue_scm_export(int fd, struct hl_cmsg_kqueue_meta *metadata) {
+    if (!metadata || fd < 0 || fd >= HL_NFD) return 0;
+    if (g_linux_box != NULL) {
+        hl_linux_fd_snapshot snapshot;
+        hl_status snapshot_status = hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)fd, &snapshot);
+        if (snapshot_status == HL_STATUS_OK &&
+            snapshot.kind == UINT32_C(0x696e6f74)) { // HL_LINUX_OBJECT_INOTIFY (header is included later)
+            metadata->kind = 3;
+            metadata->nonblock = (snapshot.status_flags & O_NONBLOCK) != 0;
+            metadata->object_id = snapshot.ofd;
+            metadata->descriptor_flags = snapshot.descriptor_flags;
+            return 1;
+        }
+    }
+    if (g_epoll[fd]) {
+        int slot = epoll_slot(fd);
+        if (slot < 0 || slot >= HL_NFD) return -1;
+        if (g_ep_chgn[slot] > 0) {
+            if (kevent(slot, g_ep_chg[slot], g_ep_chgn[slot], NULL, 0, NULL) < 0) return -1;
+            g_ep_chgn[slot] = 0;
+        }
+        metadata->kind = 1;
+        metadata->canonical_fd = slot;
+        return 1;
+    }
+    if (fd < 1024 && g_inotify[fd]) {
+        inotify_object_assign(fd);
+        metadata->kind = 2;
+        metadata->nonblock = g_inotify_nb[fd];
+        metadata->object_id = g_inotify_object[fd];
+        return 1;
+    }
+    return 0;
+}
+
+static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker) {
+    if (!metadata || fd < 0 || fd >= HL_NFD) return -1;
+    if (metadata->kind == 1) {
+        int source = metadata->source_fd;
+        int slot = fd;
+        if (metadata->source_pid == (int32_t)getpid() && source >= 0 && source < HL_NFD && g_epoll[source]) {
+            slot = epoll_slot(source);
+            if (dup2(source, fd) < 0) return -1;
+            g_ep_dupd[source] = 1;
+            hl_native_kqueue_duplicate(source, fd);
+        } else return epoll_scm_image_import(fd, metadata, marker) == 0 ? 1 : -1;
+        g_epoll[fd] = 1;
+        g_ep_dupd[fd] = 1;
+        g_ep_cslot[fd] = (uint16_t)(slot + 1);
+        g_epoll_family_seen = 1;
+        return 0;
+    }
+    if (metadata->kind == 2 && fd < 1024) {
+        int source = metadata->source_fd;
+        if (metadata->source_pid != (int32_t)getpid() || source < 0 || source >= 1024 || !g_inotify[source] ||
+            dup2(source, fd) < 0)
+            return -1;
+        g_inotify[fd] = 1;
+        g_inotify_nb[fd] = metadata->nonblock != 0;
+        g_inotify_object[fd] = metadata->object_id;
+        g_epoll_family_seen = 1;
+        return 0;
+    }
+    if (metadata->kind == 3) {
+        int source = metadata->source_fd;
+        if (g_linux_box != NULL && metadata->source_pid == (int32_t)getpid() && source >= 0 && source < HL_NFD) {
+            hl_linux_fd_snapshot source_snapshot;
+            if (bound_snapshot((uint64_t)(uint32_t)source, &source_snapshot)) {
+                if (bound_shadow_install(fd) != fd) return -1;
+                int64_t duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)source, (hl_linux_fd)fd,
+                                                    metadata->descriptor_flags ? HL_LINUX_O_CLOEXEC : 0);
+                hl_linux_fd_snapshot snapshot;
+                if (duplicated < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot) ||
+                    bound_fdvis_publish_snapshot(fd, &snapshot) != 0) {
+                    close(fd);
+                    return -1;
+                }
+                return 0;
+            }
+        }
+        return typed_inotify_scm_image_import(fd, metadata, marker);
+    }
+    return -1;
+}
+
+static int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
+    if (metadata == NULL || metadata->kind != 1) return 0;
+    int slot = metadata->canonical_fd;
+    uint32_t count = 0;
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index)
+        if (__atomic_load_n(&g_ep_native_watches[index].active, __ATOMIC_ACQUIRE) == 1 &&
+            g_ep_native_watches[index].epoll == slot)
+            count++;
+    if (count > EP_NATIVE_WATCH_LIMIT) return -1;
+    size_t size = sizeof count + (size_t)count * sizeof(struct hl_cmsg_epoll_watch);
+    unsigned char *image = malloc(size);
+    if (image == NULL) return -1;
+    memcpy(image, &count, sizeof count);
+    uint32_t written = 0;
+    struct hl_cmsg_epoll_watch *saved = (void *)(image + sizeof count);
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        ep_native_watch *watch = &g_ep_native_watches[index];
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 || watch->epoll != slot) continue;
+        saved[written++] = (struct hl_cmsg_epoll_watch){watch->logical_descriptor, watch->events, watch->armed, 0,
+                                                        watch->data};
+    }
+    int result = pwrite(marker, image, size, (off_t)sizeof *metadata) == (ssize_t)size ? 0 : -1;
+    free(image);
+    if (result == 0) metadata->image_size = size;
+    return result;
+}
+
+static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fds, int capacity) {
+    if (metadata == NULL || metadata->kind != 1) return 0;
+    int count = 0;
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        ep_native_watch *watch = &g_ep_native_watches[index];
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 ||
+            watch->epoll != metadata->canonical_fd)
+            continue;
+        if (fds != NULL) {
+            if (count >= capacity || fcntl(watch->descriptor, F_GETFD) < 0) return -1;
+            fds[count] = watch->descriptor;
+        }
+        count++;
+    }
+    metadata->hidden_count = (uint32_t)count;
+    return count;
+}
+
+static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int marker, const int *fds) {
+    if (metadata == NULL || metadata->kind != 1 || metadata->hidden_count == 0) return 0;
+    if (metadata->image_size != sizeof(uint32_t) +
+                                    (size_t)metadata->hidden_count * sizeof(struct hl_cmsg_epoll_watch))
+        return -1;
+    for (uint32_t index = 0; index < metadata->hidden_count; ++index) {
+        off_t offset = (off_t)sizeof *metadata + (off_t)sizeof(uint32_t) +
+                       (off_t)index * (off_t)sizeof(struct hl_cmsg_epoll_watch);
+        struct hl_cmsg_epoll_watch watch;
+        if (pread(marker, &watch, sizeof watch, offset) != (ssize_t)sizeof watch) return -1;
+        watch.reserved = (uint32_t)watch.descriptor;
+        watch.descriptor = fds[index];
+        if (pwrite(marker, &watch, sizeof watch, offset) != (ssize_t)sizeof watch) return -1;
+    }
+    return 0;
+}
+
+static int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker) {
+    if (metadata == NULL || metadata->kind != 1 || metadata->image_size < sizeof(uint32_t) ||
+        metadata->image_size > 64u * 1024u * 1024u || metadata->image_size > SIZE_MAX)
+        return -1;
+    size_t size = (size_t)metadata->image_size;
+    unsigned char *image = malloc(size);
+    if (image == NULL || pread(marker, image, size, (off_t)sizeof *metadata) != (ssize_t)size) {
+        free(image);
+        return -1;
+    }
+    uint32_t count;
+    memcpy(&count, image, sizeof count);
+    if (count > EP_NATIVE_WATCH_LIMIT || sizeof count + (size_t)count * sizeof(struct hl_cmsg_epoll_watch) != size) {
+        free(image);
+        return -1;
+    }
+    int instance = kqueue();
+    if (instance < 0 || (instance != fd && dup2(instance, fd) < 0)) {
+        if (instance >= 0) close(instance);
+        free(image);
+        return -1;
+    }
+    if (instance != fd) close(instance);
+    g_epoll[fd] = 1;
+    g_ep_dupd[fd] = 1;
+    g_ep_cslot[fd] = (uint16_t)(fd + 1);
+    g_epoll_family_seen = 1;
+    const struct hl_cmsg_epoll_watch *saved = (const void *)(image + sizeof count);
+    for (uint32_t index = 0; index < count; ++index) {
+        if (saved[index].descriptor < 0 ||
+            (metadata->hidden_count == 0 && saved[index].descriptor >= HL_NFD) ||
+            fcntl(saved[index].descriptor, F_GETFD) < 0) {
+            fprintf(stderr, "[scm-epoll] hidden fd validation failed index=%u fd=%d errno=%d\n", index,
+                    saved[index].descriptor, errno);
+            goto fail;
+        }
+        struct kevent changes[2];
+        int changes_count = 0;
+        uint16_t flags = (uint16_t)((saved[index].events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
+                                    (saved[index].events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
+        if (saved[index].armed & 1u)
+            EV_SET(&changes[changes_count++], saved[index].descriptor, EVFILT_READ, EV_ADD | flags, 0, 0,
+                   (void *)(uintptr_t)saved[index].data);
+        if (saved[index].armed & 2u)
+            EV_SET(&changes[changes_count++], saved[index].descriptor, EVFILT_WRITE, EV_ADD | flags, 0, 0,
+                   (void *)(uintptr_t)saved[index].data);
+        if (changes_count && kevent(fd, changes, changes_count, NULL, 0, NULL) < 0) {
+            fprintf(stderr, "[scm-epoll] kevent add failed index=%u ep=%d watched=%d errno=%d\n", index, fd,
+                    saved[index].descriptor, errno);
+            goto fail;
+        }
+        if (saved[index].descriptor < HL_NFD) ep_mem_set(fd, saved[index].descriptor, 1);
+        if (ep_native_set(fd, saved[index].descriptor, 3, saved[index].events, saved[index].data) != 0) {
+            fprintf(stderr, "[scm-epoll] sparse watch install failed index=%u ep=%d watched=%d\n", index, fd,
+                    saved[index].descriptor);
+            goto fail;
+        }
+        ep_native_watch *native = ep_native_find(fd, saved[index].descriptor);
+        if (native) {
+            native->armed = saved[index].armed;
+            native->owned = metadata->hidden_count != 0;
+            native->logical_descriptor = metadata->hidden_count != 0 ? (int32_t)saved[index].reserved
+                                                                      : saved[index].descriptor;
+        }
+        if (saved[index].descriptor < HL_NFD) {
+            g_ep_owner[saved[index].descriptor] = fd + 1;
+            g_ep_events[saved[index].descriptor] = saved[index].events;
+            g_ep_udata[saved[index].descriptor] = saved[index].data;
+            g_ep_rd[saved[index].descriptor] = (saved[index].armed & 1u) != 0;
+            g_ep_wr[saved[index].descriptor] = (saved[index].armed & 2u) != 0;
+            g_ep_os[saved[index].descriptor] = (saved[index].events & UINT32_C(0x40000000)) != 0;
+        }
+    }
+    free(image);
+    return 0;
+fail:
+    ep_native_retire_epoll(fd);
+    ep_mem_clear(fd);
+    g_epoll[fd] = 0;
+    g_ep_dupd[fd] = 0;
+    g_ep_cslot[fd] = 0;
+    free(image);
+    return -1;
+}
 
 static int ep_mem_test(int ep, int fd) {
     if (ep < 0 || ep >= HL_NFD || fd < 0 || fd >= HL_NFD) return 0;
@@ -186,21 +500,43 @@ static void ep_rearm_from_interest(int ep, int ident, int slot) {
 // udata. Called from fd_reset_emul BEFORE the interest table + ofd id are cleared, and before the real
 // close(). No-op unless the closing fd is both watched (g_ep_owner) and has a dup alias (g_ofd_id).
 static void ep_close_rehome(int fd) {
-    if (fd < 0 || fd >= HL_NFD || !g_ep_owner[fd] || !g_ofd_id[fd]) return;
+    if (fd < 0 || fd >= HL_NFD || !g_ofd_id[fd]) return;
+    int y = ofd_surviving_alias(fd);
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        ep_native_watch *watch = &g_ep_native_watches[index];
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 || watch->descriptor != fd) continue;
+        int owner = watch->epoll;
+        if (y < 0 || y >= HL_NFD || y == fd || ep_native_find(owner, y)) {
+            ep_mem_set(owner, fd, 0);
+            __atomic_store_n(&watch->active, 0, __ATOMIC_RELEASE);
+            continue;
+        }
+#if defined(__linux__)
+        if (owner >= 0 && owner < HL_NFD && g_ep_chgn[owner] > 0) {
+            (void)kevent(owner, g_ep_chg[owner], g_ep_chgn[owner], NULL, 0, NULL);
+            g_ep_chgn[owner] = 0;
+        }
+        (void)hl_native_kevent_rehome(owner, fd, y);
+#else
+        struct kevent changes[2];
+        int count = 0;
+        uint16_t flags = (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
+                                    (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
+        if (watch->armed & 1u) EV_SET(&changes[count++], y, EVFILT_READ, EV_ADD | flags, 0, 0,
+                                      (void *)(uintptr_t)watch->data);
+        if (watch->armed & 2u) EV_SET(&changes[count++], y, EVFILT_WRITE, EV_ADD | flags, 0, 0,
+                                      (void *)(uintptr_t)watch->data);
+        if (count) (void)kevent(owner, changes, count, NULL, 0, NULL);
+#endif
+        watch->descriptor = y;
+        watch->logical_descriptor = y;
+        ep_mem_set(owner, y, 1);
+        ep_mem_set(owner, fd, 0);
+    }
+    if (!g_ep_owner[fd] || y < 0 || y >= HL_NFD || y == fd) return;
     int ep = g_ep_owner[fd] - 1;
     if (ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1) return; // epoll instance gone
-    int y = ofd_surviving_alias(fd);
-    if (y < 0 || y >= HL_NFD || y == fd) return; // last OFD reference is closing -> let the knote die
     if (g_ep_owner[y]) return;                   // the alias is already a watched fd of its own -> don't clobber
-#if defined(__linux__)
-    if (g_ep_chgn[ep] > 0) {
-        (void)kevent(ep, g_ep_chg[ep], g_ep_chgn[ep], NULL, 0, NULL);
-        g_ep_chgn[ep] = 0;
-    }
-    (void)hl_native_kevent_rehome(ep, fd, y);
-#else
-    ep_rearm_from_interest(ep, y, fd); // kqueue keys interest by descriptor number, so move its knotes
-#endif
     /* Native epoll keys the registration by the watched open-file description and retains it until its
        final alias closes.  Re-adding y would create or collide with a second registration; only the guest
        bookkeeping needs to follow the surviving descriptor. */
@@ -564,24 +900,26 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
             *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ev;
             memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &kv[i].udata, 8);
             // EPOLLONESHOT: the kernel auto-removed this registration; keep our armed map in sync.
-            if (opt && kv[i].ident < HL_NFD && g_ep_os[kv[i].ident]) {
+            if (kv[i].ident < HL_NFD && g_ep_os[kv[i].ident]) {
                 if (kv[i].filter == EVFILT_READ)
                     g_ep_rd[kv[i].ident] = 0;
                 else if (kv[i].filter == EVFILT_WRITE)
                     g_ep_wr[kv[i].ident] = 0;
             }
+            if (kv[i].ident < HL_NFD) ep_native_disarm(epoll_slot(ep), (int)kv[i].ident, kv[i].filter);
             oi++;
         }
         /* Provider pumps only publish an atomic readiness mark and trigger the
          * EVFILT_USER wake.  The epoll owner consumes and formats it here, so
          * callbacks never mutate epoll queues or acquire inherited locks. */
+        int registry_ep = epoll_slot(ep);
         uint32_t provider_ep_generation =
-            ep >= 0 && ep < HL_NFD ? g_ep_provider_generations[ep] : 0;
+            registry_ep >= 0 && registry_ep < HL_NFD ? g_ep_provider_generations[registry_ep] : 0;
         for (uint32_t provider_index = 0; provider_index < EP_PROVIDER_WATCH_LIMIT && oi < maxev;
              ++provider_index) {
             ep_provider_watch *provider_watch = &g_ep_provider_watches[provider_index];
             if (atomic_load_explicit(&provider_watch->state, memory_order_acquire) != EP_PROVIDER_ACTIVE ||
-                provider_watch->epoll != ep ||
+                provider_watch->epoll != registry_ep ||
                 provider_watch->epoll_generation != provider_ep_generation)
                 continue;
             hl_linux_fd_snapshot provider_snapshot;
@@ -643,11 +981,11 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
         // Object-backed watches (inotify): no host fd feeds the kqueue, so sample the object's readiness
         // on this bounded tick and format the event here, exactly as poll()/select() observe the same
         // typed objects. Runs after ep_unlock so the object mutex is never taken under the epoll lock.
-        if (ep >= 0 && ep < HL_NFD && g_ep_object_count[ep] > 0) {
-            uint32_t obj_ep_generation = g_ep_provider_generations[ep];
+        if (registry_ep >= 0 && registry_ep < HL_NFD && g_ep_object_count[registry_ep] > 0) {
+            uint32_t obj_ep_generation = g_ep_provider_generations[registry_ep];
             for (uint32_t oidx = 0; oidx < EP_OBJECT_WATCH_LIMIT && oi < maxev; ++oidx) {
                 ep_object_watch *ow = &g_ep_object_watches[oidx];
-                if (atomic_load_explicit(&ow->active, memory_order_acquire) == 0 || ow->epoll != ep ||
+                if (atomic_load_explicit(&ow->active, memory_order_acquire) == 0 || ow->epoll != registry_ep ||
                     ow->epoll_generation != obj_ep_generation)
                     continue;
                 hl_linux_fd_snapshot osnap;
@@ -745,7 +1083,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         g_eventfd_peer[fds[0]] = peer + 1;
         g_eventfd_cslot[fds[0]] = fds[0] + 1;
         g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
-        g_eventfd_gnb[fds[0]] = (a1 & 0x800) != 0; // EFD_NONBLOCK -> guest wants non-blocking reads
+        eventfd_guest_nb_set(fds[0], (a1 & 0x800) != 0); // OFD-shared guest non-blocking intent
         g_eventfd_count[fds[0]] = a0;              // initval
         g_eventfd_refs[fds[0]] = 1;                // one alias (this fd); dup() bumps it (fd_carry_virt)
         if (a0 > 0) {
@@ -775,7 +1113,9 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             g_ep_primen[r] = 0;
             g_ep_wake_armed[r] = 0;
             g_epoll[r] = 1;
+            g_ep_cslot[r] = (uint16_t)(r + 1);
             g_epoll_family_seen = 1;
+            ep_native_retire_epoll(r);
             ep_mem_clear(r);
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -784,6 +1124,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // epoll_ctl(epfd, op, fd, event) -> kevent
     case 21: {
         int op = (int)a1, fd = (int)a2, epfd = (int)a0;
+        int registry_ep = epoll_slot(epfd);
         uint32_t ev = 0;
         uint64_t data = (uint64_t)(unsigned)fd;
         // (extends): epoll_ctl(2) full error surface, in the kernel's exact ORDER (LTP
@@ -844,8 +1185,9 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a engine-tracked epoll
         // instance (membership bitmap). Confined to fd < HL_NFD, matching the readiness path below.
-        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
-            int ep = epfd;
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD &&
+            fd >= 0 && fd < HL_NFD) {
+            int ep = registry_ep;
             int member = ep_mem_test(ep, fd);
             if (op == 1 && member) {
                 G_RET(c) = (uint64_t)(-EEXIST);
@@ -861,15 +1203,20 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // survives fork (re-armed on the rebuilt child kqueue) and a watched-fd close whose OFD lives on via a
         // dup (re-homed onto the surviving alias). DEL drops the entry. Confined to in-range epfd/fd, matching
         // the readiness path; a couple of fd-indexed stores, so the epoll_ctl hot path is essentially unchanged.
-        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD) {
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD &&
+            fd >= 0 && fd < HL_NFD) {
             if (op == 2) { // DEL
                 g_ep_owner[fd] = 0;
                 g_ep_events[fd] = 0;
                 g_ep_udata[fd] = 0;
             } else { // ADD / MOD
-                g_ep_owner[fd] = epfd + 1;
+                g_ep_owner[fd] = registry_ep + 1;
                 g_ep_events[fd] = ev;
                 g_ep_udata[fd] = data;
+            }
+            if (ep_native_set(registry_ep, fd, op, ev, data) != 0) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
             }
         }
         // op: 1=ADD 2=DEL 3=MOD ; EPOLLET=0x80000000 -> EV_CLEAR ; EPOLLONESHOT=0x40000000 -> EV_ONESHOT
@@ -932,6 +1279,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         for (int i = 0; i < n; i++) {
             // per-filter so DEL of an absent one is ignored
             kevent((int)a0, &kv[i], 1, NULL, 0, NULL);
+        }
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && fd >= 0 && fd < HL_NFD) {
+            g_ep_rd[fd] = want_rd ? 1 : 0;
+            g_ep_wr[fd] = want_wr ? 1 : 0;
+            g_ep_os[fd] = (op != 2 && (ev & UINT32_C(0x40000000))) ? 1 : 0;
         }
         // EPOLLET: prime an already-ready fd so its initial readiness is reported (see g_ep_prime).
         if ((xf & EV_CLEAR) && op != 2) {
@@ -1040,6 +1392,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             fcntl(r, F_SETFD, (a0 & 0x80000) ? FD_CLOEXEC : 0);
         }
 #endif
+        if (r >= 0 && r < HL_NFD) {
+            g_inotify[r] = 1;
+            g_epoll_family_seen = 1;
+            g_inotify_nb[r] = (a0 & 0x800) ? 1 : 0;
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1059,6 +1416,17 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
 #if defined(__linux__)
         int wd = inotify_add_watch((int)a0, p, (uint32_t)a2);
+        if (wd >= 0 && wd < HL_NFD) {
+            struct stat dst;
+            snprintf(g_inotify_wpath[wd], sizeof g_inotify_wpath[wd], "%s", p);
+            g_inotify_mask[wd] = (uint32_t)a2;
+            g_inotify_isdir[wd] = stat(p, &dst) == 0 && S_ISDIR(dst.st_mode);
+            if (g_inotify_isdir[wd]) {
+                free(g_inotify_snap[wd]);
+                g_inotify_snap[wd] = dir_snapshot(p);
+            }
+            g_inotify_owner[wd] = (int)a0;
+        }
         G_RET(c) = wd < 0 ? (uint64_t)(-errno) : (uint64_t)wd;
 #else
         int wfd = hl_native_open_watch(p);
@@ -1075,12 +1443,16 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             G_RET(c) = (uint64_t)(-(int64_t)e);
             break;
         }
-        // a directory watch: remember the path + a snapshot so read() can diff into IN_CREATE/IN_DELETE+name
+        // Remember every watched path/mask; directories also retain a name snapshot for create/delete diffs.
         struct stat dst;
-        if (wfd >= 0 && wfd < HL_NFD && stat(p, &dst) == 0 && S_ISDIR(dst.st_mode)) {
+        if (wfd >= 0 && wfd < HL_NFD) {
             snprintf(g_inotify_wpath[wfd], sizeof g_inotify_wpath[wfd], "%s", p);
-            free(g_inotify_snap[wfd]);
-            g_inotify_snap[wfd] = dir_snapshot(p);
+            g_inotify_mask[wfd] = (uint32_t)a2;
+            g_inotify_isdir[wfd] = stat(p, &dst) == 0 && S_ISDIR(dst.st_mode);
+            if (g_inotify_isdir[wfd]) {
+                free(g_inotify_snap[wfd]);
+                g_inotify_snap[wfd] = dir_snapshot(p);
+            }
             g_inotify_owner[wfd] = (int)a0; // the inotify instance this watch belongs to (for the move queue)
         }
         G_RET(c) = (uint64_t)wfd;

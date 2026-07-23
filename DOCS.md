@@ -95,13 +95,23 @@ need not retain configuration storage. Applying these values to the instance opt
 or allocation failure destroys the candidate instance without starting a process or changing another engine.
 
 ABI 1 is the exact prefix ending at `environment`; ABI 2 appends the remaining settings. Cache enable and disable are
-mutually exclusive, checkpoint and restore cannot be selected together, an IP requires a bridge, external publication
+mutually exclusive. Checkpoint and restore directories may be selected together so a restored process tree is armed
+for its next capture; an IP requires a bridge, external publication
 requires publication rules, and isolated networking rejects publication, bridge, IP, and egress settings. Full host
 sandboxing and sentry-only routing are distinct mutually exclusive modes. Cache, filesystem-generation, checkpoint,
 and restore locations are absolute paths. A non-NULL string is always nonempty. The serialized `hl_launch_config`
 remains the launcher wire format, not the preferred embedding API; public callers never receive raw access to the
 internal `HL_*` option registry. Rootfs and scalar memory/pid/CPU limits live in `hl_engine_config`, arguments are
 supplied to `hl_engine_run`, and debug logging is deliberately a debug-build concern rather than box configuration.
+
+Checkpoint/restore is currently an AArch64, full-or-refuse operation. A successful capture freezes every live
+descendant at an engine safepoint, writes each process's guest memory, CPU state, signal dispositions, identity, and
+path-backed descriptors into a temporary process directory, syncs those files, atomically publishes each process,
+and syncs `MANIFEST` last. Restore rejects incomplete manifests and malformed process trees before resuming init.
+The current format supports single-threaded process trees with regular-file and terminal descriptors. Capture
+explicitly refuses multi-threaded processes, sentry/untrusted mode, and guest-owned sockets, pipes, epoll, eventfd,
+timerfd, inotify, and memfd descriptors. A process that daemonizes out of the init descendant tree is not yet captured.
+These cases are unsupported, not silently omitted from a successful image.
 
 ### 3.2 Engine core (`src/core`)
 

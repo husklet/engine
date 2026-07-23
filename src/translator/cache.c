@@ -937,7 +937,17 @@ static void stw_park_handler(int sig, siginfo_t *si, void *ucv) {
        precision.  Ordinary cache rotation still parks here. */
     if (atomic_load_explicit(&g_dispatch_gate, memory_order_acquire)) {
         int slot = g_my_stw_slot;
-        if (slot >= 0 && g_stw_threads[slot].cpu) g_stw_threads[slot].cpu->irq = 1;
+        if (slot >= 0 && g_stw_threads[slot].cpu) {
+            struct cpu *cpu = g_stw_threads[slot].cpu;
+            cpu->irq = 1;
+            if (!atomic_load_explicit(&g_stw_threads[slot].in_translated, memory_order_acquire) &&
+                !__atomic_load_n(&cpu->in_service, __ATOMIC_SEQ_CST)) {
+                uint64_t request = atomic_load_explicit(&g_dispatch_request, memory_order_acquire);
+                atomic_store_explicit(&g_stw_threads[slot].dispatch_ack, request, memory_order_release);
+                while (atomic_load_explicit(&g_dispatch_gate, memory_order_acquire))
+                    jit_backoff_ns(UINT64_C(50000));
+            }
+        }
         return;
     }
     atomic_fetch_add_explicit(&g_stw_parked, 1, memory_order_seq_cst);
@@ -1119,6 +1129,73 @@ static void stw_mapping_end(void) {
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
     pthread_mutex_unlock(&g_jit_lock);
+}
+
+/* Arm a checkpoint-grade dispatcher barrier.  Unlike stw_mapping_begin(), the
+   caller must interrupt every peer, including threads blocked in host service,
+   then call stw_checkpoint_wait().  The registry remains locked throughout so
+   the returned inventory cannot gain or lose a thread before release. */
+static uint64_t stw_checkpoint_arm(void) {
+    pthread_t caller = pthread_self();
+    pthread_mutex_lock(&g_jit_lock);
+    uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
+    pthread_mutex_lock(&g_stw_reg_lock);
+    for (int i = 0; i < STW_MAXTHREAD; i++) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        if (pthread_equal(g_stw_threads[i].th, caller))
+            atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
+        else if (g_stw_threads[i].cpu)
+            __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
+    }
+    // A peer may have passed its top-of-dispatch gate immediately before activation and be waiting for
+    // g_jit_lock. Let it drain through cache lookup to stw_before_translated(), where it acknowledges and
+    // parks. g_stw_reg_lock remains held, so the checkpoint thread inventory is still immutable.
+    pthread_mutex_unlock(&g_jit_lock);
+    return request;
+}
+
+static int stw_checkpoint_wait(uint64_t request) {
+    for (int attempt = 0; attempt < 100000; attempt++) {
+        int pending = 0;
+        for (int i = 0; i < STW_MAXTHREAD; i++) {
+            if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+            if (atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) < request) {
+                pending = 1;
+                break;
+            }
+        }
+        if (!pending) return 0;
+        jit_backoff_ns(UINT64_C(50000));
+    }
+    for (int i = 0; i < STW_MAXTHREAD; i++) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        uint64_t ack = atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire);
+        if (ack >= request) continue;
+        struct cpu *c = g_stw_threads[i].cpu;
+        fprintf(stderr, "[ckpt] thread barrier timeout tid=%d translated=%d service=%llu ack=%llu request=%llu\n",
+                c ? c->tid : -1,
+                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire),
+                (unsigned long long)(c ? __atomic_load_n(&c->in_service, __ATOMIC_SEQ_CST) : 0),
+                (unsigned long long)ack,
+                (unsigned long long)request);
+    }
+    return -1;
+}
+
+static int stw_checkpoint_cpus(struct cpu **out, int capacity) {
+    int count = 0;
+    for (int i = 0; i < STW_MAXTHREAD; i++) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        if (count < capacity) out[count] = g_stw_threads[i].cpu;
+        count++;
+    }
+    return count;
+}
+
+static void stw_checkpoint_end(void) {
+    atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
+    pthread_mutex_unlock(&g_stw_reg_lock);
 }
 
 // # of OTHER live guest threads (excludes the caller). 0 -> the cheap in-place flush is safe.

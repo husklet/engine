@@ -187,6 +187,11 @@ static void run_guest(struct cpu *c) {
         // from bouncing a hot loop out of the code cache every iteration -- a fresh signal simply re-sets
         // irq (host_sigh / thread-directed path) and the next body check catches it.
         c->irq = 0;
+        // A checkpoint freezes the registry while holding g_jit_lock. Peers must acknowledge and park at
+        // this already-spilled dispatcher boundary BEFORE cache lookup attempts to acquire that same lock.
+        // The threaded gate is also the precise boundary needed by mapping activation; single-threaded runs
+        // retain their zero-overhead path.
+        if (g_threaded) stw_dispatch_safepoint();
 #ifdef G_CKPT_POLL
         // Checkpoint safepoint: all guest architectural state is spilled into `c` here, so a pending
         // control-triggered checkpoint (SIGUSR1) writes a coherent snapshot and _exit()s. Defined only by
@@ -341,10 +346,12 @@ static void run_guest(struct cpu *c) {
         if (!stw_before_translated(selected_bus_epoch)) continue;
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
         run_block(c, rxcode);
-        stw_after_translated();
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);
+        // Keep in_translated asserted through reason/service handling. Once cleared, the CPU is a complete
+        // resumable dispatcher image, so an asynchronous checkpoint park may safely acknowledge it.
+        stw_after_translated();
         // W4E tier-2: a hot self-loop's back-edge counter fired -> recompile+swap it in. pc is already =
         // loop start, so the next iteration of this dispatcher loop runs the folded block. R_TIER2 is
         // disjoint from R_SYSCALL (handled in the reason hook above) so this never double-fires.

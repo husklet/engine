@@ -17,6 +17,7 @@
 #include "../../include/hl/config.h"
 #include "../../include/hl/host_services.h"
 #include "../../include/hl/linux_abi.h"
+#include "../host/system.h"
 #include "launch.h"
 #include "options.h"
 
@@ -336,8 +337,17 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
         fprintf(stderr, "hl-engine: --configfile: open failed: %s\n", path);
         return 78;
     }
+    /* The unlinked launch wire remains open while the runner owns pointers
+     * decoded from it.  It is engine control state, never a guest descriptor. */
+    hl_host_private_init();
+    if (hl_host_process_fd_private_add(fd) != 0) {
+        close(fd);
+        fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
+        return 78;
+    }
     unlink(path);
     int rc = hl_read_config_file(fd, runner);
+    hl_host_process_fd_private_remove(fd);
     close(fd);
     return rc;
 }

@@ -175,6 +175,12 @@ impl Launch {
         if let Some(coherence) = spec.filesystem.coherence {
             config = config.filesystem_generation(coherence.host_path());
         }
+        if let Some(directory) = spec.checkpoint.capture_directory {
+            config = config.checkpoint_directory(directory);
+        }
+        if let Some(directory) = spec.checkpoint.restore_directory {
+            config = config.restore_directory(directory);
+        }
         for (name, value) in spec.process.env {
             config = config.env(name, value);
         }

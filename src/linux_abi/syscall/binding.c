@@ -2254,9 +2254,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             int64_t epoll_result = -ENOSYS;
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && (int)a2 >= 0 && (int)a2 < HL_NFD &&
                 hl_provider_files_is_handle(watched.host_handle)) {
-                uint32_t epoll_generation = g_ep_provider_generations[(int)a0];
+                int registry_ep = epoll_slot((int)a0);
+                uint32_t epoll_generation = g_ep_provider_generations[registry_ep];
                 ep_provider_watch *watch = ep_provider_find(g_ep_provider_watches, EP_PROVIDER_WATCH_LIMIT,
-                                                            (int)a0, epoll_generation, (int)a2,
+                                                            registry_ep, epoll_generation, (int)a2,
                                                             watched.descriptor_generation);
                 if (a1 == HL_LINUX_EPOLL_DELETE) {
                     if (watch == NULL) epoll_result = -ENOENT;
@@ -2281,7 +2282,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                         uint32_t serial = g_ep_provider_serial = ep_provider_next(g_ep_provider_serial);
                         uint32_t interests = ((events & 1u) ? HL_LINUX_READY_READ : 0u) |
                                              ((events & 4u) ? HL_LINUX_READY_WRITE : 0u);
-                        ep_provider_activate(replacement, (int)a0, epoll_generation, (int)a2,
+                        ep_provider_activate(replacement, registry_ep, epoll_generation, (int)a2,
                                              watched.descriptor_generation, serial, watched.host_handle,
                                              events, interests, data);
                         ep_wake_arm((int)a0);
@@ -2307,8 +2308,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                     hl_linux_object_unpin(&pin);
                 }
                 if (object_epollable) {
-                    uint32_t epoll_generation = g_ep_provider_generations[(int)a0];
-                    ep_object_watch *watch = ep_object_find((int)a0, epoll_generation, (int)a2,
+                    int registry_ep = epoll_slot((int)a0);
+                    uint32_t epoll_generation = g_ep_provider_generations[registry_ep];
+                    ep_object_watch *watch = ep_object_find(registry_ep, epoll_generation, (int)a2,
                                                             watched.descriptor_generation);
                     if (a1 == HL_LINUX_EPOLL_DELETE) {
                         if (watch == NULL) epoll_result = -ENOENT;
@@ -2331,11 +2333,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                                     G_RET(c) = (uint64_t)(int64_t)-ENOSPC;
                                     return 1;
                                 }
-                                watch->epoll = (int)a0;
+                                watch->epoll = registry_ep;
                                 watch->epoll_generation = epoll_generation;
                                 watch->descriptor = (int)a2;
                                 watch->descriptor_generation = watched.descriptor_generation;
-                                g_ep_object_count[(int)a0]++;
+                                g_ep_object_count[registry_ep]++;
                             }
                             watch->events = events;
                             watch->interests = interests;

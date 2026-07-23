@@ -35,12 +35,23 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
     hl_host_services services = {0};
     hl_engine_fd_binding bindings[3] = {0};
     hl_engine_executable executable = {0};
+    const char *checkpoint_directory =
+        options == NULL ? hl_option_get("HL_CHECKPOINT_DIR") : hl_options_get(options, "HL_CHECKPOINT_DIR");
+    const char *restore_directory =
+        options == NULL ? hl_option_get("HL_RESTORE_DIR") : hl_options_get(options, "HL_RESTORE_DIR");
+    hl_engine_box_config box = {.abi = HL_ENGINE_BOX_ABI,
+                                .size = sizeof(box),
+                                .uid = -1,
+                                .gid = -1,
+                                .checkpoint_directory = checkpoint_directory,
+                                .restore_directory = restore_directory};
     hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config), .guest_isa = guest_isa, .rootfs = rootfs};
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     hl_engine *engine = NULL;
     hl_status status = hl_native_host_create(&native, &services);
     uint32_t binding_count = 0;
     int exit_status = 70;
+    if (checkpoint_directory != NULL || restore_directory != NULL) config.box = &box;
     if (status == HL_STATUS_OK) {
         if (rootfs == NULL && argc != 0 && argv != NULL && argv[0] != NULL) {
             hl_host_result opened = services.file->open_relative(

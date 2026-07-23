@@ -121,7 +121,9 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
         ));
     }
     if !checkpoint.enabled
-        && (checkpoint.maximum_pause_ms.is_some()
+        && (checkpoint.capture_directory.is_some()
+            || checkpoint.restore_directory.is_some()
+            || checkpoint.maximum_pause_ms.is_some()
             || checkpoint.mode != crate::spec::CheckpointMode::Full
             || checkpoint.incompatible_resources != crate::spec::IncompatibleResourcePolicy::Refuse)
     {
@@ -131,11 +133,50 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
             "checkpoint options require checkpointing to be enabled",
         ));
     }
-    if checkpoint.enabled {
+    if !checkpoint.enabled {
+        return Ok(());
+    }
+    if checkpoint.capture_directory.is_none() && checkpoint.restore_directory.is_none() {
+        return Err(spec_error(
+            SpecErrorCategory::Conflict,
+            "checkpoint",
+            "a capture or restore directory is required",
+        ));
+    }
+    let directory = checkpoint
+        .capture_directory
+        .as_ref()
+        .or(checkpoint.restore_directory.as_ref())
+        .expect("validated checkpoint operation");
+    if !directory.is_absolute() {
+        return Err(spec_error(
+            SpecErrorCategory::Invalid,
+            "checkpoint",
+            "checkpoint directories must be absolute",
+        ));
+    }
+    if directory.parent().is_none() || directory.file_name().is_none() {
+        return Err(spec_error(
+            SpecErrorCategory::Invalid,
+            "checkpoint",
+            "checkpoint directory must name a non-root destination",
+        ));
+    }
+    if spec.guest.architecture != crate::Guest::Aarch64 {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
-            "checkpoint.enabled",
-            "checkpointing is not supported",
+            "checkpoint",
+            "native checkpoint/restore currently supports AArch64 guests only",
+        ));
+    }
+    if checkpoint.mode != crate::spec::CheckpointMode::Full
+        || checkpoint.maximum_pause_ms.is_some()
+        || checkpoint.incompatible_resources != crate::spec::IncompatibleResourcePolicy::Refuse
+    {
+        return Err(spec_error(
+            SpecErrorCategory::Unsupported,
+            "checkpoint",
+            "only full checkpoints with refuse-on-incompatible-resource policy are supported",
         ));
     }
     Ok(())

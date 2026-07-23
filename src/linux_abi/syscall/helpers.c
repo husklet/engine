@@ -1,9 +1,5 @@
 // Extracted service() helper block: file-scope globals + static helper functions used by service().
 // Not standalone -- #included by ../service.c after its system headers and before static void service().
-// Emulated pipe-buffer sizes for F_SETPIPE_SZ/F_GETPIPE_SZ (macOS has no pipe-size fcntl): we record
-// the requested (page-rounded) size per-fd and report it back, so size-probing programs see it stick.
-static int g_pipesz[HL_NFD];
-
 // ---- guest RLIMIT_NOFILE enforcement -------------------------------------------------------------
 // hl shares the host descriptor table, whose real cap is far larger than the guest's (engine-private fds
 // are hoisted above 1<<20, see engine_fd_hoist), so the guest's soft RLIMIT_NOFILE is purely EMULATED
@@ -1288,6 +1284,11 @@ static uint8_t g_epoll[HL_NFD]; // per fd: an epoll instance (backed by kqueue) 
 // interest DIRECTLY to the kernel (the deferred per-epfd changelist would strand a change on one alias);
 // forces epoll_ctl/epoll_wait onto the immediate path for a dup'd instance.
 static uint8_t g_ep_dupd[HL_NFD];
+static uint16_t g_ep_cslot[HL_NFD]; // epoll aliases -> canonical registry slot + 1
+
+static int epoll_slot(int fd) {
+    return fd >= 0 && fd < HL_NFD && g_ep_cslot[fd] ? (int)g_ep_cslot[fd] - 1 : fd;
+}
 
 // ---- per-instance epoll interest table (fd -> owning instance + events + udata) --------------------
 // Linux keeps an interest list per epoll instance and ties each registration to the underlying OPEN FILE
@@ -1306,6 +1307,9 @@ static int g_ep_owner[HL_NFD];       // watched fd -> owning epoll instance fd +
 static uint32_t g_ep_events[HL_NFD]; // watched fd -> the epoll events mask registered (EPOLLIN/OUT/ET/ONESHOT)
 static uint64_t g_ep_udata[HL_NFD];  // watched fd -> the epoll_event.data registered for it
 static void ep_mem_close(int ep, int fd); // implemented beside the membership table in event.c
+static int ep_mem_test(int ep, int fd);
+static void ep_mem_set(int ep, int fd, int on);
+static void ep_mem_clear(int ep);
 
 // ---- open-file-description identity for fd-number aliases (dup) -------------------------------------
 // hl shares the host descriptor table with the guest, so two guest fds that refer to the same OFD are two
@@ -1313,20 +1317,17 @@ static void ep_mem_close(int ep, int fd); // implemented beside the membership t
 // dup(2)/dup2/dup3/F_DUPFD tags both fds with a shared group id (see fd_carry_virt). close() clears the id.
 // Used by the epoll close path to find a surviving alias of a just-closed watched fd (finding: epoll
 // readiness must persist while a dup keeps the OFD open).
-static uint32_t g_ofd_id[HL_NFD]; // 0 = no known alias; else a group id shared by every dup of this OFD
-static uint32_t g_ofd_next = 1;
-
 // Assign (or propagate) a shared OFD group id from oldfd to newfd on dup.
 static void ofd_link_dup(int newfd, int oldfd) {
     if (oldfd < 0 || oldfd >= HL_NFD || newfd < 0 || newfd >= HL_NFD || oldfd == newfd) return;
-    if (!g_ofd_id[oldfd]) g_ofd_id[oldfd] = g_ofd_next++;
+    if (!g_ofd_id[oldfd]) g_ofd_id[oldfd] = ofd_identity_new();
     g_ofd_id[newfd] = g_ofd_id[oldfd];
 }
 
 // Find an OPEN guest fd (other than `fd`) that shares fd's OFD group id, or -1 if none survives.
 static int ofd_surviving_alias(int fd) {
     if (fd < 0 || fd >= HL_NFD || !g_ofd_id[fd]) return -1;
-    uint32_t id = g_ofd_id[fd];
+    uint64_t id = g_ofd_id[fd];
     for (int i = 0; i < HL_NFD; i++)
         if (i != fd && g_ofd_id[i] == id && fcntl(i, F_GETFD) != -1) return i;
     return -1;
@@ -1357,10 +1358,46 @@ static void ep_push(int ep, uintptr_t ident, int16_t filt, uint16_t flags, void 
     EV_SET(&a[g_ep_chgn[ep]++], ident, filt, flags, 0, 0, udata);
 }
 
+static void ep_rehome_instance(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_epoll[fd] || epoll_slot(fd) != fd) return;
+    int replacement = -1;
+    for (int candidate = 0; candidate < HL_NFD; ++candidate)
+        if (candidate != fd && g_epoll[candidate] && epoll_slot(candidate) == fd &&
+            fcntl(candidate, F_GETFD) >= 0) {
+            replacement = candidate;
+            break;
+        }
+    if (replacement < 0) return;
+    g_ep_provider_generations[replacement] = g_ep_provider_generations[fd];
+    for (int candidate = 0; candidate < HL_NFD; ++candidate) {
+        if (g_ep_cslot[candidate] == (uint16_t)(fd + 1)) g_ep_cslot[candidate] = (uint16_t)(replacement + 1);
+        if (g_ep_owner[candidate] == fd + 1) g_ep_owner[candidate] = replacement + 1;
+        if (ep_mem_test(fd, candidate)) ep_mem_set(replacement, candidate, 1);
+    }
+    ep_mem_clear(fd);
+    for (uint32_t index = 0; index < EP_PROVIDER_WATCH_LIMIT; ++index) {
+        ep_provider_watch *watch = &g_ep_provider_watches[index];
+        if (atomic_load_explicit(&watch->state, memory_order_acquire) == EP_PROVIDER_ACTIVE && watch->epoll == fd) {
+            watch->epoll = replacement;
+            watch->epoll_generation = g_ep_provider_generations[replacement];
+        }
+    }
+    for (uint32_t index = 0; index < EP_OBJECT_WATCH_LIMIT; ++index) {
+        ep_object_watch *watch = &g_ep_object_watches[index];
+        if (atomic_load_explicit(&watch->active, memory_order_acquire) != 0 && watch->epoll == fd) {
+            watch->epoll = replacement;
+            watch->epoll_generation = g_ep_provider_generations[replacement];
+        }
+    }
+    g_ep_object_count[replacement] = g_ep_object_count[fd];
+    g_ep_object_count[fd] = 0;
+}
+
 // reset epoll armed-state for a guest fd (called from close(): kqueue auto-removes a closed fd, so the
 // armed map must follow to avoid a later stale EV_DELETE on a reused fd number).
 static void ep_fd_reset(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
+    ep_rehome_instance(fd);
     // Closing the final descriptor for a watched OFD removes its registration from Linux epoll.  kqueue
     // removes the knote itself, but our Linux EEXIST/ENOENT membership mirror must be cleared explicitly;
     // otherwise immediate reuse of this descriptor number makes a fresh EPOLL_CTL_ADD fail with EEXIST.
@@ -1387,6 +1424,7 @@ static void ep_fd_reset(int fd) {
     }
     g_epoll[fd] = 0;   // a reused fd number is no longer an epoll instance
     g_ep_dupd[fd] = 0; // ...nor a dup alias of one
+    g_ep_cslot[fd] = 0;
     // drop this fd's own interest-table entry + OFD group id (any surviving-dup re-home already ran in
     // ep_close_rehome). A reused fd number must start with no owner/events/udata and no stale alias link.
     g_ep_owner[fd] = 0;
@@ -1418,7 +1456,12 @@ static void inotify_fd_reset(int fd) {
                 g_inotify_snap[w] = NULL;
                 g_inotify_wpath[w][0] = 0;
                 g_inotify_owner[w] = 0;
+                g_inotify_mask[w] = 0;
+                g_inotify_pending[w] = 0;
+                g_inotify_isdir[w] = 0;
+#if !defined(__linux__)
                 close(w); // the watch's own host O_EVTONLY fd; kqueue auto-removes its EVFILT_VNODE registration
+#endif
             }
         }
         g_inotify[fd] = 0;
@@ -1431,6 +1474,12 @@ static void inotify_fd_reset(int fd) {
         g_inotify_wpath[fd][0] = 0;
     }
     g_inotify_owner[fd] = 0;
+    g_inotify_mask[fd] = 0;
+    g_inotify_pending[fd] = 0;
+    g_inotify_isdir[fd] = 0;
+    free(g_inotify_raw[fd]);
+    g_inotify_raw[fd] = NULL;
+    g_inotify_raw_len[fd] = g_inotify_raw_pos[fd] = 0;
 }
 
 // Shared boundary errno translation for every svc_<family>() module tail. Each family early-returns from

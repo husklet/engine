@@ -1626,8 +1626,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // (g_self_gppid), since its live host parent differs after the tree was re-forked.
         if (g_self_gppid >= 0)
             G_RET(c) = (uint64_t)g_self_gppid;
-        else
-            G_RET(c) = (container_pid() == 1) ? 0 : (uint64_t)getppid();
+        else if (container_pid() == 1)
+            G_RET(c) = 0;
+        else {
+            pid_t parent = getppid();
+            G_RET(c) = (uint64_t)((g_init_hostpid && parent == g_init_hostpid) ? 1 : parent);
+        }
         break;
     // getuid/geteuid -> container uid (0=root by default), reflecting any runtime drop (apt -> _apt).
     case 174:

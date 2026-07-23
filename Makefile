@@ -368,7 +368,7 @@ SOAK_CASE_NAMES := $(basename $(notdir $(SOAK_CASE_SOURCES)))
 SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
-.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir e2e-mac-gates \
+.PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-checkpoint-tree e2e-checkpoint-signal e2e-checkpoint-pipe e2e-checkpoint-deleted e2e-checkpoint-threads e2e-checkpoint-memfd e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir e2e-mac-gates \
 	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 # A mac bridge launch owns a remote process group and a shared capture mount.
@@ -780,6 +780,62 @@ $(BUILD)/e2e/guest-spin-x86_64: tests/e2e/guest_spin.c
 $(BUILD)/e2e/guest-descendant-aarch64: tests/e2e/guest_descendant.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-tree-aarch64: tests/e2e/checkpoint_tree.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-signal-aarch64: tests/e2e/checkpoint_signal_state.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-pipe-aarch64: tests/e2e/checkpoint_pipe.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-deleted-aarch64: tests/e2e/checkpoint_deleted.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-threads-aarch64: tests/e2e/checkpoint_threads.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static -pthread $< -o $@
+
+$(BUILD)/e2e/checkpoint-memfd-aarch64: tests/e2e/checkpoint_memfd.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-eventfd-aarch64: tests/e2e/checkpoint_eventfd.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-timerfd-aarch64: tests/e2e/checkpoint_timerfd.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-inotify-aarch64: tests/e2e/checkpoint_inotify.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-epoll-aarch64: tests/e2e/checkpoint_epoll.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-socketpair-aarch64: tests/e2e/checkpoint_socketpair.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-socket-state-aarch64: tests/e2e/checkpoint_socket_state.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-connected-socket-aarch64: tests/e2e/checkpoint_connected_socket.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-connecting-refusal-aarch64: tests/e2e/checkpoint_connecting_refusal.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
 $(BUILD)/e2e/guest-domain-aarch64: tests/e2e/guest_domain.c
 	@mkdir -p $(@D)
@@ -1831,6 +1887,86 @@ e2e-lifecycle-control: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bri
 	$(BUILD)/tools/bridge-runner $(MAC) $(abspath $(BUILD)/tools/lifecycle-force-x86_64) --force-stop \
 		$(abspath $(BUILD)/e2e/guest-spin-x86_64)
 
+e2e-checkpoint-tree: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-tree-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64)
+
+e2e-checkpoint-signal: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-signal-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-signal-aarch64) signal-state
+
+e2e-checkpoint-pipe: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-pipe-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-pipe-aarch64) pipe
+
+e2e-checkpoint-deleted: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-deleted-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-deleted-aarch64) deleted
+
+e2e-checkpoint-threads: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-threads-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-threads-aarch64) threads
+
+e2e-checkpoint-memfd: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-memfd-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-memfd-aarch64) memfd
+
+e2e-checkpoint-eventfd: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-eventfd-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-eventfd-aarch64) eventfd
+
+e2e-checkpoint-timerfd: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-timerfd-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-timerfd-aarch64) timerfd
+
+e2e-checkpoint-inotify: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-inotify-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-inotify-aarch64) inotify
+
+e2e-checkpoint-epoll: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-epoll-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-epoll-aarch64) epoll-checkpoint
+
+e2e-checkpoint-socketpair: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-socketpair-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-socketpair-aarch64) socketpair
+
+e2e-checkpoint-socket-state: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-socket-state-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-socket-state-aarch64) socket-state
+
+e2e-checkpoint-connected-socket: $(BUILD)/tools/checkpoint-tree-runner \
+	$(BUILD)/e2e/checkpoint-connected-socket-aarch64 $(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-connected-socket-aarch64) connected-socket
+
+e2e-checkpoint-connecting-refusal: $(BUILD)/tools/checkpoint-tree-runner \
+	$(BUILD)/e2e/checkpoint-connecting-refusal-aarch64 $(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-connecting-refusal-aarch64) connecting-refusal
+
+e2e-checkpoint-corrupt-magic: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-tree-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-magic
+
+e2e-checkpoint-corrupt-truncated: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-tree-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-truncated
+
 e2e-embedding-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
 	$(BUILD)/e2e/fd-binding-aarch64 $(BUILD)/e2e/fd-binding-x86_64
@@ -1872,6 +2008,10 @@ $(BUILD)/tools/e2e-runner: tools/e2e_runner.c tools/launch.h
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
 $(BUILD)/tools/bridge-runner: tools/bridge_runner.c tools/launch.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
+
+$(BUILD)/tools/checkpoint-tree-runner: tests/integration/checkpoint_tree_runner.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
 
@@ -2168,15 +2308,16 @@ $(BUILD)/perf/syscall-x86_64: tests/perf/syscall.c
 
 # combined-bench: single-process, self-timing multi-phase guest. The SAME
 # source builds for both arches (portable timer picks cntvct on aarch64,
-# CLOCK_MONOTONIC elsewhere). The sqlite phase is opt-in per arch via
-# COMBINED_BENCH_SQLITE_<arch> (needs a static libsqlite3 for that arch); it is
-# on for aarch64 (host has libsqlite3.a) and off for the x86_64 cross build.
-# A native x86_64 cell can enable it with COMBINED_BENCH_SQLITE_x86_64=1.
+# CLOCK_MONOTONIC elsewhere). The sqlite phase links a static libsqlite3 that
+# nix supplies for BOTH arches: the *_LINUX_STATIC_CC vars carry the -I/-L for
+# the per-arch static sqlite (aarch64 via linuxArmSqlite, x86_64 via
+# linuxX86Sqlite in flake.nix). It is therefore on for both arches by default;
+# a cell can still opt out per arch via COMBINED_BENCH_SQLITE_<arch>=0.
 COMBINED_BENCH_SQLITE_aarch64 ?= 1
-COMBINED_BENCH_SQLITE_x86_64 ?= 0
+COMBINED_BENCH_SQLITE_x86_64 ?= 1
 COMBINED_SQLITE_CPP_1 := -DHL_BENCH_SQLITE
 COMBINED_SQLITE_CPP_0 :=
-COMBINED_SQLITE_LIBS_1 := -lsqlite3 -lm -ldl -lpthread
+COMBINED_SQLITE_LIBS_1 := -lsqlite3 -lm
 COMBINED_SQLITE_LIBS_0 :=
 
 $(BUILD)/perf/combined-bench-aarch64: tests/perf/combined_bench.c

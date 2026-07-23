@@ -251,6 +251,7 @@ static hl_linux_snapshot g_ckpt_snapshot;
 // normal launch (and always for x86, which never arms checkpoint) -- the whole gate is unaffected.
 static volatile uint32_t *g_ckpt_trigger;
 static uint32_t g_ckpt_seen_gen;
+static _Atomic int g_ckpt_barrier_active;
 
 // A whole-tree checkpoint has been requested. Consulted by syscall_should_restart / svc_poll_retry so a
 // process parked in a blocking host syscall (for example a shell in read()/poll on its pty)
@@ -260,7 +261,8 @@ static uint32_t g_ckpt_seen_gen;
 static int ckpt_pending(void) __attribute__((unused));
 
 static int ckpt_pending(void) {
-    return g_ckpt_trigger && (*g_ckpt_trigger != g_ckpt_seen_gen);
+    return atomic_load_explicit(&g_ckpt_barrier_active, memory_order_acquire) ||
+           (g_ckpt_trigger && (*g_ckpt_trigger != g_ckpt_seen_gen));
 }
 
 // This restored process's OWN guest pid (0 => normal launch, report the host pid). A checkpoint restore

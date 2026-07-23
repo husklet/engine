@@ -808,7 +808,12 @@ static void load_elf(const char *path, struct loaded *out) {
         }
         base = (uint8_t *)(uintptr_t)image_mapping.address;
     } else {
-        image_mapping = elf_map_checked(NULL, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+        /* Checkpointable launches must not let ASLR choose an image VA that a
+         * fresh restore process may use for its own mappings.  Main image and
+         * interpreter consume deterministic slots from the same high arena as
+         * the stack, brk, and guest mmap allocations. */
+        void *hint = (void *)(uintptr_t)hl_linux_snapshot_reserve(&g_ckpt_snapshot, span);
+        image_mapping = elf_map_checked(hint, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                                         HL_HOST_MEMORY_PRIVATE, "image base");
         base = (uint8_t *)(uintptr_t)image_mapping.address;
     }

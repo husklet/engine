@@ -53,8 +53,9 @@ canonicalization, and directory enumeration do not use extension-specific syscal
 revoked when the machine exits. The `engine.handles` contract also advertises bounded
 `memory-allocation`: launch-scoped `Memory` authority allocates validated host resources before the guest starts,
 retains them for the machine lifetime, and releases them on exit or rollback. This does not advertise guest virtual
-address mapping or transferable memory handles. Other node sources and checkpoints remain undiscovered or return a
-typed unsupported error.
+address mapping or transferable memory handles. Other node sources remain undiscovered or return a typed unsupported
+error. The AArch64 backend advertises checkpoint format 1.0 and lowers full-or-refuse capture and restore directories
+to the native engine; unsupported resource classes are refused rather than omitted from an image.
 
 The public `transport` module contains the frozen, bounded provider-channel foundation: versioned
 frames, request ids, deadlines, cancellation, peer-close detection, lifecycle handshake, and a
@@ -75,8 +76,8 @@ Discovery also reports launch resource controls, live-update support, host versu
 observability, debugging, and checkpoint support as separate capability models. Their corresponding `MachineSpec`
 fields are fully typed and preflight checks malformed bounds before checking backend availability. Today the native
 backend lowers memory/process/CPU-count ceilings, host time, secure host entropy, and a read-write translation cache;
-valid requests for richer accounting, virtual time, deterministic entropy, checkpoints, structured telemetry, or
-authorized debugging fail with a field-addressed `Unsupported` error instead of being silently ignored.
+valid requests for richer accounting, virtual time, deterministic entropy, incremental checkpoint modes, structured
+telemetry, or authorized debugging fail with a field-addressed `Unsupported` error instead of being silently ignored.
 
 The published crate contains a pinned static archive for each supported host target. Cargo selects and links the
 matching archive without compiling C or downloading anything. Child isolation reexecutes the downstream application

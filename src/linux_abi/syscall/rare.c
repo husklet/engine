@@ -131,6 +131,15 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 g_memfd_seal[fd] = (a1 & 2) ? 0 : 0x1 /*F_SEAL_SEAL*/;
                 memfd_reg_set_fd(fd, g_memfd_seal[fd]);
             }
+            if (proc_fdvis_publish_native_fd(fd) != 0) {
+                if (fd < HL_NFD) {
+                    g_memfd_is[fd] = 0;
+                    g_memfd_seal[fd] = 0;
+                }
+                close(fd);
+                fd = -1;
+                errno = EMFILE;
+            }
         }
         G_RET(c) = fd < 0 ? (uint64_t)(-errno) : (uint64_t)fd;
         break;

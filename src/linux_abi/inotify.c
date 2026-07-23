@@ -6,8 +6,6 @@
 #include <string.h>
 #include <pthread.h>
 
-enum { HL_LINUX_OBJECT_INOTIFY = 0x696e6f74u };
-
 #define INOTIFY_EVENT_MASK UINT32_C(0x00000fff)
 #define INOTIFY_OPTION_MASK                                                                                            \
     (HL_LINUX_IN_ONLYDIR | HL_LINUX_IN_DONT_FOLLOW | HL_LINUX_IN_EXCL_UNLINK | HL_LINUX_IN_MASK_CREATE |               \
@@ -478,5 +476,187 @@ int64_t hl_linux_inotify_remove(hl_linux_abi *linux_abi, hl_linux_fd fd, int32_t
     }
     mutation_end(object);
     hl_linux_object_unpin(&pin);
+    return inotify_error(status);
+}
+
+#define INOTIFY_IMAGE_MAGIC UINT64_C(0x484c494e4f544659)
+#define INOTIFY_IMAGE_VERSION UINT32_C(1)
+
+typedef struct inotify_image_header {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t watch_count;
+    int32_t next_wd;
+    uint32_t nonblocking;
+    uint64_t queue_size;
+} inotify_image_header;
+
+typedef struct inotify_image_watch {
+    int32_t wd;
+    uint32_t mask;
+    uint64_t token;
+    uint64_t path_size;
+} inotify_image_watch;
+
+hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, size_t capacity,
+                                  size_t *out_size) {
+    hl_linux_object_pin pin;
+    inotify_object *object;
+    inotify_image_header header;
+    unsigned char *cursor = buffer;
+    size_t needed = sizeof(header);
+    uint32_t index;
+    hl_status status;
+    if (linux_abi == NULL || out_size == NULL) return HL_STATUS_INVALID_ARGUMENT;
+    status = hl_linux_object_pin_fd(linux_abi, fd, &pin);
+    if (status != HL_STATUS_OK) return status;
+    if (pin.ops != &inotify_ops) {
+        hl_linux_object_unpin(&pin);
+        return HL_STATUS_INVALID_ARGUMENT;
+    }
+    object = pin.context;
+    status = inotify_pump(object);
+    if (status != HL_STATUS_OK) {
+        hl_linux_object_unpin(&pin);
+        return status;
+    }
+    pthread_mutex_lock(&object->snapshot_lock);
+    for (index = 0; index < object->watch_count; ++index) {
+        size_t path_size = object->watches[index].path_size;
+        if (path_size > SIZE_MAX - sizeof(inotify_image_watch) ||
+            needed > SIZE_MAX - sizeof(inotify_image_watch) - path_size) {
+            pthread_mutex_unlock(&object->snapshot_lock);
+            hl_linux_object_unpin(&pin);
+            return HL_STATUS_OUT_OF_MEMORY;
+        }
+        needed += sizeof(inotify_image_watch) + path_size;
+    }
+    if (object->queue_size > SIZE_MAX - needed) {
+        pthread_mutex_unlock(&object->snapshot_lock);
+        hl_linux_object_unpin(&pin);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
+    needed += object->queue_size;
+    *out_size = needed;
+    if (buffer == NULL || capacity < needed) {
+        pthread_mutex_unlock(&object->snapshot_lock);
+        hl_linux_object_unpin(&pin);
+        return buffer == NULL ? HL_STATUS_OK : HL_STATUS_OUT_OF_MEMORY;
+    }
+    header = (inotify_image_header){INOTIFY_IMAGE_MAGIC, INOTIFY_IMAGE_VERSION, object->watch_count,
+                                    object->next_wd, object->nonblocking, object->queue_size};
+    memcpy(cursor, &header, sizeof(header));
+    cursor += sizeof(header);
+    for (index = 0; index < object->watch_count; ++index) {
+        inotify_watch *watch = &object->watches[index];
+        inotify_image_watch saved = {watch->wd, watch->mask, watch->token, watch->path_size};
+        memcpy(cursor, &saved, sizeof(saved));
+        cursor += sizeof(saved);
+        memcpy(cursor, watch->path, watch->path_size);
+        cursor += watch->path_size;
+    }
+    memcpy(cursor, object->queue, object->queue_size);
+    pthread_mutex_unlock(&object->snapshot_lock);
+    hl_linux_object_unpin(&pin);
+    return HL_STATUS_OK;
+}
+
+int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
+                                   const hl_linux_inotify_provider_ops *provider, void *provider_context,
+                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer,
+                                   size_t size) {
+    const unsigned char *cursor = buffer;
+    const unsigned char *end = cursor + size;
+    inotify_image_header header;
+    inotify_object *object = NULL;
+    uint32_t index;
+    hl_status status = HL_STATUS_INVALID_ARGUMENT;
+    if (linux_abi == NULL || provider == NULL || buffer == NULL || size < sizeof(header) ||
+        provider->add == NULL || provider->modify == NULL || provider->remove == NULL || provider->drain == NULL ||
+        provider->wait == NULL || provider->wait_handle == NULL || provider->readiness == NULL ||
+        provider->clone == NULL || provider->close == NULL)
+        goto fail_provider;
+    memcpy(&header, cursor, sizeof(header));
+    cursor += sizeof(header);
+    if (header.magic != INOTIFY_IMAGE_MAGIC || header.version != INOTIFY_IMAGE_VERSION || header.next_wd <= 0 ||
+        header.queue_size > (uint64_t)(end - cursor) || header.watch_count > UINT32_C(1048576))
+        goto fail_provider;
+    object = calloc(1, sizeof(*object));
+    if (object == NULL) {
+        status = HL_STATUS_OUT_OF_MEMORY;
+        goto fail_provider;
+    }
+    if (pthread_mutex_init(&object->snapshot_lock, NULL) != 0) {
+        status = HL_STATUS_OUT_OF_MEMORY;
+        free(object);
+        object = NULL;
+        goto fail_provider;
+    }
+    object->provider = provider;
+    object->provider_context = provider_context;
+    object->next_wd = header.next_wd;
+    object->nonblocking = (status_flags & HL_LINUX_O_NONBLOCK) != 0;
+    if (header.watch_count != 0) {
+        object->watches = calloc(header.watch_count, sizeof(*object->watches));
+        if (object->watches == NULL) {
+            status = HL_STATUS_OUT_OF_MEMORY;
+            goto fail_object;
+        }
+        object->watch_capacity = header.watch_count;
+    }
+    for (index = 0; index < header.watch_count; ++index) {
+        inotify_image_watch saved;
+        inotify_watch *watch = &object->watches[index];
+        if ((size_t)(end - cursor) < sizeof(saved)) goto fail_object;
+        memcpy(&saved, cursor, sizeof(saved));
+        cursor += sizeof(saved);
+        if (saved.wd <= 0 || saved.path_size == 0 || saved.path_size > (uint64_t)(end - cursor) ||
+            saved.path_size > SIZE_MAX - 1u)
+            goto fail_object;
+        watch->path = malloc((size_t)saved.path_size + 1u);
+        if (watch->path == NULL) {
+            status = HL_STATUS_OUT_OF_MEMORY;
+            goto fail_object;
+        }
+        memcpy(watch->path, cursor, (size_t)saved.path_size);
+        watch->path[saved.path_size] = 0;
+        cursor += saved.path_size;
+        watch->wd = saved.wd;
+        watch->mask = saved.mask;
+        watch->token = saved.token;
+        watch->path_size = (size_t)saved.path_size;
+        status = provider->add(provider_context, watch->path, watch->path_size, watch->token, watch->mask);
+        if (status != HL_STATUS_OK) goto fail_object;
+        object->watch_count++;
+    }
+    if (header.queue_size != (uint64_t)(end - cursor)) goto fail_object;
+    if (header.queue_size != 0) {
+        object->queue = malloc((size_t)header.queue_size);
+        if (object->queue == NULL) {
+            status = HL_STATUS_OUT_OF_MEMORY;
+            goto fail_object;
+        }
+        memcpy(object->queue, cursor, (size_t)header.queue_size);
+        object->queue_size = object->queue_capacity = (size_t)header.queue_size;
+    }
+    status = hl_linux_object_install_at(linux_abi, requested, &inotify_ops, object, HL_LINUX_OBJECT_INOTIFY,
+                                        status_flags, descriptor_flags);
+    if (status != HL_STATUS_OK) goto fail_object;
+    return (int64_t)requested;
+fail_object:
+    if (object != NULL) {
+        for (index = 0; index < object->watch_count; ++index) {
+            (void)provider->remove(provider_context, object->watches[index].token);
+            free(object->watches[index].path);
+        }
+        if (object->watch_count < object->watch_capacity)
+            free(object->watches[object->watch_count].path);
+        free(object->watches);
+        free(object->queue);
+        pthread_mutex_destroy(&object->snapshot_lock);
+        free(object);
+    }
+fail_provider:
+    if (provider != NULL && provider->close != NULL && provider_context != NULL) (void)provider->close(provider_context);
     return inotify_error(status);
 }

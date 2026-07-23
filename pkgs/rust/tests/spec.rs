@@ -589,7 +589,8 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
         .iter()
         .any(|feature| feature.as_str() == "memory-allocation"));
     assert_eq!(handles.limits.mappings, 64);
-    assert!(!capabilities.checkpoint.supported);
+    assert!(capabilities.checkpoint.supported);
+    assert_eq!(capabilities.checkpoint.format, Some(Version::new(1, 0)));
 }
 
 #[test]
@@ -1197,8 +1198,8 @@ fn meaningful_unsupported_launch_policy_is_never_silently_ignored() {
 
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
     spec.checkpoint.enabled = true;
-    let error = Engine::new().validate(&spec).unwrap_err();
-    assert_eq!(error.field, "checkpoint.enabled");
+    spec.checkpoint.capture_directory = Some("/checkpoint".into());
+    Engine::new().validate(&spec).unwrap();
 
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
     spec.cpu.features.insert("example-feature".into());

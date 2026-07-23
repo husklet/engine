@@ -1,4 +1,10 @@
-use std::{fs::File, sync::Mutex};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use crate::{
     control::{
@@ -14,13 +20,15 @@ use crate::{
 pub struct Machine {
     child: Child,
     pauses: Mutex<usize>,
+    checkpoint_directory: Option<PathBuf>,
 }
 
 impl Machine {
-    pub(crate) const fn new(child: Child) -> Self {
+    pub(crate) const fn new(child: Child, checkpoint_directory: Option<PathBuf>) -> Self {
         Self {
             child,
             pauses: Mutex::new(0),
+            checkpoint_directory,
         }
     }
 
@@ -121,6 +129,79 @@ impl Machine {
             machine: self,
             active: true,
         })
+    }
+
+    /// Persists the complete native process tree and waits for atomic manifest publication.
+    ///
+    /// A checkpoint-armed machine exits after capture. The destination must not already contain data;
+    /// this prevents stale process records from being mistaken for members of the new checkpoint.
+    ///
+    /// # Errors
+    /// Returns a typed control error if capture was not configured, the destination is unsafe, the native
+    /// interrupt fails, the process exits without publishing a manifest, or the deadline expires.
+    pub fn checkpoint(&self, timeout: Duration) -> Result<PathBuf, ControlError> {
+        let directory = self
+            .checkpoint_directory
+            .as_ref()
+            .ok_or_else(|| ControlError::unsupported("checkpoint"))?;
+        if directory.exists() {
+            let mut entries = std::fs::read_dir(directory)
+                .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?;
+            if entries.next().transpose().map_err(|error| {
+                checkpoint_error("inspect checkpoint directory", &error)
+            })?.is_some()
+            {
+                return Err(checkpoint_context(
+                    "checkpoint destination already contains data",
+                ));
+            }
+        } else {
+            std::fs::create_dir(directory)
+                .map_err(|error| checkpoint_error("create checkpoint directory", &error))?;
+        }
+
+        let trigger = PathBuf::from(format!("{}.trigger", directory.display()));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&trigger)
+            .map_err(|error| checkpoint_error("open checkpoint trigger", &error))?;
+        let mut bytes = [0_u8; 4];
+        let read = file
+            .read(&mut bytes)
+            .map_err(|error| checkpoint_error("read checkpoint trigger", &error))?;
+        if read != 0 && read != bytes.len() {
+            return Err(checkpoint_context("checkpoint trigger is corrupt"));
+        }
+        let generation = u32::from_le_bytes(bytes).wrapping_add(1).max(1);
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&generation.to_le_bytes()))
+            .and_then(|_| file.set_len(4))
+            .and_then(|_| file.sync_data())
+            .map_err(|error| checkpoint_error("publish checkpoint request", &error))?;
+
+        crate::ffi::signal(self.id(), checkpoint_interrupt_signal())
+            .map_err(|error| checkpoint_error("interrupt checkpoint target", &error))?;
+        let manifest = directory.join("MANIFEST");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if manifest.is_file() {
+                return Ok(directory.clone());
+            }
+            if self.child.completed() {
+                return Err(checkpoint_context(
+                    "engine exited without publishing a complete checkpoint manifest",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(checkpoint_context(
+                    "checkpoint deadline expired before manifest publication",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     pub(crate) fn release_pause(&self, report: bool) -> Result<(), ControlError> {
@@ -263,6 +344,28 @@ impl Machine {
     pub fn wait(self) -> Result<Exit, Error> {
         self.child.wait()
     }
+}
+
+fn checkpoint_context(context: impl Into<String>) -> ControlError {
+    ControlError {
+        category: crate::ControlErrorCategory::Host,
+        operation: "checkpoint",
+        context: context.into(),
+    }
+}
+
+fn checkpoint_error(context: &str, error: &std::io::Error) -> ControlError {
+    checkpoint_context(format!("{context}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+const fn checkpoint_interrupt_signal() -> i32 {
+    23 // SIGURG: reserved engine interrupt on Linux.
+}
+
+#[cfg(target_os = "macos")]
+const fn checkpoint_interrupt_signal() -> i32 {
+    29 // SIGINFO: reserved engine interrupt on macOS.
 }
 
 #[cfg(target_os = "linux")]

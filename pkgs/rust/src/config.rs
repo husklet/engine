@@ -36,6 +36,8 @@ pub struct Config {
     pub(crate) sandbox: Sandbox,
     pub(crate) translation_cache: Option<PathBuf>,
     pub(crate) filesystem_generation: Option<PathBuf>,
+    pub(crate) checkpoint_directory: Option<PathBuf>,
+    pub(crate) restore_directory: Option<PathBuf>,
     pub(crate) mounts: Vec<Mount>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
     pub(crate) process_domain: Option<Domain>,
@@ -190,6 +192,20 @@ impl Config {
     #[must_use]
     pub fn filesystem_generation(mut self, path: impl Into<PathBuf>) -> Self {
         self.filesystem_generation = Some(path.into());
+        self
+    }
+
+    /// Arm native whole-process-tree checkpoint capture for this launch.
+    #[must_use]
+    pub fn checkpoint_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.checkpoint_directory = Some(path.into());
+        self
+    }
+
+    /// Restore a native whole-process-tree checkpoint for this launch.
+    #[must_use]
+    pub fn restore_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.restore_directory = Some(path.into());
         self
     }
 

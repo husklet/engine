@@ -64,8 +64,8 @@ pub(super) fn capabilities() -> EngineCapabilities {
             operations: BTreeSet::new(),
         },
         checkpoint: CheckpointCapabilities {
-            supported: false,
-            format: None,
+            supported: true,
+            format: Some(Version::new(1, 0)),
         },
         control: crate::spec::ControlCapabilities {
             operations: BTreeSet::from([

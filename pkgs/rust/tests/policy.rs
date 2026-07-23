@@ -119,13 +119,31 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         hl_engine::spec::SpecErrorCategory::Conflict
     );
     value.checkpoint.enabled = true;
+    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
     value.checkpoint.maximum_pause_ms = Some(0);
     assert_eq!(
         Engine::new().validate(&value).unwrap_err().field,
         "checkpoint.maximum_pause_ms"
     );
-    value.checkpoint.maximum_pause_ms = Some(100);
+    value.checkpoint.maximum_pause_ms = None;
+    value.checkpoint.mode = CheckpointMode::Full;
     value.checkpoint.incompatible_resources = IncompatibleResourcePolicy::Refuse;
+    Engine::new().validate(&value).unwrap();
+
+    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    Engine::new().validate(&value).unwrap();
+
+    let mut value = spec();
+    value.checkpoint.enabled = true;
+    value.checkpoint.capture_directory = Some("relative/checkpoint".into());
+    assert_eq!(
+        Engine::new().validate(&value).unwrap_err().category,
+        hl_engine::spec::SpecErrorCategory::Invalid
+    );
+
+    let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
+    value.checkpoint.enabled = true;
+    value.checkpoint.restore_directory = Some("/tmp/restore".into());
     assert_eq!(
         Engine::new().validate(&value).unwrap_err().category,
         hl_engine::spec::SpecErrorCategory::Unsupported

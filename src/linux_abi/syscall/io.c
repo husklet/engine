@@ -69,15 +69,26 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // timerfd: the timer is armed on the (host-shared) kqueue, so the dup drains the same expirations; carry
     // the routing flag plus the deadline/interval bookkeeping timerfd_gettime reports against.
     if (g_timerfd[oldfd]) {
+        int slot = timerfd_slot(oldfd);
         g_timerfd[newfd] = 1;
         g_tfd_deadline[newfd] = g_tfd_deadline[oldfd];
         g_tfd_interval[newfd] = g_tfd_interval[oldfd];
         g_tfd_first_oneshot[newfd] = g_tfd_first_oneshot[oldfd];
+        g_tfd_clock[newfd] = g_tfd_clock[oldfd];
+        g_tfd_object[newfd] = g_tfd_object[oldfd];
+        g_tfd_nb[newfd] = g_tfd_nb[oldfd];
+        g_tfd_shared[newfd] = g_tfd_shared[oldfd];
+        g_tfd_cslot[newfd] = slot + 1;
+        g_tfd_refs[slot]++;
     }
     // inotify: the instance is a (host-shared) kqueue with its watches; carry the routing flag so the dup's
     // read() drains the same event queue. Watches stay owned by the original instance fd -- closing the DUP
     // tears down nothing (no watch is owned by it), and closing the original behaves as before the dup.
-    if (oldfd < 1024 && newfd < 1024 && g_inotify[oldfd]) g_inotify[newfd] = 1;
+    if (oldfd < 1024 && newfd < 1024 && g_inotify[oldfd]) {
+        g_inotify[newfd] = 1;
+        g_inotify_nb[newfd] = g_inotify_nb[oldfd];
+        g_inotify_object[newfd] = g_inotify_object[oldfd];
+    }
     // signalfd: a duplicate refers to the SAME OFD (shares its self-pipe). Carry the slot mapping and bump the
     // OFD refcount so the pipe is torn down only when the last alias closes (see fd_reset_emul).
     if (g_sigfd_slot[oldfd]) {
@@ -89,6 +100,8 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // changelist queued before the dup now so already-registered interest is not stranded on the original.
     if (g_epoll[oldfd]) {
         g_epoll[newfd] = 1;
+        g_ep_cslot[newfd] = (uint16_t)(epoll_slot(oldfd) + 1);
+        if (!g_ep_cslot[oldfd]) g_ep_cslot[oldfd] = (uint16_t)(oldfd + 1);
         g_ep_dupd[oldfd] = 1;
         g_ep_dupd[newfd] = 1;
         if (g_ep_chgn[oldfd] > 0) {
@@ -570,6 +583,30 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         // inotify read -> struct inotify_event[]
+#if defined(__linux__)
+        if (rfd >= 0 && rfd < HL_NFD && g_inotify[rfd] &&
+            g_inotify_raw_pos[rfd] < g_inotify_raw_len[rfd]) {
+            if (a2 < 16) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            size_t available = g_inotify_raw_len[rfd] - g_inotify_raw_pos[rfd];
+            size_t copied = available < (size_t)a2 ? available : (size_t)a2;
+            memcpy((void *)a1, g_inotify_raw[rfd] + g_inotify_raw_pos[rfd], copied);
+            g_inotify_raw_pos[rfd] += copied;
+            if (g_inotify_raw_pos[rfd] == g_inotify_raw_len[rfd]) {
+                free(g_inotify_raw[rfd]);
+                g_inotify_raw[rfd] = NULL;
+                g_inotify_raw_pos[rfd] = g_inotify_raw_len[rfd] = 0;
+            }
+            G_RET(c) = copied;
+            break;
+        }
+#else
         if (rfd >= 0 && rfd < 1024 && g_inotify[rfd]) {
             // Linux needs room for at least one struct inotify_event (16-byte header); a shorter buffer is
             // EINVAL and must NOT consume the queued event (checked before any kqueue drain / snapshot diff).
@@ -588,9 +625,45 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // First drain any queued rename events (IN_MOVED_FROM/IN_MOVED_TO) for this instance; the
             // snapshot diff below can only synthesize IN_CREATE/IN_DELETE, not paired moves.
             off += inomv_drain(rfd, out, (size_t)a2);
+            for (int wd = 0; wd < 1024; wd++) {
+                if (g_inotify_owner[wd] != rfd || !g_inotify_pending[wd]) continue;
+                if (g_inotify_isdir[wd]) {
+                    char *cur = dir_snapshot(g_inotify_wpath[wd]);
+                    char *old = g_inotify_snap[wd];
+                    for (int pass = 0; pass < 2; pass++) {
+                        const char *src = pass == 0 ? cur : old, *other = pass == 0 ? old : cur;
+                        uint32_t mask = pass == 0 ? 0x100u : 0x200u;
+                        for (const char *p = src ? src : ""; *p;) {
+                            const char *e = strchr(p, '\n');
+                            size_t length = e ? (size_t)(e - p) : strlen(p);
+                            if (length && !snap_has(other, p, length) && (g_inotify_mask[wd] & mask)) {
+                                size_t nlen = (length + 1 + 15) & ~(size_t)15;
+                                if (off + 16 + nlen > a2) break;
+                                *(int32_t *)(out + off) = wd;
+                                *(uint32_t *)(out + off + 4) = mask;
+                                *(uint32_t *)(out + off + 8) = 0;
+                                *(uint32_t *)(out + off + 12) = (uint32_t)nlen;
+                                memcpy(out + off + 16, p, length);
+                                memset(out + off + 16 + length, 0, nlen - length);
+                                off += 16 + nlen;
+                            }
+                            p = e ? e + 1 : p + length;
+                        }
+                    }
+                    free(old);
+                    g_inotify_snap[wd] = cur;
+                } else if (off + 16 <= a2) {
+                    *(int32_t *)(out + off) = wd;
+                    *(uint32_t *)(out + off + 4) = g_inotify_pending[wd] & g_inotify_mask[wd];
+                    *(uint32_t *)(out + off + 8) = 0;
+                    *(uint32_t *)(out + off + 12) = 0;
+                    off += 16;
+                }
+                g_inotify_pending[wd] = 0;
+            }
             struct kevent kv[32];
             struct timespec zero = {0, 0};
-            int nb = fcntl(rfd, F_GETFL) & O_NONBLOCK;
+            int nb = g_inotify_nb[rfd];
             // If we already produced move events, poll the kqueue non-blocking so we never wait behind them.
             int n = kevent(rfd, NULL, 0, kv, 32, (nb || off > 0) ? &zero : NULL);
             if (n <= 0) {
@@ -603,7 +676,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             for (int i = 0; i < n; i++) {
                 int wd = (int)kv[i].ident;
-                if (wd >= 0 && wd < 1024 && g_inotify_wpath[wd][0]) {
+                if (wd >= 0 && wd < 1024 && g_inotify_isdir[wd]) {
                     // directory watch: diff current entries against the snapshot -> IN_CREATE/IN_DELETE+name
                     char *cur = dir_snapshot(g_inotify_wpath[wd]);
                     char *old = g_inotify_snap[wd];
@@ -613,7 +686,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         for (const char *p = src ? src : ""; *p;) {
                             const char *e = strchr(p, '\n');
                             size_t l = e ? (size_t)(e - p) : strlen(p);
-                            if (l && !snap_has(other, p, l)) {
+                            if (l && !snap_has(other, p, l) && (g_inotify_mask[wd] & mask)) {
                                 size_t nlen = (l + 1 + 15) & ~(size_t)15; // padded name field
                                 if (off + 16 + nlen > a2) break;
                                 *(int32_t *)(out + off) = wd;
@@ -646,12 +719,104 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)off;
             break;
         }
+#endif
         // timerfd read -> drain timer, return count
         if (rfd >= 0 && rfd < HL_NFD && g_timerfd[rfd]) {
             // Linux needs an 8-byte buffer; a shorter read is EINVAL and must NOT drain the expiration
             // (checked before the kqueue drain so the pending tick survives an invalid short read).
             if (a2 < 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            int tslot = timerfd_slot(rfd);
+            if (tslot < 0 || tslot >= HL_NFD) {
+                G_RET(c) = (uint64_t)(-EBADF);
+                break;
+            }
+            if (g_tfd_shared[rfd]) {
+                struct timerfd_shared_state *shared = g_tfd_shared[rfd];
+            timerfd_shared_retry:
+                timerfd_shared_lock(shared);
+                struct timespec now;
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+                uint64_t expirations = shared->pending;
+                shared->pending = 0;
+                if (shared->deadline > 0 && now_ns >= shared->deadline) {
+                    if (shared->interval > 0) {
+                        uint64_t elapsed = 1 + (uint64_t)((now_ns - shared->deadline) / shared->interval);
+                        expirations += elapsed;
+                        shared->deadline += (int64_t)elapsed * shared->interval;
+                    } else {
+                        expirations += 1;
+                        shared->deadline = 0;
+                    }
+                }
+                int64_t next = shared->deadline;
+                int64_t interval = shared->interval;
+                timerfd_shared_unlock(shared);
+                struct kevent stale;
+                struct timespec zero = {0, 0};
+                (void)kevent(rfd, NULL, 0, &stale, 1, &zero);
+                if (expirations != 0) {
+                    if (!a1 || !host_range_mapped((uintptr_t)a1, 8)) {
+                        G_RET(c) = (uint64_t)(-EFAULT);
+                        break;
+                    }
+                    if (next > now_ns) {
+                        struct kevent future;
+                        EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, next - now_ns, NULL);
+                        (void)kevent(rfd, &future, 1, NULL, 0, NULL);
+                    }
+                    g_tfd_deadline[tslot] = next;
+                    g_tfd_interval[tslot] = interval;
+                    *(uint64_t *)a1 = expirations;
+                    G_RET(c) = 8;
+                    break;
+                }
+                if (g_tfd_nb[rfd]) {
+                    G_RET(c) = (uint64_t)(-EAGAIN);
+                    break;
+                }
+                struct kevent wake;
+                int waited = kevent(rfd, NULL, 0, &wake, 1, NULL);
+                if (waited > 0) goto timerfd_shared_retry;
+                G_RET(c) = (uint64_t)(waited < 0 ? -errno : -EAGAIN);
+                break;
+            }
+            if (g_tfd_nb[rfd] && g_tfd_deadline[tslot] == 0 && g_tfd_pending[tslot] == 0) {
+                G_RET(c) = (uint64_t)(-EAGAIN);
+                break;
+            }
+            if (g_tfd_pending[tslot] != 0) {
+                if (!a1 || !host_range_mapped((uintptr_t)a1, 8)) {
+                    G_RET(c) = (uint64_t)(-EFAULT);
+                    break;
+                }
+                uint64_t expirations = g_tfd_pending[tslot];
+                g_tfd_pending[tslot] = 0;
+                struct kevent pending_event;
+                struct timespec zero = {0, 0};
+                (void)kevent(rfd, NULL, 0, &pending_event, 1, &zero);
+                if (g_tfd_interval[tslot] > 0 && g_tfd_deadline[tslot] > 0) {
+                    struct timespec now;
+                    hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                    int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+                    if (now_ns >= g_tfd_deadline[tslot]) {
+                        uint64_t elapsed = 1 + (uint64_t)((now_ns - g_tfd_deadline[tslot]) /
+                                                         g_tfd_interval[tslot]);
+                        expirations += elapsed;
+                        g_tfd_deadline[tslot] += (int64_t)elapsed * g_tfd_interval[tslot];
+                    }
+                    struct kevent future;
+                    int64_t delay = g_tfd_deadline[tslot] - now_ns;
+                    if (delay < 0) delay = 0;
+                    EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                    (void)kevent(rfd, &future, 1, NULL, 0, NULL);
+                    g_tfd_first_oneshot[tslot] = 1;
+                }
+                *(uint64_t *)a1 = expirations;
+                G_RET(c) = 8;
                 break;
             }
             struct kevent kv;
@@ -673,36 +838,36 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                  * overdue EV_ONESHOT. Linux timerfd one-shots have exactly one expiration; only a
                  * periodic timer accumulates multiple expirations.
                  */
-                uint64_t expirations = g_tfd_interval[rfd] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
+                uint64_t expirations = g_tfd_interval[tslot] == 0 ? UINT64_C(1) : (uint64_t)kv.data;
                 /*
                  * A distinct first deadline is represented by an EV_ONESHOT.  kqueue can therefore
                  * only report the first expiry, while Linux accumulates every interval that elapsed
                  * before read(2).  Derive that count from the original deadline and keep the next
                  * deadline phase-aligned instead of restarting the period at read time.
                  */
-                if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0 && g_tfd_deadline[rfd] > 0) {
+                if (g_tfd_first_oneshot[tslot] && g_tfd_interval[tslot] > 0 && g_tfd_deadline[tslot] > 0) {
                     struct timespec tnow;
                     hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
                     int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
-                    if (now_ns >= g_tfd_deadline[rfd])
-                        expirations = 1 + (uint64_t)((now_ns - g_tfd_deadline[rfd]) / g_tfd_interval[rfd]);
+                    if (now_ns >= g_tfd_deadline[tslot])
+                        expirations = 1 + (uint64_t)((now_ns - g_tfd_deadline[tslot]) / g_tfd_interval[tslot]);
                 }
                 *(uint64_t *)a1 = expirations;
             }
             // A periodic timerfd whose first expiry (it_value) differed from its interval was armed as a
             // one-shot for that first tick (event.c case 86). Now that the first tick has been consumed,
             // re-arm the recurring periodic at the interval so subsequent expiries fire every it_interval.
-            if (g_tfd_first_oneshot[rfd] && g_tfd_interval[rfd] > 0) {
+            if (g_tfd_first_oneshot[tslot] && g_tfd_interval[tslot] > 0) {
                 struct kevent rkv;
                 struct timespec tnow;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &tnow);
                 int64_t now_ns = (int64_t)tnow.tv_sec * 1000000000LL + tnow.tv_nsec;
-                int64_t next = g_tfd_deadline[rfd];
-                if (next <= now_ns) next += ((now_ns - next) / g_tfd_interval[rfd] + 1) * g_tfd_interval[rfd];
+                int64_t next = g_tfd_deadline[tslot];
+                if (next <= now_ns) next += ((now_ns - next) / g_tfd_interval[tslot] + 1) * g_tfd_interval[tslot];
                 int64_t delay = next - now_ns;
                 EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
                 kevent(rfd, &rkv, 1, NULL, 0, NULL);
-                g_tfd_deadline[rfd] = next;
+                g_tfd_deadline[tslot] = next;
             }
             G_RET(c) = 8;
             break;
@@ -1438,7 +1603,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // host read end's O_NONBLOCK (the internal drains rely on it; clearing it would let a drain
             // block). Other flag changes still apply to the host fd. See vfs.c g_eventfd_gnb.
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_eventfd_peer[(int)a0]) {
-                g_eventfd_gnb[(int)a0] = (la & 0x800) != 0;
+                eventfd_guest_nb_set((int)a0, (la & 0x800) != 0);
                 mf |= O_NONBLOCK; // keep host O_NONBLOCK on regardless of the guest's request
             }
             int r = fcntl((int)a0, F_SETFL, mf);
@@ -1879,6 +2044,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 g_sock_seqpacket[fds[1]] = 1;
                 g_sock_pair_peer[fds[1]] = fds[0] + 1;
             }
+            sock_pair_identity_assign(fds[0], fds[1]);
         }
         G_RET(c) = 0;
         break;

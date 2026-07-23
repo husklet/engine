@@ -93,8 +93,13 @@ impl Engine {
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
+        let checkpoint_directory = launch.config.checkpoint_directory.clone();
+        if let Some(parent) = checkpoint_directory.as_deref().and_then(std::path::Path::parent) {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+        }
         launch::start(launch, io, authorities, resources)
-            .map(Machine::new)
+            .map(|child| Machine::new(child, checkpoint_directory))
             .map_err(SpawnError::Engine)
     }
 

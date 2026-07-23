@@ -268,6 +268,24 @@ static uint8_t g_seq_end[HL_NFD];
 #define HL_CMSG_EVENTFD_MAGIC 0xddefd001u
 #define HL_CMSG_SEQ_MAGIC 0xdd5e9001u
 #define HL_CMSG_TIMERFD_MAGIC 0xdd71e001u
+#define HL_CMSG_OFD_MAGIC 0xdd0fd001u
+
+/* Stable open-file-description identity.  This lives before ancillary translation because SCM_RIGHTS
+ * import/export must carry it; dup/close helpers later in the unified syscall translation unit share it. */
+static uint64_t g_ofd_id[HL_NFD];
+static _Atomic uint32_t g_ofd_next = 1;
+
+static uint64_t ofd_identity_new(void) {
+    uint32_t sequence = atomic_fetch_add_explicit(&g_ofd_next, 1u, memory_order_relaxed);
+    if (sequence == 0) sequence = atomic_fetch_add_explicit(&g_ofd_next, 1u, memory_order_relaxed);
+    return UINT64_C(0x4000000000000000) | ((uint64_t)(uint32_t)getpid() << 32) | sequence;
+}
+
+static uint64_t ofd_identity_ensure(int fd) {
+    if (fd < 0 || fd >= HL_NFD) return 0;
+    if (!g_ofd_id[fd]) g_ofd_id[fd] = ofd_identity_new();
+    return g_ofd_id[fd];
+}
 
 struct hl_cmsg_eventfd_meta {
     uint32_t magic;
@@ -296,7 +314,67 @@ struct hl_cmsg_timerfd_meta {
     int64_t interval;
     int32_t source_fd;  // sender's fd number (valid only within source_pid)
     int32_t source_pid; // sender engine pid: re-alias the host kqueue only when the receiver shares it
+    uint32_t nb;
+    uint32_t portable;
+    uint32_t restore_shared;
+    uint32_t reserved;
+    uint64_t object;
+    uint64_t shared_state; // restore-only MAP_SHARED address inherited by the reforked process tree
 };
+struct hl_cmsg_ofd_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    uint64_t identity;
+};
+struct hl_cmsg_memfd_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    int32_t seals;
+    uint32_t reserved;
+};
+struct hl_cmsg_pipe_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    uint64_t identity;
+    int32_t size;
+    uint32_t reserved;
+};
+struct hl_cmsg_signalfd_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    int32_t source_pid;
+    int32_t source_slot;
+    uint64_t mask;
+};
+struct hl_cmsg_kqueue_meta {
+    uint32_t magic;
+    uint32_t ordinal;
+    int32_t source_pid;
+    int32_t source_fd;
+    uint32_t kind;
+    uint32_t nonblock;
+    uint64_t object_id;
+    uint32_t descriptor_flags;
+    int32_t canonical_fd;
+    uint32_t hidden_count;
+    uint32_t reserved;
+    uint64_t image_size;
+};
+struct hl_cmsg_epoll_watch {
+    int32_t descriptor;
+    uint32_t events;
+    uint32_t armed;
+    uint32_t reserved;
+    uint64_t data;
+};
+static int kqueue_scm_export(int fd, struct hl_cmsg_kqueue_meta *metadata);
+static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
+static int typed_inotify_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker);
+static int typed_inotify_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
+static int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker);
+static int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
+static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fds, int capacity);
+static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int marker, const int *fds);
 
 static __thread int g_cmsg_tmpfds[1024];
 static __thread uint8_t g_cmsg_tmpfd_borrowed[1024];
@@ -304,6 +382,8 @@ static __thread int g_cmsg_ntmpfds;
 static __thread uint16_t g_cmsg_seq_slot[253];
 static __thread uint8_t g_cmsg_seq_end[253];
 static __thread int g_cmsg_nseq;
+static __thread uint16_t g_cmsg_event_slot[253];
+static __thread int g_cmsg_nevent;
 static int bound_attachment_borrow(int guest_fd, int *native_fd);
 static void bound_attachment_release(int native_fd);
 
@@ -336,6 +416,15 @@ static void cmsg_seq_finish(int sent) {
         }
     }
     g_cmsg_nseq = 0;
+}
+
+static void cmsg_event_finish(int sent) {
+    if (!sent)
+        for (int index = 0; index < g_cmsg_nevent; ++index) {
+            uint32_t slot = g_cmsg_event_slot[index];
+            if (slot < HL_NFD && g_eventfd_refs[slot] > 0) g_eventfd_refs[slot]--;
+        }
+    g_cmsg_nevent = 0;
 }
 
 static int cmsg_level_l2m(int lv) {
@@ -403,6 +492,257 @@ static int cmsg_timerfd_marker(const struct hl_cmsg_timerfd_meta *m) {
     return fd;
 }
 
+static int cmsg_ofd_marker(const struct hl_cmsg_ofd_meta *m) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-ofdXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (write(fd, m, sizeof *m) != (ssize_t)sizeof *m) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int cmsg_import_ofd_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_ofd_meta metadata;
+        int marker = fds[visible - 1];
+        memset(&metadata, 0, sizeof metadata);
+        if (pread(marker, &metadata, sizeof metadata, 0) != (ssize_t)sizeof metadata ||
+            metadata.magic != HL_CMSG_OFD_MAGIC)
+            break;
+        if (metadata.ordinal >= (uint32_t)(visible - 1) || !metadata.identity) break;
+        int fd = fds[metadata.ordinal];
+        if (fd >= 0 && fd < HL_NFD) g_ofd_id[fd] = metadata.identity;
+        close(marker);
+        visible--;
+    }
+    return visible;
+}
+
+static int cmsg_memfd_marker(const struct hl_cmsg_memfd_meta *metadata) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-memfd-metaXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (write(fd, metadata, sizeof *metadata) != (ssize_t)sizeof *metadata) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int cmsg_import_memfd_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_memfd_meta metadata;
+        int marker = fds[visible - 1];
+        memset(&metadata, 0, sizeof metadata);
+        if (pread(marker, &metadata, sizeof metadata, 0) != (ssize_t)sizeof metadata ||
+            metadata.magic != UINT32_C(0x484c4d46))
+            break;
+        if (metadata.ordinal >= (uint32_t)(visible - 1)) break;
+        int fd = fds[metadata.ordinal];
+        if (fd >= 0 && fd < HL_NFD) {
+            g_memfd_is[fd] = 1;
+            g_memfd_seal[fd] = metadata.seals;
+            memfd_reg_set_fd(fd, metadata.seals);
+        }
+        close(marker);
+        visible--;
+    }
+    return visible;
+}
+
+static int cmsg_pipe_marker(const struct hl_cmsg_pipe_meta *metadata) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-pipe-metaXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (write(fd, metadata, sizeof *metadata) != (ssize_t)sizeof *metadata) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int cmsg_import_pipe_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_pipe_meta metadata;
+        int marker = fds[visible - 1];
+        memset(&metadata, 0, sizeof metadata);
+        if (pread(marker, &metadata, sizeof metadata, 0) != (ssize_t)sizeof metadata ||
+            metadata.magic != UINT32_C(0x484c5049))
+            break;
+        if (metadata.ordinal >= (uint32_t)(visible - 1) || metadata.identity == 0) break;
+        int fd = fds[metadata.ordinal];
+        if (fd >= 0 && fd < HL_NFD) {
+            g_pipe_identity[fd] = metadata.identity;
+            g_pipesz[fd] = metadata.size;
+        }
+        close(marker);
+        visible--;
+    }
+    return visible;
+}
+
+static int cmsg_signalfd_marker(const struct hl_cmsg_signalfd_meta *metadata) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-sigfd-metaXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (write(fd, metadata, sizeof *metadata) != (ssize_t)sizeof *metadata) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int cmsg_kqueue_marker(struct hl_cmsg_kqueue_meta *metadata) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-kqueue-metaXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (typed_inotify_scm_image_export(metadata, fd) != 0 || epoll_scm_image_export(metadata, fd) != 0 ||
+        pwrite(fd, metadata, sizeof *metadata, 0) != (ssize_t)sizeof *metadata || lseek(fd, 0, SEEK_SET) < 0 ||
+        cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+static int cmsg_kqueue_placeholder(void) {
+    if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
+    char name[] = "/tmp/.hl-kqueue-fdXXXXXX";
+    int fd = mkstemp(name);
+    if (fd < 0) return -1;
+    unlink(name);
+    if (cmsg_tmpfd_track(fd, 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+static int cmsg_import_kqueue_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 2) {
+        struct hl_cmsg_kqueue_meta metadata;
+        int marker = fds[visible - 1];
+        memset(&metadata, 0, sizeof metadata);
+        if (pread(marker, &metadata, sizeof metadata, 0) != (ssize_t)sizeof metadata ||
+            metadata.magic != UINT32_C(0x484c4b51) || metadata.hidden_count > (uint32_t)(visible - 1))
+            break;
+        int hidden_base = visible - 1 - (int)metadata.hidden_count;
+        if (metadata.ordinal >= (uint32_t)hidden_base) break;
+        int fd = fds[metadata.ordinal];
+        int imported = -1;
+        int adopted = 0;
+        for (; adopted < (int)metadata.hidden_count; ++adopted) {
+            int private_fd = hl_host_process_fd_private_adopt(fds[hidden_base + adopted]);
+            if (private_fd < 0) break;
+            fds[hidden_base + adopted] = private_fd;
+        }
+        if (adopted == (int)metadata.hidden_count &&
+            (metadata.kind != 1 || epoll_scm_image_remap(&metadata, marker, fds + hidden_base) == 0) && fd >= 0)
+            imported = kqueue_scm_import(fd, &metadata, marker);
+        if (imported < 0)
+            fprintf(stderr, "[scm-epoll] import failed kind=%u hidden=%u adopted=%d fd=%d errno=%d\n",
+                    metadata.kind, metadata.hidden_count, adopted, fd, errno);
+        if (imported <= 0) {
+            for (int index = 0; index < adopted; ++index) {
+                hl_host_process_fd_private_remove(fds[hidden_base + index]);
+                close(fds[hidden_base + index]);
+            }
+            for (uint32_t index = (uint32_t)adopted; index < metadata.hidden_count; ++index)
+                close(fds[hidden_base + (int)index]);
+        }
+        if (imported < 0 && fd >= 0) {
+            close(fd);
+            fds[metadata.ordinal] = -1;
+        }
+        close(marker);
+        visible = hidden_base;
+    }
+    return visible;
+}
+
+static int cmsg_import_signalfd_trailer(int *fds, int nfds) {
+    int visible = nfds;
+    while (visible >= 3) {
+        struct hl_cmsg_signalfd_meta metadata;
+        int hidden = fds[visible - 2];
+        int marker = fds[visible - 1];
+        memset(&metadata, 0, sizeof metadata);
+        if (pread(marker, &metadata, sizeof metadata, 0) != (ssize_t)sizeof metadata ||
+            metadata.magic != UINT32_C(0x484c5346))
+            break;
+        if (metadata.ordinal >= (uint32_t)(visible - 2)) break;
+        int fd = fds[metadata.ordinal];
+        if (fd >= 0 && fd < HL_NFD) {
+            if (metadata.source_pid == (int32_t)getpid() && metadata.source_slot >= 0 &&
+                metadata.source_slot < HL_SFD_MAX && g_sfd[metadata.source_slot].refs > 0) {
+                g_sigfd_slot[fd] = (uint8_t)(metadata.source_slot + 1);
+                g_sfd[metadata.source_slot].refs++;
+                close(hidden);
+            } else {
+                int slot = sfd_alloc();
+                int writer = slot >= 0 ? hl_host_process_fd_private_adopt(hidden) : -1;
+                if (slot >= 0 && writer >= 0) {
+                    g_sfd[slot].rd = fd;
+                    g_sfd[slot].wr = writer;
+                    g_sfd[slot].mask = metadata.mask;
+                    g_sigfd_slot[fd] = (uint8_t)(slot + 1);
+                } else {
+                    if (writer >= 0) {
+                        hl_host_process_fd_private_remove(writer);
+                        close(writer);
+                    } else close(hidden);
+                    if (slot >= 0) g_sfd[slot].refs = 0;
+                }
+            }
+        } else close(hidden);
+        close(marker);
+        visible -= 2;
+    }
+    return visible;
+}
+
 // Peel trailing timerfd markers (LIFO; appended last by cmsg_l2m so imported first), restoring the
 // emulation state onto the received fd so its read/poll/gettime route through the timerfd path.
 static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
@@ -415,18 +755,69 @@ static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
         if (m.ordinal >= (uint32_t)(visible - 1)) break;
         int fd = fds[m.ordinal];
         if (fd >= 0 && fd < HL_NFD) {
+            if (m.portable) {
+                int timer = kqueue();
+                if (timer < 0 || dup2(timer, fd) < 0) {
+                    if (timer >= 0) close(timer);
+                    close(marker);
+                    visible--;
+                    continue;
+                }
+                if (timer != fd) close(timer);
+            }
             g_timerfd[fd] = 1;
             g_epoll_family_seen = 1;
             g_tfd_deadline[fd] = m.deadline;
             g_tfd_interval[fd] = m.interval;
             g_tfd_clock[fd] = m.clock;
+            g_tfd_nb[fd] = (uint8_t)(m.nb != 0);
             g_tfd_first_oneshot[fd] = (uint8_t)(m.first_oneshot != 0);
             // The timer is armed on the host kqueue registry keyed by fd number. Within the sending
             // engine process the received fd is a live dup of that kqueue, so alias it onto the same
             // queue (exactly as dup() does). Across processes the registry is not shared; the pid guard
             // skips the alias, leaving the received fd inert as before (no cross-process regression).
-            if (m.source_pid == (int32_t)getpid())
+            if (!m.portable && m.source_pid == (int32_t)getpid()) {
                 hl_native_kqueue_duplicate(m.source_fd, fd);
+            } else {
+                struct timerfd_shared_state *state = NULL;
+                if (m.shared_state != 0 &&
+                    (m.source_pid == (int32_t)getpid() || m.restore_shared != 0))
+                    state = (struct timerfd_shared_state *)(uintptr_t)m.shared_state;
+                if (state == NULL) {
+                    state = mmap(NULL, sizeof *state, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+                    if (state == MAP_FAILED) state = NULL;
+                    if (state != NULL) {
+                        memset(state, 0, sizeof *state);
+                        state->deadline = m.deadline;
+                        state->interval = m.interval;
+                    }
+                }
+                if (state == NULL) {
+                    close(marker);
+                    visible--;
+                    continue;
+                }
+                g_tfd_cslot[fd] = fd + 1;
+                g_tfd_object[fd] = m.object ? m.object : ofd_identity_new();
+                g_tfd_shared[fd] = state;
+                g_tfd_refs[fd]++;
+                struct timespec now;
+                hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
+                int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+                timerfd_shared_lock(state);
+                int64_t next = state->deadline;
+                uint64_t pending = state->pending;
+                timerfd_shared_unlock(state);
+                g_tfd_deadline[fd] = next;
+                g_tfd_interval[fd] = state->interval;
+                g_tfd_pending[fd] = pending;
+                if (pending != 0 || next > now_ns) {
+                    struct kevent event;
+                    int64_t delay = pending != 0 ? 1 : next - now_ns;
+                    EV_SET(&event, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                    (void)kevent(fd, &event, 1, NULL, 0, NULL);
+                }
+            }
         }
         close(marker);
         visible--;
@@ -524,7 +915,8 @@ static int cmsg_import_eventfd_trailer(int *fds, int nfds) {
             g_eventfd_peer[pub] = h + 1;
             g_eventfd_cslot[pub] = (int)m->slot + 1;
             g_eventfd_sema[pub] = (uint8_t)(m->sema != 0);
-            g_eventfd_gnb[pub] = (uint8_t)(m->nb != 0); // carry the guest blocking/non-blocking intent
+            eventfd_guest_nb_set(pub, m->nb != 0); // carry the OFD-shared guest blocking intent
+            g_eventfd_refs[m->slot]++;
             // The imported read end must be host-O_NONBLOCK too (internal drains rely on it); the sender set
             // the write-side, but ensure the received public fd is non-blocking regardless of its origin.
             {
@@ -551,6 +943,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
     if (errp) *errp = 0;
     cmsg_tmpfds_close();
     cmsg_seq_finish(0);
+    cmsg_event_finish(0);
     size_t go = 0, ho = 0;
     while (go + LX_CMSGHDR <= glen) {
         uint64_t clen = *(const uint64_t *)(g + go); // Linux cmsg_len (8B)
@@ -571,13 +964,30 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 if (errp) *errp = EINVAL;
                 return -1;
             }
-            combo_cap = nfds * 4; // visible fd + seq marker + possible eventfd write-side fd + marker fd
+            combo_cap = nfds * 6; // visible + OFD/seq/timer markers + eventfd sideband pair
             combo = malloc((size_t)combo_cap * sizeof(int));
             if (!combo) {
                 if (errp) *errp = ENOMEM;
                 return -1;
             }
+            struct hl_cmsg_kqueue_meta kqueue_metadata[253];
+            memset(kqueue_metadata, 0, sizeof kqueue_metadata);
             for (int i = 0; i < nfds; i++) {
+                if (kqueue_scm_export(fds[i], &kqueue_metadata[i]) > 0) {
+                    int placeholder = cmsg_kqueue_placeholder();
+                    if (placeholder < 0) {
+                        free(combo);
+                        if (errp) *errp = EMFILE;
+                        return -1;
+                    }
+                    kqueue_metadata[i].magic = UINT32_C(0x484c4b51);
+                    kqueue_metadata[i].ordinal = (uint32_t)i;
+                    kqueue_metadata[i].source_pid = (int32_t)getpid();
+                    kqueue_metadata[i].source_fd = fds[i];
+                    combo[combo_n++] = placeholder;
+                    (void)ofd_identity_ensure(fds[i]);
+                    continue;
+                }
                 int native = fds[i];
                 int borrowed = bound_attachment_borrow(fds[i], &native);
                 if (borrowed < 0 || (borrowed > 0 && cmsg_tmpfd_track(native, 1) != 0)) {
@@ -587,6 +997,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     return -1;
                 }
                 combo[combo_n++] = native;
+                (void)ofd_identity_ensure(fds[i]);
                 if (fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] && g_cmsg_nseq < 253) {
                     uint32_t slot = g_seq_ref[fds[i]] - 1;
                     uint32_t end = g_seq_end[fds[i]];
@@ -631,8 +1042,16 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     .ordinal = (uint32_t)i,
                     .slot = (uint32_t)eventfd_counter_slot(fd),
                     .sema = (uint32_t)(g_eventfd_sema[fd] != 0),
-                    .nb = (uint32_t)(g_eventfd_gnb[fd] != 0),
+                    .nb = (uint32_t)eventfd_guest_nb(fd),
                 };
+                int event_slot = eventfd_counter_slot(fd);
+                if (event_slot < 0 || event_slot >= HL_NFD || g_cmsg_nevent >= 253) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                g_eventfd_refs[event_slot]++;
+                g_cmsg_event_slot[g_cmsg_nevent++] = (uint16_t)event_slot;
                 int marker = cmsg_eventfd_marker(&m);
                 if (marker < 0) {
                     free(combo);
@@ -640,6 +1059,109 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     return -1;
                 }
                 combo[combo_n++] = hidden;
+                combo[combo_n++] = marker;
+            }
+            for (int i = 0; i < nfds; i++) {
+                int fd = fds[i];
+                if (!memfd_ensure_fd(fd)) continue;
+                if (combo_n + 1 > combo_cap) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                struct hl_cmsg_memfd_meta metadata = {
+                    .magic = UINT32_C(0x484c4d46),
+                    .ordinal = (uint32_t)i,
+                    .seals = g_memfd_seal[fd],
+                };
+                int marker = cmsg_memfd_marker(&metadata);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = marker;
+            }
+            for (int i = 0; i < nfds; i++) {
+                int fd = fds[i];
+                if (fd < 0 || fd >= HL_NFD || g_pipe_identity[fd] == 0) continue;
+                if (combo_n + 1 > combo_cap) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                struct hl_cmsg_pipe_meta metadata = {
+                    .magic = UINT32_C(0x484c5049),
+                    .ordinal = (uint32_t)i,
+                    .identity = g_pipe_identity[fd],
+                    .size = g_pipesz[fd],
+                };
+                int marker = cmsg_pipe_marker(&metadata);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = marker;
+            }
+            for (int i = 0; i < nfds; i++) {
+                struct hl_cmsg_kqueue_meta metadata = kqueue_metadata[i];
+                if (metadata.kind == 0) continue;
+                int hidden_count = epoll_scm_hidden_export(&metadata, NULL, 0);
+                if (hidden_count < 0 || combo_n + hidden_count + 1 > 253) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                if (combo_n + hidden_count + 1 > combo_cap) {
+                    int expanded = combo_n + hidden_count + 1;
+                    int *replacement = realloc(combo, (size_t)expanded * sizeof *combo);
+                    if (replacement == NULL) {
+                        free(combo);
+                        if (errp) *errp = ENOMEM;
+                        return -1;
+                    }
+                    combo = replacement;
+                    combo_cap = expanded;
+                }
+                if (hidden_count != 0 &&
+                    epoll_scm_hidden_export(&metadata, combo + combo_n, hidden_count) != hidden_count) {
+                    free(combo);
+                    if (errp) *errp = EIO;
+                    return -1;
+                }
+                combo_n += hidden_count;
+                int marker = cmsg_kqueue_marker(&metadata);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = marker;
+            }
+            for (int i = 0; i < nfds; i++) {
+                int fd = fds[i];
+                if (fd < 0 || fd >= HL_NFD || !g_sigfd_slot[fd]) continue;
+                int slot = g_sigfd_slot[fd] - 1;
+                if (slot < 0 || slot >= HL_SFD_MAX || g_sfd[slot].wr < 0 || combo_n + 2 > combo_cap) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                struct hl_cmsg_signalfd_meta metadata = {
+                    .magic = UINT32_C(0x484c5346),
+                    .ordinal = (uint32_t)i,
+                    .source_pid = (int32_t)getpid(),
+                    .source_slot = slot,
+                    .mask = g_sfd[slot].mask,
+                };
+                int marker = cmsg_signalfd_marker(&metadata);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = g_sfd[slot].wr;
                 combo[combo_n++] = marker;
             }
             for (int i = 0; i < nfds; i++) {
@@ -659,8 +1181,35 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     .interval = g_tfd_interval[fd],
                     .source_fd = fd,
                     .source_pid = (int32_t)getpid(),
+                    .nb = (uint32_t)(g_tfd_nb[fd] != 0),
+                    .portable = 1,
+                    .object = g_tfd_object[fd],
+                    .shared_state = (uint64_t)(uintptr_t)g_tfd_shared[fd],
                 };
+                struct hl_cmsg_timerfd_meta placeholder_metadata;
+                memset(&placeholder_metadata, 0, sizeof placeholder_metadata);
+                int placeholder = cmsg_timerfd_marker(&placeholder_metadata);
+                if (placeholder < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[i] = placeholder;
                 int marker = cmsg_timerfd_marker(&tm);
+                if (marker < 0) {
+                    free(combo);
+                    if (errp) *errp = EMSGSIZE;
+                    return -1;
+                }
+                combo[combo_n++] = marker;
+            }
+            for (int i = 0; i < nfds; i++) {
+                struct hl_cmsg_ofd_meta metadata = {
+                    .magic = HL_CMSG_OFD_MAGIC,
+                    .ordinal = (uint32_t)i,
+                    .identity = g_ofd_id[fds[i]],
+                };
+                int marker = cmsg_ofd_marker(&metadata);
                 if (marker < 0) {
                     free(combo);
                     if (errp) *errp = EMSGSIZE;
@@ -705,7 +1254,12 @@ static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t 
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && dlen >= sizeof(int)) {
             int nfds = (int)(dlen / sizeof(int));
             int *fds = (int *)CMSG_DATA(c);
-            int visible = cmsg_import_timerfd_trailer(fds, nfds);
+            int visible = cmsg_import_ofd_trailer(fds, nfds);
+            visible = cmsg_import_signalfd_trailer(fds, visible);
+            visible = cmsg_import_kqueue_trailer(fds, visible);
+            visible = cmsg_import_pipe_trailer(fds, visible);
+            visible = cmsg_import_memfd_trailer(fds, visible);
+            visible = cmsg_import_timerfd_trailer(fds, visible);
             visible = cmsg_import_eventfd_trailer(fds, visible);
             visible = cmsg_import_seq_trailer(fds, visible);
             for (int i = 0; i < visible; i++) {
@@ -866,6 +1420,7 @@ static uint8_t g_sock_stream[HL_NFD];
 // association after FIN so getpeername() there returns ENOTCONN. This sticky flag lets connect(203) report
 // EISCONN faithfully (LTP connect01). Cleared on close (fd_reset_emul) and at socket()/accept re-init.
 static uint8_t g_sock_conn[HL_NFD];
+static uint8_t g_sock_connecting[HL_NFD];
 // fd -> a pending asynchronous socket error (Linux errno) to hand back on the next getsockopt(SO_ERROR),
 // then clear (Linux delivers SO_ERROR once). A non-blocking stream connect() to a closed private-loopback
 // port has no live INET peer to surface ECONNREFUSED through the AF_UNIX switch, so we stash it here and
@@ -1118,6 +1673,104 @@ static void seq_ref_fork_cancel(void) {
 // otherwise land in our own retained end's queue and be misread as a premature EOF -- exactly what broke
 // a multi-process SEQPACKET handshake). Carried on dup (fd_carry_sock); reset on close (fd_reset_emul).
 static int g_sock_pair_peer[HL_NFD];
+static uint64_t g_sock_object[HL_NFD];
+static uint64_t g_sock_peer_object[HL_NFD];
+static _Atomic uint32_t g_sock_object_next = 1;
+
+static uint64_t sock_object_new(void) {
+    uint32_t sequence = atomic_fetch_add_explicit(&g_sock_object_next, 1u, memory_order_relaxed);
+    if (sequence == 0) sequence = atomic_fetch_add_explicit(&g_sock_object_next, 1u, memory_order_relaxed);
+    return ((uint64_t)(uint32_t)getpid() << 32) | sequence;
+}
+
+static void sock_pair_identity_assign(int first, int second) {
+    if (first < 0 || first >= HL_NFD || second < 0 || second >= HL_NFD) return;
+    uint64_t first_object = sock_object_new();
+    uint64_t second_object = sock_object_new();
+    g_sock_object[first] = first_object;
+    g_sock_peer_object[first] = second_object;
+    g_sock_object[second] = second_object;
+    g_sock_peer_object[second] = first_object;
+}
+
+#define SOCK_INTERNAL_HELLO_MAGIC UINT64_C(0x484c434f4e4e3031)
+struct sock_internal_hello {
+    uint64_t magic;
+    uint64_t client_object;
+    uint64_t server_object;
+    uint64_t check;
+};
+
+/* Private loopback/bridge streams are AF_UNIX transports hidden behind guest INET sockets.  Give both
+ * endpoints reciprocal identities on the wire before any guest payload can be sent.  The accepted side
+ * consumes this engine-private header before exposing the fd, so it is invisible to the guest protocol. */
+static int sock_internal_connect_identify(int fd) {
+    if (fd < 0 || fd >= HL_NFD || !g_sock_object[fd]) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_sock_peer_object[fd]) return 0;
+    uint64_t peer = sock_object_new();
+    struct sock_internal_hello hello = {
+        SOCK_INTERNAL_HELLO_MAGIC, g_sock_object[fd], peer,
+        SOCK_INTERNAL_HELLO_MAGIC ^ g_sock_object[fd] ^ peer,
+    };
+    int saved = fcntl(fd, F_GETFL);
+    if (saved < 0) return -1;
+    if ((saved & O_NONBLOCK) && fcntl(fd, F_SETFL, saved & ~O_NONBLOCK) != 0) return -1;
+    const unsigned char *bytes = (const unsigned char *)&hello;
+    size_t offset = 0;
+    while (offset < sizeof hello) {
+        ssize_t count = send(fd, bytes + offset, sizeof hello - offset, 0);
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        int error = count == 0 ? EPIPE : errno;
+        if (saved & O_NONBLOCK) (void)fcntl(fd, F_SETFL, saved);
+        errno = error;
+        return -1;
+    }
+    if ((saved & O_NONBLOCK) && fcntl(fd, F_SETFL, saved) != 0) return -1;
+    g_sock_peer_object[fd] = peer;
+    return 0;
+}
+
+static int sock_internal_accept_identify(int fd) {
+    struct pollfd ready = {fd, POLLIN, 0};
+    int polled;
+    do {
+        polled = poll(&ready, 1, 20);
+    } while (polled < 0 && errno == EINTR);
+    if (polled <= 0 || !(ready.revents & POLLIN)) return 0; /* host-forwarded connection */
+    struct sock_internal_hello hello;
+    ssize_t peeked;
+    do {
+        peeked = recv(fd, &hello, sizeof hello, MSG_PEEK | MSG_DONTWAIT);
+    } while (peeked < 0 && errno == EINTR);
+    if (peeked < (ssize_t)sizeof hello || hello.magic != SOCK_INTERNAL_HELLO_MAGIC) return 0;
+    if (!hello.client_object || !hello.server_object || hello.client_object == hello.server_object ||
+        hello.check != (SOCK_INTERNAL_HELLO_MAGIC ^ hello.client_object ^ hello.server_object)) {
+        errno = EPROTO;
+        return -1;
+    }
+    unsigned char *bytes = (unsigned char *)&hello;
+    size_t offset = 0;
+    while (offset < sizeof hello) {
+        ssize_t count = recv(fd, bytes + offset, sizeof hello - offset, 0);
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        errno = count == 0 ? ECONNRESET : errno;
+        return -1;
+    }
+    g_sock_object[fd] = hello.server_object;
+    g_sock_peer_object[fd] = hello.client_object;
+    return 1;
+}
 
 // fd -> a DISTINCT synthetic peer pid stamped on both ends at socketpair() creation (0 = none). macOS
 // captures LOCAL_PEERPID at socketpair-creation time and reports the CREATOR's pid on BOTH ends, never
@@ -1180,6 +1833,7 @@ static uint32_t g_tcp_laddr[HL_NFD];     // fd -> raw __be32 v4 bind addr (0.0.0
 static uint8_t g_tcp_l6[HL_NFD];         // fd -> 1 if the bind was AF_INET6 (row goes in /proc/net/tcp6)
 static uint8_t g_tcp_laddr6[HL_NFD][16]; // fd -> 16-byte v6 bind addr
 static uint8_t g_tcp_listen[HL_NFD];     // fd -> 1 once listen(2) succeeded (row is emitted only then)
+static int g_sock_backlog[HL_NFD];
 
 static int lo_on(void) {
     return g_netns[0] != 0;
@@ -1377,9 +2031,18 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_seqpacket[dst] = g_sock_seqpacket[src];
     seq_ref_dup(dst, src);
     g_sock_pair_peer[dst] = g_sock_pair_peer[src]; // dup aliases the same end -> same partner
+    g_sock_object[dst] = g_sock_object[src];
+    g_sock_peer_object[dst] = g_sock_peer_object[src];
     g_sock_peer_pid[dst] = g_sock_peer_pid[src];   // ... and the same synthetic peer node identity
     g_sock_passcred[dst] = g_sock_passcred[src];
     g_sock_conn[dst] = g_sock_conn[src];
+    g_sock_connecting[dst] = g_sock_connecting[src];
+    g_so_error[dst] = g_so_error[src];
+    g_so_reuseport[dst] = g_so_reuseport[src];
+    memcpy(g_tcp_optval[dst], g_tcp_optval[src], sizeof g_tcp_optval[dst]);
+    memcpy(g_tcp_optset[dst], g_tcp_optset[src], sizeof g_tcp_optset[dst]);
+    memcpy(g_ipopt_val[dst], g_ipopt_val[src], sizeof g_ipopt_val[dst]);
+    memcpy(g_ipopt_set[dst], g_ipopt_set[src], sizeof g_ipopt_set[dst]);
     g_sock_fam[dst] = g_sock_fam[src];
     g_lo_port[dst] = g_lo_port[src];
     g_lo_v6[dst] = g_lo_v6[src];
@@ -1391,6 +2054,7 @@ static void fd_carry_sock(int dst, int src) {
     g_tcp_laddr[dst] = g_tcp_laddr[src];
     g_tcp_l6[dst] = g_tcp_l6[src];
     g_tcp_listen[dst] = g_tcp_listen[src];
+    g_sock_backlog[dst] = g_sock_backlog[src];
     memcpy(g_tcp_laddr6[dst], g_tcp_laddr6[src], 16);
     g_icmp_kind[dst] = g_icmp_kind[src];
     g_icmp_ip[dst] = g_icmp_ip[src];
