@@ -369,6 +369,12 @@ int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, i
         free(image);
         return -1;
     }
+    // Tell the kqueue layer the queue now also answers to `fd`. On macOS a dup'd kqueue descriptor IS the
+    // same queue and this is a no-op; on a Linux host the queue lives in a side table keyed by descriptor,
+    // so without this the alias stays registered only for `instance` -- which is closed a line later. Every
+    // subsequent kevent(fd, ...) then failed EBADF on the EPOLL INSTANCE itself (not the watched fd), which
+    // is what broke importing an epoll set over SCM_RIGHTS (compat case scm-epoll).
+    if (instance != fd) hl_native_kqueue_duplicate(instance, fd);
     if (instance != fd) close(instance);
     g_epoll[fd] = 1;
     g_ep_dupd[fd] = 1;
@@ -626,6 +632,7 @@ static void kqueue_rebuild_after_fork(void) {
         if (kq < 0) continue;
         if (kq != fd) {
             dup2(kq, fd);
+            hl_native_kqueue_duplicate(kq, fd); // register the alias BEFORE the source goes away (see above)
             close(kq);
         }
         // timerfd: Linux children INHERIT the armed timer. The deadline/interval survive the fork (COW BSS),
