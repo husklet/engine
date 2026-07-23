@@ -323,7 +323,7 @@ CORE_ABI_X86_64 := $(CORE_ABI_BOTH) moffs fpedge fpdnan repmovsdf x87m80 shldfla
 CORE_ABI_BINS := $(CORE_ABI_AARCH64:%=$(BUILD)/compat/core/abi/aarch64/%) \
 	$(CORE_ABI_X86_64:%=$(BUILD)/compat/core/abi/x86_64/%)
 CORE_WORKLOAD_BOTH := busyloop ibtc_dispatch bigmem bigarr soak_codecache soak_indirect soak_threadchurn \
-	soak_forkchurn soak_allocchurn smc_mprotect
+	soak_forkchurn soak_allocchurn smc_mprotect stw_futex_quiesce
 CORE_WORKLOAD_AARCH64 := $(CORE_WORKLOAD_BOTH) dbserver luajit_trace soak_smc smc_threads smc_selfflush sqlite
 CORE_WORKLOAD_X86_64 := $(CORE_WORKLOAD_BOTH) smc_remap_reuse smc_mremap smc_table_overflow
 CORE_WORKLOAD_BINS := $(CORE_WORKLOAD_AARCH64:%=$(BUILD)/compat/core/workload/aarch64/%) \

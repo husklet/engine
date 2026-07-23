@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700 /* nftw() is XSI; needed for the scratch-tree cleanup below */
 
+#include <ftw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -158,6 +160,23 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
     _exit(127);
 }
 
+/* --- scratch-tree cleanup (see the atexit registration in main) ----------- */
+static char g_scratch_root[4096];
+
+static int scratch_remove_entry(const char *path, const struct stat *info, int flag, struct FTW *ftw) {
+    (void)info;
+    (void)flag;
+    (void)ftw;
+    remove(path); /* best effort: FTW_DEPTH gives us children before parents */
+    return 0;
+}
+
+static void scratch_cleanup(void) {
+    if (g_scratch_root[0] == '\0') return;
+    (void)nftw(g_scratch_root, scratch_remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+    g_scratch_root[0] = '\0';
+}
+
 int main(int argc, char **argv) {
     char temporary[1024];
     char checkpoint[512], trigger[520], manifest[528], output[512], release[512], release_error[520];
@@ -209,6 +228,12 @@ int main(int argc, char **argv) {
         return 2;
     strcat(temporary, "/build/hl-checkpoint-tree.XXXXXX");
     if (mkdtemp(temporary) == NULL) return 2;
+    /* The scratch tree is created here but the runner has ~87 return paths, so
+     * cleaning up at each one is unmaintainable -- and skipping it leaked a
+     * build/hl-checkpoint-tree.XXXXXX directory per invocation (hundreds had
+     * accumulated). Register one atexit hook that removes the whole tree. */
+    snprintf(g_scratch_root, sizeof g_scratch_root, "%s", temporary);
+    atexit(scratch_cleanup);
     snprintf(checkpoint, sizeof checkpoint, "%s/image", temporary);
     snprintf(trigger, sizeof trigger, "%s.trigger", checkpoint);
     snprintf(manifest, sizeof manifest, "%s/MANIFEST", checkpoint);

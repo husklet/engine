@@ -19,3 +19,4 @@ smcremapreuse	soak	smc_remap_reuse.c	smc_remap_reuse.c	x86_64	-static-pie -O2 -p
 smcmremap	soak	smc_mremap.c	smc_mremap.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/smc_mremap.out	x86-smc,mremap	active	exact x86-only registration
 smctableoverflow	soak	smc_table_overflow.c	smc_table_overflow.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/smc_table_overflow.out	x86-smc,capacity	active	exact x86-only registration
 sqlite	realsw	sqlite.c	sqlite.c	aarch64	-static-pie -O2 -pthread -lsqlite3 -lm -ldl	argv:/tmp/hl_sqlite_test.db	-	0	expected/sqlite.out	linux-libc,sqlite3,filesystem	active	exact AArch64-only registration including argv; deterministic replacement for native oracle
+stwfutexquiesce	regression	stw_futex_quiesce.c	stw_futex_quiesce.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/stw_futex_quiesce.out	threads,futex,bus-transition,regression	active	exact registered golden; guest-bus STW must not wait on futex-parked peers
