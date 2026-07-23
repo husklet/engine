@@ -1347,3 +1347,27 @@ void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {
 void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block) {
     __atomic_store_n(&fake->process_block_wait, block != 0, __ATOMIC_RELEASE);
 }
+
+/* Private-descriptor hooks.
+ *
+ * src/core/launch.c declares these __attribute__((weak)) and NULL-checks them, because a portable
+ * core/unit link deliberately contains no production host: only host/private.c (in the real linux/macos
+ * host libraries) implements them. That works on ELF, where an undefined weak symbol is permitted and
+ * evaluates to NULL -- but Mach-O's static linker still demands the symbol, so every unit test that pulls
+ * in launch.o failed to link on macOS with "Undefined symbols for architecture arm64". Declaring the
+ * references weak_import does not help either: the symbol is defined nowhere in that link at all.
+ *
+ * The fake host is the right place to resolve it. It exists precisely to satisfy the host contract in
+ * tests, it is never linked into a production engine (those link libhl-host-{linux,macos}.a, which carry
+ * the real host/private.c), so these cannot shadow the real implementations. Registering a private
+ * descriptor is a no-op for a fake host, which is the correct fake behaviour. */
+void hl_host_private_init(void) {}
+
+int hl_host_process_fd_private_add(int descriptor) {
+    (void)descriptor;
+    return 0;
+}
+
+void hl_host_process_fd_private_remove(int descriptor) {
+    (void)descriptor;
+}
