@@ -726,6 +726,32 @@ static void guest_from_host(const char *host, char *out, size_t n) {
     if (g_chroot[0]) chroot_strip(out, n);
 }
 
+// Map a canonical HOST path back to the guest namespace using the VOLUME table only, reporting whether any
+// volume actually backed it. This is the bare-mode (no rootfs) counterpart of guest_from_host: there the
+// engine chdir()s for real, so the live host cwd is normally the guest cwd -- but that identity does NOT
+// hold inside a mapped volume, where the host path is the volume's backing directory. getcwd() then handed
+// the guest a host path, which both leaked the host layout across the container boundary and broke
+// realpath() on a relative path (glibc joins it onto getcwd(), and the host path does not exist in the
+// guest namespace -> ENOENT). guest_from_host_raw cannot be used here because it answers "/" for anything
+// outside every layer, which in bare mode would replace a perfectly good identity-mapped cwd with "/".
+// Longest host prefix wins, matching guest_from_host_raw: mounts nest.
+static int guest_from_host_volume(const char *host, char *out, size_t n) {
+    size_t best_len = 0;
+    const char *best_suffix = NULL;
+    const char *best_guest = NULL;
+    for (int i = 0; i < g_nvols; i++)
+        if (!g_vols[i].dead && !strncmp(host, g_vols[i].hcanon, g_vols[i].hlen) &&
+            (host[g_vols[i].hlen] == '/' || host[g_vols[i].hlen] == 0) &&
+            (best_guest == NULL || g_vols[i].hlen > best_len)) {
+            best_len = g_vols[i].hlen;
+            best_suffix = host + g_vols[i].hlen;
+            best_guest = g_vols[i].guest;
+        }
+    if (best_guest == NULL) return 0;
+    snprintf(out, n, "%s%s", best_guest, best_suffix);
+    return 1;
+}
+
 // Append name/type to a growable (realloc-doubling) parallel array pair. Returns -1 on OOM (leaving the
 // arrays valid, just not grown) so the caller emits what it already has rather than overrunning.
 static int ovl_push(char (**names)[256], uint8_t **types, int *cap, int n, const char *nm, uint8_t ty) {

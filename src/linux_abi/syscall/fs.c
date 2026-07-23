@@ -863,17 +863,19 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // FITS does the copy run -> -EFAULT on a NULL/bad BUF. The old code passed the guest BUF straight to
         // the host getcwd(BUF,size): a NULL/huge-size probe (LTP getcwd01 case 2: buf=NULL,size=(size_t)-1)
         // made libc getcwd write through NULL -> SIGSEGV in the engine instead of returning EFAULT.
-        char cwbuf[4200];
+        char cwbuf[4200], cwguest[4200];
         const char *cw;
         if (g_rootfs) {
             cw = g_cwd[0] ? g_cwd : "/"; // the GUEST cwd (not the host path)
         } else {
-            // bare mode: the engine chdir()s for real, so the live host cwd IS the guest cwd
+            // Bare mode: the engine chdir()s for real, so the live host cwd IS the guest cwd -- EXCEPT
+            // inside a mapped volume, where the host cwd is the volume's backing directory. Translate
+            // through the volume table there; outside every volume bare mode is identity and cwbuf stands.
             if (!getcwd(cwbuf, sizeof cwbuf)) {
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            cw = cwbuf;
+            cw = guest_from_host_volume(cwbuf, cwguest, sizeof cwguest) ? cwguest : cwbuf;
         }
         size_t len = strlen(cw) + 1; // path length INCLUDING the terminating NUL, exactly like the kernel
         if (len > (size_t)a1) {
@@ -3640,10 +3642,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (p) {
             const char *leaf = proc_self_leaf(gp);
             if (leaf && (!strcmp(leaf, "root") || !strcmp(leaf, "cwd"))) {
-                char cwb[4200];
+                char cwb[4200], cwg[4200];
                 const char *tgt = "/";
-                // bare mode (no rootfs): the engine chdir()s for real, so the live host cwd IS the guest cwd
-                if (!strcmp(leaf, "cwd")) tgt = (!g_rootfs && getcwd(cwb, sizeof cwb)) ? cwb : (g_cwd[0] ? g_cwd : "/");
+                // Bare mode (no rootfs): the live host cwd IS the guest cwd, except inside a mapped volume
+                // -- readlink() must never hand the guest a host path (see guest_from_host_volume).
+                if (!strcmp(leaf, "cwd")) {
+                    if (!g_rootfs && getcwd(cwb, sizeof cwb))
+                        tgt = guest_from_host_volume(cwb, cwg, sizeof cwg) ? cwg : cwb;
+                    else
+                        tgt = g_cwd[0] ? g_cwd : "/";
+                }
                 size_t l = strlen(tgt);
                 if (l > bs) l = bs;
                 memcpy(buf, tgt, l);
@@ -3864,11 +3872,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         break;
                     }
-                    char cwb[4200];
+                    char cwb[4200], cwg[4200];
                     const char *tgt = "/";
-                    // bare mode: the engine chdir()s for real, so the live host cwd IS the guest cwd
-                    if (!strcmp(sleaf, "cwd"))
-                        tgt = (!g_rootfs && getcwd(cwb, sizeof cwb)) ? cwb : (g_cwd[0] ? g_cwd : "/");
+                    // Bare mode: the live host cwd IS the guest cwd, except inside a mapped volume. tgt is a
+                    // GUEST path here -- it is handed to xresolve_overlay below, which maps guest -> host.
+                    if (!strcmp(sleaf, "cwd")) {
+                        if (!g_rootfs && getcwd(cwb, sizeof cwb))
+                            tgt = guest_from_host_volume(cwb, cwg, sizeof cwg) ? cwg : cwb;
+                        else
+                            tgt = g_cwd[0] ? g_cwd : "/";
+                    }
                     struct stat es;
                     if (a3 & 0x100) { // lstat: the symlink itself (Linux: st_size == 0)
                         memset(&es, 0, sizeof es);
