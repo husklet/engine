@@ -175,6 +175,11 @@ static int64_t inotify_read(void *opaque, void *buffer, size_t size) {
         size_t record;
         memcpy(&length, object->queue + offset + 12, 4);
         record = 16u + length;
+        /* The record must fit BOTH in what remains of the queue and in the
+         * guest's buffer. Bounding only by the guest buffer let a malformed
+         * queue push `offset` past queue_size, which then read out of bounds
+         * and underflowed `queue_size -= offset` to ~SIZE_MAX. */
+        if (record > object->queue_size - offset) break;
         if (record > size - offset) break;
         offset += record;
     }
@@ -637,6 +642,24 @@ int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
         }
         memcpy(object->queue, cursor, (size_t)header.queue_size);
         object->queue_size = object->queue_capacity = (size_t)header.queue_size;
+        /* Validate the RECORD FRAMING, not just the total size. The queue is a
+         * run of 16-byte headers (wd, mask, cookie, len) each followed by `len`
+         * name bytes, and inotify_read() walks it trusting `len`. A restored
+         * image is untrusted input -- the image digest is an unkeyed FNV-1a, so
+         * it detects bit-rot but is trivially recomputed after a deliberate
+         * edit -- so a record claiming a `len` past the end of the queue would
+         * let that walk run off the allocation. Require every record to fit and
+         * the records to tile the queue EXACTLY; reject the image otherwise. */
+        {
+            size_t walk = 0;
+            while (walk != object->queue_size) {
+                uint32_t name_len;
+                if (object->queue_size - walk < 16u) goto fail_object;
+                memcpy(&name_len, object->queue + walk + 12, 4);
+                if ((size_t)name_len > object->queue_size - walk - 16u) goto fail_object;
+                walk += 16u + (size_t)name_len;
+            }
+        }
     }
     status = hl_linux_object_install_at(linux_abi, requested, &inotify_ops, object, HL_LINUX_OBJECT_INOTIFY,
                                         status_flags, descriptor_flags);

@@ -5191,6 +5191,10 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
     ckpt_restore_backings_close();
     ckpt_restore_pipe_seeds_close();
     ckpt_restore_eventfd_seeds_close();
+    ckpt_restore_signalfd_seeds_close(); /* was omitted here (it is closed in
+                                          * ckpt_restore_tree): every re-forked
+                                          * process leaked its signalfd seed
+                                          * reader+writer pair for its lifetime */
     ckpt_restore_socket_seeds_close();
     run_guest(&c);
     _exit(c.exit_code);
