@@ -1,0 +1,15 @@
+#!/bin/sh
+# Forward a compile/link to the macOS host through OrbStack's `mac`.
+#
+# This is what lets CMake express the Makefile's `MAC=mac` REMOTE build lane
+# (compiling macOS artifacts from the Linux side) without CMake needing any
+# notion of remote execution: the compiler is just a local executable that
+# happens to run the real compiler elsewhere.
+#
+# Two constraints learned the hard way:
+#  * `mac` resolves the command NAME on the macOS side. Passing an absolute
+#    path (e.g. /usr/bin/clang) fails with "posix_spawn: no such file or
+#    directory", so invoke the bare name.
+#  * Only the shared repo path is visible from both sides, so the CMake build
+#    directory MUST live inside the repo (…/build-macos), not /tmp.
+exec mac clang "$@"
