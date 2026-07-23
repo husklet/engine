@@ -124,6 +124,29 @@ void hl_x86_x87_adjust_top(int delta) { // top += delta  (pop = +1)
 // hl_x86_x87_load/hl_x86_x87_store/hl_x86_x87_push/hl_x86_x87_adjust_top calls keep the translate-time static-top
 // shadow consistent exactly like the surrounding ops.
 
+// x87 GENERATED-NaN sign fixup -- the scalar-double analogue of emit_dnan_pre/post (SSE).
+// x87 invalid operations (fsqrt of a negative, 0/0, inf/inf, inf-inf, 0*inf) deliver the QNaN
+// floating-point INDEFINITE with the sign bit SET (0xFFF8000000000000); ARM's FADD/FSUB/FMUL/FDIV/
+// FSQRT deliver the DEFAULT NaN with the sign CLEAR -- identical payload, opposite sign. A NaN
+// PROPAGATED from an input keeps that input's sign on both ISAs, so only a GENERATED NaN may be
+// stamped: "result is NaN AND no input was NaN". PRE runs while both inputs are still live (the
+// ARM forms are destructive, so the mask cannot be built afterwards); POST runs on the result.
+// Scratch: v22/v23, which nothing in the D8-DF lowering (v16/v17/v18/v20 only) uses.
+#define FCMEQd(d, n, m) emit32(0x5E60E400u | ((m) << 16) | ((n) << 5) | (d)) /* FCMEQ Dd,Dn,Dm */
+
+void hl_x86_x87_dnan_pre(int n, int m) {
+    FCMEQd(22, n, n);                                  // d22 = (n == n)   (all-ones iff n is NOT NaN)
+    FCMEQd(23, m, m);                                  // d23 = (m == m)
+    emit32(0x0E201C00u | (23 << 16) | (22 << 5) | 22); // AND v22.8b, v22, v23  -> both inputs ordered
+}
+
+void hl_x86_x87_dnan_post(int d) {
+    FCMEQd(23, d, d);                                    // d23 = (result == result)
+    emit32(0x0E601C00u | (23 << 16) | (22 << 5) | 22);   // BIC v22.8b -> ordered inputs AND NaN result
+    emit32(0x4F005400u | (127u << 16) | (22 << 5) | 22); // SHL v22.2d, v22, #63 -> the sign bit, or 0
+    emit32(0x0EA01C00u | (22 << 16) | ((d) << 5) | (d)); // ORR v_d.8b -> stamp x86's negative indefinite
+}
+
 // FPREM (round-to-zero) / FPREM1 (round-to-nearest-even): ST0 = ST0 - ST1*Q, Q = round(ST0/ST1).
 // The reduction is completed in one fused step, so C2<-0 ("reduction complete"). FPREM also publishes
 // the low three bits of |Q| (C0<-Q2, C3<-Q1, C1<-Q0); FPREM1 leaves the quotient bits cleared -- both
@@ -131,9 +154,11 @@ void hl_x86_x87_adjust_top(int delta) { // top += delta  (pop = +1)
 void hl_x86_x87_remainder(int ieee) {
     hl_x86_x87_load(18, 0);                                         // d18 = ST0
     hl_x86_x87_load(16, 1);                                         // d16 = ST1
+    hl_x86_x87_dnan_pre(18, 16);                                    // generated NaN (x/0, inf%y) -> negative
     emit32(0x1E601800u | (16 << 16) | (18 << 5) | 17);              // fdiv  d17, d18, d16
     emit32((ieee ? 0x1E644000u : 0x1E65C000u) | (17 << 5) | 17);    // frintn/frintz d17, d17  (= Q)
     emit32(0x1F408000u | (16 << 16) | (18 << 10) | (17 << 5) | 18); // fmsub d18, d17, d16, d18 (ST0-Q*ST1)
+    hl_x86_x87_dnan_post(18);
     hl_x86_x87_store(18, 0);
     e_ldr(16, 28, OFF_FPSW);
     e_movconst(19, ~(uint64_t)0x4700);
@@ -153,11 +178,25 @@ void hl_x86_x87_remainder(int ieee) {
 // FSCALE: ST0 = ST0 * 2^trunc(ST1). Build 2^n straight into the double exponent field; clamping the
 // biased exponent to [0,2047] gives +0.0 on underflow and +Inf on overflow, matching scalbn.
 void hl_x86_x87_scale(void) {
-    hl_x86_x87_load(18, 0);               // d18 = ST0
-    hl_x86_x87_load(16, 1);               // d16 = ST1
-    emit32(0x1E780000u | (16 << 5) | 16); // fcvtzs w16, d16  (n = trunc(ST1), int32-saturating)
-    e_sxt(16, 16, 4);                     // sign-extend n to 64-bit
-    e_addi(16, 16, 1023, 1);              // biased exponent e = n + 1023
+    hl_x86_x87_load(18, 0);      // d18 = ST0
+    hl_x86_x87_load(16, 1);      // d16 = ST1
+    hl_x86_x87_dnan_pre(18, 16); // inf*0 -> x86's NEGATIVE indefinite, not ARM's default NaN
+    // FSCALE of a NON-FINITE or ZERO ST0 is the IDENTITY (scalbn(+-inf,n)=+-inf, scalbn(+-0,n)=+-0,
+    // scalbn(NaN,n)=NaN) for EVERY n. The exponent clamp below cannot express that: a large negative
+    // ST1 clamps 2^n to +0.0, so inf*0 came out as the indefinite instead of inf (and symmetrically a
+    // large positive ST1 turned +-0 into a NaN via 0*inf). Capture ST0 and the "not finite, or zero"
+    // predicate now, and select ST0 back over the product at the end.
+    emit32(0x1E60C000u | (18 << 5) | 19); // fabs  d19, d18            (|ST0|)
+    e_movconst(20, 0x7ff0000000000000ull);
+    e_fmov_to_d(20, 20);                               // d20 = +inf
+    emit32(0x7EE0E400u | (19 << 16) | (20 << 5) | 21); // FCMGT d21, d20, d19       (|ST0| < inf, ordered)
+    emit32(0x2E205800u | (21 << 5) | 21);              // NOT   v21.8b              -> inf or NaN
+    emit32(0x5EE0D800u | (19 << 5) | 20);              // FCMEQ d20, d19, #0.0      -> +-0
+    emit32(0x0EA01C00u | (20 << 16) | (21 << 5) | 21); // ORR   v21.8b              -> "identity" mask
+    emit32(0x0EA01C00u | (18 << 16) | (18 << 5) | 20); // MOV   v20.8b, v18         (save ST0)
+    emit32(0x1E780000u | (16 << 5) | 16);              // fcvtzs w16, d16  (n = trunc(ST1), int32-saturating)
+    e_sxt(16, 16, 4);                                  // sign-extend n to 64-bit
+    e_addi(16, 16, 1023, 1);                           // biased exponent e = n + 1023
     e_movconst(19, 2047);
     e_subi_s(31, 16, 2047, 1);        // cmp e, #2047
     e_csel(16, 19, 16, 12 /*GT*/, 1); // e = (e > 2047) ? 2047 : e
@@ -167,6 +206,9 @@ void hl_x86_x87_scale(void) {
     e_lsl_i(16, 16, 52, 1);                            // place e into the exponent field
     e_fmov_to_d(17, 16);                               // d17 = 2^n
     emit32(0x1E600800u | (17 << 16) | (18 << 5) | 18); // fmul d18, d18, d17
+    emit32(0x2E601C00u | (18 << 16) | (20 << 5) | 21); // BSL v21.8b, v20(ST0), v18(prod) -> identity?ST0:prod
+    emit32(0x0EA01C00u | (21 << 16) | (21 << 5) | 18); // MOV v18.8b, v21
+    hl_x86_x87_dnan_post(18);
     hl_x86_x87_store(18, 0);
 }
 

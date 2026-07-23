@@ -99,6 +99,48 @@ engine disagree in a way that is not a translator bug:
 * `CMPXCHG` with a 32-bit **register** destination on the failing-comparison path: the SDM's
   `DEST <- DEST` write zero-extends on hardware, qemu preserves the upper half.
 
-`MXCSR` is excluded from the make targets: the engine surfaces the host FPSR rather than modelling
-x86's sticky exception-status bits, so PE/UE/DE/IE differ on nearly every seed. That is a real but
-separately-tracked divergence, not a per-seed finding.
+`MXCSR` is excluded from the make targets. The engine *does* project the host FPSR cumulative flags
+into MXCSR bits 0..5 (`emit_fpsr_to_mxcsr`, translate.c), so the divergence is narrower than "not
+modelled at all". Measured over 126 diverging seeds:
+
+| differing bit | seeds |
+| --- | --- |
+| DE (bit 1, denormal operand) | 126 / 126 |
+| UE (bit 4) | 5 |
+| OE (bit 3) | 4 |
+| IE (bit 0) | 3 |
+| PE (bit 5) | 2 |
+
+DE is present in *every* one and is the blocker. x86 sets DE whenever a SOURCE OPERAND is denormal;
+AArch64 has no equivalent -- FPSR.IDC is raised only when FZ=1 flushes a denormal input, and the
+engine must run with FZ=0 to keep results bit-exact. Modelling DE therefore means testing the inputs
+of every SSE FP instruction inline (a per-lane `|x| < min_normal && x != 0` probe plus a sticky OR
+into a new cpu-side MXCSR shadow, on the hot path of every FP kernel) and rebuilding
+stmxcsr/ldmxcsr/fxsave/fxrstor around that shadow instead of the FPSR. That is a real per-instruction
+cost for a flag no portable software can observe -- C99 exposes FE_INVALID / FE_DIVBYZERO /
+FE_OVERFLOW / FE_UNDERFLOW / FE_INEXACT and has no name for DE at all. The mask therefore stays,
+deliberately; this is the assessment behind it rather than an unexamined default.
+
+## Two-NaN operand selection
+
+When BOTH inputs of an FP lane are NaN, `qemu-x86_64` selects the surviving operand with softfloat's
+`float_2nan_prop_x87` rule -- a QNaN beats an SNaN; between two NaNs of the same kind the LARGER
+significand wins; on a significand tie the POSITIVE one wins -- and it applies that rule to SSE as
+well as to x87. The Intel SDM (Vol. 1, "Rules for handling NaNs") instead specifies plain
+FIRST-OPERAND priority for SSE: `QNaN(SRC1)` whenever SRC1 is any NaN. Oracle and manual disagree
+here, and the engine's C softmulator (`avx_dnan_f32`/`avx_dnan_f64`, avx.c) follows the ORACLE so the
+campaign stays usable. Two consequences worth knowing: the implemented rule is COMMUTATIVE, which is
+why the horizontal ops need not reproduce x86's odd-lane-first addend order; and this is a
+deliberate oracle-compatibility choice, not an accident.
+
+## Mode coverage
+
+`--gen-args "+bmi"` is clean (400/400 seeds). `--gen-args "+x87"` still reports ~18% of seeds
+diverging, and every one that has been minimized bottoms out in the DOCUMENTED 80-bit gap (H11,
+lower/x87.c): the engine carries ST(0..7) as binary64, so an `fdiv`/`fsqrt` chain double-rounds
+against a real 64-bit-mantissa FPU. Those are not new findings. Two x87 oracle caveats:
+
+* `F2XM1` outside [-1,+1] is architecturally UNDEFINED (the SDM constrains the source range); qemu
+  returns the indefinite, the engine returns `exp2(x)-1`. The generator does not emit `f2xm1`.
+* the x87 divergences show up only in the `MEM` hash, because the generator's x87 results reach the
+  dump through `fstpl` stores.

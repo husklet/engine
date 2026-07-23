@@ -294,6 +294,252 @@ static void sse_flag_clobber(void) {
     printf("%-18s %016lx\n", "cmp-cvttsd2si-js", r);
 }
 
+/* ---------------------------------------------------------------- unaligned (split-lock) atomics */
+/* `xchg reg,mem` is implicitly locked and every `lock`-prefixed RMW is legal at ANY address on x86.
+ * The backend lowers them to single LSE atomics (SWPAL / LDADDAL / LDCLRAL / LDEORAL / LDSETAL /
+ * CASAL), which alignment-fault on AArch64 -- so an unaligned one used to kill the guest with
+ * SIGBUS. A SIGBUS/BUS_ADRALN fixup (lse_align_fixup, linux_abi/x86.c) now emulates them. */
+static unsigned char atom[256] __attribute__((aligned(64)));
+
+static void atom_reset(void) {
+    for (unsigned i = 0; i < sizeof atom; i++)
+        atom[i] = (unsigned char)(i * 7 + 3);
+}
+
+static void unaligned_atomics(void) {
+    for (int off = 1; off <= 15; off += 7) {
+        unsigned char *p = atom + 64 + off;
+        unsigned long a, m;
+        atom_reset();
+        a = 0x1122334455667788ULL;
+        __asm__ volatile("xchgq %0,(%1)" : "+r"(a) : "r"(p) : "memory");
+        memcpy(&m, p, 8);
+        printf("%-18s %2d %016lx %016lx\n", "xchg64", off, a, m);
+        atom_reset();
+        a = 0x00000000deadbeefULL;
+        __asm__ volatile("lock xaddl %k0,(%1)" : "+r"(a) : "r"(p) : "memory", "cc");
+        memcpy(&m, p, 4);
+        printf("%-18s %2d %016lx %016lx\n", "xadd32", off, a, m & 0xffffffffUL);
+        atom_reset();
+        a = 0x0f0f0f0f0f0f0f0fULL;
+        __asm__ volatile("lock andq %0,(%1)" : : "r"(a), "r"(p) : "memory", "cc");
+        memcpy(&m, p, 8);
+        printf("%-18s %2d %016lx\n", "lock-and64", off, m);
+        atom_reset();
+        a = 0x1000000000000001ULL;
+        __asm__ volatile("lock orq %0,(%1)" : : "r"(a), "r"(p) : "memory", "cc");
+        memcpy(&m, p, 8);
+        printf("%-18s %2d %016lx\n", "lock-or64", off, m);
+        atom_reset();
+        __asm__ volatile("lock btsq $37,(%0)" : : "r"(p) : "memory", "cc");
+        memcpy(&m, p, 8);
+        printf("%-18s %2d %016lx\n", "lock-bts64", off, m);
+        atom_reset();
+        { /* cmpxchg, both the taken and the failing comparison */
+            unsigned long want = 0, rax, nv = 0xAAAABBBBCCCCDDDDULL;
+            int z;
+            memcpy(&want, p, 8);
+            rax = want;
+            __asm__ volatile("lock cmpxchgq %3,(%2)\n setz %b1"
+                             : "+a"(rax), "=q"(z)
+                             : "r"(p), "r"(nv)
+                             : "memory", "cc");
+            memcpy(&m, p, 8);
+            printf("%-18s %2d z=%d %016lx %016lx\n", "cmpxchg-hit", off, z & 1, rax, m);
+            rax = 0xdeadbeefdeadbeefULL;
+            __asm__ volatile("lock cmpxchgq %3,(%2)\n setz %b1"
+                             : "+a"(rax), "=q"(z)
+                             : "r"(p), "r"(nv)
+                             : "memory", "cc");
+            memcpy(&m, p, 8);
+            printf("%-18s %2d z=%d %016lx %016lx\n", "cmpxchg-miss", off, z & 1, rax, m);
+        }
+        atom_reset();
+        a = 0x12345678;
+        __asm__ volatile("xchgl %k0,(%1)" : "+r"(a) : "r"(p) : "memory");
+        memcpy(&m, p, 4);
+        printf("%-18s %2d %016lx %016lx\n", "xchg32", off, a, m & 0xffffffffUL);
+    }
+}
+
+/* ---------------------------------------------------------------- two-NaN operand selection */
+/* When both inputs of an FP lane are NaN, the operand that survives is chosen by significand and
+ * kind, not by ARM's SNaN-first rule (see avx_dnan_f32/f64). The SSE3 horizontal/addsub family
+ * (0F 7C/7D/D0) had NO NaN-input gate at all and so always took ARM's answer. */
+static const unsigned long long NANK[6] = {
+    0x7ff0000000000001ULL, /* sNaN + payload 1 */
+    0x7ff8000000000009ULL, /* qNaN + payload 9 */
+    0xfff0000000000002ULL, /* sNaN - payload 2 */
+    0xfff8000000000004ULL, /* qNaN - payload 4 */
+    0x7ff0000000000000ULL, /* +inf  */
+    0x3ff0000000000000ULL, /* 1.0   */
+};
+
+static void nan_pairs(void) {
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 6; j++) {
+            A2[0] = A2[1] = NANK[i];
+            B2[0] = B2[1] = NANK[j];
+            VRUN(LOAD2, "addpd %%xmm1,%%xmm0");
+            printf("addpd %d%d ", i, j);
+            show("");
+            VRUN(LOAD2, "mulpd %%xmm1,%%xmm0");
+            printf("mulpd %d%d ", i, j);
+            show("");
+            /* horizontal: the pair is (even,odd) WITHIN each source */
+            A2[0] = NANK[i];
+            A2[1] = NANK[j];
+            B2[0] = NANK[j];
+            B2[1] = NANK[i];
+            VRUN(LOAD2, "haddpd %%xmm1,%%xmm0");
+            printf("haddpd %d%d ", i, j);
+            show("");
+            VRUN(LOAD2, "hsubpd %%xmm1,%%xmm0");
+            printf("hsubpd %d%d ", i, j);
+            show("");
+            VRUN(LOAD2, "addsubpd %%xmm1,%%xmm0");
+            printf("addsubpd %d%d ", i, j);
+            show("");
+            A4[0] = (unsigned)(NANK[i] >> 32);
+            A4[1] = (unsigned)(NANK[j] >> 32);
+            A4[2] = (unsigned)(NANK[j] >> 32);
+            A4[3] = (unsigned)(NANK[i] >> 32);
+            B4[0] = (unsigned)(NANK[j] >> 32);
+            B4[1] = (unsigned)(NANK[i] >> 32);
+            B4[2] = (unsigned)(NANK[i] >> 32);
+            B4[3] = (unsigned)(NANK[j] >> 32);
+            VRUN(LOAD4, "haddps %%xmm1,%%xmm0");
+            printf("haddps %d%d ", i, j);
+            show("");
+            VRUN(LOAD4, "hsubps %%xmm1,%%xmm0");
+            printf("hsubps %d%d ", i, j);
+            show("");
+            VRUN(LOAD4, "addsubps %%xmm1,%%xmm0");
+            printf("addsubps %d%d ", i, j);
+            show("");
+        }
+}
+
+/* ---------------------------------------------------------------- in-place float->int converts */
+/* CVT(T)PS2DQ needs a "make indefinite" mask built from the SOURCE floats. It used to be built
+ * AFTER the FCVT*S, which for the in-place `cvttps2dq %xmm0,%xmm0` form read the integer result
+ * reinterpreted as f32: an all-ones lane looked like a NaN and was forced to 0x80000000, and a
+ * genuine indefinite lane (0x80000000 == -0.0f) looked ordered and kept ARM's NaN->0. */
+static void cvt_in_place(void) {
+    static const unsigned int SRC[4] = {0xbfc00000u /* -1.5 */, 0x7fc00000u /* NaN */, 0x4f000000u /* 2^31 */,
+                                        0x42c80000u /* 100.0 */};
+    for (int rot = 0; rot < 4; rot++) {
+        for (int i = 0; i < 4; i++)
+            A4[i] = SRC[(i + rot) & 3];
+        __asm__ volatile("movdqa A4(%%rip), %%xmm0\n cvttps2dq %%xmm0, %%xmm0\n"
+                         " movdqa %%xmm0, xmm_out(%%rip)"
+                         :
+                         :
+                         : "xmm0", "memory");
+        printf("cvttps2dq-ip%d ", rot);
+        show("");
+        __asm__ volatile("movdqa A4(%%rip), %%xmm0\n cvtps2dq %%xmm0, %%xmm0\n"
+                         " movdqa %%xmm0, xmm_out(%%rip)"
+                         :
+                         :
+                         : "xmm0", "memory");
+        printf("cvtps2dq-ip%d  ", rot);
+        show("");
+    }
+}
+
+/* ---------------------------------------------------------------- x87 generated-NaN sign */
+/* An x87 invalid operation delivers the QNaN indefinite with the SIGN BIT SET; ARM's FADD/FSUB/
+ * FMUL/FDIV/FSQRT deliver the positive default NaN (identical payload, opposite sign). */
+static double fa, fb, fr;
+
+static void x87_indefinite(void) {
+#define X87_2(tag, x, y, ins)                                                                                          \
+    do {                                                                                                               \
+        fa = (x);                                                                                                      \
+        fb = (y);                                                                                                      \
+        __asm__ volatile("fldl %1\n fldl %2\n " ins "\n fstpl %0" : "=m"(fr) : "m"(fb), "m"(fa) : "memory", "st");     \
+        unsigned long u;                                                                                               \
+        memcpy(&u, &fr, 8);                                                                                            \
+        printf("%-18s %016lx\n", tag, u);                                                                              \
+    } while (0)
+#define X87_1(tag, x, ins)                                                                                             \
+    do {                                                                                                               \
+        fa = (x);                                                                                                      \
+        __asm__ volatile("fldl %1\n " ins "\n fstpl %0" : "=m"(fr) : "m"(fa) : "memory", "st");                        \
+        unsigned long u;                                                                                               \
+        memcpy(&u, &fr, 8);                                                                                            \
+        printf("%-18s %016lx\n", tag, u);                                                                              \
+    } while (0)
+    double inf = __builtin_inf(), zero = 0.0, nnan = -__builtin_nan("");
+    X87_1("fsqrt-neg", -4.0, "fsqrt");
+    X87_1("fsqrt-negzero", -0.0, "fsqrt");
+    X87_2("fdiv-0/0", zero, zero, "fdivp %%st,%%st(1)");
+    X87_2("fdiv-inf/inf", inf, inf, "fdivp %%st,%%st(1)");
+    X87_2("fsub-inf-inf", inf, inf, "fsubp %%st,%%st(1)");
+    X87_2("fmul-0*inf", zero, inf, "fmulp %%st,%%st(1)");
+    X87_2("fadd-inf-inf", inf, -inf, "faddp %%st,%%st(1)");
+    X87_2("fdivr-0/0", zero, zero, "fdivrp %%st,%%st(1)");
+    X87_2("fprem-0", -1.0, zero, "fprem\n fstp %%st(1)");
+    /* FSCALE is the identity on +-inf / +-0 / NaN for EVERY scale; the biased-exponent clamp used to
+     * turn those into 0*inf (an indefinite) once the scale saturated the clamp in either direction. */
+    X87_2("fscale-inf-down", inf, -1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-ninf-down", -inf, -1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-zero-up", zero, 1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-nzero-up", -0.0, 1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-one-down", 1.0, -1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-one-up", 1.0, 1.0e30, "fscale\n fstp %%st(1)");
+    X87_2("fscale-normal", 3.0, 2.0, "fscale\n fstp %%st(1)");
+    X87_2("fscale-nan", nnan, 5.0, "fscale\n fstp %%st(1)");
+    /* a PROPAGATED NaN keeps its own sign on both ISAs -- must NOT be stamped */
+    X87_2("fadd-propagate", nnan, 1.0, "faddp %%st,%%st(1)");
+    X87_2("fmul-propagate", -nnan, 1.0, "fmulp %%st,%%st(1)");
+    X87_1("fsqrt-propagate", -nnan, "fsqrt");
+#undef X87_1
+#undef X87_2
+}
+
+/* ---------------------------------------------------------------- PCMPISTRI equal-ordered */
+/* The equal-ordered aggregation (imm[3:2]=11b) walks the needle over operand2 with the SDM's
+ * asymmetric validity table: needle exhausted -> forced TRUE, haystack exhausted first -> forced
+ * FALSE. The inner loop used to be bounded by the needle length rather than the element count, so a
+ * needle reaching the end of a null-free operand2 was wrongly reported as a mismatch. */
+static const char *const PSTR[8] = {
+    "abcdef\0\0\0\0\0\0\0\0\0", "abc\0defghijklmn",          "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    "xyzabcdefghijkl",          "aaaaaaaaaaaaaaa",           "zzabcdef\0zzzzzz",
+    "abcabcabcabcabc",          "nopq\0\0\0\0\0\0\0\0\0\0\0"};
+
+static void pcmpistri_forms(void) {
+    static const int IMM[10] = {0x00, 0x04, 0x08, 0x0c, 0x1c, 0x3c, 0x5c, 0x7c, 0x0d, 0x1d};
+    for (int ia = 0; ia < 8; ia++)
+        for (int ib = 0; ib < 8; ib++) {
+            memset(A2, 0, 16);
+            memset(B2, 0, 16);
+            memcpy(A2, PSTR[ia], 15);
+            memcpy(B2, PSTR[ib], 15);
+            ((unsigned char *)A2)[15] = (ia == 4 || ia == 6) ? 'q' : 0;
+            ((unsigned char *)B2)[15] = (ib == 4 || ib == 6) ? 'q' : 0;
+            for (int k = 0; k < 10; k++) {
+                unsigned long rcx = 0, fl = 0;
+                switch (IMM[k]) {
+#define PIS(im)                                                                                                        \
+    case im:                                                                                                           \
+        __asm__ volatile("movdqa A2(%%rip),%%xmm0\n movdqa B2(%%rip),%%xmm1\n"                                         \
+                         " pcmpistri $" #im ",%%xmm1,%%xmm0\n movq %%rcx,%0\n pushfq\n popq %1"                        \
+                         : "=r"(rcx), "=r"(fl)                                                                         \
+                         :                                                                                             \
+                         : "xmm0", "xmm1", "rcx", "cc", "memory");                                                     \
+        break;
+                    PIS(0x00)
+                    PIS(0x04) PIS(0x08) PIS(0x0c) PIS(0x1c) PIS(0x3c) PIS(0x5c) PIS(0x7c) PIS(0x0d) PIS(0x1d)
+#undef PIS
+                        default : break;
+                }
+                printf("pcmpistri %02x %d%d %2lu %04lx\n", IMM[k], ia, ib, rcx, fl & 0x8d5UL);
+            }
+        }
+}
+
 int main(void) {
     scalar_upper_lanes();
     packed_converts();
@@ -303,5 +549,10 @@ int main(void) {
     cmpxchg_xadd();
     popcnt_flags();
     sse_flag_clobber();
+    unaligned_atomics();
+    nan_pairs();
+    cvt_in_place();
+    x87_indefinite();
+    pcmpistri_forms();
     return 0;
 }

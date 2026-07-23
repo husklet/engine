@@ -17,6 +17,7 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
     return result.status == HL_STATUS_OK ? (void *)(uintptr_t)state->mapping.address : NULL;
 }
 
+#include <stdatomic.h>
 #include <sys/ucontext.h>
 #include "../host/native_context.h"
 
@@ -873,6 +874,89 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     return 1;
 }
 
+// Unaligned guest ATOMIC (LSE) alignment-fault fixup.
+//
+// x86 makes `xchg reg,mem` implicitly locked and lets `lock` prefix any of add/adc/sub/sbb/and/or/xor/
+// btc/bts/btr/xadd/cmpxchg -- at ANY address, aligned or not. A split-lock access is legal x86 and real
+// hardware honours it (it locks the bus). The backend lowers all of those to single LSE instructions
+// (SWPAL / LDADDAL / LDCLRAL / LDEORAL / LDSETAL / CASAL, emit.c e_lse / e_cas), and an LSE atomic to an
+// address that is not naturally aligned raises SIGBUS/BUS_ADRALN on AArch64 (an unaligned atomic is
+// CONSTRAINED UNPREDICTABLE-free only when SCTLR.nAA permits it, and never across a 16-byte granule).
+// Without this fixup an otherwise-valid guest program dies of SIGBUS.
+//
+// Exactly as for the LDAPR fixup above: a BUS_ADRALN raised at an engine-emitted LSE atomic host PC is
+// ALWAYS synthetic (x86 permits the access), never a guest-visible fault, so emulating it and resuming is
+// sound. The emulation performs the read-modify-write under a dedicated global lock with acquire-release
+// barriers, which keeps it atomic against OTHER unaligned guest atomics -- the case a split-lock guest
+// actually exercises. It is NOT mutually exclusive with the aligned LSE fast path on an overlapping
+// address; making that work would require stopping the world on every atomic (what qemu-user does via
+// cpu_loop_exit_atomic) and would tax every correctly-aligned lock in every guest. The trade is
+// deliberate and documented: correctness for split-lock programs, no cost on the aligned path.
+static _Atomic unsigned g_unaligned_atomic_lock;
+
+static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
+    if (sig != SIGBUS || !si || !ucv) return 0;
+#ifdef BUS_ADRALN
+    if (si->si_code != BUS_ADRALN) return 0;
+#else
+    if (si->si_code != 1) return 0;
+#endif
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
+    extern int jit_pc_in_cache(uint64_t pc, uint64_t * base);
+    if (!jit_pc_in_cache(hpc, NULL)) return 0; // not code we emitted
+    uint32_t insn = *(uint32_t *)hpc;
+    int size = insn >> 30; // 0=B 1=H 2=W 3=X
+    unsigned width = 1u << size;
+    int rs = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+    // Two encodings, and only the two the backend emits:
+    //   atomic memory op  op[29:24]=111000 A=1 R=1 bit21=1 bits[11:10]=00, o3[15]/opc[14:12] select the op
+    //   CASAL             op[29:21]=001010001 (A=1,L=1), o0[15]=1, Rt2[14:10]=11111
+    int is_amo = (insn & 0x3FE00C00u) == 0x38E00000u; // 111000 A=1 R=1 bit21=1 bits[11:10]=00
+    int is_cas = (insn & 0x3FE0FC00u) == 0x08E0FC00u;
+    unsigned o3opc = (insn >> 12) & 0xF; // [o3, opc]
+    if (is_amo) {
+        // SWP is o3=1,opc=000 (0b1000); LDADD/LDCLR/LDEOR/LDSET are o3=0,opc=0..3. Nothing else is emitted
+        // for a guest atomic, so decline anything else rather than guess at its semantics.
+        if (o3opc > 3 && o3opc != 8) return 0;
+    } else if (!is_cas) {
+        return 0;
+    }
+    uint64_t *X = HL_HOST_UC_REGS(uc);
+    uint64_t addr = (rn == 31) ? (uint64_t)HL_HOST_UC_SP(uc) : X[rn];
+    // Only emulate a fully mapped access; otherwise decline so the genuine guest fault is delivered.
+    if (!hl_host_range_mapped((uintptr_t)addr, width)) return 0;
+    uint64_t sval = (rs == 31) ? 0 : X[rs];
+    uint64_t tval = (rt == 31) ? 0 : X[rt];
+    if (width < 8) { // the W-form operates on 32 bits; B/H forms on their low bytes
+        uint64_t m = (width == 4) ? 0xFFFFFFFFull : ((1ull << (8 * width)) - 1);
+        sval &= m;
+        tval &= m;
+    }
+    uint64_t old = 0, neu;
+    while (atomic_exchange_explicit(&g_unaligned_atomic_lock, 1u, memory_order_acquire))
+        ;
+    memcpy(&old, (const void *)addr, width); // little-endian host == little-endian guest
+    if (is_cas) {
+        neu = (old == sval) ? tval : old; // CASAL: Rs is the comparand, Rt the new value
+    } else {
+        switch (o3opc) {
+        case 0: neu = old + sval; break;  // LDADD
+        case 1: neu = old & ~sval; break; // LDCLR
+        case 2: neu = old ^ sval; break;  // LDEOR
+        case 3: neu = old | sval; break;  // LDSET
+        default: neu = sval; break;       // SWP
+        }
+    }
+    memcpy((void *)addr, &neu, width);
+    atomic_store_explicit(&g_unaligned_atomic_lock, 0u, memory_order_release);
+    // CASAL returns the pre-image in Rs; the LD*/SWP forms return it in Rt. Both zero-extend to 64 bits.
+    int dst = is_cas ? rs : rt;
+    if (dst != 31) X[dst] = old;
+    HL_HOST_UC_PC(uc) += 4;
+    return 1;
+}
+
 // x86-TSO LDAPR alignment-fault fixup. Guest loads are emitted as LDAPR (Load-AcquirePC) to supply the
 // x86-TSO LoadLoad+LoadStore ordering in one instruction (emit.c). On a FEAT_LSE2 host an unaligned LDAPR
 // that crosses a 16-byte granule raises SIGBUS/BUS_ADRALN. x86 permits every unaligned normal load, and a
@@ -920,6 +1004,9 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // this synthetic BUS_ADRALN is neither a guest fault nor a lazy-map candidate. (No-op unless the fault
     // is a BUS_ADRALN at an engine LDAPR host PC.)
     if (ldapr_align_fixup(sig, si, uc)) return;
+    // Same shape, for guest ATOMICs: an unaligned (split-lock) x86 lock/xchg lowered to an LSE atomic
+    // alignment-faults on AArch64 although x86 permits it. Emulate + resume; see lse_align_fixup.
+    if (lse_align_fixup(sig, si, uc)) return;
     // host_range_mapped's fault-guarded probe (thread.c): a probe load on an unmapped guest page long-jumps
     // back to report "unmapped" -> -EFAULT. MUST run first: the lazy zero-page mapper below would otherwise
     // serve the probe fault with a fresh mapping, flipping a correct EFAULT into a bogus success (and

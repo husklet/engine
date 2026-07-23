@@ -210,13 +210,15 @@ static int qnan64(uint64_t u) {
 
 // x86 add/sub/mul/div result NaN handling. Two distinct rules, both of which the host NEON FADD/FMUL/FSUB/
 // FDIV that computed `r` gets WRONG, so we recompute from the operands here:
-//   (1) INPUT NaN: x86 selects src1 when src1 is a QNaN, otherwise src2 if src2 is a NaN, otherwise
-//       src1 -- i.e. QNaN(src1)-priority, else src2. Measured against qemu-x86_64 for all four
-//       NaN-pair kinds: (qnan,qnan)->src1, (qnan,snan)->src1, (snan,qnan)->src2, (snan,snan)->src2.
-//       The earlier condition additionally required src2 to be a non-QNaN before preferring src1, so
-//       the (qnan,qnan) pair -- by far the common one, since every propagated NaN is quiet -- wrongly
-//       returned src2. A single NaN input returns that operand quieted. The chosen NaN is quieted by
-//       setting its mantissa MSB (payload+sign preserved).
+//   (1) INPUT NaN: a single NaN input is returned, quieted. When BOTH inputs are NaN the operand is
+//       selected by the rule the reference oracle (qemu-x86_64) applies to SSE, which is softfloat's
+//       `float_2nan_prop_x87`: a QNaN beats an SNaN; between two NaNs of the SAME kind the one with
+//       the LARGER significand wins; on a significand tie the POSITIVE one wins. It is fully
+//       COMMUTATIVE -- which is why the horizontal ops below need not care whether x86 pairs
+//       odd+even or even+odd. Measured exhaustively against qemu-x86_64 (see the NaN-selection note
+//       in tests/fuzz/isa/x86_64/README.md, which also records that the SDM instead specifies plain
+//       first-operand priority for SSE, i.e. oracle and manual disagree here).
+//       The chosen NaN is quieted by setting its mantissa MSB (payload + sign preserved).
 //   (2) GENERATED NaN (result NaN, NO input NaN: 0/0, inf/inf, 0*inf, inf-inf): x86 yields the QNaN
 //       floating-point INDEFINITE with the sign bit SET (0xFFC00000 / 0xFFF8000000000000); ARM yields the
 //       positive default NaN. Same payload, opposite sign.
@@ -226,7 +228,15 @@ static float avx_dnan_f32(float r, float x, float y) {
     memcpy(&yb, &y, 4);
     int xn = nan32(xb), yn = nan32(yb);
     if (xn || yn) {
-        uint32_t w = (xn && yn) ? (qnan32(xb) ? xb : yb) : (xn ? xb : yb);
+        uint32_t w;
+        if (!xn || !yn) {
+            w = xn ? xb : yb; // exactly one NaN input -> that one
+        } else if (qnan32(xb) != qnan32(yb)) {
+            w = qnan32(xb) ? xb : yb; // quiet beats signaling
+        } else {
+            uint32_t fx = xb & 0x007fffffu, fy = yb & 0x007fffffu; // same kind -> larger significand
+            w = (fx > fy) ? xb : (fy > fx) ? yb : ((xb >> 31) <= (yb >> 31) ? xb : yb); // tie -> positive
+        }
         w |= 0x00400000u; // quiet the selected NaN (x86)
         memcpy(&r, &w, 4);
         return r;
@@ -244,7 +254,15 @@ static double avx_dnan_f64(double r, double x, double y) {
     memcpy(&yb, &y, 8);
     int xn = nan64(xb), yn = nan64(yb);
     if (xn || yn) {
-        uint64_t w = (xn && yn) ? (qnan64(xb) ? xb : yb) : (xn ? xb : yb);
+        uint64_t w;
+        if (!xn || !yn) {
+            w = xn ? xb : yb; // exactly one NaN input -> that one
+        } else if (qnan64(xb) != qnan64(yb)) {
+            w = qnan64(xb) ? xb : yb; // quiet beats signaling
+        } else {
+            uint64_t fx = xb & 0x000fffffffffffffull, fy = yb & 0x000fffffffffffffull;  // larger significand
+            w = (fx > fy) ? xb : (fy > fx) ? yb : ((xb >> 63) <= (yb >> 63) ? xb : yb); // tie -> positive
+        }
         w |= 0x0008000000000000ull; // quiet the selected NaN (x86)
         memcpy(&r, &w, 8);
         return r;
@@ -967,7 +985,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                         for (int i = 0; i < 4; i++)
                             o[i] =
                                 (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i]) : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
-                    } else { // hadd/hsub
+                    } else { // hadd/hsub (the NaN selection rule is commutative, so the addend order of
+                             // HADD -- SDM: SRC[63:32]+SRC[31:0] -- is not observable)
                         o[0] = sub ? avx_dnan_f32(x[0] - x[1], x[0], x[1]) : avx_dnan_f32(x[0] + x[1], x[0], x[1]);
                         o[1] = sub ? avx_dnan_f32(x[2] - x[3], x[2], x[3]) : avx_dnan_f32(x[2] + x[3], x[2], x[3]);
                         o[2] = sub ? avx_dnan_f32(y[0] - y[1], y[0], y[1]) : avx_dnan_f32(y[0] + y[1], y[0], y[1]);
@@ -2592,10 +2611,23 @@ static int sse42_intres(const uint8_t *a, const uint8_t *b, int la, int lb, int 
                 bit = 1;
             break;
         case 3: // equal-ordered: needle a[0..la) matches b starting at position i
+            // The inner loop is bounded by the ELEMENT COUNT (k = i+j < n), not by la: the SDM's
+            // per-element validity table decides the rest, and it is NOT symmetric --
+            //   a valid,   b valid   -> compare
+            //   a valid,   b invalid -> force FALSE   (needle runs off the end of the haystack)
+            //   a invalid, b either  -> force TRUE    (needle exhausted -> the match stands)
+            // Bounding the loop by `j < la` instead evaluated a k that had walked past the last
+            // element, so a needle reaching the end of a full (null-free) operand2 -- e.g. the
+            // all-ones vector a `cmppd` leaves behind -- was wrongly reported as a mismatch.
             bit = 1;
-            for (int j = 0; j < la; j++) {
+            for (int j = 0; i + j < n; j++) {
                 int k = i + j;
-                if (k >= lb || sse42_elem(a, j, wordsz, sgn) != sse42_elem(b, k, wordsz, sgn)) {
+                if (j >= la) break; // a invalid -> forced TRUE
+                if (k >= lb) {      // a valid, b invalid -> FALSE
+                    bit = 0;
+                    break;
+                }
+                if (sse42_elem(a, j, wordsz, sgn) != sse42_elem(b, k, wordsz, sgn)) {
                     bit = 0;
                     break;
                 }
@@ -2687,6 +2719,51 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(D + i, &z, 4);
             }
         }
+        c->rip = next;
+        return;
+    }
+
+    // ---- Legacy (non-VEX) SSE3 horizontal / addsub FP (0F 7C haddp*, 0F 7D hsubp*, 0F D0 addsubp*) ------
+    // Same NaN-INPUT gate as the vertical arithmetic above: the JIT inlines these as NEON UZP+FADD/FSUB
+    // (translate.c), which selects the ARM way (SNaN-priority, else src1) when a result lane has two NaN
+    // inputs, where x86 wants QNaN(first-operand)-priority, else the second operand. translate.c exits here
+    // whenever any checked input lane is a NaN. Note HADD's first addend is the ODD lane of the pair (SDM:
+    // DEST[63:0] <- SRC1[127:64] + SRC1[63:0]); HSUB's is the even one. Commutative for values, NOT for NaN
+    // selection. 66 -> double lanes, F2 -> single. Legacy SSE preserves the upper YMM bits -> write only D.
+    if (I.two && map == 0 && (op == 0x7C || op == 0x7D || op == 0xD0)) {
+        int dbl = I.p66 != 0;
+        int sub = (op == 0x7D);
+        uint8_t b[64];
+        avx_get_rm(state, c, &I, next, 16, b); // src2 (r/m)
+        uint8_t out[16];
+        if (dbl) {
+            double x[2], y[2], o[2];
+            memcpy(x, D, 16);
+            memcpy(y, b, 16);
+            if (op == 0xD0) { // addsub: even lane subtracts, odd lane adds
+                o[0] = avx_dnan_f64(x[0] - y[0], x[0], y[0]);
+                o[1] = avx_dnan_f64(x[1] + y[1], x[1], y[1]);
+            } else {
+                o[0] = sub ? avx_dnan_f64(x[0] - x[1], x[0], x[1]) : avx_dnan_f64(x[0] + x[1], x[0], x[1]);
+                o[1] = sub ? avx_dnan_f64(y[0] - y[1], y[0], y[1]) : avx_dnan_f64(y[0] + y[1], y[0], y[1]);
+            }
+            memcpy(out, o, 16);
+        } else {
+            float x[4], y[4], o[4];
+            memcpy(x, D, 16);
+            memcpy(y, b, 16);
+            if (op == 0xD0) {
+                for (int i = 0; i < 4; i++)
+                    o[i] = (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i]) : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
+            } else {
+                o[0] = sub ? avx_dnan_f32(x[0] - x[1], x[0], x[1]) : avx_dnan_f32(x[0] + x[1], x[0], x[1]);
+                o[1] = sub ? avx_dnan_f32(x[2] - x[3], x[2], x[3]) : avx_dnan_f32(x[2] + x[3], x[2], x[3]);
+                o[2] = sub ? avx_dnan_f32(y[0] - y[1], y[0], y[1]) : avx_dnan_f32(y[0] + y[1], y[0], y[1]);
+                o[3] = sub ? avx_dnan_f32(y[2] - y[3], y[2], y[3]) : avx_dnan_f32(y[2] + y[3], y[2], y[3]);
+            }
+            memcpy(out, o, 16);
+        }
+        memcpy(D, out, 16);
         c->rip = next;
         return;
     }

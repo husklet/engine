@@ -995,6 +995,18 @@ static int fpdnan_on(void) { return 1; }
 // POST to a 2-op chain from the result. two_in: 1 for add/sub/mul/div (src1=vd, src2=s); 0 for sqrt.
 // SHL.T #(esize-1) turns an all-ones "not-NaN" lane into exactly the sign bit (0x8000...), a 0 lane
 // stays 0 -- no constant/DUP needed.
+// NaN-INPUT gate for the PACKED SSE3 horizontal / addsub family (0F 7C haddp*, 0F 7D hsubp*,
+// 0F D0 addsubp*), the exact analogue of the inline gate the vertical 0F 58/59/5C/5E arithmetic
+// carries. Those NEON sequences (UZP1/UZP2 + FADD/FSUB, or FSUB/FADD + BSL) are bit-exact with x86
+// for finite inputs and for a lane with a SINGLE NaN input, but when a result lane has TWO NaN
+// inputs ARM picks SNaN-first-else-src1 where x86 picks QNaN-first-else-second-operand -- the exact
+// mirror. Reproducing x86's per-lane priority inline would cost more than the op itself, so gate:
+// if ANY lane of either source is a NaN, exit to the x86-exact C softmulator (R_SSE3B ->
+// hl_x86_sse_run, which grew coverage for these three opcodes alongside this gate). Real FP code
+// has no NaN inputs, so the inline path below is untouched. Emit while src1 is still live in vd.
+// Scratch: v24/v25 and x16 (all dead here -- s is v16 at most, a different register file).
+static void emit_nan_input_gate(int vd, int s, int dbl, uint64_t gpc);
+
 static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
     uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ Vd.2d/.4s (all-ones per lane where NOT NaN)
     unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
@@ -1044,6 +1056,23 @@ static void emit_dnan_post(int vd, int dbl, int packed) {
     uint8_t *Lok = (uint8_t *)g_cp;
     *p_bvc = 0x54000000u | ((uint32_t)(((Lok - (uint8_t *)p_bvc) / 4) & 0x7FFFF) << 5) | 7; // b.vc (cond VC=7)
     emit32(0xD51B4200u | 22);                                                               // msr nzcv, x22
+}
+
+// See the forward declaration above for the rationale. Packed-only: every 0F 7C/7D/D0 form is packed.
+static void emit_nan_input_gate(int vd, int s, int dbl, uint64_t gpc) {
+    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ .2d/.4s (all-ones per NON-NaN lane)
+    emit32(EQ | (vd << 16) | (vd << 5) | 24);      // v24 = (src1 == src1)
+    emit32(EQ | (s << 16) | (s << 5) | 25);        // v25 = (src2 == src2)
+    e_v3(0x4E201C00u, 24, 24, 25);                 // v24 = src1nn & src2nn  (AND.16b)
+    e_ext(25, 24, 24, 8);                          // fold the two 64-bit halves -> low 64 = all lanes
+    e_v3(0x4E201C00u, 24, 24, 25);
+    e_fmov_from_d(16, 24);          // x16 = lane mask (all-ones iff no NaN in ANY lane of either source)
+    e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~mask (0 iff clean; nonzero iff a NaN input)
+    uint32_t *p_cbz = (uint32_t *)g_cp;
+    emit32(0);                     // cbz x16, Lfast (patched below)
+    emit_exit_const(gpc, R_SSE3B); // NaN present -> x86-exact C emulation of this instruction
+    uint8_t *Lfast = (uint8_t *)g_cp;
+    *p_cbz = 0xB4000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
 }
 
 // ---- AVX2 FMA (vfmadd/vfmsub/vfnmadd/vfnmsub) -> NEON FMLA/FMLS ----
@@ -3566,6 +3595,7 @@ static void *translate_block(uint64_t gpc) {
                             continue;
                         } // fcom/fcomp
                         hl_x86_x87_load(18, 0);
+                        hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                         if (reg == 0)
                             FAd(18, 18, 16);
                         else if (reg == 1)
@@ -3582,6 +3612,7 @@ static void *translate_block(uint64_t gpc) {
                             report_unimpl(gpc, &I);
                             break;
                         }
+                        hl_x86_x87_dnan_post(18);
                         hl_x86_x87_store(18, 0);
                     }
                     gpc = next;
@@ -3623,7 +3654,9 @@ static void *translate_block(uint64_t gpc) {
                         hl_x86_x87_push(16);
                     } else if (reg == 7 && rm == 2) {
                         hl_x86_x87_load(16, 0);
+                        hl_x86_x87_dnan_pre(16, 16); // fsqrt(-x): x86 yields the NEGATIVE indefinite
                         emit32(0x1E61C000u | (16 << 5) | 16);
+                        hl_x86_x87_dnan_post(16);
                         hl_x86_x87_store(16, 0);
                     } // fsqrt
                     else if (reg == 2 && rm == 0) { /* fnop */
@@ -3706,6 +3739,7 @@ static void *translate_block(uint64_t gpc) {
                         a = 16;
                         b = 18;
                     } // DC/DE: dst=ST(i)=v16, other=ST0=v18
+                    hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                     if (reg == 0)
                         FAd(a, a, b);
                     else if (reg == 1)
@@ -3735,6 +3769,7 @@ static void *translate_block(uint64_t gpc) {
                         report_unimpl(gpc, &I);
                         break;
                     }
+                    hl_x86_x87_dnan_post(a);
                     hl_x86_x87_store(a, dst_i);
                     if (op == 0xDE) hl_x86_x87_adjust_top(1); // pop
                 } else if (op == 0xDD) {
@@ -4037,6 +4072,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                     uint32_t szb = I.p66 ? 0x00400000u : 0; // 66 -> double lanes (.2d), F2 -> single (.4s)
                     int dbl = I.p66 != 0;
+                    emit_nan_input_gate(vd, s, dbl, gpc); // two-NaN lanes -> x86-exact C softmulator
                     int fixnan = fpdnan_on();
                     if (fixnan) {
                         // Generated-NaN sign fixup, as for the vertical FP arithmetic: an inf-inf in
@@ -4082,6 +4118,7 @@ static void *translate_block(uint64_t gpc) {
                     // sign bit first hands FADD a sign-flipped NaN, which it then propagates
                     // (addsubps with a positive NaN in an even lane came out negative).
                     int dbl = I.p66 != 0;
+                    emit_nan_input_gate(vd, s, dbl, gpc); // two-NaN lanes -> x86-exact C softmulator
                     int fixnan = fpdnan_on();
                     if (fixnan) emit_dnan_pre(vd, s, 1, dbl);
                     if (dbl) {
@@ -4806,28 +4843,34 @@ static void *translate_block(uint64_t gpc) {
                         g_ldr_q(16, 17, 0);
                         s = 16;
                     }
-                    if (I.rep)
-                        emit32(0x4EA1B800u | (s << 5) | vd); // F3: cvttps2dq -> FCVTZS .4S (truncate)
-                    else if (I.p66)
-                        emit32(0x4E21A800u | (s << 5) | vd); // 66: cvtps2dq  -> FCVTNS .4S (round to nearest)
-                    else
-                        emit32(0x4E21D800u | (s << 5) | vd); // NP: cvtdq2ps  -> SCVTF  .4S (s32->f32)
                     if (I.rep || I.p66) {
                         // H13 (packed): x86 float->int32 gives the integer indefinite (0x80000000) per lane on
                         // out-of-range or NaN; ARM saturates positive overflow to INT_MAX and NaN to 0 (negative
                         // overflow already agrees at INT_MIN). Per lane, build the "make-indefinite" mask =
                         //   (s >= 2^31)  OR  (s != s)   -- FCMGE against a 2^31 broadcast, ORed with ~FCMEQ(s,s)
                         // and BSL 0x80000000 over the saturating result.
-                        e_v3(0x4E20E400u, 17, s, s);       // FCMEQ v17.4s, s, s  -> ordered lanes (0 where NaN)
+                        // The mask MUST be built from the source floats BEFORE the convert: for the (common)
+                        // `cvttps2dq %xmm7,%xmm7` in-place form s == vd, so converting first would leave the
+                        // mask reading the INTEGER result reinterpreted as f32 -- an all-ones lane (-1) then
+                        // looks like a NaN and was wrongly forced to the indefinite, while a genuine
+                        // indefinite lane (0x80000000 == -0.0f) looked ordered and kept ARM's NaN->0. Same
+                        // hazard, and the same ordering, as the cvt(t)pd2dq lowering (0F E6) above.
+                        e_v3(0x4E20E400u, 17, s, s);          // FCMEQ v17.4s, s, s  -> ordered lanes (0 where NaN)
                         emit32(0x6E205800u | (17 << 5) | 17); // NOT v17.16b       -> NaN mask
                         e_movconst(19, 0x4F000000u);          // 2^31 as f32
                         emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> threshold
                         e_v3(0x6E20E400u, 18, s, 18);         // FCMGE v18.4s, s, thr -> s>=2^31 mask
                         e_v3(0x4EA01C00u, 17, 17, 18);        // ORR v17.16b       -> combined make-indefinite mask
+                        if (I.rep)
+                            emit32(0x4EA1B800u | (s << 5) | vd); // F3: cvttps2dq -> FCVTZS .4S (truncate)
+                        else
+                            emit32(0x4E21A800u | (s << 5) | vd); // 66: cvtps2dq -> FCVTNS .4S (round to nearest)
                         e_movconst(19, 0x80000000u);
                         emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> 0x80000000 per lane
                         e_v3(0x6E601C00u, 17, 18, vd);        // BSL v17.16b, indef, result -> mask?indef:result
                         e_vmov(vd, 17);
+                    } else {
+                        emit32(0x4E21D800u | (s << 5) | vd); // NP: cvtdq2ps -> SCVTF .4S (s32->f32)
                     }
                 } else if (op == 0xF6) {                     // psadbw (66): sum of abs byte diffs per 64-bit half
                     int s = I.is_mem ? 16 : vm;

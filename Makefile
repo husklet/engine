@@ -2354,7 +2354,7 @@ compat-core-workload: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOA
 # MXCSR is excluded from the comparison: the engine mirrors the host FPSR rather than modelling
 # x86's sticky exception-status bits, which is a known open divergence tracked separately.
 ISA_FUZZ_SEEDS ?= 200
-ISA_FUZZ_REGRESS_SEEDS := 1 17 33 50 66 83 99 116 133 149 166 185 201 218 236 253 269 285 302 320 337 354 372 388
+ISA_FUZZ_REGRESS_SEEDS := 1 17 33 50 66 83 99 116 133 149 166 185 201 218 236 253 269 285 302 320 337 354 372 388 587
 
 .PHONY: isa-fuzz isa-fuzz-regress
 isa-fuzz: $(BUILD)/linux-production/hl-engine-linux-x86_64

@@ -13,6 +13,8 @@ void hl_x86_x87_load(int destination, int index);
 void hl_x86_x87_store(int source, int index);
 void hl_x86_x87_push(int source);
 void hl_x86_x87_adjust_top(int delta);
+void hl_x86_x87_dnan_pre(int n, int m);
+void hl_x86_x87_dnan_post(int destination);
 void hl_x86_x87_remainder(int ieee);
 void hl_x86_x87_scale(void);
 void hl_x86_x87_extract(void);
