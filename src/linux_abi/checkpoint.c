@@ -117,6 +117,7 @@ struct ckpt_inotify_raw {
 struct ckpt_manifest {
     uint64_t magic, version, arch;
     uint64_t n_procs;
+    uint64_t image_hash, image_files, image_bytes;
     int32_t root_gpid;
     // The controlling terminal's FOREGROUND process group at checkpoint, in guest terms (1 == the container
     // init's own group; 0 == none/unknown). Restore re-points the fresh pty at it (tcsetpgrp) so ^C/^Z reach
@@ -470,6 +471,100 @@ static int ckpt_sync_dir(const char *path) {
     int result = fsync(fd);
     close(fd);
     return result;
+}
+
+static uint64_t ckpt_hash_bytes(uint64_t hash, const void *data, size_t size) {
+    const unsigned char *bytes = data;
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int ckpt_name_compare(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+
+static int ckpt_hash_tree(const char *base, const char *relative, uint64_t *hash, uint64_t *files,
+                          uint64_t *bytes) {
+    char directory[1400];
+    snprintf(directory, sizeof directory, "%s%s%s", base, relative[0] ? "/" : "", relative);
+    DIR *dir = opendir(directory);
+    if (!dir) return -1;
+    char **names = NULL;
+    size_t count = 0, capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!relative[0] && (!strcmp(entry->d_name, "MANIFEST") ||
+                             !strcmp(entry->d_name, "RECOVERY.jsonl") ||
+                             !strncmp(entry->d_name, ".RECOVERY.jsonl.tmp.", 21)))
+            continue;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 16;
+            char **expanded = realloc(names, next * sizeof *expanded);
+            if (!expanded) goto fail;
+            names = expanded;
+            capacity = next;
+        }
+        names[count] = strdup(entry->d_name);
+        if (!names[count]) goto fail;
+        count++;
+    }
+    closedir(dir);
+    dir = NULL;
+    qsort(names, count, sizeof *names, ckpt_name_compare);
+    for (size_t index = 0; index < count; ++index) {
+        char child_relative[1400], path[1400];
+        snprintf(child_relative, sizeof child_relative, "%s%s%s", relative, relative[0] ? "/" : "",
+                 names[index]);
+        snprintf(path, sizeof path, "%s/%s", base, child_relative);
+        struct stat status;
+        if (lstat(path, &status) != 0) goto fail;
+        if (S_ISDIR(status.st_mode)) {
+            if (ckpt_hash_tree(base, child_relative, hash, files, bytes) != 0) goto fail;
+            continue;
+        }
+        if (!S_ISREG(status.st_mode)) goto fail;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) goto fail;
+        uint64_t size = (uint64_t)status.st_size;
+        *hash = ckpt_hash_bytes(*hash, child_relative, strlen(child_relative) + 1);
+        *hash = ckpt_hash_bytes(*hash, &size, sizeof size);
+        unsigned char buffer[65536];
+        for (;;) {
+            ssize_t received = read(fd, buffer, sizeof buffer);
+            if (received > 0) {
+                *hash = ckpt_hash_bytes(*hash, buffer, (size_t)received);
+                continue;
+            }
+            if (received < 0 && errno == EINTR) continue;
+            if (received < 0) {
+                close(fd);
+                goto fail;
+            }
+            break;
+        }
+        close(fd);
+        (*files)++;
+        *bytes += size;
+    }
+    for (size_t index = 0; index < count; ++index) free(names[index]);
+    free(names);
+    return 0;
+fail:
+    if (dir) closedir(dir);
+    for (size_t index = 0; index < count; ++index) free(names[index]);
+    free(names);
+    return -1;
+}
+
+static int ckpt_image_digest(const char *base, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
+    *hash = UINT64_C(14695981039346656037);
+    *files = 0;
+    *bytes = 0;
+    return ckpt_hash_tree(base, "", hash, files, bytes);
 }
 
 static int ckpt_capture_pipe(int fd, uint64_t identity) {
@@ -2034,6 +2129,10 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         int fgh = (tf >= 0) ? tcgetpgrp(tf) : -1;
         man.fg_pgid_gpid = (fgh <= 0) ? 0 : (g_init_hostpid && fgh == g_init_hostpid) ? 1 : fgh;
     }
+    if (ckpt_image_digest(base, &man.image_hash, &man.image_files, &man.image_bytes) != 0) {
+        fprintf(stderr, "[ckpt] cannot hash workspace image: %s\n", strerror(errno));
+        _exit(70);
+    }
     char mp[1200];
     snprintf(mp, sizeof mp, "%s/MANIFEST", base);
     if (ckpt_store_sync(mp, &man, sizeof man) != 0 || ckpt_sync_dir(base) != 0) {
@@ -2062,6 +2161,12 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
     }
     if (man->version != CKPT_VERSION || man->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] manifest version/arch mismatch\n");
+        return -1;
+    }
+    uint64_t image_hash, image_files, image_bytes;
+    if (ckpt_image_digest(dir, &image_hash, &image_files, &image_bytes) != 0 ||
+        image_hash != man->image_hash || image_files != man->image_files || image_bytes != man->image_bytes) {
+        fprintf(stderr, "[restore] checkpoint image integrity mismatch\n");
         return -1;
     }
     if (man->n_procs == 0 || man->n_procs > 512 || man->root_gpid != 1) {
@@ -3574,9 +3679,84 @@ static int ckpt_recovery_report(const char *base, int policy) {
     return 0;
 }
 
+static int ckpt_validate_process_image(const char *base, const struct ckpt_proc *process,
+                                       struct ckpt_meta *meta) {
+    char procdir[1300], path[1400];
+    snprintf(procdir, sizeof procdir, "%s/proc.%d", base, process->gpid);
+    if (ckpt_read_meta_dir(procdir, meta) != 0 || meta->self_gpid != process->gpid ||
+        meta->ppid_gpid != process->ppid || meta->pagesz == 0 || meta->pagesz > UINT64_C(1048576) ||
+        (meta->pagesz & (meta->pagesz - 1)) != 0 || meta->n_regions > UINT64_C(1048576) ||
+        meta->n_fds > HL_NFD)
+        return -1;
+
+    snprintf(path, sizeof path, "%s/pages", procdir);
+    FILE *pages = fopen(path, "rb");
+    if (!pages) return -1;
+    for (uint64_t index = 0; index < meta->n_regions; ++index) {
+        struct ckpt_region region;
+        if (ckpt_rd_all(pages, &region, sizeof region) != 0 || region.addr == 0 || region.len == 0 ||
+            region.addr > UINT64_MAX - region.len || region.glen > region.len ||
+            region.npages > (region.len - 1) / meta->pagesz + 1) {
+            fclose(pages);
+            return -1;
+        }
+        for (uint64_t page = 0; page < region.npages; ++page) {
+            uint64_t address;
+            if (ckpt_rd_all(pages, &address, sizeof address) != 0 || address < region.addr ||
+                address >= region.addr + region.len || (address - region.addr) % meta->pagesz != 0) {
+                fclose(pages);
+                return -1;
+            }
+            uint64_t remaining = region.addr + region.len - address;
+            size_t size = (size_t)(remaining < meta->pagesz ? remaining : meta->pagesz);
+            unsigned char buffer[4096];
+            while (size != 0) {
+                size_t chunk = size < sizeof buffer ? size : sizeof buffer;
+                if (ckpt_rd_all(pages, buffer, chunk) != 0) {
+                    fclose(pages);
+                    return -1;
+                }
+                size -= chunk;
+            }
+        }
+    }
+    int trailing = fgetc(pages);
+    fclose(pages);
+    if (trailing != EOF) return -1;
+
+    struct cpu *images = NULL, leader;
+    if (ckpt_restore_cpu_dir(procdir, meta, &images) != 0 ||
+        ckpt_restore_leader(images, meta->n_threads, &leader) != 0) {
+        free(images);
+        return -1;
+    }
+    free(images);
+
+    snprintf(path, sizeof path, "%s/fds", procdir);
+    FILE *fds = fopen(path, "rb");
+    if (!fds) return -1;
+    uint64_t descriptors = 0;
+    struct ckpt_fd record;
+    while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
+        if (record.gfd < 0 || record.gfd >= HL_NFD || record.kind < CKF_TTY || record.kind > CKF_DEVICE) {
+            fclose(fds);
+            return -1;
+        }
+        descriptors++;
+    }
+    int valid_fds = feof(fds) && descriptors == meta->n_fds;
+    fclose(fds);
+    return valid_fds ? 0 : -1;
+}
+
 static int ckpt_restore_preflight(const char *base, int policy) {
     for (int i = 0; i < g_nrprocs; ++i) {
         struct ckpt_proc *process = &g_rprocs[i];
+        struct ckpt_meta meta;
+        if (ckpt_validate_process_image(base, process, &meta) != 0) {
+            ckpt_process_stop(process, "checkpoint process image is invalid");
+            continue;
+        }
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, process->gpid);
         FILE *file = fopen(path, "rb");

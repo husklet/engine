@@ -143,13 +143,14 @@ int main(int argc, char **argv) {
     int connecting_fallback_case = argc == 4 && strcmp(argv[3], "connecting-fallback") == 0;
     int corrupt_magic_case = argc == 4 && strcmp(argv[3], "corrupt-magic") == 0;
     int corrupt_truncated_case = argc == 4 && strcmp(argv[3], "corrupt-truncated") == 0;
+    int corrupt_content_case = argc == 4 && strcmp(argv[3], "corrupt-content") == 0;
     int permissive_case = argc == 4 &&
                           (strcmp(argv[3], "missing-external") == 0 || connecting_fallback_case);
     int modified_external_case = argc == 4 && strcmp(argv[3], "modified-external") == 0;
     if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
-         !corrupt_truncated_case && !permissive_case && !modified_external_case) ||
+         !corrupt_truncated_case && !corrupt_content_case && !permissive_case && !modified_external_case) ||
         getcwd(temporary, sizeof temporary) == NULL ||
         strlen(temporary) + sizeof("/build/hl-checkpoint-tree.XXXXXX") > sizeof temporary)
         return 2;
@@ -230,16 +231,28 @@ int main(int argc, char **argv) {
         if (stat(records, &status) != 0 || status.st_size < 1 || truncate(records, status.st_size - 1) != 0)
             return 7;
     }
+    if (corrupt_content_case) {
+        char pages[640];
+        unsigned char corrupt;
+        snprintf(pages, sizeof pages, "%s/proc.1/pages", checkpoint);
+        fd = open(pages, O_RDWR);
+        if (fd < 0 || pread(fd, &corrupt, 1, 0) != 1 || (corrupt ^= 0x5au, pwrite(fd, &corrupt, 1, 0)) != 1 ||
+            fsync(fd) != 0)
+            return 7;
+        close(fd);
+    }
     child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case);
     if (child < 0) return 8;
     result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
-    if (corrupt_magic_case || corrupt_truncated_case) {
+    if (corrupt_magic_case || corrupt_truncated_case || corrupt_content_case) {
         if (result == 0 || result == 124 || output_has(output, "TREE-RESTORED")) {
             fprintf(stderr, "checkpoint runner: corrupt image accepted mode=%s result=%d restored=%d\n",
-                    corrupt_magic_case ? "magic" : "truncated", result, output_has(output, "TREE-RESTORED"));
+                    corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" : "content", result,
+                    output_has(output, "TREE-RESTORED"));
             return 8;
         }
-        printf("checkpoint corrupt-%s rejection: ok\n", corrupt_magic_case ? "magic" : "truncated");
+        printf("checkpoint corrupt-%s rejection: ok\n",
+               corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" : "content");
         return 0;
     }
     if (result != 0) {
