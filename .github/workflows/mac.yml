@@ -63,15 +63,28 @@ jobs:
           # sandboxed/SIP-on macos-26 runner. Surface the failing tail and retry once so transient
           # runner divergence self-heals; a consistent failure still fails both attempts. Per-binary
           # 180s timeouts (Makefile) already bound any hang and name the culprit.
-          # Redirect to a FILE and bound with `timeout` -- never pipe. tee waits for EOF, which only
-          # arrives once every process holding the pipe's write end exits; guest/engine processes that
-          # outlive a suite inherit this step's stdout, so a finished run could hang indefinitely (the
-          # Linux compat step sat in exactly this state for over nine hours). See linux.yml.
+          # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
+          # Output goes to a FILE, never a pipe -- the compat suite deliberately leaves processes alive
+          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived),
+          # they inherit this step's stdout, and a pipe would then never reach EOF: one run sat wedged in
+          # `tee` for over nine hours. A file has no reader to block. Returns 124 on expiry.
+          run_bounded() {
+            local secs="$1" log="$2"; shift 2
+            "$@" >"$log" 2>&1 </dev/null &
+            local pid=$! waited=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$waited" -ge "$secs" ]; then
+                kill -TERM "$pid" 2>/dev/null; sleep 10; kill -KILL "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null; return 124
+              fi
+              sleep 5; waited=$((waited + 5))
+            done
+            wait "$pid"
+          }
           run_tm() {
             local st=0
-            timeout --signal=TERM --kill-after=60s 22m \
-              nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos' \
-              >"$1" 2>&1 </dev/null || st=$?
+            run_bounded 1320 "$1" \
+              nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos' || st=$?
             tail -n 60 "$1"
             return $st
           }
@@ -148,13 +161,28 @@ jobs:
           # contention self-heals; a genuine/consistent break still fails both attempts. The first-try
           # failure is surfaced as a ::warning (never silently swallowed) so a real intermittent bug
           # stays visible for follow-up even when the retry greens the job.
-          # File, not pipe, plus an external bound -- see the note in linux.yml: a process that outlives
-          # the suite keeps a pipe's write end open, so tee never sees EOF and the step hangs forever.
+          # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
+          # Output goes to a FILE, never a pipe -- the compat suite deliberately leaves processes alive
+          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived),
+          # they inherit this step's stdout, and a pipe would then never reach EOF: one run sat wedged in
+          # `tee` for over nine hours. A file has no reader to block. Returns 124 on expiry.
+          run_bounded() {
+            local secs="$1" log="$2"; shift 2
+            "$@" >"$log" 2>&1 </dev/null &
+            local pid=$! waited=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$waited" -ge "$secs" ]; then
+                kill -TERM "$pid" 2>/dev/null; sleep 10; kill -KILL "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null; return 124
+              fi
+              sleep 5; waited=$((waited + 5))
+            done
+            wait "$pid"
+          }
           run_bucket() {
             local st=0
-            timeout --signal=TERM --kill-after=60s 40m \
-              nix develop --command sh -c 'make -sk -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" ${{ matrix.targets }}' \
-              >"$1" 2>&1 </dev/null || st=$?
+            run_bounded 2400 "$1" \
+              nix develop --command sh -c 'make -sk -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" ${{ matrix.targets }}' || st=$?
             tail -c 200000 "$1" >> "$GITHUB_STEP_SUMMARY" || true
             tail -n 60 "$1"
             return $st
