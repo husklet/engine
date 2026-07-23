@@ -98,11 +98,11 @@ void hl_aarch64_signal_build(struct cpu *c, int sig, const hl_aarch64_signal_sta
     // vregs[32] (512) = 528, then a null _aarch64_ctx terminator ends the chain. __reserved is 16-aligned
     // within the mcontext, so it starts at mc+288 (the 280-byte sigcontext head rounded up to 16).
     uint8_t *rsv = (uint8_t *)(mc + 288);
-    *(uint32_t *)(rsv + 0) = 0x46508001u;    // FPSIMD_MAGIC
-    *(uint32_t *)(rsv + 4) = 528u;           // sizeof(struct fpsimd_context)
-    *(uint32_t *)(rsv + 8) = 0;              // fpsr (not separately modelled)
-    *(uint32_t *)(rsv + 12) = 0;             // fpcr
-    memcpy(rsv + 16, c->v, sizeof c->v);     // vregs[32]
+    *(uint32_t *)(rsv + 0) = 0x46508001u;          // FPSIMD_MAGIC
+    *(uint32_t *)(rsv + 4) = 528u;                 // sizeof(struct fpsimd_context)
+    *(uint32_t *)(rsv + 8) = 0;                    // fpsr (not separately modelled)
+    *(uint32_t *)(rsv + 12) = 0;                   // fpcr
+    memcpy(rsv + 16, c->v, sizeof c->v);           // vregs[32]
     *(uint32_t *)(rsv + 16 + sizeof c->v + 0) = 0; // terminator magic = 0
     *(uint32_t *)(rsv + 16 + sizeof c->v + 4) = 0; // terminator size  = 0
     c->x[0] = (uint64_t)sig;

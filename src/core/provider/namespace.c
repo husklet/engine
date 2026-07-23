@@ -109,7 +109,9 @@ int hl_provider_namespace_install(hl_provider_namespace *namespace, const void *
              node->kind != HL_PROVIDER_NODE_SYMLINK && node->kind != HL_PROVIDER_NODE_CHARACTER &&
              node->kind != HL_PROVIDER_NODE_BLOCK) ||
             ((node->kind == HL_PROVIDER_NODE_SERVICE || node->kind == HL_PROVIDER_NODE_CHARACTER ||
-              node->kind == HL_PROVIDER_NODE_BLOCK) ? node->service == 0 : node->service != 0) ||
+              node->kind == HL_PROVIDER_NODE_BLOCK)
+                 ? node->service == 0
+                 : node->service != 0) ||
             (node->mode & ~07777u) != 0 || node->path_size > maximum_path || take(&source, node->path_size, &path) != 0)
             goto done;
         memcpy(node->path, path, node->path_size);

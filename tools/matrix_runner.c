@@ -62,7 +62,6 @@ typedef struct resource_baseline {
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
-
 static void interrupt_runner(int signal_number) {
     sig_atomic_t group = active_group;
     interrupted_signal = signal_number;
@@ -94,8 +93,7 @@ static long count_directory_entries(const char *path) {
 }
 
 static resource_baseline resource_measure(void) {
-    resource_baseline measured = {count_directory_entries("/proc/self/fd"),
-                                  count_directory_entries("/proc/self/task")};
+    resource_baseline measured = {count_directory_entries("/proc/self/fd"), count_directory_entries("/proc/self/task")};
     return measured;
 }
 
@@ -108,13 +106,13 @@ static int resources_restored(resource_baseline baseline, const suite_case *item
     int thread_clean = baseline.threads < 0 || current.threads == baseline.threads;
     if (child_clean && descriptor_clean && thread_clean) return 1;
     if (getenv("GITHUB_ACTIONS") != NULL)
-        fprintf(stderr, "::error title=Compatibility resource leak (%s)::children=%s descriptors=%ld/%ld "
-                        "threads=%ld/%ld\n",
-                item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors,
-                baseline.threads, current.threads);
-    fprintf(stderr,
-            "matrix-runner: %s resource leak: children=%s descriptors=%ld/%ld threads=%ld/%ld\n",
-            item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors, baseline.threads,
+        fprintf(stderr,
+                "::error title=Compatibility resource leak (%s)::children=%s descriptors=%ld/%ld "
+                "threads=%ld/%ld\n",
+                item->name, child_clean ? "clean" : "live", baseline.descriptors, current.descriptors, baseline.threads,
+                current.threads);
+    fprintf(stderr, "matrix-runner: %s resource leak: children=%s descriptors=%ld/%ld threads=%ld/%ld\n", item->name,
+            child_clean ? "clean" : "live", baseline.descriptors, current.descriptors, baseline.threads,
             current.threads);
     return 0;
 }
@@ -236,8 +234,8 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (*excluded)++;
             continue;
         }
-        if ((strcmp(fields[11], "active") != 0 && !macos_only) || *case_count == CASE_MAX || !relative_path(fields[2]) ||
-            !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
+        if ((strcmp(fields[11], "active") != 0 && !macos_only) || *case_count == CASE_MAX ||
+            !relative_path(fields[2]) || !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
             (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
             parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
@@ -524,9 +522,9 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     if (scratch != NULL) {
         char volume[1600];
         const char *declared = wire.config.volumes_offset ? wire.pool + wire.config.volumes_offset : NULL;
-        int length = declared ? snprintf(volume, sizeof volume, "%s,%s:%s,/tmp:%s", declared, binary_root,
-                                         binary_root, scratch)
-                              : snprintf(volume, sizeof volume, "%s:%s,/tmp:%s", binary_root, binary_root, scratch);
+        int length =
+            declared ? snprintf(volume, sizeof volume, "%s,%s:%s,/tmp:%s", declared, binary_root, binary_root, scratch)
+                     : snprintf(volume, sizeof volume, "%s:%s,/tmp:%s", binary_root, binary_root, scratch);
         if (length < 0 || length >= (int)sizeof volume ||
             pool_string(&wire, volume, &wire.config.volumes_offset) != 0 ||
             pool_string(&wire, "/tmp", &wire.config.working_directory_offset) != 0)
@@ -852,7 +850,8 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         memcmp(result->output, expected, expected_size) != 0) {
         size_t common = result->output_size < expected_size ? result->output_size : expected_size;
         size_t mismatch = 0;
-        while (mismatch < common && result->output[mismatch] == expected[mismatch]) ++mismatch;
+        while (mismatch < common && result->output[mismatch] == expected[mismatch])
+            ++mismatch;
         if (mismatch < common)
             fprintf(stderr, "matrix-runner: %s [%s] first stdout difference at byte %zu: got=%02x expected=%02x\n",
                     item->name, isa, mismatch, result->output[mismatch], expected[mismatch]);
@@ -885,11 +884,10 @@ int main(int argc, char **argv) {
         if (errno != 0 || end == argv[8] || *end != '\0' || repetitions == 0 || repetitions > 10000) goto usage;
         if (argc == 10) only = argv[9];
     } else if (argc != 7) {
-usage:
-        fprintf(
-            stderr,
-            "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT "
-            "[--repeat N] [CASE]\n");
+    usage:
+        fprintf(stderr,
+                "usage: matrix-runner BRIDGE AARCH64_ENGINE AARCH64_BIN_ROOT X86_64_ENGINE X86_64_BIN_ROOT SUITE_ROOT "
+                "[--repeat N] [CASE]\n");
         return 2;
     }
     if (load_manifest(argv[6], cases, &count, &excluded, engine_is_macho(argv[2])) != 0) return 1;

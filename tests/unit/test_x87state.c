@@ -13,11 +13,9 @@ static uint64_t bits(double value) {
 }
 
 int main(void) {
-    const uint64_t values[] = {
-        UINT64_C(0x0000000000000000), UINT64_C(0x8000000000000000),
-        UINT64_C(0x3ff0000000000000), UINT64_C(0xc004000000000000),
-        UINT64_C(0x7ff0000000000000), UINT64_C(0xfff0000000000000),
-        UINT64_C(0x7ff8000000000001)};
+    const uint64_t values[] = {UINT64_C(0x0000000000000000), UINT64_C(0x8000000000000000), UINT64_C(0x3ff0000000000000),
+                               UINT64_C(0xc004000000000000), UINT64_C(0x7ff0000000000000), UINT64_C(0xfff0000000000000),
+                               UINT64_C(0x7ff8000000000001)};
     uint8_t image[10];
     for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index) {
         double value;
@@ -37,8 +35,10 @@ int main(void) {
         cpu.fpcw = 0x027f;
         cpu.fpsw = 0x4500;
         cpu.fptop = 5;
-        for (size_t index = 0; index < 8; ++index) cpu.st[index] = (double)index + 0.25;
-        for (size_t index = 0; index < sizeof(cpu.v); ++index) ((uint8_t *)cpu.v)[index] = (uint8_t)index;
+        for (size_t index = 0; index < 8; ++index)
+            cpu.st[index] = (double)index + 0.25;
+        for (size_t index = 0; index < sizeof(cpu.v); ++index)
+            ((uint8_t *)cpu.v)[index] = (uint8_t)index;
         hl_x86_fxsave(&cpu);
         memset(cpu.st, 0, sizeof(cpu.st));
         memset(cpu.v, 0, sizeof(cpu.v));
@@ -47,7 +47,8 @@ int main(void) {
         cpu.fptop = 0;
         hl_x86_fxrstor(&cpu);
         HL_CHECK(cpu.fpcw == 0x027f && cpu.fpsw == 0x4500 && cpu.fptop == 5);
-        for (size_t index = 0; index < 8; ++index) HL_CHECK(cpu.st[index] == (double)index + 0.25);
+        for (size_t index = 0; index < 8; ++index)
+            HL_CHECK(cpu.st[index] == (double)index + 0.25);
         for (size_t index = 0; index < sizeof(cpu.v); ++index)
             HL_CHECK(((const uint8_t *)cpu.v)[index] == (uint8_t)index);
         cpu.fptop = 3;

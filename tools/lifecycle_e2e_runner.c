@@ -191,8 +191,7 @@ int main(int argc, char **argv) {
     lifecycle_host_destroy(host);
     if (fail_code_publish)
         return status == HL_STATUS_PLATFORM_FAILURE && result.kind == HL_ENGINE_EXIT_ENGINE_ERROR &&
-                       result.guest_status == HL_STATUS_PLATFORM_FAILURE && result.detail == 0 &&
-                       fatal_events == 0
+                       result.guest_status == HL_STATUS_PLATFORM_FAILURE && result.detail == 0 && fatal_events == 0
                    ? 0
                    : 79;
     if (bad_result)
@@ -211,13 +210,13 @@ int main(int argc, char **argv) {
     if (expect_signal >= 0) {
         if (status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_SIGNAL && result.guest_status == expect_signal)
             return 0;
-        fprintf(stderr, "lifecycle: expected signal=%d status=%d kind=%u guest=%d detail=%llu\n", expect_signal,
-                status, result.kind, result.guest_status, (unsigned long long)result.detail);
+        fprintf(stderr, "lifecycle: expected signal=%d status=%d kind=%u guest=%d detail=%llu\n", expect_signal, status,
+                result.kind, result.guest_status, (unsigned long long)result.detail);
         return 85;
     }
     if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE) {
-        fprintf(stderr, "lifecycle: status=%d kind=%u guest=%d detail=%llu\n", status, result.kind,
-                result.guest_status, (unsigned long long)result.detail);
+        fprintf(stderr, "lifecycle: status=%d kind=%u guest=%d detail=%llu\n", status, result.kind, result.guest_status,
+                (unsigned long long)result.detail);
         return 72;
     }
     return result.guest_status;

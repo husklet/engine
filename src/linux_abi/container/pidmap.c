@@ -50,4 +50,6 @@ int32_t hl_linux_pidmap_guest(const hl_linux_pidmap *map, int32_t host) {
     return host;
 }
 
-uint32_t hl_linux_pidmap_count(const hl_linux_pidmap *map) { return map != NULL ? map->count : 0; }
+uint32_t hl_linux_pidmap_count(const hl_linux_pidmap *map) {
+    return map != NULL ? map->count : 0;
+}

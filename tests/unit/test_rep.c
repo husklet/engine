@@ -8,8 +8,8 @@
 #include "../../src/translator/guest/x86_64/rep.h"
 
 static uint64_t descriptor(int width, int scan, int repne, int repeat, int reverse) {
-    return (uint64_t)width | ((uint64_t)scan << 8) | ((uint64_t)repne << 9) |
-           ((uint64_t)repeat << 10) | ((uint64_t)reverse << 11);
+    return (uint64_t)width | ((uint64_t)scan << 8) | ((uint64_t)repne << 9) | ((uint64_t)repeat << 10) |
+           ((uint64_t)reverse << 11);
 }
 
 int main(void) {

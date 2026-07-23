@@ -62,12 +62,10 @@ int main(void) {
      * an edge once, and ONESHOT disarms until MOD installs new interests. */
     int unsubscribe = 0;
     atomic_store(&first->ready, 1);
-    HL_CHECK(ep_provider_take_ready(first, 1, &unsubscribe) == 1 && !unsubscribe &&
-             atomic_load(&first->ready) == 1);
+    HL_CHECK(ep_provider_take_ready(first, 1, &unsubscribe) == 1 && !unsubscribe && atomic_load(&first->ready) == 1);
     first->events = UINT32_C(0x80000001);
     atomic_store(&first->ready, 1);
-    HL_CHECK(ep_provider_take_ready(first, 1, &unsubscribe) == 1 && !unsubscribe &&
-             atomic_load(&first->ready) == 0);
+    HL_CHECK(ep_provider_take_ready(first, 1, &unsubscribe) == 1 && !unsubscribe && atomic_load(&first->ready) == 0);
     first->events = UINT32_C(0x40000001);
     first->interests = 1;
     atomic_store(&first->ready, 1);
@@ -82,8 +80,7 @@ int main(void) {
         if (atomic_load(&watches[index].state) == EP_PROVIDER_FREE) {
             ep_provider_watch *reserved = ep_provider_alloc(watches, 4);
             HL_CHECK(reserved != NULL);
-            ep_provider_activate(reserved, 20 + (int)index, 1, 40 + (int)index, 1,
-                                 10 + index, 90 + index, 1, 1, index);
+            ep_provider_activate(reserved, 20 + (int)index, 1, 40 + (int)index, 1, 10 + index, 90 + index, 1, 1, index);
         }
     HL_CHECK(ep_provider_alloc(watches, 4) == NULL);
     HL_CHECK(ep_provider_next(UINT32_MAX) == 1 && ep_provider_next(41) == 42);

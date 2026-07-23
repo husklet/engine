@@ -16,41 +16,109 @@ static uint64_t last_exit_rip;
 static uint64_t last_exit_reason;
 static uint32_t code[32];
 
-uint64_t hl_x86_guest_pointer(uint64_t address) { return address; }
-void hl_x86_count_rep_movs(void) { movs_count++; }
-void hl_x86_count_rep_stos(void) { stos_count++; }
-void emit32(uint32_t instruction) { code[emitted++] = instruction; }
-uint32_t *hl_x86_emit_cursor(void) { return &code[emitted]; }
-void hl_x86_emit_spill(void) {}
-void hl_x86_emit_reload(void) {}
-void hl_x86_emit_vector_reset(void) {}
+uint64_t hl_x86_guest_pointer(uint64_t address) {
+    return address;
+}
+
+void hl_x86_count_rep_movs(void) {
+    movs_count++;
+}
+
+void hl_x86_count_rep_stos(void) {
+    stos_count++;
+}
+
+void emit32(uint32_t instruction) {
+    code[emitted++] = instruction;
+}
+
+uint32_t *hl_x86_emit_cursor(void) {
+    return &code[emitted];
+}
+
+void hl_x86_emit_spill(void) {
+}
+
+void hl_x86_emit_reload(void) {
+}
+
+void hl_x86_emit_vector_reset(void) {
+}
+
 void hl_x86_emit_host_pointer(int destination, uint64_t pointer) {
     (void)destination;
     (void)pointer;
 }
+
 void e_movconst(int destination, uint64_t value) {
     (void)destination;
     last_constant = value;
 }
+
 void e_str(int source, int base, int offset) {
     (void)source;
     (void)base;
     last_store_offset = offset;
 }
+
 void emit_exit_const(uint64_t rip, uint64_t reason) {
     exits++;
     last_exit_rip = rip;
     last_exit_reason = reason;
 }
-void e_addi(int d, int s, unsigned i, int sf) { (void)d; (void)s; (void)i; (void)sf; }
-void e_subi(int d, int s, unsigned i, int sf) { (void)d; (void)s; (void)i; (void)sf; }
-void e_ldr(int d, int b, int o) { (void)d; (void)b; (void)o; }
-void e_load(int w, int d, int a) { (void)w; (void)d; (void)a; }
-void e_store(int w, int s, int a) { (void)w; (void)s; (void)a; }
-void e_lsl_i(int d, int s, int n, int sf) { (void)d; (void)s; (void)n; (void)sf; }
-void e_mov_rr(int d, int s, int sf) { (void)d; (void)s; (void)sf; }
+
+void e_addi(int d, int s, unsigned i, int sf) {
+    (void)d;
+    (void)s;
+    (void)i;
+    (void)sf;
+}
+
+void e_subi(int d, int s, unsigned i, int sf) {
+    (void)d;
+    (void)s;
+    (void)i;
+    (void)sf;
+}
+
+void e_ldr(int d, int b, int o) {
+    (void)d;
+    (void)b;
+    (void)o;
+}
+
+void e_load(int w, int d, int a) {
+    (void)w;
+    (void)d;
+    (void)a;
+}
+
+void e_store(int w, int s, int a) {
+    (void)w;
+    (void)s;
+    (void)a;
+}
+
+void e_lsl_i(int d, int s, int n, int sf) {
+    (void)d;
+    (void)s;
+    (void)n;
+    (void)sf;
+}
+
+void e_mov_rr(int d, int s, int sf) {
+    (void)d;
+    (void)s;
+    (void)sf;
+}
+
 void e_rrr(uint32_t op, int d, int l, int r, int sf, int sh) {
-    (void)op; (void)d; (void)l; (void)r; (void)sf; (void)sh;
+    (void)op;
+    (void)d;
+    (void)l;
+    (void)r;
+    (void)sf;
+    (void)sh;
 }
 
 static int check_copy_semantics(void) {
@@ -102,8 +170,8 @@ static int check_compare_exit(void) {
     hl_x86_repstr_state state = {.direction = HL_X86_DIRECTION_BACKWARD, .optimize = 1};
     HL_CHECK(hl_x86_lower_repstr(&insn, UINT64_C(0x4321), &state) == TX_BREAK);
     HL_CHECK(exits == 1 && last_exit_rip == UINT64_C(0x4321) && last_exit_reason == R_REPSTR);
-    HL_CHECK(last_constant == (UINT64_C(1) | (UINT64_C(1) << 8) | (UINT64_C(1) << 9) |
-                               (UINT64_C(1) << 10) | (UINT64_C(1) << 11)));
+    HL_CHECK(last_constant ==
+             (UINT64_C(1) | (UINT64_C(1) << 8) | (UINT64_C(1) << 9) | (UINT64_C(1) << 10) | (UINT64_C(1) << 11)));
     HL_CHECK(last_store_offset == OFF_DIVOP);
     return 0;
 }

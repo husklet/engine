@@ -206,7 +206,8 @@ typedef struct mutation_case {
 
 static void *mutation_main(void *opaque) {
     mutation_case *test = opaque;
-    while (!atomic_load_explicit(&test->begin, memory_order_acquire)) sched_yield();
+    while (!atomic_load_explicit(&test->begin, memory_order_acquire))
+        sched_yield();
     atomic_store_explicit(&test->attempted, 1, memory_order_release);
     test->result = hl_host_process_fd_private_add(MUTATION_FD);
     atomic_store_explicit(&test->finished, 1, memory_order_release);
@@ -219,12 +220,13 @@ static int test_mutation_serialized_across_fork(void) {
     int64_t parent = (int64_t)getpid();
     uint64_t parent_start = process_start((pid_t)parent);
     if (parent_start == 0 || hl_host_process_fd_private_add(TEST_FD) != 0 ||
-        pthread_create(&mutator, NULL, mutation_main, &test) != 0 ||
-        hl_host_process_fd_private_fork_prepare() != 0)
+        pthread_create(&mutator, NULL, mutation_main, &test) != 0 || hl_host_process_fd_private_fork_prepare() != 0)
         return -1;
     atomic_store_explicit(&test.begin, 1, memory_order_release);
-    while (!atomic_load_explicit(&test.attempted, memory_order_acquire)) sched_yield();
-    for (int spin = 0; spin < 1000; ++spin) sched_yield();
+    while (!atomic_load_explicit(&test.attempted, memory_order_acquire))
+        sched_yield();
+    for (int spin = 0; spin < 1000; ++spin)
+        sched_yield();
     if (atomic_load_explicit(&test.finished, memory_order_acquire)) {
         hl_host_process_fd_private_fork_complete(0);
         (void)pthread_join(mutator, NULL);
@@ -277,10 +279,12 @@ static int test_cell_spill_and_child_replay(void) {
     if (hl_host_process_fd_private_fork_complete(0) != 0) goto failed;
     int status = 0;
     int ok = waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    for (int index = 0; index < added; ++index)
+        hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
     return ok ? 0 : -1;
 failed:
-    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    for (int index = 0; index < added; ++index)
+        hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
     return -1;
 }
 
@@ -288,8 +292,8 @@ static int test_unrelated_process_mutation_does_not_abort_fork(void) {
     struct shared_state {
         _Atomic int ready;
         _Atomic int stop;
-    } *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    } *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
     if (shared == MAP_FAILED) return -1;
     int added = 0;
     for (; added < SPILL_FD_COUNT; ++added)
@@ -305,7 +309,8 @@ static int test_unrelated_process_mutation_does_not_abort_fork(void) {
         }
         _exit(0);
     }
-    while (!atomic_load_explicit(&shared->ready, memory_order_acquire)) sched_yield();
+    while (!atomic_load_explicit(&shared->ready, memory_order_acquire))
+        sched_yield();
     int ok = 1;
     for (int round = 0; round < 2000; ++round) {
         if (hl_host_process_fd_private_fork_prepare() != 0) {
@@ -320,11 +325,13 @@ static int test_unrelated_process_mutation_does_not_abort_fork(void) {
     atomic_store_explicit(&shared->stop, 1, memory_order_release);
     int status = 0;
     ok = ok && waitpid(mutator, &status, 0) == mutator && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    for (int index = 0; index < added; ++index)
+        hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
     munmap(shared, sizeof(*shared));
     return ok ? 0 : -1;
 failed:
-    for (int index = 0; index < added; ++index) hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
+    for (int index = 0; index < added; ++index)
+        hl_host_process_fd_private_remove(SPILL_FD_BASE + index);
     munmap(shared, sizeof(*shared));
     return -1;
 }

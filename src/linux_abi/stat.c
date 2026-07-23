@@ -21,8 +21,7 @@ static int hl_stat_validate(const hl_linux_stat_record *record, void *output, si
                             size_t required_size) {
     if (record == NULL || output == NULL || output_size < required_size) return -HL_LINUX_EINVAL;
     if (record->size > INT64_MAX || record->blocks_512 > INT64_MAX ||
-        record->accessed_nanoseconds >= UINT64_C(1000000000) ||
-        record->modified_nanoseconds >= UINT64_C(1000000000) ||
+        record->accessed_nanoseconds >= UINT64_C(1000000000) || record->modified_nanoseconds >= UINT64_C(1000000000) ||
         record->changed_nanoseconds >= UINT64_C(1000000000))
         return -HL_LINUX_EOVERFLOW;
     return 0;

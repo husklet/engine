@@ -5,7 +5,9 @@
 #include <errno.h>
 #include <stdlib.h>
 
-const char *hl_environment_debug_log(void) { return getenv("HL_LOG"); }
+const char *hl_environment_debug_log(void) {
+    return getenv("HL_LOG");
+}
 
 int hl_environment_take_activation_descriptor(long *descriptor) {
     const char *value = getenv("HL_ACTIVATION_FD");

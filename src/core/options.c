@@ -15,7 +15,14 @@ typedef struct hl_option_definition {
 } hl_option_definition;
 
 enum hl_option_ownership { HL_OPTION_LAUNCH_INPUT = 1, HL_OPTION_INTERNAL_STATE = 2, HL_OPTION_DEBUG_ONLY = 3 };
-enum hl_option_shape { HL_OPTION_TEXT = 1, HL_OPTION_PATH = 2, HL_OPTION_INTEGER = 3, HL_OPTION_FLAG = 4, HL_OPTION_RECORDS = 5 };
+
+enum hl_option_shape {
+    HL_OPTION_TEXT = 1,
+    HL_OPTION_PATH = 2,
+    HL_OPTION_INTEGER = 3,
+    HL_OPTION_FLAG = 4,
+    HL_OPTION_RECORDS = 5
+};
 
 #define HL_LAUNCH_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_LAUNCH_INPUT, shape}
 #define HL_INTERNAL_OPTION(name, purpose, shape) {name, purpose, HL_OPTION_INTERNAL_STATE, shape}
@@ -107,8 +114,7 @@ int hl_options_clone(hl_options *destination, const hl_options *source) {
         size_t size = source->value_sizes[index];
         if (size == 0) continue;
         if (size > HL_OPTION_STORE_LIMIT || source->values[index] == NULL || source->values[index][size - 1] != 0 ||
-            source->store_size > HL_OPTION_STORE_LIMIT ||
-            destination->store_size > HL_OPTION_STORE_LIMIT - size) {
+            source->store_size > HL_OPTION_STORE_LIMIT || destination->store_size > HL_OPTION_STORE_LIMIT - size) {
             hl_options_destroy(destination);
             return -1;
         }
@@ -128,7 +134,8 @@ void hl_options_destroy(hl_options *options) {
     size_t index;
     if (options == NULL) return;
     if (options->values != NULL)
-        for (index = 0; index < options->value_count; ++index) free(options->values[index]);
+        for (index = 0; index < options->value_count; ++index)
+            free(options->values[index]);
     free(options->values);
     free(options->value_sizes);
     memset(options, 0, sizeof(*options));
@@ -203,11 +210,18 @@ int hl_options_clone_current(hl_options *destination) {
     return current == NULL ? -1 : hl_options_clone(destination, current);
 }
 
-const char *hl_option_get(const char *name) { return hl_options_get(hl_options_current(), name); }
+const char *hl_option_get(const char *name) {
+    return hl_options_get(hl_options_current(), name);
+}
+
 int hl_option_set(const char *name, const char *value, int overwrite) {
     return hl_options_set(hl_options_current(), name, value, overwrite);
 }
-int hl_option_unset(const char *name) { return hl_options_unset(hl_options_current(), name); }
+
+int hl_option_unset(const char *name) {
+    return hl_options_unset(hl_options_current(), name);
+}
+
 void hl_option_reset(void) {
     hl_options *options = hl_options_current();
     if (options == NULL) return;

@@ -153,7 +153,10 @@ static const char *arch_to_gnu(const char *a) {
     if (!strcmp(a, "amd64")) return "x86_64";
     return NULL;
 }
-static const char *arch_to_docker(const char *a) { return a; }
+
+static const char *arch_to_docker(const char *a) {
+    return a;
+}
 
 static const char *host_arch(void) {
     struct utsname u;
@@ -163,19 +166,19 @@ static const char *host_arch(void) {
     return "unknown";
 }
 
-static int is_execu(const char *p) { return p && access(p, X_OK) == 0; }
+static int is_execu(const char *p) {
+    return p && access(p, X_OK) == 0;
+}
 
 /* Fill defaults for binary/engine from root+arch when not overridden. */
 static void ctx_defaults(ctx_t *c) {
     static char bpath[LINE], epath[LINE];
     if (!c->binary) {
-        snprintf(bpath, sizeof(bpath), "%s/build/perf/combined-bench-%s", c->root,
-                 c->gnu);
+        snprintf(bpath, sizeof(bpath), "%s/build/perf/combined-bench-%s", c->root, c->gnu);
         c->binary = bpath;
     }
     if (!c->engine) {
-        snprintf(epath, sizeof(epath),
-                 "%s/build/linux-production/hl-engine-linux-%s", c->root, c->gnu);
+        snprintf(epath, sizeof(epath), "%s/build/linux-production/hl-engine-linux-%s", c->root, c->gnu);
         c->engine = epath;
     }
 }
@@ -185,6 +188,7 @@ static const char *docker_cmd(void) {
     const char *d = getenv("DOCKER");
     return (d && *d) ? d : "docker";
 }
+
 static const char *docker_image(const ctx_t *c) {
     if (c->image) return c->image;
     const char *e = getenv("DOCKER_IMAGE");
@@ -224,6 +228,7 @@ static int native_reach(const ctx_t *c, char *r, size_t n) {
     snprintf(r, n, "native run on this %s host", c->arch);
     return 1;
 }
+
 static int native_cmd(const ctx_t *c, char *out, size_t n) {
     return snprintf(out, n, "%s", c->binary) < (int)n ? 0 : -1;
 }
@@ -235,11 +240,13 @@ static const char *qemu_of(const ctx_t *c) {
     snprintf(q, sizeof(q), "qemu-%s", c->gnu);
     return q;
 }
+
 static int which_ok(const char *bin) {
     char cmd[LINE];
     snprintf(cmd, sizeof(cmd), "command -v %s >/dev/null 2>&1", bin);
     return system(cmd) == 0;
 }
+
 static int qemu_reach(const ctx_t *c, char *r, size_t n) {
     if (!is_execu(c->binary)) {
         snprintf(r, n, "guest binary missing: %s", c->binary);
@@ -252,6 +259,7 @@ static int qemu_reach(const ctx_t *c, char *r, size_t n) {
     snprintf(r, n, "%s available", qemu_of(c));
     return 1;
 }
+
 static int qemu_cmd(const ctx_t *c, char *out, size_t n) {
     return snprintf(out, n, "%s %s", qemu_of(c), c->binary) < (int)n ? 0 : -1;
 }
@@ -269,6 +277,7 @@ static int hl_reach(const ctx_t *c, char *r, size_t n) {
     snprintf(r, n, "engine %s", c->engine);
     return 1;
 }
+
 static int hl_cmd(const ctx_t *c, char *out, size_t n) {
     return snprintf(out, n, "%s %s", c->engine, c->binary) < (int)n ? 0 : -1;
 }
@@ -281,18 +290,18 @@ static int docker_reach(const ctx_t *c, char *r, size_t n) {
     }
     char probe[LINE];
     if (c->sock)
-        snprintf(probe, sizeof(probe), "%s -H unix://%s version >/dev/null 2>&1",
-                 docker_cmd(), c->sock);
+        snprintf(probe, sizeof(probe), "%s -H unix://%s version >/dev/null 2>&1", docker_cmd(), c->sock);
     else
         snprintf(probe, sizeof(probe), "%s version >/dev/null 2>&1", docker_cmd());
     if (system(probe) != 0) {
-        snprintf(r, n, "docker not reachable via '%s'%s%s", docker_cmd(),
-                 c->sock ? " sock=" : "", c->sock ? c->sock : "");
+        snprintf(r, n, "docker not reachable via '%s'%s%s", docker_cmd(), c->sock ? " sock=" : "",
+                 c->sock ? c->sock : "");
         return 0;
     }
     snprintf(r, n, "docker via '%s', image %s", docker_cmd(), docker_image(c));
     return 1;
 }
+
 static int docker_cmd_build(const ctx_t *c, char *out, size_t n) {
     /* Stream the guest binary in over stdin (no bind-mount). On OrbStack the
      * host `mac docker` daemon rewrites bind-mount paths (the Linux path does
@@ -305,8 +314,7 @@ static int docker_cmd_build(const ctx_t *c, char *out, size_t n) {
     return snprintf(out, n,
                     "%s%s%s run --rm -i --platform linux/%s %s "
                     "sh -c 'cat >/b && chmod +x /b && /b' < %s",
-                    docker_cmd(), hopt1, hopt2, arch_to_docker(c->arch),
-                    docker_image(c), c->binary) < (int)n
+                    docker_cmd(), hopt1, hopt2, arch_to_docker(c->arch), docker_image(c), c->binary) < (int)n
                ? 0
                : -1;
 }
@@ -340,19 +348,26 @@ static uint64_t umedian(uint64_t *v, int n) {
     for (int i = 1; i < n; ++i) {
         uint64_t x = v[i];
         int j = i - 1;
-        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; --j; }
+        while (j >= 0 && v[j] > x) {
+            v[j + 1] = v[j];
+            --j;
+        }
         v[j + 1] = x;
     }
     return (n % 2) ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
+
 static uint64_t umin(const uint64_t *v, int n) {
     uint64_t m = v[0];
-    for (int i = 1; i < n; ++i) if (v[i] < m) m = v[i];
+    for (int i = 1; i < n; ++i)
+        if (v[i] < m) m = v[i];
     return m;
 }
+
 static uint64_t umax(const uint64_t *v, int n) {
     uint64_t m = v[0];
-    for (int i = 1; i < n; ++i) if (v[i] > m) m = v[i];
+    for (int i = 1; i < n; ++i)
+        if (v[i] > m) m = v[i];
     return m;
 }
 
@@ -369,7 +384,10 @@ static int run_once(const char *cmd, phase_acc_t *acc, int *nph) {
             /* find or create phase slot */
             int idx = -1;
             for (int i = 0; i < *nph; ++i)
-                if (!strcmp(acc[i].name, name)) { idx = i; break; }
+                if (!strcmp(acc[i].name, name)) {
+                    idx = i;
+                    break;
+                }
             if (idx < 0) {
                 if (*nph >= MAX_PHASES) continue;
                 idx = (*nph)++;
@@ -406,15 +424,25 @@ static int cmd_run(int argc, char **argv) {
     for (int i = 0; i < argc; ++i) {
         const char *a = argv[i];
 #define NEXT() (i + 1 < argc ? argv[++i] : NULL)
-        if (!strcmp(a, "--env")) env = NEXT();
-        else if (!strcmp(a, "--arch")) c.arch = NEXT();
-        else if (!strcmp(a, "--repeats")) { const char *v = NEXT(); if (v) repeats = atoi(v); }
-        else if (!strcmp(a, "--out")) out = NEXT();
-        else if (!strcmp(a, "--binary")) c.binary = NEXT();
-        else if (!strcmp(a, "--engine")) c.engine = NEXT();
-        else if (!strcmp(a, "--qemu-bin")) c.qemu_bin = NEXT();
-        else if (!strcmp(a, "--sock")) c.sock = NEXT();
-        else if (!strcmp(a, "--image")) c.image = NEXT();
+        if (!strcmp(a, "--env"))
+            env = NEXT();
+        else if (!strcmp(a, "--arch"))
+            c.arch = NEXT();
+        else if (!strcmp(a, "--repeats")) {
+            const char *v = NEXT();
+            if (v) repeats = atoi(v);
+        } else if (!strcmp(a, "--out"))
+            out = NEXT();
+        else if (!strcmp(a, "--binary"))
+            c.binary = NEXT();
+        else if (!strcmp(a, "--engine"))
+            c.engine = NEXT();
+        else if (!strcmp(a, "--qemu-bin"))
+            c.qemu_bin = NEXT();
+        else if (!strcmp(a, "--sock"))
+            c.sock = NEXT();
+        else if (!strcmp(a, "--image"))
+            c.image = NEXT();
         else {
             fprintf(stderr, "run: unknown flag '%s'\n", a);
             return 2;
@@ -426,20 +454,24 @@ static int cmd_run(int argc, char **argv) {
         return 2;
     }
     c.gnu = arch_to_gnu(c.arch);
-    if (!c.gnu) { fprintf(stderr, "run: bad --arch '%s'\n", c.arch); return 2; }
+    if (!c.gnu) {
+        fprintf(stderr, "run: bad --arch '%s'\n", c.arch);
+        return 2;
+    }
     const provider_t *p = find_provider(env);
-    if (!p) { fprintf(stderr, "run: unknown --env '%s'\n", env); return 2; }
+    if (!p) {
+        fprintf(stderr, "run: unknown --env '%s'\n", env);
+        return 2;
+    }
     if (repeats < 1 || repeats > MAX_REPEATS) repeats = 5;
     ctx_defaults(&c);
 
     char reason[LINE];
     if (!p->reachable(&c, reason, sizeof(reason))) {
-        fprintf(stderr, "error: env=%s arch=%s not reachable: %s\n", env, c.arch,
-                reason);
+        fprintf(stderr, "error: env=%s arch=%s not reachable: %s\n", env, c.arch, reason);
         return 1;
     }
-    fprintf(stderr, "== run env=%s arch=%s repeats=%d ==\n   %s\n", env, c.arch,
-            repeats, reason);
+    fprintf(stderr, "== run env=%s arch=%s repeats=%d ==\n   %s\n", env, c.arch, repeats, reason);
     if (p->setup && p->setup(&c) != 0) {
         fprintf(stderr, "error: setup failed\n");
         return 1;
@@ -462,20 +494,32 @@ static int cmd_run(int argc, char **argv) {
         }
     }
     if (p->teardown) p->teardown(&c);
-    if (nph == 0) { fprintf(stderr, "error: no PHASE output\n"); return 1; }
+    if (nph == 0) {
+        fprintf(stderr, "error: no PHASE output\n");
+        return 1;
+    }
 
     /* emit CSV */
     FILE *o = stdout;
-    if (out) { ensure_parent_dir(out); o = fopen(out, "w"); if (!o) { perror("fopen"); return 1; } }
+    if (out) {
+        ensure_parent_dir(out);
+        o = fopen(out, "w");
+        if (!o) {
+            perror("fopen");
+            return 1;
+        }
+    }
     fprintf(o, "env,arch,phase,us,ok,us_min,us_max,repeats\n");
     for (int i = 0; i < nph; ++i) {
         uint64_t md = umedian(acc[i].us, acc[i].count);
-        fprintf(o, "%s,%s,%s,%llu,%llu,%llu,%llu,%d\n", env, c.arch, acc[i].name,
-                (unsigned long long)md, (unsigned long long)acc[i].ok,
-                (unsigned long long)umin(acc[i].us, acc[i].count),
+        fprintf(o, "%s,%s,%s,%llu,%llu,%llu,%llu,%d\n", env, c.arch, acc[i].name, (unsigned long long)md,
+                (unsigned long long)acc[i].ok, (unsigned long long)umin(acc[i].us, acc[i].count),
                 (unsigned long long)umax(acc[i].us, acc[i].count), acc[i].count);
     }
-    if (out) { fclose(o); fprintf(stderr, "wrote %s\n", out); }
+    if (out) {
+        fclose(o);
+        fprintf(stderr, "wrote %s\n", out);
+    }
     return 0;
 }
 
@@ -486,8 +530,7 @@ static int cmd_list(void) {
     detect_root(c.root, sizeof(c.root));
     struct utsname u;
     uname(&u);
-    printf("host: %s %s (arch=%s)  root=%s\n", u.sysname, u.machine, host_arch(),
-           c.root);
+    printf("host: %s %s (arch=%s)  root=%s\n", u.sysname, u.machine, host_arch(), c.root);
     printf("%-10s %-6s %-10s %s\n", "env", "arch", "reachable", "detail");
     printf("--------------------------------------------------------------------\n");
     for (int i = 0; i < NPROV; ++i) {
@@ -498,8 +541,7 @@ static int cmd_list(void) {
             ctx_defaults(&cc);
             char reason[LINE];
             int ok = PROVIDERS[i].reachable(&cc, reason, sizeof(reason));
-            printf("%-10s %-6s %-10s %s\n", PROVIDERS[i].name, cc.arch,
-                   ok ? "yes" : "no", reason);
+            printf("%-10s %-6s %-10s %s\n", PROVIDERS[i].name, cc.arch, ok ? "yes" : "no", reason);
         }
     }
     return 0;
@@ -516,7 +558,10 @@ typedef struct {
 
 static int read_csv(const char *path, col_t *col) {
     FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "report: cannot open %s\n", path); return -1; }
+    if (!f) {
+        fprintf(stderr, "report: cannot open %s\n", path);
+        return -1;
+    }
     char line[LINE];
     col->nph = 0;
     col->env[0] = col->arch[0] = '\0';
@@ -525,8 +570,8 @@ static int read_csv(const char *path, col_t *col) {
         char env[32], arch[16], ph[64];
         unsigned long long us, ok, mn, mx;
         int rep;
-        if (sscanf(line, "%31[^,],%15[^,],%63[^,],%llu,%llu,%llu,%llu,%d", env,
-                   arch, ph, &us, &ok, &mn, &mx, &rep) >= 5) {
+        if (sscanf(line, "%31[^,],%15[^,],%63[^,],%llu,%llu,%llu,%llu,%d", env, arch, ph, &us, &ok, &mn, &mx, &rep) >=
+            5) {
             snprintf(col->env, sizeof(col->env), "%s", env);
             snprintf(col->arch, sizeof(col->arch), "%s", arch);
             if (col->nph < MAX_PHASES) {
@@ -543,17 +588,27 @@ static int read_csv(const char *path, col_t *col) {
 
 static int col_us(const col_t *c, const char *ph, uint64_t *out) {
     for (int i = 0; i < c->nph; ++i)
-        if (!strcmp(c->phase[i], ph)) { *out = c->us[i]; return 1; }
+        if (!strcmp(c->phase[i], ph)) {
+            *out = c->us[i];
+            return 1;
+        }
     return 0;
 }
+
 static int col_ok(const col_t *c, const char *ph, uint64_t *out) {
     for (int i = 0; i < c->nph; ++i)
-        if (!strcmp(c->phase[i], ph)) { *out = c->ok[i]; return 1; }
+        if (!strcmp(c->phase[i], ph)) {
+            *out = c->ok[i];
+            return 1;
+        }
     return 0;
 }
 
 static int cmd_report(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "report: need CSV file(s)\n"); return 2; }
+    if (argc < 1) {
+        fprintf(stderr, "report: need CSV file(s)\n");
+        return 2;
+    }
     /* --baseline <env>: which env's column is the 1.00x reference per arch
      * (default native). e.g. --baseline hl-engine shows every column as a
      * multiple of hl-engine, so you read "how does X compare to hl". */
@@ -567,7 +622,10 @@ static int cmd_report(int argc, char **argv) {
         }
         if (read_csv(argv[i], &cols[ncol]) == 0) ncol++;
     }
-    if (ncol == 0) { fprintf(stderr, "report: no valid CSV\n"); return 1; }
+    if (ncol == 0) {
+        fprintf(stderr, "report: no valid CSV\n");
+        return 1;
+    }
 
     /* union of phase names, first-seen order */
     char order[MAX_PHASES][64];
@@ -576,9 +634,11 @@ static int cmd_report(int argc, char **argv) {
         for (int i = 0; i < cols[c].nph; ++i) {
             int found = 0;
             for (int j = 0; j < norder; ++j)
-                if (!strcmp(order[j], cols[c].phase[i])) { found = 1; break; }
-            if (!found && norder < MAX_PHASES)
-                snprintf(order[norder++], 64, "%s", cols[c].phase[i]);
+                if (!strcmp(order[j], cols[c].phase[i])) {
+                    found = 1;
+                    break;
+                }
+            if (!found && norder < MAX_PHASES) snprintf(order[norder++], 64, "%s", cols[c].phase[i]);
         }
 
     /* baseline column per arch: the --baseline env if present for that arch,
@@ -590,8 +650,7 @@ static int cmd_report(int argc, char **argv) {
             if (!strcmp(cols[k].arch, cols[c].arch)) {
                 if (b < 0) b = k;
                 if (!strcmp(cols[k].env, baseline_env) && want < 0) want = k;
-                if ((!strcmp(cols[k].env, "native") ||
-                     !strcmp(cols[k].env, "orbstack")) && nat < 0) nat = k;
+                if ((!strcmp(cols[k].env, "native") || !strcmp(cols[k].env, "orbstack")) && nat < 0) nat = k;
             }
         base_of[c] = want >= 0 ? want : (nat >= 0 ? nat : b);
     }
@@ -617,16 +676,18 @@ static int cmd_report(int argc, char **argv) {
         printf("%-14s", ph);
         for (int c = 0; c < ncol; ++c) {
             uint64_t v;
-            if (col_us(&cols[c], ph, &v)) printf(" %14llu", (unsigned long long)v);
-            else printf(" %14s", "-");
+            if (col_us(&cols[c], ph, &v))
+                printf(" %14llu", (unsigned long long)v);
+            else
+                printf(" %14s", "-");
         }
         for (int c = 0; c < ncol; ++c) {
             uint64_t v, bv;
             int b = base_of[c];
-            if (b >= 0 && col_us(&cols[c], ph, &v) && col_us(&cols[b], ph, &bv) &&
-                bv > 0)
+            if (b >= 0 && col_us(&cols[c], ph, &v) && col_us(&cols[b], ph, &bv) && bv > 0)
                 printf(" %9.2f", (double)v / (double)bv);
-            else printf(" %9s", "-");
+            else
+                printf(" %9s", "-");
         }
         printf("\n");
         /* checksum divergence (skip tid-based syscall) */
@@ -636,8 +697,11 @@ static int cmd_report(int argc, char **argv) {
             for (int c = 0; c < ncol; ++c) {
                 uint64_t o;
                 if (col_ok(&cols[c], ph, &o)) {
-                    if (!have) { first = o; have = 1; }
-                    else if (o != first) bad = 1;
+                    if (!have) {
+                        first = o;
+                        have = 1;
+                    } else if (o != first)
+                        bad = 1;
                 }
             }
             if (bad) {
@@ -648,7 +712,8 @@ static int cmd_report(int argc, char **argv) {
         }
     }
     printf("ratios are x-%s per arch (each column vs the %s cell of the same "
-           "arch; missing -> first column).\n", baseline_env, baseline_env);
+           "arch; missing -> first column).\n",
+           baseline_env, baseline_env);
     printf("note: 'syscall' ok= is tid-dependent; divergence there is expected.\n");
     if (diverged) {
         fprintf(stderr, "WARNING: checksum divergence in phases:%s\n", divlist);
@@ -660,15 +725,14 @@ static int cmd_report(int argc, char **argv) {
 
 /* ---------------------------------------------------------------- main */
 static int usage(void) {
-    fprintf(stderr,
-            "usage:\n"
-            "  bench-runner list\n"
-            "  bench-runner run --env <native|orbstack|docker|qemu|hl-engine> "
-            "--arch <arm64|amd64>\n"
-            "                   [--repeats N] [--out F.csv] [--binary B] "
-            "[--engine E]\n"
-            "                   [--qemu-bin Q] [--sock S] [--image I]\n"
-            "  bench-runner report F.csv [F.csv ...]\n");
+    fprintf(stderr, "usage:\n"
+                    "  bench-runner list\n"
+                    "  bench-runner run --env <native|orbstack|docker|qemu|hl-engine> "
+                    "--arch <arm64|amd64>\n"
+                    "                   [--repeats N] [--out F.csv] [--binary B] "
+                    "[--engine E]\n"
+                    "                   [--qemu-bin Q] [--sock S] [--image I]\n"
+                    "  bench-runner report F.csv [F.csv ...]\n");
     return 2;
 }
 

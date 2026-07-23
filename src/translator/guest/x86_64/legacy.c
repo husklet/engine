@@ -53,6 +53,7 @@ static int x86_tv2ts(const hl_x86_legacy_context *context, uint64_t p, struct ti
 // (set only here, consumed in the clone case), so a real clone(56) call never triggers a restore.
 static __thread uint64_t g_x86_forksave[5];
 static __thread int g_x86_forksave_on;
+
 void hl_x86_legacy_restore_fork(struct cpu *c) {
     if (!g_x86_forksave_on) return;
     c->r[7] = g_x86_forksave[0];

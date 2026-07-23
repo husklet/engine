@@ -13,9 +13,7 @@ static int hl_persist_leaf(const char *name, size_t *size) {
     if (name == NULL || name[0] == 0 || size == NULL) return 0;
     for (cursor = name; *cursor != 0; cursor++)
         if (*cursor == '/') return 0;
-    if ((cursor - name == 1 && name[0] == '.') ||
-        (cursor - name == 2 && name[0] == '.' && name[1] == '.'))
-        return 0;
+    if ((cursor - name == 1 && name[0] == '.') || (cursor - name == 2 && name[0] == '.' && name[1] == '.')) return 0;
     *size = (size_t)(cursor - name);
     return 1;
 }
@@ -30,8 +28,7 @@ int hl_persist_directory_open(hl_persist_directory *directory, const hl_host_ser
         services->file->validate_private_directory == NULL || (create && services->file->make_directory == NULL))
         return 0;
     path_size = strlen(path);
-    if (create)
-        (void)services->file->make_directory(services->context, HL_HOST_HANDLE_CWD, path, path_size, 0700);
+    if (create) (void)services->file->make_directory(services->context, HL_HOST_HANDLE_CWD, path, path_size, 0700);
     result = services->file->open_relative(services->context, HL_HOST_HANDLE_CWD, path, path_size,
                                            HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0, 0);
     if (result.status != HL_STATUS_OK) return 0;
@@ -66,9 +63,8 @@ int hl_persist_load_at(const hl_persist_directory *directory, const char *name, 
         data == NULL || size == NULL || !hl_persist_leaf(name, &name_size))
         return 0;
     const hl_host_services *services = directory->services;
-    if (services->file->open_relative == NULL || services->file->read_at == NULL ||
-        services->file->metadata == NULL || services->file->close == NULL ||
-        services->file->validate_private_regular == NULL)
+    if (services->file->open_relative == NULL || services->file->read_at == NULL || services->file->metadata == NULL ||
+        services->file->close == NULL || services->file->validate_private_regular == NULL)
         return 0;
     opened = services->file->open_relative(services->context, directory->handle, name, name_size,
                                            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
@@ -90,7 +86,10 @@ int hl_persist_load_at(const hl_persist_directory *directory, const char *name, 
     ok = 1;
 done:
     if (services->file->close(services->context, opened.value).status != HL_STATUS_OK) ok = 0;
-    if (!ok) { free(bytes); return 0; }
+    if (!ok) {
+        free(bytes);
+        return 0;
+    }
     *data = bytes;
     *size = (size_t)metadata.size;
     return 1;
@@ -113,8 +112,7 @@ int hl_persist_remove_at(const hl_persist_directory *directory, const char *name
     if (directory == NULL || directory->services == NULL || directory->handle == HL_HOST_HANDLE_INVALID ||
         !hl_persist_leaf(name, &name_size) || directory->services->file->unlink_relative == NULL)
         return 0;
-    return directory->services->file
-               ->unlink_relative(directory->services->context, directory->handle, name, name_size)
+    return directory->services->file->unlink_relative(directory->services->context, directory->handle, name, name_size)
                .status == HL_STATUS_OK;
 }
 

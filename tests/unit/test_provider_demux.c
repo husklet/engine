@@ -238,8 +238,7 @@ static int fork_subscriptions(void) {
         pid_wake_state child_wake = {.expected = getpid()};
         close(sync_pipe[0]);
         close(pair[1]);
-        if (hl_provider_demux_subscribe(demux, 91, pid_wake, &child_wake) != 0 ||
-            write(sync_pipe[1], &ready, 1) != 1)
+        if (hl_provider_demux_subscribe(demux, 91, pid_wake, &child_wake) != 0 || write(sync_pipe[1], &ready, 1) != 1)
             _exit(3);
         for (int i = 0; i < 1000 && atomic_load(&child_wake.calls) == 0; ++i) {
             struct timespec pause = {0, 1000000L};
@@ -280,8 +279,7 @@ static int dead_owner_reclaim(void) {
     pid_t child;
     hl_provider_demux *demux = NULL;
     pid_wake_state wake_state = {.expected = getpid()};
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 ||
-        hl_provider_demux_create(&demux, pair[0], 16, 1, 1, 1) != 0)
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || hl_provider_demux_create(&demux, pair[0], 16, 1, 1, 1) != 0)
         return 1;
     child = fork();
     if (child < 0) return 2;
@@ -312,15 +310,14 @@ static int dead_waiter_teardown(void) {
         hl_provider_ticket ticket;
         hl_provider_reply reply;
         close(ready[0]);
-        if (hl_provider_demux_begin(demux, "hang", 4, &ticket) != 0 || write(ready[1], "x", 1) != 1)
-            _exit(3);
+        if (hl_provider_demux_begin(demux, "hang", 4, &ticket) != 0 || write(ready[1], "x", 1) != 1) _exit(3);
         (void)hl_provider_demux_wait(demux, ticket, 30000, &reply);
         _exit(4);
     }
     close(ready[1]);
     char marker;
-    if (read(ready[0], &marker, 1) != 1 || kill(child, SIGKILL) != 0 ||
-        waitpid(child, &status, 0) != child || !WIFSIGNALED(status))
+    if (read(ready[0], &marker, 1) != 1 || kill(child, SIGKILL) != 0 || waitpid(child, &status, 0) != child ||
+        !WIFSIGNALED(status))
         return 5;
     hl_provider_demux_destroy(demux);
     close(pair[0]);

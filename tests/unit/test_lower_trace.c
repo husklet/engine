@@ -11,18 +11,53 @@ static size_t code_count;
 static unsigned flag_loads;
 static unsigned chain_exits;
 
-void emit32(uint32_t instruction) { code[code_count++] = instruction; }
-uint32_t *hl_x86_emit_cursor(void) { return &code[code_count]; }
-void hl_x86_emit_flags_load(void) { flag_loads++; }
-void hl_x86_emit_host_pointer(int destination, uint64_t pointer) { (void)destination; (void)pointer; }
-void e_ldr(int destination, int base, int offset) { (void)destination; (void)base; (void)offset; }
-void e_str(int source, int base, int offset) { (void)source; (void)base; (void)offset; }
-void e_subi(int destination, int source, unsigned immediate, int wide) {
-    (void)destination; (void)source; (void)immediate; (void)wide;
+void emit32(uint32_t instruction) {
+    code[code_count++] = instruction;
 }
-void e_nzcv_save(void) {}
-void emit_exit_const(uint64_t rip, uint64_t reason) { (void)rip; (void)reason; }
-int alu_kind_primary(uint8_t opcode) { return opcode < 0x40 && (opcode & 7) <= 5 ? (opcode >> 3) & 7 : -1; }
+
+uint32_t *hl_x86_emit_cursor(void) {
+    return &code[code_count];
+}
+
+void hl_x86_emit_flags_load(void) {
+    flag_loads++;
+}
+
+void hl_x86_emit_host_pointer(int destination, uint64_t pointer) {
+    (void)destination;
+    (void)pointer;
+}
+
+void e_ldr(int destination, int base, int offset) {
+    (void)destination;
+    (void)base;
+    (void)offset;
+}
+
+void e_str(int source, int base, int offset) {
+    (void)source;
+    (void)base;
+    (void)offset;
+}
+
+void e_subi(int destination, int source, unsigned immediate, int wide) {
+    (void)destination;
+    (void)source;
+    (void)immediate;
+    (void)wide;
+}
+
+void e_nzcv_save(void) {
+}
+
+void emit_exit_const(uint64_t rip, uint64_t reason) {
+    (void)rip;
+    (void)reason;
+}
+
+int alu_kind_primary(uint8_t opcode) {
+    return opcode < 0x40 && (opcode & 7) <= 5 ? (opcode >> 3) & 7 : -1;
+}
 
 int hl_x86_decode(uint64_t address, struct insn *insn) {
     const uint8_t *bytes = (const uint8_t *)(uintptr_t)address;
@@ -32,9 +67,19 @@ int hl_x86_decode(uint64_t address, struct insn *insn) {
     return 0;
 }
 
-static void no_flags(void) {}
-static int page_present(uint64_t address) { (void)address; return 1; }
-static void chain_exit(uint64_t target) { (void)target; chain_exits++; emit32(UINT32_C(0xd503201f)); }
+static void no_flags(void) {
+}
+
+static int page_present(uint64_t address) {
+    (void)address;
+    return 1;
+}
+
+static void chain_exit(uint64_t target) {
+    (void)target;
+    chain_exits++;
+    emit32(UINT32_C(0xd503201f));
+}
 
 static hl_x86_trace_state state(int *pending, uint64_t counters[2], uint64_t profiles[3]) {
     return (hl_x86_trace_state){
@@ -62,10 +107,8 @@ static int check_analysis(void) {
 
     uint32_t same[] = {UINT32_C(0xf9000420), UINT32_C(0xf9400421)};
     uint32_t distinct[] = {UINT32_C(0xf9000420), UINT32_C(0xf9400821)};
-    HL_CHECK(hl_x86_trace_loop_hazard((uint64_t)(uintptr_t)same,
-                                      (uint64_t)(uintptr_t)(same + 2)));
-    HL_CHECK(!hl_x86_trace_loop_hazard((uint64_t)(uintptr_t)distinct,
-                                       (uint64_t)(uintptr_t)(distinct + 2)));
+    HL_CHECK(hl_x86_trace_loop_hazard((uint64_t)(uintptr_t)same, (uint64_t)(uintptr_t)(same + 2)));
+    HL_CHECK(!hl_x86_trace_loop_hazard((uint64_t)(uintptr_t)distinct, (uint64_t)(uintptr_t)(distinct + 2)));
     return 0;
 }
 
@@ -74,8 +117,7 @@ static int check_liveness(void) {
     int pending = 0;
     uint64_t counters[2] = {0}, profiles[3] = {0};
     hl_x86_trace_state trace = state(&pending, counters, profiles);
-    int live = hl_x86_trace_flags_livein(&trace, (uint64_t)(uintptr_t)guest,
-                                         (uint64_t)(uintptr_t)guest);
+    int live = hl_x86_trace_flags_livein(&trace, (uint64_t)(uintptr_t)guest, (uint64_t)(uintptr_t)guest);
     HL_CHECK((live & HL_X86_FLAG_ZF) != 0);
     HL_CHECK(profiles[1] == 1);
     return 0;

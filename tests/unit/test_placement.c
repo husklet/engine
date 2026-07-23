@@ -27,8 +27,8 @@ int main(void) {
     map_fixture fixture = {.results = {fixed, NULL}};
 
     HL_CHECK(hl_elf_place_image(map_record, &fixture, fixed, 0x20000, &failed) == fixed);
-    HL_CHECK(failed == 0 && fixture.calls == 1 && fixture.addresses[0] == fixed &&
-             fixture.lengths[0] == 0x20000 && fixture.placements[0] == HL_ELF_MAP_FIXED);
+    HL_CHECK(failed == 0 && fixture.calls == 1 && fixture.addresses[0] == fixed && fixture.lengths[0] == 0x20000 &&
+             fixture.placements[0] == HL_ELF_MAP_FIXED);
 
     fixture = (map_fixture){.results = {NULL, chosen}};
     HL_CHECK(hl_elf_place_image(map_record, &fixture, fixed, 0x30000, &failed) == chosen);

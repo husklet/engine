@@ -50,8 +50,7 @@ static hl_host_result generation_open(void *opaque, hl_host_handle directory, co
 }
 
 static hl_host_result generation_map(void *opaque, hl_host_handle file, uint64_t requested_address, uint64_t offset,
-                                     uint64_t size, uint32_t protection, uint32_t flags,
-                                     hl_host_file_mapping *output) {
+                                     uint64_t size, uint32_t protection, uint32_t flags, hl_host_file_mapping *output) {
     struct generation_host *host = opaque;
     struct generation_mapping *mapping = NULL;
     void *address;
@@ -240,10 +239,10 @@ int main(void) {
     HL_CHECK(hl_fdcache_metadata_lookup("/root/sibling-created", &result, &found) == 0);
 
     /* Every preparation failure leaves the active mapping authoritative. */
-    const enum generation_fault faults[] = {GENERATION_OPEN_FAIL,       GENERATION_MAP_FAIL,
-                                            GENERATION_MAP_FAIL_OWNED,  GENERATION_MAP_NO_HANDLE,
-                                            GENERATION_MAP_NO_ADDRESS, GENERATION_MAP_SHORT,
-                                            GENERATION_CLOSE_FAIL};
+    const enum generation_fault faults[] = {
+        GENERATION_OPEN_FAIL,      GENERATION_MAP_FAIL,  GENERATION_MAP_FAIL_OWNED, GENERATION_MAP_NO_HANDLE,
+        GENERATION_MAP_NO_ADDRESS, GENERATION_MAP_SHORT, GENERATION_CLOSE_FAIL};
+
     for (size_t index = 0; index < sizeof(faults) / sizeof(faults[0]); ++index) {
         uint32_t releases = generation.release_calls;
         generation.fault = faults[index];

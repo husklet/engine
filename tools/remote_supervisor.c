@@ -89,8 +89,7 @@ int main(int argc, char **argv) {
     if (child < 0) return 125;
     if (child == 0) {
         (void)setpgid(0, 0);
-        if (capture_output >= 0 &&
-            (dup2(capture_output, STDOUT_FILENO) < 0 || dup2(capture_error, STDERR_FILENO) < 0))
+        if (capture_output >= 0 && (dup2(capture_output, STDOUT_FILENO) < 0 || dup2(capture_error, STDERR_FILENO) < 0))
             _exit(126);
         if (capture_output >= 0) close(capture_output);
         if (capture_error >= 0) close(capture_error);

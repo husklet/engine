@@ -807,8 +807,8 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
     }
     int native_flags = (sharing == HL_HOST_MEMORY_SHARED ? MAP_SHARED : MAP_PRIVATE) | MAP_ANON;
     if (placement != 0) native_flags |= MAP_FIXED;
-    address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags,
-                   -1, 0);
+    address =
+        mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_macos_protection(protection), native_flags, -1, 0);
     if (address == MAP_FAILED) {
         hl_host_result failure = hl_macos_errno();
         if (placement == HL_HOST_MEMORY_FIXED_NOREPLACE)
@@ -835,8 +835,8 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
     hl_macos_mapping *owned = hl_macos_lookup(host, registered.value);
     if (owned != NULL) owned->writable = address;
     pthread_mutex_unlock(&host->lock);
-    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value,
-                                       (uint64_t)(uintptr_t)address, size, 0};
+    *output = (hl_host_memory_mapping){
+        HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value, (uint64_t)(uintptr_t)address, size, 0};
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -861,16 +861,14 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
     hl_macos_mapping *mapping;
     int status;
     long page = sysconf(_SC_PAGESIZE);
-    if (size == 0 || size > SIZE_MAX || page <= 0)
-        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (size == 0 || size > SIZE_MAX || page <= 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     mapping = hl_macos_lookup(host, handle);
     if (mapping == NULL || offset > mapping->size || size > mapping->size - offset) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    if ((offset != 0 || size != mapping->size) &&
-        (offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)) {
+    if ((offset != 0 || size != mapping->size) && (offset % (uint64_t)page != 0 || size % (uint64_t)page != 0)) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
@@ -1072,8 +1070,7 @@ static hl_host_result hl_macos_clock_sleep_until(void *context, uint32_t clock_k
         remaining = deadline_ns - now_ns;
         /* Recheck non-monotonic clocks periodically so realtime adjustments and process-CPU progress
          * change the effective absolute deadline instead of becoming one stale wall-clock delay. */
-        if (clock_kind != HL_HOST_CLOCK_MONOTONIC && remaining > UINT64_C(10000000))
-            remaining = UINT64_C(10000000);
+        if (clock_kind != HL_HOST_CLOCK_MONOTONIC && remaining > UINT64_C(10000000)) remaining = UINT64_C(10000000);
         delay.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
         delay.tv_nsec = (long)(remaining % UINT64_C(1000000000));
         /* Match Linux high-resolution timer wakeups without leaking a Darwin scheduler policy into linux_abi. */
@@ -1339,7 +1336,7 @@ static int hl_macos_file_descriptor(hl_host_macos *host, hl_host_handle handle, 
 }
 
 static hl_host_result hl_macos_attachment_borrow_file_at_least(void *context, hl_host_handle handle,
-                                                              uint32_t minimum_descriptor) {
+                                                               uint32_t minimum_descriptor) {
     hl_host_macos *host = context;
     int descriptor = -1;
     int found;
@@ -2255,8 +2252,7 @@ static hl_host_result hl_macos_file_unlink(void *context, hl_host_handle directo
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_host_result hl_macos_file_rmdir(void *context, hl_host_handle directory, const char *path,
-                                          size_t path_size) {
+static hl_host_result hl_macos_file_rmdir(void *context, hl_host_handle directory, const char *path, size_t path_size) {
     hl_host_macos *host = context;
     char local[PATH_MAX];
     int directory_fd;
@@ -4094,8 +4090,7 @@ static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process
                 while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
             }
             if (pid == 0) _exit(255);
-            return hl_macos_result(private_status != 0 ? HL_STATUS_RESOURCE_LIMIT : HL_STATUS_PLATFORM_FAILURE, 0,
-                                   0);
+            return hl_macos_result(private_status != 0 ? HL_STATUS_RESOURCE_LIMIT : HL_STATUS_PLATFORM_FAILURE, 0, 0);
         }
     }
     if (pid < 0) {
@@ -4236,9 +4231,9 @@ static hl_host_result hl_macos_process_terminate(void *context, hl_host_handle h
     else if (reason == HL_HOST_PROCESS_TERMINATE_FORCE)
         signal_number = SIGKILL;
     else {
-        static const unsigned char linux_to_macos[32] = {
-            0, 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15,
-            16, 20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 30, 12};
+        static const unsigned char linux_to_macos[32] = {0,  1,  2,  3,  4,  5,  6,  10, 8,  9,  30,
+                                                         11, 31, 13, 14, 15, 16, 20, 19, 17, 18, 21,
+                                                         22, 16, 24, 25, 26, 27, 28, 23, 30, 12};
         uint32_t guest = reason - HL_HOST_PROCESS_TERMINATE_SIGNAL;
         signal_number = guest < 32 ? linux_to_macos[guest] : (int)guest;
     }
@@ -4437,8 +4432,8 @@ static hl_host_result hl_macos_file_validate_private_regular(void *context, hl_h
 }
 
 static hl_host_result hl_macos_file_store_private_atomic(void *context, hl_host_handle directory, const char *path,
-                                                          size_t path_size, hl_host_const_bytes input,
-                                                          uint32_t permissions) {
+                                                         size_t path_size, hl_host_const_bytes input,
+                                                         uint32_t permissions) {
     static _Atomic uint64_t sequence;
     hl_host_macos *host = context;
     char name[PATH_MAX], temporary[PATH_MAX];
@@ -4446,7 +4441,8 @@ static hl_host_result hl_macos_file_store_private_atomic(void *context, hl_host_
     if (path == NULL || path_size == 0 || path_size >= sizeof(name) || memchr(path, '\0', path_size) != NULL ||
         (permissions & ~0777u) != 0 || (input.size != 0 && input.data == NULL))
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    memcpy(name, path, path_size); name[path_size] = '\0';
+    memcpy(name, path, path_size);
+    name[path_size] = '\0';
     if (directory != HL_HOST_HANDLE_CWD) {
         directory_fd = hl_macos_file_descriptor(host, directory, 0);
         if (directory_fd >= 0) directory_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
@@ -4457,23 +4453,40 @@ static hl_host_result hl_macos_file_store_private_atomic(void *context, hl_host_
         int count = snprintf(temporary, sizeof temporary, "%s.hl-%llx-%llx.tmp", name,
                              (unsigned long long)(uint64_t)getpid(), (unsigned long long)token);
         if (count <= 0 || (size_t)count >= sizeof temporary) break;
-        descriptor = openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                            (mode_t)permissions);
+        descriptor =
+            openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, (mode_t)permissions);
         if (descriptor >= 0 || errno != EEXIST) break;
     }
-    if (descriptor < 0) { if (directory_fd != AT_FDCWD) close(directory_fd); return hl_macos_errno(); }
+    if (descriptor < 0) {
+        if (directory_fd != AT_FDCWD) close(directory_fd);
+        return hl_macos_errno();
+    }
     size_t done = 0;
     int saved = 0;
     while (done < input.size) {
         ssize_t count = write(descriptor, (const uint8_t *)input.data + done, input.size - done);
-        if (count > 0) done += (size_t)count;
-        else if (count < 0 && errno == EINTR) continue;
-        else { saved = count == 0 ? EIO : errno; break; }
+        if (count > 0)
+            done += (size_t)count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else {
+            saved = count == 0 ? EIO : errno;
+            break;
+        }
     }
     int ok = done == input.size;
-    if (ok && fsync(descriptor) != 0) { ok = 0; saved = errno; }
-    if (close(descriptor) != 0 && ok) { ok = 0; saved = errno; }
-    if (ok && renameat(directory_fd, temporary, directory_fd, name) != 0) { ok = 0; saved = errno; }
+    if (ok && fsync(descriptor) != 0) {
+        ok = 0;
+        saved = errno;
+    }
+    if (close(descriptor) != 0 && ok) {
+        ok = 0;
+        saved = errno;
+    }
+    if (ok && renameat(directory_fd, temporary, directory_fd, name) != 0) {
+        ok = 0;
+        saved = errno;
+    }
     if (!ok) (void)unlinkat(directory_fd, temporary, 0);
     if (directory_fd != AT_FDCWD) close(directory_fd);
     errno = saved != 0 ? saved : EIO;
@@ -4501,17 +4514,17 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
-        hl_macos_unmap_range,      hl_macos_map_anonymous, hl_macos_discard, hl_macos_repair_signal_page};
+        hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
-                                                  .size = sizeof(clock),
-                                                  .monotonic_ns = hl_macos_monotonic,
-                                                  .realtime_ns = hl_macos_realtime,
-                                                  .raw_monotonic_ns = hl_macos_raw_monotonic,
-                                                  .process_cpu_ns = hl_macos_process_cpu,
-                                                  .thread_cpu_ns = hl_macos_thread_cpu,
-                                                  .sleep_until = hl_macos_clock_sleep_until,
-                                                  .architectural_counter_hz = hl_macos_architectural_counter,
-                                                  .backoff_ns = hl_macos_backoff};
+                                                 .size = sizeof(clock),
+                                                 .monotonic_ns = hl_macos_monotonic,
+                                                 .realtime_ns = hl_macos_realtime,
+                                                 .raw_monotonic_ns = hl_macos_raw_monotonic,
+                                                 .process_cpu_ns = hl_macos_process_cpu,
+                                                 .thread_cpu_ns = hl_macos_thread_cpu,
+                                                 .sleep_until = hl_macos_clock_sleep_until,
+                                                 .architectural_counter_hz = hl_macos_architectural_counter,
+                                                 .backoff_ns = hl_macos_backoff};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_macos_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),
@@ -4595,8 +4608,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                                    hl_macos_stream_readiness, hl_macos_stream_move};
     static const hl_host_posix_attachment_services posix_attachment = {
         HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_macos_attachment_borrow_file,
-        hl_macos_attachment_borrow_file_at_least,
-        hl_macos_attachment_release};
+        hl_macos_attachment_borrow_file_at_least, hl_macos_attachment_release};
     hl_host_macos *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_host = NULL;

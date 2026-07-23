@@ -135,8 +135,7 @@ uint64_t hl_x86_avx_address(const hl_x86_avx_state *state, uint64_t address) {
     return low != 0 && address >= low && address < high ? address + bias : address;
 }
 
-static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
-                       int wbytes) {
+static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes) {
     uint64_t a;
     if (I->rip_rel) {
         a = rip_after + (uint64_t)I->disp;
@@ -156,8 +155,8 @@ static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn
 }
 
 // Read the r/m operand (register or memory) into buf as `wbytes` bytes.
-static void avx_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
-                       int wbytes, uint8_t buf[64]) {
+static void avx_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes,
+                       uint8_t buf[64]) {
     memset(buf, 0, 64);
     if (I->is_mem) {
         uint64_t a = avx_ea(state, c, I, rip_after, wbytes);
@@ -169,8 +168,8 @@ static void avx_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn
     }
 }
 
-static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after,
-                       int wbytes, const uint8_t buf[64]) {
+static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t rip_after, int wbytes,
+                       const uint8_t buf[64]) {
     if (I->is_mem) {
         uint64_t a = avx_ea(state, c, I, rip_after, wbytes);
         memcpy((void *)a, buf, (size_t)wbytes);
@@ -193,12 +192,21 @@ static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn
 // input keeps that input's sign on both ISAs, so only the generated case (result NaN AND neither input
 // NaN) is fixed up here. Matches the legacy-SSE inline fixup (translate.c emit_dnan_pre/post).
 // NaN classification (exponent all-ones, mantissa nonzero; QNaN = mantissa MSB set).
-static int nan32(uint32_t u) { return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0; }
-static int qnan32(uint32_t u) { return nan32(u) && (u & 0x00400000u) != 0; }
+static int nan32(uint32_t u) {
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
+}
+
+static int qnan32(uint32_t u) {
+    return nan32(u) && (u & 0x00400000u) != 0;
+}
+
 static int nan64(uint64_t u) {
     return (u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull) != 0;
 }
-static int qnan64(uint64_t u) { return nan64(u) && (u & 0x0008000000000000ull) != 0; }
+
+static int qnan64(uint64_t u) {
+    return nan64(u) && (u & 0x0008000000000000ull) != 0;
+}
 
 // x86 add/sub/mul/div result NaN handling. Two distinct rules, both of which the host NEON FADD/FMUL/FSUB/
 // FDIV that computed `r` gets WRONG, so we recompute from the operands here:
@@ -290,22 +298,22 @@ static double avx_fp_arith_f64(int op, double x, double y) {
 // comparator serves both widths; the 16..31 signaling variants yield the same boolean as 0..15.
 static int avx_cmp_pred(double x, double y, int pred) {
     switch (pred & 0xf) {
-    case 0: return x == y;                          // EQ_OQ
-    case 1: return x < y;                           // LT_OS
-    case 2: return x <= y;                          // LE_OS
-    case 3: return !(x == x) || !(y == y);          // UNORD_Q
-    case 4: return !(x == y);                       // NEQ_UQ
-    case 5: return !(x < y);                        // NLT_US
-    case 6: return !(x <= y);                       // NLE_US
-    case 7: return (x == x) && (y == y);            // ORD_Q
+    case 0: return x == y;                             // EQ_OQ
+    case 1: return x < y;                              // LT_OS
+    case 2: return x <= y;                             // LE_OS
+    case 3: return !(x == x) || !(y == y);             // UNORD_Q
+    case 4: return !(x == y);                          // NEQ_UQ
+    case 5: return !(x < y);                           // NLT_US
+    case 6: return !(x <= y);                          // NLE_US
+    case 7: return (x == x) && (y == y);               // ORD_Q
     case 8: return (x == y) || !(x == x) || !(y == y); // EQ_UQ
-    case 9: return !(x >= y);                       // NGE_US
-    case 10: return !(x > y);                       // NGT_US
-    case 11: return 0;                              // FALSE_OQ
-    case 12: return (x < y) || (x > y);             // NEQ_OQ
-    case 13: return x >= y;                         // GE_OS
-    case 14: return x > y;                          // GT_OS
-    default: return 1;                              // TRUE_UQ
+    case 9: return !(x >= y);                          // NGE_US
+    case 10: return !(x > y);                          // NGT_US
+    case 11: return 0;                                 // FALSE_OQ
+    case 12: return (x < y) || (x > y);                // NEQ_OQ
+    case 13: return x >= y;                            // GE_OS
+    case 14: return x > y;                             // GT_OS
+    default: return 1;                                 // TRUE_UQ
     }
 }
 
@@ -319,6 +327,7 @@ static int avx_cmp_pred(double x, double y, int pred) {
 // silence the -Wpedantic noise narrowly rather than dropping the type.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
+
 static uint16_t avx_f32_to_f16(float f, int imm) {
     _Float16 h;
     uint16_t o;
@@ -342,6 +351,7 @@ static float avx_f16_to_f32(uint16_t bits) {
     memcpy(&h, &bits, 2);
     return (float)h;
 }
+
 #pragma GCC diagnostic pop
 
 static double sse_round_d(double x, int mode, int use_mxcsr);
@@ -485,8 +495,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 // dst[127:es] = src1(vvvv), dst[255:128] = 0.
                 int es = (pp == 2) ? 4 : 8;
                 uint8_t t[64];
-                avx_get(c, vv, d);   // src1 (vvvv) provides [127:es]
-                avx_get(c, rd, t);   // reg operand provides the low element
+                avx_get(c, vv, d); // src1 (vvvv) provides [127:es]
+                avx_get(c, rd, t); // reg operand provides the low element
                 memcpy(d, t, (size_t)es);
                 avx_put(c, I.rm_reg, d, 16);
             } else {
@@ -952,8 +962,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(y, b + lane, 16);
                     if (op == 0xD0) { // addsub: even lanes subtract, odd lanes add
                         for (int i = 0; i < 4; i++)
-                            o[i] = (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i])
-                                           : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
+                            o[i] =
+                                (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i]) : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
                     } else { // hadd/hsub
                         o[0] = sub ? avx_dnan_f32(x[0] - x[1], x[0], x[1]) : avx_dnan_f32(x[0] + x[1], x[0], x[1]);
                         o[1] = sub ? avx_dnan_f32(x[2] - x[3], x[2], x[3]) : avx_dnan_f32(x[2] + x[3], x[2], x[3]);
@@ -1118,9 +1128,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0xF1:
         case 0xF2:
         case 0xF3: { // vpsllw/d/q (logical left)
-            int es = (op == 0xD1 || op == 0xE1 || op == 0xF1)   ? 2
-                     : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4
-                                                                : 8;
+            int es = (op == 0xD1 || op == 0xE1 || op == 0xF1) ? 2 : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4 : 8;
             int arith = (op == 0xE1 || op == 0xE2);
             int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
             avx_get(c, vv, a);
@@ -1310,14 +1318,15 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     if (!(f == f) || f >= 2147483648.0f || f < -2147483648.0f)
                         r = (int32_t)0x80000000; // integer indefinite
                     else
-                        r = (int32_t)(pp == 2 ? __builtin_truncf(f) : __builtin_rintf(f)); // F3(pp==2)=truncate, 66(pp==1)=round
+                        r = (int32_t)(pp == 2 ? __builtin_truncf(f)
+                                              : __builtin_rintf(f)); // F3(pp==2)=truncate, 66(pp==1)=round
                     memcpy(d + i, &r, 4);
                 }
             }
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0xE6: { // vcvttpd2dq(66)/vcvtdq2pd(F3)/vcvtpd2dq(F2): packed double<->int32
+        case 0xE6: {       // vcvttpd2dq(66)/vcvtdq2pd(F3)/vcvtpd2dq(F2): packed double<->int32
             if (pp == 2) { // F3 cvtdq2pd: W/2 bytes int32 -> W bytes double
                 avx_get_rm(state, c, &I, next, W / 2, b);
                 int n = W / 8;
@@ -1413,11 +1422,11 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x01: // vphaddw    per-128-lane horizontal add/sub of adjacent pairs; src1=vvvv, src2=rm.
-        case 0x02: // vphaddd    (03/07 saturate the 16-bit results)
-        case 0x03: // vphaddsw
-        case 0x05: // vphsubw
-        case 0x06: // vphsubd
+        case 0x01:   // vphaddw    per-128-lane horizontal add/sub of adjacent pairs; src1=vvvv, src2=rm.
+        case 0x02:   // vphaddd    (03/07 saturate the 16-bit results)
+        case 0x03:   // vphaddsw
+        case 0x05:   // vphsubw
+        case 0x06:   // vphsubd
         case 0x07: { // vphsubsw
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, W, b);
@@ -1557,8 +1566,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x38:   // vpminsb/vpmaxsb (byte), vpminsd/vpmaxsd (dword),
-        case 0x39:   // vpminuw/vpmaxuw (word), vpminud/vpmaxud (dword) -- src1=vvvv, src2=rm
+        case 0x38: // vpminsb/vpmaxsb (byte), vpminsd/vpmaxsd (dword),
+        case 0x39: // vpminuw/vpmaxuw (word), vpminud/vpmaxud (dword) -- src1=vvvv, src2=rm
         case 0x3A:
         case 0x3B:
         case 0x3C:
@@ -1618,9 +1627,9 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, (uint8_t *)o, 16);
             goto done;
         }
-        case 0x0E:   // vtestps: like vptest but tests only the per-dword sign bits
-        case 0x0F:   // vtestpd: per-qword sign bits
-        case 0x17: { // vptest: ZF=(op1 & op2)==0, CF=(op2 & ~op1)==0 over the full width; op1=reg, op2=rm
+        case 0x0E:             // vtestps: like vptest but tests only the per-dword sign bits
+        case 0x0F:             // vtestpd: per-qword sign bits
+        case 0x17: {           // vptest: ZF=(op1 & op2)==0, CF=(op2 & ~op1)==0 over the full width; op1=reg, op2=rm
             avx_get(c, rd, a); // op1 (ModRM.reg); VPTEST/VTEST take no vvvv
             avx_get_rm(state, c, &I, next, W, b);
             uint64_t zacc = 0, cacc = 0;
@@ -1670,8 +1679,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x1A:   // vbroadcastf128: m128 -> both 128-bit lanes of ymm (256-bit only)
-        case 0x5A: { // vbroadcasti128: same m128 -> both lanes broadcast
+        case 0x1A:                                 // vbroadcastf128: m128 -> both 128-bit lanes of ymm (256-bit only)
+        case 0x5A: {                               // vbroadcasti128: same m128 -> both lanes broadcast
             avx_get_rm(state, c, &I, next, 16, b); // low m128 source
             memcpy(d, b, 16);
             memcpy(d + 16, b, 16);
@@ -1725,11 +1734,11 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, 16);
             goto done;
         }
-        case 0xDC:   // vaesenc     dst = MixColumns(SubBytes(ShiftRows(src1))) ^ src2(key)
-        case 0xDD:   // vaesenclast dst = SubBytes(ShiftRows(src1)) ^ key (no MixColumns)
-        case 0xDE:   // vaesdec     inverse round with MixColumns
-        case 0xDF: { // vaesdeclast inverse round, no InvMixColumns
-            avx_get(c, vv, a);                     // src1 (state)
+        case 0xDC:             // vaesenc     dst = MixColumns(SubBytes(ShiftRows(src1))) ^ src2(key)
+        case 0xDD:             // vaesenclast dst = SubBytes(ShiftRows(src1)) ^ key (no MixColumns)
+        case 0xDE:             // vaesdec     inverse round with MixColumns
+        case 0xDF: {           // vaesdeclast inverse round, no InvMixColumns
+            avx_get(c, vv, a); // src1 (state)
             avx_get_rm(state, c, &I, next, 16, b); // src2 (round key)
             uint8_t t[16];
             int dec = (op == 0xDE || op == 0xDF);
@@ -1821,9 +1830,9 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x90: // vpgatherd{d,q}: 32-bit (dword) indices
-        case 0x92: // vgatherd{ps,pd}: 32-bit indices (same addressing; element bits are float)
-        case 0x91: // vpgatherq{d,q}: 64-bit (qword) indices
+        case 0x90:   // vpgatherd{d,q}: 32-bit (dword) indices
+        case 0x92:   // vgatherd{ps,pd}: 32-bit indices (same addressing; element bits are float)
+        case 0x91:   // vpgatherq{d,q}: 64-bit (qword) indices
         case 0x93: { // vgatherq{ps,pd}: 64-bit indices
             // AVX2 masked gather. VSIB: index is a VECTOR register (I.m_index) scaled by 1<<m_scale off a
             // GPR base+disp. Mask = VEX.vvvv; per element the top bit selects "load", and the WHOLE mask
@@ -2014,8 +2023,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res =
-                        fma_dnan_f32(__builtin_fmaf((float)sneg_mul * x, y, (float)sneg_add * z), x, y, z);
+                    float res = fma_dnan_f32(__builtin_fmaf((float)sneg_mul * x, y, (float)sneg_add * z), x, y, z);
                     memcpy(d + i, &res, 4);
                 }
             }
@@ -2244,8 +2252,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             avx_put(c, rd, d, W);
             goto done;
         }
-        case 0x4A: // vblendvps (dword)
-        case 0x4B: // vblendvpd (qword)
+        case 0x4A:   // vblendvps (dword)
+        case 0x4B:   // vblendvpd (qword)
         case 0x4C: { // vpblendvb (byte): mask register = is4 imm[7:4]; element taken from rm if mask top bit set
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, W, b);
@@ -2512,8 +2520,7 @@ static inline int sat_u16(int v) {
 }
 
 // Read the 16-byte r/m operand (xmm register or m128) of a legacy SSE insn.
-static void sse_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t next,
-                       uint8_t buf[16]) {
+static void sse_get_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn *I, uint64_t next, uint8_t buf[16]) {
     if (I->is_mem)
         memcpy(buf, (void *)avx_ea(state, c, I, next, 16), 16);
     else
@@ -3130,7 +3137,10 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
             uint16_t best = w[0];
             int idx = 0;
             for (int i = 1; i < 8; i++)
-                if (w[i] < best) { best = w[i]; idx = i; }
+                if (w[i] < best) {
+                    best = w[i];
+                    idx = i;
+                }
             uint16_t o[8] = {best, (uint16_t)idx, 0, 0, 0, 0, 0, 0};
             memcpy(r, o, 16);
             break;

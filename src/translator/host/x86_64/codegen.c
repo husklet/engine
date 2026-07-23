@@ -33,8 +33,8 @@ static hl_status hl_x86_64_emit_binary(hl_code_buffer *output, uint8_t opcode, u
     if (status != HL_STATUS_OK) return status;
     status = hl_x86_64_emit_byte(output, opcode);
     if (status != HL_STATUS_OK) return status;
-    modrm = (uint8_t)(UINT8_C(0xc0) | (uint8_t)((uint8_t)(source & UINT8_C(7)) << 3) |
-                      (uint8_t)(destination & UINT8_C(7)));
+    modrm =
+        (uint8_t)(UINT8_C(0xc0) | (uint8_t)((uint8_t)(source & UINT8_C(7)) << 3) | (uint8_t)(destination & UINT8_C(7)));
     return hl_x86_64_emit_byte(output, modrm);
 }
 

@@ -14,8 +14,8 @@
 //
 // ===== H11 (KNOWN GAP, NOT fixed here): x87 stack is 64-bit double, not 80-bit extended ==========
 // The architectural x87 register file is 80-bit extended precision (64-bit explicit mantissa, 15-bit
-// exponent). This engine carries ST(0..7) as IEEE-754 binary64 in cpu->st[] (see hl_x86_x87_load/hl_x86_x87_store here and
-// hl_x86_x87_load_ext80/hl_x86_x87_store_ext80_pop in x87state.c). Precisely what that loses:
+// exponent). This engine carries ST(0..7) as IEEE-754 binary64 in cpu->st[] (see hl_x86_x87_load/hl_x86_x87_store here
+// and hl_x86_x87_load_ext80/hl_x86_x87_store_ext80_pop in x87state.c). Precisely what that loses:
 //   * mantissa: 64 explicit bits -> 52 -> every D8-DF arithmetic op (fadd/fmul/fsub/fdiv/fsqrt/frndint/
 //     fprem/fscale/fxtract above) and every transcendental (x87_func) rounds each intermediate to 53
 //     significant bits instead of 64, so long chains of x87 math and C `long double` computations drift
@@ -44,11 +44,17 @@
 
 static struct hl_x87_stack g_fp_stack;
 
-int hl_x86_x87_optimized(void) { return 1; }
+int hl_x86_x87_optimized(void) {
+    return 1;
+}
 
-void hl_x86_x87_reset(void) { hl_x87_stack_reset(&g_fp_stack); }
+void hl_x86_x87_reset(void) {
+    hl_x87_stack_reset(&g_fp_stack);
+}
 
-void hl_x86_x87_anchor(unsigned top) { hl_x87_stack_anchor(&g_fp_stack, top); }
+void hl_x86_x87_anchor(unsigned top) {
+    hl_x87_stack_anchor(&g_fp_stack, top);
+}
 
 // &cpu->st[shadow slot i] -> xdst, single add (OFF_ST + slot*8 fits the add imm12).
 static void fp_slot_addr(int xdst, int i) {
@@ -71,7 +77,9 @@ void hl_x86_x87_drop(void) {
     hl_x87_stack_drop(&g_fp_stack);
 }
 
-int hl_x86_x87_known(void) { return hl_x87_stack_known(&g_fp_stack); }
+int hl_x86_x87_known(void) {
+    return hl_x87_stack_known(&g_fp_stack);
+}
 
 #define FP_STATIC (hl_x86_x87_optimized() && hl_x86_x87_known())
 
@@ -112,16 +120,17 @@ void hl_x86_x87_adjust_top(int delta) { // top += delta  (pop = +1)
 // ===== x87 D9 Fx remainder / scale / extract group (computed on host doubles) ===========
 // These ops have no SSE counterpart; emulate them on f64 with the same write-back-to-cpu->st[]
 // and FPSW condition-code conventions as the inline D8-DF arithmetic. Scratch: GP x16/x17/x19/x21,
-// FP v16/v17/v18 (v0..v15 are guest xmm; v16+ are free). The hl_x86_x87_load/hl_x86_x87_store/hl_x86_x87_push/hl_x86_x87_adjust_top calls
-// keep the translate-time static-top shadow consistent exactly like the surrounding ops.
+// FP v16/v17/v18 (v0..v15 are guest xmm; v16+ are free). The
+// hl_x86_x87_load/hl_x86_x87_store/hl_x86_x87_push/hl_x86_x87_adjust_top calls keep the translate-time static-top
+// shadow consistent exactly like the surrounding ops.
 
 // FPREM (round-to-zero) / FPREM1 (round-to-nearest-even): ST0 = ST0 - ST1*Q, Q = round(ST0/ST1).
 // The reduction is completed in one fused step, so C2<-0 ("reduction complete"). FPREM also publishes
 // the low three bits of |Q| (C0<-Q2, C3<-Q1, C1<-Q0); FPREM1 leaves the quotient bits cleared -- both
 // matching qemu's helper_fprem and the `do { fprem } while (C2)` loop libc wraps around fmod/remainder.
 void hl_x86_x87_remainder(int ieee) {
-    hl_x86_x87_load(18, 0);                                                   // d18 = ST0
-    hl_x86_x87_load(16, 1);                                                   // d16 = ST1
+    hl_x86_x87_load(18, 0);                                         // d18 = ST0
+    hl_x86_x87_load(16, 1);                                         // d16 = ST1
     emit32(0x1E601800u | (16 << 16) | (18 << 5) | 17);              // fdiv  d17, d18, d16
     emit32((ieee ? 0x1E644000u : 0x1E65C000u) | (17 << 5) | 17);    // frintn/frintz d17, d17  (= Q)
     emit32(0x1F408000u | (16 << 16) | (18 << 10) | (17 << 5) | 18); // fmsub d18, d17, d16, d18 (ST0-Q*ST1)
@@ -144,8 +153,8 @@ void hl_x86_x87_remainder(int ieee) {
 // FSCALE: ST0 = ST0 * 2^trunc(ST1). Build 2^n straight into the double exponent field; clamping the
 // biased exponent to [0,2047] gives +0.0 on underflow and +Inf on overflow, matching scalbn.
 void hl_x86_x87_scale(void) {
-    hl_x86_x87_load(18, 0);                         // d18 = ST0
-    hl_x86_x87_load(16, 1);                         // d16 = ST1
+    hl_x86_x87_load(18, 0);               // d18 = ST0
+    hl_x86_x87_load(16, 1);               // d16 = ST1
     emit32(0x1E780000u | (16 << 5) | 16); // fcvtzs w16, d16  (n = trunc(ST1), int32-saturating)
     e_sxt(16, 16, 4);                     // sign-extend n to 64-bit
     e_addi(16, 16, 1023, 1);              // biased exponent e = n + 1023
@@ -164,8 +173,8 @@ void hl_x86_x87_scale(void) {
 // FXTRACT: split ST0 into unbiased exponent and significand. ST0 <- significand (in [1,2) with ST0's
 // sign), then the exponent is pushed so ST1 = exponent, ST0 = significand (normal operands).
 void hl_x86_x87_extract(void) {
-    hl_x86_x87_load(16, 0);          // d16 = ST0
-    e_fmov_from_d(16, 16); // x16 = bit pattern
+    hl_x86_x87_load(16, 0); // d16 = ST0
+    e_fmov_from_d(16, 16);  // x16 = bit pattern
     e_lsr_i(17, 16, 52, 1);
     e_movconst(19, 0x7FF);
     e_rrr(A_AND, 17, 17, 19, 1, 0);       // exponent field
@@ -176,8 +185,8 @@ void hl_x86_x87_extract(void) {
     e_movconst(19, 1023ULL << 52);
     e_rrr(A_ORR, 16, 16, 19, 1, 0); // set exponent to bias -> significand in [1,2)
     e_fmov_to_d(18, 16);            // d18 = significand
-    hl_x86_x87_store(17, 0);                   // ST0 = exponent
-    hl_x86_x87_push(18);                    // push significand -> ST0 = significand, ST1 = exponent
+    hl_x86_x87_store(17, 0);        // ST0 = exponent
+    hl_x86_x87_push(18);            // push significand -> ST0 = significand, ST1 = exponent
 }
 
 // FRNDINT: round ST0 to an integral value using the CURRENT x87 rounding control (cpu->fpcw bits[11:10]).
@@ -232,15 +241,15 @@ static void fp_project_exceptions(void) {
         e_rrr(A_AND, 17, 17, 20, 0, 0);
         e_rrr(A_ORR, 21, 21, 17, 0, i); // x21 |= bit << i
     }
-    e_rrr(A_ORR, 16, 16, 21, 0, 0);  // FSW |= exceptions (sticky, bits 0..5)
-    e_ldr(17, 28, OFF_FPCW);         // w17 = FCW (bits 0..5 are the exception masks)
-    e_rrr(A_BIC, 17, 21, 17, 0, 0);  // x17 = raised & ~masked = unmasked exceptions
+    e_rrr(A_ORR, 16, 16, 21, 0, 0); // FSW |= exceptions (sticky, bits 0..5)
+    e_ldr(17, 28, OFF_FPCW);        // w17 = FCW (bits 0..5 are the exception masks)
+    e_rrr(A_BIC, 17, 21, 17, 0, 0); // x17 = raised & ~masked = unmasked exceptions
     e_movconst(20, 0x3f);
-    e_rrr(A_AND, 17, 17, 20, 0, 0);  // keep only bits 0..5
-    e_subi_s(31, 17, 0, 1);          // cmp x17, #0
-    e_cset(17, 1 /*NE*/, 1);         // x17 = (any unmasked exception)
-    e_bfi(16, 17, 7, 1, 1);          // ES (error summary, bit 7)
-    e_bfi(16, 17, 15, 1, 1);         // B  (busy, bit 15, mirrors ES)
+    e_rrr(A_AND, 17, 17, 20, 0, 0); // keep only bits 0..5
+    e_subi_s(31, 17, 0, 1);         // cmp x17, #0
+    e_cset(17, 1 /*NE*/, 1);        // x17 = (any unmasked exception)
+    e_bfi(16, 17, 7, 1, 1);         // ES (error summary, bit 7)
+    e_bfi(16, 17, 15, 1, 1);        // B  (busy, bit 15, mirrors ES)
 }
 
 // FNSTSW / FSTSW: the x87 status word reports TOP-of-stack (cpu->fptop) in bits 11-13 ORed with the

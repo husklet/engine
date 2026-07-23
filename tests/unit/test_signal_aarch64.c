@@ -64,8 +64,10 @@ int main(void) {
 
     memset(&cpu, 0, sizeof(cpu));
     memset(stack, 0xa7, sizeof(stack));
-    for (size_t index = 0; index < 31; ++index) cpu.x[index] = UINT64_C(0x1000) + index;
-    for (size_t index = 0; index < 64; ++index) cpu.v[index] = UINT64_C(0x8000) + index;
+    for (size_t index = 0; index < 31; ++index)
+        cpu.x[index] = UINT64_C(0x1000) + index;
+    for (size_t index = 0; index < 64; ++index)
+        cpu.v[index] = UINT64_C(0x8000) + index;
     cpu.sp = (uint64_t)(uintptr_t)(stack + 7000);
     cpu.pc = bias + UINT64_C(0x401234);
     cpu.nzcv = UINT64_C(0xa0000000);

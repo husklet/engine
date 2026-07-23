@@ -183,8 +183,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
         }
         if (k == 0 || k == 1) { // ROL/ROR: set only CF/OF; leave SF/ZF/PF/AF (no shift flag path)
             int rwidth = ssf ? 64 : 32;
-            if (bycl)
-                e_rot_flags_cl(16, k, rwidth);
+            if (bycl) e_rot_flags_cl(16, k, rwidth);
             // Dead-flag elision (immediate ROL/ROR, widths 32/64): CF (and OF for a 1-bit rotate) are
             // the only flags written; when the whole flag output is provably dead at every successor
             // (state->output_flags_dead) skip the CF/OF synthesis -- the value in x16 is final. This is
@@ -244,7 +243,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             e_csel(20, 24, 20, 0 /*EQ: count==0*/, 1);
             e_str(20, 28, OFF_NZCV);
             if (!state->parity_aux_dead && (k == 4 || k == 5 || k == 7)) { // shifts set PF; rotates leave it
-                e_ldr(25, 28, OFF_PF);                          // old PF (skipped when PF dead)
+                e_ldr(25, 28, OFF_PF);                                     // old PF (skipped when PF dead)
                 e_csel(23, 25, 16, 0, 1); // EQ (count==0) -> keep old PF, else result low byte (x16)
                 e_pf_save(23);
             }

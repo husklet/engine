@@ -138,8 +138,8 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     boot_time_seconds = hl_linux_boot_time();
     if (boot_time_seconds != 0) {
         info->start_time_seconds = boot_time_seconds + fields[22] / (uint64_t)ticks;
-        info->start_time_ns = boot_time_seconds * UINT64_C(1000000000) +
-                              fields[22] * UINT64_C(1000000000) / (uint64_t)ticks;
+        info->start_time_ns =
+            boot_time_seconds * UINT64_C(1000000000) + fields[22] * UINT64_C(1000000000) / (uint64_t)ticks;
     }
     info->virtual_bytes = fields[23];
     page_size = sysconf(_SC_PAGESIZE);
@@ -169,8 +169,8 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
     target[length] = '\0';
     entry->descriptor = descriptor;
     entry->kind = hl_linux_fd_kind(target);
-    entry->flags = hl_host_process_fd_private_is(pid, process.start_time_ns, descriptor)
-                       ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+    entry->flags =
+        hl_host_process_fd_private_is(pid, process.start_time_ns, descriptor) ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
     entry->reserved = 0;
     entry->stable_device = 0;
     entry->stable_object = 0;
@@ -209,7 +209,8 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
             entries[total].descriptor = (int32_t)descriptor;
             entries[total].kind = HL_HOST_FD_OTHER;
             entries[total].flags = hl_host_process_fd_private_is(pid, process.start_time_ns, (int)descriptor)
-                                       ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE : 0;
+                                       ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE
+                                       : 0;
             entries[total].reserved = 0;
             entries[total].stable_device = 0;
             entries[total].stable_object = 0;

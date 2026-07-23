@@ -23,7 +23,6 @@
 #endif
 #endif
 
-
 enum {
     HLPR_HEADER = 32,
     HLPR_REQUEST = 3,
@@ -86,6 +85,7 @@ struct hl_provider_demux {
 };
 
 enum { HL_PROVIDER_LOCAL_PUMPS = 64 };
+
 typedef struct hl_provider_local_pump {
     hl_provider_demux *demux;
     uint64_t id;
@@ -330,8 +330,8 @@ int hl_provider_demux_create(hl_provider_demux **out, int fd, uint32_t max_paylo
         d->waiters[i].buffer = d->reply_storage + (size_t)i * max_payload;
     for (i = 0; i < max_subscriptions; ++i) {
         d->subscriptions[i].sizes = (uint32_t *)((unsigned char *)d + event_sizes_offset) + (size_t)i * event_capacity;
-        d->subscriptions[i].storage = (unsigned char *)d + event_storage_offset +
-                                      (size_t)i * event_capacity * max_event_payload;
+        d->subscriptions[i].storage =
+            (unsigned char *)d + event_storage_offset + (size_t)i * event_capacity * max_event_payload;
     }
     i = 0;
     d->descriptor = fd;
@@ -540,7 +540,8 @@ static void *local_pump_main(void *opaque) {
         wake = pump->wake;
         context = pump->context;
         pthread_mutex_unlock(&d->lock);
-        while (wake != NULL && notifications-- != 0) wake(context, pump->id);
+        while (wake != NULL && notifications-- != 0)
+            wake(context, pump->id);
     }
     return NULL;
 }
@@ -649,8 +650,7 @@ int hl_provider_demux_subscribe_remote(hl_provider_demux *d, uint64_t id, const 
     if (status != 0) return status;
     pthread_mutex_lock(&d->lock);
     for (i = 0; i < d->maximum_subscriptions; ++i)
-        if (d->subscriptions[i].active && d->subscriptions[i].id == id &&
-            d->subscriptions[i].owner != getpid()) {
+        if (d->subscriptions[i].active && d->subscriptions[i].id == id && d->subscriptions[i].owner != getpid()) {
             first = 0;
             break;
         }

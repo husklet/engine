@@ -17,8 +17,8 @@ int main(void) {
     int64_t copy;
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_linux_abi_init(&linux_abi, &services, fds, 32, ofds, 32) == HL_STATUS_OK);
-    HL_CHECK(hl_linux_pipe_create(&linux_abi, UINT32_MAX, 0, unchanged) == -HL_LINUX_EINVAL &&
-             unchanged[0] == 17 && unchanged[1] == 19);
+    HL_CHECK(hl_linux_pipe_create(&linux_abi, UINT32_MAX, 0, unchanged) == -HL_LINUX_EINVAL && unchanged[0] == 17 &&
+             unchanged[1] == 19);
     HL_CHECK(hl_linux_pipe_create(&linux_abi, HL_LINUX_O_NONBLOCK, HL_LINUX_FD_CLOEXEC, pipe) == 0);
     HL_CHECK(hl_linux_fcntl(&linux_abi, pipe[0], HL_LINUX_F_GETFD, 0) == HL_LINUX_FD_CLOEXEC);
     HL_CHECK(hl_linux_read(&linux_abi, pipe[0], bytes, sizeof bytes) == -HL_LINUX_EAGAIN);

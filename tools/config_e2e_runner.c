@@ -89,9 +89,14 @@ static int process_domain(uint64_t identity[2]) {
     if (fd < 0) return -1;
     while (offset < sizeof(uint64_t) * 2u) {
         ssize_t count = read(fd, output + offset, sizeof(uint64_t) * 2u - offset);
-        if (count > 0) offset += (size_t)count;
-        else if (count < 0 && errno == EINTR) continue;
-        else { (void)close(fd); return -1; }
+        if (count > 0)
+            offset += (size_t)count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else {
+            (void)close(fd);
+            return -1;
+        }
     }
     if (close(fd) != 0) return -1;
     return (identity[0] | identity[1]) != 0 ? 0 : -1;

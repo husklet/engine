@@ -185,8 +185,7 @@ hl_status hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn
     watch_state *state;
     hl_linux_watch_change *changes;
     size_t index, count = 0;
-    if (set == NULL || set->state == NULL || callback == NULL || out_count == NULL)
-        return HL_STATUS_INVALID_ARGUMENT;
+    if (set == NULL || set->state == NULL || callback == NULL || out_count == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *out_count = 0;
     state = set->state;
     pthread_mutex_lock(&state->lock);
@@ -199,8 +198,11 @@ hl_status hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn
         size_t position = state->queue[index];
         watch_slot *slot = &state->slots[position];
         if (!slot->queued || slot->references == 0) continue;
-        changes[count++] = (hl_linux_watch_change){watch_token(position, slot->generation), slot->device,
-                                                   slot->object, slot->size, slot->pending_size,
+        changes[count++] = (hl_linux_watch_change){watch_token(position, slot->generation),
+                                                   slot->device,
+                                                   slot->object,
+                                                   slot->size,
+                                                   slot->pending_size,
                                                    slot->pending_flags};
         slot->size = slot->pending_size;
         slot->pending_flags = 0;
@@ -208,7 +210,8 @@ hl_status hl_linux_watch_drain(hl_linux_watch_set *set, hl_linux_watch_change_fn
     }
     state->queued = 0;
     pthread_mutex_unlock(&state->lock);
-    for (index = 0; index < count; ++index) callback(opaque, &changes[index]);
+    for (index = 0; index < count; ++index)
+        callback(opaque, &changes[index]);
     free(changes);
     *out_count = count;
     return HL_STATUS_OK;
@@ -238,8 +241,8 @@ hl_status hl_linux_watch_fork_prepare(hl_linux_watch_set *set, hl_linux_watch_fo
             pthread_mutex_unlock(&state->lock);
             return HL_STATUS_RESOURCE_LIMIT;
         }
-        plan->records[plan->count++] = (hl_linux_watch_fork_record){watch_token(index, slot->generation),
-                                                                    slot->device, slot->object};
+        plan->records[plan->count++] =
+            (hl_linux_watch_fork_record){watch_token(index, slot->generation), slot->device, slot->object};
     }
     return HL_STATUS_OK;
 }
@@ -260,8 +263,8 @@ hl_status hl_linux_watch_fork_snapshot(hl_linux_watch_set *set, hl_linux_watch_f
         watch_slot *slot = &state->slots[index];
         if (slot->references == 0) continue;
         if (plan->count == plan->capacity) return HL_STATUS_RESOURCE_LIMIT;
-        plan->records[plan->count++] = (hl_linux_watch_fork_record){watch_token(index, slot->generation),
-                                                                    slot->device, slot->object};
+        plan->records[plan->count++] =
+            (hl_linux_watch_fork_record){watch_token(index, slot->generation), slot->device, slot->object};
     }
     return HL_STATUS_OK;
 }

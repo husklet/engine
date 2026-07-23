@@ -72,8 +72,8 @@ int main(void) {
                                                            HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY, 0, 0);
         HL_CHECK(root.status == HL_STATUS_OK);
         HL_CHECK(services.file->make_fifo(services.context, root.value, "probe-fifo", 10, 0600).status == HL_STATUS_OK);
-        hl_host_result fifo = services.file->open_relative(services.context, root.value, "probe-fifo", 10,
-                                                           HL_HOST_FILE_PATH_ONLY, 0, 0);
+        hl_host_result fifo =
+            services.file->open_relative(services.context, root.value, "probe-fifo", 10, HL_HOST_FILE_PATH_ONLY, 0, 0);
         HL_CHECK(fifo.status == HL_STATUS_OK);
         HL_CHECK(services.file->metadata(services.context, fifo.value, &metadata).status == HL_STATUS_OK);
         HL_CHECK(metadata.type == HL_HOST_FILE_TYPE_FIFO);

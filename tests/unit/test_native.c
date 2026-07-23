@@ -26,8 +26,7 @@ static void *persist_writer(void *opaque) {
     unsigned char payload[257];
     memset(payload, stress->value, sizeof payload);
     for (int iteration = 0; iteration < 100; iteration++)
-        if (!hl_persist_store_at(stress->directory, "cache", payload, sizeof payload))
-            atomic_store(stress->failed, 1);
+        if (!hl_persist_store_at(stress->directory, "cache", payload, sizeof payload)) atomic_store(stress->failed, 1);
     return NULL;
 }
 
@@ -97,10 +96,9 @@ int main(void) {
         const char first[] = "complete generation one";
         const char second[] = "two";
         HL_CHECK(mkdtemp(directory) != NULL);
-        hl_host_result parent = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory,
-                                                             strlen(directory), HL_HOST_FILE_READ |
-                                                                 HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW,
-                                                             0, 0);
+        hl_host_result parent =
+            services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
+                                         HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0, 0);
         HL_CHECK(parent.status == HL_STATUS_OK &&
                  services.file->validate_private_directory(services.context, parent.value).status == HL_STATUS_OK);
         HL_CHECK(services.file->close(services.context, parent.value).status == HL_STATUS_OK);
@@ -120,8 +118,7 @@ int main(void) {
         HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
         HL_CHECK(chmod(directory, 0777) == 0);
         parent = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, directory, strlen(directory),
-                                              HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0,
-                                              0);
+                                              HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_NOFOLLOW, 0, 0);
         HL_CHECK(parent.status == HL_STATUS_OK &&
                  services.file->validate_private_directory(services.context, parent.value).status ==
                      HL_STATUS_PERMISSION_DENIED);
@@ -164,7 +161,8 @@ int main(void) {
             HL_CHECK(pthread_create(&writers[index], NULL, persist_writer, &stress[index]) == 0);
         }
         HL_CHECK(pthread_create(&reader, NULL, persist_reader, &stress[0]) == 0);
-        for (int index = 0; index < 4; index++) HL_CHECK(pthread_join(writers[index], NULL) == 0);
+        for (int index = 0; index < 4; index++)
+            HL_CHECK(pthread_join(writers[index], NULL) == 0);
         HL_CHECK(pthread_join(reader, NULL) == 0);
         HL_CHECK(atomic_load(&failed) == 0);
         HL_CHECK(hl_persist_remove_at(&directory, "cache") == 1);
@@ -183,8 +181,7 @@ int main(void) {
         hl_host_event_record event = {0};
         HL_CHECK(file.status == HL_STATUS_OK && watch.status == HL_STATUS_OK && pollset.status == HL_STATUS_OK);
         HL_CHECK(services.event
-                     ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, watch.value, 909,
-                               HL_HOST_READY_READ)
+                     ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, watch.value, 909, HL_HOST_READY_READ)
                      .status == HL_STATUS_OK);
         HL_CHECK(services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){"a", 1}).value == 1);
         uint64_t deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
@@ -206,7 +203,8 @@ int main(void) {
                       : 40);
         }
         int child_status = 0;
-        HL_CHECK(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+        HL_CHECK(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+                 WEXITSTATUS(child_status) == 0);
         snprintf(moved, sizeof moved, "%s.moved", path);
         HL_CHECK(rename(path, moved) == 0);
         deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);

@@ -171,8 +171,8 @@ static hl_status epoll_subscribe(hl_linux_epoll *epoll, hl_linux_epoll_watch *wa
     hl_status status = hl_linux_object_pin_ofd(epoll->linux_abi, watch->ofd, watch->ofd_generation, &target);
     if ((status == HL_STATUS_NOT_SUPPORTED || status == HL_STATUS_NOT_FOUND) &&
         hl_provider_files_is_handle(watch->provider_handle)) {
-        if (hl_provider_files_subscribe(watch->provider_handle, watch->interests, epoll_notify, epoll,
-                                        watch->token) == 0) {
+        if (hl_provider_files_subscribe(watch->provider_handle, watch->interests, epoll_notify, epoll, watch->token) ==
+            0) {
             watch->subscribed = EPOLL_CALLBACK;
             return HL_STATUS_OK;
         }
@@ -393,9 +393,7 @@ static int64_t epoll_sample(hl_linux_epoll *epoll, hl_linux_epoll_event *events,
             break;
         }
         pthread_mutex_unlock(&epoll->lock);
-        if (ready != 0) {
-            events[delivered++] = (hl_linux_epoll_event){ready, watch->data};
-        }
+        if (ready != 0) { events[delivered++] = (hl_linux_epoll_event){ready, watch->data}; }
     }
     return (int64_t)delivered;
 }

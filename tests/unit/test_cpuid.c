@@ -32,8 +32,7 @@ int main(void) {
     HL_CHECK((cpu.r[RCX] & (UINT64_C(1) << 28)) == 0); /* AVX is not advertised. */
 
     query(&cpu, 7, 0);
-    HL_CHECK((cpu.r[RBX] & ((UINT64_C(1) << 3) | (UINT64_C(1) << 8) | (UINT64_C(1) << 9) |
-                            (UINT64_C(1) << 29))) != 0);
+    HL_CHECK((cpu.r[RBX] & ((UINT64_C(1) << 3) | (UINT64_C(1) << 8) | (UINT64_C(1) << 9) | (UINT64_C(1) << 29))) != 0);
     HL_CHECK(cpu.r[RDX] == (UINT64_C(1) << 4));
     query(&cpu, 7, 1);
     HL_CHECK(cpu.r[RAX] == 0 && cpu.r[RBX] == 0 && cpu.r[RCX] == 0 && cpu.r[RDX] == 0);

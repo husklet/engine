@@ -62,15 +62,13 @@ int main(void) {
        pinned parent. Both temporary handles must be released on every call;
        this count exceeds the handle capacity of both host implementations. */
     for (size_t iteration = 0; iteration < 5000; ++iteration) {
-        read = services.file->open_beneath(services.context, root.value, "a/file", 6,
-                                           HL_HOST_FILE_READ, 0, 0, 0);
+        read = services.file->open_beneath(services.context, root.value, "a/file", 6, HL_HOST_FILE_READ, 0, 0, 0);
         HL_CHECK(read.status == HL_STATUS_OK);
         HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
     }
     /* PATH_ONLY is the portable Linux O_PATH contract: creation and
        truncation flags are ignored on every host. */
-    read = services.file->open_beneath(services.context, root.value, "a/path-missing", 14,
-                                       HL_HOST_FILE_PATH_ONLY,
+    read = services.file->open_beneath(services.context, root.value, "a/path-missing", 14, HL_HOST_FILE_PATH_ONLY,
                                        HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0);
     HL_CHECK(read.status == HL_STATUS_NOT_FOUND);
     {
@@ -79,8 +77,8 @@ int main(void) {
         snprintf(path_missing, sizeof(path_missing), "%s/a/path-missing", temporary);
         HL_CHECK(lstat(path_missing, &status) != 0 && errno == ENOENT);
     }
-    read = services.file->open_beneath(services.context, root.value, "a/file", 6,
-                                       HL_HOST_FILE_PATH_ONLY, HL_HOST_FILE_TRUNCATE, 0, 0);
+    read = services.file->open_beneath(services.context, root.value, "a/file", 6, HL_HOST_FILE_PATH_ONLY,
+                                       HL_HOST_FILE_TRUNCATE, 0, 0);
     HL_CHECK(read.status == HL_STATUS_OK);
     HL_CHECK(services.file->close(services.context, read.value).status == HL_STATUS_OK);
     {
@@ -115,12 +113,12 @@ int main(void) {
                  close(descriptor) == 0);
     }
     /* Absolute input and embedded NULs cannot change the root interpretation. */
-    HL_CHECK(services.file
-                 ->open_beneath(services.context, root.value, "/a/file", 7, HL_HOST_FILE_READ, 0, 0, 0)
-                 .status == HL_STATUS_INVALID_ARGUMENT);
-    HL_CHECK(services.file
-                 ->open_beneath(services.context, root.value, "a\0/file", 7, HL_HOST_FILE_READ, 0, 0, 0)
-                 .status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(
+        services.file->open_beneath(services.context, root.value, "/a/file", 7, HL_HOST_FILE_READ, 0, 0, 0).status ==
+        HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(
+        services.file->open_beneath(services.context, root.value, "a\0/file", 7, HL_HOST_FILE_READ, 0, 0, 0).status ==
+        HL_STATUS_INVALID_ARGUMENT);
     /* Parent traversal clamps at root rather than escaping it. */
     descriptor = open(escaped, O_WRONLY | O_CREAT | O_EXCL, 0600);
     HL_CHECK(descriptor >= 0 && write(descriptor, "r", 1) == 1 && close(descriptor) == 0);
@@ -143,15 +141,13 @@ int main(void) {
     /* O_CREAT|O_EXCL observes the directory entry itself: both a link whose
        target exists and a dangling link are EEXIST, and neither is followed. */
     HL_CHECK(services.file
-                 ->open_beneath(services.context, root.value, "a/fifo", 6,
-                                HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                 ->open_beneath(services.context, root.value, "a/fifo", 6, HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
                                 HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0)
                  .status == HL_STATUS_ALREADY_EXISTS);
     HL_CHECK(unlink(fifo) == 0);
     HL_CHECK(symlink("missing-target", fifo) == 0);
     HL_CHECK(services.file
-                 ->open_beneath(services.context, root.value, "a/fifo", 6,
-                                HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                 ->open_beneath(services.context, root.value, "a/fifo", 6, HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
                                 HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600, 0)
                  .status == HL_STATUS_ALREADY_EXISTS);
     HL_CHECK(services.file->close(services.context, root.value).status == HL_STATUS_OK);

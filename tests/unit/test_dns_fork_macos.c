@@ -20,7 +20,8 @@ static void resolve_localhost(void) {
 
 static void *resolver_thread(void *unused) {
     (void)unused;
-    while (atomic_load_explicit(&running, memory_order_relaxed)) resolve_localhost();
+    while (atomic_load_explicit(&running, memory_order_relaxed))
+        resolve_localhost();
     return NULL;
 }
 

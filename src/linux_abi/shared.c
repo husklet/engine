@@ -9,12 +9,12 @@ hl_status hl_linux_memory_create(const hl_host_services *host, uint64_t size, ui
     hl_host_result discarded;
     if (output == NULL) return HL_STATUS_INVALID_ARGUMENT;
     *output = NULL;
-    if (host == NULL || host->memory == NULL || host->memory->map_anonymous == NULL ||
-        host->memory->discard == NULL || host->memory->release == NULL || size == 0 || size > SIZE_MAX)
+    if (host == NULL || host->memory == NULL || host->memory->map_anonymous == NULL || host->memory->discard == NULL ||
+        host->memory->release == NULL || size == 0 || size > SIZE_MAX)
         return HL_STATUS_INVALID_ARGUMENT;
     if (flags != HL_HOST_MEMORY_SHARED && flags != HL_HOST_MEMORY_PRIVATE) return HL_STATUS_INVALID_ARGUMENT;
-    mapped = host->memory->map_anonymous(host->context, 0, size, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                         flags, &mapping);
+    mapped = host->memory->map_anonymous(host->context, 0, size, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, flags,
+                                         &mapping);
     if (mapped.status != HL_STATUS_OK || mapping.handle == HL_HOST_HANDLE_INVALID || mapping.address == 0 ||
         mapping.address > UINTPTR_MAX || mapping.mapped_size < size) {
         if (mapping.handle != HL_HOST_HANDLE_INVALID) (void)host->memory->release(host->context, mapping.handle);

@@ -718,7 +718,7 @@ static void fsgen_bind(const hl_host_services *host, const char *path) {
         !host->file->close || !host->memory->map_file || !host->memory->release)
         return;
     opened = host->file->open_relative(host->context, HL_HOST_HANDLE_CWD, path, strlen(path),
-                                      HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
+                                       HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
     if (opened.status != HL_STATUS_OK || opened.value == HL_HOST_HANDLE_INVALID) return;
     mapped = host->memory->map_file(host->context, opened.value, 0, 0, sizeof(uint32_t),
                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_SHARED, &mapping);

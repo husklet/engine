@@ -46,8 +46,7 @@ static void *churn_topology(void *opaque) {
             atomic_fetch_add_explicit(&churn->failures, 1, memory_order_relaxed);
             continue;
         }
-        if (hl_linux_close(churn->abi, fd) != 0)
-            atomic_fetch_add_explicit(&churn->failures, 1, memory_order_relaxed);
+        if (hl_linux_close(churn->abi, fd) != 0) atomic_fetch_add_explicit(&churn->failures, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&churn->operations, 1, memory_order_release);
     }
     return NULL;

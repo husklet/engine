@@ -262,9 +262,7 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
     /* Process handles store a pid in this field, not a descriptor. */
     if (descriptor >= 0 && kind != HL_LINUX_HANDLE_PROCESS) {
         int adopted = hl_host_process_fd_private_adopt(descriptor);
-        if (adopted < 0) {
-            return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
-        }
+        if (adopted < 0) { return hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0); }
         descriptor = adopted;
     }
     if (wake_descriptor >= 0 && kind != HL_LINUX_HANDLE_PROCESS) {
@@ -412,8 +410,7 @@ static hl_host_result hl_linux_memory_discard(void *context, hl_host_handle mapp
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
-static int hl_linux_memory_repair_signal_page(void *context, uint64_t address, uint64_t size,
-                                              uint32_t protection) {
+static int hl_linux_memory_repair_signal_page(void *context, uint64_t address, uint64_t size, uint32_t protection) {
     (void)context;
     if (address == 0 || address > UINTPTR_MAX || size != UINT64_C(4096) || (address & UINT64_C(4095)) != 0 ||
         (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0)
@@ -506,8 +503,8 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
 }
 
 static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requested_address, uint64_t size,
-                                                     uint32_t protection, uint32_t flags,
-                                                     hl_host_memory_mapping *output) {
+                                                    uint32_t protection, uint32_t flags,
+                                                    hl_host_memory_mapping *output) {
     hl_host_linux *host = context;
     hl_host_result registered;
     void *address;
@@ -537,8 +534,8 @@ static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requ
         return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
     }
 #endif
-    address = mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags,
-                   -1, 0);
+    address =
+        mmap((void *)(uintptr_t)requested_address, (size_t)size, hl_linux_protection(protection), native_flags, -1, 0);
     if (address == MAP_FAILED) {
         hl_host_result failure = hl_linux_errno_result();
         (void)hl_linux_memory_discard(context, registered.value);
@@ -563,8 +560,8 @@ static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requ
     hl_linux_handle_entry *owned = hl_linux_lookup_locked(host, registered.value, HL_LINUX_HANDLE_MAPPING);
     if (owned != NULL) owned->address = address;
     pthread_mutex_unlock(&host->lock);
-    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value,
-                                       (uint64_t)(uintptr_t)address, size, 0};
+    *output = (hl_host_memory_mapping){
+        HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), registered.value, (uint64_t)(uintptr_t)address, size, 0};
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -741,8 +738,7 @@ static hl_host_result hl_linux_memory_repair_code(void *context, hl_host_code_ma
     }
     inherited = *entry;
     pthread_mutex_unlock(&host->lock);
-    if (mapping->content_size > inherited.size)
-        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (mapping->content_size > inherited.size) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
 
     if (inherited.executable_address != inherited.address) {
         descriptor = memfd_create("hl-code", MFD_CLOEXEC);
@@ -1118,8 +1114,8 @@ static hl_host_result hl_linux_file_validate_private_regular(void *context, hl_h
 }
 
 static hl_host_result hl_linux_file_store_private_atomic(void *context, hl_host_handle directory, const char *path,
-                                                          size_t path_size, hl_host_const_bytes input,
-                                                          uint32_t permissions) {
+                                                         size_t path_size, hl_host_const_bytes input,
+                                                         uint32_t permissions) {
     static _Atomic uint64_t sequence;
     hl_host_linux *host = context;
     char name[PATH_MAX], temporary[PATH_MAX];
@@ -1127,7 +1123,8 @@ static hl_host_result hl_linux_file_store_private_atomic(void *context, hl_host_
     if (path == NULL || path_size == 0 || path_size >= sizeof(name) || memchr(path, '\0', path_size) != NULL ||
         (permissions & ~0777u) != 0 || (input.size != 0 && input.data == NULL))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    memcpy(name, path, path_size); name[path_size] = '\0';
+    memcpy(name, path, path_size);
+    name[path_size] = '\0';
     if (directory != HL_HOST_HANDLE_CWD) {
         pthread_mutex_lock(&host->lock);
         directory_fd = hl_linux_descriptor(host, directory, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
@@ -1140,23 +1137,40 @@ static hl_host_result hl_linux_file_store_private_atomic(void *context, hl_host_
         int count = snprintf(temporary, sizeof temporary, "%s.hl-%llx-%llx.tmp", name,
                              (unsigned long long)(uint64_t)getpid(), (unsigned long long)token);
         if (count <= 0 || (size_t)count >= sizeof temporary) break;
-        descriptor = openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                            (mode_t)permissions);
+        descriptor =
+            openat(directory_fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, (mode_t)permissions);
         if (descriptor >= 0 || errno != EEXIST) break;
     }
-    if (descriptor < 0) { if (directory_fd != AT_FDCWD) close(directory_fd); return hl_linux_errno_result(); }
+    if (descriptor < 0) {
+        if (directory_fd != AT_FDCWD) close(directory_fd);
+        return hl_linux_errno_result();
+    }
     size_t done = 0;
     int saved = 0;
     while (done < input.size) {
         ssize_t count = write(descriptor, (const uint8_t *)input.data + done, input.size - done);
-        if (count > 0) done += (size_t)count;
-        else if (count < 0 && errno == EINTR) continue;
-        else { saved = count == 0 ? EIO : errno; break; }
+        if (count > 0)
+            done += (size_t)count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else {
+            saved = count == 0 ? EIO : errno;
+            break;
+        }
     }
     int ok = done == input.size;
-    if (ok && fsync(descriptor) != 0) { ok = 0; saved = errno; }
-    if (close(descriptor) != 0 && ok) { ok = 0; saved = errno; }
-    if (ok && renameat(directory_fd, temporary, directory_fd, name) != 0) { ok = 0; saved = errno; }
+    if (ok && fsync(descriptor) != 0) {
+        ok = 0;
+        saved = errno;
+    }
+    if (close(descriptor) != 0 && ok) {
+        ok = 0;
+        saved = errno;
+    }
+    if (ok && renameat(directory_fd, temporary, directory_fd, name) != 0) {
+        ok = 0;
+        saved = errno;
+    }
     if (!ok) (void)unlinkat(directory_fd, temporary, 0);
     if (directory_fd != AT_FDCWD) close(directory_fd);
     errno = saved != 0 ? saved : EIO;
@@ -1369,7 +1383,7 @@ static hl_host_result hl_linux_file_set_permissions(void *context, hl_host_handl
 }
 
 static hl_host_result hl_linux_attachment_borrow_file_at_least(void *context, hl_host_handle file,
-                                                              uint32_t minimum_descriptor) {
+                                                               uint32_t minimum_descriptor) {
     hl_host_linux *host = context;
     int descriptor;
     int borrowed;
@@ -1700,8 +1714,7 @@ static hl_host_result hl_linux_file_unlink(void *context, hl_host_handle directo
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_host_result hl_linux_file_rmdir(void *context, hl_host_handle directory, const char *path,
-                                          size_t path_size) {
+static hl_host_result hl_linux_file_rmdir(void *context, hl_host_handle directory, const char *path, size_t path_size) {
     hl_host_linux *host = context;
     char local[PATH_MAX];
     int directory_fd;
@@ -3454,8 +3467,7 @@ static hl_host_result hl_linux_process_spawn_mode(void *context, hl_host_process
         errno = fork_error;
         return result.status == HL_STATUS_OK ? hl_linux_errno_result() : result;
     }
-    if (private_status != 0 && result.status == HL_STATUS_OK)
-        result = hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    if (private_status != 0 && result.status == HL_STATUS_OK) result = hl_linux_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
     if (result.status != HL_STATUS_OK) {
         if (pid > 0) {
             int status;
@@ -3562,13 +3574,10 @@ static hl_host_result hl_linux_process_terminate(void *context, hl_host_handle h
     pid = entry != NULL && !entry->process_reaped && !host->destroying ? entry->descriptor : -1;
     pthread_mutex_unlock(&host->lock);
     if (pid < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    int signal_number = reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT
-                            ? SIGINT
-                            : reason == HL_HOST_PROCESS_TERMINATE_FORCE
-                                  ? SIGKILL
-                                  : (int)(reason - HL_HOST_PROCESS_TERMINATE_SIGNAL);
-    if (kill(pid, signal_number) != 0)
-        return hl_linux_errno_result();
+    int signal_number = reason == HL_HOST_PROCESS_TERMINATE_INTERRUPT ? SIGINT
+                        : reason == HL_HOST_PROCESS_TERMINATE_FORCE   ? SIGKILL
+                                                                    : (int)(reason - HL_HOST_PROCESS_TERMINATE_SIGNAL);
+    if (kill(pid, signal_number) != 0) return hl_linux_errno_result();
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
@@ -3670,18 +3679,18 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_reserve_code, hl_linux_memory_repair_code,
                                                    hl_linux_memory_code_write,   hl_linux_memory_code_write,
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
-                                                   hl_linux_memory_unmap_range, hl_linux_memory_map_anonymous,
-                                                   hl_linux_memory_discard,     hl_linux_memory_repair_signal_page};
+                                                   hl_linux_memory_unmap_range,  hl_linux_memory_map_anonymous,
+                                                   hl_linux_memory_discard,      hl_linux_memory_repair_signal_page};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
-                                                  .size = sizeof(clock),
-                                                  .monotonic_ns = hl_linux_monotonic,
-                                                  .realtime_ns = hl_linux_realtime,
-                                                  .raw_monotonic_ns = hl_linux_raw_monotonic,
-                                                  .process_cpu_ns = hl_linux_process_cpu,
-                                                  .thread_cpu_ns = hl_linux_thread_cpu,
-                                                  .sleep_until = hl_linux_clock_sleep_until,
-                                                  .architectural_counter_hz = hl_linux_architectural_counter,
-                                                  .backoff_ns = hl_linux_backoff};
+                                                 .size = sizeof(clock),
+                                                 .monotonic_ns = hl_linux_monotonic,
+                                                 .realtime_ns = hl_linux_realtime,
+                                                 .raw_monotonic_ns = hl_linux_raw_monotonic,
+                                                 .process_cpu_ns = hl_linux_process_cpu,
+                                                 .thread_cpu_ns = hl_linux_thread_cpu,
+                                                 .sleep_until = hl_linux_clock_sleep_until,
+                                                 .architectural_counter_hz = hl_linux_architectural_counter,
+                                                 .backoff_ns = hl_linux_backoff};
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_linux_log};
     static const hl_host_file_services file = {HL_HOST_FILE_ABI,
                                                sizeof(file),
@@ -3745,8 +3754,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
         hl_linux_counter_unsubscribe, hl_linux_counter_close,
     };
     static const hl_host_transfer_services transfer = {
-        HL_HOST_TRANSFER_ABI,      sizeof(transfer),          hl_linux_transfer_channel_pair,
-        hl_linux_transfer_send,    hl_linux_transfer_receive, hl_linux_transfer_duplicate,
+        HL_HOST_TRANSFER_ABI,    sizeof(transfer),          hl_linux_transfer_channel_pair,
+        hl_linux_transfer_send,  hl_linux_transfer_receive, hl_linux_transfer_duplicate,
         hl_linux_transfer_close,
     };
     static const hl_host_directory_services directory = {
@@ -3762,8 +3771,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_stream_readiness, hl_linux_stream_move};
     static const hl_host_posix_attachment_services posix_attachment = {
         HL_HOST_POSIX_ATTACHMENT_ABI, sizeof(posix_attachment), hl_linux_attachment_borrow_file,
-        hl_linux_attachment_borrow_file_at_least,
-        hl_linux_attachment_release};
+        hl_linux_attachment_borrow_file_at_least, hl_linux_attachment_release};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};

@@ -64,26 +64,26 @@ void hl_x86_signal_build(struct cpu *c, int sig, const hl_x86_signal_state *stat
                         : (base != c->r[4])                           ? 1 /*SS_ONSTACK*/
                                                                       : 0;
     for (size_t i = 0; i < 16; i++)
-        *(uint64_t *)(mc + i * 8) = c->r[GREG2R[i]];      // gregs[0..15]
-    *(uint64_t *)(mc + 16 * 8) = c->rip;                  // gregs[16] = RIP
+        *(uint64_t *)(mc + i * 8) = c->r[GREG2R[i]]; // gregs[0..15]
+    *(uint64_t *)(mc + 16 * 8) = c->rip;             // gregs[16] = RIP
     *(uint64_t *)(mc + 17 * 8) = hl_x86_signal_nzcv_to_eflags(c->nzcv) | ((c->df & 1) << 10);
-    *(uint64_t *)(uc + 296) = c->sigmask;                 // uc_sigmask (restored on sigreturn)
-    memcpy((void *)xs, c->v, sizeof c->v);                // preserve guest xmm across the handler
+    *(uint64_t *)(uc + 296) = c->sigmask;  // uc_sigmask (restored on sigreturn)
+    memcpy((void *)xs, c->v, sizeof c->v); // preserve guest xmm across the handler
     // Preserve the EXTENDED vector + x87 state too: the xmm area above holds only the low 128 bits, so a
     // handler that touches YMM/ZMM upper lanes or the x87 stack would otherwise leave the interrupted state
     // corrupted on sigreturn (proven: an AVX handler zeroed the interrupted ymm UPPER lanes). Stash it in the
     // frame's free tail, just past the 256-byte xmm area (well below the handler's rsp = sp-8, so untouched).
-    uint64_t xe = xs + sizeof c->v;                       // extended-state save area, inside the 2048B frame
-    memcpy((void *)(xe + 0), c->vhi, sizeof c->vhi);      // ymm/zmm bits[128:256) of regs 0..15
-    memcpy((void *)(xe + 256), c->kreg, sizeof c->kreg);  // AVX-512 opmask k0..k7
-    memcpy((void *)(xe + 320), c->st, sizeof c->st);      // x87 register stack (double model)
+    uint64_t xe = xs + sizeof c->v;                      // extended-state save area, inside the 2048B frame
+    memcpy((void *)(xe + 0), c->vhi, sizeof c->vhi);     // ymm/zmm bits[128:256) of regs 0..15
+    memcpy((void *)(xe + 256), c->kreg, sizeof c->kreg); // AVX-512 opmask k0..k7
+    memcpy((void *)(xe + 320), c->st, sizeof c->st);     // x87 register stack (double model)
     *(uint64_t *)(xe + 384) = c->fptop;
     *(uint64_t *)(xe + 392) = c->fpsw;
     *(uint64_t *)(xe + 400) = c->fpcw;
-    *(int *)(info + 0) = sig;                             // siginfo.si_signo
-    *(int *)(info + 8) = *state->code;                     // si_code (SI_QUEUE for sigqueue, else 0)
-    *(uint64_t *)(info + 16) = *state->address;            // si_addr (synchronous fault address; 0 for async)
-    *(uint64_t *)(info + 24) = *state->value;              // si_value
+    *(int *)(info + 0) = sig;                   // siginfo.si_signo
+    *(int *)(info + 8) = *state->code;          // si_code (SI_QUEUE for sigqueue, else 0)
+    *(uint64_t *)(info + 16) = *state->address; // si_addr (synchronous fault address; 0 for async)
+    *(uint64_t *)(info + 24) = *state->value;   // si_value
     // SA_SIGINFO sender identity for a kill/tgkill signal: _kill/_rt union overlays si_addr@16 -> si_pid@16,
     // si_uid@20 (async kill has si_addr==0, so this fills those 8 bytes).
     if (*state->pid) {
@@ -134,8 +134,7 @@ void hl_x86_signal_restore(struct cpu *c) {
 // host x0..x15 and xmm0..15 in host v0..v15, with cpu pinned in host x28. Reconstruct the guest GPR/xmm
 // state from the host fault context (the deferred-flag NZCV is left as last spilled). block_return
 // (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
-int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache_contains,
-                          void *callback_context) {
+int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache_contains, void *callback_context) {
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
     if (!cache_contains(callback_context, hpc)) return 0; // host PC outside the code cache -> a genuine engine fault
@@ -143,7 +142,7 @@ int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache
     __uint128_t *V = HL_HOST_UC_VREGS(uc);
     if (V == NULL) return 0;
     for (int i = 0; i < 16; i++)
-        c->r[i] = X[i];                                   // rax..r15 == host x0..x15
+        c->r[i] = X[i];           // rax..r15 == host x0..x15
     memcpy(c->v, V, sizeof c->v); // xmm0..15 == host v0..v15
     return 1;
 }
@@ -174,8 +173,8 @@ int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t result = (uint64_t)(int64_t)(-EFAULT);
     memcpy(HL_HOST_UC_REGS(uc), &result, sizeof(result)); // guest rax = -EFAULT
-    HL_HOST_UC_PC(uc) = c->fastclk_resume;                  // resume at the in-block EFAULT tail
-    c->fastclk_resume = 0;                                       // window closed
+    HL_HOST_UC_PC(uc) = c->fastclk_resume;                // resume at the in-block EFAULT tail
+    c->fastclk_resume = 0;                                // window closed
     return 1;
 }
 
@@ -189,10 +188,10 @@ int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
 // cpu->rip already holds the architectural #DE PC set by the emitted block exit.
 int hl_x86_signal_raise_divide(struct cpu *c, const hl_x86_signal_queue *queue, int si_code) {
     if (queue->handler(queue->context, 8) <= 1) return 0; // SIG_DFL/SIG_IGN
-    queue->codes[8] = si_code;                           // FPE_INTDIV / FPE_INTOVF
-    queue->addresses[8] = c->rip;                        // si_addr = faulting instruction
-    c->sigmask &= ~(1ull << 7);             // a synchronous fault forces delivery even if SIGFPE was blocked
-    c->reason = R_BRANCH;                   // resume as a plain branch (no stale special-op handling)
+    queue->codes[8] = si_code;                            // FPE_INTDIV / FPE_INTOVF
+    queue->addresses[8] = c->rip;                         // si_addr = faulting instruction
+    c->sigmask &= ~(1ull << 7); // a synchronous fault forces delivery even if SIGFPE was blocked
+    c->reason = R_BRANCH;       // resume as a plain branch (no stale special-op handling)
     __atomic_or_fetch(queue->pending, 1ull << 8, __ATOMIC_SEQ_CST);
     return 1;
 }
@@ -209,7 +208,7 @@ int hl_x86_signal_raise_trap(struct cpu *c, const hl_x86_signal_queue *queue) {
     if (sig < 1 || sig > 64 || queue->handler(queue->context, sig) <= 1) return 0;
     queue->codes[sig] = code;
     queue->addresses[sig] = (sig == 4) ? c->rip : 0;
-    c->sigmask &= ~(1ull << (sig - 1));        // a synchronous trap forces delivery even if blocked
+    c->sigmask &= ~(1ull << (sig - 1)); // a synchronous trap forces delivery even if blocked
     c->reason = R_BRANCH;
     __atomic_or_fetch(queue->pending, 1ull << sig, __ATOMIC_SEQ_CST);
     return 1;

@@ -26,12 +26,12 @@ int main(int argc, char **argv) {
     hl_host_result opened = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, argv[1], strlen(argv[1]),
                                                          HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
     if (opened.status != HL_STATUS_OK) goto destroy;
-    executable = (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0,
-                                        opened.value, NULL, 0};
+    executable =
+        (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0, opened.value, NULL, 0};
     hl_host_result adopted = services.file->standard_stream(services.context, STDIN_FILENO);
     if (adopted.status != HL_STATUS_OK) goto destroy;
-    binding = (hl_engine_fd_binding){HL_ENGINE_ABI, sizeof(binding), STDIN_FILENO,
-                                     HL_LINUX_O_RDWR, 0, HL_ENGINE_FD_TRANSFER, adopted.value};
+    binding = (hl_engine_fd_binding){HL_ENGINE_ABI,         sizeof(binding), STDIN_FILENO, HL_LINUX_O_RDWR, 0,
+                                     HL_ENGINE_FD_TRANSFER, adopted.value};
     config.abi = HL_ENGINE_ABI;
     config.size = sizeof(config);
     config.guest_isa = HL_GUEST_ISA_AARCH64;
@@ -42,14 +42,15 @@ int main(int argc, char **argv) {
     result.abi = HL_ENGINE_ABI;
     result.size = sizeof(result);
     run_status = hl_engine_run(engine, 1, (const char *const *)(argv + 1), &result);
-    if (run_status == HL_STATUS_OK &&
-        result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 0)
-        outcome = 0;
+    if (run_status == HL_STATUS_OK && result.kind == HL_ENGINE_EXIT_CODE && result.guest_status == 0) outcome = 0;
 destroy:
     hl_engine_destroy(engine);
     hl_host_macos_destroy(host);
 done:
-    if (saved >= 0) { (void)dup2(saved, STDIN_FILENO); close(saved); }
+    if (saved >= 0) {
+        (void)dup2(saved, STDIN_FILENO);
+        close(saved);
+    }
     if (slave >= 0) close(slave);
     if (master >= 0) close(master);
     if (outcome != 0)

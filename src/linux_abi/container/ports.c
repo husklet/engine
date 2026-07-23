@@ -43,4 +43,6 @@ int hl_linux_ports_contains(const hl_linux_ports *ports, uint16_t container) {
     return 0;
 }
 
-uint32_t hl_linux_ports_count(const hl_linux_ports *ports) { return ports != NULL ? ports->count : 0; }
+uint32_t hl_linux_ports_count(const hl_linux_ports *ports) {
+    return ports != NULL ? ports->count : 0;
+}

@@ -278,8 +278,7 @@ HL_API hl_status hl_linux_fd_snapshot_get(const hl_linux_abi *linux_abi, hl_linu
  * map_file has returned. The returned mapping owns its independent host handle.
  */
 HL_API int64_t hl_linux_map_file(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t address, uint64_t offset,
-                                uint64_t size, uint32_t protection, uint32_t flags,
-                                hl_host_file_mapping *mapping);
+                                 uint64_t size, uint32_t protection, uint32_t flags, hl_host_file_mapping *mapping);
 
 /*
  * Host-agnostic Linux file-I/O syscall semantics.

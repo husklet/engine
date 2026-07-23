@@ -31,20 +31,30 @@ static void fake_counter_notify(void *observer, uint64_t token) {
 }
 
 static hl_host_result fake_watch_open(void *context, hl_host_handle file) {
-    (void)context; (void)file;
+    (void)context;
+    (void)file;
     return (hl_host_result){HL_STATUS_OK, 0, 1, 0};
 }
+
 static hl_host_result fake_watch_query(void *context, hl_host_handle watch, hl_host_watch_record *record) {
-    (void)context; (void)watch; (void)record;
+    (void)context;
+    (void)watch;
+    (void)record;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
+
 static hl_host_result fake_watch_drain(void *context, hl_host_handle watch, hl_host_watch_record *records,
                                        size_t capacity) {
-    (void)context; (void)watch; (void)records; (void)capacity;
+    (void)context;
+    (void)watch;
+    (void)records;
+    (void)capacity;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
+
 static hl_host_result fake_watch_close(void *context, hl_host_handle watch) {
-    (void)context; (void)watch;
+    (void)context;
+    (void)watch;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
@@ -74,8 +84,8 @@ int main(void) {
     hl_host_result pollset;
     hl_host_directory_record directory_record;
     hl_host_event_record ready;
-    hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), fake_watch_open, fake_watch_query,
-                                    fake_watch_drain, fake_watch_close};
+    hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch),    fake_watch_open,
+                                    fake_watch_query,  fake_watch_drain, fake_watch_close};
 
     hl_fake_host_init(&fake, &services);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK) == HL_STATUS_OK);
@@ -109,8 +119,10 @@ int main(void) {
         HL_CHECK(hl_host_services_validate(&standalone, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
         pipe = standalone.stream->pipe_pair(standalone.context, HL_HOST_STREAM_NONBLOCK);
         HL_CHECK(pipe.status == HL_STATUS_OK);
-        HL_CHECK(standalone.stream->write(standalone.context, pipe.detail, (hl_host_const_bytes){"fake", 4}).value == 4);
-        HL_CHECK(standalone.stream->read(standalone.context, pipe.value, (hl_host_bytes){bytes, sizeof bytes}).value == 4);
+        HL_CHECK(standalone.stream->write(standalone.context, pipe.detail, (hl_host_const_bytes){"fake", 4}).value ==
+                 4);
+        HL_CHECK(standalone.stream->read(standalone.context, pipe.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 4);
         HL_CHECK(memcmp(bytes, "fake", 4) == 0);
         HL_CHECK(standalone.stream->close(standalone.context, pipe.value).status == HL_STATUS_OK);
         HL_CHECK(standalone.stream->close(standalone.context, pipe.detail).status == HL_STATUS_OK);

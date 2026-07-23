@@ -11,6 +11,7 @@
 #define HL_LINUX_FD_RESERVED UINT32_MAX
 
 static _Atomic uint32_t g_linux_ofd_token_counter;
+
 static uint64_t hl_linux_new_ofd_token(void) {
     uint64_t token = ((uint64_t)(uint32_t)getpid() << 32) |
                      (uint64_t)(atomic_fetch_add_explicit(&g_linux_ofd_token_counter, 1, memory_order_relaxed) + 1u);
@@ -18,8 +19,7 @@ static uint64_t hl_linux_new_ofd_token(void) {
 }
 
 static hl_status hl_linux_fd_get_unlocked(const hl_linux_abi *linux_abi, hl_linux_fd fd,
-                                          const hl_linux_fd_entry **fd_entry,
-                                          const hl_linux_ofd_entry **ofd_entry);
+                                          const hl_linux_fd_entry **fd_entry, const hl_linux_ofd_entry **ofd_entry);
 static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi);
 static hl_status hl_linux_ofd_finalize(hl_linux_abi *linux_abi, hl_linux_ofd_entry *ofd_entry,
                                        hl_host_handle *final_handle);
@@ -184,8 +184,8 @@ int64_t hl_linux_map_file(hl_linux_abi *linux_abi, hl_linux_fd fd, uint64_t addr
     }
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
-    result = memory->map_file(linux_abi->host->context, ofd->host_handle, address, offset, size, protection, flags,
-                              mapping);
+    result =
+        memory->map_file(linux_abi->host->context, ofd->host_handle, address, offset, size, protection, flags, mapping);
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
@@ -484,8 +484,7 @@ hl_status hl_linux_abi_fork_parent(hl_linux_abi *linux_abi, hl_linux_fork_plan *
             hl_linux_fork_record *record = &plan->records[index];
             if (record->snapshot_pin != 2 || record->ofd >= linux_abi->ofd_capacity) continue;
             hl_linux_ofd_entry *entry = &linux_abi->ofds[record->ofd];
-            if (entry->generation == record->generation)
-                (void)hl_linux_ofd_finalize_owned(linux_abi, entry);
+            if (entry->generation == record->generation) (void)hl_linux_ofd_finalize_owned(linux_abi, entry);
             record->snapshot_pin = 0;
         }
         if (completed.status != HL_STATUS_OK) status = (hl_status)completed.status;
@@ -932,8 +931,7 @@ int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entri
                 }
 #endif
                 else {
-                    entries[index].readiness =
-                        entries[index].interests & (HL_LINUX_READY_READ | HL_LINUX_READY_WRITE);
+                    entries[index].readiness = entries[index].interests & (HL_LINUX_READY_READ | HL_LINUX_READY_WRITE);
                     if (entries[index].readiness != 0) count_ready++;
                 }
             } else if (status != HL_STATUS_OK) {
@@ -1356,8 +1354,7 @@ int64_t hl_linux_read(hl_linux_abi *linux_abi, hl_linux_fd fd, void *buffer, siz
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_lock(linux_abi, ofd);
     files = hl_linux_files(linux_abi);
-    if ((ofd->status_flags & HL_LINUX_O_PATH) ||
-        (ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_WRONLY)
+    if ((ofd->status_flags & HL_LINUX_O_PATH) || (ofd->status_flags & HL_LINUX_O_ACCMODE) == HL_LINUX_O_WRONLY)
         result = -HL_LINUX_EBADF;
     else if (size != 0 && buffer == NULL)
         result = -HL_LINUX_EINVAL;
@@ -1679,14 +1676,14 @@ static int64_t hl_linux_extended_sync(hl_linux_abi *linux_abi, hl_linux_fd fd, u
     if (files == NULL)
         result = -HL_LINUX_ENOSYS;
     else if (filesystem)
-        host_result = files->sync_filesystem == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
-                                                     : files->sync_filesystem(linux_abi->host->context,
-                                                                              ofd->host_handle),
+        host_result = files->sync_filesystem == NULL
+                          ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                          : files->sync_filesystem(linux_abi->host->context, ofd->host_handle),
         result = host_result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)host_result.status);
     else
-        host_result = files->sync_range == NULL ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
-                                                : files->sync_range(linux_abi->host->context, ofd->host_handle,
-                                                                    offset, size, flags),
+        host_result = files->sync_range == NULL
+                          ? (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0}
+                          : files->sync_range(linux_abi->host->context, ofd->host_handle, offset, size, flags),
         result = host_result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)host_result.status);
     hl_linux_lock(linux_abi);
     ofd->active_operations--;

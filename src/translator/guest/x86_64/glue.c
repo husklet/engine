@@ -36,7 +36,9 @@ uint64_t g_prof_t2fold;
 uint64_t g_prof_xflag;
 uint64_t g_prof_xflag_scan;
 
-int ibtc1way(void) { return 0; }
+int ibtc1way(void) {
+    return 0;
+}
 
 uint64_t coldprof_now_ns(const hl_host_services *services) {
     hl_host_result result;
@@ -46,12 +48,22 @@ uint64_t coldprof_now_ns(const hl_host_services *services) {
     return result.status == HL_STATUS_OK ? result.value : 0;
 }
 
-int nosseopt(void) { return 0; }
+int nosseopt(void) {
+    return 0;
+}
 
-int noeaopt(void) { return 0; }
+int noeaopt(void) {
+    return 0;
+}
 
-void hl_x86_count_rep_movs(void) { g_repmovs_n++; }
+void hl_x86_count_rep_movs(void) {
+    g_repmovs_n++;
+}
 
-void hl_x86_count_rep_stos(void) { g_repstos_n++; }
+void hl_x86_count_rep_stos(void) {
+    g_repstos_n++;
+}
 
-int notier2x(void) { return g_notier2x; }
+int notier2x(void) {
+    return g_notier2x;
+}

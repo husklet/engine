@@ -50,9 +50,14 @@ static int process_domain(uint64_t identity[2]) {
     if (fd < 0) return -1;
     while (offset < sizeof(uint64_t) * 2u) {
         ssize_t count = read(fd, output + offset, sizeof(uint64_t) * 2u - offset);
-        if (count > 0) offset += (size_t)count;
-        else if (count < 0 && errno == EINTR) continue;
-        else { (void)close(fd); return -1; }
+        if (count > 0)
+            offset += (size_t)count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else {
+            (void)close(fd);
+            return -1;
+        }
     }
     if (close(fd) != 0) return -1;
     return (identity[0] | identity[1]) != 0 ? 0 : -1;
@@ -74,11 +79,18 @@ static int make_config(const char *guest, char path[64]) {
     config.pool_size = (uint32_t)(guest_size + 2);
     config.uid = -1;
     config.gid = -1;
-    if (process_domain(config.process_domain) != 0) { close(fd); unlink(path); return -1; }
+    if (process_domain(config.process_domain) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
     config.arguments_offset = 1;
     config.executable_host_offset = 1;
-    if (write_full(fd, &config, sizeof(config)) != 0 || write_full(fd, pool, config.pool_size) != 0 ||
-        close(fd) != 0) { close(fd); unlink(path); return -1; }
+    if (write_full(fd, &config, sizeof(config)) != 0 || write_full(fd, pool, config.pool_size) != 0 || close(fd) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
     return 0;
 }
 
@@ -101,8 +113,8 @@ static int run_one(const char *executable, uint32_t guest_isa, const char *guest
     hl_activation_process_destroy(process);
     if (status != HL_STATUS_OK || process_id == 0 || ready != 1 || memcmp(&result, &repeated, sizeof(result)) != 0 ||
         result.kind != HL_ENGINE_EXIT_CODE || result.guest_status != expected) {
-        fprintf(stderr, "dual backend: isa=%u status=%d kind=%u guest=%d detail=%llu\n", guest_isa,
-                status, result.kind, result.guest_status, (unsigned long long)result.detail);
+        fprintf(stderr, "dual backend: isa=%u status=%d kind=%u guest=%d detail=%llu\n", guest_isa, status, result.kind,
+                result.guest_status, (unsigned long long)result.detail);
         return 1;
     }
     return 0;
@@ -163,7 +175,10 @@ static int closed_stdio_one(const char *executable, const char *guest) {
     int waited = 0;
     if (make_config(guest, config_path) != 0) return 1;
     child = fork();
-    if (child < 0) { unlink(config_path); return 1; }
+    if (child < 0) {
+        unlink(config_path);
+        return 1;
+    }
     if (child == 0) {
         hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
         hl_status status;
@@ -208,11 +223,10 @@ int main(int argc, char **argv) {
         reject_without_launch(argv[0], argv[1], 3) || reject_without_launch(argv[0], argv[1], 4) ||
         hl_activation_spawn(argv[0], HL_GUEST_ISA_AARCH64, argv[1], NULL) != HL_STATUS_INVALID_ARGUMENT)
         return 66;
-    if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42) ||
-        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42) ||
-        run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70) ||
-        run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) || kill_one(argv[0], argv[5]) ||
-        pipe_one(argv[0], argv[6]) || closed_stdio_one(argv[0], argv[1]) || corrupt_wait_one(argv[0], argv[1]))
+    if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42) || run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42) ||
+        run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70) || run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) ||
+        kill_one(argv[0], argv[5]) || pipe_one(argv[0], argv[6]) || closed_stdio_one(argv[0], argv[1]) ||
+        corrupt_wait_one(argv[0], argv[1]))
         return 71;
     return 0;
 }

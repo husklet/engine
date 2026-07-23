@@ -25,6 +25,7 @@ static size_t descriptor_count(void) {
 
 int main(void) {
     enum { REPEATS = 20 };
+
     size_t baseline = descriptor_count();
     for (uint32_t iteration = 0; iteration < REPEATS; ++iteration) {
         hl_host_macos *host = NULL;

@@ -49,8 +49,8 @@ static hl_host_result map_shared(void *opaque, uint64_t requested, uint64_t size
     host->handle++;
     host->size = size;
     host->owned = 1;
-    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), host->handle,
-                                       (uint64_t)(uintptr_t)host->address, size, 0};
+    *output = (hl_host_memory_mapping){
+        HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), host->handle, (uint64_t)(uintptr_t)host->address, size, 0};
     if (host->fault == FAULT_MAP_OWNED) return (hl_host_result){HL_STATUS_OUT_OF_MEMORY, 0, 0, 0};
     if (host->fault == FAULT_NO_ADDRESS) output->address = 0;
     if (host->fault == FAULT_SHORT) output->mapped_size = size - 1;
@@ -61,8 +61,7 @@ static hl_host_result discard_shared(void *opaque, hl_host_handle handle) {
     shared_host *host = opaque;
     host->discard_calls++;
     assert(host->owned && handle == host->handle);
-    if (host->fault == FAULT_DISCARD || host->fault == FAULT_RELEASE)
-        return (hl_host_result){HL_STATUS_IO, 0, 0, 0};
+    if (host->fault == FAULT_DISCARD || host->fault == FAULT_RELEASE) return (hl_host_result){HL_STATUS_IO, 0, 0, 0};
     host->owned = 0;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
@@ -118,7 +117,8 @@ int main(void) {
     host.expected_flags = HL_HOST_MEMORY_SHARED;
     HL_CHECK(hl_linux_shared_create(&services, 4096, &output) == HL_STATUS_OK);
     HL_CHECK(output == host.address && !host.owned && host.discard_calls == 1 && host.release_calls == 0);
-    for (size_t index = 0; index < 4096; ++index) HL_CHECK(((unsigned char *)output)[index] == 0);
+    for (size_t index = 0; index < 4096; ++index)
+        HL_CHECK(((unsigned char *)output)[index] == 0);
     ((unsigned char *)output)[0] = 42;
     HL_CHECK(((unsigned char *)host.address)[0] == 42);
     force_cleanup(&host);

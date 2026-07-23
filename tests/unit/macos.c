@@ -79,8 +79,8 @@ typedef struct stream_read_context {
 
 static void *stream_read_thread(void *opaque) {
     stream_read_context *reader = opaque;
-    reader->result = reader->services->file->read(reader->services->context, reader->handle, reader->bytes,
-                                                   sizeof(reader->bytes));
+    reader->result =
+        reader->services->file->read(reader->services->context, reader->handle, reader->bytes, sizeof(reader->bytes));
     return NULL;
 }
 
@@ -97,8 +97,8 @@ static void *stream_writer_thread(void *opaque) {
     unsigned char record[64];
     memset(record, writer->byte, sizeof record);
     for (uint32_t index = 0; index < writer->records; ++index) {
-        hl_host_result result = writer->services->stream->write(
-            writer->services->context, writer->handle, (hl_host_const_bytes){record, sizeof record});
+        hl_host_result result = writer->services->stream->write(writer->services->context, writer->handle,
+                                                                (hl_host_const_bytes){record, sizeof record});
         if (result.status != HL_STATUS_OK || result.value != sizeof record) {
             writer->failed = 1;
             break;
@@ -160,7 +160,7 @@ int main(void) {
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     {
         hl_host_result root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, "/", 1,
-                                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
+                                                           HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
         struct stat status;
         hl_host_result borrowed;
         HL_CHECK(root.status == HL_STATUS_OK);
@@ -179,12 +179,11 @@ int main(void) {
         hl_host_file_metadata range_metadata;
         hl_host_result range_file;
         snprintf(range_path, sizeof(range_path), "/tmp/hl_file_abi14_macos_%ld", (long)getpid());
-        range_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, range_path,
-                                                  strlen(range_path), HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+        range_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, range_path, strlen(range_path),
+                                                  HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
                                                   HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE, 0600);
         HL_CHECK(range_file.status == HL_STATUS_OK && services.file->abi == HL_HOST_FILE_ABI);
-        HL_CHECK(services.file->allocate_range(services.context, range_file.value, 0, 0, 8192).status ==
-                 HL_STATUS_OK);
+        HL_CHECK(services.file->allocate_range(services.context, range_file.value, 0, 0, 8192).status == HL_STATUS_OK);
         HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
                  range_metadata.size == 8192);
         HL_CHECK(services.file->allocate_range(services.context, range_file.value, 0, 8192, 8192).status ==
@@ -192,8 +191,8 @@ int main(void) {
         HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
                  range_metadata.size == 16384 && range_metadata.allocated_size <= 16384);
         HL_CHECK(services.file->filesystem_metadata(services.context, range_file.value, &filesystem).status ==
-                     HL_STATUS_OK && filesystem.block_size > 0 && filesystem.blocks > 0 &&
-                 filesystem.blocks_free <= filesystem.blocks);
+                     HL_STATUS_OK &&
+                 filesystem.block_size > 0 && filesystem.blocks > 0 && filesystem.blocks_free <= filesystem.blocks);
         HL_CHECK(services.file->close(services.context, range_file.value).status == HL_STATUS_OK &&
                  unlink(range_path) == 0);
     }
@@ -547,8 +546,9 @@ int main(void) {
         unsigned char payload[8192];
         unsigned char *reservation;
         memset(payload, 0x5a, sizeof payload);
-        HL_CHECK(services.file->write_at(services.context, file.value, 0,
-                                         (hl_host_const_bytes){payload, sizeof payload}).value == sizeof payload);
+        HL_CHECK(
+            services.file->write_at(services.context, file.value, 0, (hl_host_const_bytes){payload, sizeof payload})
+                .value == sizeof payload);
         reservation = mmap(NULL, 32768, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         HL_CHECK(reservation != MAP_FAILED);
         memset(reservation, 0xa5, 4096);
@@ -572,8 +572,7 @@ int main(void) {
         {
             long page_value = sysconf(_SC_PAGESIZE);
             size_t host_page = page_value > 0 ? (size_t)page_value : 16384u;
-            unsigned char *occupied = mmap(NULL, host_page, PROT_READ | PROT_WRITE,
-                                           MAP_ANON | MAP_PRIVATE, -1, 0);
+            unsigned char *occupied = mmap(NULL, host_page, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
             unsigned char *vacant = mmap(NULL, host_page, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
             hl_host_file_mapping exact = {HL_HOST_FILE_MAPPING_ABI, sizeof(exact), 0, 0, 0, 0};
             hl_host_file_mapping collision = {HL_HOST_FILE_MAPPING_ABI, sizeof(collision), 0, 0, 0, 0};
@@ -601,8 +600,7 @@ int main(void) {
                  ->sync_range(services.context, file.value, 0, 0,
                               HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE | HL_HOST_FILE_SYNC_WAIT_AFTER)
                  .status == HL_STATUS_OK);
-    HL_CHECK(services.file->sync_range(services.context, file.value, 0, 0, 8).status ==
-             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.file->sync_range(services.context, file.value, 0, 0, 8).status == HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.file->sync_filesystem(services.context, file.value).status == HL_STATUS_OK);
     {
         char resolved[1024];
@@ -693,23 +691,21 @@ int main(void) {
                                    HL_HOST_READY_READ)
                          .status == HL_STATUS_OK);
             HL_CHECK(services.file->truncate(services.context, clone.value, 9).status == HL_STATUS_OK);
-            uint64_t watch_deadline =
-                services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
-            HL_CHECK(services.event
-                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
-                         .value == 1 &&
-                     notification.token == 313 && (notification.readiness & HL_HOST_READY_READ) != 0);
+            uint64_t watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
+            HL_CHECK(
+                services.event->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline).value ==
+                    1 &&
+                notification.token == 313 && (notification.readiness & HL_HOST_READY_READ) != 0);
             HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
                      changed.generation > current.generation && changed.size == 9 &&
                      (changed.changes & HL_HOST_WATCH_SIZE) != 0);
-            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).status ==
-                     HL_STATUS_WOULD_BLOCK);
-            HL_CHECK(services.file->write_at(services.context, clone.value, 0,
-                                             (hl_host_const_bytes){"q", 1}).value == 1);
+            HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).status == HL_STATUS_WOULD_BLOCK);
+            HL_CHECK(services.file->write_at(services.context, clone.value, 0, (hl_host_const_bytes){"q", 1}).value ==
+                     1);
             watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
-            HL_CHECK(services.event
-                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
-                         .value == 1);
+            HL_CHECK(
+                services.event->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline).value ==
+                1);
             HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
                      changed.size == 9 && (changed.changes & HL_HOST_WATCH_DATA) != 0);
             pid_t watch_child = fork();
@@ -728,22 +724,22 @@ int main(void) {
             (void)unlink(moved_path);
             HL_CHECK(rename(path, moved_path) == 0);
             watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
-            HL_CHECK(services.event
-                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
-                         .value == 1);
+            HL_CHECK(
+                services.event->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline).value ==
+                1);
             HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
                      (changed.changes & HL_HOST_WATCH_IDENTITY) != 0);
             HL_CHECK(rename(moved_path, path) == 0);
             watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
-            HL_CHECK(services.event
-                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
-                         .value == 1);
+            HL_CHECK(
+                services.event->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline).value ==
+                1);
             HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1);
             HL_CHECK(unlink(path) == 0);
             watch_deadline = services.clock->monotonic_ns(services.context).value + UINT64_C(1000000000);
-            HL_CHECK(services.event
-                         ->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline)
-                         .value == 1);
+            HL_CHECK(
+                services.event->wait(services.context, watched_pollset.value, &notification, 1, watch_deadline).value ==
+                1);
             HL_CHECK(services.watch->drain(services.context, watch.value, &changed, 1).value == 1 &&
                      (changed.changes & HL_HOST_WATCH_DELETED) != 0);
             int replacement = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -799,18 +795,17 @@ int main(void) {
             hl_host_result pollset = services.event->create(services.context);
             hl_host_event_record event_record = {0};
             HL_CHECK(pollset.status == HL_STATUS_OK);
-            HL_CHECK(services.event
-                         ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, pipe.value, 73,
-                                   HL_HOST_READY_READ)
-                         .status == HL_STATUS_OK);
-            HL_CHECK(services.event
-                         ->wait(services.context, pollset.value, &event_record, 1, HL_HOST_DEADLINE_INFINITE)
+            HL_CHECK(
+                services.event
+                    ->control(services.context, pollset.value, HL_HOST_EVENT_ADD, pipe.value, 73, HL_HOST_READY_READ)
+                    .status == HL_STATUS_OK);
+            HL_CHECK(services.event->wait(services.context, pollset.value, &event_record, 1, HL_HOST_DEADLINE_INFINITE)
                          .value == 1);
             HL_CHECK(event_record.token == 73 && (event_record.readiness & HL_HOST_READY_READ) != 0);
-            HL_CHECK(services.event
-                         ->control(services.context, pollset.value, HL_HOST_EVENT_DELETE, pipe.value, 73,
-                                   HL_HOST_READY_READ)
-                         .status == HL_STATUS_OK);
+            HL_CHECK(
+                services.event
+                    ->control(services.context, pollset.value, HL_HOST_EVENT_DELETE, pipe.value, 73, HL_HOST_READY_READ)
+                    .status == HL_STATUS_OK);
             HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
         }
         HL_CHECK((standalone.stream->readiness(standalone.context, pipe.value, HL_HOST_READY_READ).value &
@@ -895,7 +890,8 @@ int main(void) {
         unsigned char payload[100];
         memset(payload, 0x5a, sizeof payload);
         HL_CHECK(source.status == HL_STATUS_OK && destination.status == HL_STATUS_OK);
-        HL_CHECK(services.file->write(services.context, source.detail, payload, sizeof payload).value == sizeof payload);
+        HL_CHECK(services.file->write(services.context, source.detail, payload, sizeof payload).value ==
+                 sizeof payload);
         HL_CHECK(pthread_create(&thread, NULL, stream_read_thread, &reader) == 0);
         moved = services.stream->move(services.context, source.value, 0, destination.detail, 0, sizeof payload, 0);
         HL_CHECK(pthread_join(thread, NULL) == 0);
@@ -911,6 +907,7 @@ int main(void) {
     }
     {
         enum { RECORDS = 100, RECORD_SIZE = 64, TOTAL = 2 * RECORDS * RECORD_SIZE };
+
         hl_host_result pipe = services.stream->pipe_pair(services.context, 0);
         stream_writer_context first = {&services, pipe.detail, 'A', RECORDS, 0};
         stream_writer_context second = {&services, pipe.detail, 'B', RECORDS, 0};
@@ -921,8 +918,8 @@ int main(void) {
         HL_CHECK(pthread_create(&first_thread, NULL, stream_writer_thread, &first) == 0);
         HL_CHECK(pthread_create(&second_thread, NULL, stream_writer_thread, &second) == 0);
         while (total < sizeof received) {
-            hl_host_result result = services.stream->read(
-                services.context, pipe.value, (hl_host_bytes){received + total, sizeof received - total});
+            hl_host_result result = services.stream->read(services.context, pipe.value,
+                                                          (hl_host_bytes){received + total, sizeof received - total});
             HL_CHECK(result.status == HL_STATUS_OK && result.value != 0 && result.value <= sizeof received - total);
             total += (size_t)result.value;
         }
@@ -943,7 +940,8 @@ int main(void) {
         char retained[8] = {0};
         hl_host_result written;
         memset(fill, 0xa5, sizeof fill);
-        do written = services.file->write(services.context, destination.detail, fill, sizeof fill);
+        do
+            written = services.file->write(services.context, destination.detail, fill, sizeof fill);
         while (written.status == HL_STATUS_OK && written.value != 0);
         HL_CHECK(written.status == HL_STATUS_WOULD_BLOCK);
         HL_CHECK(services.file->write(services.context, source.detail, "retain", 6).value == 6);

@@ -20,8 +20,7 @@ static uint64_t guest_to_host(uint64_t address, uint64_t low, uint64_t high, uin
 // the generic per-element loop.
 // width-w (a-b) flags -> ARM NZCV, in the engine's borrow convention (stored C = NOT x86 CF),
 // byte-identical to what do_alu()/SUBS produces for a normal cmp of the same width.
-void hl_x86_rep_compare(struct cpu *c, uint64_t nonpie_low, uint64_t nonpie_high,
-                        uint64_t nonpie_bias) {
+void hl_x86_rep_compare(struct cpu *c, uint64_t nonpie_low, uint64_t nonpie_high, uint64_t nonpie_bias) {
     uint64_t d = c->divop;
     int w = (int)(d & 0xff);
     uint64_t stride = (uint64_t)w;
@@ -36,16 +35,16 @@ void hl_x86_rep_compare(struct cpu *c, uint64_t nonpie_low, uint64_t nonpie_high
     // not -> the low deref SIGSEGV'd (node:20 x86 `node --version`). Bias ONLY the dereferenced pointers;
     // the RSI/RDI write-back below advances the GUEST (unbiased) values. Inert for PIE/static-PIE (g_nonpie_lo
     // == 0 makes repstr_g2h the identity), so no behavior change for the common case.
-    uint64_t gsi = c->r[RSI], gdi = c->r[RDI];             // guest (unbiased) pointers for the write-back
+    uint64_t gsi = c->r[RSI], gdi = c->r[RDI]; // guest (unbiased) pointers for the write-back
     uint64_t rsi = guest_to_host(gsi, nonpie_low, nonpie_high, nonpie_bias);
     uint64_t rdi = guest_to_host(gdi, nonpie_low, nonpie_high, nonpie_bias);
-    int64_t step = df ? -(int64_t)w : (int64_t)w;          // DF=1 (std) scans high->low, DF=0 low->high
+    int64_t step = df ? -(int64_t)w : (int64_t)w; // DF=1 (std) scans high->low, DF=0 low->high
     uint64_t wmask = (w == 8) ? ~0ull : ((1ull << (8 * w)) - 1);
     uint64_t acc = c->r[RAX] & wmask; // scas accumulator (AL/AX/EAX/RAX)
     int stop_on_equal = isrepne;      // REPNE stops at first equal; REPE stops at first not-equal
     uint64_t k = 0, av = 0, bv = 0;
     if (!df && isrep && w == 1) { // ---- fast host scan (the lever; forward only) ----
-        if (!isscas) {                           // rep cmps byte  -> memcmp-style first-difference scan
+        if (!isscas) {            // rep cmps byte  -> memcmp-style first-difference scan
             const uint8_t *pa = (const uint8_t *)rsi, *pb = (const uint8_t *)rdi;
             if (!stop_on_equal) { // REPE: stop at first diff -> memcmp tests equality fast,
                 if (memcmp(pa, pb, n) == 0)
@@ -80,20 +79,18 @@ void hl_x86_rep_compare(struct cpu *c, uint64_t nonpie_low, uint64_t nonpie_high
             bv = pb[k - 1];
         }
     } else if (!df && isrep && !isscas) { // rep cmps word/dword/qword (forward)
-        if (!stop_on_equal) {                            // REPE: memcmp tests equality fast, then locate the element
+        if (!stop_on_equal) {             // REPE: memcmp tests equality fast, then locate the element
             if (memcmp((void *)rsi, (void *)rdi, n * (size_t)w) == 0)
                 k = n;
             else {
                 size_t i = 0;
-                while (hl_x86_operand_read(rsi + i * stride, w) ==
-                       hl_x86_operand_read(rdi + i * stride, w))
+                while (hl_x86_operand_read(rsi + i * stride, w) == hl_x86_operand_read(rdi + i * stride, w))
                     i++;
                 k = i + 1;
             }
         } else {
             size_t i = 0;
-            while (i < n && hl_x86_operand_read(rsi + i * stride, w) !=
-                                hl_x86_operand_read(rdi + i * stride, w))
+            while (i < n && hl_x86_operand_read(rsi + i * stride, w) != hl_x86_operand_read(rdi + i * stride, w))
                 i++;
             k = (i < n) ? i + 1 : n;
         }

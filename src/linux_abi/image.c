@@ -85,8 +85,8 @@ int hl_linux_image_read_handle(const hl_host_services *host, hl_host_handle hand
     bytes = malloc((size_t)metadata.size);
     if (bytes == NULL) return -1;
     while (offset < metadata.size) {
-        hl_host_result read = file->read_at(host->context, handle, offset,
-                                            (hl_host_bytes){bytes + offset, metadata.size - offset});
+        hl_host_result read =
+            file->read_at(host->context, handle, offset, (hl_host_bytes){bytes + offset, metadata.size - offset});
         if (read.status != HL_STATUS_OK || read.value == 0 || read.value > metadata.size - offset) {
             free(bytes);
             return -1;

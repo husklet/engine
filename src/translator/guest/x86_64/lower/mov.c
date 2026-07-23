@@ -95,7 +95,7 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
                     else
                         e_stur(w, sv, rn, off);
                 } else {
-                    emit_ea(I, next);                                     // may clobber x16
+                    emit_ea(I, next); // may clobber x16
                     emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
                     int sv = (w == 1) ? byte_val(I, I->reg, 16) : I->reg; // byte src: ah/bh/ch/dh -> bits 8-15
                     e_store(w, sv, 17);

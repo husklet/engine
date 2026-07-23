@@ -32,15 +32,14 @@ static int pipe_services(const hl_host_services *host) {
 static int64_t pipe_read(void *opaque, void *buffer, size_t size) {
     pipe_object *object = opaque;
     if (object->writing) return -HL_LINUX_EBADF;
-    return pipe_error(object->host->stream->read(object->host->context, object->stream,
-                                                 (hl_host_bytes){buffer, size}));
+    return pipe_error(object->host->stream->read(object->host->context, object->stream, (hl_host_bytes){buffer, size}));
 }
 
 static int64_t pipe_write(void *opaque, const void *buffer, size_t size) {
     pipe_object *object = opaque;
     if (!object->writing) return -HL_LINUX_EBADF;
-    return pipe_error(object->host->stream->write(object->host->context, object->stream,
-                                                  (hl_host_const_bytes){buffer, size}));
+    return pipe_error(
+        object->host->stream->write(object->host->context, object->stream, (hl_host_const_bytes){buffer, size}));
 }
 
 static int64_t pipe_status(void *opaque, hl_linux_file_status *status) {
@@ -63,8 +62,7 @@ static uint32_t pipe_readiness(void *opaque, uint32_t interests) {
     if ((interests & HL_LINUX_READY_WRITE) != 0) host_interests |= HL_HOST_READY_WRITE;
     if ((interests & HL_LINUX_READY_ERROR) != 0) host_interests |= HL_HOST_READY_ERROR;
     if ((interests & HL_LINUX_READY_HANGUP) != 0) host_interests |= HL_HOST_READY_HANGUP;
-    hl_host_result result =
-        object->host->stream->readiness(object->host->context, object->stream, host_interests);
+    hl_host_result result = object->host->stream->readiness(object->host->context, object->stream, host_interests);
     if (result.status != HL_STATUS_OK) return HL_LINUX_READY_ERROR & interests;
     if ((result.value & HL_HOST_READY_READ) != 0) ready |= HL_LINUX_READY_READ;
     if ((result.value & HL_HOST_READY_WRITE) != 0) ready |= HL_LINUX_READY_WRITE;
@@ -143,8 +141,8 @@ int64_t hl_linux_pipe_create(hl_linux_abi *linux_abi, uint32_t status_flags, uin
     if (status != HL_STATUS_OK) {
         (void)pipe_close(reader);
         (void)pipe_close(writer);
-        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE
-               : status == HL_STATUS_OUT_OF_MEMORY ? -HL_LINUX_ENOMEM
+        return status == HL_STATUS_RESOURCE_LIMIT     ? -HL_LINUX_EMFILE
+               : status == HL_STATUS_OUT_OF_MEMORY    ? -HL_LINUX_ENOMEM
                : status == HL_STATUS_INVALID_ARGUMENT ? -HL_LINUX_EINVAL
                                                       : -HL_LINUX_EIO;
     }
@@ -153,8 +151,8 @@ int64_t hl_linux_pipe_create(hl_linux_abi *linux_abi, uint32_t status_flags, uin
     if (status != HL_STATUS_OK) {
         (void)hl_linux_fd_close(linux_abi, installed[0], NULL);
         (void)pipe_close(writer);
-        return status == HL_STATUS_RESOURCE_LIMIT ? -HL_LINUX_EMFILE
-               : status == HL_STATUS_OUT_OF_MEMORY ? -HL_LINUX_ENOMEM
+        return status == HL_STATUS_RESOURCE_LIMIT     ? -HL_LINUX_EMFILE
+               : status == HL_STATUS_OUT_OF_MEMORY    ? -HL_LINUX_ENOMEM
                : status == HL_STATUS_INVALID_ARGUMENT ? -HL_LINUX_EINVAL
                                                       : -HL_LINUX_EIO;
     }

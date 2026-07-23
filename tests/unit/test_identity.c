@@ -4,11 +4,16 @@
 
 #include <string.h>
 
-typedef struct identity_fake { hl_host_file_metadata metadata; int closes; } identity_fake;
+typedef struct identity_fake {
+    hl_host_file_metadata metadata;
+    int closes;
+} identity_fake;
 
 static hl_host_result identity_open(void *context, hl_host_handle directory, const char *path, size_t size,
                                     uint32_t access, uint32_t creation, uint32_t permissions) {
-    (void)context; (void)creation; (void)permissions;
+    (void)context;
+    (void)creation;
+    (void)permissions;
     return directory == HL_HOST_HANDLE_CWD && size == 4 && memcmp(path, "/bin", 4) == 0 &&
                    access == (HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW)
                ? (hl_host_result){HL_STATUS_OK, 0, 7, 0}
@@ -40,11 +45,17 @@ int main(void) {
     const uint64_t fields[] = {3, 5, 7, 11, 13};
     identity_fake fake = {.metadata = file};
     static const hl_host_file_services file_services = {
-        .abi = HL_HOST_FILE_ABI, .size = sizeof(file_services), .open_relative = identity_open,
-        .metadata = identity_metadata, .close = identity_close,
+        .abi = HL_HOST_FILE_ABI,
+        .size = sizeof(file_services),
+        .open_relative = identity_open,
+        .metadata = identity_metadata,
+        .close = identity_close,
     };
     hl_host_services services = {
-        .abi = HL_HOST_SERVICES_ABI, .size = sizeof(services), .context = &fake, .file = &file_services,
+        .abi = HL_HOST_SERVICES_ABI,
+        .size = sizeof(services),
+        .context = &fake,
+        .file = &file_services,
     };
 
     HL_CHECK(hl_identity_name(NULL) == 0x1357ull);

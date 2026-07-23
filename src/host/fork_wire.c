@@ -73,8 +73,7 @@ int hl_fork_wire_send_descriptors(int socket, const void *buffer, size_t size, c
     char control[CMSG_SPACE(sizeof(int) * HL_FORK_WIRE_MAX_DESCRIPTORS)] = {0};
     struct msghdr message = {0};
     ssize_t result;
-    if (buffer == NULL || size == 0 || descriptor_count < 0 ||
-        descriptor_count > HL_FORK_WIRE_MAX_DESCRIPTORS ||
+    if (buffer == NULL || size == 0 || descriptor_count < 0 || descriptor_count > HL_FORK_WIRE_MAX_DESCRIPTORS ||
         (descriptor_count > 0 && descriptors == NULL)) {
         errno = EINVAL;
         return -1;
@@ -95,13 +94,11 @@ int hl_fork_wire_send_descriptors(int socket, const void *buffer, size_t size, c
         result = sendmsg(socket, &message, 0);
     } while (result < 0 && errno == EINTR);
     if (result <= 0) return -1;
-    if ((size_t)result < size)
-        return hl_fork_wire_send(socket, (const char *)buffer + result, size - (size_t)result);
+    if ((size_t)result < size) return hl_fork_wire_send(socket, (const char *)buffer + result, size - (size_t)result);
     return 0;
 }
 
-int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors,
-                                     int *descriptor_count) {
+int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors, int *descriptor_count) {
     struct iovec vector = {.iov_base = buffer, .iov_len = size};
     char control[CMSG_SPACE(sizeof(int) * HL_FORK_WIRE_MAX_DESCRIPTORS)];
     struct msghdr message = {0};
@@ -122,27 +119,27 @@ int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int 
     if ((message.msg_flags & MSG_CTRUNC) != 0) {
         /* The kernel may already have installed the rights that fit. Close every complete one visible
            in the truncated buffer before rejecting the message. */
-        for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header != NULL;
-             header = CMSG_NXTHDR(&message, header)) {
+        for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header != NULL; header = CMSG_NXTHDR(&message, header)) {
             if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
                 header->cmsg_len >= CMSG_LEN(0)) {
                 size_t bytes = header->cmsg_len - CMSG_LEN(0);
                 int *rights = (int *)CMSG_DATA(header);
-                for (size_t index = 0; index < bytes / sizeof(int); index++) (void)close(rights[index]);
+                for (size_t index = 0; index < bytes / sizeof(int); index++)
+                    (void)close(rights[index]);
             }
         }
         errno = EMSGSIZE;
         return -1;
     }
-    for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header != NULL;
-         header = CMSG_NXTHDR(&message, header)) {
+    for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header != NULL; header = CMSG_NXTHDR(&message, header)) {
         if (header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS) {
             if (header->cmsg_len < CMSG_LEN(0)) goto invalid_rights;
             size_t bytes = header->cmsg_len - CMSG_LEN(0);
             int count = (int)(bytes / sizeof(int));
             int *rights = (int *)CMSG_DATA(header);
             if (bytes % sizeof(int) != 0 || count > HL_FORK_WIRE_MAX_DESCRIPTORS - *descriptor_count) {
-                for (int index = 0; index < count; index++) (void)close(rights[index]);
+                for (int index = 0; index < count; index++)
+                    (void)close(rights[index]);
                 goto invalid_rights;
             }
             memcpy(descriptors + *descriptor_count, rights, sizeof(int) * (size_t)count);
@@ -152,7 +149,8 @@ int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int 
     return (int)result;
 
 invalid_rights:
-    while (*descriptor_count > 0) (void)close(descriptors[--*descriptor_count]);
+    while (*descriptor_count > 0)
+        (void)close(descriptors[--*descriptor_count]);
     errno = EPROTO;
     return -1;
 }

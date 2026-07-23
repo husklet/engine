@@ -18,18 +18,14 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
             ((file->abi == HL_HOST_FILE_ABI_14 || file->abi == HL_HOST_FILE_ABI_15 ||
               file->abi == HL_HOST_FILE_ABI_16) &&
              file->size >= offsetof(hl_host_file_services, set_permissions)) ||
-            (file->abi == HL_HOST_FILE_ABI_17 &&
-             file->size >= offsetof(hl_host_file_services, read_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_18 &&
-             file->size >= offsetof(hl_host_file_services, make_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_19 &&
-             file->size >= offsetof(hl_host_file_services, make_fifo)) ||
+            (file->abi == HL_HOST_FILE_ABI_17 && file->size >= offsetof(hl_host_file_services, read_directory)) ||
+            (file->abi == HL_HOST_FILE_ABI_18 && file->size >= offsetof(hl_host_file_services, make_directory)) ||
+            (file->abi == HL_HOST_FILE_ABI_19 && file->size >= offsetof(hl_host_file_services, make_fifo)) ||
             (file->abi == HL_HOST_FILE_ABI_20 &&
              file->size >= offsetof(hl_host_file_services, validate_private_regular)) ||
             (file->abi == HL_HOST_FILE_ABI_21 &&
              file->size >= offsetof(hl_host_file_services, validate_private_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_22 &&
-             file->size >= offsetof(hl_host_file_services, remove_directory)) ||
+            (file->abi == HL_HOST_FILE_ABI_22 && file->size >= offsetof(hl_host_file_services, remove_directory)) ||
             (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
 }
 
@@ -68,18 +64,16 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_POSIX_ATTACHMENT) != 0 &&
         (!hl_valid_group(services->posix_attachment, HL_HOST_POSIX_ATTACHMENT_ABI,
                          sizeof(*services->posix_attachment)) ||
-         services->posix_attachment->borrow_file == NULL ||
-         services->posix_attachment->borrow_file_at_least == NULL ||
+         services->posix_attachment->borrow_file == NULL || services->posix_attachment->borrow_file_at_least == NULL ||
          services->posix_attachment->release == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_FILE) != 0 &&
-        (!hl_valid_file_group(services->file) ||
-         services->file->open_relative == NULL || services->file->read_at == NULL || services->file->write_at == NULL ||
-         services->file->append == NULL || services->file->metadata == NULL || services->file->close == NULL ||
-         services->file->read == NULL || services->file->write == NULL || services->file->clone_for_fork == NULL ||
-         services->file->seek == NULL || services->file->rename_relative == NULL ||
-         services->file->unlink_relative == NULL || services->file->path == NULL ||
-         services->file->standard_stream == NULL || services->file->readlink == NULL ||
+        (!hl_valid_file_group(services->file) || services->file->open_relative == NULL ||
+         services->file->read_at == NULL || services->file->write_at == NULL || services->file->append == NULL ||
+         services->file->metadata == NULL || services->file->close == NULL || services->file->read == NULL ||
+         services->file->write == NULL || services->file->clone_for_fork == NULL || services->file->seek == NULL ||
+         services->file->rename_relative == NULL || services->file->unlink_relative == NULL ||
+         services->file->path == NULL || services->file->standard_stream == NULL || services->file->readlink == NULL ||
          services->file->set_owner == NULL || services->file->resolve_beneath == NULL ||
          services->file->sync_range == NULL || services->file->sync_filesystem == NULL ||
          services->file->open_beneath == NULL ||

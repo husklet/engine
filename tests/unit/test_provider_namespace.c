@@ -42,8 +42,8 @@ static void entry_v2(unsigned char **cursor, uint8_t kind, uint64_t service, con
     }
 }
 
-static void device_v3(unsigned char **cursor, uint8_t kind, uint64_t service, const char *path,
-                      uint32_t major, uint32_t minor) {
+static void device_v3(unsigned char **cursor, uint8_t kind, uint64_t service, const char *path, uint32_t major,
+                      uint32_t minor) {
     entry_v2(cursor, kind, service, path, NULL);
     put32(cursor, major);
     put32(cursor, minor);
@@ -95,8 +95,8 @@ int main(void) {
     device_v3(&cursor, HL_PROVIDER_NODE_CHARACTER, 55, "/dev/provider", 226, 128);
     HL_CHECK(hl_provider_namespace_install(&namespace, wire, (size_t)(cursor - wire), 4, 128) == 0);
     node = hl_provider_namespace_resolve(&namespace, "/dev/provider", 13);
-    HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_CHARACTER && node->service == 55 &&
-             node->major == 226 && node->minor == 128);
+    HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_CHARACTER && node->service == 55 && node->major == 226 &&
+             node->minor == 128);
     hl_provider_namespace_revoke(&namespace);
     HL_CHECK(namespace.count == 0 && namespace.generation != generation);
     return 0;

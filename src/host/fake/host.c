@@ -42,8 +42,7 @@ static hl_host_result hl_fake_release(void *context, hl_host_handle mapping) {
 
 static hl_host_result hl_fake_discard(void *context, hl_host_handle mapping) {
     hl_fake_host *fake = context;
-    if (mapping == 0 || fake->live_mappings == 0)
-        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (mapping == 0 || fake->live_mappings == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     fake->live_mappings--;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
@@ -92,9 +91,12 @@ static hl_host_result hl_fake_map_anonymous(void *context, uint64_t address, uin
     result = hl_fake_result(fake, ++fake->next_handle);
     if (result.status != HL_STATUS_OK) return result;
     fake->live_mappings++;
-    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(*output), result.value,
+    *output = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI,
+                                       sizeof(*output),
+                                       result.value,
                                        address != 0 ? address : UINT64_C(0x20000000) + result.value * UINT64_C(0x10000),
-                                       size, 0};
+                                       size,
+                                       0};
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
 }
 
@@ -334,8 +336,7 @@ static hl_host_result hl_fake_file_close(void *context, hl_host_handle file) {
 
 static hl_host_result hl_fake_file_clone(void *context, hl_host_handle file) {
     hl_fake_host *fake = context;
-    if (hl_fake_file_index(fake, file) < 0)
-        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (hl_fake_file_index(fake, file) < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     return hl_fake_file_create_owned(fake, 1);
 }
 
@@ -343,32 +344,29 @@ static hl_host_result hl_fake_file_clone(void *context, hl_host_handle file) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
-#define HL_FAKE_FILE_STUB(name, parameters) \
-    static hl_host_result name parameters { return hl_fake_file_unsupported(); }
+#define HL_FAKE_FILE_STUB(name, parameters)                                                                            \
+    static hl_host_result name parameters {                                                                            \
+        return hl_fake_file_unsupported();                                                                             \
+    }
 HL_FAKE_FILE_STUB(hl_fake_file_open_relative,
                   (void *context, hl_host_handle directory, const char *path, size_t path_size, uint32_t access,
                    uint32_t creation, uint32_t permissions))
-HL_FAKE_FILE_STUB(hl_fake_file_read_at,
-                  (void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output))
+HL_FAKE_FILE_STUB(hl_fake_file_read_at, (void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output))
 HL_FAKE_FILE_STUB(hl_fake_file_write_at,
                   (void *context, hl_host_handle file, uint64_t offset, hl_host_const_bytes input))
 HL_FAKE_FILE_STUB(hl_fake_file_append, (void *context, hl_host_handle file, hl_host_const_bytes input))
-HL_FAKE_FILE_STUB(hl_fake_file_metadata,
-                  (void *context, hl_host_handle file, hl_host_file_metadata *output))
+HL_FAKE_FILE_STUB(hl_fake_file_metadata, (void *context, hl_host_handle file, hl_host_file_metadata *output))
 HL_FAKE_FILE_STUB(hl_fake_file_read, (void *context, hl_host_handle file, void *output, uint64_t output_size))
-HL_FAKE_FILE_STUB(hl_fake_file_write,
-                  (void *context, hl_host_handle file, const void *input, uint64_t input_size))
+HL_FAKE_FILE_STUB(hl_fake_file_write, (void *context, hl_host_handle file, const void *input, uint64_t input_size))
 HL_FAKE_FILE_STUB(hl_fake_file_seek, (void *context, hl_host_handle file, int64_t offset, uint32_t whence))
 HL_FAKE_FILE_STUB(hl_fake_file_readv,
                   (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
 HL_FAKE_FILE_STUB(hl_fake_file_writev,
                   (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
 HL_FAKE_FILE_STUB(hl_fake_file_readv_at,
-                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
-                   uint64_t offset))
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count, uint64_t offset))
 HL_FAKE_FILE_STUB(hl_fake_file_writev_at,
-                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count,
-                   uint64_t offset))
+                  (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count, uint64_t offset))
 HL_FAKE_FILE_STUB(hl_fake_file_appendv,
                   (void *context, hl_host_handle file, const hl_host_iovec *vectors, uint32_t count))
 HL_FAKE_FILE_STUB(hl_fake_file_truncate, (void *context, hl_host_handle file, uint64_t size))
@@ -376,18 +374,14 @@ HL_FAKE_FILE_STUB(hl_fake_file_sync, (void *context, hl_host_handle file))
 HL_FAKE_FILE_STUB(hl_fake_file_rename,
                   (void *context, hl_host_handle old_directory, const char *old_path, size_t old_path_size,
                    hl_host_handle new_directory, const char *new_path, size_t new_path_size))
-HL_FAKE_FILE_STUB(hl_fake_file_unlink,
-                  (void *context, hl_host_handle directory, const char *path, size_t path_size))
-HL_FAKE_FILE_STUB(hl_fake_file_rmdir,
-                  (void *context, hl_host_handle directory, const char *path, size_t path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_unlink, (void *context, hl_host_handle directory, const char *path, size_t path_size))
+HL_FAKE_FILE_STUB(hl_fake_file_rmdir, (void *context, hl_host_handle directory, const char *path, size_t path_size))
 HL_FAKE_FILE_STUB(hl_fake_file_path, (void *context, hl_host_handle file, hl_host_bytes output))
 HL_FAKE_FILE_STUB(hl_fake_file_standard_stream, (void *context, uint32_t stream))
 HL_FAKE_FILE_STUB(hl_fake_file_readlink, (void *context, hl_host_handle file, hl_host_bytes output))
-HL_FAKE_FILE_STUB(hl_fake_file_set_owner,
-                  (void *context, hl_host_handle file, uint32_t uid, uint32_t gid))
-HL_FAKE_FILE_STUB(hl_fake_file_resolve,
-                  (void *context, hl_host_handle root, const char *path, size_t path_size, uint32_t policy,
-                   hl_host_file_resolution *output))
+HL_FAKE_FILE_STUB(hl_fake_file_set_owner, (void *context, hl_host_handle file, uint32_t uid, uint32_t gid))
+HL_FAKE_FILE_STUB(hl_fake_file_resolve, (void *context, hl_host_handle root, const char *path, size_t path_size,
+                                         uint32_t policy, hl_host_file_resolution *output))
 HL_FAKE_FILE_STUB(hl_fake_file_sync_range,
                   (void *context, hl_host_handle file, uint64_t offset, uint64_t size, uint32_t flags))
 HL_FAKE_FILE_STUB(hl_fake_file_open_beneath,
@@ -397,28 +391,21 @@ HL_FAKE_FILE_STUB(hl_fake_file_allocate,
                   (void *context, hl_host_handle file, uint32_t mode, uint64_t offset, uint64_t size))
 HL_FAKE_FILE_STUB(hl_fake_file_filesystem_metadata,
                   (void *context, hl_host_handle file, hl_host_filesystem_metadata *output))
-HL_FAKE_FILE_STUB(hl_fake_file_set_permissions,
-                  (void *context, hl_host_handle file, uint32_t permissions))
-HL_FAKE_FILE_STUB(hl_fake_file_set_times,
-                  (void *context, hl_host_handle file, const hl_host_file_time times[2]))
-HL_FAKE_FILE_STUB(hl_fake_file_read_directory,
-                  (void *context, hl_host_handle file, hl_host_file_entry *entries, uint32_t entry_capacity,
-                   uint32_t byte_capacity))
+HL_FAKE_FILE_STUB(hl_fake_file_set_permissions, (void *context, hl_host_handle file, uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_set_times, (void *context, hl_host_handle file, const hl_host_file_time times[2]))
+HL_FAKE_FILE_STUB(hl_fake_file_read_directory, (void *context, hl_host_handle file, hl_host_file_entry *entries,
+                                                uint32_t entry_capacity, uint32_t byte_capacity))
 HL_FAKE_FILE_STUB(hl_fake_file_make_directory,
-                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
-                   uint32_t permissions))
-HL_FAKE_FILE_STUB(hl_fake_file_make_symlink,
-                  (void *context, const char *target, size_t target_size, hl_host_handle directory,
-                   const char *path, size_t path_size))
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size, uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_make_symlink, (void *context, const char *target, size_t target_size,
+                                              hl_host_handle directory, const char *path, size_t path_size))
 HL_FAKE_FILE_STUB(hl_fake_file_make_link,
                   (void *context, hl_host_handle old_directory, const char *old_path, size_t old_path_size,
                    hl_host_handle new_directory, const char *new_path, size_t new_path_size, uint32_t flags))
 HL_FAKE_FILE_STUB(hl_fake_file_make_fifo,
-                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
-                   uint32_t permissions))
-HL_FAKE_FILE_STUB(hl_fake_file_store_private,
-                  (void *context, hl_host_handle directory, const char *path, size_t path_size,
-                   hl_host_const_bytes input, uint32_t permissions))
+                  (void *context, hl_host_handle directory, const char *path, size_t path_size, uint32_t permissions))
+HL_FAKE_FILE_STUB(hl_fake_file_store_private, (void *context, hl_host_handle directory, const char *path,
+                                               size_t path_size, hl_host_const_bytes input, uint32_t permissions))
 #undef HL_FAKE_FILE_STUB
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -963,8 +950,7 @@ static hl_host_result hl_fake_watch_drain(void *context, hl_host_handle handle, 
                                           size_t capacity) {
     hl_fake_host *fake = context;
     int index = hl_fake_watch_index(fake, handle);
-    if (index < 0 || records == NULL || capacity == 0)
-        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if (index < 0 || records == NULL || capacity == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     if (fake->watch_delivered[index] == fake->watch_records[index].generation)
         return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
     records[0] = fake->watch_records[index];
@@ -992,13 +978,11 @@ static int hl_fake_stream_index(const hl_fake_host *fake, hl_host_handle handle)
 static hl_host_result hl_fake_stream_pipe_pair(void *context, uint32_t flags) {
     hl_fake_host *fake = context;
     uint32_t first, second, object;
-    if ((flags & ~(uint32_t)HL_HOST_STREAM_NONBLOCK) != 0)
-        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    if ((flags & ~(uint32_t)HL_HOST_STREAM_NONBLOCK) != 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     for (first = 0; first < 16 && fake->stream_handles[first] != 0; ++first) {}
     for (second = first + 1; second < 16 && fake->stream_handles[second] != 0; ++second) {}
     for (object = 0; object < 8 && fake->stream_sizes[object] != 0; ++object) {}
-    if (first == 16 || second == 16 || object == 8)
-        return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
+    if (first == 16 || second == 16 || object == 8) return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
     fake->stream_handles[first] = ++fake->next_handle;
     fake->stream_handles[second] = ++fake->next_handle;
     fake->stream_objects[first] = (uint8_t)object;
@@ -1031,8 +1015,8 @@ static hl_host_result hl_fake_stream_read(void *context, hl_host_handle stream, 
     if (size == 0) {
         uint32_t peer;
         for (peer = 0; peer < 16; ++peer)
-            if (fake->stream_handles[peer] != 0 &&
-                fake->stream_objects[peer] == fake->stream_objects[index] && fake->stream_write_ends[peer])
+            if (fake->stream_handles[peer] != 0 && fake->stream_objects[peer] == fake->stream_objects[index] &&
+                fake->stream_write_ends[peer])
                 break;
         return peer == 16 ? hl_fake_result(fake, 0) : (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
     }
@@ -1053,8 +1037,8 @@ static hl_host_result hl_fake_stream_write(void *context, hl_host_handle stream,
     {
         uint32_t peer;
         for (peer = 0; peer < 16; ++peer)
-            if (fake->stream_handles[peer] != 0 &&
-                fake->stream_objects[peer] == fake->stream_objects[index] && !fake->stream_write_ends[peer])
+            if (fake->stream_handles[peer] != 0 && fake->stream_objects[peer] == fake->stream_objects[index] &&
+                !fake->stream_write_ends[peer])
                 break;
         if (peer == 16) return (hl_host_result){HL_STATUS_DISCONNECTED, 0, 0, 0};
     }
@@ -1133,8 +1117,8 @@ static hl_host_result hl_fake_stream_move(void *context, hl_host_handle source, 
     return hl_fake_result(fake, count);
 }
 
-void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object,
-                             uint64_t size, uint32_t changes) {
+void hl_fake_host_watch_emit(hl_fake_host *fake, hl_host_handle file, uint64_t device, uint64_t object, uint64_t size,
+                             uint32_t changes) {
     for (uint32_t index = 0; index < 16; ++index) {
         if (fake->watch_handles[index] == 0 || fake->watch_files[index] != file) continue;
         hl_host_watch_record *record = &fake->watch_records[index];
@@ -1240,15 +1224,15 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_discard,
                                                    hl_fake_repair_signal_page};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
-                                                  .size = sizeof(clock),
-                                                  .monotonic_ns = hl_fake_monotonic,
-                                                  .realtime_ns = hl_fake_realtime,
-                                                  .raw_monotonic_ns = hl_fake_raw_monotonic,
-                                                  .process_cpu_ns = hl_fake_process_cpu,
-                                                  .thread_cpu_ns = hl_fake_thread_cpu,
-                                                  .sleep_until = hl_fake_sleep_until,
-                                                  .architectural_counter_hz = hl_fake_architectural_counter,
-                                                  .backoff_ns = hl_fake_backoff};
+                                                 .size = sizeof(clock),
+                                                 .monotonic_ns = hl_fake_monotonic,
+                                                 .realtime_ns = hl_fake_realtime,
+                                                 .raw_monotonic_ns = hl_fake_raw_monotonic,
+                                                 .process_cpu_ns = hl_fake_process_cpu,
+                                                 .thread_cpu_ns = hl_fake_thread_cpu,
+                                                 .sleep_until = hl_fake_sleep_until,
+                                                 .architectural_counter_hz = hl_fake_architectural_counter,
+                                                 .backoff_ns = hl_fake_backoff};
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
@@ -1277,12 +1261,12 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                  hl_fake_event_close,
                                                  NULL,
                                                  NULL};
-    static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI, sizeof(watch), hl_fake_watch_open,
-                                                  hl_fake_watch_query, hl_fake_watch_drain, hl_fake_watch_close};
+    static const hl_host_watch_services watch = {HL_HOST_WATCH_ABI,   sizeof(watch),       hl_fake_watch_open,
+                                                 hl_fake_watch_query, hl_fake_watch_drain, hl_fake_watch_close};
     static const hl_host_stream_services stream = {
-        HL_HOST_STREAM_ABI, sizeof(stream), hl_fake_stream_pipe_pair, hl_fake_stream_read,
-        hl_fake_stream_write, hl_fake_stream_duplicate, hl_fake_stream_close,
-        hl_fake_stream_set_status_flags, hl_fake_stream_readiness, hl_fake_stream_move};
+        HL_HOST_STREAM_ABI,       sizeof(stream),           hl_fake_stream_pipe_pair, hl_fake_stream_read,
+        hl_fake_stream_write,     hl_fake_stream_duplicate, hl_fake_stream_close,     hl_fake_stream_set_status_flags,
+        hl_fake_stream_readiness, hl_fake_stream_move};
     static const hl_host_file_services file = {
         .abi = HL_HOST_FILE_ABI,
         .size = sizeof(file),

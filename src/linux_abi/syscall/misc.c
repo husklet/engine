@@ -32,15 +32,13 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
                 break;
             }
             memcpy(context->hostname, (const void *)(uintptr_t)address, (size_t)length);
-            context->hostname[length < (int)context->hostname_capacity ? length :
-                                                                        (int)context->hostname_capacity - 1] = 0;
+            context->hostname[length < (int)context->hostname_capacity ? length : (int)context->hostname_capacity - 1] =
+                0;
         }
         *guest_result = 0;
         break;
     }
-    case 162:
-        *guest_result = 0;
-        break;
+    case 162: *guest_result = 0; break;
     case 179: {
         char *output = (char *)(uintptr_t)address;
         uint64_t total;
@@ -55,8 +53,8 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
         // hardcoded 8 GiB disagreed with /proc/meminfo whenever the container was unconstrained, so a runtime
         // that sizes its heap off sysinfo (glibc get_phys_pages, some JVMs) and one that reads /proc/meminfo
         // saw two different machine sizes.
-        total = context->memory_limit ? context->memory_limit :
-                (context->host_memory_total ? context->host_memory_total : UINT64_C(8) << 30);
+        total = context->memory_limit ? context->memory_limit
+                                      : (context->host_memory_total ? context->host_memory_total : UINT64_C(8) << 30);
         if (context->memory_limit)
             free_memory = total > context->memory_used ? total - context->memory_used : 0;
         else
@@ -93,11 +91,8 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
         *guest_result = (int64_t)size;
         break;
     }
-    case 293:
-        *guest_result = -ENOSYS;
-        break;
-    default:
-        return 0;
+    case 293: *guest_result = -ENOSYS; break;
+    default: return 0;
     }
     return 1;
 }

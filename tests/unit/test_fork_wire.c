@@ -97,8 +97,8 @@ int main(void) {
         memcpy(CMSG_DATA(header), rights, sizeof rights);
         HL_CHECK(sendmsg(sockets[0], &ancillary, 0) == 1);
         received_count = 0;
-        HL_CHECK(hl_fork_wire_receive_descriptors(sockets[1], message, sizeof message, received,
-                                                  &received_count) == -1);
+        HL_CHECK(hl_fork_wire_receive_descriptors(sockets[1], message, sizeof message, received, &received_count) ==
+                 -1);
         HL_CHECK(received_count == 0);
         for (int index = 0; index < 9; index++) {
             HL_CHECK(close(extra[index][0]) == 0);
@@ -136,8 +136,7 @@ int main(void) {
         HL_CHECK(hl_host_fork_client_open(&client, path) == -1);
 
         HL_CHECK(hl_host_fork_client_send_launch(&client, "launch", 6) == 0);
-        HL_CHECK(hl_fork_wire_receive_descriptors(accepted, launch, sizeof launch,
-                                                  launch_descriptors,
+        HL_CHECK(hl_fork_wire_receive_descriptors(accepted, launch, sizeof launch, launch_descriptors,
                                                   &launch_descriptor_count) == 6);
         HL_CHECK(memcmp(launch, "launch", 6) == 0);
         HL_CHECK(launch_descriptor_count == 3);

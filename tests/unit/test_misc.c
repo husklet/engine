@@ -64,7 +64,8 @@ int main(void) {
         state.allow_mapping = 0;
         memset(output, 0x7b, sizeof(output));
         HL_CHECK(hl_linux_misc_dispatch(&context, 160, arguments, &result) == 1 && result == -EFAULT);
-        for (size_t index = 0; index < sizeof(output); ++index) HL_CHECK(output[index] == 0x7b);
+        for (size_t index = 0; index < sizeof(output); ++index)
+            HL_CHECK(output[index] == 0x7b);
         state.allow_mapping = 1;
     }
 
@@ -105,11 +106,13 @@ int main(void) {
         arguments[0] = (uint64_t)(uintptr_t)output;
         arguments[1] = sizeof(output);
         HL_CHECK(hl_linux_misc_dispatch(&context, 278, arguments, &result) == 1 && result == (int64_t)sizeof(output));
-        for (size_t index = 0; index < sizeof(output); ++index) HL_CHECK(output[index] == 0xa5);
+        for (size_t index = 0; index < sizeof(output); ++index)
+            HL_CHECK(output[index] == 0xa5);
         state.allow_mapping = 0;
         memset(output, 0x31, sizeof(output));
         HL_CHECK(hl_linux_misc_dispatch(&context, 278, arguments, &result) == 1 && result == -EFAULT);
-        for (size_t index = 0; index < sizeof(output); ++index) HL_CHECK(output[index] == 0x31);
+        for (size_t index = 0; index < sizeof(output); ++index)
+            HL_CHECK(output[index] == 0x31);
     }
 
     HL_CHECK(hl_linux_misc_dispatch(&context, 162, arguments, &result) == 1 && result == 0);

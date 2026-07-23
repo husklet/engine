@@ -16,7 +16,8 @@ int main(void) {
         HL_CHECK(second != NULL && count < 16);
         second++;
         second[strcspn(second, "\r\n")] = 0;
-        for (size_t index = 0; index < count; ++index) HL_CHECK(strcmp(artifact[index], second) != 0);
+        for (size_t index = 0; index < count; ++index)
+            HL_CHECK(strcmp(artifact[index], second) != 0);
         HL_CHECK(strlen(second) < sizeof artifact[count]);
         strcpy(artifact[count++], second);
     }

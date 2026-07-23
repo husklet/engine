@@ -86,8 +86,7 @@ int main(int argc, char **argv) {
         int i = 1;
         if (i < argc && strcmp(argv[i], "--") == 0) i++;
         if (i >= argc) {
-            static const char msg[] =
-                "usage: fair-worker-wrapper [--] COMMAND [ARG ...]\n";
+            static const char msg[] = "usage: fair-worker-wrapper [--] COMMAND [ARG ...]\n";
             (void)write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
             return 2;
         }

@@ -8,12 +8,8 @@ static hl_host_result monotonic(void *context) {
 }
 
 int main(void) {
-    hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
-                                    .size = sizeof clock,
-                                    .monotonic_ns = monotonic};
-    hl_host_services services = {.abi = HL_HOST_SERVICES_ABI,
-                                 .size = sizeof services,
-                                 .clock = &clock};
+    hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI, .size = sizeof clock, .monotonic_ns = monotonic};
+    hl_host_services services = {.abi = HL_HOST_SERVICES_ABI, .size = sizeof services, .clock = &clock};
 
     g_repmovs_n = 0;
     g_repstos_n = 0;

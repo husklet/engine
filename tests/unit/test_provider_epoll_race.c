@@ -24,7 +24,8 @@ static void release(ep_provider_watch *watch, uint32_t owner) {
         atomic_store(&failed, 1);
         return;
     }
-    while (atomic_load_explicit(&watch->callbacks, memory_order_acquire) != 0) sched_yield();
+    while (atomic_load_explicit(&watch->callbacks, memory_order_acquire) != 0)
+        sched_yield();
     uint32_t expected = owner;
     if (!atomic_compare_exchange_strong(&owners[index], &expected, 0)) atomic_store(&failed, 1);
     ep_provider_retire_finish(watch);
@@ -63,8 +64,8 @@ static void *mutate(void *opaque) {
             break;
         }
         uint32_t serial = atomic_fetch_add(&serials, 1) + 1;
-        ep_provider_activate(watch, (int)(owner + 10), iteration + 1, (int)(index + 50), iteration + 1,
-                             serial, 100 + index, iteration & 1 ? 1 : UINT32_C(0x80000001), 1, serial);
+        ep_provider_activate(watch, (int)(owner + 10), iteration + 1, (int)(index + 50), iteration + 1, serial,
+                             100 + index, iteration & 1 ? 1 : UINT32_C(0x80000001), 1, serial);
 
         /* Stale callback epochs must never enter a newly published record. */
         if (serial > 1 && ep_provider_callback_enter(watch, serial - 1)) {
@@ -83,9 +84,8 @@ static void *mutate(void *opaque) {
                     ep_provider_reservation_cancel(replacement);
                 } else {
                     uint32_t replacement_serial = atomic_fetch_add(&serials, 1) + 1;
-                    ep_provider_activate(replacement, (int)(owner + 10), iteration + 1,
-                                         (int)(index + 50), iteration + 1, replacement_serial,
-                                         100 + index, 4, 2, replacement_serial);
+                    ep_provider_activate(replacement, (int)(owner + 10), iteration + 1, (int)(index + 50),
+                                         iteration + 1, replacement_serial, 100 + index, 4, 2, replacement_serial);
                     release(watch, owner);
                     watch = replacement;
                 }
@@ -102,7 +102,8 @@ int main(void) {
     HL_CHECK(pthread_create(&pumps[1], NULL, callbacks, NULL) == 0);
     for (uint32_t index = 0; index < WORKERS; ++index)
         HL_CHECK(pthread_create(&workers[index], NULL, mutate, (void *)(uintptr_t)(index + 1)) == 0);
-    for (uint32_t index = 0; index < WORKERS; ++index) HL_CHECK(pthread_join(workers[index], NULL) == 0);
+    for (uint32_t index = 0; index < WORKERS; ++index)
+        HL_CHECK(pthread_join(workers[index], NULL) == 0);
     atomic_store(&stop_callbacks, 1);
     HL_CHECK(pthread_join(pumps[0], NULL) == 0 && pthread_join(pumps[1], NULL) == 0);
     HL_CHECK(!atomic_load(&failed));

@@ -52,8 +52,7 @@ int main(void) {
                                         HL_LINUX_READY_READ, UINT64_C(0x70697065)) == 0);
         HL_CHECK(hl_linux_epoll_wait(&linux_abi, (hl_linux_fd)epoll, &event, 1, 0) == 0);
         HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)writer, "e", 1) == 1);
-        HL_CHECK(hl_linux_epoll_wait(&linux_abi, (hl_linux_fd)epoll, &event, 1,
-                                     HL_HOST_DEADLINE_INFINITE) == 1);
+        HL_CHECK(hl_linux_epoll_wait(&linux_abi, (hl_linux_fd)epoll, &event, 1, HL_HOST_DEADLINE_INFINITE) == 1);
         HL_CHECK(event.data == UINT64_C(0x70697065) && (event.readiness & HL_LINUX_READY_READ) != 0);
         HL_CHECK(hl_linux_epoll_control(&linux_abi, (hl_linux_fd)epoll, HL_LINUX_EPOLL_DELETE, pipe[0], 0, 0) == 0);
         HL_CHECK(hl_linux_epoll_wait(&linux_abi, (hl_linux_fd)epoll, &event, 1, 0) == 0);

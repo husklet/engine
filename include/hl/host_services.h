@@ -219,8 +219,8 @@ typedef struct hl_host_memory_services {
      * fork-shared mappings are a freshly sized memfd, both of which the kernel guarantees to
      * read as zero. Callers (e.g. hl_linux_memory_create) rely on this instead of eagerly
      * memset()ing the whole region, which would only fault in pages that discard() then drops. */
-    hl_host_result (*map_anonymous)(void *context, uint64_t requested_address, uint64_t size,
-                                    uint32_t protection, uint32_t flags, hl_host_memory_mapping *output);
+    hl_host_result (*map_anonymous)(void *context, uint64_t requested_address, uint64_t size, uint32_t protection,
+                                    uint32_t flags, hl_host_memory_mapping *output);
     /* Retire an ownership handle without changing the process address space. */
     hl_host_result (*discard)(void *context, hl_host_handle mapping);
     /* Signal-context VM repair. This is an engine contract, not a claim that
@@ -344,6 +344,7 @@ typedef struct hl_host_file_entry {
 } hl_host_file_entry;
 
 enum { HL_HOST_FILE_IOV_MAX = 1024 };
+
 enum {
     HL_HOST_FILE_SYNC_WAIT_BEFORE = 1u << 0,
     HL_HOST_FILE_SYNC_WRITE = 1u << 1,
@@ -403,12 +404,9 @@ typedef struct hl_host_file_services {
      * opened without following a symlink. Creation therefore cannot escape root.
      */
     hl_host_result (*open_beneath)(void *context, hl_host_handle root, const char *path, size_t path_size,
-                                   uint32_t access, uint32_t creation, uint32_t permissions,
-                                   uint32_t resolve_policy);
-    hl_host_result (*allocate_range)(void *context, hl_host_handle file, uint32_t mode, uint64_t offset,
-                                     uint64_t size);
-    hl_host_result (*filesystem_metadata)(void *context, hl_host_handle file,
-                                          hl_host_filesystem_metadata *output);
+                                   uint32_t access, uint32_t creation, uint32_t permissions, uint32_t resolve_policy);
+    hl_host_result (*allocate_range)(void *context, hl_host_handle file, uint32_t mode, uint64_t offset, uint64_t size);
+    hl_host_result (*filesystem_metadata)(void *context, hl_host_handle file, hl_host_filesystem_metadata *output);
     /* Change only permission bits on an opaque file. Guest ownership virtualization is a Linux-front job. */
     hl_host_result (*set_permissions)(void *context, hl_host_handle file, uint32_t permissions);
     /* Atomically update access and modification times on the open object. */
@@ -421,16 +419,16 @@ typedef struct hl_host_file_services {
                                      uint32_t permissions);
     hl_host_result (*make_symlink)(void *context, const char *target, size_t target_size, hl_host_handle directory,
                                    const char *path, size_t path_size);
-    hl_host_result (*make_link)(void *context, hl_host_handle old_directory, const char *old_path,
-                                size_t old_path_size, hl_host_handle new_directory, const char *new_path,
-                                size_t new_path_size, uint32_t flags);
+    hl_host_result (*make_link)(void *context, hl_host_handle old_directory, const char *old_path, size_t old_path_size,
+                                hl_host_handle new_directory, const char *new_path, size_t new_path_size,
+                                uint32_t flags);
     hl_host_result (*make_fifo)(void *context, hl_host_handle directory, const char *path, size_t path_size,
                                 uint32_t permissions);
     /* Verify host-private cache input without exposing a native uid to portable layers. */
     hl_host_result (*validate_private_regular)(void *context, hl_host_handle file);
     /* Publish a complete private file through a unique temporary and atomic replacement. */
-    hl_host_result (*store_private_atomic)(void *context, hl_host_handle directory, const char *path,
-                                           size_t path_size, hl_host_const_bytes input, uint32_t permissions);
+    hl_host_result (*store_private_atomic)(void *context, hl_host_handle directory, const char *path, size_t path_size,
+                                           hl_host_const_bytes input, uint32_t permissions);
     /* Verify a pinned directory is owner-private before namespace transactions use it. */
     hl_host_result (*validate_private_directory)(void *context, hl_host_handle directory);
     /* Remove an empty directory relative to an opaque directory handle. */
@@ -657,8 +655,8 @@ typedef struct hl_host_stream_services {
     hl_host_result (*readiness)(void *context, hl_host_handle stream, uint32_t interests);
     /* Endpoint kinds come from the host handle table. File endpoints must be POSITIONED so this
      * operation never races or mutates a file OFD offset; file-to-file movement is rejected. */
-    hl_host_result (*move)(void *context, hl_host_handle source, uint64_t source_offset,
-                           hl_host_handle destination, uint64_t destination_offset, uint64_t size, uint32_t flags);
+    hl_host_result (*move)(void *context, hl_host_handle source, uint64_t source_offset, hl_host_handle destination,
+                           uint64_t destination_offset, uint64_t size, uint32_t flags);
 } hl_host_stream_services;
 
 /* Optional POSIX-host adapter for native ancillary descriptor transport. A borrow aliases the same

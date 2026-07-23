@@ -85,7 +85,8 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
         }
         (void)nanosleep(&tick, NULL);
     }
-    if (timed_out) fprintf(stderr, "%s: timed out\n", guest);
+    if (timed_out)
+        fprintf(stderr, "%s: timed out\n", guest);
     else if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_exit)
         fprintf(stderr, "%s: exit mismatch status=%d expected=%d\n", guest, status, expected_exit);
     else if (!same_file(output, golden))
@@ -141,7 +142,8 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
         int expected_exit;
         char guest[1024], golden[1024], binary[512];
         if (length == 0 || line[0] == '#') continue;
-        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) line[--length] = 0;
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = 0;
         cursor = line;
         while (count < 13) {
             fields[count++] = cursor;
@@ -234,8 +236,8 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
     }
     free(line);
     if (fclose(file) != 0) return 1;
-    printf("linux-matrix: %zu active %s cases passed; %zu require typed launch; %zu excluded or other ISA\n",
-           passed, architecture, unsupported, excluded);
+    printf("linux-matrix: %zu active %s cases passed; %zu require typed launch; %zu excluded or other ISA\n", passed,
+           architecture, unsupported, excluded);
     return passed == 0;
 }
 
@@ -244,8 +246,10 @@ int main(int argc, char **argv) {
     if (argc == 5 && strcmp(argv[1], "--suite") == 0)
         return run_suite(argv[2], argv[3], argv[4]) ? EXIT_FAILURE : EXIT_SUCCESS;
     if (argc < 5 || (argc - 2) % 3 != 0) {
-        fprintf(stderr, "usage: %s ENGINE GUEST GOLDEN EXIT [GUEST GOLDEN EXIT ...]\n"
-                        "       %s --suite ENGINE BIN_ROOT SUITE_ROOT\n", argv[0], argv[0]);
+        fprintf(stderr,
+                "usage: %s ENGINE GUEST GOLDEN EXIT [GUEST GOLDEN EXIT ...]\n"
+                "       %s --suite ENGINE BIN_ROOT SUITE_ROOT\n",
+                argv[0], argv[0]);
         return 2;
     }
     for (int index = 2; index < argc; index += 3) {

@@ -54,14 +54,14 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
     if (checkpoint_directory != NULL || restore_directory != NULL) config.box = &box;
     if (status == HL_STATUS_OK) {
         if (rootfs == NULL && argc != 0 && argv != NULL && argv[0] != NULL) {
-            hl_host_result opened = services.file->open_relative(
-                services.context, HL_HOST_HANDLE_CWD, argv[0], strlen(argv[0]),
-                HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+            hl_host_result opened =
+                services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, argv[0], strlen(argv[0]),
+                                             HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
             if (opened.status != HL_STATUS_OK)
                 status = (hl_status)opened.status;
             else {
-                executable = (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER,
-                                                    0, opened.value, NULL, 0};
+                executable = (hl_engine_executable){
+                    HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0, opened.value, NULL, 0};
                 config.executable = &executable;
             }
         }
@@ -98,8 +98,7 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
         uint32_t index;
         for (index = 0; index < binding_count; ++index)
             (void)services.file->close(services.context, bindings[index].host_handle);
-        if (config.executable != NULL)
-            (void)services.file->close(services.context, executable.host_handle);
+        if (config.executable != NULL) (void)services.file->close(services.context, executable.host_handle);
     }
     if (status == HL_STATUS_OK)
         status = hl_engine_run(engine, (int)argc, (const char *const *)(uintptr_t)argv, &result);

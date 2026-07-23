@@ -27,7 +27,8 @@ static hl_host_result result(hl_status status, uint64_t value) {
 static hl_host_result fake_open(void *context, hl_host_handle directory, const char *path, size_t path_size,
                                 uint32_t access, uint32_t creation, uint32_t permissions) {
     persist_fake *fake = context;
-    (void)creation; (void)permissions;
+    (void)creation;
+    (void)permissions;
     if (directory == HL_HOST_HANDLE_CWD && path_size == 4 && memcmp(path, "/tmp", 4) == 0 &&
         (access & HL_HOST_FILE_DIRECTORY) != 0) {
         fake->opened_parent++;
@@ -68,7 +69,11 @@ static hl_host_result fake_close(void *context, hl_host_handle file) {
 
 static hl_host_result fake_mkdir(void *context, hl_host_handle directory, const char *path, size_t path_size,
                                  uint32_t permissions) {
-    (void)context; (void)directory; (void)path; (void)path_size; (void)permissions;
+    (void)context;
+    (void)directory;
+    (void)path;
+    (void)path_size;
+    (void)permissions;
     return result(HL_STATUS_ALREADY_EXISTS, 0);
 }
 
@@ -95,20 +100,31 @@ static hl_host_result fake_store(void *context, hl_host_handle directory, const 
 }
 
 static hl_host_result fake_unlink(void *context, hl_host_handle directory, const char *path, size_t path_size) {
-    (void)context; (void)directory; (void)path; (void)path_size;
+    (void)context;
+    (void)directory;
+    (void)path;
+    (void)path_size;
     return result(HL_STATUS_OK, 0);
 }
 
 int main(void) {
     static const hl_host_file_services file_template = {
-        .abi = HL_HOST_FILE_ABI, .size = sizeof(file_template), .open_relative = fake_open, .read_at = fake_read_at,
-        .metadata = fake_metadata, .close = fake_close, .make_directory = fake_mkdir,
-        .validate_private_regular = fake_private_file, .store_private_atomic = fake_store,
-        .validate_private_directory = fake_private_directory, .unlink_relative = fake_unlink,
+        .abi = HL_HOST_FILE_ABI,
+        .size = sizeof(file_template),
+        .open_relative = fake_open,
+        .read_at = fake_read_at,
+        .metadata = fake_metadata,
+        .close = fake_close,
+        .make_directory = fake_mkdir,
+        .validate_private_regular = fake_private_file,
+        .store_private_atomic = fake_store,
+        .validate_private_directory = fake_private_directory,
+        .unlink_relative = fake_unlink,
     };
     hl_host_file_services file = file_template;
     persist_fake fake = {.input = (const unsigned char *)"cached", .input_size = 6};
-    hl_host_services services = {.abi = HL_HOST_SERVICES_ABI, .size = sizeof(services), .context = &fake, .file = &file};
+    hl_host_services services = {
+        .abi = HL_HOST_SERVICES_ABI, .size = sizeof(services), .context = &fake, .file = &file};
     void *data = NULL;
     size_t size = 0;
     hl_persist_directory directory;

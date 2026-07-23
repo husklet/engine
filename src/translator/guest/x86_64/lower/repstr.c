@@ -117,7 +117,7 @@ void hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df)
 static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df_static) {
     // emit_spill (below) clears cpu->vdirty and republishes cpu->V, and emit_reload restores host
     // v0..v15 FROM cpu->V, so this leaves cpu->V current -> no vdirty mark needed (a later syscall may slim).
-    hl_x86_emit_spill();                          // x0..x15 + xmm0..15 + flags -> cpu (membank)
+    hl_x86_emit_spill();                   // x0..x15 + xmm0..15 + flags -> cpu (membank)
     e_ldr(0, 28, R_OFF(RDI));              // x0 = dst (rdi)
     e_ldr(1, 28, R_OFF(movs ? RSI : RAX)); // x1 = src (rsi) / fill value (rax)
     e_ldr(2, 28, R_OFF(RCX));              // x2 = element count (rcx)
@@ -177,15 +177,15 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
         // so this fast path serves BOTH forward and backward. Fall back to the scalar loop only for NOREP=1,
         // `lods` (result is RAX, not a bulk move), or a segment override / 32-bit address size (the scalar
         // loop ignores both too).
-        if (I->rep && !lods && !I->seg && !I->addr32 && (w == 1 || w == 2 || w == 4 || w == 8) &&
-            state->optimize) {
+        if (I->rep && !lods && !I->seg && !I->addr32 && (w == 1 || w == 2 || w == 4 || w == 8) && state->optimize) {
             int shift = w == 1 ? 0 : w == 2 ? 1 : w == 4 ? 2 : 3;
             emit_rep_string(movs, w, shift, state->direction);
             return TX_NEXT;
         }
-        // Scalar element loop. DF stride: forward +w, backward -w. When DF is statically known (HL_X86_DIRECTION_FORWARD/HL_X86_DIRECTION_BACKWARD)
-        // use an immediate add/sub; when HL_X86_DIRECTION_DYNAMIC (block entry / after popfq) compute a runtime stride reg (x17)
-        // from cpu->df so a cross-block `std`/popfq direction is honored.
+        // Scalar element loop. DF stride: forward +w, backward -w. When DF is statically known
+        // (HL_X86_DIRECTION_FORWARD/HL_X86_DIRECTION_BACKWARD) use an immediate add/sub; when HL_X86_DIRECTION_DYNAMIC
+        // (block entry / after popfq) compute a runtime stride reg (x17) from cpu->df so a cross-block `std`/popfq
+        // direction is honored.
         int dyn = (state->direction == HL_X86_DIRECTION_DYNAMIC);
         if (dyn) {
             e_movconst(17, (uint64_t)w);         // x17 = +w
@@ -197,10 +197,10 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
     do {                                                                                                               \
         if (dyn)                                                                                                       \
             e_rrr(A_ADD, (reg), (reg), 17, 1, 0);                                                                      \
-        else if (state->direction == HL_X86_DIRECTION_BACKWARD)                                                                                       \
-            e_subi((reg), (reg), (unsigned)w, 1);                                                                                \
-        else                                                                                                          \
-            e_addi((reg), (reg), (unsigned)w, 1);                                                                                \
+        else if (state->direction == HL_X86_DIRECTION_BACKWARD)                                                        \
+            e_subi((reg), (reg), (unsigned)w, 1);                                                                      \
+        else                                                                                                           \
+            e_addi((reg), (reg), (unsigned)w, 1);                                                                      \
     } while (0)
         uint32_t *cbz = NULL, *top = NULL;
         if (I->rep) {
@@ -239,11 +239,12 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
         int isscas = (op == 0xAE || op == 0xAF);
         int isrep = (I->rep || I->repne);
         uint64_t desc = (uint64_t)w | ((uint64_t)isscas << 8) | ((uint64_t)(I->repne ? 1 : 0) << 9) |
-                        ((uint64_t)isrep << 10) | ((uint64_t)(state->direction == HL_X86_DIRECTION_BACKWARD ? 1 : 0) << 11);
+                        ((uint64_t)isrep << 10) |
+                        ((uint64_t)(state->direction == HL_X86_DIRECTION_BACKWARD ? 1 : 0) << 11);
         e_movconst(16, desc);
-        if (state->direction == HL_X86_DIRECTION_DYNAMIC) {              // DF unknown statically -> OR in the runtime direction bit
-            e_ldr(18, 28, OFF_DF);         // x18 = cpu->df (0/1)
-            e_rrr(A_ORR, 16, 16, 18, 1, 11); // desc |= df << 11
+        if (state->direction == HL_X86_DIRECTION_DYNAMIC) { // DF unknown statically -> OR in the runtime direction bit
+            e_ldr(18, 28, OFF_DF);                          // x18 = cpu->df (0/1)
+            e_rrr(A_ORR, 16, 16, 18, 1, 11);                // desc |= df << 11
         }
         e_str(16, 28, OFF_DIVOP);
         emit_exit_const(next, R_REPSTR); // spills regs+flags; do_repstr() resumes at `next`
@@ -251,8 +252,10 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
     }
     if (op == 0xFC || op == 0xFD) { // cld (FC) / std (FD): update BOTH the runtime bit and the static shadow
         e_movconst(16, (uint64_t)(op == 0xFD));
-        e_str(16, 28, OFF_DF);            // cpu->df = 0 (fwd) / 1 (bwd) -- persists across blocks
-        state->direction = (op == 0xFD) ? HL_X86_DIRECTION_BACKWARD : HL_X86_DIRECTION_FORWARD; // statically known for the rest of THIS block (fast stride)
+        e_str(16, 28, OFF_DF); // cpu->df = 0 (fwd) / 1 (bwd) -- persists across blocks
+        state->direction = (op == 0xFD)
+                               ? HL_X86_DIRECTION_BACKWARD
+                               : HL_X86_DIRECTION_FORWARD; // statically known for the rest of THIS block (fast stride)
         return TX_NEXT;
     }
     return TX_FALL;

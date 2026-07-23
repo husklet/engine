@@ -183,15 +183,14 @@ int main(int argc, char **argv) {
            options.label, host.sysname, host.release, host.machine, options.warmups, options.samples,
            (unsigned long long)(cold / 1000), (unsigned long long)(values[0] / 1000),
            (unsigned long long)(values[percentile_index(options.samples, 50)] / 1000),
-           (unsigned long long)(values[percentile_index(options.samples, 90)] / 1000),
-           (unsigned long long)(p99 / 1000),
+           (unsigned long long)(values[percentile_index(options.samples, 90)] / 1000), (unsigned long long)(p99 / 1000),
            (unsigned long long)(values[options.samples - 1] / 1000), sum / (long double)options.samples / 1000.0L,
            options.command[0]);
     if ((options.max_cold_us != 0 && cold > (uint64_t)options.max_cold_us * UINT64_C(1000)) ||
         (options.max_p99_us != 0 && p99 > (uint64_t)options.max_p99_us * UINT64_C(1000))) {
-        fprintf(stderr, "perf-runner: metric %s exceeded threshold (cold=%llu/%luus p99=%llu/%luus)\n",
-                options.label, (unsigned long long)(cold / 1000), options.max_cold_us,
-                (unsigned long long)(p99 / 1000), options.max_p99_us);
+        fprintf(stderr, "perf-runner: metric %s exceeded threshold (cold=%llu/%luus p99=%llu/%luus)\n", options.label,
+                (unsigned long long)(cold / 1000), options.max_cold_us, (unsigned long long)(p99 / 1000),
+                options.max_p99_us);
         free(values);
         return 1;
     }

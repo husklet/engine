@@ -138,8 +138,7 @@ int main(void) {
     {
         long page_value = sysconf(_SC_PAGESIZE);
         uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(4096);
-        void *physical = mmap(NULL, (size_t)(page * 2), PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void *physical = mmap(NULL, (size_t)(page * 2), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         uint64_t physical_address = (uint64_t)(uintptr_t)physical;
         uint64_t logical_address = physical_address + page / 2;
         uint64_t found_address = 0, found_length = 0;
@@ -193,9 +192,8 @@ int main(void) {
         long page_value = sysconf(_SC_PAGESIZE);
         uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(4096);
         mapping_probe probe = {0};
-        hl_host_memory_services memory = {.map_anonymous = probe_map,
-                                          .release = probe_release,
-                                          .discard = probe_discard};
+        hl_host_memory_services memory = {
+            .map_anonymous = probe_map, .release = probe_release, .discard = probe_discard};
         hl_host_services host = {.context = &probe, .memory = &memory};
         uint64_t address = 0;
         hl_gmap_bind_host(&host);

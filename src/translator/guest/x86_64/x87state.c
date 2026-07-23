@@ -18,8 +18,7 @@ double hl_x86_ext80_load(const uint8_t image[10]) {
         memcpy(&value, &bits, sizeof(value));
     } else if (exponent == 0x7fff) {
         uint64_t fraction = significand & ((UINT64_C(1) << 63) - 1);
-        uint64_t bits = (uint64_t)sign << 63 | UINT64_C(0x7ff) << 52 |
-                        (fraction != 0 ? UINT64_C(1) << 51 : 0);
+        uint64_t bits = (uint64_t)sign << 63 | UINT64_C(0x7ff) << 52 | (fraction != 0 ? UINT64_C(1) << 51 : 0);
         memcpy(&value, &bits, sizeof(value));
     } else {
         uint64_t bits;

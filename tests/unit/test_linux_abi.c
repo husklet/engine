@@ -480,8 +480,8 @@ int main(void) {
         hl_host_file_mapping output = {HL_HOST_FILE_MAPPING_ABI, sizeof(output), 0, 0, 0, 0};
         uint32_t complete_size = linux_abi.size;
         linux_abi.size = (uint32_t)offsetof(hl_linux_abi, vma_state);
-        HL_CHECK(hl_linux_map_file(&linux_abi, 0, 0, 0, 4096, HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE,
-                                   &output) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_map_file(&linux_abi, 0, 0, 0, 4096, HL_HOST_MEMORY_READ, HL_HOST_MEMORY_PRIVATE, &output) ==
+                 -HL_LINUX_EINVAL);
         linux_abi.size = complete_size;
     }
     {
@@ -503,11 +503,10 @@ int main(void) {
         HL_CHECK(hl_linux_fd_cancel(&linux_abi, &reservation) == HL_STATUS_NOT_FOUND);
         HL_CHECK(hl_linux_close(&linux_abi, 6) == 0);
         HL_CHECK(hl_linux_fd_reserve_at(&linux_abi, 6, &reservation) == HL_STATUS_OK);
-        HL_CHECK(hl_linux_file_adopt_reserved(&linux_abi, &reservation, 55,
-                                              HL_LINUX_O_RDONLY | HL_LINUX_O_CLOEXEC) == 6);
-        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, 6, &snapshot) == HL_STATUS_OK &&
-                 snapshot.host_handle == 55 && snapshot.status_flags == HL_LINUX_O_RDONLY &&
-                 snapshot.descriptor_flags == HL_LINUX_FD_CLOEXEC);
+        HL_CHECK(hl_linux_file_adopt_reserved(&linux_abi, &reservation, 55, HL_LINUX_O_RDONLY | HL_LINUX_O_CLOEXEC) ==
+                 6);
+        HL_CHECK(hl_linux_fd_snapshot_get(&linux_abi, 6, &snapshot) == HL_STATUS_OK && snapshot.host_handle == 55 &&
+                 snapshot.status_flags == HL_LINUX_O_RDONLY && snapshot.descriptor_flags == HL_LINUX_FD_CLOEXEC);
         HL_CHECK(hl_linux_close(&linux_abi, 6) == 0);
         file_host.closes = 0;
         file_host.opens = 0;

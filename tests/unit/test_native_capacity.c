@@ -52,14 +52,13 @@ int main(void) {
     HL_CHECK(close(native) == 0);
     HL_CHECK(hl_native_host_create(&host, &services) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_FILE | HL_HOST_CAP_WATCH | HL_HOST_CAP_EVENT |
-                                                       HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_COUNTER |
-                                                       HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
+                                                      HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_COUNTER |
+                                                      HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
 
     hl_host_result file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                                        HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
     HL_CHECK(file.status == HL_STATUS_OK);
-    cross_mapping = services.memory->reserve(services.context, 4096, 4096,
-                                             HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+    cross_mapping = services.memory->reserve(services.context, 4096, 4096, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
     HL_CHECK(cross_mapping.status == HL_STATUS_OK);
     for (size_t index = 0; index < WATCH_COUNT; ++index) {
         hl_host_result opened = services.watch->open(services.context, file.value);
@@ -79,19 +78,19 @@ int main(void) {
         directories[index] = created.value;
     }
     for (size_t index = 0; index < DIRECTORY_WATCH_COUNT; ++index)
-        HL_CHECK(services.directory
-                     ->add(services.context, directories[0], file.value, index + 1, HL_HOST_DIRECTORY_MODIFY)
-                     .status == HL_STATUS_OK);
+        HL_CHECK(
+            services.directory->add(services.context, directories[0], file.value, index + 1, HL_HOST_DIRECTORY_MODIFY)
+                .status == HL_STATUS_OK);
     {
         hl_host_result duplicated = services.directory->duplicate(services.context, directories[0]);
         HL_CHECK(duplicated.status == HL_STATUS_OK);
         grown_directory_copy = duplicated.value;
         HL_CHECK(services.directory->remove(services.context, grown_directory_copy, DIRECTORY_WATCH_COUNT).status ==
                  HL_STATUS_OK);
-        HL_CHECK(services.directory
-                     ->add(services.context, directories[0], file.value, DIRECTORY_WATCH_COUNT,
-                           HL_HOST_DIRECTORY_MODIFY)
-                     .status == HL_STATUS_OK);
+        HL_CHECK(
+            services.directory
+                ->add(services.context, directories[0], file.value, DIRECTORY_WATCH_COUNT, HL_HOST_DIRECTORY_MODIFY)
+                .status == HL_STATUS_OK);
         HL_CHECK(services.directory->remove(services.context, directories[0], DIRECTORY_WATCH_COUNT).status ==
                  HL_STATUS_OK);
     }
@@ -138,8 +137,8 @@ int main(void) {
         files = calloc(FILE_COUNT, sizeof(*files));
         HL_CHECK(mappings != NULL && files != NULL);
         for (size_t index = 0; index < MAPPING_COUNT; ++index) {
-            hl_host_result reserved = services.memory->reserve(services.context, 4096, 4096,
-                                                               HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+            hl_host_result reserved =
+                services.memory->reserve(services.context, 4096, 4096, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
             HL_CHECK(reserved.status == HL_STATUS_OK);
             mappings[index] = reserved.value;
         }
@@ -155,13 +154,11 @@ int main(void) {
         HL_CHECK(child >= 0);
         if (child == 0) {
             hl_host_watch_record inherited = {0};
-            int valid = services.watch->query(services.context, watches[WATCH_COUNT - 1], &inherited).status ==
-                            HL_STATUS_OK &&
-                        services.counter->get_flags(services.context, counters[COUNTER_COUNT - 1]).status ==
-                            HL_STATUS_OK &&
-                        services.memory->protect(services.context, mappings[MAPPING_COUNT - 1], 0, 4096,
-                                                 HL_HOST_MEMORY_READ)
-                                .status == HL_STATUS_OK;
+            int valid =
+                services.watch->query(services.context, watches[WATCH_COUNT - 1], &inherited).status == HL_STATUS_OK &&
+                services.counter->get_flags(services.context, counters[COUNTER_COUNT - 1]).status == HL_STATUS_OK &&
+                services.memory->protect(services.context, mappings[MAPPING_COUNT - 1], 0, 4096, HL_HOST_MEMORY_READ)
+                        .status == HL_STATUS_OK;
             _exit(valid ? 0 : 41);
         }
         int status = 0;
@@ -186,8 +183,8 @@ int main(void) {
         HL_CHECK(services.memory->release(services.context, mappings[index - 1]).status == HL_STATUS_OK);
     {
         hl_host_handle stale = mappings[0];
-        hl_host_result replacement = services.memory->reserve(
-            services.context, 4096, 4096, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
+        hl_host_result replacement =
+            services.memory->reserve(services.context, 4096, 4096, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE);
         HL_CHECK(replacement.status == HL_STATUS_OK);
         HL_CHECK(replacement.value != stale);
         HL_CHECK(services.memory->protect(services.context, stale, 0, 4096, HL_HOST_MEMORY_READ).status ==

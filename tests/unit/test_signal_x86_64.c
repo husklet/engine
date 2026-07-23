@@ -24,22 +24,35 @@ int main(void) {
     int code = -6, pid = 123, uid = 456;
     uint64_t value = UINT64_C(0xabcdef0123456789), address = UINT64_C(0x99887766);
     hl_x86_signal_state state = {
-        .handler = UINT64_C(0x70001000), .mask = UINT64_C(0x200), .code = &code, .value = &value,
-        .address = &address, .pid = &pid, .uid = &uid, .sigreturn_pc = UINT64_C(0xfffffffffff0),
+        .handler = UINT64_C(0x70001000),
+        .mask = UINT64_C(0x200),
+        .code = &code,
+        .value = &value,
+        .address = &address,
+        .pid = &pid,
+        .uid = &uid,
+        .sigreturn_pc = UINT64_C(0xfffffffffff0),
     };
 
     memset(&cpu, 0, sizeof(cpu));
-    for (size_t i = 0; i < 16; ++i) cpu.r[i] = UINT64_C(0x1000) + i;
-    for (size_t i = 0; i < 32; ++i) cpu.v[i] = UINT64_C(0x2000) + i;
-    for (size_t i = 0; i < 32; ++i) cpu.vhi[i] = UINT64_C(0x3000) + i;
-    for (size_t i = 0; i < 8; ++i) cpu.kreg[i] = UINT64_C(0x4000) + i;
-    for (size_t i = 0; i < 8; ++i) cpu.st[i] = (double)i + 0.25;
+    for (size_t i = 0; i < 16; ++i)
+        cpu.r[i] = UINT64_C(0x1000) + i;
+    for (size_t i = 0; i < 32; ++i)
+        cpu.v[i] = UINT64_C(0x2000) + i;
+    for (size_t i = 0; i < 32; ++i)
+        cpu.vhi[i] = UINT64_C(0x3000) + i;
+    for (size_t i = 0; i < 8; ++i)
+        cpu.kreg[i] = UINT64_C(0x4000) + i;
+    for (size_t i = 0; i < 8; ++i)
+        cpu.st[i] = (double)i + 0.25;
     cpu.r[4] = (uint64_t)(uintptr_t)(stack + 7000);
     cpu.rip = UINT64_C(0x401234);
     cpu.nzcv = UINT64_C(0xb0000000);
     cpu.df = 1;
     cpu.sigmask = UINT64_C(0x40);
-    cpu.fptop = 3; cpu.fpsw = 4; cpu.fpcw = 5;
+    cpu.fptop = 3;
+    cpu.fpsw = 4;
+    cpu.fpcw = 5;
     saved = cpu;
 
     hl_x86_signal_build(&cpu, 12, &state);
@@ -81,10 +94,12 @@ int main(void) {
     uint64_t installed = 2, pending = 0, addresses[65] = {0};
     int codes[65] = {0};
     hl_x86_signal_queue queue = {handler, &installed, codes, addresses, &pending};
-    cpu.rip = UINT64_C(0x1234); cpu.sigmask = UINT64_MAX;
+    cpu.rip = UINT64_C(0x1234);
+    cpu.sigmask = UINT64_MAX;
     HL_CHECK(hl_x86_signal_raise_divide(&cpu, &queue, 1 /* FPE_INTDIV */) == 1);
     HL_CHECK(codes[8] == 1 && addresses[8] == cpu.rip && (pending & (UINT64_C(1) << 8)));
-    cpu.divop = 4 | (2 << 8); pending = 0;
+    cpu.divop = 4 | (2 << 8);
+    pending = 0;
     HL_CHECK(hl_x86_signal_raise_trap(&cpu, &queue) == 1);
     HL_CHECK(codes[4] == 2 && addresses[4] == cpu.rip && (pending & (UINT64_C(1) << 4)));
     installed = 1;

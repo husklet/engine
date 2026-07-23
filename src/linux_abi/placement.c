@@ -1,7 +1,6 @@
 #include "placement.h"
 
-void *hl_elf_place_image(hl_elf_mapper mapper, void *context, void *fixed_address, size_t length,
-                         int *fixed_failed) {
+void *hl_elf_place_image(hl_elf_mapper mapper, void *context, void *fixed_address, size_t length, int *fixed_failed) {
     void *mapped;
     if (fixed_failed != NULL) *fixed_failed = 0;
     if (mapper == NULL || length == 0) return NULL;

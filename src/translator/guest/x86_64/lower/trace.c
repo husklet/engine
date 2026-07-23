@@ -54,8 +54,8 @@ int hl_x86_trace_trap_head(uint64_t a) {
 // promotes the block, after which this stub is dead.
 static void emit_t2_counter_x86(hl_x86_trace_state *state, int slot, uint64_t start, void *body) {
     hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&state->tier_counters[slot]);
-    e_ldr(17, 16, 0);                                               // x17 = count
-    e_subi(17, 17, 1, 1);                                           // --count (sub-imm: flag-free)
+    e_ldr(17, 16, 0);     // x17 = count
+    e_subi(17, 17, 1, 1); // --count (sub-imm: flag-free)
     e_str(17, 16, 0);
     uint32_t *p_cbnz = hl_x86_emit_cursor();
     emit32(0); // cbnz x17, Lcont (still counting -> keep looping; flag-free)
@@ -188,13 +188,12 @@ static int loop_flags_dead(uint64_t start) {
 //    bytes before it can be re-entered through the map (baked `b body` chains into orphaned old code
 //    share the pre-existing stitch/chain staleness window, no wider).
 //  * The live ARM NZCV stays CANONICAL (borrow convention) at every block boundary even when the
-//    membank store is elided: TRACE_FLAGS_SUB's live flags already are canonical, TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC get the
-//    msr-only fixup (e_nzcv_fix_ci/_c1). Every exit to the dispatcher spills the LIVE flags
-//    (emit_spill -> e_nzcv_save), so the successor's irq-poll exit -- the only place an ASYNC
-//    signal can observe RFLAGS -- persists the true flag bytes before maybe_deliver_signal reads
-//    cpu->nzcv. The membank may go stale only ACROSS a chained edge whose successor provably
-//    overwrites CF/ZF/SF/OF before any read (same observable class as the existing intra-block
-//    deferral between a producer and its consumer).
+//    membank store is elided: TRACE_FLAGS_SUB's live flags already are canonical, TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC get
+//    the msr-only fixup (e_nzcv_fix_ci/_c1). Every exit to the dispatcher spills the LIVE flags (emit_spill ->
+//    e_nzcv_save), so the successor's irq-poll exit -- the only place an ASYNC signal can observe RFLAGS -- persists
+//    the true flag bytes before maybe_deliver_signal reads cpu->nzcv. The membank may go stale only ACROSS a chained
+//    edge whose successor provably overwrites CF/ZF/SF/OF before any read (same observable class as the existing
+//    intra-block deferral between a producer and its consumer).
 //  * The scan never dereferences a byte outside (a) the 4KB page(s) of the branch instruction doing
 //    the asking (bytes the translator is already decoding) or (b) pages with a live translation
 //    (txpg_has -> mapped, executable guest code). A speculative jcc target on a never-mapped page is
@@ -436,18 +435,17 @@ void hl_x86_trace_flags_edge(hl_x86_trace_state *state, uint64_t target, uint64_
 // (CS/CC/HI/LS read C, VS/VC/GE/LT/GT/LE read V) needs canonical C/V at the branch -> excluded from the fast path.
 static int arm_cc_reads_only_nz(int cc) {
     switch (cc & 0xF) {
-    case 0:  // EQ (Z)
-    case 1:  // NE (Z)
-    case 4:  // MI (N)
-    case 5:  // PL (N)
+    case 0: // EQ (Z)
+    case 1: // NE (Z)
+    case 4: // MI (N)
+    case 5: // PL (N)
         return 1;
-    default:
-        return 0;
+    default: return 0;
     }
 }
 
-void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor, int stitch_fall, int arm_cc,
-                           int *save_taken, int *save_fall) {
+void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor, int stitch_fall,
+                            int arm_cc, int *save_taken, int *save_fall) {
     *save_taken = HL_X86_JCC_SPILL_NONE;
     *save_fall = HL_X86_JCC_SPILL_NONE;
     if (!(*state->pending_flags)) {
@@ -459,24 +457,29 @@ void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t 
         return;
     }
     if ((*state->pending_flags) == HL_X86_PENDING_SUB) {
-        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB : HL_X86_JCC_SPILL_NONE;
+        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB
+                                                                                           : HL_X86_JCC_SPILL_NONE;
         if (!*save_taken) (*state->flag_elisions)++;
         if (stitch_fall) return; // keep (*state->pending_flags) live for the inline continuation
-        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB : HL_X86_JCC_SPILL_NONE;
+        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_SUB
+                                                                                         : HL_X86_JCC_SPILL_NONE;
         if (!*save_fall) (*state->flag_elisions)++;
         (*state->pending_flags) = HL_X86_PENDING_NONE;
         return;
     }
     if ((*state->pending_flags) == HL_X86_PENDING_LOGIC && arm_cc_reads_only_nz(arm_cc)) {
-        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC : HL_X86_JCC_SPILL_NONE;
+        *save_taken = (hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC
+                                                                                           : HL_X86_JCC_SPILL_NONE;
         if (!*save_taken) (*state->flag_elisions)++;
         if (stitch_fall) return; // keep (*state->pending_flags) live: raw ANDS NZCV is the intra-block LOGIC state
-        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC : HL_X86_JCC_SPILL_NONE;
+        *save_fall = (hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV) ? HL_X86_JCC_SPILL_LOGIC
+                                                                                         : HL_X86_JCC_SPILL_NONE;
         if (!*save_fall) (*state->flag_elisions)++;
         (*state->pending_flags) = HL_X86_PENDING_NONE;
         return;
     }
-    if (!(hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) && !(hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV)) {
+    if (!(hl_x86_trace_flags_livein(state, taken, anchor) & HL_X86_FLAG_NZCV) &&
+        !(hl_x86_trace_flags_livein(state, fall, anchor) & HL_X86_FLAG_NZCV)) {
         if ((*state->pending_flags) == HL_X86_PENDING_ADD)
             state->fix_add_flags();
         else
@@ -500,7 +503,8 @@ int hl_x86_trace_pfaf_dead(hl_x86_trace_state *state, const struct insn *NI, uin
     if (!NI->two && op >= 0x70 && op <= 0x7F) lo = op & 0xF;
     if (NI->two && (op & 0xF0) == 0x80) lo = op & 0xF;
     if (lo >= 0 && lo != 0xA && lo != 0xB) // any jcc except jp/jnp (those READ PF)
-        return !(hl_x86_trace_flags_livein(state, n2 + (uint64_t)NI->imm, anchor) & (HL_X86_FLAG_PF | HL_X86_FLAG_AF)) &&
+        return !(hl_x86_trace_flags_livein(state, n2 + (uint64_t)NI->imm, anchor) &
+                 (HL_X86_FLAG_PF | HL_X86_FLAG_AF)) &&
                !(hl_x86_trace_flags_livein(state, n2, anchor) & (HL_X86_FLAG_PF | HL_X86_FLAG_AF));
     return 0;
 }
@@ -511,13 +515,13 @@ int hl_x86_trace_pfaf_dead(hl_x86_trace_state *state, const struct insn *NI, uin
 //   live ARM NZCV canonical; otherwise e_nzcv_load() reloads cpu->nzcv) -- only the back-edge differs:
 //   it routes through emit_t2_counter_x86 (which promotes when hot) instead of a plain `b body`.
 // TIER-2 (state->tier_two): FOLD the trampoline to a single `b.cond body`; additionally, when the deferred
-//   flags are a *sub/cmp* producer ((*state->pending_flags) == TRACE_FLAGS_SUB) and provably dead at loop top, ELIDE the
-//   per-iteration `mrs;str` save onto the loop-exit (fall) edge only. The elision is restricted to
-//   TRACE_FLAGS_SUB because its finalizer (e_nzcv_save) leaves the live ARM NZCV already in the canonical borrow
-//   convention x86cc_to_arm() assumes -- so the back-edge branch can read the live NZCV directly and the
-//   save is pure spill-for-successor. TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC finalizers msr a *corrected* value into the live
-//   NZCV, so they MUST materialize before the branch (fold-only). Bit-identical guest-visible control
-//   flow + cpu->nzcv in every case.
+//   flags are a *sub/cmp* producer ((*state->pending_flags) == TRACE_FLAGS_SUB) and provably dead at loop top, ELIDE
+//   the per-iteration `mrs;str` save onto the loop-exit (fall) edge only. The elision is restricted to TRACE_FLAGS_SUB
+//   because its finalizer (e_nzcv_save) leaves the live ARM NZCV already in the canonical borrow convention
+//   x86cc_to_arm() assumes -- so the back-edge branch can read the live NZCV directly and the save is pure
+//   spill-for-successor. TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC finalizers msr a *corrected* value into the live NZCV, so
+//   they MUST materialize before the branch (fold-only). Bit-identical guest-visible control flow + cpu->nzcv in every
+//   case.
 void hl_x86_trace_self_loop(hl_x86_trace_state *state, int cc, uint64_t start, uint64_t fall, void *body, int slot) {
     if (state->tier_two) {
         int dead = ((*state->pending_flags) == HL_X86_PENDING_SUB) && loop_flags_dead(start);
@@ -536,9 +540,11 @@ void hl_x86_trace_self_loop(hl_x86_trace_state *state, int cc, uint64_t start, u
                 (*state->tier_folds)++;
                 return;
             }
-            state->materialize_flags(); // FOLD only: spill before the branch (TRACE_FLAGS_SUB -> e_nzcv_save, == tier-1)
+            state
+                ->materialize_flags(); // FOLD only: spill before the branch (TRACE_FLAGS_SUB -> e_nzcv_save, == tier-1)
         } else if ((*state->pending_flags)) {
-            state->materialize_flags(); // TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC: materialize (msr's corrected NZCV) before the branch
+            state->materialize_flags(); // TRACE_FLAGS_ADD/TRACE_FLAGS_LOGIC: materialize (msr's corrected NZCV) before
+                                        // the branch
         } else {
             hl_x86_emit_flags_load();
         }
@@ -555,7 +561,7 @@ void hl_x86_trace_self_loop(hl_x86_trace_state *state, int cc, uint64_t start, u
     else
         hl_x86_emit_flags_load();
     uint32_t *patch = hl_x86_emit_cursor();
-    emit32(0);             // b.cond -> Lcnt (counter)
+    emit32(0);                    // b.cond -> Lcnt (counter)
     state->emit_chain_exit(fall); // fall = loop exit
     int64_t d = ((uint8_t *)hl_x86_emit_cursor() - (uint8_t *)patch) / 4;
     *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (cc & 0xF);

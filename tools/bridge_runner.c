@@ -46,9 +46,18 @@ static int run(char **arguments, time_t deadline, int *status) {
     for (;;) {
         pid_t waited = waitpid(child, status, WNOHANG);
         if (waited == child) return 0;
-        if (waited < 0 && errno != EINTR) { stop(child); return -1; }
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) { stop(child); return -1; }
-        if (now.tv_sec >= deadline) { stop(child); return 1; }
+        if (waited < 0 && errno != EINTR) {
+            stop(child);
+            return -1;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            stop(child);
+            return -1;
+        }
+        if (now.tv_sec >= deadline) {
+            stop(child);
+            return 1;
+        }
         (void)nanosleep(&tick, NULL);
     }
 }
@@ -67,8 +76,11 @@ int main(int argc, char **argv) {
     if (outcome == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
     if (outcome == 1)
         fprintf(stderr, "bridge-runner: timeout after %d seconds\n", TOTAL_TIMEOUT_SECONDS);
-    else if (outcome < 0) perror("bridge-runner");
-    else if (WIFEXITED(status)) fprintf(stderr, "bridge-runner: command exited %d\n", WEXITSTATUS(status));
-    else if (WIFSIGNALED(status)) fprintf(stderr, "bridge-runner: command received signal %d\n", WTERMSIG(status));
+    else if (outcome < 0)
+        perror("bridge-runner");
+    else if (WIFEXITED(status))
+        fprintf(stderr, "bridge-runner: command exited %d\n", WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        fprintf(stderr, "bridge-runner: command received signal %d\n", WTERMSIG(status));
     return 1;
 }

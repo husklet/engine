@@ -110,7 +110,8 @@ int main(void) {
         jobs[index] = (producer){&set, reused, 1000u + index * 1000u};
         HL_CHECK(pthread_create(&threads[index], NULL, produce, &jobs[index]) == 0);
     }
-    for (index = 0; index < 4; ++index) HL_CHECK(pthread_join(threads[index], NULL) == 0);
+    for (index = 0; index < 4; ++index)
+        HL_CHECK(pthread_join(threads[index], NULL) == 0);
     value = (observed){0};
     HL_CHECK(hl_linux_watch_drain(&set, observe, &value, &count) == HL_STATUS_OK && count == 1);
     HL_CHECK(value.count == 1 && value.old_size == 20 && value.flags == 15);

@@ -3,11 +3,10 @@
 #include <stdint.h>
 #include <string.h>
 
-int hl_fork_wire_pack_strings(char *output, size_t capacity, size_t *offset, int count,
-                              char *const strings[]) {
+int hl_fork_wire_pack_strings(char *output, size_t capacity, size_t *offset, int count, char *const strings[]) {
     int32_t encoded_count;
-    if (output == NULL || offset == NULL || count < 0 || (count > 0 && strings == NULL) ||
-        *offset > capacity || capacity - *offset < sizeof encoded_count)
+    if (output == NULL || offset == NULL || count < 0 || (count > 0 && strings == NULL) || *offset > capacity ||
+        capacity - *offset < sizeof encoded_count)
         return -1;
     encoded_count = count;
     memcpy(output + *offset, &encoded_count, sizeof encoded_count);
@@ -29,8 +28,7 @@ int hl_fork_wire_pack_strings(char *output, size_t capacity, size_t *offset, int
     return 0;
 }
 
-int hl_fork_wire_unpack_strings(const char *input, size_t size, size_t *offset, char **strings,
-                                int capacity) {
+int hl_fork_wire_unpack_strings(const char *input, size_t size, size_t *offset, char **strings, int capacity) {
     int32_t count;
     if (input == NULL || offset == NULL || strings == NULL || capacity < 1 || *offset > size ||
         size - *offset < sizeof count)
