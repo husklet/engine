@@ -53,51 +53,6 @@ jobs:
       - name: Test Rust package
         run: nix build --print-build-logs .#checks.aarch64-linux.rust
 
-      - name: Test Linux compatibility
-        timeout-minutes: 30
-        shell: bash
-        run: |
-          set -o pipefail
-          # The typed compat scratch is mapped as the guest's /tmp; on this ext4
-          # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
-          sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
-          export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
-          # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
-          # Output goes to a FILE, never a pipe. The compat suite deliberately leaves processes alive
-          # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived) and
-          # they inherit this step's stdout, so with `| tee` the reader can wait on an EOF that never
-          # comes. A file has no reader to block. Returns 124 on expiry.
-          run_bounded() {
-            local secs="$1" log="$2"; shift 2
-            "$@" >"$log" 2>&1 </dev/null &
-            local pid=$! waited=0
-            while kill -0 "$pid" 2>/dev/null; do
-              if [ "$waited" -ge "$secs" ]; then
-                kill -TERM "$pid" 2>/dev/null; sleep 10; kill -KILL "$pid" 2>/dev/null
-                wait "$pid" 2>/dev/null; return 124
-              fi
-              sleep 5; waited=$((waited + 5))
-            done
-            wait "$pid"
-          }
-          status=0
-          run_bounded 1500 runtime.log \
-            nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" test-linux-production-typed' || status=$?
-          tail -c 200000 runtime.log >> "$GITHUB_STEP_SUMMARY" || true
-          tail -n 60 runtime.log
-          if [ "$status" -ne 0 ]; then
-            message=$(tail -c 1500 runtime.log)
-            message=${message//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
-            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-              echo "::error title=Linux runtime compatibility TIMED OUT after 25m::$message"
-            else
-              echo "::error title=Linux runtime compatibility failed::$message"
-            fi
-            exit 1
-          fi
-
       # The CMake build is being brought up as the standard build path to replace
       # the hand-written Makefile. Gating it here keeps it honest: it must
       # configure, build, pass the unit suite via CTest, and produce an
@@ -120,3 +75,80 @@ jobs:
 
       - name: Package Rust crate
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
+
+  # Runtime compatibility, sharded across parallel runners. This used to be one
+  # step inside `linux` running `test-linux-production-typed`, i.e. every suite
+  # sequentially in a single job. Each bucket runs the same `typed-<suite>`
+  # targets the aggregate chains, so a shard and a full local run execute
+  # identical commands.
+  linux-compat:
+    name: compat / ${{ matrix.name }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fs-proc
+            targets: typed-filesystem typed-procfs typed-process
+          - name: net-ipc
+            targets: typed-network typed-network-icmp typed-ipc typed-isolation
+          - name: syscall
+            targets: typed-syscall typed-syscall_edges typed-abi typed-completeness
+          - name: libc-posix
+            targets: typed-libc typed-posix typed-time
+          - name: mem-signals
+            targets: typed-memory typed-signals typed-threads
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v20
+        with:
+          diagnostic-endpoint: ""
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compat suites
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          set -o pipefail
+          # The typed compat scratch is mapped as the guest's /tmp; on this ext4
+          # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
+          sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
+          export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
+          # Portable bound: output to a FILE, never a pipe. The compat suite leaves
+          # processes alive by design (pc-forkoutlive has a child outlive its parent;
+          # the fork-server/supervisor are long-lived) and they inherit this step's
+          # stdout, so a reader on a pipe can wait for an EOF that never comes.
+          run_bounded() {
+            local secs="$1" log="$2"; shift 2
+            "$@" >"$log" 2>&1 </dev/null &
+            local pid=$! waited=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$waited" -ge "$secs" ]; then
+                kill -TERM "$pid" 2>/dev/null; sleep 10; kill -KILL "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null; return 124
+              fi
+              sleep 5; waited=$((waited + 5))
+            done
+            wait "$pid"
+          }
+          status=0
+          run_bounded 2100 runtime.log \
+            nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" ${{ matrix.targets }}' || status=$?
+          tail -c 200000 runtime.log >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 60 runtime.log
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 1500 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            if [ "$status" -eq 124 ]; then
+              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT::$message"
+            else
+              echo "::error title=Linux compat (${{ matrix.name }}) failed::$message"
+            fi
+            exit 1
+          fi

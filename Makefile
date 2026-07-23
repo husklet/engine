@@ -2178,92 +2178,70 @@ $(BUILD)/linux-production/hl-remote-supervisor: tools/remote_supervisor.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(WARNINGS) $< -lc -o $@
 
+# ---- typed compat lane (Linux ELF production engines) ----------------------
+# ONE definition, two entry points: `typed-<suite>` for CI, which shards the
+# suites across parallel runners, and `test-linux-production-typed` which chains
+# the same commands sequentially for a local full run. Deriving both from
+# TYPED_RUN keeps a shard and the aggregate from drifting apart -- the failure
+# mode that duplicated recipes invite.
+TYPED_SUITES := filesystem isolation network procfs process memory syscall \
+	syscall_edges abi completeness ipc libc posix signals threads time
+
+# Per-suite fixture prerequisites. The suite directory name and the *_BINS
+# variable do not follow one convention, so the mapping is explicit.
+TYPED_BINS_filesystem    := $(FILESYSTEM_CASE_BINS)
+TYPED_BINS_isolation     := $(ISOLATION_CASE_BINS)
+TYPED_BINS_network       := $(NETWORK_CASE_BINS)
+TYPED_BINS_procfs        := $(PROCFS_CASE_BINS)
+TYPED_BINS_process       := $(PROCESS_CASE_BINS)
+TYPED_BINS_memory        := $(MEMORY_CASE_BINS)
+TYPED_BINS_syscall       := $(SYSCALL_CASE_BINS)
+TYPED_BINS_syscall_edges := $(SYSCALL_EDGE_CASE_BINS)
+TYPED_BINS_abi           := $(ABI_CASE_BINS)
+TYPED_BINS_completeness  := $(COMPLETENESS_BINS)
+TYPED_BINS_ipc           := $(IPC_CASE_BINS)
+TYPED_BINS_libc          := $(LIBC_CASE_BINS)
+TYPED_BINS_posix         := $(POSIX_CASE_BINS)
+TYPED_BINS_signals       := $(SIGNALS_CASE_BINS)
+TYPED_BINS_threads       := $(THREAD_CASE_BINS)
+TYPED_BINS_time          := $(TIME_CASE_BINS)
+
+TYPED_ENGINES := $(BUILD)/linux-production/hl-engine-linux-aarch64 \
+	$(BUILD)/linux-production/hl-engine-linux-x86_64 \
+	$(BUILD)/linux-production/hl-remote-supervisor $(BUILD)/tools/matrix-runner
+
+# $(call TYPED_RUN,<suite>[,<case>]) -- the matrix-runner invocation for a suite.
+TYPED_RUN = $(BUILD)/tools/matrix-runner env \
+	$(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
+	$(abspath $(BUILD)/compat/$(1)/aarch64) \
+	$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
+	$(abspath $(BUILD)/compat/$(1)/x86_64) $(abspath tests/compat/$(1)) $(2)
+
+define TYPED_SUITE_RULE
+.PHONY: typed-$(1)
+typed-$(1): $$(TYPED_ENGINES) $$(TYPED_BINS_$(1))
+	$$(call TYPED_RUN,$(1))
+endef
+$(foreach s,$(TYPED_SUITES),$(eval $(call TYPED_SUITE_RULE,$(s))))
+
+# The ICMP bridge case runs the SAME network suite under the deny-icmp wrapper,
+# which drops the host's ping capability for the child, so it is its own target.
+.PHONY: typed-network-icmp
+typed-network-icmp: $(TYPED_ENGINES) $(BUILD)/tests/deny-icmp $(NETWORK_CASE_BINS)
+	$(BUILD)/tests/deny-icmp $(call TYPED_RUN,network,icmp-bridge)
+
+TYPED_TARGETS := $(foreach s,$(TYPED_SUITES),typed-$(s)) typed-network-icmp
+
+# Full local run: the same commands, chained so they stay SEQUENTIAL even under
+# -j. Several suites contain load-sensitive stress gates that fail when run
+# concurrently with each other, which is exactly why this is a && chain in one
+# recipe line rather than a list of prerequisites.
 .PHONY: test-linux-production-typed
-test-linux-production-typed: $(BUILD)/linux-production/hl-engine-linux-aarch64 \
-	$(BUILD)/linux-production/hl-engine-linux-x86_64 $(BUILD)/linux-production/hl-remote-supervisor \
-	$(BUILD)/tools/matrix-runner $(BUILD)/tests/deny-icmp $(FILESYSTEM_CASE_BINS) $(ISOLATION_CASE_BINS) $(NETWORK_CASE_BINS) \
-	$(PROCFS_CASE_BINS) $(PROCESS_CASE_BINS) $(MEMORY_CASE_BINS) $(SYSCALL_CASE_BINS) \
-	$(SYSCALL_EDGE_CASE_BINS) $(ABI_CASE_BINS) $(COMPLETENESS_BINS) $(IPC_CASE_BINS) \
-	$(LIBC_CASE_BINS) $(POSIX_CASE_BINS) $(SIGNALS_CASE_BINS) $(THREAD_CASE_BINS) $(TIME_CASE_BINS)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/filesystem/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/filesystem/x86_64) $(abspath tests/compat/filesystem)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/isolation/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/isolation/x86_64) $(abspath tests/compat/isolation)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/network/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network)
-	$(BUILD)/tests/deny-icmp $(BUILD)/tools/matrix-runner env \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/network/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/network/x86_64) $(abspath tests/compat/network) icmp-bridge
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/procfs/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/procfs/x86_64) $(abspath tests/compat/procfs)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/process/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/process/x86_64) $(abspath tests/compat/process)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/memory/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/memory/x86_64) $(abspath tests/compat/memory)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/syscall/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/syscall/x86_64) $(abspath tests/compat/syscall)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/syscall_edges/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/syscall_edges/x86_64) $(abspath tests/compat/syscall_edges)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/abi/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/abi/x86_64) $(abspath tests/compat/abi)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/completeness/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/completeness/x86_64) $(abspath tests/compat/completeness)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/ipc/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/ipc/x86_64) $(abspath tests/compat/ipc)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/libc/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/libc/x86_64) $(abspath tests/compat/libc)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/posix/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/posix/x86_64) $(abspath tests/compat/posix)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/signals/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/signals/x86_64) $(abspath tests/compat/signals)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/threads/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/threads/x86_64) $(abspath tests/compat/threads)
-	$(BUILD)/tools/matrix-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-aarch64) \
-		$(abspath $(BUILD)/compat/time/aarch64) \
-		$(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
-		$(abspath $(BUILD)/compat/time/x86_64) $(abspath tests/compat/time)
+test-linux-production-typed: $(TYPED_ENGINES) $(BUILD)/tests/deny-icmp \
+	$(foreach s,$(TYPED_SUITES),$(TYPED_BINS_$(s)))
+	$(foreach s,$(TYPED_SUITES),$(call TYPED_RUN,$(s)) && ) \
+		$(BUILD)/tests/deny-icmp $(call TYPED_RUN,network,icmp-bridge)
 
-$(BUILD)/tools/remote-supervisor: tools/remote_supervisor.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
-
-$(BUILD)/tests/remote-supervisor: tests/integration/remote_supervisor.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(WARNINGS) $< -o $@
-
-.PHONY: remote-supervisor-test
 remote-supervisor-test: $(BUILD)/tools/remote-supervisor $(BUILD)/tests/remote-supervisor
 	$(BUILD)/tests/remote-supervisor $(BUILD)/tools/remote-supervisor
 
