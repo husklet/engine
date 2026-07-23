@@ -122,6 +122,15 @@ endforeach()
 
 hl_guest_finalize(guest-fixtures-gates)
 
+# ---------------------------------------------------------------------------
+# Everything from here on is the NATIVE LINUX lane: it consumes the
+# linux-production engines and the prod_* objects that Phase2Production.cmake
+# only defines on a Linux host, so it must be guarded or a Darwin configure
+# fails on missing targets. Sections 1-2 above build guest fixtures and are
+# host-agnostic. The macOS equivalents live in Phase4Mac.cmake.
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+
 # ===========================================================================
 # 3. lifecycle runners (native Linux)
 # ===========================================================================
@@ -468,3 +477,6 @@ add_custom_target(bench
   COMMAND $<TARGET_FILE:bench-runner> report --baseline hl-engine
   DEPENDS bench-runner
   COMMENT "fair combined self-timing bench (see tools/bench/README.md)")
+
+
+endif() # native Linux lane

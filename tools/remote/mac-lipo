@@ -1,0 +1,3 @@
+#!/bin/sh
+# Forward lipo to the macOS host (see tools/remote/mac-cc for the constraints).
+exec mac lipo "$@"

@@ -26,10 +26,10 @@
 #    lifecycle-core objects (Makefile lines 1263-1269) — preserved exactly.
 # ---------------------------------------------------------------------------
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  return()
-endif()
-
+# NOTE: the unity dep closure and hl_object() are HOST-AGNOSTIC helpers and are
+# deliberately defined ABOVE the Linux guard below: the macOS lane
+# (Phase4Mac.cmake) and the Linux-only gate sections both call hl_object(), so
+# leaving it inside the guard made it undefined on a Darwin configure.
 # Explicit dependency closure for the unity translation units (PRODUCTION_UNITY_DEPS).
 file(GLOB_RECURSE _HL_UNITY_DEPS CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/core/*.c   ${CMAKE_SOURCE_DIR}/src/core/*.h
@@ -51,6 +51,11 @@ function(hl_object name src)
     set_source_files_properties(${src} PROPERTIES OBJECT_DEPENDS "${_HL_UNITY_DEPS}")
   endif()
 endfunction()
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  return()
+endif()
+
 
 # ---- native Linux production engines --------------------------------------
 # Provider subsystem: one TU each (put32/get32 collision avoidance).
