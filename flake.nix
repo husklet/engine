@@ -59,27 +59,27 @@
           ccFor = g:
             let p = pkgsFor g;
             in if isNative g then nativeCC else "${p.stdenv.cc}/bin/${p.stdenv.cc.targetPrefix}cc";
-          # A static sqlite for the guest ISA, built with that ISA's ordinary
-          # GLIBC stdenv rather than taken from pkgsStatic.
-          #
-          # pkgsStatic is a MUSL stdenv, so naming it drags in a whole musl cross
-          # toolchain per guest ISA -- gcc built from source, tens of minutes, no
-          # binary-cache hit -- purely to obtain one small C library. It was also
-          # inconsistent: the guest binaries link -static against GLIBC, so a musl
-          # libsqlite3.a was the odd one out in the link. Overriding the normal
-          # sqlite to build a static archive keeps the toolchain, the libc and the
-          # link consistent, and costs one small package instead of a compiler.
-          staticSqliteFor = g:
-            (pkgsFor g).sqlite.overrideAttrs (previous: {
-              dontDisableStatic = true;
-              configureFlags = (previous.configureFlags or [ ]) ++ [ "--enable-static" "--disable-shared" ];
-            });
           # Guest binaries link a STATIC sqlite and glibc for their own ISA; the
           # -I/-L pair is what the compat-core dbserver/sqlite workloads and the
           # combined-bench sqlite phase need.
+          #
+          # This deliberately uses the STOCK pkgsStatic.sqlite even though that is
+          # a musl stdenv and therefore implies a musl cross toolchain per guest
+          # ISA. Two alternatives were tried and are worse:
+          #   * moving the -I/-L pair to a separate perf-only shell -- wrong,
+          #     because the aarch64 dbserver/sqlite workloads are compat-core
+          #     cases that CI builds, not perf targets;
+          #   * overriding the ordinary glibc sqlite to build a static archive --
+          #     leaves the binary cache, forcing a from-source rebuild of the
+          #     whole chain including tcl, which does not cross-compile for
+          #     x86_64 (implicit strlen declaration is an error on modern gcc).
+          # The stock path is cached. A long musl toolchain build usually means
+          # the nix/CI cache key changed (it hashes flake.nix), not a new
+          # dependency.
           staticCCFor = g:
-            let p = pkgsFor g; sq = staticSqliteFor g;
-            in "${ccFor g} -I${lib.getDev sq}/include -L${lib.getLib sq}/lib -L${p.glibc.static}/lib";
+            let p = pkgsFor g;
+            in "${ccFor g} -I${lib.getDev p.pkgsStatic.sqlite}/include"
+               + " -L${lib.getLib p.pkgsStatic.sqlite}/lib -L${p.glibc.static}/lib";
           # The compiler *packages* (not paths) that belong on PATH in a shell.
           ccPkgFor = g: if isNative g then pkgs.gcc else (pkgsFor g).stdenv.cc;
 

@@ -392,10 +392,10 @@ nix flake check             # format + unit + package + rust
 nix run .#fmt               # apply clang-format in the working tree
 ```
 
-`*_LINUX_STATIC_CC` carries a static sqlite built with the guest ISA's ordinary **glibc** stdenv, not one
-taken from `pkgsStatic`. `pkgsStatic` is a musl stdenv, so naming it would pull in a full musl cross
-toolchain per guest ISA (a from-source gcc build, no binary-cache hit) just to obtain one small library --
-and it would link a musl libsqlite3.a into otherwise glibc-static guests.
+`*_LINUX_STATIC_CC` carries the stock `pkgsStatic.sqlite` for the guest ISA, which implies a musl cross
+toolchain per ISA. That is intentional: it is what the binary cache has. If nix starts building a musl gcc
+from source, the cause is almost always a changed cache key -- both the nix eval and the CI cache action
+hash `flake.nix` -- rather than a newly added dependency.
 
 `fmt` is the only app: it mutates the working tree, so it cannot be a derivation. Everything that merely
 verifies is a `check`, which is also why checks can compile — they get a real stdenv, whereas a
