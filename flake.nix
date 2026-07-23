@@ -59,12 +59,23 @@
           ccFor = g:
             let p = pkgsFor g;
             in if isNative g then nativeCC else "${p.stdenv.cc}/bin/${p.stdenv.cc.targetPrefix}cc";
-          # Guest binaries link a STATIC sqlite and glibc for their own ISA; the
-          # -I/-L pair is what the combined-bench sqlite phase needs.
-          staticCCFor = g:
+          # Guest binaries link a STATIC glibc for their own ISA. This stays LEAN
+          # on purpose -- see sqliteCCFor for why the static sqlite is not here.
+          staticCCFor = g: "${ccFor g} -L${(pkgsFor g).glibc.static}/lib";
+          # Same, plus the static sqlite -I/-L pair that the combined-bench
+          # sqlite phase (tests/perf/combined_bench.c, and the aarch64 dbserver/
+          # sqlite workloads) links with -lsqlite3.
+          #
+          # This is deliberately NOT in the default shell. pkgsStatic is a MUSL
+          # stdenv, so naming it drags in a full musl cross toolchain per guest
+          # ISA -- gcc built from source, tens of minutes, no binary-cache hit --
+          # and nothing outside the perf targets needs it. Having it in the
+          # default environment put that build on the critical path of every
+          # `nix develop` and every CI job. Use `nix develop .#bench` for perf.
+          sqliteCCFor = g:
             let p = pkgsFor g;
-            in "${ccFor g} -I${lib.getDev p.pkgsStatic.sqlite}/include"
-               + " -L${lib.getLib p.pkgsStatic.sqlite}/lib -L${p.glibc.static}/lib";
+            in "${staticCCFor g} -I${lib.getDev p.pkgsStatic.sqlite}/include"
+               + " -L${lib.getLib p.pkgsStatic.sqlite}/lib";
           # The compiler *packages* (not paths) that belong on PATH in a shell.
           ccPkgFor = g: if isNative g then pkgs.gcc else (pkgsFor g).stdenv.cc;
 
@@ -92,6 +103,13 @@
               "${upper g}_DYNAMIC_LIBC" = "${(pkgsFor g).glibc}/lib/libc.so.6";
             })
             { CC = nativeCC; NATIVE_CC = nativeCC; }
+            guestISAs;
+
+          # The perf overlay: identical, except *_LINUX_STATIC_CC also carries
+          # the static sqlite. The Makefile reads the same variable either way.
+          benchEnv = env // lib.foldl'
+            (acc: g: acc // { "${upper g}_LINUX_STATIC_CC" = sqliteCCFor g; })
+            { }
             guestISAs;
         };
 
@@ -272,6 +290,18 @@
               export NATIVE_CC="${tc.nativeCC}"
             '';
           } // lib.optionalAttrs tc.canBuildGuests tc.env);
+
+          # Perf shell: everything the default shell has, plus the static sqlite
+          # the combined-bench sqlite phase links. Separate because resolving it
+          # builds a musl cross toolchain from source per guest ISA.
+          bench = pkgs.mkShell ({
+            packages = [ pkgs.gnumake pkgs.pkg-config ]
+              ++ lib.optionals tc.canBuildGuests tc.crossCompilers;
+            shellHook = lib.optionalString tc.canBuildGuests ''
+              export CC="${tc.nativeCC}"
+              export NATIVE_CC="${tc.nativeCC}"
+            '';
+          } // lib.optionalAttrs tc.canBuildGuests tc.benchEnv);
         });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
