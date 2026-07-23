@@ -22,3 +22,6 @@ results/
 # Test artifact: tests/compat/core/workload/sqlite.c writes this into the CWD
 # when run without an explicit path argument. It was committed by accident.
 test.db
+
+# Scratch dirs created in the CWD by the filesystem/error-matrix compat cases.
+hl_errmat_*/
