@@ -29,10 +29,41 @@ static int output_has(const char *path, const char *needle) {
     return strstr(data, needle) != NULL;
 }
 
+static int output_count(const char *path, const char *needle) {
+    char data[16384];
+    int fd = open(path, O_RDONLY), count = 0;
+    ssize_t size;
+    if (fd < 0) return 0;
+    size = read(fd, data, sizeof(data) - 1);
+    close(fd);
+    if (size < 0) return 0;
+    data[size] = 0;
+    for (char *cursor = data; (cursor = strstr(cursor, needle)) != NULL; cursor += strlen(needle)) count++;
+    return count;
+}
+
 static int wait_for_path(const char *path, time_t deadline) {
     struct timespec tick = {0, 10000000};
     while (time(NULL) < deadline) {
         if (exists(path)) return 0;
+        nanosleep(&tick, NULL);
+    }
+    return -1;
+}
+
+static int wait_for_output(const char *path, const char *needle, time_t deadline) {
+    struct timespec tick = {0, 10000000};
+    while (time(NULL) < deadline) {
+        if (output_has(path, needle)) return 0;
+        nanosleep(&tick, NULL);
+    }
+    return -1;
+}
+
+static int wait_for_output_count(const char *path, const char *needle, int count, time_t deadline) {
+    struct timespec tick = {0, 10000000};
+    while (time(NULL) < deadline) {
+        if (output_count(path, needle) >= count) return 0;
         nanosleep(&tick, NULL);
     }
     return -1;
@@ -100,7 +131,8 @@ static int wait_child(pid_t pid, time_t deadline) {
 }
 
 static pid_t launch(const char *engine, const char *guest, const char *release,
-                    const char *output, const char *checkpoint, int restore, int permissive) {
+                    const char *output, const char *checkpoint, int restore, int permissive,
+                    const char *guest_mode) {
     pid_t pid = fork();
     if (pid != 0) return pid;
     if (!restore && setsid() < 0) _exit(126);
@@ -113,9 +145,14 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
         execl(engine, engine, "--restore-policy", "discard-optional", "--restore", checkpoint, (char *)NULL);
     else if (restore)
         execl(engine, engine, "--restore", checkpoint, (char *)NULL);
+    else if (permissive && guest_mode)
+        execl(engine, engine, "--restore-policy", "discard-optional", "--checkpoint", checkpoint, guest,
+              release, guest_mode, (char *)NULL);
     else if (permissive)
         execl(engine, engine, "--restore-policy", "discard-optional", "--checkpoint", checkpoint, guest,
               release, (char *)NULL);
+    else if (guest_mode)
+        execl(engine, engine, "--checkpoint", checkpoint, guest, release, guest_mode, (char *)NULL);
     else
         execl(engine, engine, "--checkpoint", checkpoint, guest, release, (char *)NULL);
     _exit(127);
@@ -144,13 +181,29 @@ int main(int argc, char **argv) {
     int corrupt_magic_case = argc == 4 && strcmp(argv[3], "corrupt-magic") == 0;
     int corrupt_truncated_case = argc == 4 && strcmp(argv[3], "corrupt-truncated") == 0;
     int corrupt_content_case = argc == 4 && strcmp(argv[3], "corrupt-content") == 0;
+    int corrupt_missing_case = argc == 4 && strcmp(argv[3], "corrupt-missing") == 0;
+    int corrupt_extra_case = argc == 4 && strcmp(argv[3], "corrupt-extra") == 0;
     int permissive_case = argc == 4 &&
                           (strcmp(argv[3], "missing-external") == 0 || connecting_fallback_case);
     int modified_external_case = argc == 4 && strcmp(argv[3], "modified-external") == 0;
+    int io_case = argc == 4 && (!strcmp(argv[3], "io-replace") || !strcmp(argv[3], "io-recreate") ||
+                                !strcmp(argv[3], "io-directory") || !strcmp(argv[3], "io-duplicate") ||
+                                !strcmp(argv[3], "io-device") || !strcmp(argv[3], "io-type-change") ||
+                                !strcmp(argv[3], "io-permission") || !strcmp(argv[3], "io-missing-root") ||
+                                !strcmp(argv[3], "io-append") || !strcmp(argv[3], "io-shortened") ||
+                                !strcmp(argv[3], "io-repeat") || !strcmp(argv[3], "io-directory-change") ||
+                                !strcmp(argv[3], "io-missing-child-strict") || !strcmp(argv[3], "io-fifo-refusal") ||
+                                !strcmp(argv[3], "io-queued-device") || !strcmp(argv[3], "io-queued-missing"));
+    const char *guest_mode = io_case ? argv[3] + 3 : NULL;
+    int io_capture_refusal = io_case && !strcmp(guest_mode, "fifo-refusal");
+    int io_strict_restore = io_case && !strcmp(guest_mode, "missing-child-strict");
+    if (io_case && !io_capture_refusal && !io_strict_restore) permissive_case = 1;
     if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
-         !corrupt_truncated_case && !corrupt_content_case && !permissive_case && !modified_external_case) ||
+         !corrupt_truncated_case && !corrupt_content_case && !corrupt_missing_case && !corrupt_extra_case &&
+         !permissive_case && !modified_external_case &&
+         !io_case) ||
         getcwd(temporary, sizeof temporary) == NULL ||
         strlen(temporary) + sizeof("/build/hl-checkpoint-tree.XXXXXX") > sizeof temporary)
         return 2;
@@ -163,12 +216,14 @@ int main(int argc, char **argv) {
     snprintf(release, sizeof release, "%s/release", temporary);
     snprintf(release_error, sizeof release_error, "%s.error", release);
 
-    child = launch(argv[1], argv[2], release, output, checkpoint, 0, permissive_case);
+    child = launch(argv[1], argv[2], release, output, checkpoint, 0, permissive_case, guest_mode);
     if (child < 0) return 3;
     if (wait_for_ready(output, (deleted_case || threads_case || memfd_case || inotify_case || epoll_case ||
-                                signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case) ? 1 :
+                                signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case ||
+                                (io_case && strcmp(guest_mode, "type-change") && strcmp(guest_mode, "permission") &&
+                                 strcmp(guest_mode, "directory-change") && strcmp(guest_mode, "missing-child-strict"))) ? 1 :
                                    (socketpair_case || connected_socket_case) ? 2 : socket_state_case ? 1 :
-                                   (pipe_case || eventfd_case || timerfd_case || permissive_case) ? 2 : 3,
+                                   (pipe_case || eventfd_case || timerfd_case || permissive_case || io_strict_restore) ? 2 : 3,
                        time(NULL) + TIMEOUT_SECONDS) != 0) {
         fprintf(stderr, "checkpoint runner: readiness timeout one=%d two=%d three=%d\n",
                 output_has(output, "READY 1"), output_has(output, "READY 2"), output_has(output, "READY 3"));
@@ -186,6 +241,11 @@ int main(int argc, char **argv) {
     if (kill(child, SIGURG) != 0) return 5;
 #endif
     result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    if (io_capture_refusal) {
+        if (result != 70 || exists(manifest) || !output_has(output, "incomplete")) return 6;
+        printf("checkpoint io named-fifo refusal: ok\n");
+        return 0;
+    }
     if (connecting_refusal_case) {
         if (result != 70 || exists(manifest) || !output_has(release_error, "connected/in-progress socket")) {
             fprintf(stderr, "checkpoint runner: connecting refusal result=%d manifest=%d diagnostic=%d\n",
@@ -197,7 +257,7 @@ int main(int argc, char **argv) {
     }
     if (result != 0 || wait_for_path(manifest, time(NULL) + TIMEOUT_SECONDS) != 0) return 6;
 
-    if (permissive_case && !connecting_fallback_case) {
+    if (permissive_case && !connecting_fallback_case && !io_case) {
         char external[640];
         snprintf(external, sizeof external, "%s.external", release);
         if (unlink(external) != 0) return 7;
@@ -208,6 +268,44 @@ int main(int argc, char **argv) {
         fd = open(external, O_WRONLY | O_TRUNC);
         if (fd < 0 || write(fd, "after", 5) != 5 || fsync(fd) != 0) return 7;
         close(fd);
+    }
+    if (io_case) {
+        char external[640], replacement[660], nested[680];
+        snprintf(external, sizeof external, "%s.external", release);
+        if (!strcmp(guest_mode, "replace")) {
+            snprintf(replacement, sizeof replacement, "%s.new", external);
+            fd = open(replacement, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0 || write(fd, "replacement", 11) != 11 || fsync(fd) != 0 || close(fd) != 0 ||
+                rename(replacement, external) != 0)
+                return 7;
+        } else if (!strcmp(guest_mode, "recreate")) {
+            if (unlink(external) != 0) return 7;
+            fd = open(external, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (fd < 0 || write(fd, "recreated", 9) != 9 || fsync(fd) != 0 || close(fd) != 0) return 7;
+        } else if (!strcmp(guest_mode, "directory")) {
+            snprintf(nested, sizeof nested, "%s/current", external);
+            fd = open(nested, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0 || write(fd, "current", 7) != 7 || fsync(fd) != 0 || close(fd) != 0) return 7;
+        } else if (!strcmp(guest_mode, "type-change")) {
+            if (unlink(external) != 0 || mkdir(external, 0700) != 0) return 7;
+        } else if (!strcmp(guest_mode, "directory-change")) {
+            if (rmdir(external) != 0) return 7;
+            fd = open(external, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (fd < 0 || close(fd) != 0) return 7;
+        } else if (!strcmp(guest_mode, "permission")) {
+            if (chmod(external, 0000) != 0) return 7;
+        } else if (!strcmp(guest_mode, "missing-root")) {
+            if (unlink(external) != 0) return 7;
+        } else if (!strcmp(guest_mode, "queued-missing")) {
+            if (unlink(external) != 0) return 7;
+        } else if (!strcmp(guest_mode, "missing-child-strict")) {
+            if (unlink(external) != 0) return 7;
+        } else if (!strcmp(guest_mode, "append")) {
+            fd = open(external, O_WRONLY | O_APPEND);
+            if (fd < 0 || write(fd, "host", 4) != 4 || fsync(fd) != 0 || close(fd) != 0) return 7;
+        } else if (!strcmp(guest_mode, "shortened")) {
+            if (truncate(external, 2) != 0) return 7;
+        }
     }
 
     fd = open(release, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -241,28 +339,85 @@ int main(int argc, char **argv) {
             return 7;
         close(fd);
     }
-    child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case);
+    if (corrupt_missing_case) {
+        char signals[640];
+        snprintf(signals, sizeof signals, "%s/proc.1/signals", checkpoint);
+        if (unlink(signals) != 0) return 7;
+    }
+    if (corrupt_extra_case) {
+        char extra[640];
+        snprintf(extra, sizeof extra, "%s/unexpected", checkpoint);
+        fd = open(extra, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 || write(fd, "unexpected", 10) != 10 || fsync(fd) != 0 || close(fd) != 0) return 7;
+    }
+    child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case, NULL);
     if (child < 0) return 8;
     result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
-    if (corrupt_magic_case || corrupt_truncated_case || corrupt_content_case) {
+    if (io_case && (!strcmp(guest_mode, "missing-root") || !strcmp(guest_mode, "queued-missing"))) {
+        char report[640];
+        snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
+        if (result == 0 || result == 124 ||
+            (!output_has(report, "container init") && !output_has(report, "required external") &&
+             !output_has(report, "queued external")))
+            return 8;
+        printf("checkpoint io %s refusal: ok\n", guest_mode);
+        return 0;
+    }
+    if (io_strict_restore) {
+        char report[640];
+        snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
+        if (result == 0 || result == 124 || !output_has(report, "required external")) return 8;
+        printf("checkpoint io strict missing-child refusal: ok\n");
+        return 0;
+    }
+    if (corrupt_magic_case || corrupt_truncated_case || corrupt_content_case || corrupt_missing_case ||
+        corrupt_extra_case) {
         if (result == 0 || result == 124 || output_has(output, "TREE-RESTORED")) {
             fprintf(stderr, "checkpoint runner: corrupt image accepted mode=%s result=%d restored=%d\n",
-                    corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" : "content", result,
+                    corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" :
+                    corrupt_content_case ? "content" : corrupt_missing_case ? "missing" : "extra", result,
                     output_has(output, "TREE-RESTORED"));
             return 8;
         }
         printf("checkpoint corrupt-%s rejection: ok\n",
-               corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" : "content");
+               corrupt_magic_case ? "magic" : corrupt_truncated_case ? "truncated" :
+               corrupt_content_case ? "content" : corrupt_missing_case ? "missing" : "extra");
         return 0;
     }
     if (result != 0) {
         fprintf(stderr, "checkpoint runner: restore exited %d\n", result);
         return 8;
     }
+    if (io_case) {
+        char report[640], marker[128];
+        snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
+        if (!strcmp(guest_mode, "type-change") || !strcmp(guest_mode, "permission") ||
+            !strcmp(guest_mode, "directory-change")) {
+            if (wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+                output_has(output, "IO-CHILD-RESTORED") ||
+                !output_has(report, "\"outcome\":\"stopped\""))
+                return 9;
+        } else {
+            snprintf(marker, sizeof marker, "IO-%s-RESTORED", guest_mode);
+            for (char *p = marker; *p; ++p)
+                if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
+            if (wait_for_output(output, marker, time(NULL) + TIMEOUT_SECONDS) != 0 ||
+                !output_has(report, "\"outcome\":\"reconnected\""))
+                return 9;
+        }
+        if (!strcmp(guest_mode, "repeat")) {
+            child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case, NULL);
+            if (child < 0 || wait_child(child, time(NULL) + TIMEOUT_SECONDS) != 0 ||
+                wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, time(NULL) + TIMEOUT_SECONDS) != 0)
+                return 9;
+        }
+        printf("checkpoint io %s: ok\n", guest_mode);
+        return 0;
+    }
     if (connecting_fallback_case) {
         char report[640];
         snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
-        if (!output_has(output, "CONNECTING-FALLBACK-RESTORED") ||
+        if (wait_for_output(output, "CONNECTING-FALLBACK-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
             !output_has(report, "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint connecting-socket fallback: ok\n");
@@ -271,7 +426,8 @@ int main(int argc, char **argv) {
     if (permissive_case) {
         char report[640];
         snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
-        if (!output_has(output, "PARENT-RESTORED") || output_has(output, "CHILD-RESTORED") ||
+        if (wait_for_output(output, "PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            output_has(output, "CHILD-RESTORED") ||
             !output_has(report, "\"outcome\":\"stopped\"") || !output_has(report, "required external path"))
             return 9;
         printf("checkpoint missing-external pruning: ok\n");
@@ -280,7 +436,7 @@ int main(int argc, char **argv) {
     if (modified_external_case) {
         char report[640];
         snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
-        if (!output_has(output, "MODIFIED-EXTERNAL-RESTORED") ||
+        if (wait_for_output(output, "MODIFIED-EXTERNAL-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
             !output_has(report, "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint modified-external current-state restore: ok\n");

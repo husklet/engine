@@ -837,6 +837,18 @@ $(BUILD)/e2e/checkpoint-connecting-refusal-aarch64: tests/e2e/checkpoint_connect
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
+$(BUILD)/e2e/checkpoint-connecting-fallback-aarch64: tests/e2e/checkpoint_connecting_fallback.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-missing-external-aarch64: tests/e2e/checkpoint_missing_external.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-modified-external-aarch64: tests/e2e/checkpoint_modified_external.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
 define checkpoint_x86_fixture
 $(BUILD)/e2e/checkpoint-$(1)-x86_64: tests/e2e/$(2).c
 	@mkdir -p $$(@D)
@@ -859,6 +871,11 @@ $(eval $(call checkpoint_x86_fixture,connecting-refusal,checkpoint_connecting_re
 $(eval $(call checkpoint_x86_fixture,connecting-fallback,checkpoint_connecting_fallback,))
 $(eval $(call checkpoint_x86_fixture,missing-external,checkpoint_missing_external,))
 $(eval $(call checkpoint_x86_fixture,modified-external,checkpoint_modified_external,))
+$(eval $(call checkpoint_x86_fixture,io-recovery,checkpoint_io_recovery,))
+
+$(BUILD)/e2e/checkpoint-io-recovery-aarch64: tests/e2e/checkpoint_io_recovery.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
 $(BUILD)/e2e/guest-domain-aarch64: tests/e2e/guest_domain.c
 	@mkdir -p $(@D)
@@ -2024,6 +2041,53 @@ e2e-checkpoint-recovery-x86_64: $(BUILD)/tools/checkpoint-tree-runner \
 		$(abspath $(BUILD)/e2e/checkpoint-connecting-fallback-x86_64) connecting-fallback
 	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/checkpoint-tree-x86_64) corrupt-content
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-x86_64) corrupt-missing
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-x86_64) corrupt-extra
+
+e2e-checkpoint-recovery-aarch64: $(BUILD)/tools/checkpoint-tree-runner \
+	$(BUILD)/e2e/checkpoint-missing-external-aarch64 $(BUILD)/e2e/checkpoint-modified-external-aarch64 \
+	$(BUILD)/e2e/checkpoint-connecting-fallback-aarch64 $(BUILD)/e2e/checkpoint-tree-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-missing-external-aarch64) missing-external
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-modified-external-aarch64) modified-external
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-connecting-fallback-aarch64) connecting-fallback
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-content
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-missing
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-extra
+
+CHECKPOINT_IO_CASES := io-replace io-recreate io-directory io-duplicate io-device io-type-change io-permission \
+	io-missing-root io-append io-shortened io-repeat io-directory-change io-missing-child-strict io-fifo-refusal \
+	io-queued-device io-queued-missing
+
+e2e-checkpoint-io-x86_64: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-io-recovery-x86_64 \
+	$(BUILD)/production/hl-engine-linux-x86_64
+	@set -e; for case in $(CHECKPOINT_IO_CASES); do \
+		$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+			$(abspath $(BUILD)/e2e/checkpoint-io-recovery-x86_64) "$$case"; \
+	done
+
+e2e-checkpoint-io-aarch64: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-io-recovery-aarch64 \
+	$(BUILD)/production/hl-engine-linux-aarch64
+	@set -e; for case in $(CHECKPOINT_IO_CASES); do \
+		$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+			$(abspath $(BUILD)/e2e/checkpoint-io-recovery-aarch64) "$$case"; \
+	done
+
+e2e-checkpoint-io-full: e2e-checkpoint-io-x86_64 e2e-checkpoint-io-aarch64 \
+	e2e-checkpoint-recovery-x86_64 e2e-checkpoint-recovery-aarch64 e2e-checkpoint-x86_64 \
+	e2e-checkpoint-tree e2e-checkpoint-signal e2e-checkpoint-pipe e2e-checkpoint-deleted \
+	e2e-checkpoint-threads e2e-checkpoint-memfd e2e-checkpoint-eventfd e2e-checkpoint-timerfd \
+	e2e-checkpoint-inotify e2e-checkpoint-epoll e2e-checkpoint-socketpair e2e-checkpoint-socket-state \
+	e2e-checkpoint-connected-socket e2e-checkpoint-connecting-refusal e2e-checkpoint-corrupt-magic \
+	e2e-checkpoint-corrupt-truncated
 
 e2e-embedding-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
