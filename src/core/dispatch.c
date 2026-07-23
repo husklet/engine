@@ -346,12 +346,13 @@ static void run_guest(struct cpu *c) {
         if (!stw_before_translated(selected_bus_epoch)) continue;
         // map_host()/translate_block() return RW-alias addresses; execute via the RX alias.
         run_block(c, rxcode);
+        // The translated image is fully spilled at block return. Release STW ownership before reason handling:
+        // clone and mapping syscalls may themselves initiate a stop-the-world operation and must not wait on
+        // their own caller. Checkpoint capture still occurs at the next loop-top dispatcher safepoint.
+        stw_after_translated();
         // Frontend hook: post-run_block reason handling (aarch64: R_SYSCALL service + pc+=4, else R_BRANCH;
         // x86 adds R_CPUID/x87/DIV/IDIV/99). The per-arch syscall pc-advance convention lives in the hook.
         G_DISPATCH_REASON(c);
-        // Keep in_translated asserted through reason/service handling. Once cleared, the CPU is a complete
-        // resumable dispatcher image, so an asynchronous checkpoint park may safely acknowledge it.
-        stw_after_translated();
         // W4E tier-2: a hot self-loop's back-edge counter fired -> recompile+swap it in. pc is already =
         // loop start, so the next iteration of this dispatcher loop runs the folded block. R_TIER2 is
         // disjoint from R_SYSCALL (handled in the reason hook above) so this never double-fires.

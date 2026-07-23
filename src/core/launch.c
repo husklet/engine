@@ -21,6 +21,13 @@
 #include "launch.h"
 #include "options.h"
 
+/* Portable core/unit links intentionally do not include a production host implementation. Production engines
+ * resolve these hooks from host/private.c; weak lookup keeps the config reader portable without sacrificing
+ * private-descriptor registration when that implementation is present. */
+extern void hl_host_private_init(void) __attribute__((weak));
+extern int hl_host_process_fd_private_add(int descriptor) __attribute__((weak));
+extern void hl_host_process_fd_private_remove(int descriptor) __attribute__((weak));
+
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
 int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
                        const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
@@ -338,15 +345,15 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
     }
     /* The unlinked launch wire remains open while the runner owns pointers
      * decoded from it.  It is engine control state, never a guest descriptor. */
-    hl_host_private_init();
-    if (hl_host_process_fd_private_add(fd) != 0) {
+    if (hl_host_private_init != NULL) hl_host_private_init();
+    if (hl_host_process_fd_private_add != NULL && hl_host_process_fd_private_add(fd) != 0) {
         close(fd);
         fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
         return 78;
     }
     unlink(path);
     int rc = hl_read_config_file(fd, runner);
-    hl_host_process_fd_private_remove(fd);
+    if (hl_host_process_fd_private_remove != NULL) hl_host_process_fd_private_remove(fd);
     close(fd);
     return rc;
 }
