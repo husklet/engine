@@ -317,6 +317,10 @@ ISA_X86_64_FIXTURES := ctest_x64 g_x64 go_goro_x86 go_heapgc_x86 gw hello_x86 hx
 ISA_X86_64_SOURCES := isa_regress
 ISA_X86_64_BINS := $(ISA_X86_64_FIXTURES:%=$(BUILD)/compat/isa/x86_64/%) \
 	$(ISA_X86_64_SOURCES:%=$(BUILD)/compat/isa/x86_64/%)
+# aarch64 counterpart: the lowering divergences the differential aarch64 ISA fuzzer
+# (tests/fuzz/isa/aarch64) found against a NATIVE run of the same binary on the ARM64 host.
+ISA_AARCH64_SOURCES := isa_regress
+ISA_AARCH64_BINS := $(ISA_AARCH64_SOURCES:%=$(BUILD)/compat/isa/aarch64/%)
 # These are committed binary inputs, not native host build targets; suppress built-in .c rules.
 $(ISA_X86_64_FIXTURES:%=tests/compat/isa/x86_64/%): ;
 CORE_ABI_BOTH := hello math strings bitops varargs longjmp recursion fnptr jumptable ibtc_dispatch floatmath \
@@ -373,7 +377,7 @@ SOAK_CASE_BINS := $(SOAK_CASE_NAMES:%=$(BUILD)/soak/aarch64/%) \
 	$(SOAK_CASE_NAMES:%=$(BUILD)/soak/x86_64/%)
 
 .PHONY: all linux-compile clean install uninstall package-test FORCE test sanitize unit $(UNIT_RUN_TARGETS) test-debug-log test-macos compat-build compat-native compat-engines dynamic-e2e e2e-compat e2e-checkpoint-tree e2e-checkpoint-signal e2e-checkpoint-pipe e2e-checkpoint-deleted e2e-checkpoint-threads e2e-checkpoint-memfd e2e-mac-build e2e-mac-build-signal e2e-mac-build-control e2e-mac-build-hygiene e2e-mac-build-fd e2e-mac-build-stdio e2e-mac-build-dir e2e-lifecycle-signal e2e-lifecycle-control e2e-lifecycle-hygiene e2e-embedding-fd e2e-embedding-stdio e2e-embedding-dir e2e-mac-gates \
-	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
+	compat-abi compat-abi-corpus compat-core compat-core-abi compat-core-regress compat-core-syscall compat-core-workload compat-filesystem compat-ipc compat-isa-aarch64 compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-threads compat-time $(E2E_CASE_RUNS) perf-compat perf-macos perf-native-aarch64 format format-check help
 
 # A mac bridge launch owns a remote process group and a shared capture mount.
 # Concurrent suites can starve a launch past the transport deadline and overlap
@@ -1077,6 +1081,11 @@ $(BUILD)/compat/time/x86_64/%: tests/compat/time/%.c
 $(BUILD)/compat/isa/x86_64/isa_regress: tests/compat/isa/x86_64/isa_regress.c
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static -no-pie -fno-pie -std=gnu11 $< -o $@
+
+# -static -no-pie on purpose: g_nonpie_lo must be armed for the LSE-upgrade and bias-fold paths.
+$(BUILD)/compat/isa/aarch64/isa_regress: tests/compat/isa/aarch64/isa_regress.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -no-pie -fno-pie -std=gnu11 $< -o $@
 
 $(BUILD)/compat/isa/x86_64/%: tests/compat/isa/x86_64/%
 	@mkdir -p $(@D)
@@ -1823,7 +1832,7 @@ $(BUILD)/tools/stdio-x86_64: $(BUILD)/mac/stdio/x86_64-runner.o \
 	$(MAC) clang -o $@ $(filter %.o %.a,$^)
 	$(MAC) $(CODESIGN) -s - --entitlements packaging/macos/jit.entitlements -f $@
 
-e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time \
+e2e-compat: test-macos compat-engines compat-abi compat-abi-corpus compat-core compat-filesystem compat-ipc compat-threads compat-isa-aarch64 compat-isa-x86-64 compat-isolation compat-libc compat-completeness compat-memory compat-network compat-posix compat-process compat-procfs compat-signals compat-soak compat-syscall compat-syscall-edges compat-time \
 	$(BUILD)/tools/e2e-runner $(BUILD)/tools/config-e2e-runner \
 	$(BUILD)/tools/lifecycle-aarch64 $(BUILD)/tools/lifecycle-x86_64 \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \
@@ -2333,6 +2342,11 @@ compat-isa-x86-64: compat-engines $(BUILD)/tools/matrix-runner $(ISA_X86_64_BINS
 		$(abspath $(BUILD)/compat/isa/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/compat/isa/x86_64) $(abspath tests/compat/isa/x86_64)
 
+compat-isa-aarch64: compat-engines $(BUILD)/tools/matrix-runner $(ISA_AARCH64_BINS)
+	$(BUILD)/tools/matrix-runner $(MAC) $(abspath $(BUILD)/production/hl-engine-linux-aarch64) \
+		$(abspath $(BUILD)/compat/isa/aarch64) $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/compat/isa/x86_64) $(abspath tests/compat/isa/aarch64)
+
 compat-core: compat-core-abi compat-core-syscall compat-core-regress compat-core-workload
 
 compat-core-abi: compat-engines $(BUILD)/tools/matrix-runner $(CORE_ABI_BINS)
@@ -2362,6 +2376,25 @@ isa-fuzz: $(BUILD)/linux-production/hl-engine-linux-x86_64
 
 isa-fuzz-regress: $(BUILD)/linux-production/hl-engine-linux-x86_64
 	tests/fuzz/isa/x86_64/run.sh --list "$(ISA_FUZZ_REGRESS_SEEDS)" --ignore-mxcsr
+
+# ---- differential AArch64 ISA fuzzing (tests/fuzz/isa/aarch64) ------------------------------
+#   isa-fuzz-arm          : campaign over ISA_FUZZ_ARM_SEEDS fresh seeds (default 200)
+#   isa-fuzz-arm-regress  : the deterministic seed set below -- cheap, for CI
+# The oracle is the ARM64 HOST running the same binary, so this needs no emulator and no cross
+# compiler; it is ARM64-Linux only (run.sh refuses to run elsewhere). Nothing is masked: every
+# dumped register, NZCV, FPSR, FPCR, all 32 V registers and the scratch-memory hash are compared.
+ISA_FUZZ_ARM_SEEDS ?= 200
+ISA_FUZZ_ARM_ARGS ?= +i8mm +bf16 +dczva +fpcr
+ISA_FUZZ_ARM_REGRESS_SEEDS := 1 2 9 10 22 26 37 44 55 70 93 99 118 150 153 173 184 202 215 226 244 275 283 300
+
+.PHONY: isa-fuzz-arm isa-fuzz-arm-regress
+isa-fuzz-arm: $(BUILD)/linux-production/hl-engine-linux-aarch64
+	tests/fuzz/isa/aarch64/run.sh --seeds $(ISA_FUZZ_ARM_SEEDS) --gen-args "$(ISA_FUZZ_ARM_ARGS)"
+
+isa-fuzz-arm-regress: $(BUILD)/linux-production/hl-engine-linux-aarch64
+	tests/fuzz/isa/aarch64/run.sh --list "$(ISA_FUZZ_ARM_REGRESS_SEEDS)" --gen-args "$(ISA_FUZZ_ARM_ARGS)"
+	tests/fuzz/isa/aarch64/run.sh --list "$(ISA_FUZZ_ARM_REGRESS_SEEDS)" --pie \
+		--gen-args "$(ISA_FUZZ_ARM_ARGS)" --out $(BUILD)/isafuzz-arm-pie
 
 .PHONY: compat-core-workload-extended
 compat-core-workload-extended: compat-engines $(BUILD)/tools/matrix-runner $(CORE_WORKLOAD_BINS)

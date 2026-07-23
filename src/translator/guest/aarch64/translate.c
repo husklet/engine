@@ -136,7 +136,43 @@ static int uses_x18(uint32_t in, int mask) {
    ADDV therefore preserves the exact 32-bit modular accumulation semantics.
    USMMLA is U8*S8: reinterpret (u8 - 128) as s8, then add 128*sum(s8) for
    each right-hand row. */
+// FEAT_I8MM / FEAT_BF16 are OPTIONAL, and the engine's CPU model does not advertise them, so a guest that
+// uses them is already reaching past the contract. Where the HOST implements them the honest answer is the
+// architectural one: copy the instruction verbatim (same ISA, same silicon, bit-exact and faster). The
+// lowerings below are the fallback for hosts that lack the extension. This matters for BFDOT in particular:
+// its architectural definition adds both bf16 products and the addend with a SINGLE rounding and forced
+// FZ/DN, and it raises no FP exceptions -- properties the widen/fmul/pairwise-add decomposition cannot
+// reproduce (the differential ISA fuzzer, tests/fuzz/isa/aarch64, showed 1-ulp results, wrong NaN payloads
+// and a spurious FPSR.UFC). Probed once, before any translation runs.
+static int g_host_i8mm, g_host_bf16;
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1u << 13)
+#endif
+#ifndef HWCAP2_BF16
+#define HWCAP2_BF16 (1u << 14)
+#endif
+__attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
+    unsigned long h2 = getauxval(AT_HWCAP2);
+    g_host_i8mm = (h2 & HWCAP2_I8MM) ? 1 : 0;
+    g_host_bf16 = (h2 & HWCAP2_BF16) ? 1 : 0;
+}
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+static int hl_sysctl_flag(const char *name) {
+    int v = 0;
+    size_t n = sizeof v;
+    return sysctlbyname(name, &v, &n, NULL, 0) == 0 && v;
+}
+__attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
+    g_host_i8mm = hl_sysctl_flag("hw.optional.arm.FEAT_I8MM");
+    g_host_bf16 = hl_sysctl_flag("hw.optional.arm.FEAT_BF16");
+}
+#endif
+
 static int is_i8mm_mmla(uint32_t in) {
+    if (g_host_i8mm) return 0;
     uint32_t op = in & ~(0x1Fu | (0x1Fu << 5) | (0x1Fu << 16));
     return op == 0x4E80A400u || op == 0x6E80A400u || op == 0x4E80AC00u;
 }
@@ -206,10 +242,12 @@ static void emit_i8mm_mmla(uint32_t in) {
    the rounded high half of the IEEE binary32 encoding; BFDOT can be expressed
    exactly with baseline widening, shifts, FP multiply, and pairwise add. */
 static int is_bf16_bfcvt(uint32_t in) {
+    if (g_host_bf16) return 0;
     return (in & ~(0x1Fu | (0x1Fu << 5))) == 0x1E634000u;
 }
 
 static int is_bf16_bfdot(uint32_t in) {
+    if (g_host_bf16) return 0;
     return (in & ~(0x1Fu | (0x1Fu << 5) | (0x1Fu << 16))) == 0x6E40FC00u;
 }
 
@@ -1384,6 +1422,17 @@ static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
         emit32(in);
 }
 
+// The rewritten LSE op replaces a whole ldxr/stxr RETRY LOOP, and that loop only ever falls out of
+// `cbnz Ws, loop` with the store-exclusive status register Ws == 0. A single LSE instruction never
+// touches Ws, so without this the guest keeps the stale pre-loop value of Ws -- an architectural
+// divergence the differential ISA fuzzer (tests/fuzz/isa/aarch64) caught directly. Emit it LAST: in
+// the original loop the stxr writes Ws after every other operand, so a Ws that aliases Wt/Ws2/Wm
+// must also end up zero.
+static void emit_lse_status_zero(int Ws) {
+    if (Ws == 31) return; /* stxr wzr: the status is architecturally discarded */
+    emit_atomic_part(0x2A1F03E0u | (uint32_t)Ws, 1, 0); /* mov Ws, wzr */
+}
+
 // Returns bytes consumed (12 or 16) if a known atomic loop at gpc was rewritten, else 0.
 static int try_lse_atomic(uint64_t gpc) {
     uint32_t i0 = *(uint32_t *)gpc;
@@ -1415,6 +1464,7 @@ static int try_lse_atomic(uint64_t gpc) {
             if (guestbase_on() || is_stolen(Wt) || is_stolen(Xn) || is_stolen(Ws) || is_stolen(Wv)) {
                 // swpal Wv, Wt, [Xn] (a single LSE op; emit_atomic_part folds/mangles the corner cases).
                 emit_atomic_part(0xB8E08000u | (sz == 3 ? 0x40000000u : 0) | (Wv << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
+                emit_lse_status_zero(Ws);
                 g_lse_n++;
                 return 12;
             }
@@ -1468,6 +1518,7 @@ static int try_lse_atomic(uint64_t gpc) {
                 }
                 // reconstruct the new value (re-emit the original op) for any following guest code
                 emit_atomic_part(i1, gpr_field_mask(i1), 0);
+                emit_lse_status_zero(Ws);
                 g_lse_n++;
                 return 16;
             }
@@ -1492,6 +1543,7 @@ static int try_lse_atomic(uint64_t gpc) {
                 emit_atomic_part(0xB8E00000u | szb | (Ws << 16) | (Xn << 5) | Wt, 1 | 2 | 4, 1);
                 // re-emit add Ws2, Wt, #imm (reconstruct the new value)
                 emit_atomic_part(i1, gpr_field_mask(i1), 0);
+                emit_lse_status_zero(Ws);
                 g_lse_n++;
                 return 16;
             }
@@ -1523,6 +1575,16 @@ static int try_lse_atomic(uint64_t gpc) {
             emit_atomic_part((sz == 3 ? 0xC8E0FC00u : 0x88E0FC00u) | (Wt << 16) | (Xn << 5) | Wnew, 1 | 2 | 4 | 8, 1);
             // cmp Wt, Wexp (reproduce NZCV): subs wzr, Wt, Wexp -> Rn=Wt[5], Rm=Wexp[16]
             emit_atomic_part(0x6B00001Fu | szd | (Wexp << 16) | (Wt << 5), 2 | 4, 0);
+            // The guest loop reaches `stxr Ws` only when the compare matched; on the b.ne-out path Ws
+            // keeps its pre-loop value. Reproduce both with a csel off the NZCV just recomputed.
+            {
+                int Ws = (i3 >> 16) & 31;
+                // 64-bit csel: the not-taken path must preserve the FULL guest register (a 32-bit csel
+                // would zero the top half of an untouched Ws); the taken path selects xzr, and stxr's
+                // W-sized status write is zero-extending anyway, so 0 is right for it too.
+                if (Ws != 31)
+                    emit_atomic_part(0x9A800000u | ((uint32_t)Ws << 16) | (31u << 5) | (uint32_t)Ws, 1 | 2 | 4, 0);
+            }
             g_lse_n++;
             return 20;
         }
@@ -2106,12 +2168,19 @@ static void *translate_block(uint64_t gpc) {
         // load-acquire/store-release (o2=1: LDAR/LDLAR/STLR/STLLR), which are NOT part of an exclusive
         // pair. Masking bit23 in (0x3FC00000) keeps a bare LDAR -- ubiquitous in C++ std::atomic and
         // glibc -- from opening the region and leaving in_excl stuck on. L (bit22) selects load vs store.
-        if ((in & 0x3FC00000u) == 0x08400000u)
-            // load-exclusive (o2=0, L=1)
-            in_excl = 1;
-        else if (in_excl && (in & 0x3FC00000u) == 0x08000000u)
-            // store-exclusive (o2=0, L=0)
-            in_excl = 0;
+        // CASP/CASPA/CASPL/CASPAL share this encoding box (o2=0, and A reuses the L bit), so the plain
+        // mask alone reads CASPA/CASPAL as a load-exclusive and CASP/CASPL as a store-exclusive. A CASPA
+        // then latches in_excl ON for the rest of the block, which disables the non-PIE bias fold for
+        // every following memory op -- a fatal SIGSEGV on the next low image access. Exclude CASP here;
+        // it is a single self-contained instruction and opens no monitor region.
+        if (!is_casp(in)) {
+            if ((in & 0x3FC00000u) == 0x08400000u)
+                // load-exclusive (o2=0, L=1)
+                in_excl = 1;
+            else if (in_excl && (in & 0x3FC00000u) == 0x08000000u)
+                // store-exclusive (o2=0, L=0)
+                in_excl = 0;
+        }
         // Defensive: the deferred-branch table is fixed-size. If a region ever fills it (pathological
         // or mis-decoded -- a real LDXR..STXR pair never holds this many conditional branches), end the
         // region here so the branches below take the normal exit path instead of overflowing defer[].
@@ -2725,7 +2794,7 @@ static void *translate_block(uint64_t gpc) {
                between LDXR/LDXP and STXR/STXP, which would clear the host
                exclusive monitor; activation cannot publish a new BUS range
                until this thread reaches the dispatcher. */
-            if ((in & 0x3FC00000u) == 0x08400000u) {
+            if ((in & 0x3FC00000u) == 0x08400000u && !is_casp(in)) {
                 uint64_t bytes = UINT64_C(1) << ((in >> 30) & 3);
                 if ((in >> 21) & 1) bytes *= 2;
                 emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
