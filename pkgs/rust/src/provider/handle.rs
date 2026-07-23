@@ -1,5 +1,5 @@
-use crate::provider::{LinuxError, ResourceId};
 use crate::api::extension::{Protections, ServiceId, Sharing};
+use crate::provider::{LinuxError, ResourceId};
 use std::{collections::BTreeSet, time::SystemTime};
 
 /// Opens provider resources. Guest descriptor numbers never cross this boundary.

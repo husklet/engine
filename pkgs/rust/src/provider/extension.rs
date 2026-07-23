@@ -1,4 +1,3 @@
-use crate::provider::{ExtensionError, Lifecycle, ProcessId};
 use crate::api::{
     extension::{
         ExtensionCapability, ExtensionConfig, ExtensionLimits, ExtensionSelection, ExtensionSpec,
@@ -6,6 +5,7 @@ use crate::api::{
     },
     Version,
 };
+use crate::provider::{ExtensionError, Lifecycle, ProcessId};
 use std::{collections::BTreeSet, time::SystemTime};
 
 /// A manifest and preparation boundary implemented outside the engine core.

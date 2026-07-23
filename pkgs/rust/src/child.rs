@@ -1,4 +1,4 @@
-use crate::{ffi, result, configfile::ConfigFile, Domain, Error, Exit, Terminal};
+use crate::{configfile::ConfigFile, ffi, result, Domain, Error, Exit, Terminal};
 use std::{fs::File, io::Read};
 
 /// Owned running engine process.

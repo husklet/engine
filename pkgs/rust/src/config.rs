@@ -212,7 +212,10 @@ impl Config {
 
     /// Select recovery behavior for resources that changed or disappeared after capture.
     #[must_use]
-    pub const fn checkpoint_policy(mut self, policy: crate::spec::IncompatibleResourcePolicy) -> Self {
+    pub const fn checkpoint_policy(
+        mut self,
+        policy: crate::spec::IncompatibleResourcePolicy,
+    ) -> Self {
         self.checkpoint_policy = policy;
         self
     }

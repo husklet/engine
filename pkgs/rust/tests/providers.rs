@@ -1,15 +1,15 @@
 use std::{collections::BTreeSet, sync::Arc, time::SystemTime};
 
+use hl_engine::extension::{
+    ExtensionError, ExtensionErrorCategory, ExtensionManifest, ExtensionProvider, PrepareContext,
+    PreparedExtension, ProcessId,
+};
 use hl_engine::{
     extension::{
         ExtensionConfig, ExtensionLimits, Feature, FileEntry, FileSource, Inheritance,
         MemoryRequirement, Metadata, NamespaceEntry, Protections, ProviderId, Sharing,
     },
     Version,
-};
-use hl_engine::extension::{
-    ExtensionError, ExtensionErrorCategory, ExtensionManifest, ExtensionProvider, PrepareContext,
-    PreparedExtension, ProcessId,
 };
 
 struct Files;

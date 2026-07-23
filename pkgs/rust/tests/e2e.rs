@@ -71,7 +71,10 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
     let machine = Engine::new().spawn(capture, io).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while machine.processes().unwrap().len() != 3 {
-        assert!(Instant::now() < deadline, "guest process tree did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "guest process tree did not become ready"
+        );
         thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(
@@ -130,7 +133,10 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "pipe process tree did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "pipe process tree did not become ready"
+        );
         thread::sleep(Duration::from_millis(2));
     }
     machine.checkpoint(Duration::from_secs(10)).unwrap();
@@ -144,7 +150,9 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
         Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
         Exit::Code(0)
     );
-    assert!(fs::read_to_string(output).unwrap().contains("PIPE-RESTORED"));
+    assert!(fs::read_to_string(output)
+        .unwrap()
+        .contains("PIPE-RESTORED"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -175,7 +183,10 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
         .unwrap_or_default()
         .contains("READY 1")
     {
-        assert!(Instant::now() < deadline, "deleted-file guest did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "deleted-file guest did not become ready"
+        );
         thread::sleep(Duration::from_millis(2));
     }
     machine.checkpoint(Duration::from_secs(10)).unwrap();
