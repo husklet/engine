@@ -7,9 +7,14 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 12u
+#define HL_CONFIG_ABI 13u
 #define HL_CONFIG_ABI_LEGACY 10u
 #define HL_CONFIG_ABI_NETWORK_TRANSPORT 11u
+#define HL_CONFIG_ABI_OVERLAY 12u
+#define HL_CONFIG_ABI_CHECKPOINT_POLICY 13u
+#define HL_CONFIG_CHECKPOINT_REFUSE 0u
+#define HL_CONFIG_CHECKPOINT_RECONNECT 1u
+#define HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL 2u
 #define HL_CONFIG_NETWORK_VIRTUAL 0u
 #define HL_CONFIG_NETWORK_ISOLATED 1u
 #define HL_CONFIG_NETWORK_HOST 2u
@@ -67,7 +72,9 @@ typedef struct hl_launch_config {
     /* ABI 12: NUL-terminated lower path records starting at lower_layers_offset. */
     uint32_t lower_layer_count;
     uint32_t overlay_work_offset;
-    uint32_t reserved_abi12[2];
+    /* ABI 13: behavior when a saved external resource cannot be reconstructed. */
+    uint32_t checkpoint_policy;
+    uint32_t reserved_abi13;
 } hl_launch_config;
 
 typedef enum hl_launch_result_kind {

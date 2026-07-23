@@ -856,6 +856,8 @@ $(eval $(call checkpoint_x86_fixture,socketpair,checkpoint_socketpair,))
 $(eval $(call checkpoint_x86_fixture,socket-state,checkpoint_socket_state,))
 $(eval $(call checkpoint_x86_fixture,connected-socket,checkpoint_connected_socket,))
 $(eval $(call checkpoint_x86_fixture,connecting-refusal,checkpoint_connecting_refusal,))
+$(eval $(call checkpoint_x86_fixture,missing-external,checkpoint_missing_external,))
+$(eval $(call checkpoint_x86_fixture,modified-external,checkpoint_modified_external,))
 
 $(BUILD)/e2e/guest-domain-aarch64: tests/e2e/guest_domain.c
 	@mkdir -p $(@D)
@@ -2008,6 +2010,14 @@ e2e-checkpoint-x86_64: $(BUILD)/tools/checkpoint-tree-runner $(CHECKPOINT_X86_BI
 	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-socket-state-x86_64) socket-state
 	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-connected-socket-x86_64) connected-socket
 	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) $(abspath $(BUILD)/e2e/checkpoint-connecting-refusal-x86_64) connecting-refusal
+
+e2e-checkpoint-recovery-x86_64: $(BUILD)/tools/checkpoint-tree-runner \
+	$(BUILD)/e2e/checkpoint-missing-external-x86_64 $(BUILD)/e2e/checkpoint-modified-external-x86_64 \
+	$(BUILD)/production/hl-engine-linux-x86_64
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/checkpoint-missing-external-x86_64) missing-external
+	$(BUILD)/tools/checkpoint-tree-runner $(abspath $(BUILD)/production/hl-engine-linux-x86_64) \
+		$(abspath $(BUILD)/e2e/checkpoint-modified-external-x86_64) modified-external
 
 e2e-embedding-fd: $(BUILD)/tests/test_lifecycle_identity $(BUILD)/tools/bridge-runner \
 	$(BUILD)/tools/binding-aarch64 $(BUILD)/tools/binding-x86_64 \

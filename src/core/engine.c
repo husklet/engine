@@ -1,4 +1,5 @@
 #include "hl/engine.h"
+#include "hl/config.h"
 #include "hl/linux_abi.h"
 #include "engine_backend.h"
 #include "options.h"
@@ -305,18 +306,23 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_NETWORK_ISOLATED;
     const size_t abi1_size = offsetof(hl_engine_box_config, lower_layers);
     const size_t abi3_size = offsetof(hl_engine_box_config, file_owners);
+    const size_t abi4_size = offsetof(hl_engine_box_config, checkpoint_policy);
+    int has_checkpoint_policy;
     int has_v2;
     if (box == NULL) return HL_STATUS_OK;
-    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI) ||
+    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 &&
+         box->abi != HL_ENGINE_BOX_ABI_4 && box->abi != HL_ENGINE_BOX_ABI) ||
         (box->abi == HL_ENGINE_BOX_ABI_1 && box->size != abi1_size) ||
         (box->abi == HL_ENGINE_BOX_ABI_3 && box->size < abi3_size) ||
-        (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box)))
-        return HL_STATUS_ABI_MISMATCH;
-    has_v2 = box->abi >= HL_ENGINE_BOX_ABI;
-    if (has_v2)
-        known_flags |=
-            HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
-    if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1)
+         (box->abi == HL_ENGINE_BOX_ABI_4 && box->size < abi4_size) ||
+         (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box))) return HL_STATUS_ABI_MISMATCH;
+    has_v2 = box->abi >= HL_ENGINE_BOX_ABI_4;
+    has_checkpoint_policy = box->abi >= HL_ENGINE_BOX_ABI;
+    if (has_v2) known_flags |= HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED |
+                               HL_ENGINE_BOX_SENTRY_ONLY;
+    if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1 ||
+         (has_checkpoint_policy && (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL ||
+                                    box->reserved_checkpoint != 0)))
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
@@ -346,6 +352,12 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
             if (box->publish[index].host_port == 0 || box->publish[index].guest_port == 0)
                 return HL_STATUS_INVALID_ARGUMENT;
     }
+    if (box->checkpoint_directory != NULL || box->restore_directory != NULL) {
+        number[0] = (char)('0' + (has_checkpoint_policy ? box->checkpoint_policy : 0));
+        number[1] = 0;
+        if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK)
+            return HL_STATUS_OUT_OF_MEMORY;
+    }
     engine->owned_working_directory = hl_engine_copy_string(box->working_directory);
     engine->owned_hostname = hl_engine_copy_string(box->hostname);
     engine->owned_environment = hl_engine_copy_string(box->environment);
@@ -355,9 +367,9 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         return HL_STATUS_OUT_OF_MEMORY;
     memset(&engine->box_config, 0, sizeof(engine->box_config));
     memcpy(&engine->box_config, box,
-           box->abi == HL_ENGINE_BOX_ABI_1   ? abi1_size
-           : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size
-                                             : sizeof(*box));
+            box->abi == HL_ENGINE_BOX_ABI_1 ? abi1_size :
+            box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size :
+            box->abi == HL_ENGINE_BOX_ABI_4 ? abi4_size : sizeof(*box));
     engine->box_config.working_directory = engine->owned_working_directory;
     engine->box_config.hostname = engine->owned_hostname;
     engine->box_config.environment = engine->owned_environment;

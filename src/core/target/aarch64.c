@@ -1192,6 +1192,9 @@ int hl_engine_entry(int argc, char **argv) {
         } else if (!strcmp(argv[ai], "--restore") && ai + 1 < argc) {
             hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1); // guest entry dispatches to restore without an ELF arg
             ai += 2;
+        } else if (!strcmp(argv[ai], "--restore-policy") && ai + 1 < argc) {
+            if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;
+            ai += 2;
         } else if (!strcmp(argv[ai], "--hostname") && ai + 1 < argc) {
             strncpy(g_hostname, argv[ai + 1], 64);
             ai += 2;

@@ -155,9 +155,10 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
     if (magic != HL_CONFIG_MAGIC ||
-        (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_NETWORK_TRANSPORT && abi != HL_CONFIG_ABI_LEGACY) ||
-        header_size < offsetof(hl_launch_config, network_transport) || header_size > HL_LAUNCH_HEADER_LIMIT ||
-        pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
+         (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_OVERLAY &&
+          abi != HL_CONFIG_ABI_NETWORK_TRANSPORT && abi != HL_CONFIG_ABI_LEGACY) ||
+         header_size < offsetof(hl_launch_config, network_transport) ||
+         header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
     }
@@ -261,6 +262,10 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     if (s[0]) APPLY_OPTION("HL_CHECKPOINT_DIR", s);
     s = launch_string(&cfg, pool, cfg.restore_directory_offset);
     if (s[0]) APPLY_OPTION("HL_RESTORE_DIR", s);
+    if (cfg.abi >= HL_CONFIG_ABI_CHECKPOINT_POLICY) {
+        char checkpoint_policy[2] = {(char)('0' + cfg.checkpoint_policy), 0};
+        APPLY_OPTION("HL_CHECKPOINT_POLICY", checkpoint_policy);
+    }
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     s = launch_string(&cfg, pool, cfg.debug_log_offset);
     if (s[0]) APPLY_OPTION("HL_LOG", s);

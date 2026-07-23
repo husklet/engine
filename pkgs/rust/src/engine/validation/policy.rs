@@ -169,14 +169,11 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
             "native checkpoint/restore supports AArch64 and x86_64 guests",
         ));
     }
-    if checkpoint.mode != crate::spec::CheckpointMode::Full
-        || checkpoint.maximum_pause_ms.is_some()
-        || checkpoint.incompatible_resources != crate::spec::IncompatibleResourcePolicy::Refuse
-    {
+    if checkpoint.mode != crate::spec::CheckpointMode::Full || checkpoint.maximum_pause_ms.is_some() {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
             "checkpoint",
-            "only full checkpoints with refuse-on-incompatible-resource policy are supported",
+            "only full checkpoints without a pause deadline are supported",
         ));
     }
     Ok(())

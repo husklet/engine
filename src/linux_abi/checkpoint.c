@@ -3372,6 +3372,8 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
 // The process table read from the checkpoint (one entry per proc.<gpid>/meta), used to rebuild the tree.
 struct ckpt_proc {
     int gpid, ppid, pgid, sid;
+    int viable;
+    char reason[192];
 };
 static struct ckpt_proc *g_rprocs;
 static int g_nrprocs;
@@ -3400,6 +3402,8 @@ static int ckpt_scan_procs(const char *base) {
         g_rprocs[g_nrprocs].ppid = m.ppid_gpid;
         g_rprocs[g_nrprocs].pgid = m.pgid_gpid;
         g_rprocs[g_nrprocs].sid = m.sid_gpid;
+        g_rprocs[g_nrprocs].viable = 1;
+        g_rprocs[g_nrprocs].reason[0] = 0;
         g_nrprocs++;
     }
     closedir(d);
@@ -3434,6 +3438,145 @@ static int ckpt_validate_proc_tree(const struct ckpt_manifest *man) {
         if (!reached_root) return -1; // missing parent or detached cycle
     }
     return roots == 1 ? 0 : -1;
+}
+
+enum ckpt_recovery_policy {
+    CKPT_RECOVERY_REFUSE = 0,
+    CKPT_RECOVERY_RECONNECT = 1,
+    CKPT_RECOVERY_DISCARD_OPTIONAL = 2,
+};
+
+static int ckpt_recovery_policy(void) {
+    const char *value = hl_option_get("HL_CHECKPOINT_POLICY");
+    if (value && value[0] >= '0' && value[0] <= '2' && value[1] == 0) return value[0] - '0';
+    return CKPT_RECOVERY_REFUSE;
+}
+
+static int ckpt_recovery_policy_set(const char *value) {
+    const char *encoded = NULL;
+    if (!strcmp(value, "refuse")) encoded = "0";
+    else if (!strcmp(value, "reconnect")) encoded = "1";
+    else if (!strcmp(value, "discard-optional")) encoded = "2";
+    if (!encoded) return -1;
+    return hl_option_set("HL_CHECKPOINT_POLICY", encoded, 1);
+}
+
+static struct ckpt_proc *ckpt_proc_find(int gpid) {
+    for (int i = 0; i < g_nrprocs; ++i)
+        if (g_rprocs[i].gpid == gpid) return &g_rprocs[i];
+    return NULL;
+}
+
+static void ckpt_process_stop(struct ckpt_proc *process, const char *reason) {
+    if (!process || !process->viable) return;
+    process->viable = 0;
+    snprintf(process->reason, sizeof process->reason, "%s", reason);
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (int i = 0; i < g_nrprocs; ++i) {
+            struct ckpt_proc *child = &g_rprocs[i];
+            struct ckpt_proc *parent = ckpt_proc_find(child->ppid);
+            if (child->viable && parent && !parent->viable) {
+                child->viable = 0;
+                snprintf(child->reason, sizeof child->reason, "ancestor %d was stopped", parent->gpid);
+                changed = 1;
+            }
+        }
+    }
+}
+
+static void ckpt_json_string(FILE *file, const char *value) {
+    fputc('"', file);
+    for (const unsigned char *p = (const unsigned char *)(value ? value : ""); *p; ++p) {
+        if (*p == '"' || *p == '\\') fprintf(file, "\\%c", *p);
+        else if (*p == '\n') fputs("\\n", file);
+        else if (*p == '\r') fputs("\\r", file);
+        else if (*p == '\t') fputs("\\t", file);
+        else if (*p < 0x20) fprintf(file, "\\u%04x", *p);
+        else fputc(*p, file);
+    }
+    fputc('"', file);
+}
+
+static int ckpt_recovery_report(const char *base, int policy) {
+    char temporary[1300], published[1300];
+    snprintf(temporary, sizeof temporary, "%s/.RECOVERY.jsonl.tmp.%d", base, (int)getpid());
+    snprintf(published, sizeof published, "%s/RECOVERY.jsonl", base);
+    FILE *file = fopen(temporary, "wb");
+    if (!file) return -1;
+    fprintf(file, "{\"type\":\"summary\",\"format\":1,\"policy\":%d,\"processes\":%d}\n", policy,
+            g_nrprocs);
+    for (int i = 0; i < g_nrprocs; ++i) {
+        struct ckpt_proc *process = &g_rprocs[i];
+        fprintf(file, "{\"type\":\"process\",\"gpid\":%d,\"ppid\":%d,\"outcome\":\"%s\",\"reason\":",
+                process->gpid, process->ppid, process->viable ? "restored" : "stopped");
+        ckpt_json_string(file, process->reason);
+        fputs("}\n", file);
+        char fd_path[1300];
+        snprintf(fd_path, sizeof fd_path, "%s/proc.%d/fds", base, process->gpid);
+        FILE *fds = fopen(fd_path, "rb");
+        if (fds) {
+            struct ckpt_fd record;
+            while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
+                const char *outcome = "reconstructed";
+                if (!process->viable) outcome = "stopped";
+                else if (record.kind == CKF_FILE || record.kind == CKF_TTY) outcome = "reconnected";
+                fprintf(file, "{\"type\":\"resource\",\"gpid\":%d,\"fd\":%d,\"kind\":%d,\"outcome\":\"%s\",\"path\":",
+                        process->gpid, record.gfd, record.kind, outcome);
+                ckpt_json_string(file, record.kind == CKF_FILE ? record.path : "");
+                fputs("}\n", file);
+            }
+            fclose(fds);
+        }
+    }
+    if (ckpt_close_sync(&file) != 0 || rename(temporary, published) != 0 || ckpt_sync_dir(base) != 0) {
+        if (file) fclose(file);
+        unlink(temporary);
+        return -1;
+    }
+    return 0;
+}
+
+static int ckpt_restore_preflight(const char *base, int policy) {
+    for (int i = 0; i < g_nrprocs; ++i) {
+        struct ckpt_proc *process = &g_rprocs[i];
+        char path[1300];
+        snprintf(path, sizeof path, "%s/proc.%d/fds", base, process->gpid);
+        FILE *file = fopen(path, "rb");
+        if (!file) {
+            ckpt_process_stop(process, "descriptor image is missing");
+            continue;
+        }
+        struct ckpt_fd record;
+        while (process->viable && ckpt_rd_all(file, &record, sizeof record) == 0) {
+            if (record.kind == CKF_FILE) {
+                struct stat status;
+                if (stat(record.path, &status) != 0) {
+                    char reason[192];
+                    snprintf(reason, sizeof reason, "required external path is unavailable: %.130s", record.path);
+                    ckpt_process_stop(process, reason);
+                }
+            }
+        }
+        if (!feof(file) && process->viable) ckpt_process_stop(process, "descriptor image is corrupt");
+        fclose(file);
+    }
+    struct ckpt_proc *root = ckpt_proc_find(1);
+    int stopped = 0;
+    for (int i = 0; i < g_nrprocs; ++i) stopped += !g_rprocs[i].viable;
+    if (ckpt_recovery_report(base, policy) != 0) {
+        fprintf(stderr, "[restore] cannot publish recovery report\n");
+        return -1;
+    }
+    if (stopped && policy == CKPT_RECOVERY_REFUSE) {
+        fprintf(stderr, "[restore] preflight refused %d process(es); see RECOVERY.jsonl\n", stopped);
+        return -1;
+    }
+    if (!root || !root->viable) {
+        fprintf(stderr, "[restore] container init is not recoverable; see RECOVERY.jsonl\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int ckpt_prepare_restore_pipes(const char *base) {
@@ -4633,7 +4776,7 @@ static void ckpt_restore_proc_run(const char *base, int gpid); // fwd
 // resumes. Records the checkpoint-gpid -> live-hostpid mapping so this process's guest pids resolve.
 static void ckpt_fork_children(const char *base, int gpid) {
     for (int i = 0; i < g_nrprocs; i++) {
-        if (g_rprocs[i].ppid != gpid || g_rprocs[i].gpid == gpid) continue;
+        if (!g_rprocs[i].viable || g_rprocs[i].ppid != gpid || g_rprocs[i].gpid == gpid) continue;
         int cg = g_rprocs[i].gpid;
         pid_t p = fork();
         if (p == 0) {
@@ -4709,6 +4852,8 @@ static int ckpt_restore_tree(const char *rootfs, const char *dir) {
         fprintf(stderr, "[restore] process tree does not match manifest\n");
         return 2;
     }
+    int recovery_policy = ckpt_recovery_policy();
+    if (ckpt_restore_preflight(dir, recovery_policy) != 0) return 2;
     if (ckpt_prepare_restore_pipes(dir) != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint pipe objects\n");
         return 2;

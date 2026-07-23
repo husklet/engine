@@ -828,6 +828,9 @@ int hl_engine_entry(int argc, char **argv) {
         } else if (strcmp(argv[ai], "--restore") == 0) {
             hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1);
             ai += 2;
+        } else if (strcmp(argv[ai], "--restore-policy") == 0) {
+            if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;
+            ai += 2;
         } else if (strcmp(argv[ai], "--vol") == 0) {
             add_vol(argv[ai + 1]);
             ai += 2;

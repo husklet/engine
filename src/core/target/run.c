@@ -39,12 +39,15 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
         options == NULL ? hl_option_get("HL_CHECKPOINT_DIR") : hl_options_get(options, "HL_CHECKPOINT_DIR");
     const char *restore_directory =
         options == NULL ? hl_option_get("HL_RESTORE_DIR") : hl_options_get(options, "HL_RESTORE_DIR");
+    const char *checkpoint_policy =
+        options == NULL ? hl_option_get("HL_CHECKPOINT_POLICY") : hl_options_get(options, "HL_CHECKPOINT_POLICY");
     hl_engine_box_config box = {.abi = HL_ENGINE_BOX_ABI,
                                 .size = sizeof(box),
                                 .uid = -1,
                                 .gid = -1,
                                 .checkpoint_directory = checkpoint_directory,
-                                .restore_directory = restore_directory};
+                                .restore_directory = restore_directory,
+                                .checkpoint_policy = checkpoint_policy ? (uint32_t)(checkpoint_policy[0] - '0') : 0};
     hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config), .guest_isa = guest_isa, .rootfs = rootfs};
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     hl_engine *engine = NULL;

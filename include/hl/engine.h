@@ -8,7 +8,8 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_ENGINE_ABI 5u
-#define HL_ENGINE_BOX_ABI 4u
+#define HL_ENGINE_BOX_ABI 5u
+#define HL_ENGINE_BOX_ABI_4 4u
 #define HL_ENGINE_BOX_ABI_3 3u
 #define HL_ENGINE_BOX_ABI_1 1u
 
@@ -101,6 +102,9 @@ typedef struct hl_engine_box_config {
     const char *restore_directory;
     /* Newline-separated normalized-relative-path<TAB>uid<TAB>gid records. */
     const char *file_owners;
+    /* HL_CONFIG_CHECKPOINT_*; zero preserves strict refusal. */
+    uint32_t checkpoint_policy;
+    uint32_t reserved_checkpoint;
 } hl_engine_box_config;
 
 typedef struct hl_engine_config {

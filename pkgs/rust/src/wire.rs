@@ -14,7 +14,7 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 12;
+const ABI: u32 = 13;
 const HEADER_SIZE: usize = 200;
 const HEADER_SIZE_U32: u32 = 200;
 const MAGIC_OFFSET: usize = 0;
@@ -56,6 +56,7 @@ const NETWORK_TRANSPORT_OFFSET: usize = 176;
 const RESERVED_ABI11_OFFSET: usize = 180;
 const LOWER_COUNT_OFFSET: usize = 184;
 const OVERLAY_WORK_OFFSET: usize = 188;
+const CHECKPOINT_POLICY_OFFSET: usize = 192;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
@@ -422,6 +423,14 @@ pub(crate) fn encode(
     header.u32(ARGUMENTS_OFFSET, arguments);
     header.u32(CHECKPOINT_DIRECTORY_OFFSET, checkpoint_directory);
     header.u32(RESTORE_DIRECTORY_OFFSET, restore_directory);
+    header.u32(
+        CHECKPOINT_POLICY_OFFSET,
+        match config.checkpoint_policy {
+            crate::spec::IncompatibleResourcePolicy::Refuse => 0,
+            crate::spec::IncompatibleResourcePolicy::Reconnect => 1,
+            crate::spec::IncompatibleResourcePolicy::DiscardOptional => 2,
+        },
+    );
     header.u32(RESULT_OFFSET, result);
     header.u32(
         PUBLISH_COUNT_OFFSET,

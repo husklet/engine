@@ -13,9 +13,9 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
     memset(&config, 0, sizeof(config));
     memcpy(&config, wire, wire_size < sizeof(config) ? wire_size : sizeof(config));
     if (config.magic != HL_CONFIG_MAGIC) return HL_STATUS_CORRUPT;
-    if (config.abi != HL_CONFIG_ABI && config.abi != HL_CONFIG_ABI_NETWORK_TRANSPORT &&
-        config.abi != HL_CONFIG_ABI_LEGACY)
-        return HL_STATUS_ABI_MISMATCH;
+    if (config.abi != HL_CONFIG_ABI && config.abi != HL_CONFIG_ABI_OVERLAY &&
+         config.abi != HL_CONFIG_ABI_NETWORK_TRANSPORT &&
+         config.abi != HL_CONFIG_ABI_LEGACY) return HL_STATUS_ABI_MISMATCH;
     if (config.abi == HL_CONFIG_ABI_LEGACY) {
         if (config.header_size != legacy_size || config.reserved != 0) return HL_STATUS_CORRUPT;
         config.network_transport = config.network_isolated ? HL_CONFIG_NETWORK_ISOLATED : HL_CONFIG_NETWORK_VIRTUAL;
@@ -25,7 +25,10 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
             config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED))
             return HL_STATUS_CORRUPT;
     } else if (config.header_size < sizeof(config) || config.reserved != 0 || config.reserved_abi11 != 0 ||
-               config.reserved_abi12[0] != 0 || config.reserved_abi12[1] != 0 ||
+               (config.abi == HL_CONFIG_ABI_OVERLAY &&
+                (config.checkpoint_policy != 0 || config.reserved_abi13 != 0)) ||
+               (config.abi == HL_CONFIG_ABI &&
+                (config.checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL || config.reserved_abi13 != 0)) ||
                config.network_transport > HL_CONFIG_NETWORK_HOST ||
                config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED) ||
                config.lower_layer_count > 8 || ((config.lower_layer_count == 0) != (config.lower_layers_offset == 0)) ||

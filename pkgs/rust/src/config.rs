@@ -38,6 +38,7 @@ pub struct Config {
     pub(crate) filesystem_generation: Option<PathBuf>,
     pub(crate) checkpoint_directory: Option<PathBuf>,
     pub(crate) restore_directory: Option<PathBuf>,
+    pub(crate) checkpoint_policy: crate::spec::IncompatibleResourcePolicy,
     pub(crate) mounts: Vec<Mount>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
     pub(crate) process_domain: Option<Domain>,
@@ -206,6 +207,13 @@ impl Config {
     #[must_use]
     pub fn restore_directory(mut self, path: impl Into<PathBuf>) -> Self {
         self.restore_directory = Some(path.into());
+        self
+    }
+
+    /// Select recovery behavior for resources that changed or disappeared after capture.
+    #[must_use]
+    pub const fn checkpoint_policy(mut self, policy: crate::spec::IncompatibleResourcePolicy) -> Self {
+        self.checkpoint_policy = policy;
         self
     }
 

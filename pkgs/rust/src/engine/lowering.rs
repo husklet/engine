@@ -181,6 +181,7 @@ impl Launch {
         if let Some(directory) = spec.checkpoint.restore_directory {
             config = config.restore_directory(directory);
         }
+        config = config.checkpoint_policy(spec.checkpoint.incompatible_resources);
         for (name, value) in spec.process.env {
             config = config.env(name, value);
         }
