@@ -135,20 +135,37 @@ jobs:
             done
             wait "$pid"
           }
+          # Retry ONCE, matching the macOS lane. Several cases are stress gates with timing
+          # bounds that a contended runner can miss -- truncate-eof-bus timed out here with
+          # empty stdout while passing 8/8 locally. A genuine break still fails both attempts;
+          # the first-attempt failure is surfaced as a ::warning so a real intermittent bug
+          # stays visible rather than being silently greened by the retry.
+          run_suites() {
+            local st=0
+            run_bounded 2100 "$1" \
+              nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" ${{ matrix.targets }}' || st=$?
+            tail -n 60 "$1"
+            return $st
+          }
           status=0
-          run_bounded 2100 runtime.log \
-            nix develop --command sh -c 'make -s -j"$(nproc)" CC="$NATIVE_CC" ${{ matrix.targets }}' || status=$?
+          run_suites runtime.log || status=$?
+          if [ "$status" -ne 0 ]; then
+            warn=$(tail -c 1200 runtime.log)
+            warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
+            echo "::warning title=Linux compat (${{ matrix.name }}) failed attempt 1 — retrying::$warn"
+            status=0
+            run_suites runtime.log || status=$?
+          fi
           tail -c 200000 runtime.log >> "$GITHUB_STEP_SUMMARY" || true
-          tail -n 60 runtime.log
           if [ "$status" -ne 0 ]; then
             message=$(tail -c 1500 runtime.log)
             message=${message//'%'/'%25'}
             message=${message//$'\n'/'%0A'}
             message=${message//$'\r'/'%0D'}
             if [ "$status" -eq 124 ]; then
-              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT (both attempts)::$message"
             else
-              echo "::error title=Linux compat (${{ matrix.name }}) failed::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) failed (both attempts)::$message"
             fi
             exit 1
           fi
