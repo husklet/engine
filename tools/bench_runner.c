@@ -39,8 +39,10 @@
  *
  * Output is CSV: env,arch,phase,us,ok,us_min,us_max,repeats
  * `report` pivots one-or-more CSVs into a phase x (env,arch) table with
- * x-<baseline> ratios, and flags any checksum divergence (except the tid-based
- * syscall phase, whose ok= legitimately differs by thread id).
+ * x-<baseline> ratios, and flags any checksum divergence. Checksums are compared
+ * PER ARCH (every env of one arch runs the same guest binary, so they must
+ * match); the tid-based syscall phase is skipped entirely, and arch-dependent
+ * phases such as 'crypto' are not compared across arches.
  *
  * ============================================================================
  * EXAMPLE -- reproduce the ARM64 + AMD64 comparison tables (run from repo root)
@@ -690,18 +692,29 @@ static int cmd_report(int argc, char **argv) {
                 printf(" %9s", "-");
         }
         printf("\n");
-        /* checksum divergence (skip tid-based syscall) */
+        /* Checksum divergence, compared PER ARCH (skip tid-based syscall).
+         * Every env running the SAME arch runs the SAME guest binary, so their
+         * ok= must match exactly -- that is the check that actually detects a
+         * translation bug (e.g. hl-engine disagreeing with qemu on amd64).
+         * Comparing ACROSS arches would false-positive on phases whose result
+         * is legitimately arch-dependent: `crypto` is the live example, where
+         * x86 AES-NI (aesenc) and ARM AESE apply the round transform in a
+         * different order, so the two arches produce different (individually
+         * correct) digests. */
         if (strcmp(ph, "syscall") != 0) {
-            uint64_t first = 0;
-            int have = 0, bad = 0;
-            for (int c = 0; c < ncol; ++c) {
+            int bad = 0;
+            for (int c = 0; c < ncol && !bad; ++c) {
                 uint64_t o;
-                if (col_ok(&cols[c], ph, &o)) {
-                    if (!have) {
-                        first = o;
-                        have = 1;
-                    } else if (o != first)
+                if (!col_ok(&cols[c], ph, &o))
+                    continue;
+                for (int d = 0; d < c; ++d) {
+                    uint64_t p;
+                    if (strcmp(cols[d].arch, cols[c].arch) != 0)
+                        continue; /* different arch: not comparable */
+                    if (col_ok(&cols[d], ph, &p) && p != o) {
                         bad = 1;
+                        break;
+                    }
                 }
             }
             if (bad) {
@@ -715,11 +728,14 @@ static int cmd_report(int argc, char **argv) {
            "arch; missing -> first column).\n",
            baseline_env, baseline_env);
     printf("note: 'syscall' ok= is tid-dependent; divergence there is expected.\n");
+    printf("note: checksums are compared per-arch; arch-dependent phases (e.g. "
+           "'crypto') legitimately differ between arm64 and amd64.\n");
     if (diverged) {
         fprintf(stderr, "WARNING: checksum divergence in phases:%s\n", divlist);
         return 3;
     }
-    printf("checksums consistent across envs (except tid-based syscall). OK.\n");
+    printf("checksums consistent across envs of each arch (except tid-based "
+           "syscall). OK.\n");
     return 0;
 }
 
