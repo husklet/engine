@@ -111,6 +111,39 @@ fn cache_policy_is_explicit_and_read_write_host_store_is_supported() {
 }
 
 #[test]
+fn checkpoint_validates_capture_and_restore_directories_independently() {
+    let mut value = spec();
+    value.checkpoint.enabled = true;
+    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
+    value.checkpoint.restore_directory = Some("relative/restore".into());
+    let error = Engine::new().validate(&value).unwrap_err();
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
+    assert_eq!(error.field, "checkpoint.restore_directory");
+
+    value.checkpoint.capture_directory = Some("relative/checkpoint".into());
+    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    let error = Engine::new().validate(&value).unwrap_err();
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
+    assert_eq!(error.field, "checkpoint.capture_directory");
+
+    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
+    value.checkpoint.restore_directory = Some("/".into());
+    let error = Engine::new().validate(&value).unwrap_err();
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
+    assert_eq!(error.field, "checkpoint.restore_directory");
+
+    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    Engine::new().validate(&value).unwrap();
+
+    let mut value = spec();
+    value.checkpoint.enabled = true;
+    value.checkpoint.restore_directory = Some("relative/restore".into());
+    let error = Engine::new().validate(&value).unwrap_err();
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
+    assert_eq!(error.field, "checkpoint.restore_directory");
+}
+
+#[test]
 fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
     let mut value = spec();
     value.checkpoint.mode = CheckpointMode::Incremental;
@@ -144,10 +177,7 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
     let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
     value.checkpoint.enabled = true;
     value.checkpoint.restore_directory = Some("/tmp/restore".into());
-    assert_eq!(
-        Engine::new().validate(&value).unwrap_err().category,
-        hl_engine::spec::SpecErrorCategory::Unsupported
-    );
+    Engine::new().validate(&value).unwrap();
 
     let mut value = spec();
     value.observability.trace = Some(TraceSpec {

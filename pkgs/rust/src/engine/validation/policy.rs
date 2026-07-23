@@ -111,6 +111,34 @@ fn validate_open_files(open_files: Option<u32>, guest_fd_limit: u32) -> Result<(
     }
 }
 
+/// Applies the directory rules to one checkpoint directory, reporting failures against `field`.
+///
+/// Capture and restore directories are validated independently: a valid capture directory must never
+/// mask an invalid restore directory (or the reverse).
+fn validate_checkpoint_directory(
+    directory: Option<&std::path::Path>,
+    field: &'static str,
+) -> Result<(), SpecError> {
+    let Some(directory) = directory else {
+        return Ok(());
+    };
+    if !directory.is_absolute() {
+        return Err(spec_error(
+            SpecErrorCategory::Invalid,
+            field,
+            "checkpoint directories must be absolute",
+        ));
+    }
+    if directory.parent().is_none() || directory.file_name().is_none() {
+        return Err(spec_error(
+            SpecErrorCategory::Invalid,
+            field,
+            "checkpoint directory must name a non-root destination",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
     let checkpoint = &spec.checkpoint;
     if checkpoint.maximum_pause_ms == Some(0) {
@@ -143,25 +171,14 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
             "a capture or restore directory is required",
         ));
     }
-    let directory = checkpoint
-        .capture_directory
-        .as_ref()
-        .or(checkpoint.restore_directory.as_ref())
-        .expect("validated checkpoint operation");
-    if !directory.is_absolute() {
-        return Err(spec_error(
-            SpecErrorCategory::Invalid,
-            "checkpoint",
-            "checkpoint directories must be absolute",
-        ));
-    }
-    if directory.parent().is_none() || directory.file_name().is_none() {
-        return Err(spec_error(
-            SpecErrorCategory::Invalid,
-            "checkpoint",
-            "checkpoint directory must name a non-root destination",
-        ));
-    }
+    validate_checkpoint_directory(
+        checkpoint.capture_directory.as_deref(),
+        "checkpoint.capture_directory",
+    )?;
+    validate_checkpoint_directory(
+        checkpoint.restore_directory.as_deref(),
+        "checkpoint.restore_directory",
+    )?;
     if !matches!(spec.guest.architecture, crate::Guest::Aarch64 | crate::Guest::X86_64) {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
