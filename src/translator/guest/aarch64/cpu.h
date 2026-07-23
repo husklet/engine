@@ -182,6 +182,11 @@ static uint64_t g_nonpie_lo, g_nonpie_bias;
 // master enable (default on); cleared at startup by NOGUESTFOLD=1 for an A/B kill-switch.
 static int g_guestfold = 1;
 
+// Resolved path of the ENGINE binary itself (set once at entry). Mixed into the persistent-cache key so
+// the cache invalidates on any engine relink -- see pcache_engine_id() in cache.c for why the compile
+// timestamp of a single translation unit is not sufficient.
+static const char *g_self_path = "";
+
 static int guestbase_on(void) {
     return g_guestfold && g_nonpie_lo != 0;
 }

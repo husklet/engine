@@ -203,12 +203,21 @@ static uint64_t pcache_id_of(const char *path) {
     return hl_identity_source(&g_jit_services, path);
 }
 
-// Per-engine-build tag so the cache self-invalidates across engine rebuilds (host bytes from another build
-// must never load). __DATE__/__TIME__ change every (re)build, so an update gets a fresh cache
-// transparently (old files just go unreferenced; harmless cruft in the cache dir).
+// Per-engine-build tag so the cache self-invalidates across engine rebuilds: host bytes emitted by another
+// build must never be loaded, because they are instructions the current translator would not have emitted.
+//
+// The ENGINE BINARY's own identity is what makes this sound. __DATE__/__TIME__ alone did NOT: they freeze
+// when THIS translation unit is compiled, so changing any other translator source yielded an engine that
+// emitted different host code under an UNCHANGED tag. That defect was demonstrated on the x86_64 side,
+// where it crashed the pc-* persistent-cache cases with SIGSEGV after a codegen-only change; aarch64 shares
+// the scheme and so shared the latent hole. Any relink moves the binary's size/mtime/inode.
+//
+// The compile-time tag stays as a mix-in: it still discriminates when the engine's own path cannot be
+// resolved (hl_identity_source returns 0), e.g. an embedded/activated engine.
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
     uint64_t build = hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
+    build = hl_digest_bytes(build, &(uint64_t){pcache_id_of(g_self_path)}, sizeof(uint64_t));
     uint64_t modes = (uint64_t)(g_guestfold != 0) | ((uint64_t)(g_steal1617 != 0) << 1) |
                      ((uint64_t)(g_noibslim != 0) << 2) | ((uint64_t)(g_mtibtc != 0) << 3) |
                      ((uint64_t)(g_futexq != 0) << 4) | ((uint64_t)(g_no_stw_reclaim != 0) << 5) |

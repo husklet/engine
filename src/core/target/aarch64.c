@@ -1173,7 +1173,10 @@ int hl_engine_entry(int argc, char **argv) {
     hl_cli_route route = hl_cli_route_parse(argc, argv);
     int ai = 1;
     const char *rootfs = NULL;
+    static char self[4200];
     hl_option_reset();
+    // Engine's own path, for the persistent-cache build key (mirrors the x86_64 target).
+    g_self_path = realpath(argv[0], self) ? self : argv[0];
     // Final-product launch: the host provides one serialized, validated HL config file.
     if (route.mode == HL_CLI_CONFIG) return hl_run_config_file_with(route.config_path, hl_standalone_run);
     // fork-server dispatch (gated; standalone path untouched when neither flag is present):

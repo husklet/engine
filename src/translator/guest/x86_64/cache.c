@@ -135,17 +135,29 @@ static uint64_t pcache_id_of(const char *path) {
     return hl_identity_source(&g_jit_services, path);
 }
 
-// A per-engine-build tag mixed into every cache id so the cache self-invalidates across hl versions:
-// host code emitted by a DIFFERENT engine build is never loaded (loading it would crash). __DATE__/
-// __TIME__ change on every (re)build, so a user who updates hl transparently gets a fresh cache --
-// stale files become unreferenced automatically when the engine build changes.
+// A per-engine-build tag mixed into every cache id so the cache self-invalidates across engine builds:
+// host code emitted by a DIFFERENT engine build must never be loaded, because loading it executes
+// instructions the current translator would not have emitted.
+//
+// The identity of the ENGINE BINARY ITSELF is what makes this sound. __DATE__/__TIME__ alone did NOT:
+// they are frozen when THIS translation unit is compiled, so a change to any other translator source
+// (emit.c, translate.c, a lowering file) produced an engine that emitted different host code under an
+// UNCHANGED tag. The stale cache then loaded and the guest died with SIGSEGV -- reproducible on the
+// pc-* persistent-cache cases after a codegen-only change. Any relink changes the binary's
+// size/mtime/inode, so hashing it covers every source that contributes to the emitted code.
+//
+// The compile-time tag is retained as a mix-in: it still discriminates when the engine's own path
+// cannot be resolved (hl_identity_source returns 0), e.g. an embedded/activated engine.
 static uint64_t pcache_engine_id(void) {
     uint64_t h = 1469598103934665603ull;
     uint64_t modes;
+    uint64_t self = pcache_id_of(g_self_path);
     for (const char *p = __DATE__ " " __TIME__; *p; p++) {
         h ^= (uint8_t)*p;
         h *= 1099511628211ull;
     }
+    h ^= self;
+    h *= 1099511628211ull;
     modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) |
             ((uint64_t)(g_siginline != 0) << 2) | ((uint64_t)(slimsys_on() != 0) << 3);
     return hl_identity_configuration(h, 2, 1, modes);
