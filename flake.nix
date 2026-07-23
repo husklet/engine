@@ -11,15 +11,73 @@
           inherit system;
           config.allowUnsupportedSystem = true;
         }));
+
+      # ---------------------------------------------------------------------
+      # ONE definition of the guest toolchains and the environment the build
+      # expects. This used to be copy-pasted into packages and devShells, with
+      # the whole *_CC / *_DYNAMIC_* block written out twice more (once per
+      # host) differing only in which compiler counts as "native" -- four
+      # near-identical copies that had to be kept in sync by hand.
+      #
+      # `hostCC` is the only real difference between hosts: on aarch64-linux the
+      # native stdenv cc IS the aarch64-Linux guest compiler, while on
+      # aarch64-darwin the guest needs the aarch64-Linux cross compiler.
+      # ---------------------------------------------------------------------
+      toolchainFor = pkgs:
+        let
+          lib = nixpkgs.lib;
+          system = pkgs.stdenv.hostPlatform.system;
+          isLinuxHost = system == "aarch64-linux";
+          linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
+          linuxX86 = pkgs.pkgsCross.gnu64;
+          ccOf = p: "${p.stdenv.cc}/bin/${p.stdenv.cc.targetPrefix}cc";
+          nativeCC = "${pkgs.stdenv.cc}/bin/cc";
+          armCC = if isLinuxHost then nativeCC else ccOf linuxArm;
+          x86CC = ccOf linuxX86;
+          # A guest binary links the STATIC sqlite and glibc for its arch; the
+          # -I/-L pair is what the combined-bench sqlite phase needs on both.
+          staticCC = cc: sqlite: glibc:
+            "${cc} -I${lib.getDev sqlite}/include -L${lib.getLib sqlite}/lib -L${glibc.static}/lib";
+          armPkgs = if isLinuxHost then pkgs else linuxArm;
+        in rec {
+          inherit linuxArm linuxX86 system isLinuxHost;
+          # ORDER MATTERS and is preserved verbatim from the original shell:
+          # each cc's setup-hook assigns $CC, so the LAST one wins. Listing the
+          # x86_64 cross compiler last is what leaves $CC pointing at it -- the
+          # "poisoned $CC" the Makefile works around with CC=cc and the CMake
+          # toolchain files avoid by reading *_LINUX_CC explicitly. Reordering
+          # these silently changes which compiler a bare `make` picks up.
+          crossCompilers =
+            (if isLinuxHost then [ pkgs.gcc ] else [ linuxArm.stdenv.cc ])
+            ++ [ linuxX86.stdenv.cc ];
+          # The exact variable set the Makefile and cmake/toolchains/* consume.
+          env = {
+            CC = nativeCC;
+            NATIVE_CC = nativeCC;
+            AARCH64_LINUX_CC = armCC;
+            X86_64_LINUX_CC = x86CC;
+            AARCH64_LINUX_STATIC_CC = staticCC armCC armPkgs.pkgsStatic.sqlite armPkgs.glibc;
+            X86_64_LINUX_STATIC_CC = staticCC x86CC linuxX86.pkgsStatic.sqlite linuxX86.glibc;
+            AARCH64_DYNAMIC_LOADER = "${armPkgs.glibc}/lib/ld-linux-aarch64.so.1";
+            AARCH64_DYNAMIC_LIBC = "${armPkgs.glibc}/lib/libc.so.6";
+            X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
+            X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
+          };
+        };
     in {
       packages = forAllSystems (pkgs:
         let
-          system = pkgs.stdenv.hostPlatform.system;
+          tc = toolchainFor pkgs;
+          inherit (tc) system linuxArm linuxX86;
           runtimeHost = system == "aarch64-darwin" || system == "aarch64-linux";
-          linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
-          linuxX86 = pkgs.pkgsCross.gnu64;
-          linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
-          linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
+          linuxArmCompiler = tc.env.AARCH64_LINUX_CC;
+          linuxX86Compiler = tc.env.X86_64_LINUX_CC;
+          # NOTE: this derivation intentionally does NOT reuse tc.env wholesale.
+          # It builds `make all` plus the production engines, never the
+          # combined-bench sqlite phase, so its *_STATIC_CC deliberately carries
+          # only -L<glibc.static> and not the static-sqlite -I/-L pair the
+          # devShell exports. Keeping it lean avoids pulling sqlite into this
+          # closure for no reason.
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "hl-engine";
@@ -230,21 +288,18 @@
 
       devShells = forAllSystems (pkgs:
         let
-          system = pkgs.stdenv.hostPlatform.system;
-          linuxArm = pkgs.pkgsCross.aarch64-multiplatform;
-          linuxX86 = pkgs.pkgsCross.gnu64;
-          linuxArmSqlite = linuxArm.pkgsStatic.sqlite;
-          linuxX86Sqlite = linuxX86.pkgsStatic.sqlite;
-          linuxArmCompiler = "${linuxArm.stdenv.cc}/bin/${linuxArm.stdenv.cc.targetPrefix}cc";
-          linuxX86Compiler = "${linuxX86.stdenv.cc}/bin/${linuxX86.stdenv.cc.targetPrefix}cc";
+          tc = toolchainFor pkgs;
+          # The env block is only exported on the two hosts that can actually
+          # run guests; x86_64-linux gets the tools but not the guest toolchain
+          # wiring, exactly as before.
+          runtimeHost = tc.system == "aarch64-darwin" || tc.system == "aarch64-linux";
         in {
           default = pkgs.mkShell ({
             packages = [
               pkgs.clang
               pkgs.gnumake
-              # Phase-1 CMake build (additive, non-gating; see CMakeLists.txt and
-              # cmake/toolchains/*.cmake, which read the same *_LINUX_CC vars this shell exports).
-              # `make` remains the authoritative build; these are dev tools only.
+              # CMake is the build the project is migrating to; `make` is still
+              # the authoritative one. Both are dev tools here.
               pkgs.cmake
               pkgs.ninja
               pkgs.pkg-config
@@ -252,34 +307,8 @@
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
-            ] ++ pkgs.lib.optionals (system == "aarch64-darwin") [
-              linuxArm.stdenv.cc linuxX86.stdenv.cc
-            ] ++ pkgs.lib.optionals (system == "aarch64-linux") [
-              pkgs.gcc linuxX86.stdenv.cc
-            ];
-          } // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
-            CC = "${pkgs.stdenv.cc}/bin/cc";
-            NATIVE_CC = "${pkgs.stdenv.cc}/bin/cc";
-            AARCH64_LINUX_CC = linuxArmCompiler;
-            X86_64_LINUX_CC = linuxX86Compiler;
-            AARCH64_LINUX_STATIC_CC = "${linuxArmCompiler} -I${nixpkgs.lib.getDev linuxArmSqlite}/include -L${nixpkgs.lib.getLib linuxArmSqlite}/lib -L${linuxArm.glibc.static}/lib";
-            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -I${nixpkgs.lib.getDev linuxX86Sqlite}/include -L${nixpkgs.lib.getLib linuxX86Sqlite}/lib -L${linuxX86.glibc.static}/lib";
-            AARCH64_DYNAMIC_LOADER = "${linuxArm.glibc}/lib/ld-linux-aarch64.so.1";
-            AARCH64_DYNAMIC_LIBC = "${linuxArm.glibc}/lib/libc.so.6";
-            X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
-            X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
-          } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
-            CC = "${pkgs.stdenv.cc}/bin/cc";
-            NATIVE_CC = "${pkgs.stdenv.cc}/bin/cc";
-            AARCH64_LINUX_CC = "${pkgs.stdenv.cc}/bin/cc";
-            X86_64_LINUX_CC = linuxX86Compiler;
-            AARCH64_LINUX_STATIC_CC = "${pkgs.stdenv.cc}/bin/cc -I${nixpkgs.lib.getDev pkgs.pkgsStatic.sqlite}/include -L${nixpkgs.lib.getLib pkgs.pkgsStatic.sqlite}/lib -L${pkgs.glibc.static}/lib";
-            X86_64_LINUX_STATIC_CC = "${linuxX86Compiler} -I${nixpkgs.lib.getDev linuxX86Sqlite}/include -L${nixpkgs.lib.getLib linuxX86Sqlite}/lib -L${linuxX86.glibc.static}/lib";
-            AARCH64_DYNAMIC_LOADER = "${pkgs.glibc}/lib/ld-linux-aarch64.so.1";
-            AARCH64_DYNAMIC_LIBC = "${pkgs.glibc}/lib/libc.so.6";
-            X86_64_DYNAMIC_LOADER = "${linuxX86.glibc}/lib/ld-linux-x86-64.so.2";
-            X86_64_DYNAMIC_LIBC = "${linuxX86.glibc}/lib/libc.so.6";
-          });
+            ] ++ pkgs.lib.optionals runtimeHost tc.crossCompilers;
+          } // pkgs.lib.optionalAttrs runtimeHost tc.env);
         });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
