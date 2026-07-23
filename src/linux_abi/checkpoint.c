@@ -84,6 +84,13 @@ struct ckpt_cpu_header {
 #define CKF_SOCKETPAIR 10 // reconstructible AF_UNIX pair endpoint with framed unread queue
 #define CKF_SOCKET 11 // unconnected socket or empty-backlog listener
 #define CKF_SIGNALFD 12 // signalfd OFD mask plus unread wake-byte queue
+#define CKF_DEVICE 13 // path-backed character/block device; reconnect to current host device
+
+enum ckpt_recovery_policy {
+    CKPT_RECOVERY_REFUSE = 0,
+    CKPT_RECOVERY_RECONNECT = 1,
+    CKPT_RECOVERY_DISCARD_OPTIONAL = 2,
+};
 
 struct ckpt_inotify_watch {
     int32_t instance;
@@ -649,6 +656,8 @@ static int ckpt_socket_option_int(int fd, int option, int *value) {
     return getsockopt(fd, SOL_SOCKET, option, value, &size);
 }
 
+static int ckpt_recovery_policy(void);
+
 static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quiescent) {
     char claim[1280], data[1280], temporary[1320];
     snprintf(claim, sizeof claim, "%s/socket-state.%016llx.claim", g_ckpt_dir, (unsigned long long)identity);
@@ -657,19 +666,23 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
     close(marker);
     struct sockaddr_storage peer;
     socklen_t peer_size = sizeof peer;
-    if (require_quiescent && fd >= 0 && fd < HL_NFD && (g_sock_conn[fd] || g_sock_connecting[fd])) {
+    int degraded_connection = require_quiescent && fd >= 0 && fd < HL_NFD &&
+                              (g_sock_conn[fd] || g_sock_connecting[fd]) &&
+                              ckpt_recovery_policy() != CKPT_RECOVERY_REFUSE;
+    if (require_quiescent && !degraded_connection && fd >= 0 && fd < HL_NFD &&
+        (g_sock_conn[fd] || g_sock_connecting[fd])) {
         fprintf(stderr, "[ckpt] refuse: connected/in-progress socket fd %d requires connection-state transfer\n",
                 fd);
         unlink(claim);
         return -1;
     }
-    if (require_quiescent && getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0) {
+    if (require_quiescent && !degraded_connection && getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0) {
         fprintf(stderr, "[ckpt] refuse: connected socket fd %d requires connection-state transfer\n", fd);
         unlink(claim);
         return -1;
     }
     struct pollfd readiness = {fd, POLLIN, 0};
-    if (require_quiescent &&
+    if (require_quiescent && !degraded_connection &&
         (poll(&readiness, 1, 0) < 0 || (readiness.revents & (POLLIN | POLLERR | POLLHUP)) != 0)) {
         fprintf(stderr, "[ckpt] refuse: socket fd %d has pending input/accept/error state\n", fd);
         unlink(claim);
@@ -712,7 +725,7 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
     state.udp_peer_v6 = g_udp_peer_v6[fd];
     state.udp_local_interface = g_udp_local_interface[fd];
     state.udp_peer_interface = g_udp_peer_interface[fd];
-    state.pending_error = g_so_error[fd];
+    state.pending_error = degraded_connection ? ECONNRESET : g_so_error[fd];
     state.shadow_reuse_port = g_so_reuseport[fd];
     state.tcp_local_address = g_tcp_laddr[fd];
     state.tcp_local_v6 = g_tcp_l6[fd];
@@ -1286,8 +1299,20 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
                         fd);
                 return -1;
             }
-            if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER) {
-                r.kind = CKF_TTY;
+            if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER || metadata.type == HL_HOST_FILE_TYPE_BLOCK) {
+                char fp[512];
+                hl_host_result device_path = g_linux_box->host->file->path(
+                    g_linux_box->host->context, snapshot.host_handle, (hl_host_bytes){fp, sizeof(fp) - 1});
+                if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER && isatty(fd)) {
+                    r.kind = CKF_TTY;
+                } else if (device_path.status == HL_STATUS_OK && device_path.value < sizeof fp) {
+                    fp[device_path.value] = 0;
+                    r.kind = CKF_DEVICE;
+                    if (path_copy(r.path, sizeof r.path, fp) != 0) return -1;
+                } else {
+                    fprintf(stderr, "[ckpt] refuse: device fd %d has no recoverable path\n", fd);
+                    return -1;
+                }
             } else if (metadata.type == HL_HOST_FILE_TYPE_REGULAR ||
                        metadata.type == HL_HOST_FILE_TYPE_DIRECTORY) {
                 char fp[512];
@@ -1456,9 +1481,14 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
             r.offset = lseek(fd, 0, SEEK_CUR);
             r.object_id = ckpt_backing_id(&status);
             r.ofd_id = ckpt_native_ofd_id(recs, n, fd, r.object_id);
-            if (S_ISCHR(status.st_mode)) {
+            if (S_ISCHR(status.st_mode) && isatty(fd)) {
                 r.kind = CKF_TTY;
                 r.offset = 0;
+            } else if (S_ISCHR(status.st_mode) || S_ISBLK(status.st_mode)) {
+                if (path_size >= sizeof path) return -1;
+                path[path_size] = '\0';
+                r.kind = CKF_DEVICE;
+                if (path_copy(r.path, sizeof r.path, path) != 0) return -1;
             } else if (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode)) {
                 if (path_size >= sizeof path) return -1;
                 path[path_size] = '\0';
@@ -3236,6 +3266,17 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 g_fdpath[r.gfd][0] = 0;
             if (proc_fdvis_publish_native_fd(r.gfd) != 0) return -1;
         }
+        if (r.kind == CKF_DEVICE) {
+            int flags = r.flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+            int host_fd = open(r.path, flags);
+            if (host_fd < 0 || (host_fd != r.gfd && dup2(host_fd, r.gfd) < 0)) {
+                if (host_fd >= 0) close(host_fd);
+                return -1;
+            }
+            if (host_fd != r.gfd) close(host_fd);
+            if (r.descriptor_flags & FD_CLOEXEC) fcntl(r.gfd, F_SETFD, FD_CLOEXEC);
+            if (proc_fdvis_publish_native_fd(r.gfd) != 0) return -1;
+        }
     }
     for (int i = 0; i < count; ++i) {
         struct ckpt_fd r = records[i];
@@ -3440,12 +3481,6 @@ static int ckpt_validate_proc_tree(const struct ckpt_manifest *man) {
     return roots == 1 ? 0 : -1;
 }
 
-enum ckpt_recovery_policy {
-    CKPT_RECOVERY_REFUSE = 0,
-    CKPT_RECOVERY_RECONNECT = 1,
-    CKPT_RECOVERY_DISCARD_OPTIONAL = 2,
-};
-
 static int ckpt_recovery_policy(void) {
     const char *value = hl_option_get("HL_CHECKPOINT_POLICY");
     if (value && value[0] >= '0' && value[0] <= '2' && value[1] == 0) return value[0] - '0';
@@ -3520,10 +3555,12 @@ static int ckpt_recovery_report(const char *base, int policy) {
             while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
                 const char *outcome = "reconstructed";
                 if (!process->viable) outcome = "stopped";
-                else if (record.kind == CKF_FILE || record.kind == CKF_TTY) outcome = "reconnected";
+                else if (record.kind == CKF_FILE || record.kind == CKF_TTY || record.kind == CKF_DEVICE ||
+                         record.kind == CKF_SOCKET)
+                    outcome = "reconnected";
                 fprintf(file, "{\"type\":\"resource\",\"gpid\":%d,\"fd\":%d,\"kind\":%d,\"outcome\":\"%s\",\"path\":",
                         process->gpid, record.gfd, record.kind, outcome);
-                ckpt_json_string(file, record.kind == CKF_FILE ? record.path : "");
+                ckpt_json_string(file, (record.kind == CKF_FILE || record.kind == CKF_DEVICE) ? record.path : "");
                 fputs("}\n", file);
             }
             fclose(fds);
@@ -3549,11 +3586,15 @@ static int ckpt_restore_preflight(const char *base, int policy) {
         }
         struct ckpt_fd record;
         while (process->viable && ckpt_rd_all(file, &record, sizeof record) == 0) {
-            if (record.kind == CKF_FILE) {
+            if (record.kind == CKF_FILE || record.kind == CKF_DEVICE) {
                 struct stat status;
-                if (stat(record.path, &status) != 0) {
+                int unavailable = stat(record.path, &status) != 0;
+                if (!unavailable && record.kind == CKF_DEVICE)
+                    unavailable = !S_ISCHR(status.st_mode) && !S_ISBLK(status.st_mode);
+                if (unavailable) {
                     char reason[192];
-                    snprintf(reason, sizeof reason, "required external path is unavailable: %.130s", record.path);
+                    snprintf(reason, sizeof reason, "required external %s is unavailable: %.130s",
+                             record.kind == CKF_DEVICE ? "device" : "path", record.path);
                     ckpt_process_stop(process, reason);
                 }
             }

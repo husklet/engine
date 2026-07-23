@@ -113,6 +113,9 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
         execl(engine, engine, "--restore-policy", "discard-optional", "--restore", checkpoint, (char *)NULL);
     else if (restore)
         execl(engine, engine, "--restore", checkpoint, (char *)NULL);
+    else if (permissive)
+        execl(engine, engine, "--restore-policy", "discard-optional", "--checkpoint", checkpoint, guest,
+              release, (char *)NULL);
     else
         execl(engine, engine, "--checkpoint", checkpoint, guest, release, (char *)NULL);
     _exit(127);
@@ -137,13 +140,15 @@ int main(int argc, char **argv) {
     int connected_socket_case = argc == 4 && strcmp(argv[3], "connected-socket") == 0;
     int signal_case = argc == 4 && strcmp(argv[3], "signal-state") == 0;
     int connecting_refusal_case = argc == 4 && strcmp(argv[3], "connecting-refusal") == 0;
+    int connecting_fallback_case = argc == 4 && strcmp(argv[3], "connecting-fallback") == 0;
     int corrupt_magic_case = argc == 4 && strcmp(argv[3], "corrupt-magic") == 0;
     int corrupt_truncated_case = argc == 4 && strcmp(argv[3], "corrupt-truncated") == 0;
-    int permissive_case = argc == 4 && strcmp(argv[3], "missing-external") == 0;
+    int permissive_case = argc == 4 &&
+                          (strcmp(argv[3], "missing-external") == 0 || connecting_fallback_case);
     int modified_external_case = argc == 4 && strcmp(argv[3], "modified-external") == 0;
     if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
-         !connected_socket_case && !signal_case && !connecting_refusal_case && !corrupt_magic_case &&
+         !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
          !corrupt_truncated_case && !permissive_case && !modified_external_case) ||
         getcwd(temporary, sizeof temporary) == NULL ||
         strlen(temporary) + sizeof("/build/hl-checkpoint-tree.XXXXXX") > sizeof temporary)
@@ -160,7 +165,7 @@ int main(int argc, char **argv) {
     child = launch(argv[1], argv[2], release, output, checkpoint, 0, permissive_case);
     if (child < 0) return 3;
     if (wait_for_ready(output, (deleted_case || threads_case || memfd_case || inotify_case || epoll_case ||
-                                signal_case || connecting_refusal_case || modified_external_case) ? 1 :
+                                signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case) ? 1 :
                                    (socketpair_case || connected_socket_case) ? 2 : socket_state_case ? 1 :
                                    (pipe_case || eventfd_case || timerfd_case || permissive_case) ? 2 : 3,
                        time(NULL) + TIMEOUT_SECONDS) != 0) {
@@ -191,7 +196,7 @@ int main(int argc, char **argv) {
     }
     if (result != 0 || wait_for_path(manifest, time(NULL) + TIMEOUT_SECONDS) != 0) return 6;
 
-    if (permissive_case) {
+    if (permissive_case && !connecting_fallback_case) {
         char external[640];
         snprintf(external, sizeof external, "%s.external", release);
         if (unlink(external) != 0) return 7;
@@ -240,6 +245,15 @@ int main(int argc, char **argv) {
     if (result != 0) {
         fprintf(stderr, "checkpoint runner: restore exited %d\n", result);
         return 8;
+    }
+    if (connecting_fallback_case) {
+        char report[640];
+        snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
+        if (!output_has(output, "CONNECTING-FALLBACK-RESTORED") ||
+            !output_has(report, "\"outcome\":\"reconnected\""))
+            return 9;
+        printf("checkpoint connecting-socket fallback: ok\n");
+        return 0;
     }
     if (permissive_case) {
         char report[640];
