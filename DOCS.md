@@ -387,16 +387,15 @@ Nix drives CMake; these are the supported top-level commands.
 
 ```text
 nix develop                 # dev shell: host + guest cross compilers, $CC, $*_LINUX_CC, $*_DYNAMIC_*
-nix develop .#bench         # the above PLUS static sqlite, for the perf targets only
 nix build                   # the CMake build, installed as an SDK (packages.default)
 nix flake check             # format + unit + package + rust
 nix run .#fmt               # apply clang-format in the working tree
 ```
 
-Use `.#bench` only for the perf targets. The combined-bench sqlite phase links a static libsqlite3, and
-`pkgsStatic` is a **musl** stdenv, so naming it pulls in a full musl cross toolchain per guest ISA -- a
-from-source gcc build with no binary-cache hit. Keeping it out of the default shell keeps that off the
-critical path of every build and CI job; `*_LINUX_STATIC_CC` there carries only the static glibc.
+`*_LINUX_STATIC_CC` carries a static sqlite built with the guest ISA's ordinary **glibc** stdenv, not one
+taken from `pkgsStatic`. `pkgsStatic` is a musl stdenv, so naming it would pull in a full musl cross
+toolchain per guest ISA (a from-source gcc build, no binary-cache hit) just to obtain one small library --
+and it would link a musl libsqlite3.a into otherwise glibc-static guests.
 
 `fmt` is the only app: it mutates the working tree, so it cannot be a derivation. Everything that merely
 verifies is a `check`, which is also why checks can compile — they get a real stdenv, whereas a
