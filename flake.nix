@@ -143,6 +143,11 @@
             packages = [
               pkgs.clang
               pkgs.gnumake
+              # Phase-1 CMake build (additive, non-gating; see CMakeLists.txt and
+              # cross/*.cmake, which read the same *_LINUX_CC vars this shell exports).
+              # `make` remains the authoritative build; these are dev tools only.
+              pkgs.cmake
+              pkgs.ninja
               pkgs.pkg-config
               pkgs.rustc
               pkgs.cargo
