@@ -93,12 +93,22 @@ hl_guest_pair(${HL_PERF} translate ${HL_TESTS}/perf/translate.c LINKAGE static-p
 hl_guest_pair(${HL_PERF} resource  ${HL_TESTS}/perf/resource.c  LINKAGE static-pie
                FLAGS -O2 -std=gnu11 -pthread)
 
-# combined-bench: ONE source for both arches. The sqlite phase links the static
-# libsqlite3 nix supplies for BOTH arches through *_LINUX_STATIC_CC (see
-# linuxArmSqlite / linuxX86Sqlite in flake.nix), so it is on by default and can
-# be switched off per arch, matching COMBINED_BENCH_SQLITE_<arch>.
+# combined-bench: ONE source for both arches. Its sqlite phase links the static
+# libsqlite3 that *_LINUX_STATIC_CC carries, and that is NOT supplied for every
+# arch by default -- flake.nix gates it on the ISA's testNeedsSqlite, because the
+# x86_64 static sqlite comes from a musl stdenv and implies a from-source x86_64
+# musl cross gcc that nothing except this benchmark wants. So the default here
+# mirrors the Makefile's COMBINED_BENCH_SQLITE_<arch>: ON for aarch64 (whose
+# sqlite the dbserver/sqlite compat workloads need anyway), OFF for x86_64.
+# `nix develop .#bench` supplies the x86_64 flags; configure with
+# -DHL_COMBINED_BENCH_SQLITE_x86_64=ON there to get the phase back.
 foreach(_arch aarch64 x86_64)
-  option(HL_COMBINED_BENCH_SQLITE_${_arch} "link static sqlite into combined-bench (${_arch})" ON)
+  if(_arch STREQUAL "aarch64")
+    set(_sq_default ON)
+  else()
+    set(_sq_default OFF)
+  endif()
+  option(HL_COMBINED_BENCH_SQLITE_${_arch} "link static sqlite into combined-bench (${_arch})" ${_sq_default})
   if(HL_COMBINED_BENCH_SQLITE_${_arch})
     set(_sq_cpp -DHL_BENCH_SQLITE)
     set(_sq_lib -lsqlite3 -lm)

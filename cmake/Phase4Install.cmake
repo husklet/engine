@@ -96,6 +96,14 @@ Cflags: -I\${includedir}
 endif()
 
 # --- install rules ----------------------------------------------------------
+# Pin the library directory to "lib" BEFORE GNUInstallDirs computes its default.
+# On a 64-bit Linux that is not Debian-derived, GNUInstallDirs picks "lib64", so a
+# plain `cmake --install` produced lib64/ while `nix build` produced lib/ -- nixpkgs'
+# cmake hook passes -DCMAKE_INSTALL_LIBDIR=lib. Two different SDK layouts from one
+# project is a trap for anyone writing -L or a pkg-config path, and it is what made
+# the CI install assertions (which check lib/) fail. Cache entry, so an explicit
+# -DCMAKE_INSTALL_LIBDIR on the command line still wins.
+set(CMAKE_INSTALL_LIBDIR "lib" CACHE PATH "object code libraries (relative to prefix)")
 include(GNUInstallDirs)
 
 set(HL_INSTALL_LIBS hl-engine hl-translator hl-linux-abi)
