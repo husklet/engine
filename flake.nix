@@ -23,7 +23,7 @@
         in {
           default = pkgs.stdenv.mkDerivation {
             pname = "hl-engine";
-            version = "0.1.20";
+            version = "0.1.21";
             src = pkgs.lib.cleanSource self;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.gnumake pkgs.pkg-config ]
@@ -100,7 +100,7 @@
         } // pkgs.lib.optionalAttrs runtimeHost {
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
-            version = "0.1.20";
+            version = "0.1.21";
             # The publishable `hl-engine` crate lives at pkgs/rust; its former
             # api/provider/protocol/runtime member crates are now internal
             # modules, so the whole pkgs/rust tree is the sandbox.
