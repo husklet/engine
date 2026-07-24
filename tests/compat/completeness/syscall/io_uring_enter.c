@@ -1,11 +1,9 @@
 /* io_uring entry-point robustness + async-runtime fallback contract.
-   The engine deliberately reports io_uring as absent (ENOSYS) so glibc/liburing and async
-   runtimes (tokio, Go/Node pollers, databases) fall back to synchronous syscalls. This probe
-   asserts all three entry points are HANDLED cleanly -- either a valid result or a canonical
-   errno, never a crash or a garbage errno -- AND that the synchronous fallback path a runtime
-   takes when io_uring is unavailable actually moves bytes intact. Derived booleans only, so the
-   output is arch-neutral and identical on a real Linux host (io_uring present) and the engine
-   (io_uring ENOSYS). Companion to io_uring_setup.c, which covers the setup success/reject shape. */
+   Docker's default seccomp profile blocks io_uring with EPERM. This probe asserts all three entry
+   points are HANDLED cleanly -- either a valid result on an unrestricted native kernel, a bad-fd
+   result after native dispatch, or the container policy result -- AND that synchronous fallback
+   I/O moves bytes intact. Derived booleans only, so the output is arch-neutral and identical on a
+   real Linux host and the engine. Companion to io_uring_setup.c, which covers setup shape. */
 #include "compat.h"
 #include <stdio.h>
 #include <string.h>
@@ -23,13 +21,11 @@
 
 struct io_uring_params { unsigned pad[30]; };  /* 120 bytes; kernel writes back into it */
 
-/* A cleanly-handled io_uring call: a success, or one of the canonical refusals a correct kernel
-   or engine returns. ENOSYS = feature absent (engine); EBADF = bad ring fd (host). Anything else
-   (a fault, a wild errno) flips the verdict. */
+/* ENOSYS is deliberately excluded: the engine exposes Linux's io_uring API under Docker's default
+   policy, so it must report EPERM instead of claiming the syscall does not exist. */
 static int handled(long rc) {
     if (rc >= 0) return 1;
-    return errno == ENOSYS || errno == EBADF || errno == EINVAL ||
-           errno == EPERM || errno == EACCES || errno == EOPNOTSUPP;
+    return errno == EBADF || errno == EINVAL || errno == EPERM || errno == EACCES || errno == EOPNOTSUPP;
 }
 
 int main(void) {
@@ -40,9 +36,8 @@ int main(void) {
     if (s >= 0) close((int)s);
 
     /* Drive io_uring_enter and io_uring_register against a guaranteed-bad ring fd, so the errno is
-       deterministic across oracles: EBADF where io_uring is present, ENOSYS where it is absent.
-       Both are canonical -- the point is that the entry point is dispatched and validated, never
-       crashes the guest. */
+       deterministic across supported policies: EBADF where io_uring is admitted, EPERM where the
+       default container profile blocks it. */
     long e = syscall(__NR_io_uring_enter, -1, 0u, 0u, 0u, (void *)0, (unsigned long)0);
     int enter_ok = handled(e);
 

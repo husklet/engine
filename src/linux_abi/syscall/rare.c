@@ -67,12 +67,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 263: // fanotify_mark(fd, flags, mask, dirfd, path)
         G_RET(c) = (uint64_t)(-EPERM);
         break;
-    // io_uring: we don't implement it. Return ENOSYS ("absent") not EPERM ("present but blocked"),
-    // else runtime probers read EPERM as retryable and retry/hang. All three entry points agree.
+    // io_uring is blocked by Docker's default seccomp profile. Report the same EPERM policy result
+    // for every entry point rather than claiming that the Linux API is absent with ENOSYS.
     case 425: // io_uring_setup(2)
     case 426: // io_uring_enter(2)
     case 427: // io_uring_register(2)
-        G_RET(c) = (uint64_t)(-ENOSYS);
+        G_RET(c) = (uint64_t)(-EPERM);
         break;
     // seccomp(2): ENFORCED. We store the guest's classic-BPF program(s) and run a small cBPF interpreter
     // against a real struct seccomp_data on every syscall (os/linux/seccomp.c, gated in service()), honouring
