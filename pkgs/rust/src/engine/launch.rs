@@ -114,21 +114,37 @@ where
         .map_err(|message| Error::Distribution(message.clone()))?;
     let config_path = CString::new(config.path().as_os_str().as_bytes())
         .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
+    // Compose rather than choose: gather whichever descriptors this launch requested — a provider
+    // transport, a checkpoint broker and its trigger — and hand them to the engine in ONE combined call
+    // alongside the process I/O (stdio or a PTY). Any subset may be present simultaneously.
+    //
+    // `_transport` keeps the provider-transport child socket alive across the activation call (its fd is
+    // duplicated into the engine via SCM_RIGHTS during the call). `_server` keeps the provider dispatch
+    // thread's join handle in scope for the whole function, exactly as `start_services` did: dropping the
+    // handle only detaches the thread, but keeping it named documents and preserves that lifetime.
+    let (transport_socket, _server) = if let Some((services, authority)) = services {
+        let (child, server) = prepare_services(services, &authority)?;
+        (Some(child), Some(server))
+    } else {
+        (None, None)
+    };
+    let transport = transport_socket.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+    let (checkpoint, trigger) =
+        channels.map_or((-1, -1), |(checkpoint, trigger)| (checkpoint, trigger));
+
     let (process, stdin, stdout, stderr, terminal) = if let Some(size) = terminal {
-        let result = if let Some((services, authority)) = services {
-            start_services_terminal(
-                executable,
-                guest_number(guest),
-                &config_path,
-                size,
-                services,
-                &authority,
-            )
-        } else {
-            ffi::start_terminal(executable, guest_number(guest), &config_path, size.native())
-                .map_err(native_error)
-        };
-        let (process, file) = result?;
+        let (process, file) = ffi::start_combined(
+            executable,
+            guest_number(guest),
+            &config_path,
+            None,
+            Some(size.native()),
+            transport,
+            checkpoint,
+            trigger,
+        )
+        .map_err(native_error)?;
+        let file = file.ok_or_else(|| native_error(5))?;
         (process, None, None, None, Some(crate::Terminal::new(file)))
     } else {
         let (input, stdin, input_child) = prepare(streams.0, true)?;
@@ -139,29 +155,17 @@ where
             output,
             error,
         };
-        let process = if let Some((services, authority)) = services {
-            start_services(
-                executable,
-                guest_number(guest),
-                &config_path,
-                &native,
-                services,
-                &authority,
-            )?
-        } else if let Some((checkpoint, trigger)) = channels {
-            ffi::start_with_channels(
-                executable,
-                guest_number(guest),
-                &config_path,
-                &native,
-                checkpoint,
-                trigger,
-            )
-            .map_err(native_error)?
-        } else {
-            ffi::start(executable, guest_number(guest), &config_path, &native)
-                .map_err(native_error)?
-        };
+        let (process, _) = ffi::start_combined(
+            executable,
+            guest_number(guest),
+            &config_path,
+            Some(&native),
+            None,
+            transport,
+            checkpoint,
+            trigger,
+        )
+        .map_err(native_error)?;
         drop((input_child, output_child, error_child));
         (process, stdin, stdout, stderr, None)
     };
@@ -177,31 +181,6 @@ where
         _projections: projections,
         _provider_resources: resources,
     })
-}
-
-fn start_services(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    streams: &ffi::Streams,
-    launch: ServiceLaunch,
-    authority: &crate::extension::Authorities,
-) -> Result<ffi::Handle, Error> {
-    let (child, _server) = prepare_services(launch, authority)?;
-    ffi::start_with_transport(executable, guest, config, streams, &child).map_err(native_error)
-}
-
-fn start_services_terminal(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    size: Size,
-    launch: ServiceLaunch,
-    authority: &crate::extension::Authorities,
-) -> Result<(ffi::Handle, File), Error> {
-    let (child, _server) = prepare_services(launch, authority)?;
-    ffi::start_terminal_with_transport(executable, guest, config, size.native(), &child)
-        .map_err(native_error)
 }
 
 fn prepare_services(

@@ -3,7 +3,7 @@
 //! API" is true: the image exists only as bytes this test held in memory.
 
 use hl_engine::{
-    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio,
+    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Size, Stdio,
     StoreDirection, StoreError,
 };
 #[path = "support/checkpoint_env.rs"]
@@ -128,6 +128,78 @@ fn captured_into_memory_and_restored(guest: Guest) {
     assert_eq!(restored.wait().expect("restore exit"), Exit::Code(0));
 
     fs::remove_dir_all(root).expect("scratch cleanup");
+}
+
+/// The regression this whole change exists for: a streaming checkpoint store MUST compose with a PTY.
+/// Before the fix the Rust launch path chose terminal XOR checkpoint, hardcoding `size = null` and
+/// dropping the broker; the guest then aborted with "streaming checkpoint requested without a broker
+/// descriptor". Here the same three-process tree is captured into memory WHILE a terminal is attached, so
+/// the capture only succeeds if terminal + checkpoint + trigger were all forwarded together.
+#[test]
+fn a_store_captures_while_a_terminal_is_attached() {
+    use std::io::Read;
+
+    if checkpoint_env::skip_if_unavailable("a_store_captures_while_a_terminal_is_attached") {
+        return;
+    }
+    let guest = Guest::Aarch64;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("checkpoint-store-terminal-{}", std::process::id()));
+    let release = root.join("release");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("scratch directory");
+
+    let executable = fixture("checkpoint-tree", guest);
+    let store = Arc::new(MemoryStore::new());
+
+    let mut capture = MachineSpec::new(guest, &executable);
+    capture.process.argv.push(release.clone().into_os_string());
+    capture.checkpoint.enabled = true;
+    // The composition under test: a PTY requested alongside the streaming store.
+    capture.process.terminal = Some(Size::new(24, 80).expect("terminal size"));
+
+    let mut machine = Engine::new()
+        .spawn_with_store(
+            capture,
+            io(),
+            Arc::clone(&store) as Arc<dyn CheckpointStore>,
+            StoreDirection::Capture,
+        )
+        .expect("capture launch with a terminal attached");
+
+    // Drain the pty so the guest never blocks on a full master buffer while we wait for readiness.
+    let terminal = machine.take_terminal().expect("a terminal was requested");
+    let mut reader = terminal.try_clone().expect("clone the pty master");
+    let drain = thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+
+    wait_until_ready(&root.join("release.output"));
+
+    machine
+        .checkpoint_into_store(Duration::from_secs(20))
+        .expect("capture into the store must succeed with a terminal active");
+    assert_eq!(machine.wait().expect("capture exit"), Exit::Code(0));
+
+    assert!(
+        store.committed(),
+        "the image was never committed: terminal + checkpoint did not compose"
+    );
+    assert_eq!(
+        store
+            .objects()
+            .keys()
+            .filter(|name| name.starts_with("proc.") && name.ends_with("/meta"))
+            .count(),
+        3,
+        "expected three process images while a terminal was attached"
+    );
+
+    drop(terminal);
+    let _ = drain.join();
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A store that fails after N successful objects, so the failure lands in the middle of a process image.

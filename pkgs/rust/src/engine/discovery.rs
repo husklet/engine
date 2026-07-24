@@ -8,7 +8,7 @@ use super::{
 /// Guest architectures whose checkpoint/restore path is supported through this
 /// crate.
 ///
-/// Both `Aarch64` and `X86_64` qualify. The x86_64 restore path previously
+/// Both `Aarch64` and `X86_64` qualify. The `x86_64` restore path previously
 /// brought a process back with its file descriptors pointing at the launcher's
 /// stdio instead of the captured ones (a guest that dup2'd fd 1 onto a file
 /// wrote to the console after restore). The root cause was in the C backend:
@@ -17,7 +17,7 @@ use super::{
 /// registered a dup2'd descriptor in `proc_fdvis`, and checkpoint's fd-table
 /// scan silently dropped it. With that mapping added, every checkpoint fixture
 /// reachable from this API (`checkpoint-{tree,pipe,deleted,cycle}`) captures and
-/// restores its descriptor table correctly on x86_64, matching aarch64.
+/// restores its descriptor table correctly on `x86_64`, matching `aarch64`.
 ///
 /// This set is the ONLY place checkpoint guest support is decided: the launch
 /// validator reads it, so a guest added or removed here changes what `validate`

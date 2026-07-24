@@ -61,38 +61,6 @@ impl Default for EngineExit {
 
 unsafe extern "C" {
     pub(crate) fn hl_engine_guest_fd_limit() -> u32;
-    pub(crate) fn hl_activation_start_with_stdio(
-        executable: *const c_char,
-        guest: u32,
-        config: *const c_char,
-        streams: *const Streams,
-        process: *mut *mut Process,
-    ) -> i32;
-    pub(crate) fn hl_activation_start_with_transport(
-        executable: *const c_char,
-        guest: u32,
-        config: *const c_char,
-        streams: *const Streams,
-        transport: c_int,
-        process: *mut *mut Process,
-    ) -> i32;
-    pub(crate) fn hl_activation_start_terminal(
-        executable: *const c_char,
-        guest: u32,
-        config: *const c_char,
-        size: TerminalSize,
-        master: *mut i32,
-        process: *mut *mut Process,
-    ) -> i32;
-    pub(crate) fn hl_activation_start_terminal_with_transport(
-        executable: *const c_char,
-        guest: u32,
-        config: *const c_char,
-        size: TerminalSize,
-        transport: c_int,
-        master: *mut i32,
-        process: *mut *mut Process,
-    ) -> i32;
     pub(crate) fn hl_activation_start_with_channels(
         executable: *const c_char,
         guest: u32,
@@ -145,57 +113,6 @@ pub(crate) fn guest_fd_limit() -> u32 {
     // SAFETY: this query reads the current process resource limit and has no pointer arguments or side effects.
     unsafe { hl_engine_guest_fd_limit() }
 }
-pub(crate) fn start_terminal(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    size: TerminalSize,
-) -> Result<(Handle, File), i32> {
-    let mut process = std::ptr::null_mut();
-    let mut master = -1;
-    let status = unsafe {
-        hl_activation_start_terminal(
-            executable.as_ptr(),
-            guest,
-            config.as_ptr(),
-            size,
-            &mut master,
-            &mut process,
-        )
-    };
-    if status == 0 && !process.is_null() && master >= 0 {
-        Ok((Handle(process), unsafe { File::from_raw_fd(master) }))
-    } else {
-        Err(status)
-    }
-}
-
-pub(crate) fn start_terminal_with_transport(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    size: TerminalSize,
-    transport: &std::os::unix::net::UnixStream,
-) -> Result<(Handle, File), i32> {
-    let mut process = std::ptr::null_mut();
-    let mut master = -1;
-    let status = unsafe {
-        hl_activation_start_terminal_with_transport(
-            executable.as_ptr(),
-            guest,
-            config.as_ptr(),
-            size,
-            transport.as_raw_fd(),
-            &mut master,
-            &mut process,
-        )
-    };
-    if status == 0 && !process.is_null() && master >= 0 {
-        Ok((Handle(process), unsafe { File::from_raw_fd(master) }))
-    } else {
-        Err(status)
-    }
-}
 pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
     let status = unsafe { hl_terminal_resize(file.as_raw_fd(), size) };
     if status == 0 {
@@ -205,54 +122,6 @@ pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
     }
 }
 
-pub(crate) fn start(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    streams: &Streams,
-) -> Result<Handle, i32> {
-    let mut process = std::ptr::null_mut();
-    let status = unsafe {
-        hl_activation_start_with_stdio(
-            executable.as_ptr(),
-            guest,
-            config.as_ptr(),
-            streams,
-            &mut process,
-        )
-    };
-    if status == 0 && !process.is_null() {
-        Ok(Handle(process))
-    } else {
-        Err(status)
-    }
-}
-
-#[allow(dead_code)] // Kept private until native VFS dispatch makes the capability truthful.
-pub(crate) fn start_with_transport(
-    executable: &std::ffi::CStr,
-    guest: u32,
-    config: &std::ffi::CStr,
-    streams: &Streams,
-    transport: &std::os::unix::net::UnixStream,
-) -> Result<Handle, i32> {
-    let mut process = std::ptr::null_mut();
-    let status = unsafe {
-        hl_activation_start_with_transport(
-            executable.as_ptr(),
-            guest,
-            config.as_ptr(),
-            streams,
-            transport.as_raw_fd(),
-            &mut process,
-        )
-    };
-    if status == 0 && !process.is_null() {
-        Ok(Handle(process))
-    } else {
-        Err(status)
-    }
-}
 pub(crate) fn wait(process: &Handle) -> Result<EngineExit, i32> {
     let mut exit = EngineExit::default();
     let status = unsafe { hl_activation_wait(process.0, &mut exit) };
@@ -476,33 +345,53 @@ impl Drop for Trigger {
     }
 }
 
-/// Activation with any combination of a provider transport, a checkpoint broker and a trigger page.
-pub(crate) fn start_with_channels(
+/// Activation with any combination of stdio streams OR a terminal size, a provider transport, a
+/// checkpoint broker and a trigger page — all forwarded together through the one combined C entry point.
+///
+/// Exactly one of `streams` / `size` describes the process I/O: pass `streams` for a plain (stdio)
+/// process, or `size` for a PTY. When `size` is set the engine returns the pty master, delivered here as
+/// the `Option<File>`. `transport`, `checkpoint` and `trigger` are each `-1` when not requested.
+#[allow(clippy::too_many_arguments)] // The one C entry that composes every activation channel.
+pub(crate) fn start_combined(
     executable: &std::ffi::CStr,
     guest: u32,
     config: &std::ffi::CStr,
-    streams: &Streams,
+    streams: Option<&Streams>,
+    size: Option<TerminalSize>,
+    transport: c_int,
     checkpoint: c_int,
     trigger: c_int,
-) -> Result<Handle, i32> {
+) -> Result<(Handle, Option<File>), i32> {
     let mut process = std::ptr::null_mut();
+    let mut master = -1;
+    let size_ptr = size.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+    let streams_ptr = streams.map_or(std::ptr::null(), std::ptr::from_ref);
     let status = unsafe {
         hl_activation_start_with_channels(
             executable.as_ptr(),
             guest,
             config.as_ptr(),
-            streams,
-            std::ptr::null(),
-            -1,
+            streams_ptr,
+            size_ptr,
+            transport,
             checkpoint,
             trigger,
-            std::ptr::null_mut(),
+            &mut master,
             &mut process,
         )
     };
-    if status == 0 && !process.is_null() {
-        Ok(Handle(process))
-    } else {
-        Err(status)
+    if status != 0 || process.is_null() {
+        return Err(status);
     }
+    // The engine only fills the master when a terminal size was requested; a stdio process leaves it -1.
+    let terminal = if size.is_some() {
+        if master < 0 {
+            return Err(status);
+        }
+        // SAFETY: the descriptor was just created by the engine and is owned by this process.
+        Some(unsafe { File::from_raw_fd(master) })
+    } else {
+        None
+    };
+    Ok((Handle(process), terminal))
 }
