@@ -73,6 +73,31 @@ jobs:
             test -x build-ci-sdk/bin/hl-engine-runner
           '
 
+      # Coverage-parity gate for the Makefile retirement (docs/makefile-retirement.md).
+      # ADDITIVE: it does not replace or weaken the `typed-<suite>` jobs below --
+      # those keep running `make` exactly as before. This asserts only that every
+      # typed suite the compat matrix shards on ALSO exists as a CTest label with a
+      # non-empty test set, so a suite cannot be dropped from the CMake side (or
+      # added to the Makefile side only) without a red build. It is a name/registry
+      # check against `ctest -N`, so it costs seconds, not a suite run.
+      - name: Compat coverage parity (make typed-* vs ctest labels)
+        run: |
+          nix develop --command sh -c '
+            set -e
+            missing=
+            for s in filesystem isolation network procfs process memory syscall \
+                     syscall_edges abi completeness ipc libc posix signals threads time; do
+              label="compat-$(echo "$s" | tr _ -)"
+              n=$(ctest --test-dir build-ci -N -L "^${label}$" | grep -c "Test *#" || true)
+              echo "typed-$s -> ctest -L $label : $n test(s)"
+              [ "$n" -ge 1 ] || missing="$missing typed-$s"
+            done
+            if [ -n "$missing" ]; then
+              echo "::error title=CMake compat coverage gap::no CTest label for:$missing"
+              exit 1
+            fi
+          '
+
       # The three Rust gates below are plain `nix develop` steps, NOT flake
       # checks, and that is deliberate. checks.rust is `buildRustPackage` with
       # `doCheck = false` because its sandboxed src is a filtered copy of

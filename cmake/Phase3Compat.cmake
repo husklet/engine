@@ -260,6 +260,13 @@ foreach(_c ctest_x64 g_x64 go_goro_x86 go_heapgc_x86 gw hello_x86 hx)
     ${HL_TESTS}/compat/isa/x86_64/${_c} LINKAGE copy)
 endforeach()
 
+# 8b. isa/aarch64 — the AArch64 counterpart of isa_regress, pinning the
+# lowerings the differential aarch64 fuzzer found diverging from a NATIVE run
+# of the same binary. Non-PIE on purpose (Makefile 1084): g_nonpie_lo must be
+# armed for the LSE-upgrade and bias-fold paths.
+hl_guest_binary(aarch64 ${HL_COMPAT}/isa/aarch64/isa_regress
+  ${HL_TESTS}/compat/isa/aarch64/isa_regress.c LINKAGE nonpie FLAGS ${_gnu})
+
 # ===========================================================================
 # 9. soak
 # ===========================================================================
@@ -394,6 +401,7 @@ hl_compat_suite(core-syscall ${HL_COMPAT}/core/syscall tests/compat/core/syscall
 hl_compat_suite(core-regress ${HL_COMPAT}/core/regress tests/compat/core/regress)
 hl_compat_suite(core-workload ${HL_COMPAT}/core/workload tests/compat/core/workload)
 hl_compat_suite(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64)
+hl_compat_suite(isa-aarch64  ${HL_COMPAT}/isa          tests/compat/isa/aarch64)
 
 # --- suites with real, non-obvious concurrency constraints ------------------
 # The Makefile expresses these as prose + .NOTPARALLEL; CTest can express them
@@ -413,6 +421,19 @@ hl_compat_suite(signals    ${HL_COMPAT}/signals    tests/compat/signals    LOCKS
 hl_compat_suite(threads    ${HL_COMPAT}/threads    tests/compat/threads)
 # soak is long and CPU-hungry: give it the machine.
 hl_compat_suite(soak       ${CMAKE_BINARY_DIR}/soak tests/soak SERIAL)
+
+# --- the --repeat 10 "extended" variants ------------------------------------
+# Makefile compat-core-workload-extended / compat-soak-extended: the SAME case
+# set run ten times over, to shake out state that only leaks across repeats.
+# They are hour-scale, so they carry their own label and are NOT in `compat`:
+# select them explicitly with `ctest -L compat-extended`.
+hl_compat_suite(core-workload-extended ${HL_COMPAT}/core/workload
+                tests/compat/core/workload SERIAL ARGS --repeat 10)
+hl_compat_suite(soak-extended ${CMAKE_BINARY_DIR}/soak tests/soak
+                SERIAL ARGS --repeat 10)
+foreach(_t compat.core-workload-extended compat.soak-extended)
+  set_tests_properties(${_t} PROPERTIES LABELS "compat-extended")
+endforeach()
 
 # compat-filesystem asserts four fixtures exist before running (Makefile 2286).
 add_test(NAME compat.filesystem-fixtures-present
