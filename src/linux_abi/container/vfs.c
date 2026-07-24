@@ -6240,7 +6240,9 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
         return 0;
     }
     close(fd);
-    int writable_proc = gp && (strstr(gp, "/oom_score_adj") || strstr(gp, "/oom_adj"));
+    // /proc/self/comm is 0644 on Linux (writing it renames the task; see the write handler in io.c).
+    int writable_proc =
+        gp && (strstr(gp, "/oom_score_adj") || strstr(gp, "/oom_adj") || strstr(gp, "/self/comm"));
     s->st_mode = S_IFREG | (writable_proc ? 0644 : 0444);
     // present as a readable regular file
     s->st_nlink = 1;

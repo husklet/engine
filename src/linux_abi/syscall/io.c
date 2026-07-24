@@ -1097,6 +1097,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = a2;
             break;
         }
+        // /proc/self/comm is WRITABLE on Linux: it renames the task exactly as prctl(PR_SET_NAME) does,
+        // truncating to TASK_COMM_LEN-1 (15) characters and dropping one trailing newline, and the new name
+        // is immediately visible through prctl(PR_GET_NAME) and /proc/self/{comm,status:Name,stat}. Without
+        // this the write landed in the synthetic backing file and the task name never changed.
+        if (wfd >= 0 && wfd < HL_NFD && !strcmp(g_proc_text_desc[wfd], "self:comm")) {
+            if (!a2) {
+                G_RET(c) = 0;
+                break;
+            }
+            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            char name[16];
+            size_t take = (size_t)a2 < sizeof name - 1 ? (size_t)a2 : sizeof name - 1;
+            memcpy(name, (const void *)a1, take);
+            name[take] = 0;
+            char *nl = strchr(name, '\n');
+            if (nl) *nl = 0;
+            snprintf(g_procname, sizeof g_procname, "%.15s", name);
+            set_guest_comm_name(g_procname);
+            char rendered[32];
+            int rendered_size = snprintf(rendered, sizeof rendered, "%s\n", g_procname);
+            (void)ftruncate(wfd, 0);
+            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
+            (void)lseek(wfd, rendered_size, SEEK_SET);
+            G_RET(c) = a2; // Linux consumes the whole write even when it truncated the stored name
+            break;
+        }
         // memfd F_SEAL_WRITE: a write to a write-sealed memfd fails EPERM (emulated seal state).
         if (wfd >= 0 && wfd < HL_NFD && (memfd_seals_fd(wfd) & 0x8)) {
             G_RET(c) = (uint64_t)(-EPERM);
