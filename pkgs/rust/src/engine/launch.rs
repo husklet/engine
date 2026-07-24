@@ -10,6 +10,32 @@ pub(super) fn start(
     authorities: crate::extension::Authorities,
     resources: Vec<super::lowering::AllocatedResource>,
 ) -> Result<Child, Error> {
+    start_channels(launch, io, authorities, resources, None)
+}
+
+/// Start with the checkpoint broker and trigger descriptors attached. They are borrowed for the duration of
+/// the call and transferred to the engine with SCM_RIGHTS.
+pub(super) fn start_channels(
+    launch: Launch,
+    io: crate::spec::ProcessIo,
+    authorities: crate::extension::Authorities,
+    resources: Vec<super::lowering::AllocatedResource>,
+    channels: Option<(std::ffi::c_int, std::ffi::c_int)>,
+) -> Result<Child, Error> {
+    if let Some((checkpoint, trigger)) = channels {
+        return start_full(
+            launch.guest,
+            &launch.config,
+            launch.program,
+            launch.arguments,
+            (io.stdin, io.stdout, io.stderr),
+            launch.terminal,
+            launch.projections,
+            launch.services.map(|services| (services, authorities)),
+            resources,
+            Some((checkpoint, trigger)),
+        );
+    }
     start_legacy(
         launch.guest,
         &launch.config,
@@ -34,6 +60,28 @@ pub(super) fn start_legacy<I, S>(
     projections: Vec<crate::projection::Projection>,
     services: Option<(ServiceLaunch, crate::extension::Authorities)>,
     resources: Vec<super::lowering::AllocatedResource>,
+) -> Result<Child, Error>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    start_full(
+        guest, config, program, arguments, streams, terminal, projections, services, resources, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_full<I, S>(
+    guest: Guest,
+    config: &Config,
+    program: impl AsRef<OsStr>,
+    arguments: I,
+    streams: (Stdio, Stdio, Stdio),
+    terminal: Option<Size>,
+    projections: Vec<crate::projection::Projection>,
+    services: Option<(ServiceLaunch, crate::extension::Authorities)>,
+    resources: Vec<super::lowering::AllocatedResource>,
+    channels: Option<(std::ffi::c_int, std::ffi::c_int)>,
 ) -> Result<Child, Error>
 where
     I: IntoIterator<Item = S>,
@@ -91,6 +139,16 @@ where
                 services,
                 &authority,
             )?
+        } else if let Some((checkpoint, trigger)) = channels {
+            ffi::start_with_channels(
+                executable,
+                guest_number(guest),
+                &config_path,
+                &native,
+                checkpoint,
+                trigger,
+            )
+            .map_err(native_error)?
         } else {
             ffi::start(executable, guest_number(guest), &config_path, &native)
                 .map_err(native_error)?

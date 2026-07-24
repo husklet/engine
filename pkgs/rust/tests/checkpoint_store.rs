@@ -1,0 +1,192 @@
+//! Capture and restore a real multi-process guest through a caller-supplied store, with no checkpoint
+//! directory anywhere. This is the test that decides whether "checkpoint/restore streams through the Rust
+//! API" is true: the image exists only as bytes this test held in memory.
+
+use hl_engine::{
+    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio, StoreDirection,
+    StoreError,
+};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/{name}-aarch64"))
+}
+
+/// The fixture announces each of its three processes on its own output file. Waiting for the host process
+/// registry instead would race the guest's own fork(): the tree must exist before it can be captured.
+fn wait_until_ready(output: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = fs::read_to_string(output).unwrap_or_default();
+        if ["READY 1", "READY 2", "READY 3"]
+            .iter()
+            .all(|marker| text.contains(marker))
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "guest tree did not become ready");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn io() -> ProcessIo {
+    ProcessIo {
+        stdin: Stdio::Null,
+        stdout: Stdio::Null,
+        stderr: Stdio::Null,
+    }
+}
+
+/// The whole point: a three-process guest is captured into memory and resumed from memory. The guest proves
+/// its own state survived -- it exits 0 only if every process came back and observed what it had before.
+#[test]
+fn a_three_process_tree_is_captured_into_memory_and_restored_from_it() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("checkpoint-store-{}", std::process::id()));
+    let release = root.join("release");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("scratch directory");
+
+    let executable = fixture("checkpoint-tree");
+    let store = Arc::new(MemoryStore::new());
+
+    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    capture.process.argv.push(release.clone().into_os_string());
+    capture.checkpoint.enabled = true;
+    let machine = Engine::new()
+        .spawn_with_store(
+            capture,
+            io(),
+            Arc::clone(&store) as Arc<dyn CheckpointStore>,
+            StoreDirection::Capture,
+        )
+        .expect("capture launch");
+
+    wait_until_ready(&root.join("release.output"));
+
+    machine
+        .checkpoint_into_store(Duration::from_secs(20))
+        .expect("capture into the store");
+    assert_eq!(machine.wait().expect("capture exit"), Exit::Code(0));
+
+    // Nothing was written anywhere but this process's heap.
+    assert!(store.committed(), "the image was never committed");
+    let objects = store.objects();
+    assert_eq!(
+        objects
+            .keys()
+            .filter(|name| name.starts_with("proc.") && name.ends_with("/meta"))
+            .count(),
+        3,
+        "expected three process images, got {:?}",
+        objects.keys().collect::<Vec<_>>()
+    );
+    assert!(store.bytes() > 0);
+
+    // Restore FROM those bytes. The guest's release file is its own resume gate, not part of the image.
+    fs::write(&release, []).expect("release the restored tree");
+    let mut restore = MachineSpec::new(Guest::Aarch64, &executable);
+    restore.checkpoint.enabled = true;
+    let restored = Engine::new()
+        .spawn_with_store(
+            restore,
+            io(),
+            Arc::clone(&store) as Arc<dyn CheckpointStore>,
+            StoreDirection::Restore,
+        )
+        .expect("restore launch");
+    assert_eq!(restored.wait().expect("restore exit"), Exit::Code(0));
+
+    fs::remove_dir_all(root).expect("scratch cleanup");
+}
+
+/// A store that fails after N successful objects, so the failure lands in the middle of a process image.
+#[derive(Debug)]
+struct FailsAfter {
+    allowed: usize,
+    written: AtomicUsize,
+    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+impl CheckpointStore for FailsAfter {
+    fn put(&self, name: &str, data: &[u8]) -> Result<(), StoreError> {
+        if self.written.fetch_add(1, Ordering::SeqCst) >= self.allowed {
+            return Err(StoreError::new("the store is out of space"));
+        }
+        self.objects
+            .lock()
+            .expect("store lock")
+            .insert(name.to_owned(), data.to_vec());
+        Ok(())
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, StoreError> {
+        self.objects
+            .lock()
+            .expect("store lock")
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StoreError::new("absent"))
+    }
+    fn list(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.objects.lock().expect("store lock").keys().cloned().collect())
+    }
+}
+
+/// The documented failure contract: an error from the store fails the capture and NOTHING is committed.
+/// Whatever the store already accepted is debris the caller may discard; the engine never calls back to
+/// undo it, and never presents it as a checkpoint.
+#[test]
+fn a_store_error_mid_capture_fails_the_capture_without_committing() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("checkpoint-store-failure-{}", std::process::id()));
+    let release = root.join("release");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("scratch directory");
+
+    let store = Arc::new(FailsAfter {
+        allowed: 2,
+        written: AtomicUsize::new(0),
+        objects: Mutex::new(BTreeMap::new()),
+    });
+
+    let executable = fixture("checkpoint-tree");
+    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    capture.process.argv.push(release.clone().into_os_string());
+    capture.checkpoint.enabled = true;
+    let machine = Engine::new()
+        .spawn_with_store(
+            capture,
+            io(),
+            Arc::clone(&store) as Arc<dyn CheckpointStore>,
+            StoreDirection::Capture,
+        )
+        .expect("capture launch");
+
+    wait_until_ready(&root.join("release.output"));
+
+    let error = machine
+        .checkpoint_into_store(Duration::from_secs(20))
+        .expect_err("a failing store must fail the capture");
+    assert!(
+        format!("{error}").contains("store rejected"),
+        "the capture must fail with the store's own rejection, not a timeout: {error}"
+    );
+    assert!(
+        !store.objects.lock().expect("store lock").contains_key("MANIFEST"),
+        "a refused capture must never be committed"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

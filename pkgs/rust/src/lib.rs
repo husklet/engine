@@ -27,6 +27,7 @@ pub(crate) mod provider;
 pub(crate) mod runtime;
 
 // Host-side implementation modules.
+mod checkpoint_stream;
 mod child;
 mod command;
 mod config;
@@ -53,6 +54,7 @@ pub use crate::wire::launch_abi;
 
 // --- Backend-independent contracts (re-exported from `api`) ---
 pub use crate::api::{checkpoint, observability};
+pub use checkpoint_stream::{CheckpointStore, MemoryStore, StoreError};
 pub use crate::api::{Access, Guest, Mount, Sandbox, Stdio, Version};
 
 // --- Engine entry points and lifecycle handles ---
@@ -61,7 +63,7 @@ pub use command::Command;
 pub use config::Config;
 pub use container::Container;
 pub use domain::Domain;
-pub use engine::Engine;
+pub use engine::{Engine, StoreDirection};
 pub use error::Error;
 pub use machine::Machine;
 pub use result::Exit;

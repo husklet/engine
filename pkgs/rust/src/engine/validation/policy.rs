@@ -139,6 +139,12 @@ fn validate_checkpoint_directory(
     Ok(())
 }
 
+/// The streaming sentinel is not a path: it selects a caller-supplied store and is never opened. It is the
+/// one value allowed where an absolute directory is otherwise required.
+fn is_stream_sentinel(path: Option<&std::path::Path>) -> bool {
+    path.is_some_and(|path| path.as_os_str() == crate::checkpoint_stream::SENTINEL)
+}
+
 pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
     let checkpoint = &spec.checkpoint;
     if checkpoint.maximum_pause_ms == Some(0) {
@@ -171,14 +177,18 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
             "a capture or restore directory is required",
         ));
     }
-    validate_checkpoint_directory(
-        checkpoint.capture_directory.as_deref(),
-        "checkpoint.capture_directory",
-    )?;
-    validate_checkpoint_directory(
-        checkpoint.restore_directory.as_deref(),
-        "checkpoint.restore_directory",
-    )?;
+    if !is_stream_sentinel(checkpoint.capture_directory.as_deref()) {
+        validate_checkpoint_directory(
+            checkpoint.capture_directory.as_deref(),
+            "checkpoint.capture_directory",
+        )?;
+    }
+    if !is_stream_sentinel(checkpoint.restore_directory.as_deref()) {
+        validate_checkpoint_directory(
+            checkpoint.restore_directory.as_deref(),
+            "checkpoint.restore_directory",
+        )?;
+    }
     if !matches!(
         spec.guest.architecture,
         crate::Guest::Aarch64 | crate::Guest::X86_64

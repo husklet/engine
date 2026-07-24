@@ -22,6 +22,26 @@ use std::{
 
 static EXECUTABLE: OnceLock<Result<CString, String>> = OnceLock::new();
 
+/// Which halves of the checkpoint lifecycle a caller-supplied store backs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreDirection {
+    /// The launch captures into the store.
+    Capture,
+    /// The launch restores from the store.
+    Restore,
+    /// The launch restores from the store and can capture back into it.
+    Both,
+}
+
+impl StoreDirection {
+    const fn captures(self) -> bool {
+        matches!(self, Self::Capture | Self::Both)
+    }
+    const fn restores(self) -> bool {
+        matches!(self, Self::Restore | Self::Both)
+    }
+}
+
 mod discovery;
 mod launch;
 pub(crate) mod lowering;
@@ -104,6 +124,68 @@ impl Engine {
         launch::start(launch, io, authorities, resources)
             .map(|child| Machine::new(child, checkpoint_directory))
             .map_err(SpawnError::Engine)
+    }
+
+    /// Starts a machine whose checkpoint image is carried by a caller-supplied store instead of a
+    /// directory. See [`crate::checkpoint_stream`] for why this needs a server rather than a callback.
+    ///
+    /// # Errors
+    /// Returns a specification error for an invalid spec, or an engine error when the transport cannot be
+    /// created or activation fails.
+    pub fn spawn_with_store(
+        &self,
+        spec: MachineSpec,
+        io: ProcessIo,
+        store: Arc<dyn crate::CheckpointStore>,
+        direction: StoreDirection,
+    ) -> Result<Machine, SpawnError> {
+        self.spawn_with_store_and_authorities(spec, io, store, direction, Authorities::default())
+    }
+
+    /// [`Engine::spawn_with_store`] with the narrow provider ports granted for this launch.
+    ///
+    /// # Errors
+    /// As [`Engine::spawn_with_store`].
+    pub fn spawn_with_store_and_authorities(
+        &self,
+        spec: MachineSpec,
+        io: ProcessIo,
+        store: Arc<dyn crate::CheckpointStore>,
+        direction: StoreDirection,
+        authorities: Authorities,
+    ) -> Result<Machine, SpawnError> {
+        // The sentinel is not a path and is never opened; it tells the engine to bind the streaming sink
+        // and source instead of a workspace directory. It replaces any directory the spec asked for.
+        let mut spec = spec;
+        let sentinel = std::path::PathBuf::from(crate::checkpoint_stream::SENTINEL);
+        spec.checkpoint.enabled = true;
+        spec.checkpoint.capture_directory =
+            direction.captures().then(|| sentinel.clone());
+        spec.checkpoint.restore_directory = direction.restores().then_some(sentinel);
+        self.validate(&spec).map_err(SpawnError::Spec)?;
+        validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
+        let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
+        let launch = lower(spec).map_err(SpawnError::Spec)?;
+        let (broker, child) = ffi::broker_pair()
+            .map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+        let trigger = ffi::Trigger::create().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+        let server = Arc::new(crate::checkpoint_stream::SinkServer::new(store));
+        let acceptor = crate::checkpoint_stream::serve(&server, broker);
+        let started = launch::start_channels(
+            launch,
+            io,
+            authorities,
+            resources,
+            Some((child.raw(), trigger.raw())),
+        );
+        drop(child);
+        match started {
+            Ok(child) => Ok(Machine::with_store(child, server, trigger, acceptor)),
+            Err(error) => {
+                server.stop();
+                Err(SpawnError::Engine(error))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -1,12 +1,15 @@
 # The checkpoint sink
 
 The checkpoint writer no longer calls the filesystem. Every byte of a checkpoint image is emitted through a
-narrow internal interface, `struct ckpt_sink` (`src/linux_abi/ckpt_sink.h`), with exactly one implementation
-today: the directory sink (`src/linux_abi/ckpt_sink_dir.h`), which reproduces the historical on-disk format
-byte for byte and reaches the host only through `hl_host_services->file`.
+narrow internal interface, `struct ckpt_sink` (`src/linux_abi/ckpt_sink.h`), and read back through its
+symmetric counterpart, `struct ckpt_source` (`src/linux_abi/ckpt_source.h`). There are two implementations of
+each: the directory sink/source (`ckpt_sink_dir.h`), which reproduces the historical on-disk format byte for
+byte and reaches the host only through `hl_host_services->file`, and the streaming sink/source
+(`ckpt_sink_stream.h`), which reaches an embedder-supplied store over a socket and touches no filesystem.
 
-This is the prerequisite for letting an embedder decide *where* and *how* checkpoint bytes are stored. It is
-not itself that feature; see "What a callback sink would still need" below for the honest remaining work.
+An embedder therefore decides *where* and *how* checkpoint bytes are stored: implement `CheckpointStore` in
+the Rust crate and launch with `Engine::spawn_with_store`. See "What a caller can and cannot do" below for
+the boundaries this has today.
 
 ## The interface
 
@@ -81,48 +84,117 @@ Ordering guarantees the writer relies on, which every implementation must honour
 - **Nothing is rolled back.** Cleaning up the debris of a refused capture is the caller's job, exactly as it
   was when the debris was a directory.
 
-## What a future Rust callback implementation would have to provide
+## The streaming sink: an embedder-supplied store
 
-A caller-supplied sink must implement all of the above. Concretely:
+The sink now has a second implementation, `src/linux_abi/ckpt_sink_stream.h`, which touches no filesystem at
+all: every operation becomes a request on a socket, and a server in the Rust crate replays it onto a
+caller-supplied `CheckpointStore` (`pkgs/rust/src/checkpoint_stream.rs`). It is selected by passing the
+sentinel `@hl-checkpoint-stream` (`HL_CKPT_STREAM_SENTINEL`) where a workspace directory would go, which is
+what `Engine::spawn_with_store` does. The sentinel is never opened; it is a discriminator, so no launch-config
+ABI field was added for it.
 
-- `begin`/`write`/`write_at`/`tell`/`finish`/`abort` per named object, with `write_at` able to patch an
-  already-written range — either natively or by buffering the object in memory until `finish`.
-- Group atomicity: buffer or stage the objects of `proc.<gpid>` and expose them only on `group_commit`.
-- A `claim` primitive with test-and-set semantics that is **visible across host processes**, because the
-  processes racing for it are separate host processes (see below).
-- An explicit `commit(manifest_bytes)` call. It replaces the manifest-appeared signal end to end: the Rust
-  `MachineSpec::checkpoint` currently polls for `<dir>/MANIFEST`, and that poll would become "the sink was
-  committed".
-- Partial failure: returning an error from any callback must leave the caller's store in a state it is willing
-  to discard. The engine will not call back to undo anything.
+### Transport
 
-### The blocker for a caller-supplied sink today
+`hl_activation_start_*` re-executes a separate engine executable and every guest process is a further
+`fork()` of it, so the bytes are produced by N host processes that share no address space with the caller.
+The transport (`include/hl/checkpoint_stream.h`, `src/core/checkpoint_channel.c`) is therefore two-level:
 
-The Rust API does not run the engine in-process. `hl_activation_start_*` (`src/core/activation.c`)
-`posix_spawn`s or `fork`+`execve`s a **separate engine executable**, and each guest process is a further
-`fork()` of that child. At checkpoint time the bytes are produced by *N separate host processes*, none of
-which shares an address space with the caller's Rust code. A Rust trait object therefore cannot simply be
-handed to the writer; a callback sink needs, at minimum:
+- a **broker**, one `SOCK_DGRAM` descriptor handed to the engine at activation with `SCM_RIGHTS` and
+  inherited by every `fork()`. It carries one message kind, `hl_ckpt_hello`, with one attached descriptor.
+  Datagram framing makes concurrent announcements from arbitrarily many engine processes atomic;
+- a **channel** per engine process, created by that process and passed to the server over the broker. It is
+  strictly request/response and strictly serial — a dumping process is at a safepoint with one thread — so
+  concurrency between processes is demultiplexed by *having one channel per process*. There are no request
+  tags, because a channel never has more than one request outstanding.
 
-1. a transport established at activation and inherited across every guest `fork()` (a descriptor per engine
-   process, or a multiplexed channel), plus a request/response wire protocol carrying begin/write/write_at/
-   finish/group/claim/commit, tagged by process;
-2. a Rust-side server that demultiplexes those requests onto the caller's trait implementation, since several
-   engine processes dump concurrently;
-3. cross-process `claim` arbitration on the Rust side (today the filesystem provides it via `O_EXCL`);
-4. the coordinator's peer rendezvous re-plumbed. It currently uses the workspace itself as its synchronisation
-   medium: `access("<dir>/proc.<gpid>")` to detect a finished peer and `opendir` to count published process
-   images. With a non-filesystem sink those must become sink queries or a separate control channel;
-5. the manifest digest re-plumbed. `ckpt_image_digest` walks and *re-reads* the written workspace to hash it
-   into the manifest, and restore recomputes the same hash to authenticate the image. A streaming sink cannot
-   be walked, so the digest must be accumulated as bytes are emitted, in an order both sides agree on;
-6. a symmetric **source** interface for restore. Restore opens image files by name, reads them at arbitrary
-   offsets, and enumerates the workspace (`opendir` over `proc.*`). Streaming a checkpoint out is only half
-   the feature if it cannot be streamed back in.
+Both the protocol and the activation request are versioned (`HL_CKPT_STREAM_ABI`, activation ABI 2, which
+tags its inherited descriptors by role so a launch can carry a provider transport, a checkpoint broker and a
+trigger page independently). A mismatch fails the capture rather than producing an unreadable image.
 
-Items 4, 5 and 6 are not plumbing — they are places where the current design uses the filesystem as a
-*database* (listable, re-readable, randomly addressable), not as a byte sink. Each needs a design decision
-before a callback sink can be honest rather than nominal.
+The **trigger** — the shared generation counter `ckpt_poll` reads at every safepoint — was a file next to the
+workspace. With no workspace it is an anonymous shared mapping (`memfd_create`, or an immediately unlinked
+POSIX segment on macOS) whose descriptor is inherited exactly like the broker. It has to stay a plain memory
+load: it is read on the dispatcher's hot path, so it cannot become a message.
+
+## Decisions that were not plumbing
+
+### Rendezvous
+
+The coordinator used the workspace as its synchronisation medium: `access("<dir>/proc.<gpid>")` to detect a
+finished peer, `opendir` to count published images.
+
+**Decision: rendezvous is a sink query, not a store observation.** `group_present` and `group_count` joined the
+vtable. The *definition* is unchanged — a peer is finished when its group is committed — but it is now asked
+of the participant that actually observes every `group_commit`, instead of inferred from a directory entry
+appearing. The directory sink answers with the same `access`/`opendir` it always used, so its behaviour and
+its timing are identical; the streaming server answers from its own set of committed groups, which is
+authoritative rather than eventually-consistent. The alternative — a separate control channel — would have
+introduced a second ordering to reason about between "committed" and "announced"; there is only one.
+
+### Digest
+
+`ckpt_image_digest` walked and *re-read* the finished workspace to hash it into the manifest, and restore
+recomputed it. A stream cannot be walked, and asking an embedder's store to be re-read defeats the point.
+
+**Decision: the digest is two-level, and both sinks compute the same value.**
+
+```
+per object : h = FNV1a(name '\0' || u64 size || contents)
+image      : H = FNV1a over (name '\0' || u64 h) for every object, in ascending name order
+```
+
+The per-object hash is accumulable by a writer that sees the object exactly once; the image hash needs only
+the `(name, h)` pairs, which the server holds as objects are finished. Ascending name order makes the fold
+independent of the order in which concurrent peers happen to emit — which the old single running hash was
+not, once "walk the directory" stopped being available to impose an order.
+
+Consequences, taken deliberately:
+
+- the manifest digest changes value, so `CKPT_VERSION` is **2**. Images written by earlier builds are refused
+  rather than mis-authenticated. This codebase has already shipped one incident from a tolerated format skew;
+- the directory sink adopts the new algorithm too, so there is exactly one digest and no format flag. It
+  still computes it by walking, because it can, and that keeps the on-disk format self-describing;
+- the digest is requested through `sink->digest` / `source->digest`, so neither side re-reads the store.
+
+## Restore: the source
+
+`src/linux_abi/ckpt_source.h` is the read half, with the same two implementations. It is deliberately *not* a
+mirrored byte stream: restore opens objects by name, seeks inside them, and enumerates the image to discover
+the process tree, so the source is `size` / `read(offset)` / `list(prefix)` / `digest`.
+
+The restore driver reaches it through a `FILE*`: `ckpt_source_fopen` is a plain `fopen` on the directory
+source and a memory stream over materialised bytes on the streaming source. That was a deliberate trade —
+converting ~40 `fread`/`fseek` call sites to an explicit cursor API is a large change whose correctness could
+only be argued by inspection, while the `FILE*` seam leaves the directory path byte-for-byte what it was. The
+cost is real and is stated where it is paid: with a streaming source, one object at a time is resident in the
+restoring process, bounded by the largest single object (a process's `pages` image).
+
+`ckpt_scan_procs` (which was `opendir` over `proc.*`) and the manifest digest now go through the source too.
+
+## What a caller can and cannot do
+
+Can:
+
+- implement `CheckpointStore` (`put` / `get` / `list` / `commit`) and capture a real multi-process guest into
+  it, then restore that guest from it, with no checkpoint directory anywhere. `MemoryStore` is provided;
+- rely on only ever seeing complete objects, and on a process image appearing all at once — the server does
+  the staging, so an embedder never has to implement group atomicity;
+- rely on `commit` being the single completion signal. `Machine::checkpoint_into_store` returns when the
+  store has been committed, not when a file appeared;
+- fail. An error from any method fails the capture, and nothing is committed. Whatever the store already
+  accepted is debris the caller discards; the engine never calls back to undo it.
+
+Cannot, as it stands:
+
+- stream an object incrementally into the store. The server buffers each object until the engine finishes it,
+  because `write_at` back-patching has to land somewhere and the engine may not seek in the embedder's store.
+  A large `pages` image is therefore resident in the server while it is being written;
+- use a caller-supplied store together with a controlling terminal or a provider transport.
+  `Engine::spawn_with_store` uses the stdio form of activation; the descriptor roles support the combination,
+  the Rust entry point does not expose it yet;
+- avoid the host filesystem entirely for *guest* state. Restoring an unlinked regular file still stages its
+  contents through a host temporary file, because the guest needs a real descriptor to a real file. That is
+  guest state being reconstructed, not the checkpoint image being stored, but it is a host write.
 
 ## Raw filesystem calls left in the writer
 

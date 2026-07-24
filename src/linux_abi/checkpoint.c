@@ -303,7 +303,7 @@ static int ckpt_restore_signal_state(const char *procdir) {
     char path[1300];
     snprintf(path, sizeof path, "%s/signals", procdir);
     struct ckpt_signal_state *state = malloc(sizeof *state);
-    if (state == NULL || hl_host_file_load(effective_host_services(), path, state, sizeof *state) != 0 ||
+    if (state == NULL || ckpt_source_load(path, state, sizeof *state) != 0 ||
         state->magic != CKPT_SIGNAL_MAGIC) {
         free(state);
         return -1;
@@ -2872,14 +2872,15 @@ static int ckpt_restore_fds_dir(const char *procdir) {
     snprintf(pf, sizeof pf, "%s/fds", procdir);
     FILE *f = ckpt_source_fopen(pf);
     if (!f) return 0;
-    struct stat record_status;
-    if (fstat(fileno(f), &record_status) != 0 || record_status.st_size < 0 ||
-        record_status.st_size % (off_t)sizeof *records != 0 ||
-        (uint64_t)record_status.st_size / sizeof *records > HL_NFD) {
+    // The object's length, asked of the source. fstat(fileno()) does not work here: a streamed object is a
+    // memory stream with no descriptor behind it.
+    int64_t record_bytes = ckpt_source_object_size(pf);
+    if (record_bytes < 0 || record_bytes % (int64_t)sizeof *records != 0 ||
+        (uint64_t)record_bytes / sizeof *records > HL_NFD) {
         ckpt_source_fclose(f);
         return -1;
     }
-    int count = (int)((uint64_t)record_status.st_size / sizeof *records);
+    int count = (int)((uint64_t)record_bytes / sizeof *records);
     records = calloc((size_t)(count ? count : 1), sizeof *records);
     if (records == NULL || (count != 0 && fread(records, sizeof *records, (size_t)count, f) != (size_t)count) ||
         fgetc(f) != EOF) {
@@ -3680,11 +3681,19 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
     return 0;
 }
 
+// The restore-side recovery journal. It is the one thing restore WRITES, and it is written back into the
+// image next to what it describes. With a workspace that is a temp file renamed into place; with a
+// caller-supplied store there is no directory to rename inside, so the report is assembled in memory and
+// handed to the store as the object "RECOVERY.jsonl" -- the same name, the same content, published by the
+// same rule (all at once, or not at all).
 static int ckpt_recovery_report(const char *base, int policy) {
+    int streaming = ckpt_source_current() != NULL && ckpt_source_current()->root[0] == '\0';
     char temporary[1300], published[1300];
+    char *buffer = NULL;
+    size_t buffered = 0;
     snprintf(temporary, sizeof temporary, "%s/.RECOVERY.jsonl.tmp.%d", base, (int)getpid());
     snprintf(published, sizeof published, "%s/RECOVERY.jsonl", base);
-    FILE *file = fopen(temporary, "wb");
+    FILE *file = streaming ? open_memstream(&buffer, &buffered) : fopen(temporary, "wb");
     if (!file) return -1;
     fprintf(file, "{\"type\":\"summary\",\"format\":1,\"policy\":%d,\"processes\":%d}\n", policy,
             g_nrprocs);
@@ -3712,12 +3721,24 @@ static int ckpt_recovery_report(const char *base, int policy) {
                 if (record.kind == CKF_SOCKETPAIR && ckpt_recovery_report_queue(file, base, process, &record) != 0) {
                     ckpt_source_fclose(fds);
                     ckpt_source_fclose(file);
-                    unlink(temporary);
+                    free(buffer);
+                    if (!streaming) unlink(temporary);
                     return -1;
                 }
             }
             ckpt_source_fclose(fds);
         }
+    }
+    if (streaming) {
+        int failed = fclose(file) != 0;
+        if (!failed) {
+            struct ckpt_sink_stream *object = NULL;
+            failed = ckpt_sink_stream_begin(NULL, NULL, "RECOVERY.jsonl", 0, &object) != 0 ||
+                     ckpt_sink_stream_write(object, buffer, buffered) != 0 ||
+                     ckpt_sink_stream_finish(object) != 0;
+        }
+        free(buffer);
+        return failed ? -1 : 0;
     }
     if (ckpt_close_sync(&file) != 0 || rename(temporary, published) != 0 || ckpt_sync_dir(base) != 0) {
         if (file) ckpt_source_fclose(file);

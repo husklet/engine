@@ -21,6 +21,26 @@ pub struct Machine {
     child: Child,
     pauses: Mutex<usize>,
     checkpoint_directory: Option<PathBuf>,
+    /// Set when the image is carried by a caller-supplied store instead of a directory.
+    store: Option<StoreChannel>,
+}
+
+/// The live transport to a caller-supplied checkpoint store, owned for the machine's lifetime because every
+/// engine process in the tree keeps talking to it until it exits.
+#[derive(Debug)]
+struct StoreChannel {
+    server: std::sync::Arc<crate::checkpoint_stream::SinkServer>,
+    trigger: crate::ffi::Trigger,
+    acceptor: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StoreChannel {
+    fn drop(&mut self) {
+        self.server.stop();
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+    }
 }
 
 impl Machine {
@@ -29,6 +49,63 @@ impl Machine {
             child,
             pauses: Mutex::new(0),
             checkpoint_directory,
+            store: None,
+        }
+    }
+
+    pub(crate) fn with_store(
+        child: Child,
+        server: std::sync::Arc<crate::checkpoint_stream::SinkServer>,
+        trigger: crate::ffi::Trigger,
+        acceptor: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            child,
+            pauses: Mutex::new(0),
+            checkpoint_directory: None,
+            store: Some(StoreChannel {
+                server,
+                trigger,
+                acceptor: Some(acceptor),
+            }),
+        }
+    }
+
+    /// Requests a capture into the caller-supplied store and waits for the image to be committed.
+    ///
+    /// Completion is not "a manifest file appeared" -- there is no file. It is the explicit
+    /// [`crate::CheckpointStore::commit`] call, which the engine makes exactly once, last.
+    ///
+    /// # Errors
+    /// Returns a control error when this machine has no store, when the store rejected part of the image,
+    /// when the engine exited without committing, or when the deadline expires.
+    pub fn checkpoint_into_store(&self, timeout: Duration) -> Result<(), ControlError> {
+        let channel = self
+            .store
+            .as_ref()
+            .ok_or_else(|| ControlError::unsupported("checkpoint"))?;
+        channel.trigger.bump();
+        crate::ffi::signal(self.id(), checkpoint_interrupt_signal())
+            .map_err(|error| checkpoint_error("interrupt checkpoint target", &error))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if channel.server.committed() {
+                return Ok(());
+            }
+            if let Some(failure) = channel.server.failure() {
+                return Err(checkpoint_context(failure));
+            }
+            if self.child.completed() {
+                return Err(checkpoint_context(
+                    "engine exited without committing a complete checkpoint image",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(checkpoint_context(
+                    "checkpoint deadline expired before the image was committed",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

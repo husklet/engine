@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "checkpoint_channel.h"
 
 #include <errno.h>
@@ -13,6 +17,7 @@
 #include <unistd.h>
 
 #include "../host/fork_wire.h"
+#include "../host/system.h"
 
 static int checkpoint_broker = -1;
 static int checkpoint_trigger = -1;
@@ -86,17 +91,27 @@ int hl_ckpt_channel_acquire(void) {
         return -1;
     }
     (void)close(pair[1]);
+    /* The channel is engine control state, not a guest socket. Move it into the private descriptor range so
+     * the checkpoint writer's own descriptor scan never mistakes it for something the guest owns -- the
+     * coordinator opens its channel BEFORE it dumps itself. */
+    {
+        int adopted = hl_host_process_fd_private_adopt(pair[0]);
+        if (adopted < 0) {
+            (void)close(pair[0]);
+            return -1;
+        }
+        pair[0] = adopted;
+    }
     checkpoint_channel = pair[0];
     checkpoint_channel_owner = (long)getpid();
     return checkpoint_channel;
 }
 
-int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload,
-                         hl_ckpt_reply *reply, void *out, size_t capacity) {
+int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload, hl_ckpt_reply *reply,
+                         void *out, size_t capacity) {
     int descriptor = hl_ckpt_channel_acquire();
     size_t name_size = name != NULL ? strlen(name) + 1 : 0;
-    if (descriptor < 0 || name_size > HL_CKPT_STREAM_NAME_MAX ||
-        request->length > HL_CKPT_STREAM_PAYLOAD_MAX)
+    if (descriptor < 0 || name_size > HL_CKPT_STREAM_NAME_MAX || request->length > HL_CKPT_STREAM_PAYLOAD_MAX)
         return -1;
     request->magic = HL_CKPT_STREAM_MAGIC_REQUEST;
     request->abi = HL_CKPT_STREAM_ABI;
@@ -121,6 +136,15 @@ int hl_ckpt_broker_pair(int *out_parent, int *out_child) {
     /* Datagram framing: an arbitrary number of engine processes announce themselves concurrently and each
      * sendmsg is one indivisible record carrying one descriptor. */
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) return -1;
+    /* Close-on-exec on BOTH ends. The child end reaches the engine through SCM_RIGHTS, which exec does not
+     * affect; without this both ends also leak into the spawned engine as ordinary inherited descriptors,
+     * where the guest descriptor scan sees two anonymous sockets it cannot account for and refuses to
+     * checkpoint at all. */
+    if (fcntl(pair[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(pair[1], F_SETFD, FD_CLOEXEC) != 0) {
+        (void)close(pair[0]);
+        (void)close(pair[1]);
+        return -1;
+    }
     *out_parent = pair[0];
     *out_child = pair[1];
     return 0;
@@ -133,15 +157,18 @@ int hl_ckpt_broker_accept(int broker, int timeout_ms, uint64_t *out_host_pid) {
     int count = 0;
     int ready;
     if (broker < 0) return -1;
-    do { ready = poll(&waiting, 1, timeout_ms); } while (ready < 0 && errno == EINTR);
+    do {
+        ready = poll(&waiting, 1, timeout_ms);
+    } while (ready < 0 && errno == EINTR);
     if (ready <= 0) return -1;
-    if (hl_fork_wire_receive_descriptors(broker, &hello, sizeof hello, descriptors, &count) !=
-        (int)sizeof hello) {
-        while (count > 0) (void)close(descriptors[--count]);
+    if (hl_fork_wire_receive_descriptors(broker, &hello, sizeof hello, descriptors, &count) != (int)sizeof hello) {
+        while (count > 0)
+            (void)close(descriptors[--count]);
         return -1;
     }
     if (count != 1 || hello.magic != HL_CKPT_STREAM_MAGIC_HELLO || hello.abi != HL_CKPT_STREAM_ABI) {
-        while (count > 0) (void)close(descriptors[--count]);
+        while (count > 0)
+            (void)close(descriptors[--count]);
         return -1;
     }
     if (out_host_pid != NULL) *out_host_pid = hello.host_pid;
