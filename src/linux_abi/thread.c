@@ -1071,6 +1071,21 @@ static int gna_hit(uint64_t a, uint64_t len) {
     return 0;
 }
 
+// How many LEADING bytes of [a,a+len) are outside every tracked guest PROT_NONE region. Linux's
+// copy_to_user is byte-granular: a read(2) whose destination straddles a PROT_NONE page copies the good
+// prefix and returns that SHORT count, reporting EFAULT only when the prefix is empty. gna_hit alone
+// cannot express that (it is all-or-nothing), so the read family clamps its count with this instead.
+static uint64_t gna_prefix(uint64_t a, uint64_t len) {
+    if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return len;
+    uint64_t end = a + len;
+    for (int i = 0; i < g_ngna; i++)
+        if (a < g_gna[i].hi && end > g_gna[i].lo) {
+            uint64_t first = g_gna[i].lo > a ? g_gna[i].lo : a;
+            if (first - a < end - a) end = first;
+        }
+    return end - a;
+}
+
 static void gro_add(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     gro_clear(lo, hi);

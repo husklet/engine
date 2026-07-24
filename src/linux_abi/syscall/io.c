@@ -444,9 +444,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     if (g_ngna) {
         switch (nr) {
         case 63:
+        case 67: { // read / pread64: the kernel WRITES the buffer with byte-granular copy_to_user, so a
+                   // destination straddling a guest PROT_NONE page yields a SHORT read of the good prefix
+                   // (Linux only reports EFAULT when nothing at all could be copied). Clamp the count to
+                   // that prefix instead of failing the whole call. (read02 still EFAULTs: prefix == 0.)
+            uint64_t good = gna_prefix(a1, a2);
+            if (a2 && !good) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+            a2 = good;
+            break;
+        }
         case 64:
-        case 67:
-        case 68: // read / write / pread64 / pwrite64
+        case 68: // write / pwrite64: the source buffer is read whole-request by the pipe/socket paths, and
+                 // Linux reports EFAULT for the call rather than a short write, so keep this all-or-nothing.
             if (gna_hit(a1, a2)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 return svc_done(c);
