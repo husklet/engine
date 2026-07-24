@@ -55,6 +55,13 @@ jobs:
       # compiles src/. If those archives have fallen behind include/hl/config.h
       # the crate still builds and links, and only fails when a user launches a
       # guest — which is how ABI-9 archives reached 0.1.17 through 0.1.26.
+      # Staleness, not brokenness: an archive built before the last engine fix
+      # still launches guests, so the test below would pass while the release
+      # quietly omits the fix. This fails the publish unless the committed
+      # archives correspond to the C sources at this tag.
+      - name: Verify the archives about to be published match the C sources
+        run: nix develop --command make check-crate-archives
+
       - name: Verify the archives about to be published launch a guest
         run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
 

@@ -535,6 +535,43 @@ an error. Linux `stat` and `statfs` byte layouts are likewise encoded once in `l
 host-neutral records. Target code supplies ownership-virtualized native metadata but neither owns nor duplicates guest
 structure layouts.
 
+### 7.7 Prebuilt crate archives (`pkgs/rust`)
+
+The published Rust crate does **not** compile `src/`. `pkgs/rust/build.rs` links a prebuilt static archive committed to
+the repository — `pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a` and
+`pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a` — and `cargo publish` ships exactly those bytes. A crate user
+runs the engine that was compiled when the archives were last regenerated, not the engine in this tree.
+
+Consequently **every change to a C source or header under `src/` or `include/` requires regenerating both archives**,
+in the same commit as the change. Skipping it ships an engine missing that change, and nothing about the crate build
+reveals it: the archive still links, and a stale archive still launches guests. Releases 0.1.17, 0.1.18 and 0.1.26
+shipped an archive 478 commits behind the headers (launch-config ABI 9 against ABI 13) and every guest launch failed
+with `launch config has an invalid prefix`.
+
+Regenerate both, and rewrite `pkgs/rust/assets/PROVENANCE.md`, with one command:
+
+```text
+make refresh-crate-archives
+```
+
+It must run on an aarch64 Linux host, and it needs the mac for the darwin half: the macOS archive is compiled by
+`clang` on Apple silicon, reached through the `MAC` bridge (`mac`, see 7.5) over the shared `/Users/x/dd` checkout. On
+Darwin itself `MAC` is `env` and the command builds both locally. Without a reachable mac the darwin compile fails
+immediately rather than silently refreshing half the pair.
+
+Two CI gates protect this, on Linux and on `publish`:
+
+- `make check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
+  and header the archives are built from (`make print-archive-sources`) — plus the SHA-256 of each committed archive,
+  and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
+  hashing: seconds, no extra compilation.
+- `pkgs/rust/tests/packaged_archive.rs` launches a guest through the committed archive on both hosts. This is the
+  *correctness* check.
+
+Byte-comparing a CI rebuild against the committed archive is not used: the build is deterministic for a fixed
+toolchain, but the compiler records the absolute checkout directory in each object, so the same commit built at a
+different path produces different bytes. The manifest hash has no such dependence.
+
 ## 8. Testing model
 
 Tests prove behavior, not the presence of source text. A test must execute a public API, host service, or production
