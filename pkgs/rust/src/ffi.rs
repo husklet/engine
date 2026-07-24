@@ -93,6 +93,27 @@ unsafe extern "C" {
         master: *mut i32,
         process: *mut *mut Process,
     ) -> i32;
+    pub(crate) fn hl_activation_start_with_channels(
+        executable: *const c_char,
+        guest: u32,
+        config: *const c_char,
+        streams: *const Streams,
+        size: *const TerminalSize,
+        transport: c_int,
+        checkpoint: c_int,
+        trigger: c_int,
+        master: *mut i32,
+        process: *mut *mut Process,
+    ) -> i32;
+    pub(crate) fn hl_ckpt_broker_pair(parent: *mut c_int, child: *mut c_int) -> c_int;
+    pub(crate) fn hl_ckpt_broker_accept(
+        broker: c_int,
+        timeout_ms: c_int,
+        host_pid: *mut u64,
+    ) -> c_int;
+    pub(crate) fn hl_ckpt_trigger_create(descriptor: *mut c_int, mapping: *mut *mut c_void) -> c_int;
+    pub(crate) fn hl_ckpt_trigger_bump(mapping: *mut c_void) -> u32;
+    pub(crate) fn hl_ckpt_trigger_destroy(mapping: *mut c_void, descriptor: c_int);
     pub(crate) fn hl_terminal_resize(master: i32, size: TerminalSize) -> i32;
     pub(crate) fn hl_activation_wait(process: *mut Process, exit: *mut EngineExit) -> i32;
     pub(crate) fn hl_activation_try_wait(
@@ -349,3 +370,135 @@ pub(crate) fn pipe_pair() -> std::io::Result<(File, File)> {
 
 const _: () = assert!(std::mem::size_of::<EngineExit>() == 24);
 const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<usize>());
+
+// --- checkpoint streaming transport -------------------------------------------------------------
+//
+// The engine side of this transport lives entirely in C (SCM_RIGHTS, an anonymous shared page). These
+// wrappers turn the raw descriptors into owned Rust types at the single unsafe boundary; everything above
+// them -- the protocol codec, the demultiplexing server, the embedder's trait -- is safe code.
+
+/// The broker socketpair. The parent end is kept by the server; the child end is handed to activation.
+pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram, OwnedDescriptor)> {
+    let mut parent = -1;
+    let mut child = -1;
+    if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just created by socketpair(2) and are owned by this process.
+    let parent = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(parent) };
+    Ok((parent, OwnedDescriptor(child)))
+}
+
+/// Waits for one engine process to announce itself and returns its private channel.
+pub(crate) fn broker_accept(
+    broker: &std::os::unix::net::UnixDatagram,
+    timeout: std::time::Duration,
+) -> Option<std::os::unix::net::UnixStream> {
+    let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+    let mut host_pid = 0_u64;
+    let descriptor =
+        unsafe { hl_ckpt_broker_accept(broker.as_raw_fd(), milliseconds, &mut host_pid) };
+    if descriptor < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor was installed into this process by recvmsg and is owned by it.
+    Some(unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) })
+}
+
+/// A raw descriptor this process owns and closes on drop.
+#[derive(Debug)]
+pub(crate) struct OwnedDescriptor(c_int);
+
+impl OwnedDescriptor {
+    pub(crate) const fn raw(&self) -> c_int {
+        self.0
+    }
+}
+
+impl Drop for OwnedDescriptor {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // SAFETY: exclusive ownership of a descriptor this type created.
+            unsafe { close_descriptor(self.0) };
+        }
+    }
+}
+
+unsafe extern "C" {
+    #[link_name = "close"]
+    fn close_descriptor(descriptor: c_int) -> c_int;
+}
+
+/// The shared generation counter used to request a capture.
+#[derive(Debug)]
+pub(crate) struct Trigger {
+    descriptor: c_int,
+    mapping: *mut c_void,
+}
+
+// SAFETY: the mapping is a single shared word; every access goes through hl_ckpt_trigger_bump, which is a
+// plain store, and the handle is never aliased.
+unsafe impl Send for Trigger {}
+unsafe impl Sync for Trigger {}
+
+impl Trigger {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        let mut descriptor = -1;
+        let mut mapping = std::ptr::null_mut();
+        if unsafe { hl_ckpt_trigger_create(&mut descriptor, &mut mapping) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            descriptor,
+            mapping,
+        })
+    }
+
+    pub(crate) const fn raw(&self) -> c_int {
+        self.descriptor
+    }
+
+    /// Advances the generation, which is what every engine process observes at its next safepoint.
+    pub(crate) fn bump(&self) -> u32 {
+        unsafe { hl_ckpt_trigger_bump(self.mapping) }
+    }
+}
+
+impl Drop for Trigger {
+    fn drop(&mut self) {
+        unsafe { hl_ckpt_trigger_destroy(self.mapping, self.descriptor) };
+        self.mapping = std::ptr::null_mut();
+        self.descriptor = -1;
+    }
+}
+
+/// Activation with any combination of a provider transport, a checkpoint broker and a trigger page.
+pub(crate) fn start_with_channels(
+    executable: &std::ffi::CStr,
+    guest: u32,
+    config: &std::ffi::CStr,
+    streams: &Streams,
+    checkpoint: c_int,
+    trigger: c_int,
+) -> Result<Handle, i32> {
+    let mut process = std::ptr::null_mut();
+    let status = unsafe {
+        hl_activation_start_with_channels(
+            executable.as_ptr(),
+            guest,
+            config.as_ptr(),
+            streams,
+            std::ptr::null(),
+            -1,
+            checkpoint,
+            trigger,
+            std::ptr::null_mut(),
+            &mut process,
+        )
+    };
+    if status == 0 && !process.is_null() {
+        Ok(Handle(process))
+    } else {
+        Err(status)
+    }
+}

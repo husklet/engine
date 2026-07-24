@@ -70,7 +70,7 @@ set(PROVIDER_SOURCES
   src/core/provider/namespace.c)
 
 set(CORE_SOURCES
-  src/core/bus.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c
+  src/core/bus.c src/core/checkpoint_channel.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c
   src/core/host_services.c src/core/launch.c src/core/log.c
   src/core/options.c src/core/target/bus.c src/core/target/native.c
   src/core/target/run.c src/core/target/services.c ${PROVIDER_SOURCES})

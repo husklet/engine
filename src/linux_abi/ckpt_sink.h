@@ -32,7 +32,26 @@
 #define HL_LINUX_ABI_CKPT_SINK_H
 
 struct ckpt_sink;
-struct ckpt_sink_stream;
+
+#define CKPT_SINK_BUFFER 65536u
+
+// One open object. The representation is shared by every implementation (they are all compiled into the same
+// translation unit and the writer holds an opaque pointer) rather than being one struct per sink, so the
+// writer's handle type stays a single concrete type.
+struct ckpt_sink_stream {
+    struct ckpt_sink *sink;
+    uint64_t position; // logical end-of-stream (the sequential write cursor)
+    uint32_t flags;
+    int failed;
+    size_t buffered; // bytes held in `buffer`, logically at [position - buffered, position)
+    unsigned char buffer[CKPT_SINK_BUFFER];
+    // --- directory sink ---
+    hl_host_handle handle;
+    char staging[1500];   // path actually written
+    char published[1500]; // final path; empty when staging == published
+    // --- streaming sink ---
+    uint64_t id; // channel-local object handle carried in every request
+};
 
 enum {
     // finish() must publish the object atomically (stage, then swap into place). Used for workspace-level
@@ -58,6 +77,16 @@ typedef struct ckpt_sink_vtable {
     // Exclusive election marker: 0 acquired, 1 already held by someone else, -1 error.
     int (*claim)(struct ckpt_sink *sink, const char *name);
     void (*unclaim)(struct ckpt_sink *sink, const char *name);
+
+    // Peer rendezvous. The coordinator waits for every peer's group and then counts what was published.
+    // On the directory sink these are access() and opendir() over the workspace; on a streaming sink they
+    // are answered by the server, which is the one place that observes every group_commit.
+    int (*group_present)(struct ckpt_sink *sink, const char *group); // 1 present, 0 absent, -1 error
+    int (*group_count)(struct ckpt_sink *sink, const char *prefix);  // >=0 count, -1 error
+
+    // The image digest that authenticates the checkpoint (see docs/checkpoint-sink.md). Called once, by the
+    // coordinator, immediately before commit.
+    int (*digest)(struct ckpt_sink *sink, uint64_t *hash, uint64_t *files, uint64_t *bytes);
 
     // Explicit completion of the whole image. Nothing may be emitted afterwards.
     int (*commit)(struct ckpt_sink *sink, const void *manifest, size_t size);
@@ -131,6 +160,15 @@ static int ckpt_sink_claim(struct ckpt_sink *sink, const char *name) {
     return sink && sink->ops ? sink->ops->claim(sink, name) : -1;
 }
 static void ckpt_sink_unclaim(struct ckpt_sink *sink, const char *name) { sink->ops->unclaim(sink, name); }
+static int ckpt_sink_group_present(struct ckpt_sink *sink, const char *group) {
+    return sink && sink->ops ? sink->ops->group_present(sink, group) : -1;
+}
+static int ckpt_sink_group_count(struct ckpt_sink *sink, const char *prefix) {
+    return sink && sink->ops ? sink->ops->group_count(sink, prefix) : -1;
+}
+static int ckpt_sink_digest(struct ckpt_sink *sink, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
+    return sink && sink->ops ? sink->ops->digest(sink, hash, files, bytes) : -1;
+}
 static int ckpt_sink_commit(struct ckpt_sink *sink, const void *manifest, size_t size) {
     return sink && sink->ops ? sink->ops->commit(sink, manifest, size) : -1;
 }

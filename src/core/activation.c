@@ -4,6 +4,7 @@
 #include "provider/client.h"
 #include "provider/files.h"
 #include "provider/namespace.h"
+#include "checkpoint_channel.h"
 #include "engine_backend.h"
 #include "environment.h"
 #include "launch.h"
@@ -61,7 +62,12 @@ static void activation_host_destroy(hl_activation_host *host) {
 extern char **environ;
 void hl_activation_test_mode(uint32_t mode);
 
-enum { HL_ACTIVATION_FD = 198, HL_ACTIVATION_ABI = 1, HL_ACTIVATION_PATH_MAX = 4096 };
+enum { HL_ACTIVATION_FD = 198, HL_ACTIVATION_ABI = 2, HL_ACTIVATION_PATH_MAX = 4096 };
+/* Descriptor roles carried by one activation request, in ascending bit order. ABI 1 carried at most the
+ * provider transport in an untagged single slot; ABI 2 tags them so the checkpoint broker can be attached
+ * with or without a provider. */
+enum { HL_ACTIVATION_ROLE_TRANSPORT = 1u, HL_ACTIVATION_ROLE_CHECKPOINT = 2u,
+       HL_ACTIVATION_ROLE_TRIGGER = 4u };
 #define HL_ACTIVATION_MAGIC UINT64_C(0x484c414354495631)
 
 typedef struct hl_activation_request {
@@ -72,7 +78,9 @@ typedef struct hl_activation_request {
     uint32_t guest_isa;
     uint32_t path_size;
     uint32_t test_flags;
-    uint32_t reserved;
+    uint32_t reserved;          /* number of attached descriptors */
+    uint32_t descriptor_roles;  /* HL_ACTIVATION_ROLE_* bitmask; descriptors arrive in ascending bit order */
+    uint32_t reserved_abi2;
     char path[HL_ACTIVATION_PATH_MAX];
 } hl_activation_request;
 
@@ -332,6 +340,9 @@ static void hl_activation_child(void) {
     int signal_relay = 0;
     int inherited[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     int inherited_count = 0;
+    int transport_descriptor = -1;
+    int checkpoint_descriptor = -1;
+    int trigger_descriptor = -1;
     int environment = hl_environment_take_activation_descriptor(&descriptor);
     if (environment == 0) return;
     if (environment < 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
@@ -351,14 +362,34 @@ static void hl_activation_child(void) {
     if (hl_host_process_fd_private_add((int)descriptor) != 0) _exit(126);
     if (hl_fork_wire_receive_descriptors((int)descriptor, &request, sizeof(request), inherited,
                                          &inherited_count) != (int)sizeof(request)) _exit(126);
-    if (request.reserved > 1 || inherited_count != (int)request.reserved) {
-        while (inherited_count > 0) (void)close(inherited[--inherited_count]);
-        _exit(126);
-    }
-    if (inherited_count == 1) {
-        int adopted = hl_host_process_fd_private_adopt(inherited[0]);
-        if (adopted < 0) _exit(126);
-        inherited[0] = adopted;
+    {
+        unsigned roles = request.descriptor_roles;
+        int expected = ((roles & HL_ACTIVATION_ROLE_TRANSPORT) != 0) +
+                       ((roles & HL_ACTIVATION_ROLE_CHECKPOINT) != 0) +
+                       ((roles & HL_ACTIVATION_ROLE_TRIGGER) != 0);
+        int slot = 0;
+        if (request.reserved > 3u ||
+            (roles & ~(unsigned)(HL_ACTIVATION_ROLE_TRANSPORT | HL_ACTIVATION_ROLE_CHECKPOINT |
+                                 HL_ACTIVATION_ROLE_TRIGGER)) != 0 ||
+            inherited_count != (int)request.reserved || inherited_count != expected) {
+            while (inherited_count > 0) (void)close(inherited[--inherited_count]);
+            _exit(126);
+        }
+        for (int index = 0; index < inherited_count; ++index) {
+            int adopted = hl_host_process_fd_private_adopt(inherited[index]);
+            if (adopted < 0) _exit(126);
+            inherited[index] = adopted;
+        }
+        /* Re-seat by role: `transport` keeps the historical slot 0 meaning, `checkpoint` is the broker every
+         * later fork() of this process uses to reach the embedder's checkpoint store. */
+        if ((roles & HL_ACTIVATION_ROLE_TRANSPORT) != 0) transport_descriptor = inherited[slot++];
+        if ((roles & HL_ACTIVATION_ROLE_CHECKPOINT) != 0) checkpoint_descriptor = inherited[slot++];
+        if ((roles & HL_ACTIVATION_ROLE_TRIGGER) != 0) trigger_descriptor = inherited[slot++];
+        inherited[0] = transport_descriptor;
+        inherited[1] = -1;
+        inherited[2] = -1;
+        if (checkpoint_descriptor >= 0) hl_ckpt_channel_publish(checkpoint_descriptor);
+        if (trigger_descriptor >= 0) hl_ckpt_trigger_publish(trigger_descriptor);
     }
     reply.magic = HL_ACTIVATION_MAGIC;
     reply.abi = HL_ACTIVATION_ABI;
@@ -416,6 +447,16 @@ static void hl_activation_child(void) {
     if (inherited[0] >= 0) {
         hl_host_process_fd_private_remove(inherited[0]);
         (void)close(inherited[0]);
+    }
+    if (trigger_descriptor >= 0) {
+        hl_ckpt_trigger_publish(-1);
+        hl_host_process_fd_private_remove(trigger_descriptor);
+        (void)close(trigger_descriptor);
+    }
+    if (checkpoint_descriptor >= 0) {
+        hl_ckpt_channel_publish(-1);
+        hl_host_process_fd_private_remove(checkpoint_descriptor);
+        (void)close(checkpoint_descriptor);
     }
     hl_host_process_fd_private_remove((int)descriptor);
     (void)close((int)descriptor);
@@ -658,7 +699,8 @@ static void cache_failure(hl_activation_process *process, hl_status status) {
 
 static hl_status activation_start(const char *executable, uint32_t guest_isa, const char *guest,
                                   const hl_activation_stdio *stdio, const hl_terminal_size *terminal,
-                                  int32_t *out_master, int transport, hl_activation_process **out_process) {
+                                  int32_t *out_master, int transport, int checkpoint, int trigger,
+                                  hl_activation_process **out_process) {
     int pair[2];
     pid_t child;
     posix_spawn_file_actions_t actions;
@@ -684,7 +726,7 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         return HL_STATUS_INVALID_ARGUMENT;
     if (stdio != NULL && (stdio->input < -1 || stdio->output < -1 || stdio->error < -1))
         return HL_STATUS_INVALID_ARGUMENT;
-    if (transport < -1) return HL_STATUS_INVALID_ARGUMENT;
+    if (transport < -1 || checkpoint < -1 || trigger < -1) return HL_STATUS_INVALID_ARGUMENT;
     if (terminal != NULL && (stdio != NULL || out_master == NULL || terminal->rows == 0 || terminal->columns == 0))
         return HL_STATUS_INVALID_ARGUMENT;
 #if defined(__APPLE__)
@@ -716,7 +758,10 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     request.size = sizeof(request);
     request.guest_isa = guest_isa;
     request.path_size = (uint32_t)path_size;
-    request.reserved = transport >= 0 ? 1u : 0u;
+    request.descriptor_roles = (transport >= 0 ? (uint32_t)HL_ACTIVATION_ROLE_TRANSPORT : 0u) |
+                               (checkpoint >= 0 ? (uint32_t)HL_ACTIVATION_ROLE_CHECKPOINT : 0u) |
+                               (trigger >= 0 ? (uint32_t)HL_ACTIVATION_ROLE_TRIGGER : 0u);
+    request.reserved = (transport >= 0 ? 1u : 0u) + (checkpoint >= 0 ? 1u : 0u) + (trigger >= 0 ? 1u : 0u);
     test_mode = activation_test_mode;
     request.test_flags = test_mode == 1 ? 1u : test_mode == 4 ? 4u : test_mode == 5 ? 5u : 0u;
     if (test_mode == 2) request.magic ^= UINT64_C(1);
@@ -789,11 +834,20 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
 spawned:
     close(pair[1]);
     free(child_env);
-    if ((transport >= 0 && test_mode != 3
-             ? hl_fork_wire_send_descriptors(pair[0], &request, sizeof(request), &transport, 1)
+    {
+        int attached[3];
+        int attached_count = 0;
+        /* Ascending role-bit order, matching hl_activation_child's re-seating. */
+        if (transport >= 0) attached[attached_count++] = transport;
+        if (checkpoint >= 0) attached[attached_count++] = checkpoint;
+        if (trigger >= 0) attached[attached_count++] = trigger;
+        if (test_mode == 3) attached_count = 0;
+    if ((attached_count > 0
+             ? hl_fork_wire_send_descriptors(pair[0], &request, sizeof(request), attached, attached_count)
              : hl_fork_wire_send_descriptors(pair[0], &request,
                                              test_mode == 3 ? sizeof(request) / 2u : sizeof(request), NULL, 0)) != 0) {
         close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+    }
     }
     if (test_mode == 3) (void)shutdown(pair[0], SHUT_WR);
     if (transfer(pair[0], &reply, sizeof(reply), 0) != 0) {
@@ -818,28 +872,36 @@ spawned:
 
 hl_status hl_activation_start_with_stdio(const char *executable, uint32_t guest_isa, const char *guest,
                                          const hl_activation_stdio *stdio, hl_activation_process **out_process) {
-    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, -1, out_process);
+    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, -1, -1, -1, out_process);
 }
 
 hl_status hl_activation_start_with_transport(const char *executable, uint32_t guest_isa, const char *guest,
                                              const hl_activation_stdio *stdio, int32_t transport,
                                              hl_activation_process **out_process) {
     if (transport < 0) return HL_STATUS_INVALID_ARGUMENT;
-    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, transport, out_process);
+    return activation_start(executable, guest_isa, guest, stdio, NULL, NULL, transport, -1, -1, out_process);
 }
 
 hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_isa, const char *guest,
                                        hl_terminal_size size, int32_t *out_master,
                                        hl_activation_process **out_process) {
-    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, -1, out_process);
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, -1, -1, -1, out_process);
 }
 
 hl_status hl_activation_start_terminal_with_transport(
     const char *executable, uint32_t guest_isa, const char *guest, hl_terminal_size size,
     int32_t transport, int32_t *out_master, hl_activation_process **out_process) {
     if (transport < 0) return HL_STATUS_INVALID_ARGUMENT;
-    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, transport,
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, transport, -1, -1,
                             out_process);
+}
+
+hl_status hl_activation_start_with_channels(const char *executable, uint32_t guest_isa, const char *guest,
+                                            const hl_activation_stdio *stdio, const hl_terminal_size *size,
+                                            int32_t transport, int32_t checkpoint, int32_t trigger,
+                                            int32_t *out_master, hl_activation_process **out_process) {
+    return activation_start(executable, guest_isa, guest, stdio, size, out_master, transport, checkpoint,
+                            trigger, out_process);
 }
 
 hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {

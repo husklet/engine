@@ -15,20 +15,7 @@
 #include "ckpt_sink.h"
 
 static int ckpt_rmrf(const char *path);
-
-#define CKPT_SINK_BUFFER 65536u
-
-struct ckpt_sink_stream {
-    struct ckpt_sink *sink;
-    hl_host_handle handle;
-    uint64_t position;      // logical end-of-stream (the sequential write cursor)
-    size_t buffered;        // bytes held in `buffer`, logically at [position - buffered, position)
-    uint32_t flags;
-    int failed;
-    char staging[1500];     // path actually written
-    char published[1500];   // final path; empty when staging == published
-    unsigned char buffer[CKPT_SINK_BUFFER];
-};
+static int ckpt_image_digest(const char *base, uint64_t *hash, uint64_t *files, uint64_t *bytes);
 
 static const hl_host_services *ckpt_sink_services(void) {
     const hl_host_services *services = effective_host_services();
@@ -272,6 +259,30 @@ static int ckpt_sink_dir_commit(struct ckpt_sink *sink, const void *manifest, si
     return ckpt_sink_sync_directory(sink->root);
 }
 
+// Rendezvous. Historically the coordinator called these inline: a published group IS a directory entry, so
+// "has that peer finished?" is access() and "how many images are there?" is a readdir count.
+static int ckpt_sink_dir_group_present(struct ckpt_sink *sink, const char *group) {
+    char path[1400];
+    snprintf(path, sizeof path, "%s/%s", sink->root, group);
+    return access(path, F_OK) == 0 ? 1 : 0;
+}
+
+static int ckpt_sink_dir_group_count(struct ckpt_sink *sink, const char *prefix) {
+    DIR *directory = opendir(sink->root);
+    int count = 0;
+    struct dirent *entry;
+    if (!directory) return -1;
+    size_t length = strlen(prefix);
+    while ((entry = readdir(directory)) != NULL)
+        if (!strncmp(entry->d_name, prefix, length) && !strstr(entry->d_name, ".tmp.")) count++;
+    closedir(directory);
+    return count;
+}
+
+static int ckpt_sink_dir_digest(struct ckpt_sink *sink, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
+    return ckpt_image_digest(sink->root, hash, files, bytes);
+}
+
 static const ckpt_sink_vtable g_ckpt_sink_dir_ops = {
     .begin = ckpt_sink_dir_begin,
     .write = ckpt_sink_dir_write,
@@ -283,6 +294,9 @@ static const ckpt_sink_vtable g_ckpt_sink_dir_ops = {
     .group_commit = ckpt_sink_dir_group_commit,
     .group_abort = ckpt_sink_dir_group_abort,
     .claim = ckpt_sink_dir_claim,
+    .group_present = ckpt_sink_dir_group_present,
+    .group_count = ckpt_sink_dir_group_count,
+    .digest = ckpt_sink_dir_digest,
     .unclaim = ckpt_sink_dir_unclaim,
     .commit = ckpt_sink_dir_commit,
 };
