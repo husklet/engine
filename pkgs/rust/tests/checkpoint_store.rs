@@ -21,8 +21,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/{name}-aarch64"))
+fn fixture(name: &str, guest: Guest) -> PathBuf {
+    let isa = match guest {
+        Guest::Aarch64 => "aarch64",
+        Guest::X86_64 => "x86_64",
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/{name}-{isa}"))
 }
 
 /// The fixture announces each of its three processes on its own output file. Waiting for the host process
@@ -59,17 +63,24 @@ fn a_three_process_tree_is_captured_into_memory_and_restored_from_it() {
     ) {
         return;
     }
+    // Both arches: the x86_64 fd-restore bug is fixed (x86 dup2 now maps to
+    // canonical dup3 so checkpoint captures dup2'd descriptors). See tests/policy.rs.
+    captured_into_memory_and_restored(Guest::Aarch64);
+    captured_into_memory_and_restored(Guest::X86_64);
+}
+
+fn captured_into_memory_and_restored(guest: Guest) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(format!("checkpoint-store-{}", std::process::id()));
+        .join(format!("checkpoint-store-{}-{guest:?}", std::process::id()));
     let release = root.join("release");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("scratch directory");
 
-    let executable = fixture("checkpoint-tree");
+    let executable = fixture("checkpoint-tree", guest);
     let store = Arc::new(MemoryStore::new());
 
-    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
     let machine = Engine::new()
@@ -104,7 +115,7 @@ fn a_three_process_tree_is_captured_into_memory_and_restored_from_it() {
 
     // Restore FROM those bytes. The guest's release file is its own resume gate, not part of the image.
     fs::write(&release, []).expect("release the restored tree");
-    let mut restore = MachineSpec::new(Guest::Aarch64, &executable);
+    let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
     let restored = Engine::new()
         .spawn_with_store(
@@ -180,7 +191,7 @@ fn a_store_error_mid_capture_fails_the_capture_without_committing() {
         objects: Mutex::new(BTreeMap::new()),
     });
 
-    let executable = fixture("checkpoint-tree");
+    let executable = fixture("checkpoint-tree", Guest::Aarch64);
     let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;

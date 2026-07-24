@@ -8,21 +8,22 @@ use super::{
 /// Guest architectures whose checkpoint/restore path is supported through this
 /// crate.
 ///
-/// Only `Aarch64` qualifies. Every checkpoint exercise reachable from the Rust
-/// API is `Aarch64` (`tests/e2e.rs` plus the `checkpoint-*-aarch64` fixtures in
-/// `testdata/`; no `x86_64` checkpoint fixture exists), the engine's launch
-/// options document `HL_CHECKPOINT_DIR` as the "aarch64 checkpoint output
-/// directory" (`src/core/options.c`), and `tests/policy.rs` requires an
-/// `x86_64` checkpoint launch to be refused. The native suite does register
-/// `x86_64` checkpoint gates against the standalone Linux engine
-/// (`cmake/Phase3Gates.cmake`), so this is a statement about what this API
-/// surface can honestly promise, not a claim that the C backend is missing.
+/// Both `Aarch64` and `X86_64` qualify. The x86_64 restore path previously
+/// brought a process back with its file descriptors pointing at the launcher's
+/// stdio instead of the captured ones (a guest that dup2'd fd 1 onto a file
+/// wrote to the console after restore). The root cause was in the C backend:
+/// `x86_number()` in `src/linux_abi/number.c` did not map x86 `dup2` (33) onto
+/// canonical `dup3` (24), so the shared post-dispatch fd-publish switch never
+/// registered a dup2'd descriptor in `proc_fdvis`, and checkpoint's fd-table
+/// scan silently dropped it. With that mapping added, every checkpoint fixture
+/// reachable from this API (`checkpoint-{tree,pipe,deleted,cycle}`) captures and
+/// restores its descriptor table correctly on x86_64, matching aarch64.
 ///
 /// This set is the ONLY place checkpoint guest support is decided: the launch
 /// validator reads it, so a guest added or removed here changes what `validate`
 /// accepts in the same breath.
 pub(super) fn checkpoint_guests() -> BTreeSet<Guest> {
-    BTreeSet::from([Guest::Aarch64])
+    BTreeSet::from([Guest::Aarch64, Guest::X86_64])
 }
 
 #[allow(clippy::too_many_lines)]
