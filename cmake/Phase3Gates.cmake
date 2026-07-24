@@ -132,6 +132,23 @@ endforeach()
 
 hl_guest_finalize(guest-fixtures-gates)
 
+# ===========================================================================
+# 2b. native-oracle fixtures for the e2e-compat differential cases
+# ===========================================================================
+# `make run-e2e-compat-<case>` runs the cross-built guest under the engine and
+# diffs its output against the SAME source built and run natively on the host
+# (build/fixtures/<case>). Phase3Compat already builds the 13 `compat-native`
+# smoke fixtures; the E2E_CASES set is a superset, so fill in the rest here.
+foreach(_c ${HL_E2E_CASES})
+  if(NOT TARGET fixture-${_c})
+    add_executable(fixture-${_c} ${HL_TESTS}/compat/fixtures/${_c}.c)
+    target_compile_options(fixture-${_c} PRIVATE -O2 -g -std=gnu11 -Wall -Wextra)
+    target_link_options(fixture-${_c} PRIVATE -pthread)
+    set_target_properties(fixture-${_c} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fixtures OUTPUT_NAME ${_c})
+  endif()
+endforeach()
+
 # ---------------------------------------------------------------------------
 # Everything from here on is the NATIVE LINUX lane: it consumes the
 # linux-production engines and the prod_* objects that Phase2Production.cmake
@@ -300,6 +317,32 @@ add_test(NAME production.config-exit70
 set_tests_properties(production.config-env production.config-supervisor
   production.config-exit70 PROPERTIES LABELS "production;production-config" RESOURCE_LOCK hl-guest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# ===========================================================================
+# 4b. native-oracle differential e2e (Makefile run-e2e-compat-<case>)
+# ===========================================================================
+# The Makefile drives these through the build/production engines, i.e. the
+# macOS-built binaries reached over the `mac` remote transport, and gates the
+# whole family on HOST=linux because the ORACLE (build/fixtures/<case>) has to
+# be a natively-runnable Linux binary.
+#
+# DELIBERATE DIFFERENCE, stated rather than hidden: CMake models no remote
+# execution (see the header of Phase4Mac.cmake), so the engine here is the
+# LOCAL linux-production engine of the matching guest ISA. The case set, the
+# guest binaries, the oracle fixtures and the comparison are identical; only
+# which build of the engine runs them differs. Every case the Makefile runs is
+# run here (34 cases x 2 arches = 68).
+foreach(_c ${HL_E2E_CASES})
+  foreach(_arch aarch64 x86_64)
+    add_test(NAME e2e-oracle.${_c}-${_arch}
+      COMMAND $<TARGET_FILE:e2e-runner> env
+              ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch}
+              ${HL_E2E}/${_c}-${_arch} 0 ${CMAKE_BINARY_DIR}/fixtures/${_c})
+    set_tests_properties(e2e-oracle.${_c}-${_arch} PROPERTIES
+      LABELS "e2e-oracle" RESOURCE_LOCK "hl-guest;hl-scratch" TIMEOUT 900
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  endforeach()
+endforeach()
+
 add_test(NAME remote-supervisor COMMAND $<TARGET_FILE:tests-remote-supervisor>
          $<TARGET_FILE:remote-supervisor>)
 set_tests_properties(remote-supervisor PROPERTIES LABELS "integration" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -448,6 +491,21 @@ foreach(_arch aarch64 x86_64)
     hl_perf_linux(${_op} ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES}
                   ${HL_PERF}/${_op}-${_arch} 0)
   endforeach()
+  # warm-cache (Makefile HL_PERF_CACHE_LINUX): the translation payload run
+  # through config-e2e-runner with a PERSISTENT code-cache directory, so the
+  # measurement is the warm path. The cache dir must be empty at the start of
+  # the case, exactly like the Makefile's `$(RM) -r` prologue.
+  list(GET PERF_LIMIT_warm-cache 0 _wc_cold)
+  list(GET PERF_LIMIT_warm-cache 1 _wc_p99)
+  add_test(NAME perf.linux-warm-cache-${_arch}
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/perf/cache-warm-linux-${_arch}"
+      "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-warm-cache-${_arch} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} ${HL_PERF}/translate-${_arch} 0 1 ${CMAKE_BINARY_DIR}/perf/cache-warm-linux-${_arch}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
+  set_tests_properties(perf.linux-warm-cache-${_arch} PROPERTIES
+    LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
   add_test(NAME perf.linux-resource-${_arch}
     COMMAND ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch}
             ${HL_PERF}/resource-${_arch})
@@ -479,6 +537,58 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND
     hl_perf_native(${_op} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES} ${HL_PERF}/${_op}-aarch64 0)
   endforeach()
 endif()
+
+# ===========================================================================
+# 8. differential ISA fuzzing (Makefile isa-fuzz* targets)
+# ===========================================================================
+# Only the DETERMINISTIC regress seed sets become CTest cases: `isa-fuzz` /
+# `isa-fuzz-arm` are open-ended campaigns over fresh random seeds, which is a
+# search, not a test, and has no place in a pass/fail suite. Drive a campaign
+# straight from the shell script (tests/fuzz/isa/<arch>/run.sh --seeds N).
+# Both are opt-in via the `isa-fuzz` label; run.sh consumes the engine from
+# build/linux-production, which is where this configure puts it.
+set(HL_ISA_FUZZ_REGRESS_SEEDS
+  "1 17 33 50 66 83 99 116 133 149 166 185 201 218 236 253 269 285 302 320 337 354 372 388 587"
+  CACHE STRING "x86_64 differential ISA fuzz regression seeds")
+set(HL_ISA_FUZZ_ARM_REGRESS_SEEDS
+  "1 2 9 10 22 26 37 44 55 70 93 99 118 150 153 173 184 202 215 226 244 275 283 300"
+  CACHE STRING "aarch64 differential ISA fuzz regression seeds")
+set(HL_ISA_FUZZ_ARM_ARGS "+i8mm +bf16 +dczva +fpcr"
+  CACHE STRING "aarch64 ISA fuzz generator feature args")
+
+# MXCSR is excluded from the x86_64 comparison: the engine mirrors the host
+# FPSR rather than modelling x86's sticky exception-status bits (Makefile 2345).
+add_test(NAME isa-fuzz.x86_64-regress
+  COMMAND ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/x86_64/run.sh
+          --engine ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64
+          --out ${CMAKE_BINARY_DIR}/isafuzz
+          --list "${HL_ISA_FUZZ_REGRESS_SEEDS}" --ignore-mxcsr)
+
+# The aarch64 oracle is the ARM64 HOST running the same binary, so run.sh
+# refuses to run anywhere else; register it only where it can pass.
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  add_test(NAME isa-fuzz.aarch64-regress
+    COMMAND ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/aarch64/run.sh
+            --engine ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-aarch64
+            --out ${CMAKE_BINARY_DIR}/isafuzz-arm
+            --list "${HL_ISA_FUZZ_ARM_REGRESS_SEEDS}" --gen-args "${HL_ISA_FUZZ_ARM_ARGS}")
+  # The Makefile runs the ARM lane TWICE: once default, once --pie into a
+  # separate output dir. Both legs are the gate, so both are registered.
+  add_test(NAME isa-fuzz.aarch64-regress-pie
+    COMMAND ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/aarch64/run.sh
+            --engine ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-aarch64
+            --list "${HL_ISA_FUZZ_ARM_REGRESS_SEEDS}" --pie
+            --gen-args "${HL_ISA_FUZZ_ARM_ARGS}"
+            --out ${CMAKE_BINARY_DIR}/isafuzz-arm-pie)
+endif()
+get_property(_gate_tests DIRECTORY PROPERTY TESTS)
+foreach(_t ${_gate_tests})
+  if(_t MATCHES "^isa-fuzz\\.")
+    set_tests_properties(${_t} PROPERTIES
+      LABELS "isa-fuzz" RUN_SERIAL TRUE TIMEOUT 3600
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  endif()
+endforeach()
 
 # `make bench` has no pass/fail semantics (it prints a comparison table), so it
 # stays a build target rather than a CTest case.
