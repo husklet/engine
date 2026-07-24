@@ -23,7 +23,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 /// The fixture announces each of its three processes on its own output file. Waiting for the host process
-/// registry instead would race the guest's own fork(): the tree must exist before it can be captured.
+/// registry instead would race the guest's own `fork()`: the tree must exist before it can be captured.
 fn wait_until_ready(output: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

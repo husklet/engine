@@ -14,7 +14,7 @@ pub(super) fn start(
 }
 
 /// Start with the checkpoint broker and trigger descriptors attached. They are borrowed for the duration of
-/// the call and transferred to the engine with SCM_RIGHTS.
+/// the call and transferred to the engine with `SCM_RIGHTS`.
 pub(super) fn start_channels(
     launch: Launch,
     io: crate::spec::ProcessIo,

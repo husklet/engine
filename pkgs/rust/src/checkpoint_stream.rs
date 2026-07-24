@@ -163,6 +163,9 @@ impl MemoryStore {
     }
 
     /// Whether a complete image was committed.
+    ///
+    /// # Panics
+    /// Panics if a previous store operation panicked while holding the lock.
     #[must_use]
     pub fn committed(&self) -> bool {
         self.objects
@@ -172,6 +175,9 @@ impl MemoryStore {
     }
 
     /// Total captured bytes.
+    ///
+    /// # Panics
+    /// Panics if a previous store operation panicked while holding the lock.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.objects
@@ -362,12 +368,9 @@ impl SinkServer {
                 Ok(()) => {}
                 Err(_) => return, // the engine process exited; that is the normal end of a channel
             }
-            let request = match Request::decode(&header) {
-                Some(request) => request,
-                None => {
-                    self.record_failure("checkpoint channel framing is invalid".into());
-                    return;
-                }
+            let Some(request) = Request::decode(&header) else {
+                self.record_failure("checkpoint channel framing is invalid".into());
+                return;
             };
             let mut name = vec![0_u8; request.name_size];
             if channel.read_exact(&mut name).is_err() {
@@ -377,12 +380,13 @@ impl SinkServer {
                 .into_owned();
             let mut payload = Vec::new();
             if request.carries_payload() {
-                payload = vec![0_u8; request.length as usize];
+                // `length` is validated against `PAYLOAD_MAX` in `Request::decode`, so this never fails.
+                payload = vec![0_u8; usize::try_from(request.length).unwrap_or(0)];
                 if channel.read_exact(&mut payload).is_err() {
                     return;
                 }
             }
-            let reply = self.dispatch(id, &request, &name, payload);
+            let reply = self.dispatch(id, &request, &name, &payload);
             if reply.write(channel).is_err() {
                 return;
             }
@@ -390,16 +394,15 @@ impl SinkServer {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn dispatch(&self, id: u64, request: &Request, name: &str, payload: Vec<u8>) -> Reply {
+    fn dispatch(&self, id: u64, request: &Request, name: &str, payload: &[u8]) -> Reply {
         let key = (id, request.stream);
         match request.op {
             OP_OBJECT_BEGIN => {
                 if name.len() > NAME_MAX {
                     return Reply::error();
                 }
-                let mut state = match self.state.lock() {
-                    Ok(state) => state,
-                    Err(_) => return Reply::error(),
+                let Ok(mut state) = self.state.lock() else {
+                    return Reply::error();
                 };
                 state.open.insert(
                     key,
@@ -418,14 +421,14 @@ impl SinkServer {
                     return Reply::error();
                 };
                 if request.op == OP_OBJECT_WRITE {
-                    object.bytes.extend_from_slice(&payload);
+                    object.bytes.extend_from_slice(payload);
                 } else {
-                    let offset = request.offset as usize;
+                    let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
                     let end = offset + payload.len();
                     if object.bytes.len() < end {
                         object.bytes.resize(end, 0);
                     }
-                    object.bytes[offset..end].copy_from_slice(&payload);
+                    object.bytes[offset..end].copy_from_slice(payload);
                 }
                 Reply::ok()
             }
@@ -567,7 +570,7 @@ impl SinkServer {
                 bytes.extend_from_slice(&digest.2.to_ne_bytes());
                 Reply::payload(bytes)
             }
-            OP_COMMIT => match self.store.commit(&payload) {
+            OP_COMMIT => match self.store.commit(payload) {
                 Ok(()) => {
                     self.committed.store(true, Ordering::SeqCst);
                     Reply::ok()
