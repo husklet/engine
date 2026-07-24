@@ -634,6 +634,51 @@ static void e_af_addsub(int a, int b, int res, int tmp) {
     e_af_save(tmp);
 }
 
+// imm12 fast path for the ALU-with-immediate forms (group1 80/81/83 and the acc,imm forms). The
+// generic path materializes every immediate into a scratch register (e_movconst) and then runs the
+// register-register do_alu -- so `add $0x10,%rax` / `cmp $0x4000,%rax` each cost a `mov` the ARM
+// encoding does not need: ADDS/SUBS take a 12-bit unsigned immediate, optionally shifted left by 12.
+//
+// Applies only when the emitted bytes are provably the SAME arithmetic the generic path would do:
+//   * width >= 4 (narrow widths operate shifted into the high bits -- different code entirely),
+//   * kind add(0) / sub(5) / cmp(7) (ARM has no flag-setting AND/ORR/EOR *immediate* in this form),
+//   * g_pfaf_dead -- otherwise do_alu needs the immediate in a REGISTER for the PF source op and the
+//     (a ^ b ^ result) AF chain, so materializing it is not wasted work,
+//   * the immediate is a non-negative value that fits imm12 or imm12<<12 exactly. Negative
+//     immediates are deliberately NOT rewritten into the opposite operation: x86 CF/OF for
+//     `add $-16` are the ADD flags of a 64-bit -16, and the FL_ADD finalizer's C inversion is tied
+//     to that, so folding it into a SUBS would need a different finalizer.
+// Everything after the arithmetic (the deferred g_fl_pending state, and hence every consumer,
+// boundary and finalizer downstream) is identical to the register path. Returns 0 -> caller falls
+// back to e_movconst + do_alu.
+int do_alu_imm12(int kind, int dst, int a, uint64_t imm, int w) {
+    if (w < 4) return 0;
+    if (kind != 0 && kind != 5 && kind != 7) return 0;
+    if (g_pfaf_dead == 0) return 0;
+    if (kind == 0 && !lazyflags_on()) return 0; // NOLAZY add spills inline -- keep the generic path
+    int sf = (w == 8);
+    uint64_t v = sf ? imm : (uint64_t)(uint32_t)imm; // 32-bit ops only see the low 32 bits
+    unsigned im;
+    int sh;
+    if (v < 0x1000ull) {
+        im = (unsigned)v;
+        sh = 0;
+    } else if (v < 0x1000000ull && (v & 0xFFFull) == 0) {
+        im = (unsigned)(v >> 12);
+        sh = 1;
+    } else
+        return 0;
+    int out = dst < 0 ? 31 : dst;
+    if (kind == 0) {
+        e_addi_s_sh(out, a, im, sf, sh);
+        g_fl_pending = FL_ADD;
+    } else {
+        e_subi_s_sh(out, a, im, sf, sh);
+        g_fl_pending = FL_SUB;
+    }
+    return 1;
+}
+
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
 // 4/8-byte: direct ARM op. 1/2-byte: operate in the HIGH bits (<<sh) so ARM NZCV matches
 // x86 byte/word flags exactly, then merge the low w bytes back (preserving upper bits).

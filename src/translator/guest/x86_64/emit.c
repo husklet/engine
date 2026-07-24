@@ -263,6 +263,16 @@ void e_subi_s(int rd, int rn, unsigned imm12, int sf) { // subs rd, rn, #imm (se
     emit32((sf ? 0xF1000000u : 0x71000000u) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
 }
 
+// Flag-setting add/sub immediate with the optional LSL #12 field -- the encoder side of the
+// materialise-then-operate elision in do_alu_imm12().
+void e_addi_s_sh(int rd, int rn, unsigned imm12, int sf, int sh) { // adds rd, rn, #imm{, lsl #12}
+    emit32((sf ? 0xB1000000u : 0x31000000u) | ((unsigned)(sh & 1) << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
+}
+
+void e_subi_s_sh(int rd, int rn, unsigned imm12, int sf, int sh) { // subs rd, rn, #imm{, lsl #12}
+    emit32((sf ? 0xF1000000u : 0x71000000u) | ((unsigned)(sh & 1) << 22) | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd);
+}
+
 // shifted-register 3-operand (LSL #amt) for add/sub/and/orr/eor and their S-forms.
 void e_rrr(uint32_t base, int rd, int rn, int rm, int sf, int lsl) {
     emit32(base | (sf ? 0x80000000u : 0) | (rm << 16) | ((lsl & 0x3F) << 10) | (rn << 5) | rd);

@@ -70,6 +70,17 @@ void do_alu(int kind, int destination, int left, int right, int width) {
     seen.width = width;
 }
 
+// imm12 fold: the fake always declines, so the fixture keeps exercising the generic
+// e_movconst + do_alu path it asserts on.
+int do_alu_imm12(int kind, int destination, int left, uint64_t immediate, int width) {
+    (void)kind;
+    (void)destination;
+    (void)left;
+    (void)immediate;
+    (void)width;
+    return 0;
+}
+
 void narrow_adcsbb(int adc, int destination, int left, int right, int width) {
     seen.narrows++;
     seen.kind = adc;
