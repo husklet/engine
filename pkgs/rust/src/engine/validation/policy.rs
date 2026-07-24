@@ -139,7 +139,10 @@ fn validate_checkpoint_directory(
     Ok(())
 }
 
-pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
+pub(super) fn validate_checkpoint(
+    capabilities: &EngineCapabilities,
+    spec: &MachineSpec,
+) -> Result<(), SpecError> {
     let checkpoint = &spec.checkpoint;
     if checkpoint.maximum_pause_ms == Some(0) {
         return Err(spec_error(
@@ -179,14 +182,13 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
         checkpoint.restore_directory.as_deref(),
         "checkpoint.restore_directory",
     )?;
-    if !matches!(
-        spec.guest.architecture,
-        crate::Guest::Aarch64 | crate::Guest::X86_64
-    ) {
+    // The capability set is the single source of truth for which guests can be checkpointed;
+    // reading it here makes discovery and preflight structurally incapable of disagreeing.
+    if !capabilities.checkpoint.supports(spec.guest.architecture) {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
             "checkpoint",
-            "native checkpoint/restore supports AArch64 and x86_64 guests",
+            "native checkpoint/restore is not implemented for this guest architecture",
         ));
     }
     if checkpoint.mode != crate::spec::CheckpointMode::Full || checkpoint.maximum_pause_ms.is_some()
@@ -413,7 +415,10 @@ pub(super) fn validate_debug(spec: &MachineSpec) -> Result<(), SpecError> {
     Ok(())
 }
 
-pub(super) fn validate_network(spec: &MachineSpec) -> Result<(), SpecError> {
+pub(super) fn validate_network(
+    capabilities: &EngineCapabilities,
+    spec: &MachineSpec,
+) -> Result<(), SpecError> {
     let network = &spec.network;
     if network.mode == NetworkMode::Host && spec.security.sandbox != crate::Sandbox::Disabled {
         return Err(spec_error(
@@ -454,18 +459,18 @@ pub(super) fn validate_network(spec: &MachineSpec) -> Result<(), SpecError> {
         }
         _ => {}
     }
-    if network.interfaces.len() > 8 {
+    if network.interfaces.len() > capabilities.networking.maximum_interfaces as usize {
         return Err(spec_error(
             SpecErrorCategory::Limit,
             "network.interfaces",
-            "at most eight interfaces are supported",
+            "interface count exceeds the engine limit",
         ));
     }
-    if network.port_forwards.len() > 32 {
+    if network.port_forwards.len() > capabilities.networking.maximum_port_forwards as usize {
         return Err(spec_error(
             SpecErrorCategory::Limit,
             "network.port_forwards",
-            "at most 32 port forwards are supported",
+            "port-forward count exceeds the engine limit",
         ));
     }
     if network.external_listeners && network.port_forwards.is_empty() {

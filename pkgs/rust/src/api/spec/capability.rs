@@ -104,10 +104,32 @@ pub enum NetworkMode {
     None,
     Virtual,
 }
+/// Checkpoint/restore support, reported as the set of guest architectures the
+/// engine build actually implements it for.
+///
+/// A flat `supported: bool` could not express the real shape of this feature:
+/// checkpoint is a per-guest-backend capability, so a caller gating on it needs
+/// to know *which* guest it may checkpoint. [`CheckpointCapabilities::guests`]
+/// is the single source of truth: the launch validator rejects checkpointing
+/// for any guest absent from this set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointCapabilities {
-    pub supported: bool,
+    pub guests: BTreeSet<Guest>,
     pub format: Option<Version>,
+}
+
+impl CheckpointCapabilities {
+    /// Reports whether this build can checkpoint and restore `guest`.
+    #[must_use]
+    pub fn supports(&self, guest: Guest) -> bool {
+        self.guests.contains(&guest)
+    }
+
+    /// Reports whether checkpointing is available for any guest at all.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        !self.guests.is_empty()
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceCapabilities {

@@ -5,24 +5,65 @@ use super::{
     NetworkMode, Version,
 };
 
+/// Guest architectures whose checkpoint/restore path is supported through this
+/// crate.
+///
+/// Only `Aarch64` qualifies. Every checkpoint exercise reachable from the Rust
+/// API is `Aarch64` (`tests/e2e.rs` plus the `checkpoint-*-aarch64` fixtures in
+/// `testdata/`; no `x86_64` checkpoint fixture exists), the engine's launch
+/// options document `HL_CHECKPOINT_DIR` as the "aarch64 checkpoint output
+/// directory" (`src/core/options.c`), and `tests/policy.rs` requires an
+/// `x86_64` checkpoint launch to be refused. The native suite does register
+/// `x86_64` checkpoint gates against the standalone Linux engine
+/// (`cmake/Phase3Gates.cmake`), so this is a statement about what this API
+/// surface can honestly promise, not a claim that the C backend is missing.
+///
+/// This set is the ONLY place checkpoint guest support is decided: the launch
+/// validator reads it, so a guest added or removed here changes what `validate`
+/// accepts in the same breath.
+pub(super) fn checkpoint_guests() -> BTreeSet<Guest> {
+    BTreeSet::from([Guest::Aarch64])
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn capabilities() -> EngineCapabilities {
     let guest_fd_limit = crate::ffi::guest_fd_limit();
     EngineCapabilities {
+        // Version of the typed launch model in this crate, a compile-time fact of the source
+        // that defines it. It is deliberately NOT the C ABI number (`HL_ENGINE_ABI`), which
+        // versions a different contract.
         api: Version::new(1, 0),
+        // Both guest frontends are linked into the embedded archive unconditionally
+        // (`cmake/Phase2Production.cmake` builds `src/core/target/{aarch64,x86_64}.c` into the
+        // one library), so guest support is a compile-time fact of this build.
         guests: vec![
             GuestPlatform::linux(Guest::Aarch64),
             GuestPlatform::linux(Guest::X86_64),
         ],
         cpu: CpuCapabilities {
             architectures: vec![Guest::Aarch64, Guest::X86_64],
+            // The Linux ABI layer serves a fixed 4 KiB guest page size.
             page_sizes: vec![4096],
-            maximum_cpus: u32::MAX,
+            // The guest affinity mask is HL_LINUX_AFFINITY_BYTES (128) bytes wide
+            // (`src/linux_abi/affinity.h`), so 1024 CPUs is the largest topology the guest ABI
+            // can represent. The launch validator enforces this exact number.
+            maximum_cpus: 1024,
         },
         linux: LinuxCapabilities {
-            syscall_abi: Version::new(6, 6),
+            // The guest-visible kernel release reported by the engine's own uname(2)
+            // implementation (`src/linux_abi/syscall/misc.c`, "6.1.0"). The previous 6.6 claim
+            // contradicted what every guest actually observes.
+            syscall_abi: Version::new(6, 1),
+            // Process domains: the engine exports domain enumeration and termination
+            // (`hl_activation_domain_processes` / `hl_activation_domain_terminate`) and
+            // `Machine` drives them. Present in every build of this archive.
             process_domains: true,
+            // PTYs: `hl_activation_start_terminal` / `hl_terminal_resize` are exported and
+            // driven by `Command::terminal`. Present in every build of this archive.
             ptys: true,
+            // Descriptor passing: the host transport passes descriptors over SCM_RIGHTS on both
+            // supported hosts (`src/host/fork_wire.c`, `src/host/macos/host.c`) and
+            // `hl_activation_start_with_transport` exposes it. Present in every build.
             descriptor_passing: true,
         },
         filesystems: FilesystemCapabilities {
@@ -41,33 +82,48 @@ pub(super) fn capabilities() -> EngineCapabilities {
             maximum_port_forwards: 32,
         },
         resources: crate::spec::ResourceCapabilities {
+            // Exactly the resource kinds the launch lowering forwards to the engine
+            // (`engine/lowering.rs`: memory, process, CPU-count options). Every other kind is
+            // rejected by `validate_resources`, and the tests assert that agreement.
             launch_limits: BTreeSet::from([
                 crate::spec::ResourceKind::Memory,
                 crate::spec::ResourceKind::Processes,
                 crate::spec::ResourceKind::CpuCount,
             ]),
+            // `Machine::update_resources` is an unconditional "unsupported" (`machine.rs`).
             live_updates: BTreeSet::new(),
+            // No accounting plane exists; `validate_resources` rejects any non-disabled
+            // accounting selection.
             accounting: false,
         },
         time: crate::spec::TimeCapabilities {
+            // `validate_time_entropy` accepts only the host time source and secure host
+            // entropy, and rejects every virtual-time or deterministic-entropy selection.
             host_time: true,
             virtual_time: false,
             deterministic_entropy: false,
         },
         observability: crate::spec::ObservabilityCapabilities {
+            // `Machine::events` is an unconditional "unsupported" and `validate_observability`
+            // rejects any non-default observability spec, so no queue exists to bound.
             structured_events: false,
             metrics: false,
             tracing: false,
             maximum_queue: 0,
         },
         debugging: crate::spec::DebugCapabilities {
+            // `validate_debug` rejects every selected debug operation.
             operations: BTreeSet::new(),
         },
         checkpoint: CheckpointCapabilities {
-            supported: true,
+            guests: checkpoint_guests(),
             format: Some(Version::new(1, 0)),
         },
         control: crate::spec::ControlCapabilities {
+            // Each operation names a `Machine` method backed by an exported engine entry point:
+            // process inventory (`hl_activation_domain_processes`), signal delivery, pause and
+            // resume (stop/continue signals), and attach. The unimplemented control methods
+            // (`update_resources`, `update_network`, `hotplug`, `events`) are absent by design.
             operations: BTreeSet::from([
                 crate::spec::ControlOperation::ProcessInventory,
                 crate::spec::ControlOperation::Signal,
@@ -80,6 +136,8 @@ pub(super) fn capabilities() -> EngineCapabilities {
                 provider: namespace_provider(),
                 versions: vec![Version::new(1, 0)],
                 features: namespace_features(),
+                // `Machine::hotplug` is an unconditional "unsupported": no provider can be
+                // attached to a running machine in this build.
                 hotplug: false,
                 limits: crate::extension::ExtensionLimits {
                     namespace_entries: 4096,
@@ -93,6 +151,8 @@ pub(super) fn capabilities() -> EngineCapabilities {
                 provider: handles_provider(),
                 versions: vec![Version::new(1, 0)],
                 features: handles_features(),
+                // `Machine::hotplug` is an unconditional "unsupported": no provider can be
+                // attached to a running machine in this build.
                 hotplug: false,
                 limits: crate::extension::ExtensionLimits {
                     namespace_entries: 64,

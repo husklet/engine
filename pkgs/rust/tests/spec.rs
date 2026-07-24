@@ -590,7 +590,8 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
         .iter()
         .any(|feature| feature.as_str() == "memory-allocation"));
     assert_eq!(handles.limits.mappings, 64);
-    assert!(capabilities.checkpoint.supported);
+    assert!(capabilities.checkpoint.is_available());
+    assert!(capabilities.checkpoint.supports(Guest::Aarch64));
     assert_eq!(capabilities.checkpoint.format, Some(Version::new(1, 0)));
 }
 

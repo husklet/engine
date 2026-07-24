@@ -174,12 +174,21 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         hl_engine::spec::SpecErrorCategory::Invalid
     );
 
-    // The whole-container checkpoint format is architecture independent, so an
-    // x86_64 guest accepts a restore directory on the same terms as aarch64.
+    // x86_64 checkpoint is REFUSED, and the refusal is empirical rather than
+    // conservative. The image format is architecture independent and capture does
+    // succeed on x86_64, but restore brings the process back with its file
+    // descriptors pointing at the launcher's stdio instead of the captured ones:
+    // a guest that dup2'd fd 1 onto a file before capture writes to the console
+    // after restore, while registers and memory come back correctly. Until that is
+    // fixed the capability set advertises aarch64 only, and validation reads the
+    // capability set, so the two cannot disagree.
     let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
     value.checkpoint.enabled = true;
     value.checkpoint.restore_directory = Some("/tmp/restore".into());
-    Engine::new().validate(&value).unwrap();
+    assert_eq!(
+        Engine::new().validate(&value).unwrap_err().category,
+        hl_engine::spec::SpecErrorCategory::Unsupported
+    );
 
     let mut value = spec();
     value.observability.trace = Some(TraceSpec {
@@ -216,4 +225,80 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         Engine::new().validate(&value).unwrap_err().category,
         hl_engine::spec::SpecErrorCategory::Unsupported
     );
+}
+
+/// Every guest the capability set reports as checkpoint-capable must be accepted
+/// by preflight, and every guest it omits must be refused. Discovery and the
+/// validator read one set, so this asserts they cannot drift apart again.
+#[test]
+fn checkpoint_capability_and_validation_agree_for_every_guest() {
+    let engine = Engine::new();
+    let checkpoint = engine.capabilities().checkpoint;
+    assert!(
+        checkpoint.is_available(),
+        "a format is advertised, so at least one guest must be checkpointable"
+    );
+    for guest in [Guest::Aarch64, Guest::X86_64] {
+        let mut value = MachineSpec::new(guest, "/bin/true");
+        value.checkpoint.enabled = true;
+        value.checkpoint.capture_directory = Some("/tmp/hl-checkpoint-capability".into());
+        let outcome = engine.validate(&value);
+        if checkpoint.supports(guest) {
+            assert!(
+                outcome.is_ok(),
+                "{guest:?} is reported as checkpoint-capable but preflight rejected it"
+            );
+        } else {
+            let error = outcome.expect_err("unreported guest must be rejected");
+            assert_eq!(error.field, "checkpoint");
+            assert_eq!(
+                error.category,
+                hl_engine::spec::SpecErrorCategory::Unsupported
+            );
+        }
+    }
+}
+
+/// The advertised CPU ceiling is a promise about what a launch may ask for, so
+/// preflight must accept exactly up to it and refuse the first value beyond it.
+#[test]
+fn reported_cpu_maximum_bounds_the_accepted_topology() {
+    let engine = Engine::new();
+    let maximum = engine.capabilities().cpu.maximum_cpus;
+    assert!(maximum > 0 && maximum < u32::MAX);
+
+    let mut value = spec();
+    value.cpu.count = Some(maximum);
+    engine.validate(&value).unwrap();
+
+    value.cpu.count = Some(maximum + 1);
+    let error = engine.validate(&value).unwrap_err();
+    assert_eq!(error.field, "cpu.count");
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Limit);
+}
+
+/// The reported network maxima are the same numbers preflight enforces.
+#[test]
+fn reported_network_maxima_bound_accepted_port_forwards() {
+    let engine = Engine::new();
+    let maximum = engine.capabilities().networking.maximum_port_forwards;
+
+    let mut value = spec();
+    value.network.mode = hl_engine::spec::NetworkMode::Virtual;
+    value.network.namespace = Some(hl_engine::network::Namespace::new("caps").unwrap());
+    value.network.port_forwards = (0..=maximum)
+        .map(|index| {
+            hl_engine::network::Rule::new(
+                u16::try_from(20_000 + index).unwrap(),
+                u16::try_from(30_000 + index).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let error = engine.validate(&value).unwrap_err();
+    assert_eq!(error.field, "network.port_forwards");
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Limit);
+
+    value.network.port_forwards.pop();
+    engine.validate(&value).unwrap();
 }
