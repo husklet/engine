@@ -1,5 +1,8 @@
 /* Bridge opaque host-file bindings into the legacy native-fd guest runtime. */
 
+#ifndef G_IS_DUP2_COMPAT
+#define G_IS_DUP2_COMPAT() 0 /* aarch64 guests have no legacy dup2; every case 24 is a real dup3 */
+#endif
 #include "../object.h"
 #include "../epoll.h"
 #include "../watch.h"
@@ -2221,10 +2224,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_fd_snapshot target;
         if (bound_snapshot(a1, &target)) {
             unsigned flags = (unsigned)a2;
-            int is_dup2 = (flags & 0x40000000u) != 0;
+            int is_dup2 = G_IS_DUP2_COMPAT();
             int source_fd = (int)a0;
             int target_fd = (int)a1;
-            flags &= ~0x40000000u;
             if (source_fd == target_fd) {
                 G_RET(c) = is_dup2 ? (uint64_t)(unsigned)target_fd : (uint64_t)(int64_t)-EINVAL;
                 return 1;
@@ -3306,9 +3308,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 24: {
         struct fdvis_reservation fdvis;
         uint32_t flags = (uint32_t)a2;
-        int is_dup2 = (flags & 0x40000000u) != 0;
+        int is_dup2 = G_IS_DUP2_COMPAT();
         int target = (int)a1;
-        flags &= ~0x40000000u;
         if (source.fd == (hl_linux_fd)target) {
             result = is_dup2 ? (int64_t)source.fd : -EINVAL;
         } else if ((!is_dup2 && (flags & ~HL_LINUX_O_CLOEXEC) != 0) || target < 0 || target >= guest_nofile_cur()) {

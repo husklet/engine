@@ -111,17 +111,23 @@ static int sig_is_rt(int s) { return s >= 32 && s <= 64; }
 // Enqueue one pending instance of Linux signal `sig`. Standard signals coalesce (keep the first queued
 // siginfo, drop extras -- matching Linux non-RT coalescing); realtime signals queue FIFO up to
 // SIGQ_DEPTH. Always sets the g_pending bit so every existing pending scan sees the signal.
-static void sigq_push(int sig, int code, uint64_t value, int pid, int uid, uint64_t addr) {
-    if (sig < 1 || sig > 64) return;
+// Returns 1 iff a new instance was actually enqueued -- the signalfd wake byte must be written ONLY then,
+// or a coalesced-away duplicate leaves a spare byte in the self-pipe and signalfd reports one siginfo
+// record too many (a second read that Linux answers with EAGAIN).
+static int sigq_push(int sig, int code, uint64_t value, int pid, int uid, uint64_t addr) {
+    if (sig < 1 || sig > 64) return 0;
+    int queued = 0;
     pthread_mutex_lock(&g_sigq_lk);
     int cap = sig_is_rt(sig) ? SIGQ_DEPTH : 1;
     if (g_sigq[sig].count < cap) {
         int t = (g_sigq[sig].head + g_sigq[sig].count) % SIGQ_DEPTH;
         g_sigq[sig].e[t] = (struct sigq_ent){code, value, pid, uid, addr};
         g_sigq[sig].count++;
+        queued = 1;
     }
     pthread_mutex_unlock(&g_sigq_lk);
     __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
+    return queued;
 }
 
 // Pop the oldest queued instance of `sig` into *out. Returns 1 iff one was dequeued; clears the g_pending
@@ -663,8 +669,7 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     // handler disposition (Linux delivers a blocked signal to signalfd, not to a handler). Feed the
     // self-pipe (readability) AND queue the siginfo (ssi_int/pid/code); the read path drains it in order.
     if (blocked && sfd_routed(sig)) {
-        sigq_push(sig, code, value, pid, uid, 0);
-        sfd_deliver(sig);
+        if (sigq_push(sig, code, value, pid, uid, 0)) sfd_deliver(sig);
         return;
     }
     // custom handler -> queue for the dispatcher's maybe_deliver_signal (carries per-instance siginfo)
@@ -676,8 +681,7 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     if (h == 1) return;
     // blocked, no handler: queue pending for delivery on unblock (also feeds any signalfd via sfd_deliver)
     if (blocked) {
-        sigq_push(sig, code, value, pid, uid, 0);
-        sfd_deliver(sig);
+        if (sigq_push(sig, code, value, pid, uid, 0)) sfd_deliver(sig);
         return;
     }
     // SIGCHLD/CONT/URG/WINCH: ignore

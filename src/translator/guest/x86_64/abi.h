@@ -58,6 +58,8 @@
                             &(hl_x86_legacy_context){g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, legacy_time_seconds,     \
                                                      legacy_set_alarm, NULL})
 #define G_FORK_PRESERVE(c) hl_x86_legacy_restore_fork(c)
+// The canonical dup3 handler serves x86 legacy dup2 too; this reports which one the guest issued.
+#define G_IS_DUP2_COMPAT() hl_x86_legacy_is_dup2()
 
 // Zero the integer register file (execve). x86 = r[16].
 #define G_RESET_REGS(c) memset((c)->r, 0, sizeof(c)->r)

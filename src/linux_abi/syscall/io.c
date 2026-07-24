@@ -1,3 +1,6 @@
+#ifndef G_IS_DUP2_COMPAT
+#define G_IS_DUP2_COMPAT() 0 /* aarch64 guests have no legacy dup2; every case 24 is a real dup3 */
+#endif
 // Extracted from service(): I/O — fd read/write/seek + plain fd ops
 // (dup/dup3/fcntl/pipe2/sendfile/splice/tee/copy_file_range/fsync/etc). Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
@@ -441,9 +444,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     if (g_ngna) {
         switch (nr) {
         case 63:
+        case 67: { // read / pread64: the kernel WRITES the buffer with byte-granular copy_to_user, so a
+                   // destination straddling a guest PROT_NONE page yields a SHORT read of the good prefix
+                   // (Linux only reports EFAULT when nothing at all could be copied). Clamp the count to
+                   // that prefix instead of failing the whole call. (read02 still EFAULTs: prefix == 0.)
+            uint64_t good = gna_prefix(a1, a2);
+            if (a2 && !good) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+            a2 = good;
+            break;
+        }
         case 64:
-        case 67:
-        case 68: // read / write / pread64 / pwrite64
+        case 68: // write / pwrite64: the source buffer is read whole-request by the pipe/socket paths, and
+                 // Linux reports EFAULT for the call rather than a short write, so keep this all-or-nothing.
             if (gna_hit(a1, a2)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 return svc_done(c);
@@ -1082,6 +1097,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = a2;
             break;
         }
+        // /proc/self/comm is WRITABLE on Linux: it renames the task exactly as prctl(PR_SET_NAME) does,
+        // truncating to TASK_COMM_LEN-1 (15) characters and dropping one trailing newline, and the new name
+        // is immediately visible through prctl(PR_GET_NAME) and /proc/self/{comm,status:Name,stat}. Without
+        // this the write landed in the synthetic backing file and the task name never changed.
+        if (wfd >= 0 && wfd < HL_NFD && !strcmp(g_proc_text_desc[wfd], "self:comm")) {
+            if (!a2) {
+                G_RET(c) = 0;
+                break;
+            }
+            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            char name[16];
+            size_t take = (size_t)a2 < sizeof name - 1 ? (size_t)a2 : sizeof name - 1;
+            memcpy(name, (const void *)a1, take);
+            name[take] = 0;
+            char *nl = strchr(name, '\n');
+            if (nl) *nl = 0;
+            snprintf(g_procname, sizeof g_procname, "%.15s", name);
+            set_guest_comm_name(g_procname);
+            char rendered[32];
+            int rendered_size = snprintf(rendered, sizeof rendered, "%s\n", g_procname);
+            (void)ftruncate(wfd, 0);
+            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
+            (void)lseek(wfd, rendered_size, SEEK_SET);
+            G_RET(c) = a2; // Linux consumes the whole write even when it truncated the stored name
+            break;
+        }
         // memfd F_SEAL_WRITE: a write to a write-sealed memfd fails EPERM (emulated seal state).
         if (wfd >= 0 && wfd < HL_NFD && (memfd_seals_fd(wfd) & 0x8)) {
             G_RET(c) = (uint64_t)(-EPERM);
@@ -1533,13 +1577,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 24: {
         struct fdvis_reservation fdvis;
-        // dup3(old,new,flags). x86's legacy dup2 arrives here rewritten to the dup3 form + a private
-        // DUP2_COMPAT marker (bit 30) in the flags (see translate/x86_64/legacy.c) because the two calls
-        // DIVERGE on oldfd==newfd: dup3 -> EINVAL, but dup2 -> returns newfd unchanged (EBADF if oldfd is
-        // invalid), with no close and no CLOEXEC change. (LTP dup201)
+        // dup3(old,new,flags). x86's legacy dup2 arrives here rewritten to the dup3 form (see
+        // translator/guest/x86_64/legacy.c) because the two calls DIVERGE on oldfd==newfd: dup3 ->
+        // EINVAL, but dup2 -> returns newfd unchanged (EBADF if oldfd is invalid), with no close and no
+        // CLOEXEC change. (LTP dup201) Which of the two arrived is reported OUT OF BAND -- it used to
+        // ride as bit 30 of the flags, which made a guest's dup3(old,old,0x40000000) succeed where Linux
+        // returns EINVAL, because no dup3 flag other than O_CLOEXEC is legal.
         unsigned d3flags = (unsigned)a2;
-        int is_dup2 = (d3flags & 0x40000000u) != 0;
-        d3flags &= ~0x40000000u;
+        int is_dup2 = G_IS_DUP2_COMPAT();
         int oldfd = (int)a0, newfd = (int)a1, nofile = guest_nofile_cur();
         if (oldfd == newfd) {
             if (is_dup2) {

@@ -86,6 +86,8 @@ static int svc_poll_retry(struct cpu *c) {
 // preemption (sysmon tgkill's a worker with SIGURG and must stop THAT worker). Otherwise -- self-signal,
 // default/ignore disposition, or an unknown/dead tid -- fall back to the existing process-directed path on
 // the caller (raise_guest_signal applies the default/ignore action or coalesces into g_pending as before).
+enum { HL_SI_TKILL = -6 };
+
 static void thread_kill(struct cpu *c, int tid, int sig) {
     // Route to exactly the addressed thread's cpu->tpending when it names ANOTHER live thread and the signal
     // is either handled by a guest handler OR blocked by that target (destined for its sigwait / held
@@ -100,14 +102,17 @@ static void thread_kill(struct cpu *c, int tid, int sig) {
         // this an asynchronous pthread_cancel of a compute-bound thread was silently dropped and pthread_join
         // hung forever. Written to the single-slot g_sig* (never g_pending) so only the addressed thread's
         // tpending delivery consumes it; the values are constant for any thread-directed signal.
-        enum { HL_SI_TKILL = -6 };
         g_sigcode[sig] = HL_SI_TKILL;
         g_sigval[sig] = 0;
         g_sigpid[sig] = container_pid();
         g_siguid[sig] = 0;
         if (thread_target_signal(tid, sig)) return;
     }
-    raise_guest_signal(c, sig);
+    // Self-directed (or otherwise process-routed) tkill/tgkill. Linux stamps si_code == SI_TKILL for BOTH
+    // syscalls regardless of the target -- glibc's raise() lowers to tgkill, so a signalfd/sigwaitinfo
+    // reader of a raise()d signal must see SI_TKILL, not the SI_USER(0) a plain kill(2) carries.
+    cred_init();
+    raise_guest_signal_si(c, sig, HL_SI_TKILL, 0, container_pid(), g_ruid);
 }
 
 static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
