@@ -803,6 +803,18 @@ $(BUILD)/e2e/checkpoint-tree-aarch64: tests/e2e/checkpoint_tree.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
+$(BUILD)/e2e/checkpoint-tree-x86_64: tests/e2e/checkpoint_tree.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-cycle-aarch64: tests/e2e/checkpoint_cycle.c
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-cycle-x86_64: tests/e2e/checkpoint_cycle.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
 $(BUILD)/e2e/checkpoint-signal-aarch64: tests/e2e/checkpoint_signal_state.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
@@ -814,6 +826,14 @@ $(BUILD)/e2e/checkpoint-pipe-aarch64: tests/e2e/checkpoint_pipe.c
 $(BUILD)/e2e/checkpoint-deleted-aarch64: tests/e2e/checkpoint_deleted.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-pipe-x86_64: tests/e2e/checkpoint_pipe.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
+
+$(BUILD)/e2e/checkpoint-deleted-x86_64: tests/e2e/checkpoint_deleted.c
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
 $(BUILD)/e2e/checkpoint-threads-aarch64: tests/e2e/checkpoint_threads.c
 	@mkdir -p $(@D)

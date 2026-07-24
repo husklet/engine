@@ -1,7 +1,7 @@
 use hl_engine::{Engine, Exit, Guest, MachineSpec, ProcessIo, Stdio};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -50,16 +50,26 @@ fn initial_executable_authority_is_not_reused_by_exec() {
 
 #[test]
 fn rust_api_checkpoints_and_restores_a_three_process_tree() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("checkpoint-e2e-{}", std::process::id()));
+    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
+    // broken there -- the process returns with its file descriptors pointing at the
+    // launcher's stdio instead of the captured ones, while registers and memory
+    // restore correctly. Capture itself works. See the refusal assertion in
+    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    for guest in [Guest::Aarch64] {
+        checkpoints_and_restores_a_three_process_tree(guest);
+    }
+}
+
+fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
+    let root = scratch_root("checkpoint-e2e", guest);
     let checkpoint = root.join("image");
     let release = root.join("release");
+    let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
 
-    let executable = fixture_named("checkpoint-tree", Guest::Aarch64);
-    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    let executable = fixture_named("checkpoint-tree", guest);
+    let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
     capture.checkpoint.capture_directory = Some(checkpoint.clone());
@@ -89,29 +99,43 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
     );
 
     fs::write(&release, []).unwrap();
-    let mut restore = MachineSpec::new(Guest::Aarch64, &executable);
+    let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
     restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
         Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
         Exit::Code(0)
     );
+    // The exit status alone cannot tell a resumed tree from a relaunched one:
+    // only the restored process writes this line, through its restored fds.
+    assert!(fs::read_to_string(output)
+        .unwrap()
+        .contains("TREE-RESTORED"));
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn rust_api_restores_buffered_cross_process_pipe_state() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("checkpoint-pipe-e2e-{}", std::process::id()));
+    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
+    // broken there -- the process returns with its file descriptors pointing at the
+    // launcher's stdio instead of the captured ones, while registers and memory
+    // restore correctly. Capture itself works. See the refusal assertion in
+    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    for guest in [Guest::Aarch64] {
+        restores_buffered_cross_process_pipe_state(guest);
+    }
+}
+
+fn restores_buffered_cross_process_pipe_state(guest: Guest) {
+    let root = scratch_root("checkpoint-pipe-e2e", guest);
     let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
 
-    let executable = fixture_named("checkpoint-pipe", Guest::Aarch64);
-    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    let executable = fixture_named("checkpoint-pipe", guest);
+    let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
     capture.checkpoint.capture_directory = Some(checkpoint.clone());
@@ -140,7 +164,7 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
-    let mut restore = MachineSpec::new(Guest::Aarch64, &executable);
+    let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
     restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
@@ -155,17 +179,26 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
 
 #[test]
 fn rust_api_restores_unlinked_regular_file_content_and_offset() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("checkpoint-deleted-e2e-{}", std::process::id()));
+    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
+    // broken there -- the process returns with its file descriptors pointing at the
+    // launcher's stdio instead of the captured ones, while registers and memory
+    // restore correctly. Capture itself works. See the refusal assertion in
+    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    for guest in [Guest::Aarch64] {
+        restores_unlinked_regular_file_content_and_offset(guest);
+    }
+}
+
+fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
+    let root = scratch_root("checkpoint-deleted-e2e", guest);
     let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
 
-    let executable = fixture_named("checkpoint-deleted", Guest::Aarch64);
-    let mut capture = MachineSpec::new(Guest::Aarch64, &executable);
+    let executable = fixture_named("checkpoint-deleted", guest);
+    let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
     capture.checkpoint.capture_directory = Some(checkpoint.clone());
@@ -190,7 +223,7 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
-    let mut restore = MachineSpec::new(Guest::Aarch64, &executable);
+    let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
     restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
@@ -214,6 +247,123 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
 /// still fails, just later; a slow one no longer reports a false failure.
 const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(120);
 const READY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Restore an image while arming the next capture in the same spec, twice, and
+/// prove the guest survived both hops instead of being relaunched.
+#[test]
+fn rust_api_restores_while_arming_the_next_capture() {
+    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
+    // broken there -- the process comes back with its file descriptors pointing at
+    // the launcher's stdio instead of the captured ones, while registers and memory
+    // restore correctly. Capture itself works. See the refusal assertion in
+    // tests/policy.rs; re-add Guest::X86_64 here once the fd-restore path is fixed.
+    for guest in [Guest::Aarch64] {
+        restores_while_arming_the_next_capture(guest);
+    }
+}
+
+fn restores_while_arming_the_next_capture(guest: Guest) {
+    let root = scratch_root("checkpoint-rearm-e2e", guest);
+    let first = root.join("image.a");
+    let second = root.join("image.b");
+    let release = root.join("release");
+    let output = root.join("release.output");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    let executable = fixture_named("checkpoint-cycle", guest);
+    let mut capture = MachineSpec::new(guest, &executable);
+    capture.process.argv.push(release.clone().into_os_string());
+    capture.checkpoint.enabled = true;
+    capture.checkpoint.capture_directory = Some(first.clone());
+    let io = ProcessIo {
+        stdin: Stdio::Null,
+        stdout: Stdio::Null,
+        stderr: Stdio::Null,
+    };
+    let machine = Engine::new().spawn(capture, io).unwrap();
+    await_output(
+        &output,
+        "STAGE 1",
+        "cycle guest did not reach its first stage",
+    );
+    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), first);
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+
+    // Restore the first image and arm the second capture in one spec: the shape
+    // a caller uses to checkpoint the same guest repeatedly.
+    fs::write(root.join("release.go1"), []).unwrap();
+    let mut rearm = MachineSpec::new(guest, &executable);
+    rearm.checkpoint.enabled = true;
+    rearm.checkpoint.restore_directory = Some(first);
+    rearm.checkpoint.capture_directory = Some(second.clone());
+    let machine = Engine::new().spawn(rearm, io).unwrap();
+    await_output(
+        &output,
+        "STAGE 2",
+        "restored guest did not reach its second stage",
+    );
+    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), second);
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+
+    fs::write(root.join("release.go2"), []).unwrap();
+    let mut restore = MachineSpec::new(guest, &executable);
+    restore.checkpoint.enabled = true;
+    restore.checkpoint.restore_directory = Some(second);
+    assert_eq!(
+        Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
+        Exit::Code(0)
+    );
+
+    // A guest that was silently relaunched would boot again and reset its
+    // counter; continuity demands one boot and a strictly advancing counter.
+    let transcript = fs::read_to_string(&output).unwrap();
+    assert_eq!(
+        transcript
+            .lines()
+            .filter(|line| line.starts_with("BOOT "))
+            .count(),
+        1,
+        "guest booted more than once across the restore hops: {transcript}"
+    );
+    assert!(
+        transcript.contains("CYCLE-RESTORED"),
+        "guest did not finish the cycle: {transcript}"
+    );
+    let stages: Vec<u64> = transcript
+        .lines()
+        .filter_map(|line| line.strip_prefix("STAGE "))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(stages.len(), 3, "expected three stage marks: {transcript}");
+    assert!(
+        stages[0] < stages[1] && stages[1] < stages[2],
+        "counter did not advance across both hops: {stages:?}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn await_output(output: &Path, needle: &str, message: &str) {
+    let deadline = Instant::now() + READY_DEADLINE;
+    while !fs::read_to_string(output)
+        .unwrap_or_default()
+        .contains(needle)
+    {
+        assert!(Instant::now() < deadline, "{message}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn scratch_root(name: &str, guest: Guest) -> PathBuf {
+    let isa = match guest {
+        Guest::Aarch64 => "aarch64",
+        Guest::X86_64 => "x86_64",
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("{name}-{isa}-{}", std::process::id()))
+}
 
 fn fixture_named(name: &str, guest: Guest) -> PathBuf {
     let isa = match guest {
