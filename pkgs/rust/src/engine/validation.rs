@@ -130,6 +130,21 @@ pub(super) fn validate(
             "CPU limits must be greater than zero",
         ));
     }
+    // The advertised CPU ceiling is the guest affinity-mask width; a launch that asks for more
+    // CPUs than discovery reports must not be accepted.
+    if spec
+        .cpu
+        .count
+        .into_iter()
+        .chain(spec.resources.cpu_limit)
+        .any(|count| count > capabilities.cpu.maximum_cpus)
+    {
+        return Err(spec_error(
+            SpecErrorCategory::Limit,
+            "cpu.count",
+            "CPU count exceeds the engine limit",
+        ));
+    }
     if !spec.cpu.features.is_empty() || spec.cpu.model.is_some() {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
@@ -305,7 +320,7 @@ pub(super) fn validate(
         ));
     }
     validate_resources(spec, capabilities.limits.handles)?;
-    validate_network(spec)?;
+    validate_network(capabilities, spec)?;
     if !namespace_defaults(&spec.namespaces) {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
@@ -313,7 +328,7 @@ pub(super) fn validate(
             "custom namespace sharing modes are not implemented by this backend",
         ));
     }
-    validate_checkpoint(spec)?;
+    validate_checkpoint(capabilities, spec)?;
     validate_time_entropy(spec)?;
     validate_cache(spec)?;
     validate_observability(spec, capabilities)?;

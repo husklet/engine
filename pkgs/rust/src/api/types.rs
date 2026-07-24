@@ -1,5 +1,5 @@
 /// Linux instruction set executed by the engine.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Guest {
     Aarch64,
     X86_64,

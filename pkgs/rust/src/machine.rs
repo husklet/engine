@@ -147,9 +147,11 @@ impl Machine {
         if directory.exists() {
             let mut entries = std::fs::read_dir(directory)
                 .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?;
-            if entries.next().transpose().map_err(|error| {
-                checkpoint_error("inspect checkpoint directory", &error)
-            })?.is_some()
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?
+                .is_some()
             {
                 return Err(checkpoint_context(
                     "checkpoint destination already contains data",
@@ -178,8 +180,8 @@ impl Machine {
         let generation = u32::from_le_bytes(bytes).wrapping_add(1).max(1);
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&generation.to_le_bytes()))
-            .and_then(|_| file.set_len(4))
-            .and_then(|_| file.sync_data())
+            .and_then(|()| file.set_len(4))
+            .and_then(|()| file.sync_data())
             .map_err(|error| checkpoint_error("publish checkpoint request", &error))?;
 
         crate::ffi::signal(self.id(), checkpoint_interrupt_signal())

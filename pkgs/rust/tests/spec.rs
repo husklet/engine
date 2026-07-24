@@ -510,9 +510,10 @@ fn facade_accepts_projected_endpoints_memory_terminal_and_live_signal_together()
     })];
 
     let mut handles = handles_extension();
-    handles
-        .required_features
-        .extend([Feature::new("devices").unwrap(), Feature::new("memory-allocation").unwrap()]);
+    handles.required_features.extend([
+        Feature::new("devices").unwrap(),
+        Feature::new("memory-allocation").unwrap(),
+    ]);
     handles.namespace.push(NamespaceEntry::Device(DeviceEntry {
         path: "/dev/provider".into(),
         metadata: Metadata {
@@ -589,7 +590,8 @@ fn discovery_reports_models_and_limits_instead_of_architecture_booleans() {
         .iter()
         .any(|feature| feature.as_str() == "memory-allocation"));
     assert_eq!(handles.limits.mappings, 64);
-    assert!(capabilities.checkpoint.supported);
+    assert!(capabilities.checkpoint.is_available());
+    assert!(capabilities.checkpoint.supports(Guest::Aarch64));
     assert_eq!(capabilities.checkpoint.format, Some(Version::new(1, 0)));
 }
 
