@@ -179,14 +179,18 @@ pub(super) fn validate_checkpoint(spec: &MachineSpec) -> Result<(), SpecError> {
         checkpoint.restore_directory.as_deref(),
         "checkpoint.restore_directory",
     )?;
-    if !matches!(spec.guest.architecture, crate::Guest::Aarch64 | crate::Guest::X86_64) {
+    if !matches!(
+        spec.guest.architecture,
+        crate::Guest::Aarch64 | crate::Guest::X86_64
+    ) {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
             "checkpoint",
             "native checkpoint/restore supports AArch64 and x86_64 guests",
         ));
     }
-    if checkpoint.mode != crate::spec::CheckpointMode::Full || checkpoint.maximum_pause_ms.is_some() {
+    if checkpoint.mode != crate::spec::CheckpointMode::Full || checkpoint.maximum_pause_ms.is_some()
+    {
         return Err(spec_error(
             SpecErrorCategory::Unsupported,
             "checkpoint",

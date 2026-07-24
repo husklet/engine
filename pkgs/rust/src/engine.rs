@@ -1,7 +1,7 @@
 use crate::{
+    configfile::ConfigFile,
     extension::{Authorities, BindAccess, ExtensionCapability, HandlesAuthority, ProviderId},
     ffi,
-    configfile::ConfigFile,
     spec::{
         CheckpointCapabilities, CpuCapabilities, EngineCapabilities, EngineLimits,
         FilesystemCapabilities, GuestPlatform, LinuxCapabilities, MachineSpec, NetworkCapabilities,
@@ -94,7 +94,10 @@ impl Engine {
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
         let checkpoint_directory = launch.config.checkpoint_directory.clone();
-        if let Some(parent) = checkpoint_directory.as_deref().and_then(std::path::Path::parent) {
+        if let Some(parent) = checkpoint_directory
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
             std::fs::create_dir_all(parent)
                 .map_err(|error| SpawnError::Engine(Error::Io(error)))?;
         }

@@ -1,5 +1,5 @@
-use crate::provider::LinuxError;
 use crate::api::extension::NamespaceEntry;
+use crate::provider::LinuxError;
 
 /// Transactional namespace installation port.
 pub trait Namespace: Send + Sync {

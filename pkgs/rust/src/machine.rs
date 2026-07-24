@@ -164,9 +164,11 @@ impl Machine {
         if directory.exists() {
             let mut entries = std::fs::read_dir(directory)
                 .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?;
-            if entries.next().transpose().map_err(|error| {
-                checkpoint_error("inspect checkpoint directory", &error)
-            })?.is_some()
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?
+                .is_some()
             {
                 return Err(checkpoint_context(
                     "checkpoint destination already contains data",

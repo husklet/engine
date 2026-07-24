@@ -1,5 +1,5 @@
-use crate::provider::{Handles, Memory};
 use crate::api::extension::{ContractError, ProviderId};
+use crate::provider::{Handles, Memory};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 /// Launch-scoped authority for provider-backed open services.

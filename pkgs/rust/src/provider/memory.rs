@@ -1,8 +1,8 @@
-use crate::provider::{ResourceError, ResourceId};
 use crate::api::{
     extension::{Inheritance, Protections, ProviderId, Sharing},
     Version,
 };
+use crate::provider::{ResourceError, ResourceId};
 
 pub trait Memory: Send + Sync {
     /// Allocates a provider resource matching the declared bounds.

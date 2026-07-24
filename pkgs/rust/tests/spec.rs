@@ -510,9 +510,10 @@ fn facade_accepts_projected_endpoints_memory_terminal_and_live_signal_together()
     })];
 
     let mut handles = handles_extension();
-    handles
-        .required_features
-        .extend([Feature::new("devices").unwrap(), Feature::new("memory-allocation").unwrap()]);
+    handles.required_features.extend([
+        Feature::new("devices").unwrap(),
+        Feature::new("memory-allocation").unwrap(),
+    ]);
     handles.namespace.push(NamespaceEntry::Device(DeviceEntry {
         path: "/dev/provider".into(),
         metadata: Metadata {
