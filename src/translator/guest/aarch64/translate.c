@@ -335,6 +335,66 @@ static int stealfast_on(void) { return g_steal1617; }
 // Undersizing them to 2 overflowed the stack on such an insn -> __stack_chk_fail abort (cc1/libc).
 static void emit_mangled_x18(uint32_t in, int mask) {
     static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
+    int read_mask = mask, write_mask = mask;
+    uint32_t op = (in >> 25) & 0xF;
+    if (op == 8 || op == 9) {
+        if ((in & 0x1F000000u) == 0x10000000u) {
+            read_mask = 0; // ADR/ADRP
+            write_mask = mask & 1;
+        } else if ((in & 0x1F800000u) == 0x12800000u) {
+            write_mask = mask & 1; // MOVN/Z/K
+            read_mask = ((in >> 29) & 3) == 3 ? write_mask : 0;
+        } else if ((in & 0x1F800000u) == 0x13800000u) {
+            read_mask = mask & (2 | 4); // EXTR
+            write_mask = mask & 1;
+        } else {
+            read_mask = mask & 2;
+            write_mask = mask & 1;
+        }
+    } else if ((in & 0x0E000000u) == 0x0A000000u) {
+        read_mask = mask & (2 | 4 | 8);
+        write_mask = mask & 1;
+    } else if (!(in & 0x04000000u) &&
+        ((in & 0x3B000000u) == 0x39000000u ||
+         (in & 0x3B200000u) == 0x38000000u ||
+         (in & 0x3B200C00u) == 0x38200800u)) {
+        // Ordinary integer single load/store.  Atomics/exclusives occupy a
+        // different encoding box and deliberately stay conservative.
+        int opc = (int)((in >> 22) & 3);
+        int size = (int)((in >> 30) & 3);
+        if (!(size == 3 && opc == 2)) { // PRFM encodes an operation, not a GPR Rt
+            int mode = (int)((in >> 10) & 3);
+            int writeback = (in & 0x3B200000u) == 0x38000000u &&
+                            (mode == 1 || mode == 3);
+            int base_and_index = mask & (2 | 4);
+            if (opc == 0) { // store: Rt/base/index inputs
+                read_mask = mask & (1 | 2 | 4);
+                write_mask = writeback ? (mask & 2) : 0;
+            } else { // load: address inputs, Rt (+ writeback base) outputs
+                read_mask = base_and_index;
+                write_mask = (mask & 1) | (writeback ? (mask & 2) : 0);
+            }
+        }
+    }
+    // Ordinary integer pair transfers have directional operands.  Treating
+    // every stolen field as read/write needlessly loaded an LDP destination
+    // before the instruction overwrote it and stored an STP source back
+    // unchanged afterwards.  This is especially costly for the ubiquitous
+    // x29/x30 frame pair.  Keep exclusive/CASP and SIMD pairs on the fully
+    // conservative path; their operand rules are handled elsewhere.
+    if ((in & 0x3A000000u) == 0x28000000u && !(in & 0x04000000u)) {
+        int data = mask & (1 | 8);
+        int base = mask & 2;
+        int mode = (int)((in >> 23) & 3);
+        int writeback = mode == 1 || mode == 3;
+        if (in & (1u << 22)) { // LDP: data outputs, base input (+ output on writeback)
+            read_mask = base;
+            write_mask = data | (writeback ? base : 0);
+        } else { // STP: data/base inputs, only a writeback base is an output
+            read_mask = data | base;
+            write_mask = writeback ? base : 0;
+        }
+    }
     int stolen[4], ns = 0, used = 0;
     for (int k = 0; k < 4; k++)
         if (mask & mbits[k]) {
@@ -356,9 +416,17 @@ static void emit_mangled_x18(uint32_t in, int mask) {
     // in it across the block body).
     if (stealfast_on() && ns <= 2) {
         static const int hsc[2] = {16, 17};
-        for (int i = 0; i < ns; i++)
-            // scratch = cpu->x[stolen]
-            e_ldr(hsc[i], CPUREG, stolen[i] * 8);
+        for (int i = 0; i < ns; i++) {
+            int read = 0;
+            for (int k = 0; k < 4; k++)
+                if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
+                    read = 1;
+            if (read)
+                // scratch = cpu->x[stolen]
+                e_ldr(hsc[i], CPUREG, stolen[i] * 8);
+            else
+                emit32(0xD503201Fu); // preserve established block layout without the dead load
+        }
         uint32_t m = in;
         for (int k = 0; k < 4; k++)
             if (mask & mbits[k]) {
@@ -371,9 +439,17 @@ static void emit_mangled_x18(uint32_t in, int mask) {
                 }
             }
         emit32(m);
-        for (int i = 0; i < ns; i++)
-            // cpu->x[stolen] = scratch
-            e_str(hsc[i], CPUREG, stolen[i] * 8);
+        for (int i = 0; i < ns; i++) {
+            int written = 0;
+            for (int k = 0; k < 4; k++)
+                if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
+                    written = 1;
+            if (written)
+                // cpu->x[stolen] = scratch
+                e_str(hsc[i], CPUREG, stolen[i] * 8);
+            else
+                emit32(0xD503201Fu); // preserve established block layout without the dead store
+        }
         return;
     }
     int sc[4], nsc = 0;
@@ -382,9 +458,17 @@ static void emit_mangled_x18(uint32_t in, int mask) {
     for (int i = 0; i < ns; i++)
         // spill scratch -> cpu->mscratch
         e_str(sc[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
-    for (int i = 0; i < ns; i++)
-        // scratch = cpu->x[stolen]
-        e_ldr(sc[i], CPUREG, stolen[i] * 8);
+    for (int i = 0; i < ns; i++) {
+        int read = 0;
+        for (int k = 0; k < 4; k++)
+            if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
+                read = 1;
+        if (read)
+            // scratch = cpu->x[stolen]
+            e_ldr(sc[i], CPUREG, stolen[i] * 8);
+        else
+            emit32(0xD503201Fu);
+    }
     uint32_t m = in;
     for (int k = 0; k < 4; k++)
         if (mask & mbits[k]) {
@@ -397,9 +481,17 @@ static void emit_mangled_x18(uint32_t in, int mask) {
             }
         }
     emit32(m);
-    for (int i = 0; i < ns; i++)
-        // cpu->x[stolen] = scratch
-        e_str(sc[i], CPUREG, stolen[i] * 8);
+    for (int i = 0; i < ns; i++) {
+        int written = 0;
+        for (int k = 0; k < 4; k++)
+            if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
+                written = 1;
+        if (written)
+            // cpu->x[stolen] = scratch
+            e_str(sc[i], CPUREG, stolen[i] * 8);
+        else
+            emit32(0xD503201Fu);
+    }
     for (int i = 0; i < ns; i++)
         // restore scratch
         e_ldr(sc[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
@@ -1020,15 +1112,7 @@ static void emit_prof_bump(void *ctr) {
 // untouched -- its value lives only in cpu->x[16] under the steal. NOIBSLIM=1 restores the exact
 // legacy sequence for A/B.
 static void emit_set_x30(uint64_t val) {
-    if (g_steal1617 && !g_noibslim) {
-        e_movconst(16, val);
-        e_str(16, CPUREG, 30 * 8);
-        return;
-    }
-    e_str(0, CPUREG, (int)OFF_MSCRATCH);
-    e_movconst(0, val);
-    e_str(0, CPUREG, 30 * 8);
-    e_ldr(0, CPUREG, (int)OFF_MSCRATCH);
+    e_movconst(30, val);
 }
 
 // §B shadow push: cpu->x[30] = gpc+4; sstk[ssp&1023] = (gpc+4, &Lcont); ssp++. x0..x2 spilled to
@@ -1098,7 +1182,9 @@ static uint32_t *emit_shadow_push(uint64_t gpc) {
 //    0 NOSHADOWTUNE=1 -> EXACT original §B-on gate (byte-identical baseline codegen). A/B kill switch.
 //    1 SHADOWGATE=1   -> widen-fix: window-exhaustion = large/complex fn -> DEEP not leaf (measured: worse).
 //    2 SHADOWGATE=2   -> widen more: ANY direct call -> §B (measured: worse / no better).
-static int shadowgate(void) { return -1; }
+static int shadowgate(void) {
+    return -1;
+}
 
 // Scan target's straight-line extent (bounded by forward-branch reach). Returns -1 if a blr (unknown
 // callee) -- or, when tuned, if the scan window is exhausted with no clean terminal (large/complex fn,
@@ -1171,6 +1257,48 @@ static int target_is_leaf(uint64_t target) {
     return 1;
 }
 
+#define CTX_INLINE_DEPTH 3
+#define CTX_INLINE_INSNS 64
+static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], int depth,
+                                   uint64_t *retpc, int *cost) {
+    if (depth >= CTX_INLINE_DEPTH) return 0;
+    for (int i = 0; i < depth; i++)
+        if (ancestors[i] == target) return 0;
+    uint64_t anc[CTX_INLINE_DEPTH];
+    for (int i = 0; i < depth; i++) anc[i] = ancestors[i];
+    anc[depth] = target;
+    int total = 0;
+    for (int i = 0; i < CTX_INLINE_INSNS; i++) {
+        uint64_t pc = target + (uint64_t)i * 4;
+        if (!hl_host_range_mapped((uintptr_t)pc, 4)) return 0;
+        uint32_t in = *(uint32_t *)pc;
+        total++;
+        if ((in & 31u) == 30u &&
+            (in & 0xFC000000u) != 0x94000000u &&
+            (in & 0xFFFFFC1Fu) != 0xD65F0000u)
+            return 0;
+        if (in == 0xD4000001u || (in & 0xFC000000u) == 0x14000000u ||
+            (in & 0xFFFFFC1Fu) == 0xD61F0000u || (in & 0xFFFFFC1Fu) == 0xD63F0000u)
+            return 0;
+        if ((in & 0xFC000000u) == 0x94000000u) {
+            int64_t off = sext(in & 0x3FFFFFF, 26) << 2;
+            uint64_t child_ret;
+            int child_cost;
+            if (!context_clone_candidate(pc + off, anc, depth + 1, &child_ret, &child_cost))
+                return 0;
+            total += child_cost;
+            if (total > CTX_INLINE_INSNS * CTX_INLINE_DEPTH) return 0;
+        }
+        if ((in & 0xFFFFFC1Fu) == 0xD65F0000u) {
+            if (((in >> 5) & 31) != 30) return 0;
+            *retpc = pc;
+            *cost = total;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // §B guest bl: push shadow, host `bl body(target)` (RAS pushes &Lcont), Lcont continues at gpc+4.
 static void emit_bl_ras(uint64_t gpc, uint64_t target) {
     if (target_is_leaf(target)) {
@@ -1199,8 +1327,8 @@ static void emit_bl_ras(uint64_t gpc, uint64_t target) {
     // host ret lands here
     uint8_t *Lcont = g_cp;
     int64_t ao = Lcont - (uint8_t *)p_adr;
-    // adr x3, Lcont
-    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 3;
+    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) |
+             (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 3u;
     // after the call returns -> gpc+4
     emit_chain_exit(gpc + 4);
 }
@@ -1373,6 +1501,7 @@ static int loop_has_rmw_hazard(uint64_t start, uint64_t endpc) {
 // loop top; this holds the loop re-entry point (after the store, at that poll) so emit_selfloop folds
 // the back-edge to it instead of to `body`. NULL when no hoist applies (fall back to `body`).
 static uint8_t *g_t2_loop_top;
+static uint32_t *g_t2_irq_patch;
 
 // W4E tier-2: emit a single-block self-loop's terminating conditional (taken target == block start).
 //   tier-1 build: cond -> Lcnt (counter) ; fall-through = loop exit. The counter promotes when hot.
@@ -1707,12 +1836,68 @@ static int seen_has(const uint64_t *seen, int n, uint64_t v) {
     return 0;
 }
 
+#define COND_DEFER_MAX 64
+static struct {
+    uint32_t *patch;
+    uint32_t orig;
+    uint64_t target;
+    uint64_t source_gpc;
+    int fwd;
+} g_cond_defer[COND_DEFER_MAX];
+static int g_cond_defer_n;
+
+static void cond_defer_reset(void) { g_cond_defer_n = 0; }
+static void cond_defer_finish(void) {
+    for (int i = 0; i < g_cond_defer_n; i++) {
+        uint8_t *stub = g_cp;
+        *g_cond_defer[i].patch =
+            recode_cond(g_cond_defer[i].orig,
+                        (stub - (uint8_t *)g_cond_defer[i].patch) / 4);
+        emit_chain_exit_from(g_cond_defer[i].target,
+                             g_cond_defer[i].source_gpc);
+        void *body = map_body(g_cond_defer[i].target);
+        if (body) {
+            uint8_t *entry = (uint8_t *)body +
+                             (g_cond_defer[i].fwd ? g_fwdskip : 0);
+            int64_t d = (entry - (uint8_t *)g_cond_defer[i].patch) / 4;
+            int tb = (g_cond_defer[i].orig & 0x7e000000u) == 0x36000000u;
+            int64_t lo = tb ? -(INT64_C(1) << 13) : -(INT64_C(1) << 18);
+            int64_t hi = tb ? ((INT64_C(1) << 13) - 1) : ((INT64_C(1) << 18) - 1);
+            if (d >= lo && d <= hi) {
+                *g_cond_defer[i].patch =
+                    recode_cond(g_cond_defer[i].orig, d);
+            }
+        } else {
+            add_pend_cond(g_cond_defer[i].patch,
+                          g_cond_defer[i].target,
+                          g_cond_defer[i].orig,
+                          g_cond_defer[i].source_gpc,
+                          g_cond_defer[i].fwd);
+        }
+    }
+}
+
 // Lay a conditional's fall-through inline: `inv` is the branch insn with its condition/op
 // already inverted, so when the guest would NOT take it we keep falling through. Emit the
 // inverted branch (skips the taken-side exit), the taken chain-exit, then patch the branch to
 // jump just past it. The patched offset is always tiny (the taken exit is ~1 insn if chained,
 // ~30 if it spills) -> in range even for tbz/tbnz's 14-bit field.
 static void stitch_cond(uint32_t inv, uint64_t taken) {
+    if (g_cond_defer_n < COND_DEFER_MAX) {
+        uint32_t orig = inv;
+        if ((orig & 0xff000010u) == 0x54000000u)
+            orig ^= 1u;
+        else
+            orig ^= 1u << 24;
+        int n = g_cond_defer_n++;
+        g_cond_defer[n].patch = (uint32_t *)g_cp;
+        g_cond_defer[n].orig = orig;
+        g_cond_defer[n].target = taken;
+        g_cond_defer[n].source_gpc = g_emit_gpc;
+        g_cond_defer[n].fwd = g_fwdskip && taken > g_emit_gpc;
+        emit32(0);
+        return;
+    }
     uint32_t *patch = (uint32_t *)g_cp;
     emit32(0);
     emit_chain_exit(taken);
@@ -2005,6 +2190,193 @@ static int insn_touches_vreg(uint32_t in) {
     return 0;
 }
 
+static int x28_alu_window_classify(uint32_t in, int *mask_out,
+                                   int *read_out, int *write_out) {
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    int mask = gpr_field_mask(in), read = 0, write = 0;
+    uint32_t op = (in >> 25) & 0xFu;
+    if (op == 8 || op == 9) {
+        if ((in & 0x1F000000u) == 0x10000000u) return 0;
+        if ((in & 0x1F800000u) == 0x12800000u) {
+            int opc = (in >> 29) & 3;
+            if (opc == 1) return 0;
+            write = mask & 1;
+            if (opc == 3) read = write;
+        } else if ((in & 0x1F800000u) == 0x13800000u) {
+            read = mask & (2 | 4);
+            write = mask & 1;
+        } else if ((in & 0x1F000000u) == 0x11000000u ||
+                   (in & 0x1F800000u) == 0x12000000u ||
+                   (in & 0x1F800000u) == 0x13000000u) {
+            read = mask & 2;
+            write = mask & 1;
+        } else {
+            return 0;
+        }
+    } else if ((in & 0x0E000000u) == 0x0A000000u) {
+        read = mask & (2 | 4 | 8);
+        write = mask & 1;
+    } else {
+        return 0;
+    }
+    for (int k = 0; k < 4; k++)
+        if ((mask & mbits[k]) && is_stolen((in >> shifts[k]) & 31) &&
+            ((in >> shifts[k]) & 31) != 28)
+            return 0;
+    *mask_out = mask;
+    *read_out = read;
+    *write_out = write;
+    return 1;
+}
+
+static int x28_alu_window_field(uint32_t in, int fields) {
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if ((fields & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
+            return 1;
+    return 0;
+}
+
+static uint32_t x28_alu_window_rewrite(uint32_t in, int mask) {
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
+            in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
+    return in;
+}
+
+/*
+ * Diagnostic ceiling for forwarding the two dominant stolen values through a
+ * short straight-line run.  Guest x16 uses the otherwise engine-private host
+ * x16 and guest x28 uses host x17; x28 remains CPUREG outside the rewritten
+ * instructions.  Writes are published immediately, rather than only at the
+ * end of the window, so signal reconstruction and a fault on a later guest
+ * instruction always see architecturally committed state in cpu->x[].
+ *
+ * Deliberately admitted:
+ *   - the integer ALU forms audited by x28_alu_window_classify;
+ *   - ordinary scalar integer load/store, unsigned-immediate, unscaled,
+ *     pre/post-indexed, or register-offset.
+ * Deliberately rejected: x17/x18 operands (scratch collision), pairs,
+ * atomics/exclusives, SIMD, branches/system instructions, guest-base/folded
+ * addressing, tier 2, and active guest-bus/SMC-special translation modes.
+ */
+static int stolen_forward_classify(uint32_t in, int *mask_out,
+                                   int *read_out, int *write_out,
+                                   int *fault_out) {
+    int mask, read, write;
+    if (x28_alu_window_classify(in, &mask, &read, &write)) {
+        *mask_out = mask;
+        *read_out = read;
+        *write_out = write;
+        *fault_out = 0;
+        return 1;
+    }
+
+    /* Same audited integer-ALU set, but admit guest x16 as well as x28. */
+    uint32_t op = (in >> 25) & 0xFu;
+    mask = gpr_field_mask(in);
+    if (op == 8 || op == 9) {
+        if ((in & 0x1F000000u) == 0x10000000u) return 0;
+        if ((in & 0x1F800000u) == 0x12800000u) {
+            int opc = (in >> 29) & 3;
+            if (opc == 1) return 0;
+            write = mask & 1;
+            read = opc == 3 ? write : 0;
+        } else if ((in & 0x1F800000u) == 0x13800000u) {
+            read = mask & (2 | 4);
+            write = mask & 1;
+        } else if ((in & 0x1F000000u) == 0x11000000u ||
+                   (in & 0x1F800000u) == 0x12000000u ||
+                   (in & 0x1F800000u) == 0x13000000u) {
+            read = mask & 2;
+            write = mask & 1;
+        } else {
+            goto try_memory;
+        }
+    } else if ((in & 0x0E000000u) == 0x0A000000u) {
+        read = mask & (2 | 4 | 8);
+        write = mask & 1;
+    } else {
+        goto try_memory;
+    }
+    {
+        static const int shifts[4] = {0, 5, 16, 10};
+        static const int mbits[4] = {1, 2, 4, 8};
+        for (int k = 0; k < 4; k++) {
+            if (!(mask & mbits[k])) continue;
+            int r = (in >> shifts[k]) & 31;
+            if (is_stolen(r) && r != 16 && r != 28) return 0;
+        }
+    }
+    *mask_out = mask;
+    *read_out = read;
+    *write_out = write;
+    *fault_out = 0;
+    return 1;
+
+try_memory:
+    /* Scalar ordinary single-register loads/stores only. */
+    if (in & 0x04000000u) return 0;
+    int unsigned_imm = (in & 0x3B000000u) == 0x39000000u;
+    int unscaled = (in & 0x3B200000u) == 0x38000000u;
+    int regoff = (in & 0x3B200C00u) == 0x38200800u;
+    if (!unsigned_imm && !unscaled && !regoff) return 0;
+    if (unscaled) {
+        int mode = (in >> 10) & 3;
+        if (mode == 2) return 0; /* unprivileged: keep uncommon form baseline */
+    }
+
+    mask = gpr_field_mask(in);
+    int opc = (in >> 22) & 3;
+    int size = (in >> 30) & 3;
+    if (size == 3 && opc == 2) return 0; /* PRFM */
+    int writeback = unscaled && (((in >> 10) & 3) == 1 ||
+                                 ((in >> 10) & 3) == 3);
+    int base_index = mask & (2 | 4);
+    if (opc == 0) {
+        read = mask & (1 | 2 | 4);
+        write = writeback ? (mask & 2) : 0;
+    } else {
+        read = base_index;
+        write = (mask & 1) | (writeback ? (mask & 2) : 0);
+    }
+
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++) {
+        if (!(mask & mbits[k])) continue;
+        int r = (in >> shifts[k]) & 31;
+        if (is_stolen(r) && r != 16 && r != 28) return 0;
+    }
+    *mask_out = mask;
+    *read_out = read;
+    *write_out = write;
+    *fault_out = 1;
+    return 1;
+}
+
+static int stolen_forward_field(uint32_t in, int fields, int reg) {
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if ((fields & mbits[k]) && (int)((in >> shifts[k]) & 31) == reg)
+            return 1;
+    return 0;
+}
+
+static uint32_t stolen_forward_rewrite(uint32_t in, int mask) {
+    static const int shifts[4] = {0, 5, 16, 10};
+    static const int mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; k++)
+        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
+            in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
+    return in;
+}
+
 static void emit_cpu_model_value(int rd, uint64_t value) {
     if (is_stolen(rd)) {
         if (stealfast_on()) {
@@ -2021,6 +2393,41 @@ static void emit_cpu_model_value(int rd, uint64_t value) {
     }
 }
 
+// Recognize the compiler's otherwise redundant frame around a direct tail call:
+//
+//   stp x29,x30,[sp,#-16]!; small register-only setup; ldp x29,x30,[sp],#16; b target
+//
+// x17 is engine-private in steal mode, so it can carry the architectural LR
+// between the real stack store/load.  The stack accesses remain native and at
+// their original guest PCs (fault/unwind semantics are unchanged); this only
+// avoids repeatedly round-tripping x30 through cpu->x[30] in the generic
+// stolen-register mangler.  Keep the recognizer intentionally exact.
+static uint64_t scan_tail_x30_carry(uint64_t pc) {
+    if (!g_steal1617 || g_noibslim || jit_guest_bus_active()) return 0;
+    // The recognizer may inspect the eight setup instructions plus the tail
+    // instruction following the restoring LDP.  Refuse to speculate across an
+    // unmapped guest boundary.
+    if (!hl_host_range_mapped((uintptr_t)pc, 10 * sizeof(uint32_t))) return 0;
+    if (*(uint32_t *)pc != 0xA9BF7BFDu) return 0;
+    for (int i = 1; i <= 8; i++) {
+        uint32_t in = *(uint32_t *)(pc + (uint64_t)i * 4);
+        if (in == 0xA8C17BFDu) {
+            uint32_t tail = *(uint32_t *)(pc + (uint64_t)(i + 1) * 4);
+            return (tail & 0xFC000000u) == 0x14000000u ? pc + (uint64_t)i * 4 : 0;
+        }
+        // No memory, control flow, system, SIMD, PC-relative operation, or
+        // stolen guest register may occur while host x17 carries the LR.
+        if ((in & 0x0A000000u) == 0x08000000u ||
+            (in & 0x7C000000u) == 0x14000000u ||
+            (in & 0x1C000000u) == 0x10000000u ||
+            (in & 0x0E000000u) == 0x0E000000u ||
+            (in & 0xFFC00000u) == 0xD5000000u) return 0;
+        int mask = gpr_field_mask(in);
+        if (uses_x18(in, mask)) return 0;
+    }
+    return 0;
+}
+
 static void *translate_block(uint64_t gpc) {
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 guest_pc=%#llx", (unsigned long long)gpc);
     /* Observe writes made through another MAP_SHARED alias before decoding
@@ -2031,12 +2438,21 @@ static void *translate_block(uint64_t gpc) {
     tier2_env_init();
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
+    chain_exit_dedup_reset();
+    cond_defer_reset();
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
+    uint64_t tail_carry_ldp = scan_tail_x30_carry(gpc);
     g_blk_vdirty = 0; // reset per block; set below when a V-writing insn is emitted
     g_t2_loop_top = NULL; // reset per block; set only in the tier-2 vdirty-hoist path below
+    g_t2_irq_patch = NULL;
     void *host = g_cp;
     emit_prologue();
+    // Keep the hot chained/IBTC entry stable independently of prologue size.
+    // Cold dispatcher entry runs this padding once; hot entries target `body`
+    // below and skip it.
+    while ((uintptr_t)g_cp & 15)
+        emit32(0xD503201Fu);
     // chained jumps land here (regs already live)
     void *body = g_cp;
     // poll cpu->irq at the body entry so a caught async signal reaches a no-syscall guest loop.
@@ -2073,6 +2489,10 @@ static void *translate_block(uint64_t gpc) {
     // registered in g_map, so the truncated successor self-heals as an on-demand fresh translation via the
     // ordinary chain-exit path (identical to the NOSTITCH baseline, just re-anchored deeper).
     int ncond = 0;
+    struct {
+        uint64_t target, resume, retpc, expected_x30;
+    } ctx[CTX_INLINE_DEPTH];
+    int nctx = 0;
 #ifndef STITCH_MAX_COND
 #define STITCH_MAX_COND 3
 #endif
@@ -2092,6 +2512,115 @@ static void *translate_block(uint64_t gpc) {
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         uint32_t in = *(uint32_t *)gpc;
+        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
+            !jit_guest_bus_active() && !g_nonpie_lo) {
+            int mask, read, write, fault;
+            if (stolen_forward_classify(in, &mask, &read, &write, &fault) &&
+                (stolen_forward_field(in, read, 16) ||
+                 stolen_forward_field(in, read, 28))) {
+                int count = 0, touches = 0, last_touch = -1;
+                int need16 = 0, need28 = 0;
+                for (; count < 12; count++) {
+                    uint32_t win = *(uint32_t *)(gpc + (uint64_t)count * 4);
+                    int wm, wr, ww, wf;
+                    if (!stolen_forward_classify(win, &wm, &wr, &ww, &wf))
+                        break;
+                    int r16 = stolen_forward_field(win, wr, 16);
+                    int r28 = stolen_forward_field(win, wr, 28);
+                    if (r16 || r28) {
+                        touches++;
+                        last_touch = count;
+                        need16 |= r16;
+                        need28 |= r28;
+                    }
+                }
+                if (touches >= 3) {
+                    int window = last_touch + 1;
+                    if (provenance_fault_capable)
+                        jit_instruction_map_put(provenance_host,
+                                                (uint64_t)g_cp,
+                                                provenance_guest);
+                    /* Load x16 first: the second load still needs real x28. */
+                    if (need16) e_ldr(16, CPUREG, 16 * 8);
+                    if (need28) e_ldr(17, CPUREG, 28 * 8);
+                    for (int i = 0; i < window; i++) {
+                        uint64_t pc = gpc + (uint64_t)i * 4;
+                        uint32_t win = *(uint32_t *)pc;
+                        int wm, wr, ww, wf;
+                        int ok = stolen_forward_classify(win, &wm, &wr, &ww, &wf);
+                        assert(ok);
+                        uint64_t hstart = (uint64_t)g_cp;
+                        emit32(stolen_forward_rewrite(win, wm));
+                        if (stolen_forward_field(win, ww, 16))
+                            e_str(16, CPUREG, 16 * 8);
+                        if (stolen_forward_field(win, ww, 28))
+                            e_str(17, CPUREG, 28 * 8);
+                        if (wf)
+                            jit_instruction_map_put(hstart, (uint64_t)g_cp, pc);
+                    }
+                    if (g_txln_active) {
+                        uint64_t last =
+                            (gpc + (uint64_t)window * 4 - 1) >> 6;
+                        for (uint64_t line = gpc >> 6; line <= last; line++)
+                            txln_put(line);
+                        tx_last_line = last;
+                    }
+                    if (gpc < guest_start) guest_start = gpc;
+                    gpc += (uint64_t)window * 4;
+                    if (gpc > guest_end) guest_end = gpc;
+                    provenance_fault_capable = 0;
+                    continue;
+                }
+            }
+        }
+        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
+            !jit_guest_bus_active() && !g_nonpie_lo) {
+            int mask, read, write;
+            if (x28_alu_window_classify(in, &mask, &read, &write) &&
+                x28_alu_window_field(in, read)) {
+                int count = 0, reads = 0, last_read = -1;
+                for (; count < 12; count++) {
+                    uint32_t win = *(uint32_t *)(gpc + (uint64_t)count * 4);
+                    int wm, wr, ww;
+                    if (!x28_alu_window_classify(win, &wm, &wr, &ww))
+                        break;
+                    if (x28_alu_window_field(win, wr)) {
+                        reads++;
+                        last_read = count;
+                    }
+                }
+                if (reads >= 3) {
+                    int window = last_read + 1;
+                    if (provenance_fault_capable)
+                        jit_instruction_map_put(provenance_host,
+                                                (uint64_t)g_cp,
+                                                provenance_guest);
+                    e_ldr(17, CPUREG, 28 * 8);
+                    for (int i = 0; i < window; i++) {
+                        uint64_t pc = gpc + (uint64_t)i * 4;
+                        uint32_t win = *(uint32_t *)pc;
+                        int wm, wr, ww;
+                        int ok = x28_alu_window_classify(win, &wm, &wr, &ww);
+                        assert(ok);
+                        emit32(x28_alu_window_rewrite(win, wm));
+                        if (x28_alu_window_field(win, ww))
+                            e_str(17, CPUREG, 28 * 8);
+                    }
+                    if (g_txln_active) {
+                        uint64_t last =
+                            (gpc + (uint64_t)window * 4 - 1) >> 6;
+                        for (uint64_t line = gpc >> 6; line <= last; line++)
+                            txln_put(line);
+                        tx_last_line = last;
+                    }
+                    if (gpc < guest_start) guest_start = gpc;
+                    gpc += (uint64_t)window * 4;
+                    if (gpc > guest_end) guest_end = gpc;
+                    provenance_fault_capable = 0;
+                    continue;
+                }
+            }
+        }
         if (!g_tier2_build && g_txln_active) {
             uint64_t tx_ln = gpc >> 6;
             if (tx_ln != tx_last_line) {
@@ -2127,15 +2656,24 @@ static void *translate_block(uint64_t gpc) {
             if (g_tier2_build && gpc == start) {
                 g_t2_loop_top = g_cp;
                 e_ldr(16, CPUREG, OFF_IRQ); // ldr x16, [cpu, #irq]
-                uint32_t *p = (uint32_t *)g_cp;
-                emit32(0); // cbz x16, Lcont
-                emit_exit_const(start, R_BRANCH);
-                uint8_t *cont = g_cp;
-                *p = 0xB4000000u | (((uint32_t)(((uint8_t *)cont - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+                g_t2_irq_patch = (uint32_t *)g_cp;
+                emit32(0); // cbnz x16, shared out-of-line Lirq
             }
         }
 
         if (!in_excl) {
+            if (tail_carry_ldp && gpc == start) {
+                e_ldr(17, CPUREG, 30 * 8);
+                emit32((in & ~(31u << 10)) | (17u << 10));
+                gpc += 4;
+                continue;
+            }
+            if (tail_carry_ldp && gpc == tail_carry_ldp) {
+                emit32((in & ~(31u << 10)) | (17u << 10));
+                e_str(17, CPUREG, 30 * 8);
+                gpc += 4;
+                continue;
+            }
             int n = try_lse_atomic(gpc);
             if (n) {
                 // try_lse_atomic consumes n bytes (a whole ldxr..stxr sequence) without re-entering the
@@ -2210,10 +2748,61 @@ static void *translate_block(uint64_t gpc) {
         // bl
         if ((in & 0xFC000000u) == 0x94000000u) {
             int64_t off = sext(in & 0x3FFFFFF, 26) << 2;
+            // Fuse a direct call to the exact canonical four-insn PLT veneer:
+            //   adrp x16,page; ldr x17,[x16,#got]; add x16,x16,#lo; br x17
+            // Preserve every architectural effect and the real fault-capable GOT
+            // load; only the extra translated-block hop and its entry poll vanish.
+            uint64_t plt = gpc + off;
+            if (!hl_host_range_mapped((uintptr_t)plt, 16)) goto no_bl_plt_fuse;
+            uint32_t p0 = *(uint32_t *)plt;
+            uint32_t p1 = *(uint32_t *)(plt + 4);
+            uint32_t p2 = *(uint32_t *)(plt + 8);
+            uint32_t p3 = *(uint32_t *)(plt + 12);
+            if (!guestbase_on() && !jit_guest_bus_active() &&
+                (p0 & 0x9F00001Fu) == 0x90000010u &&
+                (p1 & 0xFFC003FFu) == 0xF9400211u &&
+                (p2 & 0xFFC003FFu) == 0x91000210u &&
+                p3 == 0xD61F0220u) {
+                int64_t pimm =
+                    sext((((p0 >> 5) & 0x7FFFF) << 2) | ((p0 >> 29) & 3), 21) << 12;
+                uint64_t page = (pcrel_base(plt) & ~0xFFFull) + pimm;
+                emit_set_x30(pcrel_base(gpc) + 4);
+                if (!emit_guest_adrp_page(16, page)) e_movconst(16, page);
+                e_str(16, CPUREG, 16 * 8);
+                uint64_t load_host = (uint64_t)g_cp;
+                emit32(p1);
+                pcache_record_provenance(load_host, (uint64_t)g_cp, plt + 4);
+                e_str(17, CPUREG, 17 * 8);
+                emit32(p2);
+                e_str(16, CPUREG, 16 * 8);
+                txpg_mark(plt, plt + 16);
+                if (g_txln_active)
+                    for (uint64_t line = plt >> 6; line <= (plt + 15) >> 6; line++)
+                        txln_put(line);
+                emit_ibranch_ip2_ready(17, 1);
+                break;
+            }
+no_bl_plt_fuse:
             // Inline an LSE outline-atomic helper call to a single host atomic op (elides the call +
             // return dispatch, the dominant atomics tax); only fires in the verbatim-safe regime.
             if (try_inline_outline_atomic(gpc, gpc + off)) {
                 gpc += 4;
+                continue;
+            }
+            uint64_t ancestors[CTX_INLINE_DEPTH];
+            for (int i = 0; i < nctx; i++) ancestors[i] = ctx[i].target;
+            uint64_t clone_ret;
+            int clone_cost;
+            if (nctx < CTX_INLINE_DEPTH &&
+                context_clone_candidate(gpc + off, ancestors, nctx, &clone_ret, &clone_cost) &&
+                (g_cp - (uint8_t *)host) + clone_cost * 16 < TRACE_MAX_BYTES) {
+                emit_set_x30(pcrel_base(gpc) + 4);
+                ctx[nctx].target = gpc + off;
+                ctx[nctx].resume = gpc + 4;
+                ctx[nctx].retpc = clone_ret;
+                ctx[nctx].expected_x30 = pcrel_base(gpc) + 4;
+                nctx++;
+                gpc += off;
                 continue;
             }
             emit_bl_ras(gpc, gpc + off);
@@ -2223,6 +2812,21 @@ static void *translate_block(uint64_t gpc) {
         // ret xN
         if ((in & 0xFFFFFC1Fu) == 0xD65F0000u) {
             int rrn = (in >> 5) & 31;
+            if (rrn == 30 && nctx > 0 && gpc == ctx[nctx - 1].retpc) {
+                e_movr(16, 30);
+                e_movconst(17, ctx[nctx - 1].expected_x30);
+                emit32(0xCB000000u | (17u << 16) | (16u << 5) | 16u);
+                uint32_t *p_zero = (uint32_t *)g_cp;
+                emit32(0);
+                emit_ibranch(30);
+                uint8_t *resume_host = g_cp;
+                *p_zero = 0xB4000000u |
+                          (((uint32_t)(((uint8_t *)resume_host - (uint8_t *)p_zero) / 4) &
+                            0x7FFFF) << 5) | 16;
+                gpc = ctx[nctx - 1].resume;
+                nctx--;
+                continue;
+            }
             if (rrn == 30)
                 // A3: §B OFF (default) -> bare IBTC return (no shadow-ret preamble); §B ON -> shadow ret
                 // (FAST host-ret on guest_ret+guest_sp match, else IBTC fallback).
@@ -2248,8 +2852,15 @@ static void *translate_block(uint64_t gpc) {
             // guest x30 lives in cpu->x[30] (stolen); RAS push needs a host blr. The link value is
             // guest-visible (spilled to the guest stack), so store the UN-BIASED (low) return vaddr
             // for non-PIE; the dispatcher re-biases on the ret. pcrel_base is identity for PIE.
-            emit_set_x30(pcrel_base(gpc) + 4);
-            emit_ibranch((in >> 5) & 31);
+            int blrn = (in >> 5) & 31;
+            if (blrn == 30) {
+                e_movr(16, 30);
+                emit_set_x30(pcrel_base(gpc) + 4);
+                emit_ibranch(16);
+            } else {
+                emit_set_x30(pcrel_base(gpc) + 4);
+                emit_ibranch(blrn);
+            }
             //   (Section 3) -- deferred; Stage-B IBTC for the function-ptr return
             break;
         }
@@ -2618,18 +3229,47 @@ static void *translate_block(uint64_t gpc) {
             int rd = in & 31;
             int64_t imm = sext((((in >> 5) & 0x7FFFF) << 2) | ((in >> 29) & 3), 21) << 12;
             uint64_t v = (pcrel_base(gpc) & ~0xFFFull) + imm;
+            // Exact canonical AArch64 PLT veneer:
+            //   adrp x16,page; ldr x17,[x16,#got]; add x16,x16,#lo; br x17
+            if (!hl_host_range_mapped((uintptr_t)gpc, 16)) goto no_adrp_plt_fuse;
+            uint32_t p1 = *(uint32_t *)(gpc + 4);
+            uint32_t p2 = *(uint32_t *)(gpc + 8);
+            uint32_t p3 = *(uint32_t *)(gpc + 12);
+            if (!guestbase_on() && !jit_guest_bus_active() &&
+                (in & 0x9F00001Fu) == 0x90000010u &&
+                (p1 & 0xFFC003FFu) == 0xF9400211u &&
+                (p2 & 0xFFC003FFu) == 0x91000210u &&
+                p3 == 0xD61F0220u) {
+                if (!emit_guest_adrp_page(16, v)) e_movconst(16, v);
+                e_str(16, CPUREG, 16 * 8);
+                uint64_t load_host = (uint64_t)g_cp;
+                emit32(p1);
+                pcache_record_provenance(load_host, (uint64_t)g_cp, gpc + 4);
+                e_str(17, CPUREG, 17 * 8);
+                emit32(p2);
+                e_str(16, CPUREG, 16 * 8);
+                if (!g_tier2_build && g_txln_active) {
+                    uint64_t last = (gpc + 12) >> 6;
+                    for (uint64_t line = gpc >> 6; line <= last; line++) txln_put(line);
+                    tx_last_line = last;
+                }
+                if (gpc + 16 > guest_end) guest_end = gpc + 16;
+                emit_ibranch_ip2_ready(17, 1);
+                break;
+            }
+no_adrp_plt_fuse:
             if (is_stolen(rd)) {
                 if (stealfast_on()) {
-                    e_movconst(16, v);
+                    if (!emit_guest_adrp_page(16, v)) e_movconst(16, v);
                     e_str(16, CPUREG, rd * 8);
                 } else {
                     x18_prolog();
-                    e_movconst(0, v);
+                    if (!emit_guest_adrp_page(0, v)) e_movconst(0, v);
                     e_str(0, 1, rd * 8);
                     x18_epilog();
                 }
             } else
-                e_movconst(rd, v);
+                if (!emit_guest_adrp_page(rd, v)) e_movconst(rd, v);
             gpc += 4;
             continue;
         }
@@ -2751,7 +3391,7 @@ static void *translate_block(uint64_t gpc) {
         }
         // retaa/retab -> shadow ret (x30)
         if ((in & 0xFFFFFBFFu) == 0xD65F0BFFu) {
-            emit_shadow_ret();
+            shadowgate() == -1 ? emit_ibranch(30) : emit_shadow_ret();
             break;
         }
 
@@ -2811,6 +3451,26 @@ static void *translate_block(uint64_t gpc) {
             gpc += 4;
             continue;
         }
+        // Exact ORR-alias MOV from a stolen source into a live guest host reg.
+        if ((in & 0x7FE0FFE0u) == 0x2A0003E0u) {
+            int rd = in & 31, rm = (in >> 16) & 31;
+            if (rd != 31 && !is_stolen(rd) && is_stolen(rm)) {
+                if (in >> 31)
+                    e_ldr(rd, CPUREG, rm * 8);
+                else
+                    emit32(0xB9400000u | ((unsigned)(rm * 2) << 10) |
+                           ((unsigned)CPUREG << 5) | (unsigned)rd);
+                gpc += 4;
+                continue;
+            }
+        }
+        // Exact MOVZ Wd/Xd,#0,LSL#0.
+        if (stealfast_on() && (in & 0x7FFFFFE0u) == 0x52800000u &&
+            is_stolen(in & 31)) {
+            e_str(31, CPUREG, (int)(in & 31) * 8);
+            gpc += 4;
+            continue;
+        }
         // everything else: verbatim,
         int mask = gpr_field_mask(in);
         if (uses_x18(in, mask))
@@ -2828,13 +3488,31 @@ static void *translate_block(uint64_t gpc) {
         *defer[i].patch = recode_cond(defer[i].in, d);
         emit_chain_exit(defer[i].target);
     }
+    cond_defer_finish();
+    chain_exit_dedup_finish();
     // IRQSLIM: the out-of-line poll exit stub the body-entry cbnz targets (irq set -> exit to
     // the dispatcher at the block start, exactly like the legacy inline poll).
-    if (g_irq_patch) {
-        uint32_t *p = g_irq_patch;
-        g_irq_patch = NULL;
-        *p = 0xB5000000u | (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16; // cbnz x16
+    if (g_irq_patch || g_t2_irq_patch) {
+        int pad_removed_t2_exit = g_t2_irq_patch != NULL;
+        uint8_t *stub = g_cp;
+        if (g_irq_patch) {
+            uint32_t *p = g_irq_patch;
+            g_irq_patch = NULL;
+            *p = 0xB5000000u |
+                 (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+        }
+        if (g_t2_irq_patch) {
+            uint32_t *p = g_t2_irq_patch;
+            g_t2_irq_patch = NULL;
+            *p = 0xB5000000u |
+                 (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+        }
+        uint8_t *exit_begin = g_cp;
         emit_exit_const(start, R_BRANCH);
+        size_t exit_bytes = (size_t)(g_cp - exit_begin);
+        if (pad_removed_t2_exit)
+            for (size_t off = 0; off < exit_bytes; off += 4)
+                emit32(0xD503201Fu);
     }
     // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
     // unregistered so a later mid-region entry self-heals via re-translate + back-patch.

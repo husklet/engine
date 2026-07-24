@@ -70,7 +70,7 @@
 // interpreter). Opt in via HL_PCACHE=1.
 
 #define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
-#define PC_VERSION 5 // v5 persists each translated guest source range for precise SMC replacement.
+#define PC_VERSION 8 // v8 persists exact fused-PLT GOT-load instruction provenance.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
@@ -88,6 +88,7 @@
 #define RK_T2CNT 3    // 4-insn movz/movk of &g_t2cnt[slot] into reg `rd`
 #define RK_ICSITE 4   // 16-byte per-site IC {target,body} literal pair -> zero on load (neutralize)
 #define RK_BUSFAULT 5 // 4-insn pointer to the generic translated-memory BUS query
+#define RK_GUEST_ADRP 6 // one-insn ADRP of a fixed guest page; re-encode for the live arena RX base
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
 static int g_pcache;            // persistent cache active (HL_PCACHE=1)
@@ -106,6 +107,22 @@ static hl_reloc g_reloc_storage[PC_RELOC_CAP];
 static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 #define g_reloc (g_reloc_table.records)
 #define g_nreloc (g_reloc_table.count)
+
+#define PC_PROV_CAP (1u << 16)
+struct pc_prov { uint64_t host_off, guest; uint32_t size, reserved; };
+static struct pc_prov g_pc_prov[PC_PROV_CAP];
+static uint32_t g_pc_nprov;
+
+static void pcache_record_provenance(uint64_t host, uint64_t end, uint64_t guest) {
+    jit_instruction_map_put(host, end, guest);
+    if (!g_pcache || host < (uint64_t)g_cache || end < host ||
+        end - host > UINT32_MAX || g_pc_nprov >= PC_PROV_CAP) {
+        if (g_pcache && g_pc_nprov >= PC_PROV_CAP) g_pcache_poison = 1;
+        return;
+    }
+    g_pc_prov[g_pc_nprov++] =
+        (struct pc_prov){host - (uint64_t)g_cache, guest, (uint32_t)(end - host), 0};
+}
 
 #if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
 extern void block_return(void) __attribute__((visibility("hidden")));
@@ -166,6 +183,25 @@ static void emit_busfaultptr(int rd) {
     }
 }
 
+// Materialize a page-aligned GUEST address with one host ADRP when it is reachable from the RX alias.
+// The instruction PC is the executable alias, not g_cp's writable alias.  Persistent-cache reload may
+// put that alias at a different VA, so record the instruction: the loader recovers its fixed guest target
+// from the saved instruction + saved RX base and re-encodes it relative to the live RX base.
+//
+// Returns 1 after emitting, or 0 if the target is outside ADRP's signed 21-page (±4 GiB) range.  Callers
+// must use their existing e_movconst fallback on 0.
+static int emit_guest_adrp_page(int rd, uint64_t target) {
+    uint64_t target_page = target & ~UINT64_C(0xfff);
+    uint64_t pc_page = (uint64_t)J_RX(g_cp) & ~UINT64_C(0xfff);
+    int64_t delta = (int64_t)(target_page - pc_page);
+    if ((delta & 0xfff) || delta < -INT64_C(0x100000000) || delta > INT64_C(0xfffff000)) return 0;
+    int64_t pages = delta >> 12;
+    uint32_t imm21 = (uint32_t)pages & 0x1fffff;
+    if (g_pcache) pc_reloc_add((uint32_t)(g_cp - g_cache), RK_GUEST_ADRP, (uint8_t)rd, 0);
+    emit32(0x90000000u | ((imm21 & 3) << 29) | (((imm21 >> 2) & 0x7ffff) << 5) | (uint32_t)rd);
+    return 1;
+}
+
 // Record a per-site IC's 16-byte cached {target,body} literal pair so a reload can zero it (the cached
 // body pointer is an arena address that would be stale in a fresh process; a zeroed guard never matches
 // -> the site harmlessly re-resolves through the dispatcher, which rewrites both literals).
@@ -174,16 +210,17 @@ static void pc_record_icsite(uint8_t *lt) {
 }
 
 // ---- persisted layout ----
-// [pc_hdr][n_reloc pc_reloc][n_mapent pc_mapent][n_pend pc_pend][n_t2 pc_t2][n_txpg u64][arena bytes]
+// [pc_hdr][reloc][map][pend][t2][txpg][provenance][arena bytes]
 struct pc_hdr {
     uint64_t magic, version;
     uint64_t cpu_sz, jit_map_n, ibtc_n;
     uint64_t img_base, interp_base;
     uint64_t bin_id, entry_jump;
     uint64_t arena_used;
-    uint64_t n_reloc, n_mapent, n_pend, n_t2, n_txpg;
+    uint64_t n_reloc, n_mapent, n_pend, n_t2, n_txpg, n_prov;
     uint64_t csum;                     // FNV-1a over every byte after this header
     uint64_t block_return_at, ibtc_at; // diagnostics only (we re-emit from live symbols)
+    uint64_t arena_rx_at;              // v6: RX base used to encode RK_GUEST_ADRP instructions
 };
 
 struct pc_mapent {
@@ -191,8 +228,8 @@ struct pc_mapent {
 };
 
 struct pc_pend {
-    uint64_t slot_off, target;
-    uint32_t is_bl, fwd; // fwd: IRQSLIM forward edge -> patch_links_to targets body+g_fwdskip, not body+0
+    uint64_t slot_off, target, source_gpc;
+    uint32_t kind, fwd, orig, reserved;
 };
 
 struct pc_t2 {
@@ -269,7 +306,7 @@ static void pcache_directory_close(void) {
 
 // Re-emit / neutralize every recorded slot for THIS process. Runs inside the jit_wprot() write window,
 // against the RW alias (g_cache + off). Offsets/slots were validated by pcache_load before we get here.
-static void pcache_relocate(void) {
+static void pcache_relocate(uint64_t saved_rx) {
     for (int i = 0; i < g_nreloc; i++) {
         uint32_t off = g_reloc[i].off, info = g_reloc[i].info;
         int kind = info & 0xff, rd = (info >> 8) & 0xff, slot = (info >> 16) & 0xffff;
@@ -289,6 +326,19 @@ static void pcache_relocate(void) {
             *(uint64_t *)(g_cache + off) = 0;
             if (!g_steal1617) *(uint64_t *)(g_cache + off + 8) = 0;
             continue;
+        case RK_GUEST_ADRP: {
+            // Validation already proved this target remains reachable from the live RX alias.
+            uint32_t in = w[0];
+            uint32_t imm21 = ((in >> 29) & 3) | (((in >> 5) & 0x7ffff) << 2);
+            int64_t pages = (int32_t)(imm21 << 11) >> 11;
+            uint64_t saved_pc_page = (saved_rx + off) & ~UINT64_C(0xfff);
+            uint64_t target_page = saved_pc_page + (uint64_t)(pages * INT64_C(4096));
+            uint64_t live_pc_page = ((uint64_t)J_RX(g_cache) + off) & ~UINT64_C(0xfff);
+            int64_t live_pages = (int64_t)(target_page - live_pc_page) >> 12;
+            uint32_t live_imm21 = (uint32_t)live_pages & 0x1fffff;
+            w[0] = 0x90000000u | ((live_imm21 & 3) << 29) | (((live_imm21 >> 2) & 0x7ffff) << 5) | rd;
+            continue;
+        }
         default: continue;
         }
         w[0] = 0xD2800000u | (((uint32_t)(v) & 0xffff) << 5) | rd;                    // movz rd, #v[0:16]
@@ -302,11 +352,30 @@ static void pcache_relocate(void) {
 // the literal pair), so the whole window must be inside the restored arena and naturally aligned.
 static int pc_reloc_ok(hl_reloc r, uint64_t arena_used) {
     int kind = r.info & 0xff, slot = (r.info >> 16) & 0xffff;
-    if (!hl_window_contains(arena_used, r.off, 16, kind == RK_ICSITE ? 8 : 4)) return 0;
+    uint64_t width = kind == RK_GUEST_ADRP ? 4 : 16;
+    if (!hl_window_contains(arena_used, r.off, width, kind == RK_ICSITE ? 8 : 4)) return 0;
     if (kind == RK_ICSITE) return 1;
     if (((r.info >> 8) & 0xff) > 30) return 0; // rd must be a real GPR (we never bake into sp/xzr)
     if (kind == RK_T2CNT) return slot < T2_MAX;
-    return kind == RK_BLOCKRET || kind == RK_IBTC || kind == RK_BUSFAULT;
+    return kind == RK_BLOCKRET || kind == RK_IBTC || kind == RK_BUSFAULT || kind == RK_GUEST_ADRP;
+}
+
+// Validate the opcode and prove that an ADRP target recovered relative to the saved RX base remains
+// encodable relative to this process's RX base.  Do this before rebuilding any live map state, so a cache
+// created with an unusually distant arena base degrades to a clean miss instead of leaving partial state.
+static int pc_guest_adrp_ok(hl_reloc r, const uint8_t *arena, uint64_t saved_rx) {
+    if ((r.info & 0xff) != RK_GUEST_ADRP) return 1;
+    uint32_t in;
+    memcpy(&in, arena + r.off, sizeof in);
+    int rd = (r.info >> 8) & 0xff;
+    if ((in & 0x9f000000u) != 0x90000000u || (in & 31) != (uint32_t)rd) return 0;
+    uint32_t imm21 = ((in >> 29) & 3) | (((in >> 5) & 0x7ffff) << 2);
+    int64_t pages = (int32_t)(imm21 << 11) >> 11;
+    uint64_t saved_pc_page = (saved_rx + r.off) & ~UINT64_C(0xfff);
+    uint64_t target_page = saved_pc_page + (uint64_t)(pages * INT64_C(4096));
+    uint64_t live_pc_page = ((uint64_t)J_RX(g_cache) + r.off) & ~UINT64_C(0xfff);
+    int64_t delta = (int64_t)(target_page - live_pc_page);
+    return !(delta & 0xfff) && delta >= -INT64_C(0x100000000) && delta <= INT64_C(0xfffff000);
 }
 
 // Returns 1 on HIT (arena + maps restored -> translation of the startup path is skipped). ANY mismatch /
@@ -327,7 +396,8 @@ static int pcache_load(uint64_t entry_jump) {
         h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
         h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
         h.arena_used > CACHE_SZ || (h.arena_used & 3) || h.n_reloc > PC_RELOC_CAP || h.n_mapent > JIT_MAP_N ||
-        h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N) {
+        h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N ||
+        h.n_prov > PC_PROV_CAP) {
         free(image);
         return 0;
     }
@@ -336,15 +406,17 @@ static int pcache_load(uint64_t entry_jump) {
     struct pc_pend *pe = h.n_pend ? malloc(h.n_pend * sizeof *pe) : NULL;
     struct pc_t2 *te = h.n_t2 ? malloc(h.n_t2 * sizeof *te) : NULL;
     uint64_t *tx = h.n_txpg ? malloc(h.n_txpg * sizeof *tx) : NULL;
+    struct pc_prov *pv = h.n_prov ? malloc(h.n_prov * sizeof *pv) : NULL;
     uint8_t *abuf = h.arena_used ? malloc(h.arena_used) : NULL;
     int ok = (h.n_reloc == 0 || re) && (h.n_mapent == 0 || me) && (h.n_pend == 0 || pe) && (h.n_t2 == 0 || te) &&
-             (h.n_txpg == 0 || tx) && (h.arena_used == 0 || abuf);
+             (h.n_txpg == 0 || tx) && (h.n_prov == 0 || pv) && (h.arena_used == 0 || abuf);
 #define PC_RD(buf, nbytes) (ok && (ok = hl_persist_take(&cursor, (buf), (size_t)(nbytes))))
     PC_RD(re, h.n_reloc * sizeof *re);
     PC_RD(me, h.n_mapent * sizeof *me);
     PC_RD(pe, h.n_pend * sizeof *pe);
     PC_RD(te, h.n_t2 * sizeof *te);
     PC_RD(tx, h.n_txpg * sizeof *tx);
+    PC_RD(pv, h.n_prov * sizeof *pv);
     if (ok) ok = hl_persist_take(&cursor, abuf, (size_t)h.arena_used) && cursor.offset == cursor.size;
 #undef PC_RD
     free(image);
@@ -357,23 +429,40 @@ static int pcache_load(uint64_t entry_jump) {
         hl_digest_update(&digest, pe, h.n_pend * sizeof *pe);
         hl_digest_update(&digest, te, h.n_t2 * sizeof *te);
         hl_digest_update(&digest, tx, h.n_txpg * sizeof *tx);
+        hl_digest_update(&digest, pv, h.n_prov * sizeof *pv);
         hl_digest_update(&digest, abuf, h.arena_used);
         ok = hl_digest_value(&digest) == h.csum;
     }
     // Per-record bounds: every offset a later pass will WRITE or BRANCH through must be inside the arena.
     for (uint64_t i = 0; ok && i < h.n_reloc; i++)
         ok = pc_reloc_ok(re[i], h.arena_used);
+    for (uint64_t i = 0; ok && i < h.n_reloc; i++)
+        ok = pc_guest_adrp_ok(re[i], abuf, h.arena_rx_at);
     for (uint64_t i = 0; ok && i < h.n_mapent; i++)
         ok = hl_window_contains(h.arena_used, me[i].host_off, 1, 4) &&
              hl_window_contains(h.arena_used, me[i].body_off, 1, 4);
-    for (uint64_t i = 0; ok && i < h.n_pend; i++)
-        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4);
+    for (uint64_t i = 0; ok && i < h.n_pend; i++) {
+        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4) &&
+             pe[i].kind <= 2 && pe[i].fwd <= 1;
+        if (ok && pe[i].kind == 2) {
+            uint32_t in = pe[i].orig;
+            int valid = (in & 0xff000010u) == 0x54000000u ||
+                        (in & 0x7e000000u) == 0x34000000u ||
+                        (in & 0x7e000000u) == 0x36000000u;
+            ok = valid && !(pe[i].source_gpc & 3) &&
+                 pe[i].fwd == (uint32_t)(g_fwdskip && pe[i].target > pe[i].source_gpc);
+        }
+    }
+    for (uint64_t i = 0; ok && i < h.n_prov; i++)
+        ok = pv[i].reserved == 0 && pv[i].size != 0 &&
+             hl_window_contains(h.arena_used, pv[i].host_off, pv[i].size, 4);
     if (!ok) {
         free(re);
         free(me);
         free(pe);
         free(te);
         free(tx);
+        free(pv);
         free(abuf);
         return 0;
     }
@@ -385,6 +474,7 @@ static int pcache_load(uint64_t entry_jump) {
         free(pe);
         free(te);
         free(tx);
+        free(pv);
         free(abuf);
         return 0;
     }
@@ -392,8 +482,15 @@ static int pcache_load(uint64_t entry_jump) {
         map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
                 g_cache + me[i].host_off, g_cache + me[i].body_off);
     pend_reset();
-    for (uint64_t i = 0; i < h.n_pend; i++) // fwd restored too: a forward pend must patch to body+8 (IRQSLIM)
-        add_pend3((uint32_t *)(g_cache + pe[i].slot_off), pe[i].target, (int)pe[i].is_bl, (int)pe[i].fwd);
+    for (uint64_t i = 0; i < h.n_pend; i++) {
+        uint32_t *slot = (uint32_t *)(g_cache + pe[i].slot_off);
+        if (pe[i].kind == 2)
+            add_pend_cond(slot, pe[i].target, pe[i].orig,
+                          pe[i].source_gpc, (int)pe[i].fwd);
+        else
+            add_pend3(slot, pe[i].target, (int)pe[i].kind,
+                      (int)pe[i].fwd);
+    }
     g_t2n = (int)h.n_t2;
     for (uint64_t i = 0; i < h.n_t2; i++) {
         g_t2gpc[i] = te[i].gpc;
@@ -406,17 +503,25 @@ static int pcache_load(uint64_t entry_jump) {
                   // smc_icflush's coarse page fallback (g_pcache_loaded) covers restored code
     for (uint64_t i = 0; i < h.n_txpg; i++)
         if (tx[i]) txpg_put(tx[i]);
+    g_pc_nprov = 0;
+    for (uint64_t i = 0; i < h.n_prov; i++) {
+        jit_instruction_map_put((uint64_t)g_cache + pv[i].host_off,
+                                (uint64_t)g_cache + pv[i].host_off + pv[i].size,
+                                pv[i].guest);
+        g_pc_prov[g_pc_nprov++] = pv[i];
+    }
     g_cp = g_cache + h.arena_used;
     free(re);
     free(me);
     free(pe);
     free(te);
     free(tx);
+    free(pv);
 
     // Commit the arena bytes + re-emit every baked host pointer, then publish to the I-cache.
     if (!jit_wprot(0)) { free(abuf); return 0; }
     memcpy(g_cache, abuf, h.arena_used);
-    pcache_relocate();
+    pcache_relocate(h.arena_rx_at);
     if (!jit_wprot(1) || !jit_publish_code(J_RX(g_cache), h.arena_used)) { free(abuf); return 0; }
     memset(g_ibtc, 0, sizeof g_ibtc); // shared IBTC data table: refills lazily
     free(abuf);
@@ -468,12 +573,15 @@ static void pcache_save(void) {
     h.n_pend = (uint64_t)g_npend;
     h.n_t2 = (uint64_t)g_t2n;
     h.n_txpg = ntxpg;
+    h.n_prov = g_pc_nprov;
     h.block_return_at = (uint64_t)block_return;
     h.ibtc_at = (uint64_t)g_ibtc;
+    h.arena_rx_at = (uint64_t)J_RX(g_cache);
     // Build the whole image in one heap buffer -> one write() (per-record writes dominated the save cost).
     size_t total = sizeof h + (size_t)g_nreloc * sizeof(hl_reloc) + (size_t)nmap * sizeof(struct pc_mapent) +
                    (size_t)g_npend * sizeof(struct pc_pend) + (size_t)g_t2n * sizeof(struct pc_t2) +
-                   (size_t)ntxpg * sizeof(uint64_t) + arena_used;
+                   (size_t)ntxpg * sizeof(uint64_t) +
+                   (size_t)g_pc_nprov * sizeof(struct pc_prov) + arena_used;
     uint8_t *buf = malloc(total);
     int ok = buf != NULL;
     if (ok) {
@@ -492,8 +600,11 @@ static void pcache_save(void) {
             w += sizeof e;
         }
         for (int i = 0; i < g_npend; i++) {
-            struct pc_pend e = {(uint64_t)((uint8_t *)g_pend[i].slot - g_cache), g_pend[i].target,
-                                (uint32_t)g_pend[i].is_bl, (uint32_t)g_pend[i].fwd};
+            struct pc_pend e = {
+                (uint64_t)((uint8_t *)g_pend[i].slot - g_cache),
+                g_pend[i].target, g_pend[i].source_gpc,
+                (uint32_t)g_pend[i].is_bl, (uint32_t)g_pend[i].fwd,
+                g_pend[i].orig, 0};
             memcpy(w, &e, sizeof e);
             w += sizeof e;
         }
@@ -507,6 +618,8 @@ static void pcache_save(void) {
                 memcpy(w, &g_txpg[i], 8);
                 w += 8;
             }
+        memcpy(w, g_pc_prov, (size_t)g_pc_nprov * sizeof(struct pc_prov));
+        w += (size_t)g_pc_nprov * sizeof(struct pc_prov);
         memcpy(w, g_cache, arena_used); // read from the RW alias is always permitted
         h.csum = hl_digest_bytes(HL_DIGEST_SEED, buf + sizeof h, total - sizeof h);
         memcpy(buf, &h, sizeof h);
@@ -534,6 +647,7 @@ static void pcache_poison_check(void) {
 // re-keys everything and lifts the bar (pcache_exec_reload).
 static void pcache_after_fork(void) {
     hl_reloc_reset(&g_reloc_table);
+    g_pc_nprov = 0;
     g_pcache_forked = 1;
 }
 
@@ -546,6 +660,7 @@ static void pcache_after_fork(void) {
 // g_pcache_loaded; this keeps the cold-run bookkeeping correct too.)
 static void pcache_after_wholesale_flush(void) {
     hl_reloc_reset(&g_reloc_table);
+    g_pc_nprov = 0;
 }
 
 #define PCACHE_FLUSH_HOOK pcache_after_wholesale_flush()
@@ -571,6 +686,7 @@ static void pcache_exec_reload(const char *prog_host, const char *interp_host, c
     // case 221), so the recording state resets with it and saving becomes safe again -- including for a
     // fork child (this is exactly the fork+execve toolchain case the cache exists for).
     hl_reloc_reset(&g_reloc_table);
+    g_pc_nprov = 0;
     g_t2n = 0;    // fresh tier-2 slot set for the new image (no cross-image alias)
     txpg_clear(); // nothing is translated now; the set re-fills (or is restored by the load below)
     txln_clear();

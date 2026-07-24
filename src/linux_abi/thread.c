@@ -426,6 +426,13 @@ struct guest_file_mapping {
 };
 static struct guest_file_mapping g_filemap[GNA_MAX];
 static int g_nfilemap;
+// Conservative address envelope for mappings that can source a MAP_SHARED
+// emulated refresh. It only expands, so lock-free readers can reject the common
+// executable-code page without racing unmap/split updates; stale bounds merely
+// fall through to the existing locked scan.
+static _Atomic uint64_t g_filemap_shared_lo = UINT64_MAX;
+static _Atomic uint64_t g_filemap_shared_hi;
+static _Atomic uint64_t g_filemap_shared_epoch;
 static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* A file mapping survives fork in every guest process, while the bookkeeping
@@ -529,11 +536,27 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
         if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, HL_NFD);
         if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     }
-    if (g_nfilemap < GNA_MAX && retained >= 0)
+    if (g_nfilemap < GNA_MAX && retained >= 0) {
+        if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
+        if (shared) {
+            uint64_t old = atomic_load_explicit(&g_filemap_shared_lo, memory_order_relaxed);
+            while (address < old &&
+                   !atomic_compare_exchange_weak_explicit(&g_filemap_shared_lo, &old, address,
+                                                          memory_order_release, memory_order_relaxed)) {}
+            uint64_t end = address + size;
+            old = atomic_load_explicit(&g_filemap_shared_hi, memory_order_relaxed);
+            while (end > old &&
+                   !atomic_compare_exchange_weak_explicit(&g_filemap_shared_hi, &old, end,
+                                                          memory_order_release, memory_order_relaxed)) {}
+        }
+        // Publish the conservative envelope before the entry itself. A lock-free
+        // refresher that observes the wider bounds then takes g_filemap_lock and
+        // cannot scan until this fully initialized entry is visible.
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
                                                               (uint64_t)st.st_dev, (uint64_t)st.st_ino,
                                                               0, 0, retained, (uint32_t)shared, (uint32_t)emulated};
-    else if (retained >= 0) {
+        if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
+    } else if (retained >= 0) {
         int shared_source = 0;
         for (int index = 0; index < g_nfilemap; ++index)
             if (g_filemap[index].fd == retained) shared_source = 1;
@@ -554,6 +577,14 @@ static int filemap_source_fd(struct guest_file_mapping *mapping);
 
 static void filemap_refresh_emulated(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
+    uint64_t epoch = atomic_load_explicit(&g_filemap_shared_epoch, memory_order_seq_cst);
+    if (!(epoch & 1)) {
+        uint64_t shared_lo = atomic_load_explicit(&g_filemap_shared_lo, memory_order_relaxed);
+        uint64_t shared_hi = atomic_load_explicit(&g_filemap_shared_hi, memory_order_relaxed);
+        if (epoch == atomic_load_explicit(&g_filemap_shared_epoch, memory_order_seq_cst) &&
+            (hi <= shared_lo || lo >= shared_hi))
+            return;
+    }
     pthread_mutex_lock(&g_filemap_lock);
     /* Host-page emulation creates a private snapshot.  Refresh every
        registered snapshot of the same shared file extent, not merely the

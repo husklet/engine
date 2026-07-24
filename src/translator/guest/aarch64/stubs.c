@@ -160,14 +160,56 @@ static void emit_exit_reg(int rn, uint64_t reason) {
 // monomorphic hit collapses to 5 instrs / 0 mem-ops:
 //   ldr x16,Lsite_tgt ; sub x16,x16,xT ; cbnz x16,Lhash ; ldr x16,Lsite_body ; br x16  (-> body)
 // The shared-hash miss tail uses x16/x17 freely (no guest values to preserve). For an indirect branch
-// THROUGH a stolen reg (x16/x17/x30) the guest target lives in cpu->x[rn]; load it into the free host
-// link reg x30 (also stolen) so the path has 3 distinct host regs: target(x30) + scratch x16/x17.
+// A branch through stolen x16/x17 uses the compact two-IP probe below. Guest x30 remains live in host x30.
+
+static void emit_ibranch_ip2_ready(int rn, int ready) {
+    int other = rn == 16 ? 17 : 16;
+    if (!ready) e_ldr(rn, CPUREG, rn * 8);
+    uint32_t *p_ldrt = (uint32_t *)g_cp;
+    emit32(0);
+    emit32(0xCB000000u | ((unsigned)rn << 16) |
+           ((unsigned)other << 5) | (unsigned)other);
+    uint32_t *p_cbnz = (uint32_t *)g_cp;
+    emit32(0);
+    uint32_t *p_bhit = (uint32_t *)g_cp;
+    emit32(0xD503201Fu);
+    uint32_t *miss = (uint32_t *)g_cp;
+    emit_spill();
+    e_ldr(9, CPUREG, rn * 8);
+    e_str(9, CPUREG, OFF_PC);
+    e_movconst(9, R_BRANCH);
+    e_str(9, CPUREG, OFF_RSN);
+    uint32_t *p_adr = (uint32_t *)g_cp;
+    emit32(0);
+    e_str(9, CPUREG, OFF_ICSITE);
+    emit_blockret(9);
+    e_br(9);
+    if ((uint64_t)g_cp & 7) emit32(0);
+    uint8_t *Lt = g_cp;
+    *(uint64_t *)g_cp = 0;
+    g_cp += 8;
+    *(uint64_t *)g_cp = (uint64_t)((uint8_t *)p_bhit - g_cache);
+    g_cp += 8;
+    *p_ldrt = 0x58000000u |
+              (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFFu) << 5) |
+              (unsigned)other;
+    *p_cbnz = 0xB5000000u |
+              (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) &
+                0x7FFFFu) << 5) | (unsigned)other;
+    int64_t ao = Lt - (uint8_t *)p_adr;
+    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) |
+             (((uint32_t)(ao >> 2) & 0x7FFFFu) << 5) | 9u;
+    pc_record_icsite(Lt);
+}
+
+static void emit_ibranch_ip2(int rn) { emit_ibranch_ip2_ready(rn, 0); }
+
 static void emit_ibranch_steal(int rn) {
-    int treg = rn;
-    if (rn == 16 || rn == 17 || rn == 30) {
-        e_ldr(30, CPUREG, rn * 8);
-        treg = 30;
+    if (rn == 16 || rn == 17) {
+        emit_ibranch_ip2(rn);
+        return;
     }
+    int treg = rn;
     // --- per-site monomorphic cache ---
     uint32_t *p_ldrt = (uint32_t *)g_cp;
     // ldr x16, Lsite_tgt
@@ -243,9 +285,6 @@ static void emit_ibranch(int rn) {
         emit_ibranch_steal(rn);
         return;
     }
-    if (rn == 30)
-        // ret/br/blr x30: load guest x30 into the FREE host link reg, then
-        e_ldr(30, CPUREG, 30 * 8);
     // run the normal IBTC (per-site + shared hash) -- fast, lock-free, correct
     if (rn == 16 || rn == 17) {
         // Hot case: a function pointer called via x16/x17 (qsort comparator, vtable). The
@@ -404,7 +443,7 @@ static void emit_ibranch(int rn) {
 // by construction: its per-site monomorphic IC hits ~5% (measured, CPython-shaped bench) yet costs
 // a literal load + compare + branch on EVERY dispatch. emit_hash_tail is the slimmed replacement:
 // straight to the shared-hash IBTC (whose hit rate at such sites is ~99.997%). Steal-mode only
-// (x16/x17/x30 engine-private); rn is a live, never-stolen guest reg. Miss exits with ic_site=1
+// (x16/x17 engine-private); rn is a live, never-stolen guest reg. Miss exits with ic_site=1
 // (shared-hash-only fill: there are no per-site literals here).
 static void emit_hash_tail(int rn) {
     emit32(0xD3424400u | (rn << 5) | 16); // ubfx x16, xRn, #2, #16  ((xRn>>2) & (IBTC_N-1))
@@ -436,13 +475,38 @@ static void emit_hash_tail(int rn) {
 // emit a single `b target.body` (regs stay live, no dispatcher round-trip). Otherwise
 // emit a full spill-exit whose first instruction is remembered so it can later be
 // back-patched into that `b` once the target gets translated.
-static void emit_chain_exit(uint64_t target) {
+#define CHAIN_EXIT_DEDUP_MAX 128
+static uint32_t *g_chain_exit_dedup_patch[CHAIN_EXIT_DEDUP_MAX];
+static int g_chain_exit_dedup_n;
+
+static void chain_exit_dedup_reset(void) {
+    g_chain_exit_dedup_n = 0;
+}
+
+static void chain_exit_dedup_finish(void) {
+    if (!g_chain_exit_dedup_n) return;
+    uint8_t *stub = g_cp;
+    for (int i = 0; i < g_chain_exit_dedup_n; i++) {
+        uint32_t *p = g_chain_exit_dedup_patch[i];
+        int64_t d = (stub - (uint8_t *)p) / 4;
+        *p = 0x14000000u | ((uint32_t)d & 0x3FFFFFFu);
+    }
+    // Each compatible site arrives with its constant guest target in x16.
+    // x16 is stolen/engine-private, and the full spill deliberately leaves it
+    // untouched, so one shared epilogue can publish the site-specific PC.
+    emit_spill();
+    e_str(16, 0, OFF_PC);
+    e_movconst(9, R_BRANCH);
+    e_str(9, 0, OFF_RSN);
+    emit_blockret(9);
+    e_br(9);
+}
+static void emit_chain_exit_from(uint64_t target, uint64_t source_gpc) {
     void *body = map_body(target);
     uint32_t *slot = (uint32_t *)g_cp;
     // IRQSLIM: a FORWARD direct edge may enter past the block's 2-insn poll (body+8) -- any
     // in-cache cycle still polls via its backward or indirect edge (see g_fwdskip in cache.c).
-    // g_emit_gpc is the guest pc of the branch being translated.
-    int fwd = g_fwdskip && target > g_emit_gpc;
+    int fwd = g_fwdskip && target > source_gpc;
     if (body) {
         int64_t d = (((uint8_t *)body + (fwd ? g_fwdskip : 0)) - (uint8_t *)slot) / 4;
         // b target.body(+8)
@@ -451,7 +515,16 @@ static void emit_chain_exit(uint64_t target) {
     }
     add_pend3(slot, target, 0, fwd);
     // slot (= first insn) is patched to `b body(+8)` later
+    if (g_steal1617 && g_chain_exit_dedup_n < CHAIN_EXIT_DEDUP_MAX) {
+        e_movconst(16, target);
+        g_chain_exit_dedup_patch[g_chain_exit_dedup_n++] = (uint32_t *)g_cp;
+        emit32(0); // b shared full-spill R_BRANCH epilogue
+        return;
+    }
     emit_exit_const(target, R_BRANCH);
+}
+static void emit_chain_exit(uint64_t target) {
+    emit_chain_exit_from(target, g_emit_gpc);
 }
 
 static int64_t sext(uint64_t v, int bits) {

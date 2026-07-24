@@ -678,7 +678,9 @@ static int g_tier2_build;          // set while recompiling a block as tier-2 (f
 static void *g_last_body;          // body pointer of the most recent translate_block (for the promoter)
 // Kill-switch + threshold env, read ONCE (idempotent static guard; the W4E diff read these in the target
 // main(), relocated here to keep the integration inside the allowed jit/ + frontend/aarch64/ units).
-static void tier2_env_init(void) { g_notier2 = 0; }
+static void tier2_env_init(void) {
+    g_notier2 = 0;
+}
 
 // Find (or allocate) the counter slot for a self-loop whose body starts at gpc. Re-translation of the
 // same loop reuses its slot so the count is not reset (and a re-translated promoted loop won't re-arm a
@@ -711,6 +713,8 @@ static struct {
     int is_bl;
     // is_bl: §B host bl, patch as bl
     int fwd; // IRQSLIM: forward direct edge -> patch to body+g_fwdskip (skip the entry poll)
+    uint32_t orig;
+    uint64_t source_gpc;
 } g_pend[1 << 16];
 
 static int g_npend;
@@ -759,6 +763,29 @@ static void add_pend3(uint32_t *slot, uint64_t target, int is_bl, int fwd) {
         g_pend[i].target = target;
         g_pend[i].is_bl = is_bl;
         g_pend[i].fwd = fwd;
+        g_pend[i].orig = 0;
+        g_pend[i].source_gpc = 0;
+        pbucket_link(i, target);
+    }
+}
+
+static uint32_t pend_recode_cond(uint32_t in, int64_t d) {
+    if ((in & 0xff000010u) == 0x54000000u)
+        return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
+    if ((in & 0x7e000000u) == 0x34000000u)
+        return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
+    return (in & 0xfff8001fu) | (((uint32_t)d & 0x3fffu) << 5);
+}
+static void add_pend_cond(uint32_t *slot, uint64_t target, uint32_t orig,
+                          uint64_t source_gpc, int fwd) {
+    if (g_npend < PEND_CAP) {
+        int32_t i = g_npend++;
+        g_pend[i].slot = slot;
+        g_pend[i].target = target;
+        g_pend[i].is_bl = 2;
+        g_pend[i].fwd = fwd;
+        g_pend[i].orig = orig;
+        g_pend[i].source_gpc = source_gpc;
         pbucket_link(i, target);
     }
 }
@@ -780,10 +807,22 @@ static void patch_links_to(uint64_t gpc, void *body) {
         if (g_pend[i].target == gpc) {
             uint8_t *entry = (uint8_t *)body + (g_pend[i].fwd ? g_fwdskip : 0);
             int64_t d = (entry - (uint8_t *)g_pend[i].slot) / 4;
+            if (g_pend[i].is_bl == 2) {
+                uint32_t orig = g_pend[i].orig;
+                int tb = (orig & 0x7e000000u) == 0x36000000u;
+                int64_t lo = tb ? -(INT64_C(1) << 13) : -(INT64_C(1) << 18);
+                int64_t hi = tb ? ((INT64_C(1) << 13) - 1) : ((INT64_C(1) << 18) - 1);
+                if (d >= lo && d <= hi) {
+                    *g_pend[i].slot = pend_recode_cond(orig, d);
+                    if (!jit_publish_code(g_pend[i].slot, 4)) return;
+                }
+                goto cond_remove;
+            }
             *g_pend[i].slot =
                 // bl / b target.body (+8: forward edge skips the entry poll under IRQSLIM)
                 (g_pend[i].is_bl ? 0x94000000u : 0x14000000u) | ((uint32_t)d & 0x3FFFFFFu);
             if (!jit_publish_code(g_pend[i].slot, 4)) return;
+cond_remove:
             // swap-remove keeps g_pend compact (pcache/layout unchanged); fix up the bucket chains.
             pbucket_unlink(i, gpc);
             int32_t last = --g_npend;
