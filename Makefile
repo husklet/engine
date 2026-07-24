@@ -421,44 +421,54 @@ $(BUILD)/linux-aarch64/embedded/%.o: %.c
 
 $(BUILD)/mac/lib/libhl-engine.a: $(MAC_CORE_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(MAC) ar rcs $@ $^
 
 $(BUILD)/mac/lib/libhl-translator.a: $(MAC_TRANSLATOR_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(MAC) ar rcs $@ $^
 
 $(BUILD)/mac/lib/libhl-linux-abi.a: $(MAC_LINUX_ABI_OBJECTS)
 	@mkdir -p $(@D)
 	rm -f $@
+	rm -f $@
 	$(MAC) ar rcs $@ $^
 
 $(BUILD)/mac/lib/libhl-host-macos.a: $(MAC_HOST_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(MAC) ar rcs $@ $^
 
 $(BUILD)/lib/libhl-engine.a: $(CORE_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-translator.a: $(TRANSLATOR_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-linux-abi.a: $(LINUX_ABI_OBJECTS)
 	@mkdir -p $(@D)
 	rm -f $@
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-host-fake.a: $(FAKE_HOST_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-host-linux.a: $(LINUX_HOST_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(BUILD)/lib/libhl-host-macos.a: $(PACKAGE_HOST_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AR) rcs $@ $^
 
 $(PACKAGE_PC): Makefile FORCE
@@ -1674,6 +1684,7 @@ $(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch
 	$(BUILD)/linux-aarch64/dual/activation.o $(LINUX_AARCH64_EMBEDDED_OBJECTS) \
 	$(LINUX_AARCH64_EMBEDDED_PROVIDER_OBJECTS)
 	@mkdir -p $(@D)
+	rm -f $@
 	$(AARCH64_LINUX_AR) rcs $@ $^
 
 .PHONY: package-embedded package-embedded-macos package-embedded-linux
