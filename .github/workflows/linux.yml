@@ -162,19 +162,19 @@ jobs:
 
       # The full integration suite (spec, e2e, alpine, container, control, ...)
       # exercises deep host behaviour -- checkpoint capture, private fd bands,
-      # tmpfs/overlay coherence, unix-socket peek accounting -- and several of its
-      # tests are sensitive to the exact hosted-runner environment in ways that are
-      # NOT product regressions (documented per-case). Running it as a hard gate
-      # meant each such test blocked every release one at a time, which is why this
-      # is NON-BLOCKING: continue-on-error surfaces failures as an annotation so a
-      # real regression stays visible, without any single host-sensitive test
-      # holding up a release. The checkpoint tests self-skip via the probe in
-      # tests/support/checkpoint_env.rs; typed_machines_cross_the_... self-skips via
-      # its /proc/self/limits check. This is the honest split: gate on what proves
-      # the artifact, observe the rest.
-      - name: Full Rust integration suite (non-blocking)
+      # tmpfs/overlay coherence, unix-socket peek accounting. This is a HARD GATE:
+      # every test must pass or genuinely self-skip. The only two dispositions that
+      # are not a plain pass are legitimate runtime self-skips for capabilities the
+      # hosted runner lacks, each of which detects the real incapability at runtime
+      # and prints a visible SKIP reason:
+      #   * the checkpoint suites self-skip via the real capture probe in
+      #     tests/support/checkpoint_env.rs;
+      #   * typed_machines_cross_the_old_private_descriptor_ceiling self-skips via
+      #     its /proc/self/limits private-descriptor-band check.
+      # There is no continue-on-error and no --skip masking list: a real regression
+      # fails the job.
+      - name: Full Rust integration suite
         timeout-minutes: 25
-        continue-on-error: true
         run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
 
   # Runtime compatibility, sharded across parallel runners. This used to be one
