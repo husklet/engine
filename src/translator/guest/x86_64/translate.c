@@ -4629,6 +4629,52 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
+                    if (packed && op != 0x51) {
+                        // ---- packed add/sub/mul/div: RESULT gate ----
+                        // Replaces the NaN-INPUT gate + emit_dnan_pre/post pair used below (which cost 16
+                        // host instructions for one guest op -- 30 of the 53 instructions the float_simd
+                        // inner loop compiled to). The two ways a bare NEON FADD/FSUB/FMUL/FDIV diverges
+                        // from x86 are (a) a lane with TWO NaN inputs (x86 and ARM select opposite
+                        // operands) and (b) a GENERATED default NaN (x86's indefinite carries the sign
+                        // bit, ARM's does not). BOTH are visible in the RESULT: these four ops propagate a
+                        // NaN operand to a NaN result unconditionally, so "some result lane is NaN" is a
+                        // sound superset of "this instruction needs the x86-exact path". So do the
+                        // arithmetic into SCRATCH v18 -- leaving the architectural vd, and hence the
+                        // R_SSE3B spill, exactly as the guest instruction found it -- test the result, and
+                        // on any NaN lane exit to the C softmulator, which re-executes the whole
+                        // instruction from unmodified guest state. Clean results commit with one MOV.
+                        //   f<op> v18.T, vd.T, s.T
+                        //   fcmeq v21.T, v18.T, v18.T   ; all-ones per NON-NaN lane
+                        //   uminv b21,   v21.16b        ; zero iff ANY lane is NaN
+                        //   fmov  w16,   s21
+                        //   cbnz  w16,   Lfast
+                        //   <exit R_SSE3B>
+                        //   Lfast: mov vd.16b, v18.16b
+                        // 7 host instructions against the old 16, and bit-identical on both paths: the old
+                        // fast path required no NaN INPUT, which for these ops implies a non-NaN result
+                        // except for a generated default NaN -- and that case now routes to C, which is the
+                        // same value the old emit_dnan_post stamped. v18/v21/w16 are translator scratch
+                        // (guest xmm0..15 live in v0..v15), so the exit spills the correct architectural
+                        // state. Scalar ss/sd forms keep the old input gate (their gate is already 6
+                        // instructions and their fixup is a predicted-not-taken FCMP branch).
+                        uint32_t d = I.p66 ? 0x00400000u : 0;
+                        uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
+                                     : op == 0x59 ? 0x6E20DC00u  // FMUL
+                                     : op == 0x5C ? 0x4EA0D400u  // FSUB
+                                                  : 0x6E20FC00u; // FDIV
+                        emit32(b | d | (s << 16) | (vd << 5) | 18);
+                        uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ .2d/.4s
+                        emit32(EQ | (18 << 16) | (18 << 5) | 21);
+                        emit32(0x6E31A800u | (21 << 5) | 21); // uminv b21, v21.16b
+                        emit32(0x1E260000u | (21 << 5) | 16); // fmov w16, s21
+                        uint32_t *p_cbnz = (uint32_t *)g_cp;
+                        emit32(0);                     // cbnz w16, Lfast (patched below)
+                        emit_exit_const(gpc, R_SSE3B); // any NaN lane -> x86-exact C emulation
+                        uint8_t *Lfast = (uint8_t *)g_cp;
+                        *p_cbnz =
+                            0x35000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 16;
+                        e_vmov(vd, 18);
+                    } else {
                     if (op != 0x51) {
                         // ---- NaN-input gate ----
                         // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
@@ -4694,6 +4740,7 @@ static void *translate_block(uint64_t gpc) {
                             e_ins_d(vd, 0, 18, 0);
                         else
                             e_ins_s(vd, 0, 18, 0);
+                    }
                     }
                 } else if (op == 0x5A) {
                     // 0F 5A is FOUR instructions, selected by the mandatory prefix:
