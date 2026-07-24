@@ -346,7 +346,10 @@ impl SinkServer {
                 continue;
             }
             let bytes = self.store.get(&name)?;
-            objects.insert(name.clone(), (object_hash(&name, &bytes), bytes.len() as u64));
+            objects.insert(
+                name.clone(),
+                (object_hash(&name, &bytes), bytes.len() as u64),
+            );
         }
         Ok(image_digest(&objects))
     }
@@ -430,10 +433,9 @@ impl SinkServer {
                 let Ok(state) = self.state.lock() else {
                     return Reply::error();
                 };
-                state
-                    .open
-                    .get(&key)
-                    .map_or_else(Reply::error, |object| Reply::value(object.bytes.len() as u64))
+                state.open.get(&key).map_or_else(Reply::error, |object| {
+                    Reply::value(object.bytes.len() as u64)
+                })
             }
             OP_OBJECT_FINISH => {
                 let object = {
@@ -611,7 +613,9 @@ impl SinkServer {
                 if offset >= bytes.len() {
                     return Reply::payload(Vec::new());
                 }
-                let length = usize::try_from(request.length).unwrap_or(0).min(PAYLOAD_MAX);
+                let length = usize::try_from(request.length)
+                    .unwrap_or(0)
+                    .min(PAYLOAD_MAX);
                 let end = offset.saturating_add(length).min(bytes.len());
                 Reply::payload(bytes[offset..end].to_vec())
             }
@@ -659,8 +663,10 @@ struct Request {
 
 impl Request {
     fn decode(bytes: &[u8; REQUEST_BYTES]) -> Option<Self> {
-        let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().ok().unwrap_or([0; 4]));
-        let long = |at: usize| u64::from_ne_bytes(bytes[at..at + 8].try_into().ok().unwrap_or([0; 8]));
+        let word =
+            |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().ok().unwrap_or([0; 4]));
+        let long =
+            |at: usize| u64::from_ne_bytes(bytes[at..at + 8].try_into().ok().unwrap_or([0; 8]));
         if word(0) != MAGIC_REQUEST || word(4) != ABI {
             return None;
         }
@@ -738,7 +744,7 @@ impl Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_digest, object_hash, MemoryStore, CheckpointStore};
+    use super::{image_digest, object_hash, CheckpointStore, MemoryStore};
     use std::collections::BTreeMap;
 
     #[test]

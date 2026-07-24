@@ -159,16 +159,16 @@ impl Engine {
         let mut spec = spec;
         let sentinel = std::path::PathBuf::from(crate::checkpoint_stream::SENTINEL);
         spec.checkpoint.enabled = true;
-        spec.checkpoint.capture_directory =
-            direction.captures().then(|| sentinel.clone());
+        spec.checkpoint.capture_directory = direction.captures().then(|| sentinel.clone());
         spec.checkpoint.restore_directory = direction.restores().then_some(sentinel);
         self.validate(&spec).map_err(SpawnError::Spec)?;
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
-        let (broker, child) = ffi::broker_pair()
-            .map_err(|error| SpawnError::Engine(Error::Io(error)))?;
-        let trigger = ffi::Trigger::create().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+        let (broker, child) =
+            ffi::broker_pair().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+        let trigger =
+            ffi::Trigger::create().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
         let server = Arc::new(crate::checkpoint_stream::SinkServer::new(store));
         let acceptor = crate::checkpoint_stream::serve(&server, broker);
         let started = launch::start_channels(

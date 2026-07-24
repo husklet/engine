@@ -66,7 +66,16 @@ where
     S: AsRef<OsStr>,
 {
     start_full(
-        guest, config, program, arguments, streams, terminal, projections, services, resources, None,
+        guest,
+        config,
+        program,
+        arguments,
+        streams,
+        terminal,
+        projections,
+        services,
+        resources,
+        None,
     )
 }
 

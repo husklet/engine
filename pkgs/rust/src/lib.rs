@@ -54,8 +54,8 @@ pub use crate::wire::launch_abi;
 
 // --- Backend-independent contracts (re-exported from `api`) ---
 pub use crate::api::{checkpoint, observability};
-pub use checkpoint_stream::{CheckpointStore, MemoryStore, StoreError};
 pub use crate::api::{Access, Guest, Mount, Sandbox, Stdio, Version};
+pub use checkpoint_stream::{CheckpointStore, MemoryStore, StoreError};
 
 // --- Engine entry points and lifecycle handles ---
 pub use child::{Child, Output};

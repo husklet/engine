@@ -111,7 +111,10 @@ unsafe extern "C" {
         timeout_ms: c_int,
         host_pid: *mut u64,
     ) -> c_int;
-    pub(crate) fn hl_ckpt_trigger_create(descriptor: *mut c_int, mapping: *mut *mut c_void) -> c_int;
+    pub(crate) fn hl_ckpt_trigger_create(
+        descriptor: *mut c_int,
+        mapping: *mut *mut c_void,
+    ) -> c_int;
     pub(crate) fn hl_ckpt_trigger_bump(mapping: *mut c_void) -> u32;
     pub(crate) fn hl_ckpt_trigger_destroy(mapping: *mut c_void, descriptor: c_int);
     pub(crate) fn hl_terminal_resize(master: i32, size: TerminalSize) -> i32;
@@ -378,7 +381,8 @@ const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<
 // them -- the protocol codec, the demultiplexing server, the embedder's trait -- is safe code.
 
 /// The broker socketpair. The parent end is kept by the server; the child end is handed to activation.
-pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram, OwnedDescriptor)> {
+pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram, OwnedDescriptor)>
+{
     let mut parent = -1;
     let mut child = -1;
     if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {

@@ -3,8 +3,8 @@
 //! API" is true: the image exists only as bytes this test held in memory.
 
 use hl_engine::{
-    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio, StoreDirection,
-    StoreError,
+    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio,
+    StoreDirection, StoreError,
 };
 use std::{
     collections::BTreeMap,
@@ -139,7 +139,13 @@ impl CheckpointStore for FailsAfter {
             .ok_or_else(|| StoreError::new("absent"))
     }
     fn list(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.objects.lock().expect("store lock").keys().cloned().collect())
+        Ok(self
+            .objects
+            .lock()
+            .expect("store lock")
+            .keys()
+            .cloned()
+            .collect())
     }
 }
 
@@ -184,7 +190,11 @@ fn a_store_error_mid_capture_fails_the_capture_without_committing() {
         "the capture must fail with the store's own rejection, not a timeout: {error}"
     );
     assert!(
-        !store.objects.lock().expect("store lock").contains_key("MANIFEST"),
+        !store
+            .objects
+            .lock()
+            .expect("store lock")
+            .contains_key("MANIFEST"),
         "a refused capture must never be committed"
     );
 
