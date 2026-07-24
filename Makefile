@@ -803,10 +803,6 @@ $(BUILD)/e2e/checkpoint-tree-aarch64: tests/e2e/checkpoint_tree.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
-$(BUILD)/e2e/checkpoint-tree-x86_64: tests/e2e/checkpoint_tree.c
-	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
-
 $(BUILD)/e2e/checkpoint-cycle-aarch64: tests/e2e/checkpoint_cycle.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
@@ -826,14 +822,6 @@ $(BUILD)/e2e/checkpoint-pipe-aarch64: tests/e2e/checkpoint_pipe.c
 $(BUILD)/e2e/checkpoint-deleted-aarch64: tests/e2e/checkpoint_deleted.c
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O0 -static $< -o $@
-
-$(BUILD)/e2e/checkpoint-pipe-x86_64: tests/e2e/checkpoint_pipe.c
-	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
-
-$(BUILD)/e2e/checkpoint-deleted-x86_64: tests/e2e/checkpoint_deleted.c
-	@mkdir -p $(@D)
-	$(X86_64_LINUX_STATIC_CC) -O0 -static $< -o $@
 
 $(BUILD)/e2e/checkpoint-threads-aarch64: tests/e2e/checkpoint_threads.c
 	@mkdir -p $(@D)
@@ -1696,7 +1684,11 @@ $(BUILD)/linux-aarch64/dual/activation.o: src/core/activation.c include/hl/activ
 
 $(BUILD)/package/macos-aarch64/libhl-engine.a: $(BUILD)/mac/lib/libhl-engine-dual.a
 	@mkdir -p $(@D)
-	cp $< $@
+	# Copy ON THE MAC. The source was written by `mac libtool` through the shared
+	# mount, and copying it from the Linux side raced that write: the result linked
+	# with "malformed archive, member exceeds file size". Doing the copy on the host
+	# that produced the bytes keeps it coherent.
+	$(MAC) cp $< $@
 
 $(BUILD)/package/linux-aarch64/libhl-engine.a: $(BUILD)/linux-aarch64/dual/aarch64-target.o \
 	$(BUILD)/linux-aarch64/dual/x86_64-target.o $(BUILD)/linux-aarch64/dual/aarch64-core.o \
