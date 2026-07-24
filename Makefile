@@ -1689,6 +1689,22 @@ else
 package-embedded: package-embedded-linux
 endif
 
+# The Rust crate at pkgs/rust/ links the PREBUILT archives committed under
+# pkgs/rust/assets/lib/ and never compiles src/; `cargo publish` ships those
+# bytes. Regenerate both whenever a C source or header changes.
+.PHONY: refresh-crate-archives check-crate-archives print-archive-sources
+refresh-crate-archives:
+	MAKE='$(MAKE)' BUILD='$(BUILD)' tools/refresh_crate_archives.sh
+
+check-crate-archives:
+	@tools/check_crate_archives.sh
+
+# Single source of truth for what the archives are built from, consumed by
+# tools/crate_archive_manifest.sh. PRODUCTION_UNITY_DEPS is exactly the set the
+# archive object rules depend on.
+print-archive-sources:
+	@printf '%s\n' $(sort $(PRODUCTION_UNITY_DEPS))
+
 $(BUILD)/package/macos-aarch64/link-test: tools/dual_backend_e2e_runner.c \
 	$(BUILD)/package/macos-aarch64/libhl-engine.a packaging/macos/jit.entitlements
 	$(MAC) clang $(CPPFLAGS) -o $@ $< -Wl,-force_load,$(BUILD)/package/macos-aarch64/libhl-engine.a
