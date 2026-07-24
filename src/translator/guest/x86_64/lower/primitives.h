@@ -34,6 +34,7 @@ void hl_x86_count_rep_movs(void);
 void hl_x86_count_rep_stos(void);
 
 void emit_ea(struct insn *insn, uint64_t next);
+int ea_reg_fold(struct insn *insn, int width, int *rn, int *rm, int *shift);
 void emit_ea_core(struct insn *insn, uint64_t next, int bias);
 void emit_load_mem(struct insn *insn, uint64_t next, int width, int destination);
 int ea_imm_fold(struct insn *insn, int width, int *base, int *offset);

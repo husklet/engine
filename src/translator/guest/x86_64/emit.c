@@ -568,6 +568,16 @@ static void e_ldp_q(int t1, int t2, int rn, int off) {
     emit32(0xAD400000u | (((unsigned)(off / 16) & 0x7F) << 15) | (t2 << 10) | (rn << 5) | t1);
 }
 
+// LDR/STR (register offset, SIMD&FP 128-bit): [Xn, Xm, LSL #(sh ? 4 : 0)]. option=011 (LSL);
+// the S bit selects between no shift and shift-by-log2(16). Used by the base+index EA fold.
+static void e_ldr_q_reg(int t, int rn, int rm, int sh) {
+    emit32(0x3CE06800u | ((unsigned)rm << 16) | ((unsigned)(sh ? 1 : 0) << 12) | ((unsigned)rn << 5) | (unsigned)t);
+}
+
+static void e_str_q_reg(int t, int rn, int rm, int sh) {
+    emit32(0x3CA06800u | ((unsigned)rm << 16) | ((unsigned)(sh ? 1 : 0) << 12) | ((unsigned)rn << 5) | (unsigned)t);
+}
+
 static void e_ldr_d(int t, int rn) {
     emit32(0xFD400000u | (rn << 5) | t);
 } // ldr d,[xn]

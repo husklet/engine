@@ -285,6 +285,34 @@ static uint64_t call_return_pc(uint64_t pc) {
 
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 void emit_ea(struct insn *I, uint64_t next_rip);
+
+// 128-bit guest vector load/store of an r/m128 operand. The `base + index*scale` addressing mode x86
+// uses for array traversal (`movaps (%rcx,%rax,1),%xmm0`) is exactly ARM's register-offset form, so
+// when ea_reg_fold() proves the EA needs no bias/segment/bus-guard/wrap handling the separate
+// `add x17, base, index` disappears and the access addresses [base, index] directly. Otherwise this
+// is byte-for-byte the emit_ea + g_ldr_q/g_str_q pair every call site used to write inline; the
+// x86-TSO barriers are the ones g_ldr_q/g_str_q emit, unchanged.
+static void g_ldr_q_ea(int t, struct insn *I, uint64_t next) {
+    int rn, rm, sh;
+    if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
+        e_ldr_q_reg(t, rn, rm, sh);
+        e_dmb_ishld();
+        return;
+    }
+    emit_ea(I, next);
+    g_ldr_q(t, 17, 0);
+}
+
+static void g_str_q_ea(int t, struct insn *I, uint64_t next) {
+    int rn, rm, sh;
+    if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
+        e_dmb_ish();
+        e_str_q_reg(t, rn, rm, sh);
+        return;
+    }
+    emit_ea(I, next);
+    g_str_q(t, 17, 0);
+}
 // unimplemented-insn diagnostic (defined below translate_block); fwd-declared so the instruction-class
 // helpers in translate/<class>.c (#included above translate_block) can defer a rare unhandled form.
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -4070,14 +4098,12 @@ static void *translate_block(uint64_t gpc) {
                         e_vmov8(vm, vd);
                 } else if (op == 0x6F || op == 0x28 || (op == 0x10 && !I.rep && !I.repne)) { // load 128 -> xmm
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(vd, 17, 0);
+                        g_ldr_q_ea(vd, &I, next);
                     } else
                         e_vmov(vd, vm);
                 } else if (op == 0x7F || op == 0x29 || (op == 0x11 && !I.rep && !I.repne)) { // store xmm -> 128
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_str_q(vd, 17, 0);
+                        g_str_q_ea(vd, &I, next);
                     } else
                         e_vmov(vm, vd);
                 } else if ((op == 0x10 || op == 0x11) && I.rep) { // movss (32-bit)
@@ -4630,13 +4656,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     uint32_t szb = (packed ? I.p66 : I.repne) ? 0x00400000u : 0;
@@ -4664,13 +4692,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
@@ -4839,13 +4869,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     int pred = (int)I.imm & 7;

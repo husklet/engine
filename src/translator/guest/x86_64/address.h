@@ -37,6 +37,8 @@ typedef struct hl_x86_address_state {
 
 void hl_x86_address_emit(const hl_x86_address_state *state, const hl_x86_insn *insn, uint64_t next_rip, int apply_bias);
 int hl_x86_address_fold(const hl_x86_address_state *state, const hl_x86_insn *insn, int width, int *rn, int *offset);
+int hl_x86_address_fold_reg(const hl_x86_address_state *state, const hl_x86_insn *insn, int width, int *rn, int *rm,
+                            int *shift);
 void hl_x86_address_load(const hl_x86_address_state *state, const hl_x86_insn *insn, uint64_t next_rip, int width,
                          int rt);
 

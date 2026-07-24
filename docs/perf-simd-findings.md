@@ -218,3 +218,112 @@ The remaining 33 instructions per iteration, in descending order of value:
 3. **`str x28,[x28,#vdirty]` every iteration**: the aarch64 frontend hoists this out of a
    tier-2 self-loop (`g_t2_loop_top`); the x86 frontend has no equivalent hoist.
 4. The `cpu->irq` poll, same 2 instructions as A.
+
+---
+
+## C — the follow-ups to B (1 and 2 FIXED, 3 assessed and rejected)
+
+### C1 — flag synthesis: the liveness scanners could not see through SSE (FIXED)
+
+Neither part of item 1 was a deliberate conservatism; both were the same classifier gap.
+`lower/trace.c` has two flag-liveness scanners, and **both bailed out on every two-byte
+(`0F xx`) opcode they did not explicitly recognise**:
+
+* `x86_flag_class()` returned `-1` ("conservatively flag-live"), so `loop_flags_dead()` gave
+  up and `hl_x86_trace_self_loop()` could never elide the per-iteration `mrs`/`str` of NZCV
+  in a tier-2 self-loop whose body contains SSE — which is every SIMD loop.
+* `x86_flag_rw()` returned `XRW_UNK`, truncating `hl_x86_trace_flags_livein()` at the first
+  SSE instruction, so both the cross-block NZCV elision and the PF/AF dead-flag elimination
+  saw "all flags live" across any SSE code. The `sub`/`str`/`eor`/`eor`/`str` in the loop is
+  the PF/AF substrate, kept alive by exactly this.
+
+The SSE/MMX data-movement and packed-ALU space touches no x86 flag, and — the load-bearing
+part, since the classification has to hold for *hl's emitters*, not just for the ISA — its
+lowering never loads/stores `cpu->nzcv|pf|af` and never leaves the live ARM NZCV disturbed.
+The two lowerings that do need host flags internally (`e_sse_var_shift`'s count clamp and the
+hoisted scalar generated-NaN fixup) already bracket themselves with `mrs`/`msr` for precisely
+this reason. Every C-emulated flag writer (`ptest`, `pcmpistri`, BMI) is `0F38`/`0F3A`/VEX,
+which the callers reject before reaching the whitelist.
+
+Fix: `x86_two_byte_flagfree()`, an explicit opcode whitelist, consulted by both scanners.
+The NZCV spill moves onto the loop-exit edge:
+
+```
+before:  cmp x0,x16 ; mrs x20,nzcv ; str x20,[x28,#136] ; b.ne top
+after:   cmp x0,x16 ; b.ne top ; mrs x20,nzcv ; str x20,[x28,#136]
+```
+
+### C2 — imm12 immediates (FIXED)
+
+The ALU-with-immediate forms always materialised the immediate into a scratch register and
+ran the register-register `do_alu`. ARM's ADDS/SUBS take a 12-bit unsigned immediate with an
+optional `LSL #12`, so `do_alu_imm12()` now emits `adds x0,x0,#0x10` / `cmp x0,#0x4,lsl #12`
+directly. Restricted to width >= 4, kind add/sub/cmp, and `g_pfaf_dead` — when PF/AF are live
+`do_alu` genuinely needs the immediate in a register for the PF source op and the
+`a ^ b ^ result` AF chain, so materialising it is not waste. Negative immediates are *not*
+rewritten into the opposite operation: x86 CF/OF for `add $-16` are the ADD flags of a 64-bit
+-16 and the `FL_ADD` finaliser's C inversion is tied to that.
+
+### C3 — memory operands (FIXED)
+
+The blockers named above are conditions, not obstacles: `address.c` already had an
+immediate-offset fold with exactly the right preconditions (`hl_x86_address_fold`), and the
+`rn == 17` bus guard is inert unless `jit_guest_bus_active()`. `hl_x86_address_fold_reg()` is
+the register-offset sibling — base+index, zero displacement, SIB scale expressible as LSL #0
+or LSL #log2(width), no bias/segment/addr32/rip-relative/bus-guard — wired in through
+`g_ldr_q_ea`/`g_str_q_ea`. Fault-PC provenance is unaffected: it keys on the emitted host code
+range, not on x17.
+
+```
+before:  add x17,x1,x0 / ldr q0,[x17] ; add x17,x2,x0 / ldr q16,[x17] ; add x17,x6,x0 / str q0,[x17]
+after:   ldr q0,[x1,x0]               ; ldr q16,[x2,x0]               ; str q0,[x6,x0]
+```
+
+### Measured effect of C1+C2+C3 together
+
+**Measurement conditions matter here and were bad.** This box was running several
+concurrent agents at load average 7-10 throughout; the per-phase run-to-run spread was
+10-90%, i.e. the noise floor is roughly the same size as the effects being chased. Every
+number below is from an **interleaved** A/B (the two engines alternated run-by-run, so drift
+hits both equally), min of 8 rounds, with the spread of each column reported. Anything inside
+about 5% is *not* a claim.
+
+| phase      | base (min) | spread | C1+C2+C3 (min) | spread | ratio |
+|------------|-----------:|-------:|---------------:|-------:|------:|
+| float_simd |    451,787 |   18%  |        373,643 |   20%  | **0.827** |
+| sqlite     |    458,305 |   44%  |        423,295 |    9%  | **0.924** |
+| string     |    695,879 |   25%  |        656,349 |    8%  | **0.943** |
+| calls      |    236,124 |   15%  |        228,831 |   40%  | 0.969 |
+| tlb        |    220,390 |   19%  |        214,447 |   38%  | 0.973 |
+| intdiv     |    347,670 |   16%  |        343,338 |   13%  | 0.988 |
+| compute    |    106,803 |   27%  |        107,015 |   23%  | 1.002 |
+| branch     |    427,075 |   12%  |        432,507 |    7%  | 1.013 |
+
+Medians over the same rounds agree on the sign for float_simd (0.905), sqlite (0.864) and
+string (0.926), and put compute/intdiv/branch at 1.00-1.02.
+
+The honest reading: **the win is on SSE-containing workloads** — float_simd, glibc's SSE
+string loops, and sqlite's SSE memcpy paths — and it is large on float_simd. The purely
+integer phases (compute, branch, intdiv) did **not** move measurably, which is what the
+mechanism predicts: C1 only fires where SSE was blocking the liveness scan, and C2 only fires
+where PF/AF are already dead. The initial expectation that this would help `compute` was
+wrong, and the sequential before/after numbers that appeared to show it were drift.
+
+All 18 phase checksums are identical between the two engines.
+
+### C4 — the `vdirty` store (assessed, NOT done)
+
+`mark_vdirty()` is already a once-per-trace latch, not per-write; it lands at the first
+xmm-writing instruction, which in a SIMD self-loop is inside the loop body. It cannot simply
+be sunk into the prologue: chained predecessors branch **straight to `body`**, skipping the
+prologue entirely, so a chained entry would never set `cpu->vdirty` and a later slim syscall
+exit would skip the xmm spill — silent guest register loss.
+
+The sound version is a reserved slot: emit one instruction slot at the top of `body` (patched
+to the `str x28,[x28,#vdirty]` on the first xmm write, left as a `nop` otherwise), and have
+the tier-2 self-loop fold branch to `body + 4` instead of `body`. Entries (dispatcher or
+chained) then execute the mark exactly once; the back edge skips it but keeps the irq poll.
+Not implemented: it is one instruction out of ~23 in the loop (~4%), which is at or below the
+measurement noise floor on this box, so it could not have been *shown* to help, and it trades
+that against the correctness-critical xmm-currency latch. If picked up, the reserved slot
+should be conditional on `g_tier2_build` so non-loop blocks pay no `nop`.

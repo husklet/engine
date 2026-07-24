@@ -234,6 +234,11 @@ void emit_ea(struct insn *insn, uint64_t next) {
     emit_ea_core(insn, next, 1);
 }
 
+int ea_reg_fold(struct insn *insn, int width, int *rn, int *rm, int *shift) {
+    hl_x86_address_state state = address_state();
+    return hl_x86_address_fold_reg(&state, insn, width, rn, rm, shift);
+}
+
 int ea_imm_fold(struct insn *insn, int width, int *rn, int *offset) {
     hl_x86_address_state state = address_state();
     return hl_x86_address_fold(&state, insn, width, rn, offset);

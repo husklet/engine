@@ -103,6 +103,30 @@ int hl_x86_address_fold(const hl_x86_address_state *state, const hl_x86_insn *in
     return 0;
 }
 
+// Register-offset addressing fold: base+index with no displacement is exactly ARM's
+// `LDR/STR <Vt>, [Xn, Xm{, LSL #amount}]`, so the separate `add x17, base, index` that
+// hl_x86_address_emit would emit is pure overhead. The conditions are the same as the imm-offset
+// fold above (hl_x86_address_fold) -- no bus guard (it needs the effective address in a register),
+// no non-PIE guest-base bias fold, no 32-bit address wrap, no segment override, not rip-relative --
+// plus: the displacement must be zero (ARM has no base+index+imm form) and the x86 SIB scale must be
+// one ARM can express with this encoding, i.e. LSL #0 or LSL #log2(width).
+// Fault behaviour is unchanged: the access still faults on the same effective address, and the
+// fault-PC provenance map keys on the emitted host code range, not on x17.
+int hl_x86_address_fold_reg(const hl_x86_address_state *state, const hl_x86_insn *insn, int width, int *rn, int *rm,
+                            int *shift) {
+    if (state->bus_active || !state->optimize || guestfold_on(state) || insn->addr32 || insn->seg || insn->rip_rel)
+        return 0;
+    if (!insn->m_hasbase || !insn->m_hasindex || insn->disp != 0) return 0;
+    int log2w = 0;
+    while ((1 << log2w) < width)
+        log2w++;
+    if (insn->m_scale != 0 && insn->m_scale != log2w) return 0;
+    *rn = insn->m_base;
+    *rm = insn->m_index;
+    *shift = insn->m_scale;
+    return 1;
+}
+
 void hl_x86_address_load(const hl_x86_address_state *state, const hl_x86_insn *insn, uint64_t next_rip, int width,
                          int rt) {
     int rn;
