@@ -196,3 +196,152 @@ hl-engine: the engine only delivers async signals at dispatcher safepoints, so g
 samples attribute to block boundaries rather than to the interrupted instruction, and the
 resulting profile is badly skewed (it showed `_init` at 3.5% and lost `_int_malloc`
 entirely).
+
+---
+
+# Round 2: three attempted mechanisms, all measured, all negative
+
+Follow-up after the diagnosis above was accepted and translator work was authorised.
+Rebased onto `origin/main` (18453f277) first. **No engine code is changed by this round** —
+every mechanism below was implemented, measured, and reverted. The numbers are the result.
+
+Measurement protocol tightened, because the machine is now shared with other agents
+(load average 5-8, several CPU-pinned processes). All comparisons below are **interleaved
+min-of-N wall clock** on the standalone sqlite repro (4 x 300k INSERTs into `:memory:`),
+which is far more noise-robust than the 12ms microbenchmarks. Baseline re-measured
+alongside every variant, never quoted from an earlier session.
+
+## Retraction: the `cpu->vdirty` store is NOT the cause of the vector-loop dispersion
+
+I was asked to land the tier-1 vdirty generalisation I had documented. **Re-measuring it
+properly disproves my original attribution, so I did not land it.**
+
+The original claim rested on 3-4 runs per configuration. With 15 runs per configuration the
+picture is different:
+
+```
+qld   hl : 22616 16490 13536 13475 14855 16243 12963 17957 12561 18134 24057 14329 12841 12841 16082
+qld   nat: 12304 12056 12357 12382 12427 12403 12221 12704 12331 12022 12227 12523 12672 12328 13117
+gpld  hl : 12510 12176 12814 12545 12438 12375 12485 13114 12556 12337 12265 12570 12372 12843 12468
+gpld  nat: 12554 13041 12726 12427 12417 12652 12413 12429 12403 12246 12099 12774 12409 12358 12441
+```
+
+The dispersion is real and it is specific to V-touching loops — that part stands. But
+instrumenting the tier-2 machinery shows **the loop in question does promote to tier-2 and
+does receive the existing hoist**:
+
+```
+qld    [t2] promotions=2 vdirty_emit=43 (t2=1 first=13) selfloop_t1=35 t2=2 hoisted=1
+gpld   [t2] promotions=2 vdirty_emit=44 (t2=0 first=11) selfloop_t1=35 t2=2 hoisted=0
+```
+
+The threshold is 1000 iterations and these loops run 50M, so the vdirty store is hoisted out
+of the steady-state loop and simply is not being executed per-iteration. It therefore cannot
+be causing the dispersion. My earlier "removing the store restores parity" A/B was
+confounded: deleting the store also deletes `g_t2_loop_top` (it is set *inside* that same
+`if` block), which removes the extra hoist poll and shifts the whole loop's code layout.
+
+What the dispersion actually tracks is absolute addresses, not code layout. The loop's
+offset within the arena is byte-identical across runs (`mod4096=1380` every time) while
+timings vary 12455-17361us. Disabling ASLR pins it to the *slow* end:
+
+```
+qld hl NO-ASLR: 24736 21540 24490 24987 24923 25603 25582 25051 25093 20086
+qld hl ASLR   : 17041 19368 25495 21796 17365 17272 22671 17897 21013 21512
+```
+
+So there is a genuine address-relationship effect (a 4K-aliasing / cache-set conflict
+between engine and guest data is the obvious candidate) that deserves its own investigation.
+It is **not** the vdirty store, and landing a vdirty change would have been fixing a cause I
+had disproven.
+
+## Mechanism 1 — trace formation across indirect dispatch: already implemented
+
+Before building anything I read what the translator already does. Most of the requested
+mechanism exists:
+
+* `g_stitch` / "opt4" already forms **multi-block regions across direct edges** —
+  unconditional `b` (translate.c:2201) and conditional fall-throughs for `b.cond`, `cbz/cbnz`
+  and `tbz/tbnz` (2290/2343/2415), bounded by `TRACE_MAX_BLK`=16, `TRACE_MAX_BYTES`=16KB and
+  `STITCH_MAX_COND`=3. The conditional budget was **already tuned on sqlite** — the comment
+  records "depth-1 fall-throughs 28% never-executed, rising to >85% by the 6th".
+* Indirect edges already have a **two-level inline cache**: a per-site monomorphic IC with a
+  patched direct `b` on hit, falling back to a shared 64Ki-entry hash IBTC.
+* The VDBE case specifically is already special-cased: `is_interp_dispatch_br` / IBSLIM
+  detects an interpreter-dispatch site, recognises it as megamorphic by construction, and
+  **skips the dead per-site IC** to go straight to the shared hash.
+* `try_inline_outline_atomic` already inlines LSE outline-atomic helper calls.
+
+Speculatively chaining the VDBE dispatch site cannot work: a switch-based interpreter has
+*one* indirect branch site with ~150 targets, so a monomorphic guard there misses by
+construction — which is exactly why IBSLIM exists. The measured headroom is also smaller than
+it looks: the computed-goto microbenchmark is 6,373us native vs 10,608us hl over 20M
+dispatches, i.e. **~0.85 cycles of extra cost per dispatch**. Even at ~48M VDBE opcodes for
+this workload that is only order-10ms against a ~275ms gap.
+
+I did not build a new mechanism here. The right next step is not speculative chaining but
+shortening the shared-hash IBTC probe itself, which needs its own design.
+
+## Mechanism 2 — direct-call inlining of leaf callees: implemented, measured, WORSE
+
+This is the one piece genuinely not present, so I built it (~90 lines in
+`translator/guest/aarch64/translate.c`): at a `bl`, if the callee is a small, straight-line,
+x30-clean leaf, lay it inline and elide its terminating `ret x30`, resuming decode at the
+return address. `x30` is still set to the architectural return value exactly as
+`try_inline_outline_atomic` does, so faults/signals/unwinders inside the inlined body see
+what the real call would have left. SMC is handled for free by the existing per-decoded-line
+`txln_put`. Conditional branches inside the callee are safe to allow: a taken edge becomes an
+ordinary chain exit to a real guest PC whose block ends in the callee's own `ret` -> IBTC ->
+the x30 we set, so only the fall-through path can reach the elision — which is exactly the
+path the extent scan walks. The elision is gated on reaching the precise `ret` PC the scan
+predicted, so anything unexpected falls back to the normal path.
+
+It works, and it does not pay:
+
+| variant | inline sites hit | sqlite min-of-6 vs baseline |
+|---------|------------------|------------------------------|
+| baseline | — | 455 / 465 / 451 ms |
+| `INLINE_LEAF_MAX`=24 | 44 | 488 / 485 / 472 ms — **4-7% SLOWER** |
+| `INLINE_LEAF_MAX`=10 | 4 | 465 / 451 ms — neutral (4 sites cannot matter; this is noise) |
+
+Consistently slower across three independent min-of-6 comparisons at the setting that
+actually inlines anything. The likely mechanism is budget contention: an inlined callee
+consumes the shared `trace_blk` / `TRACE_MAX_BYTES` region budget that the opt4 conditional
+stitcher was already tuned against, so buying a few call seams costs more valuable
+stitching elsewhere. Dropping the `trace_blk++` charge did not rescue it.
+
+**The deeper reason it cannot pay is structural, and it is worth recording.** Instrumenting
+every `bl` site in the sqlite run:
+
+```
+[inl] inlined=44 bl_sites=1774 nostitch=214 rej: b=4 bcond=0 cbz=0 tbz=0 br=192
+      svc=3 sys=18 excl=0 x30=1270 simd=6 toolong=23
+```
+
+**1270 of 1774 call sites (72%) are rejected because the callee touches x30 — it saves the
+link register in its first instruction, i.e. it is not a leaf.** Leaf-call inlining
+structurally cannot reach sqlite's hot code. The `calls` phase's 1.62x is dominated by calls
+to *non-leaf* functions, and inlining those requires reasoning about the callee's frame and
+its return-address spill/reload — a much larger change than this one, with a correspondingly
+larger correctness surface (it interacts directly with signal frames and unwinding).
+
+## What this round establishes
+
+* The two mechanisms named in the brief are, respectively, **already implemented** and
+  **measurably counterproductive as specified**.
+* The remaining gap is not reachable by the cheap structural wins. sqlite's sampled hot
+  blocks average **16.1 guest instructions**, essentially all edges are chained (4540
+  dispatcher crossings for a 455ms run), and the per-edge costs are already
+  inline-cached, stitched and tier-2 folded.
+* A real, separate, ASLR-dependent performance defect exists on vector-touching loops
+  (up to 2x, reproducible, disappears at the fast end of the distribution). It is NOT the
+  vdirty store. It should be investigated on a quiet machine, since the effect size is
+  comparable to the machine noise currently available.
+
+## What I deliberately did not do
+
+* Did not land the vdirty change — the cause I documented for it is disproven.
+* Did not land the leaf inliner — it measures worse.
+* Did not attempt non-leaf call inlining or an IBTC probe rewrite. Both are real candidates,
+  both are substantially larger than one change, and neither can be validated on a machine
+  where the noise floor is currently ~5%.
