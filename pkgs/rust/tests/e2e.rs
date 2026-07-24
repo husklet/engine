@@ -55,9 +55,7 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
     // launcher's stdio instead of the captured ones, while registers and memory
     // restore correctly. Capture itself works. See the refusal assertion in
     // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
-    for guest in [Guest::Aarch64] {
-        checkpoints_and_restores_a_three_process_tree(guest);
-    }
+    checkpoints_and_restores_a_three_process_tree(Guest::Aarch64);
 }
 
 fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
@@ -121,9 +119,7 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
     // launcher's stdio instead of the captured ones, while registers and memory
     // restore correctly. Capture itself works. See the refusal assertion in
     // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
-    for guest in [Guest::Aarch64] {
-        restores_buffered_cross_process_pipe_state(guest);
-    }
+    restores_buffered_cross_process_pipe_state(Guest::Aarch64);
 }
 
 fn restores_buffered_cross_process_pipe_state(guest: Guest) {
@@ -184,9 +180,7 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
     // launcher's stdio instead of the captured ones, while registers and memory
     // restore correctly. Capture itself works. See the refusal assertion in
     // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
-    for guest in [Guest::Aarch64] {
-        restores_unlinked_regular_file_content_and_offset(guest);
-    }
+    restores_unlinked_regular_file_content_and_offset(Guest::Aarch64);
 }
 
 fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
@@ -257,9 +251,7 @@ fn rust_api_restores_while_arming_the_next_capture() {
     // the launcher's stdio instead of the captured ones, while registers and memory
     // restore correctly. Capture itself works. See the refusal assertion in
     // tests/policy.rs; re-add Guest::X86_64 here once the fd-restore path is fixed.
-    for guest in [Guest::Aarch64] {
-        restores_while_arming_the_next_capture(guest);
-    }
+    restores_while_arming_the_next_capture(Guest::Aarch64);
 }
 
 fn restores_while_arming_the_next_capture(guest: Guest) {
