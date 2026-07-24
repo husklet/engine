@@ -387,6 +387,35 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
         return svc_done(c);
     }
+    // Empty scatter/gather (iovcnt == 0). Linux (fs/read_write.c: import_iovec with nr_segs 0) transfers
+    // nothing and returns 0 for readv/writev/preadv/pwritev. The plain host path forwards to the host libc,
+    // and BSD/macOS readv/writev reject iovcnt 0 with EINVAL -- a host-passthrough divergence from the Linux
+    // ABI. Emulate the Linux zero return directly once the fd is confirmed open (a bad fd must still win with
+    // EBADF, which the host path below reports on either kernel).
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 == 0 &&
+        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
+        G_RET(c) = 0;
+        return svc_done(c);
+    }
+    // Scatter/gather segment address validation. Linux (fs/read_write.c: import_iovec -> access_ok per
+    // segment) rejects an iovec whose [base, base+len) leaves the user address window with -EFAULT, before
+    // any data moves -- notably a segment whose length overflows the address space (e.g. two SSIZE_MAX
+    // segments). The plain host path forwards to the host libc, where BSD/macOS readv/writev instead report
+    // EINVAL for such a segment -- a host-passthrough divergence. Emulate the Linux access_ok rejection: any
+    // segment whose base+len wraps or exceeds the 48-bit user ceiling can never name real guest memory, so it
+    // is -EFAULT on every host. Real guest buffers live far below this ceiling, so valid I/O is untouched.
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 0 && a2 <= 1024 && a1 != 0 &&
+        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
+        const struct iovec *iov = (const struct iovec *)a1;
+        for (int i = 0; i < (int)a2; i++) {
+            uintptr_t base = (uintptr_t)iov[i].iov_base;
+            uintptr_t len = (uintptr_t)iov[i].iov_len;
+            if (len && (base + len < base || base + len > UINT64_C(0x0001000000000000))) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+        }
+    }
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
     // with EBADF (fs/read_write.c). It stays valid as a dirfd for *at() and for fstat/fchdir (served by
     // svc_fs), so only the I/O syscalls are gated here.
@@ -464,6 +493,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 return svc_done(c);
             }
             break;
+        case 66:   // writev / pwritev: same as write/pwrite but the source is a scatter list. Linux copies
+        case 70: { // from each segment and reports EFAULT for the whole call if any segment straddles a guest
+                   // PROT_NONE page (copy_from_user faults); the host writev cannot see it because hl force-maps
+                   // the guest page host-readable, so reject here to match Linux. iovcnt is already bounded to
+                   // [1,1024] and the array validated above, so this only inspects real segments.
+            if (a1 && a2 && a2 <= 1024) {
+                const struct iovec *iov = (const struct iovec *)a1;
+                for (int i = 0; i < (int)a2; i++)
+                    if (iov[i].iov_len && gna_hit((uint64_t)(uintptr_t)iov[i].iov_base, iov[i].iov_len)) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        return svc_done(c);
+                    }
+            }
+            break;
+        }
         default: break;
         }
     }
