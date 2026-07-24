@@ -1,3 +1,6 @@
+#ifndef G_IS_DUP2_COMPAT
+#define G_IS_DUP2_COMPAT() 0 /* aarch64 guests have no legacy dup2; every case 24 is a real dup3 */
+#endif
 // Extracted from service(): I/O — fd read/write/seek + plain fd ops
 // (dup/dup3/fcntl/pipe2/sendfile/splice/tee/copy_file_range/fsync/etc). Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
@@ -1533,13 +1536,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 24: {
         struct fdvis_reservation fdvis;
-        // dup3(old,new,flags). x86's legacy dup2 arrives here rewritten to the dup3 form + a private
-        // DUP2_COMPAT marker (bit 30) in the flags (see translate/x86_64/legacy.c) because the two calls
-        // DIVERGE on oldfd==newfd: dup3 -> EINVAL, but dup2 -> returns newfd unchanged (EBADF if oldfd is
-        // invalid), with no close and no CLOEXEC change. (LTP dup201)
+        // dup3(old,new,flags). x86's legacy dup2 arrives here rewritten to the dup3 form (see
+        // translator/guest/x86_64/legacy.c) because the two calls DIVERGE on oldfd==newfd: dup3 ->
+        // EINVAL, but dup2 -> returns newfd unchanged (EBADF if oldfd is invalid), with no close and no
+        // CLOEXEC change. (LTP dup201) Which of the two arrived is reported OUT OF BAND -- it used to
+        // ride as bit 30 of the flags, which made a guest's dup3(old,old,0x40000000) succeed where Linux
+        // returns EINVAL, because no dup3 flag other than O_CLOEXEC is legal.
         unsigned d3flags = (unsigned)a2;
-        int is_dup2 = (d3flags & 0x40000000u) != 0;
-        d3flags &= ~0x40000000u;
+        int is_dup2 = G_IS_DUP2_COMPAT();
         int oldfd = (int)a0, newfd = (int)a1, nofile = guest_nofile_cur();
         if (oldfd == newfd) {
             if (is_dup2) {

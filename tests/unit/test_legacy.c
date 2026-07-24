@@ -87,8 +87,14 @@ int main(void) {
 
     initialize(&cpu, 22);
     HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && cpu.r[RAX] == 293 && cpu.r[RSI] == 0);
+    // dup2 -> dup3 with flags 0. The "which of the two was it" signal is out of band
+    // (hl_x86_legacy_is_dup2) so a guest's real dup3 flags still reach the flag validation; a private
+    // marker bit inside the flags made dup3(old, old, 0x40000000) succeed where Linux returns EINVAL.
     initialize(&cpu, 33);
-    HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && cpu.r[RAX] == 292 && cpu.r[RDX] == 0x40000000u);
+    HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && cpu.r[RAX] == 292 && cpu.r[RDX] == 0 &&
+             hl_x86_legacy_is_dup2() == 1);
+    initialize(&cpu, 22);
+    HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && hl_x86_legacy_is_dup2() == 0);
     initialize(&cpu, 284);
     HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && cpu.r[RAX] == 290 && cpu.r[RSI] == 0);
     initialize(&cpu, 282);

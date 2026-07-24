@@ -54,6 +54,16 @@ static int x86_tv2ts(const hl_x86_legacy_context *context, uint64_t p, struct ti
 static __thread uint64_t g_x86_forksave[5];
 static __thread int g_x86_forksave_on;
 
+// dup2(2) compat marker. dup2 and dup3 diverge only on oldfd==newfd, so the shared canonical dup3
+// handler needs to know which of the two the guest issued. Carrying that as a private bit inside the
+// FLAGS argument was wrong: a guest calling dup3(old, old, 0x40000000) has to get EINVAL from Linux
+// (only O_CLOEXEC is a legal dup3 flag) but was instead served dup2 semantics and got `old` back. The
+// signal is per-thread and out-of-band instead, refreshed on every normalized x86 syscall so it can
+// never leak into a later call.
+static __thread int g_x86_dup2_compat;
+
+int hl_x86_legacy_is_dup2(void) { return g_x86_dup2_compat; }
+
 void hl_x86_legacy_restore_fork(struct cpu *c) {
     if (!g_x86_forksave_on) return;
     c->r[7] = g_x86_forksave[0];
@@ -66,6 +76,7 @@ void hl_x86_legacy_restore_fork(struct cpu *c) {
 
 int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context) {
     uint64_t *r = c->r;
+    g_x86_dup2_compat = (r[0] == 33); // legacy dup2 -> canonical dup3; cleared for every other syscall
     switch (r[0]) {
     case 158: // arch_prctl(code, addr): x86 segment-base TLS register; no aarch64 equivalent
         if (r[7] == 0x1002) {
@@ -306,11 +317,12 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
         r[6] = 0;
         r[0] = 293;
         return 0; // pipe(fds) -> pipe2(fds,0)
-    // dup2(old,new) -> dup3(old,new, DUP2_COMPAT). dup2 and dup3 DIVERGE on old==new: dup3 -> EINVAL, but
-    // dup2 -> returns new unchanged (EBADF if old is invalid). The shared canonical handler (io.c case 24)
-    // reads flag bit 30 (0x40000000, a private marker no real dup3 flag uses) to apply dup2 semantics.
+    // dup2(old,new) -> dup3(old,new,0). dup2 and dup3 DIVERGE on old==new: dup3 -> EINVAL, but dup2 ->
+    // returns new unchanged (EBADF if old is invalid). The shared canonical handler asks
+    // G_IS_DUP2_COMPAT() / hl_x86_legacy_is_dup2() which of the two arrived; the flags argument stays
+    // exactly what the guest passed so real dup3 flag validation still sees it.
     case 33:
-        r[2] = 0x40000000u;
+        r[2] = 0;
         r[0] = 292;
         return 0;
     case 284:
