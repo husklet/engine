@@ -52,6 +52,7 @@
 
 #include "../host/file.h"
 #include "../host/system.h"
+#include "ckpt_sink_dir.h" // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
 
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
@@ -205,9 +206,9 @@ struct ckpt_signal_state {
 static int ckpt_capture_file_blob(int fd, char *record_path, size_t record_capacity);
 static int ckpt_capture_right_resource(int fd, struct ckpt_fd *record);
 static void ckpt_release_captured_right(int fd);
-static int ckpt_store_sync(const char *path, const void *data, size_t size);
 static uint64_t ckpt_epoll_identity(int fd);
-static int ckpt_dump_epoll(const char *directory, const struct ckpt_fd *records, int count);
+static int ckpt_dump_epoll(struct ckpt_sink *sink, const char *group, const struct ckpt_fd *records,
+                           int count);
 static int ckpt_restore_epoll_watches(const char *directory, const struct ckpt_fd *record);
 static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *record, uint32_t ordinal);
 
@@ -267,7 +268,7 @@ static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *rec
     return marker;
 }
 
-static int ckpt_dump_signal_state(const char *path) {
+static int ckpt_dump_signal_state(struct ckpt_sink *sink, const char *group) {
     struct ckpt_signal_state *state = calloc(1, sizeof *state);
     if (state == NULL) return -1;
     state->magic = CKPT_SIGNAL_MAGIC;
@@ -291,7 +292,7 @@ static int ckpt_dump_signal_state(const char *path) {
                 g_sigq[signal].e[(g_sigq[signal].head + index) % SIGQ_DEPTH];
     }
     pthread_mutex_unlock(&g_sigq_lk);
-    int result = ckpt_store_sync(path, state, sizeof *state);
+    int result = ckpt_sink_put(sink, group, "signals", 0, state, sizeof *state);
     free(state);
     return result;
 }
@@ -386,7 +387,7 @@ static char g_ckpt_dir[1024];
 // g_ckpt_trigger / g_ckpt_seen_gen live in container/state.c (early include) so signal.c's blocking-syscall
 // restart decision (ckpt_pending) can consult them too.
 
-static int ckpt_dump_self(struct cpu *c, const char *procdir);
+static int ckpt_dump_self(struct cpu *c, const char *group);
 static void ckpt_coordinate_and_exit(struct cpu *c);
 
 // Map (creating if needed) the shared trigger-generation page for `dir`. Returns the mapping or NULL.
@@ -424,10 +425,6 @@ static volatile uint32_t *ckpt_map_trigger(const char *dir) {
     return (m == MAP_FAILED) ? NULL : (volatile uint32_t *)m;
 }
 
-static int ckpt_wr_all(FILE *f, const void *buf, size_t n) {
-    return fwrite(buf, 1, n, f) == n ? 0 : -1;
-}
-
 static int ckpt_rd_all(FILE *f, void *buf, size_t n) {
     return fread(buf, 1, n, f) == n ? 0 : -1;
 }
@@ -438,31 +435,6 @@ static int ckpt_close_sync(FILE **file) {
     *file = NULL;
     int failed = fflush(f) != 0 || fsync(fileno(f)) != 0;
     if (fclose(f) != 0) failed = 1;
-    return failed ? -1 : 0;
-}
-
-static int ckpt_store_sync(const char *path, const void *data, size_t size) {
-    const hl_host_services *services = effective_host_services();
-    if (!services || !services->file || !services->file->open_relative || !services->file->write ||
-        !services->file->sync || !services->file->close)
-        return -1;
-    hl_host_result opened = services->file->open_relative(
-        services->context, HL_HOST_HANDLE_CWD, path, strlen(path), HL_HOST_FILE_WRITE,
-        HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE, 0600);
-    if (opened.status != HL_STATUS_OK) return -1;
-    size_t offset = 0;
-    int failed = 0;
-    while (offset < size) {
-        hl_host_result written = services->file->write(
-            services->context, opened.value, (const unsigned char *)data + offset, (uint64_t)(size - offset));
-        if (written.status != HL_STATUS_OK || written.value == 0 || written.value > size - offset) {
-            failed = 1;
-            break;
-        }
-        offset += (size_t)written.value;
-    }
-    if (!failed && services->file->sync(services->context, opened.value).status != HL_STATUS_OK) failed = 1;
-    if (services->file->close(services->context, opened.value).status != HL_STATUS_OK) failed = 1;
     return failed ? -1 : 0;
 }
 
@@ -569,19 +541,16 @@ static int ckpt_image_digest(const char *base, uint64_t *hash, uint64_t *files, 
 }
 
 static int ckpt_capture_pipe(int fd, uint64_t identity) {
-    char claim[1280], data[1280], temporary[1320];
-    snprintf(claim, sizeof claim, "%s/pipe.%016llx.claim", g_ckpt_dir, (unsigned long long)identity);
-    int marker = open(claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (marker < 0) return errno == EEXIST ? 0 : -1;
-    close(marker);
-    snprintf(data, sizeof data, "%s/pipe.%016llx", g_ckpt_dir, (unsigned long long)identity);
-    snprintf(temporary, sizeof temporary, "%s.tmp.%d", data, (int)getpid());
-    FILE *output = fopen(temporary, "wb");
-    if (!output) return -1;
+    struct ckpt_sink *sink = ckpt_sink_current();
+    char name[128];
+    snprintf(name, sizeof name, "pipe.%016llx", (unsigned long long)identity);
+    int claimed = ckpt_sink_claim(sink, name);
+    if (claimed != 0) return claimed > 0 ? 0 : -1; // another process owns this shared object
+    struct ckpt_sink_stream *output = NULL;
+    if (ckpt_sink_begin(sink, NULL, name, CKPT_SINK_PUBLISH_ATOMIC, &output) != 0) return -1;
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        fclose(output);
-        unlink(temporary);
+        ckpt_sink_abort(sink, &output);
         return -1;
     }
     unsigned char buffer[65536];
@@ -589,7 +558,7 @@ static int ckpt_capture_pipe(int fd, uint64_t identity) {
     for (;;) {
         ssize_t count = read(fd, buffer, sizeof buffer);
         if (count > 0) {
-            if (fwrite(buffer, 1, (size_t)count, output) != (size_t)count) {
+            if (ckpt_sink_write(sink, output, buffer, (size_t)count) != 0) {
                 failed = 1;
                 break;
             }
@@ -600,26 +569,24 @@ static int ckpt_capture_pipe(int fd, uint64_t identity) {
         failed = 1;
         break;
     }
-    if (ckpt_close_sync(&output) != 0) failed = 1;
-    if (!failed && rename(temporary, data) != 0) failed = 1;
-    if (failed) unlink(temporary);
-    return failed ? -1 : 0;
+    if (failed) {
+        ckpt_sink_abort(sink, &output);
+        return -1;
+    }
+    return ckpt_sink_finish(sink, &output);
 }
 
 static int ckpt_capture_signalfd(int fd, uint64_t identity) {
-    char claim[1280], data[1280], temporary[1320];
-    snprintf(claim, sizeof claim, "%s/signalfd.%016llx.claim", g_ckpt_dir, (unsigned long long)identity);
-    int marker = open(claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (marker < 0) return errno == EEXIST ? 0 : -1;
-    close(marker);
-    snprintf(data, sizeof data, "%s/signalfd.%016llx", g_ckpt_dir, (unsigned long long)identity);
-    snprintf(temporary, sizeof temporary, "%s.tmp.%d", data, (int)getpid());
-    FILE *output = fopen(temporary, "wb");
-    if (!output) return -1;
+    struct ckpt_sink *sink = ckpt_sink_current();
+    char name[128];
+    snprintf(name, sizeof name, "signalfd.%016llx", (unsigned long long)identity);
+    int claimed = ckpt_sink_claim(sink, name);
+    if (claimed != 0) return claimed > 0 ? 0 : -1;
+    struct ckpt_sink_stream *output = NULL;
+    if (ckpt_sink_begin(sink, NULL, name, CKPT_SINK_PUBLISH_ATOMIC, &output) != 0) return -1;
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        fclose(output);
-        unlink(temporary);
+        ckpt_sink_abort(sink, &output);
         return -1;
     }
     unsigned char buffer[4096];
@@ -627,7 +594,7 @@ static int ckpt_capture_signalfd(int fd, uint64_t identity) {
     for (;;) {
         ssize_t count = read(fd, buffer, sizeof buffer);
         if (count > 0) {
-            if (fwrite(buffer, 1, (size_t)count, output) != (size_t)count) failed = 1;
+            if (ckpt_sink_write(sink, output, buffer, (size_t)count) != 0) failed = 1;
             if (failed) break;
             continue;
         }
@@ -636,24 +603,23 @@ static int ckpt_capture_signalfd(int fd, uint64_t identity) {
         failed = 1;
         break;
     }
-    if (ckpt_close_sync(&output) != 0) failed = 1;
-    if (!failed && rename(temporary, data) != 0) failed = 1;
-    if (failed) unlink(temporary);
-    return failed ? -1 : 0;
+    if (failed) {
+        ckpt_sink_abort(sink, &output);
+        return -1;
+    }
+    return ckpt_sink_finish(sink, &output);
 }
 
 static int ckpt_capture_socket_queue(int fd, uint64_t identity, uint32_t type) {
-    char claim[1280], data[1280], temporary[1320];
-    snprintf(claim, sizeof claim, "%s/socket.%016llx.claim", g_ckpt_dir, (unsigned long long)identity);
-    int marker = open(claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (marker < 0) return errno == EEXIST ? 0 : -1;
-    close(marker);
-    snprintf(data, sizeof data, "%s/socket.%016llx", g_ckpt_dir, (unsigned long long)identity);
-    snprintf(temporary, sizeof temporary, "%s.tmp.%d", data, (int)getpid());
-    FILE *output = fopen(temporary, "wb+");
-    if (!output) return -1;
+    struct ckpt_sink *sink = ckpt_sink_current();
+    char name[128];
+    snprintf(name, sizeof name, "socket.%016llx", (unsigned long long)identity);
+    int claimed = ckpt_sink_claim(sink, name);
+    if (claimed != 0) return claimed > 0 ? 0 : -1;
+    struct ckpt_sink_stream *output = NULL;
+    if (ckpt_sink_begin(sink, NULL, name, CKPT_SINK_PUBLISH_ATOMIC, &output) != 0) return -1;
     struct ckpt_socket_queue_header header = {CKPT_SOCKET_QUEUE_MAGIC, type, 0};
-    if (ckpt_wr_all(output, &header, sizeof header) != 0) goto fail;
+    if (ckpt_sink_write(sink, output, &header, sizeof header) != 0) goto fail;
     size_t capacity = 1u << 20;
     unsigned char *payload = malloc(capacity);
     if (payload == NULL) goto fail;
@@ -727,22 +693,24 @@ static int ckpt_capture_socket_queue(int fd, uint64_t identity, uint32_t type) {
             }
         }
         struct ckpt_socket_queue_frame frame = {(uint32_t)received, nrights};
-        if ((uint64_t)received > UINT32_MAX || ckpt_wr_all(output, &frame, sizeof frame) != 0 ||
-            ckpt_wr_all(output, payload, (size_t)received) != 0 ||
-            (nrights && ckpt_wr_all(output, rights, (size_t)nrights * sizeof rights[0]) != 0)) {
+        if ((uint64_t)received > UINT32_MAX || ckpt_sink_write(sink, output, &frame, sizeof frame) != 0 ||
+            ckpt_sink_write(sink, output, payload, (size_t)received) != 0 ||
+            (nrights && ckpt_sink_write(sink, output, rights, (size_t)nrights * sizeof rights[0]) != 0)) {
             free(payload);
             goto fail;
         }
     }
     free(payload);
-    if (fseeko(output, 0, SEEK_SET) != 0 || ckpt_wr_all(output, &header, sizeof header) != 0 ||
-        ckpt_close_sync(&output) != 0 || rename(temporary, data) != 0)
-        goto fail;
+    // peer_closed is only known after the drain loop: patch the header that was emitted first.
+    if (ckpt_sink_write_at(sink, output, 0, &header, sizeof header) != 0) goto fail;
+    if (ckpt_sink_finish(sink, &output) != 0) {
+        ckpt_sink_unclaim(sink, name);
+        return -1;
+    }
     return 0;
 fail:
-    if (output) fclose(output);
-    unlink(temporary);
-    unlink(claim);
+    ckpt_sink_abort(sink, &output);
+    ckpt_sink_unclaim(sink, name);
     return -1;
 }
 
@@ -755,11 +723,11 @@ static int ckpt_socket_option_int(int fd, int option, int *value) {
 static int ckpt_recovery_policy(void);
 
 static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quiescent) {
-    char claim[1280], data[1280], temporary[1320];
-    snprintf(claim, sizeof claim, "%s/socket-state.%016llx.claim", g_ckpt_dir, (unsigned long long)identity);
-    int marker = open(claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (marker < 0) return errno == EEXIST ? 0 : -1;
-    close(marker);
+    struct ckpt_sink *sink = ckpt_sink_current();
+    char name[128];
+    snprintf(name, sizeof name, "socket-state.%016llx", (unsigned long long)identity);
+    int claimed = ckpt_sink_claim(sink, name);
+    if (claimed != 0) return claimed > 0 ? 0 : -1;
     struct sockaddr_storage peer;
     socklen_t peer_size = sizeof peer;
     int degraded_connection = require_quiescent && fd >= 0 && fd < HL_NFD &&
@@ -769,19 +737,19 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
         (g_sock_conn[fd] || g_sock_connecting[fd])) {
         fprintf(stderr, "[ckpt] refuse: connected/in-progress socket fd %d requires connection-state transfer\n",
                 fd);
-        unlink(claim);
+        ckpt_sink_unclaim(sink, name);
         return -1;
     }
     if (require_quiescent && !degraded_connection && getpeername(fd, (struct sockaddr *)&peer, &peer_size) == 0) {
         fprintf(stderr, "[ckpt] refuse: connected socket fd %d requires connection-state transfer\n", fd);
-        unlink(claim);
+        ckpt_sink_unclaim(sink, name);
         return -1;
     }
     struct pollfd readiness = {fd, POLLIN, 0};
     if (require_quiescent && !degraded_connection &&
         (poll(&readiness, 1, 0) < 0 || (readiness.revents & (POLLIN | POLLERR | POLLHUP)) != 0)) {
         fprintf(stderr, "[ckpt] refuse: socket fd %d has pending input/accept/error state\n", fd);
-        unlink(claim);
+        ckpt_sink_unclaim(sink, name);
         return -1;
     }
     struct ckpt_socket_state state;
@@ -839,15 +807,10 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
         ckpt_socket_option_int(fd, SO_BROADCAST, &state.broadcast) != 0 ||
         getsockopt(fd, SOL_SOCKET, SO_LINGER, &state.linger, &linger_size) != 0)
         goto fail;
-    snprintf(data, sizeof data, "%s/socket-state.%016llx", g_ckpt_dir, (unsigned long long)identity);
-    snprintf(temporary, sizeof temporary, "%s.tmp.%d", data, (int)getpid());
-    if (ckpt_store_sync(temporary, &state, sizeof state) != 0 || rename(temporary, data) != 0) {
-        unlink(temporary);
-        goto fail;
-    }
+    if (ckpt_sink_put(sink, NULL, name, CKPT_SINK_PUBLISH_ATOMIC, &state, sizeof state) != 0) goto fail;
     return 0;
 fail:
-    unlink(claim);
+    ckpt_sink_unclaim(sink, name);
     return -1;
 }
 
@@ -860,10 +823,9 @@ static int ckpt_capture_file_blob(int fd, char *record_path, size_t record_capac
     if (snprintf(record_path, record_capacity, "file.%d.%d.%llu", (int)getpid(), fd,
                  (unsigned long long)sequence) >= (int)record_capacity)
         return -1;
-    snprintf(destination, sizeof destination, "%s/%s", g_ckpt_dir, record_path);
-    snprintf(temporary, sizeof temporary, "%s.tmp.%d", destination, (int)getpid());
-    FILE *output = fopen(temporary, "wb");
-    if (!output) return -1;
+    struct ckpt_sink *sink = ckpt_sink_current();
+    struct ckpt_sink_stream *output = NULL;
+    if (ckpt_sink_begin(sink, NULL, record_path, CKPT_SINK_PUBLISH_ATOMIC, &output) != 0) return -1;
     unsigned char buffer[65536];
     off_t offset = 0;
     int failed = 0;
@@ -873,7 +835,7 @@ static int ckpt_capture_file_blob(int fd, char *record_path, size_t record_capac
                             : sizeof buffer;
         ssize_t count = pread(fd, buffer, wanted, offset);
         if (count > 0) {
-            if (fwrite(buffer, 1, (size_t)count, output) != (size_t)count) {
+            if (ckpt_sink_write(sink, output, buffer, (size_t)count) != 0) {
                 failed = 1;
                 break;
             }
@@ -884,11 +846,11 @@ static int ckpt_capture_file_blob(int fd, char *record_path, size_t record_capac
         failed = 1;
         break;
     }
-    if (!failed && ckpt_close_sync(&output) != 0) failed = 1;
-    if (output) fclose(output);
-    if (!failed && rename(temporary, destination) != 0) failed = 1;
-    if (failed) unlink(temporary);
-    return failed ? -1 : 0;
+    if (failed) {
+        ckpt_sink_abort(sink, &output);
+        return -1;
+    }
+    return ckpt_sink_finish(sink, &output);
 }
 
 static int ckpt_rmrf(const char *path) {
@@ -923,8 +885,8 @@ static void ckpt_poll(struct cpu *c) {
     if (container_pid() == 1) {
         ckpt_coordinate_and_exit(c); // never returns (dumps the tree + _exit)
     }
-    char pd[1200];
-    snprintf(pd, sizeof pd, "%s/proc.%d", g_ckpt_dir, container_pid());
+    char pd[64];
+    snprintf(pd, sizeof pd, "proc.%d", container_pid());
     int rc = ckpt_dump_self(c, pd);
     fprintf(stderr, "[ckpt] proc %d %s\n", container_pid(), rc == 0 ? "OK" : "FAILED");
     _exit(rc == 0 ? 0 : 70);
@@ -943,6 +905,9 @@ static int ckpt_control_init(void) {
     }
     if (!d || !d[0]) return 0;
     snprintf(g_ckpt_dir, sizeof g_ckpt_dir, "%s", d);
+    // Bind the process-wide checkpoint sink. Today the only implementation is the directory sink; a future
+    // caller-supplied sink is installed here instead and nothing else in the writer changes.
+    ckpt_sink_bind_directory(g_ckpt_dir);
     g_ckpt_trigger = ckpt_map_trigger(d);
     if (!g_ckpt_trigger) return -1;
     g_ckpt_seen_gen = *g_ckpt_trigger;
@@ -1038,11 +1003,10 @@ static int ckpt_capture_right_resource(int fd, struct ckpt_fd *record) {
             record->ofd_id = record->object_id;
             snprintf(record->path, sizeof record->path, "inotify-right.%016llx",
                      (unsigned long long)record->object_id);
-            char destination[1280];
-            snprintf(destination, sizeof destination, "%s/%s", g_ckpt_dir, record->path);
             if (image == NULL ||
                 hl_linux_inotify_export(g_linux_box, (hl_linux_fd)fd, image, size, &actual) != HL_STATUS_OK ||
-                actual != size || ckpt_store_sync(destination, image, size) != 0) {
+                actual != size ||
+                ckpt_sink_put(ckpt_sink_current(), NULL, record->path, 0, image, size) != 0) {
                 free(image);
                 return -1;
             }
@@ -1062,7 +1026,7 @@ static int ckpt_capture_right_resource(int fd, struct ckpt_fd *record) {
         snprintf(record->path, sizeof record->path, "epoll-right.%016llx",
                  (unsigned long long)record->object_id);
         if (record->flags < 0 || record->descriptor_flags < 0 || !record->object_id ||
-            ckpt_dump_epoll(g_ckpt_dir, record, 1) != 0)
+            ckpt_dump_epoll(ckpt_sink_current(), NULL, record, 1) != 0)
             return -1;
         record->gfd = -1;
         return 0;
@@ -1629,7 +1593,7 @@ static uint32_t ckpt_inotify_fflags(uint32_t flags) {
     return mask;
 }
 
-static int ckpt_dump_inotify(const char *path) {
+static int ckpt_dump_inotify(struct ckpt_sink *sink, const char *group) {
     for (int instance = 0; instance < HL_NFD; instance++) {
         if (!g_inotify[instance]) continue;
 #if defined(__linux__)
@@ -1674,10 +1638,11 @@ static int ckpt_dump_inotify(const char *path) {
     }
     for (int instance = 0; instance < HL_NFD; instance++)
         if (g_inotify_raw_len[instance] > g_inotify_raw_pos[instance]) raw_instances++;
-    FILE *file = fopen(path, "wb");
-    if (!file) return -1;
-    if (ckpt_wr_all(file, &watches, sizeof watches) != 0 || ckpt_wr_all(file, &moves, sizeof moves) != 0 ||
-        ckpt_wr_all(file, &raw_instances, sizeof raw_instances) != 0)
+    struct ckpt_sink_stream *file = NULL;
+    if (ckpt_sink_begin(sink, group, "inotify", 0, &file) != 0) return -1;
+    if (ckpt_sink_write(sink, file, &watches, sizeof watches) != 0 ||
+        ckpt_sink_write(sink, file, &moves, sizeof moves) != 0 ||
+        ckpt_sink_write(sink, file, &raw_instances, sizeof raw_instances) != 0)
         goto fail;
     for (int wd = 0; wd < HL_NFD; wd++) {
         if (!g_inotify_owner[wd]) continue;
@@ -1692,8 +1657,8 @@ static int ckpt_dump_inotify(const char *path) {
             .is_directory = g_inotify_isdir[wd],
         };
         snprintf(watch.path, sizeof watch.path, "%s", g_inotify_wpath[wd]);
-        if (ckpt_wr_all(file, &watch, sizeof watch) != 0 ||
-            (snapshot_size && ckpt_wr_all(file, g_inotify_snap[wd], snapshot_size) != 0))
+        if (ckpt_sink_write(sink, file, &watch, sizeof watch) != 0 ||
+            (snapshot_size && ckpt_sink_write(sink, file, g_inotify_snap[wd], snapshot_size) != 0))
             goto fail;
     }
     for (int index = 0; index < g_inomv_n; index++) {
@@ -1705,24 +1670,25 @@ static int ckpt_dump_inotify(const char *path) {
             .cookie = g_inomv[index].cookie,
         };
         snprintf(move.name, sizeof move.name, "%s", g_inomv[index].name);
-        if (ckpt_wr_all(file, &move, sizeof move) != 0) goto fail;
+        if (ckpt_sink_write(sink, file, &move, sizeof move) != 0) goto fail;
     }
     for (int instance = 0; instance < HL_NFD; instance++) {
         size_t remaining = g_inotify_raw_len[instance] - g_inotify_raw_pos[instance];
         if (!remaining) continue;
         if (remaining > UINT32_MAX) goto fail;
         struct ckpt_inotify_raw raw = {.instance = instance, .size = (uint32_t)remaining};
-        if (ckpt_wr_all(file, &raw, sizeof raw) != 0 ||
-            ckpt_wr_all(file, g_inotify_raw[instance] + g_inotify_raw_pos[instance], remaining) != 0)
+        if (ckpt_sink_write(sink, file, &raw, sizeof raw) != 0 ||
+            ckpt_sink_write(sink, file, g_inotify_raw[instance] + g_inotify_raw_pos[instance], remaining) != 0)
             goto fail;
     }
-    return ckpt_close_sync(&file);
+    return ckpt_sink_finish(sink, &file);
 fail:
-    fclose(file);
+    ckpt_sink_abort(sink, &file);
     return -1;
 }
 
-static int ckpt_dump_epoll(const char *directory, const struct ckpt_fd *records, int count) {
+static int ckpt_dump_epoll(struct ckpt_sink *sink, const char *group, const struct ckpt_fd *records,
+                           int count) {
     for (int record_index = 0; record_index < count; ++record_index) {
         const struct ckpt_fd *record = &records[record_index];
         if (record->kind != CKF_EPOLL) continue;
@@ -1764,9 +1730,7 @@ static int ckpt_dump_epoll(const char *directory, const struct ckpt_fd *records,
         struct ckpt_epoll_header header = {CKPT_EPOLL_MAGIC, used, 0};
         memcpy(image, &header, sizeof header);
         memcpy(image + sizeof header, watches, (size_t)used * sizeof(*watches));
-        char path[1400];
-        snprintf(path, sizeof path, "%s/%s", directory, record->path);
-        int result = ckpt_store_sync(path, image, bytes);
+        int result = ckpt_sink_put(sink, group, record->path, 0, image, bytes);
         free(image);
         if (result != 0) return -1;
     }
@@ -1779,7 +1743,8 @@ static int ckpt_region_prot(uint64_t addr, uint64_t glen) {
 }
 
 // Sparse-dump every tracked guest mapping (image/interp/heap/stack/anon/file mmap). Non-zero HOST pages only.
-static int ckpt_dump_pages(FILE *f, size_t pagesz, uint64_t *out_n) {
+static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, size_t pagesz,
+                           uint64_t *out_n) {
     uint64_t nreg = 0;
     static uint8_t zero[65536];
     size_t mapping_count = hl_gmap_count();
@@ -1806,22 +1771,21 @@ static int ckpt_dump_pages(FILE *f, size_t pagesz, uint64_t *out_n) {
             break;
         }
         pthread_mutex_unlock(&g_filemap_lock);
-        off_t header_offset = ftello(f);
+        int64_t header_offset = ckpt_sink_tell(sink, f);
         if (header_offset < 0) return -1;
-        if (ckpt_wr_all(f, &reg, sizeof reg) != 0) return -1;
+        if (ckpt_sink_write(sink, f, &reg, sizeof reg) != 0) return -1;
         for (uint64_t off = 0; off < len; off += pagesz) {
             uint64_t va = addr + off;
             size_t n = (len - off < pagesz) ? (size_t)(len - off) : pagesz;
             if (!host_range_mapped((uintptr_t)va, n)) continue;
             if (memcmp((void *)va, zero, n) == 0) continue;
-            if (ckpt_wr_all(f, &va, sizeof va) != 0) return -1;
-            if (ckpt_wr_all(f, (void *)va, n) != 0) return -1;
+            if (ckpt_sink_write(sink, f, &va, sizeof va) != 0) return -1;
+            if (ckpt_sink_write(sink, f, (void *)va, n) != 0) return -1;
             reg.npages++;
         }
-        off_t end_offset = ftello(f);
-        if (end_offset < 0 || fseeko(f, header_offset, SEEK_SET) != 0 ||
-            ckpt_wr_all(f, &reg, sizeof reg) != 0 || fseeko(f, end_offset, SEEK_SET) != 0)
-            return -1;
+        // Patch the region header in place now that npages is known (the streaming equivalent of the
+        // old seek-back-and-rewrite).
+        if (ckpt_sink_write_at(sink, f, (uint64_t)header_offset, &reg, sizeof reg) != 0) return -1;
         nreg++;
     }
     *out_n = nreg;
@@ -1852,7 +1816,7 @@ static void ckpt_self_identity(struct ckpt_meta *m) {
 static struct cpu *g_ckpt_cpu_images;
 static int g_ckpt_cpu_count;
 
-static int ckpt_dump_self_locked(struct cpu *c, const char *procdir);
+static int ckpt_dump_self_locked(struct cpu *c, const char *group);
 
 static int ckpt_dump_self(struct cpu *c, const char *procdir) {
     struct cpu *live[THREAD_REG_MAX];
@@ -1888,12 +1852,12 @@ static int ckpt_dump_self(struct cpu *c, const char *procdir) {
     return result;
 }
 
-static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
+static int ckpt_dump_self_locked(struct cpu *c, const char *group) {
     if (g_untrusted) {
         fprintf(stderr, "[ckpt] refuse: sentry/untrusted split is P3\n");
         return -1;
     }
-    mkdir(g_ckpt_dir, 0700);
+    struct ckpt_sink *sink = ckpt_sink_current();
     struct ckpt_fd *fdrecs = calloc(HL_NFD, sizeof *fdrecs);
     int nfd = 0;
     if (fdrecs == NULL || ckpt_scan_fds(fdrecs, HL_NFD, &nfd) != 0) {
@@ -1901,17 +1865,12 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
         return -1; // P3 refusal already reported
     }
 
-    // Ensure the base checkpoint dir exists (a peer may reach here before the coordinator's mkdir; idempotent).
-    char tmp[1280];
-    snprintf(tmp, sizeof tmp, "%s.tmp.%d", procdir, (int)getpid());
-    ckpt_rmrf(tmp);
-    if (mkdir(tmp, 0700) != 0) {
-        fprintf(stderr, "[ckpt] mkdir %s: %s\n", tmp, strerror(errno));
+    // Open this process's image group. The sink stages it; nothing is visible until group_commit.
+    if (ckpt_sink_group_begin(sink, group) != 0) {
         free(fdrecs);
         return -1;
     }
-    char pf[1400];
-    FILE *fp = NULL, *ff = NULL;
+    struct ckpt_sink_stream *fp = NULL, *ff = NULL;
     int ok = 0;
     size_t pagesz = (size_t)getpagesize();
 
@@ -1941,12 +1900,10 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
         m.sig_mask[s] = g_sigact[s].mask;
     }
 
-    snprintf(pf, sizeof pf, "%s/pages", tmp);
-    fp = fopen(pf, "wb");
-    if (!fp || ckpt_dump_pages(fp, pagesz, &m.n_regions) != 0) goto done;
-    if (ckpt_close_sync(&fp) != 0) goto done;
+    if (ckpt_sink_begin(sink, group, "pages", 0, &fp) != 0) goto done;
+    if (ckpt_dump_pages(sink, fp, pagesz, &m.n_regions) != 0) goto done;
+    if (ckpt_sink_finish(sink, &fp) != 0) goto done;
 
-    snprintf(pf, sizeof pf, "%s/cpu", tmp);
     {
         size_t payload = (size_t)g_ckpt_cpu_count * sizeof *g_ckpt_cpu_images;
         size_t total = sizeof(struct ckpt_cpu_header) + payload;
@@ -1955,17 +1912,15 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
         *cpu_file = (struct ckpt_cpu_header){CKPT_CPU_MAGIC, CKPT_VERSION, G_CKPT_ARCH,
                                              (uint64_t)g_ckpt_cpu_count, sizeof(struct cpu)};
         memcpy(cpu_file + 1, g_ckpt_cpu_images, payload);
-        int cpu_rc = ckpt_store_sync(pf, cpu_file, total);
+        int cpu_rc = ckpt_sink_put(sink, group, "cpu", 0, cpu_file, total);
         free(cpu_file);
         if (cpu_rc != 0) goto done;
     }
 
-    snprintf(pf, sizeof pf, "%s/fds", tmp);
-    ff = fopen(pf, "wb");
-    if (!ff) goto done;
+    if (ckpt_sink_begin(sink, group, "fds", 0, &ff) != 0) goto done;
     for (int i = 0; i < nfd; i++)
-        if (ckpt_wr_all(ff, &fdrecs[i], sizeof fdrecs[i]) != 0) goto done;
-    if (ckpt_close_sync(&ff) != 0) goto done;
+        if (ckpt_sink_write(sink, ff, &fdrecs[i], sizeof fdrecs[i]) != 0) goto done;
+    if (ckpt_sink_finish(sink, &ff) != 0) goto done;
 
     for (int i = 0; i < nfd; i++) {
         if (fdrecs[i].kind != CKF_INOTIFY || fdrecs[i].path[0] == 0) continue;
@@ -1985,45 +1940,28 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *procdir) {
             free(image);
             goto done;
         }
-        snprintf(pf, sizeof pf, "%s/%s", tmp, fdrecs[i].path);
-        int stored = ckpt_store_sync(pf, image, bytes);
+        int stored = ckpt_sink_put(sink, group, fdrecs[i].path, 0, image, bytes);
         free(image);
         if (stored != 0) goto done;
     }
 
-    if (ckpt_dump_epoll(tmp, fdrecs, nfd) != 0) goto done;
+    if (ckpt_dump_epoll(sink, group, fdrecs, nfd) != 0) goto done;
+    if (ckpt_dump_inotify(sink, group) != 0) goto done;
+    if (ckpt_dump_signal_state(sink, group) != 0) goto done;
 
-    snprintf(pf, sizeof pf, "%s/inotify", tmp);
-    if (ckpt_dump_inotify(pf) != 0) goto done;
-
-    snprintf(pf, sizeof pf, "%s/signals", tmp);
-    if (ckpt_dump_signal_state(pf) != 0) goto done;
-
-    snprintf(pf, sizeof pf, "%s/meta", tmp); // meta written LAST (carries the section counts)
-    if (ckpt_store_sync(pf, &m, sizeof m) != 0 || ckpt_sync_dir(tmp) != 0) goto done;
+    // meta written LAST within the group (it carries the section counts).
+    if (ckpt_sink_put(sink, group, "meta", 0, &m, sizeof m) != 0) goto done;
     ok = 1;
 
 done:
-    if (fp) fclose(fp);
-    if (ff) fclose(ff);
-    if (!ok) {
-        ckpt_rmrf(tmp);
-        free(fdrecs);
-        return -1;
-    }
-    ckpt_rmrf(procdir);
-    if (rename(tmp, procdir) != 0) {
-        fprintf(stderr, "[ckpt] rename %s -> %s: %s\n", tmp, procdir, strerror(errno));
-        ckpt_rmrf(tmp);
-        free(fdrecs);
-        return -1;
-    }
-    if (ckpt_sync_dir(g_ckpt_dir) != 0) {
-        free(fdrecs);
-        return -1;
-    }
+    if (fp) ckpt_sink_abort(sink, &fp);
+    if (ff) ckpt_sink_abort(sink, &ff);
     free(fdrecs);
-    return 0;
+    if (!ok) {
+        ckpt_sink_group_abort(sink, group);
+        return -1;
+    }
+    return ckpt_sink_group_commit(sink, group);
 }
 
 // Enumerate the container's whole process tree = every ENGINE process in the init's session. hl runs each
@@ -2094,9 +2032,7 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     }
 
     // Dump ourselves (the init) last.
-    char selfpd[1200];
-    snprintf(selfpd, sizeof selfpd, "%s/proc.1", base);
-    if (ckpt_dump_self(c, selfpd) != 0) {
+    if (ckpt_dump_self(c, "proc.1") != 0) {
         fprintf(stderr, "[ckpt] init dump FAILED -- checkpoint incomplete\n");
         _exit(70);
     }
@@ -2143,9 +2079,9 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         fprintf(stderr, "[ckpt] cannot hash workspace image: %s\n", strerror(errno));
         _exit(70);
     }
-    char mp[1200];
-    snprintf(mp, sizeof mp, "%s/MANIFEST", base);
-    if (ckpt_store_sync(mp, &man, sizeof man) != 0 || ckpt_sync_dir(base) != 0) {
+    // Explicit completion. On the directory sink this is still "MANIFEST written last, then fsync the
+    // workspace"; on any other sink it is the only signal that the image is complete.
+    if (ckpt_sink_commit(ckpt_sink_current(), &man, sizeof man) != 0) {
         fprintf(stderr, "[ckpt] cannot publish workspace manifest: %s\n", strerror(errno));
         _exit(70);
     }
