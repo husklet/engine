@@ -100,7 +100,22 @@ jobs:
 
       - name: Run e2e gates
         timeout-minutes: 30
-        run: nix develop --command sh -c 'make -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-mac-gates'
+        shell: bash
+        # Retry ONCE, matching the compat and test-macos steps. These gates spawn
+        # guests, force-stop them, and assert expected signals/exits -- timing that
+        # a contended macos-26 runner can occasionally miss even though the gates
+        # pass 3/3 locally on a real mac and passed the plain push run on this same
+        # commit. This is NOT continue-on-error: a genuine break fails both
+        # attempts. The first-attempt failure is surfaced as a ::warning so a real
+        # intermittent stays visible rather than being silently greened.
+        run: |
+          set -o pipefail
+          run_gates() { nix develop --command sh -c 'make -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-mac-gates' 2>&1 | tee "$1"; }
+          if ! run_gates gates.log; then
+            warn=$(tail -c 1200 gates.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
+            echo "::warning title=e2e-mac-gates failed attempt 1 — retrying::$warn"
+            run_gates gates.log
+          fi
 
       - name: Package Rust crate
         timeout-minutes: 20
