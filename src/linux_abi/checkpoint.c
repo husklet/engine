@@ -52,11 +52,12 @@
 
 #include "../host/file.h"
 #include "../host/system.h"
-#include "ckpt_sink_dir.h" // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
+#include "ckpt_sink_dir.h"    // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
+#include "ckpt_sink_stream.h" // ... and that sink can be an embedder callback on the far side of a socket
 
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
-#define CKPT_VERSION 1 // public v1.0: full-or-refuse whole-container checkpoint image
+#define CKPT_VERSION 2 // v2: streaming-compatible two-level image digest (docs/checkpoint-sink.md)
 #define CKPT_ARCH_X86_64 1
 #define CKPT_ARCH_AARCH64 2
 #define CKPT_CPU_MAGIC UINT64_C(0x31305550434c4848) // "HHLCPU01" (LE)
@@ -405,7 +406,18 @@ static int ckpt_normalize_reopen_path(char *path) {
     return access(path, F_OK) == 0 ? 0 : 1;
 }
 
+static volatile uint32_t *ckpt_map_trigger_descriptor(int fd) {
+    void *m = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) fprintf(stderr, "[ckpt] cannot map inherited trigger: %s\n", strerror(errno));
+    return (m == MAP_FAILED) ? NULL : (volatile uint32_t *)m;
+}
+
 static volatile uint32_t *ckpt_map_trigger(const char *dir) {
+    // With a streaming sink there is no workspace, so the generation counter arrives as an inherited
+    // anonymous shared descriptor instead of a file beside the workspace. Everything downstream is identical:
+    // one shared word, read by ckpt_poll at every safepoint, bumped by the embedder to request a capture.
+    int inherited = hl_ckpt_trigger_descriptor();
+    if (inherited >= 0) return ckpt_map_trigger_descriptor(inherited);
     char tp[1200];
     snprintf(tp, sizeof tp, "%s.trigger", dir);
     int fd = open(tp, O_RDWR | O_CREAT, 0600);
@@ -459,6 +471,34 @@ static int ckpt_name_compare(const void *left, const void *right) {
     return strcmp(*(const char *const *)left, *(const char *const *)right);
 }
 
+// ---------------------------------------------------------------- image digest
+//
+// The manifest carries a digest that restore recomputes to authenticate the image. It used to be a single
+// FNV-1a fold over the whole workspace, in sorted path order, computed by RE-READING every finished file.
+// A streaming sink cannot be re-read, so the digest is now two-level:
+//
+//   per object : h = FNV1a(name '\0' || u64 size || contents)   -- accumulable while the bytes are emitted
+//   image      : H = FNV1a over (name '\0' || u64 h) for every object, in ascending name order
+//
+// The per-object hash is computable by a writer that sees the object exactly once and never again; the image
+// hash needs only the (name, h) pairs, which the streaming server accumulates as objects are finished. The
+// directory sink computes exactly the same value by walking the workspace, so the two sinks agree on what a
+// given image hashes to and neither needs a format flag. MANIFEST and the restore-side RECOVERY.jsonl are
+// excluded, as before.
+#define CKPT_HASH_BASIS UINT64_C(14695981039346656037)
+
+static uint64_t ckpt_hash_object(uint64_t hash, const char *name, uint64_t size, const void *data,
+                                 size_t length) {
+    hash = ckpt_hash_bytes(hash, name, strlen(name) + 1);
+    hash = ckpt_hash_bytes(hash, &size, sizeof size);
+    return ckpt_hash_bytes(hash, data, length);
+}
+
+static uint64_t ckpt_hash_combine(uint64_t image, const char *name, uint64_t object) {
+    image = ckpt_hash_bytes(image, name, strlen(name) + 1);
+    return ckpt_hash_bytes(image, &object, sizeof object);
+}
+
 static int ckpt_hash_tree(const char *base, const char *relative, uint64_t *hash, uint64_t *files,
                           uint64_t *bytes) {
     char directory[1400];
@@ -503,13 +543,12 @@ static int ckpt_hash_tree(const char *base, const char *relative, uint64_t *hash
         int fd = open(path, O_RDONLY);
         if (fd < 0) goto fail;
         uint64_t size = (uint64_t)status.st_size;
-        *hash = ckpt_hash_bytes(*hash, child_relative, strlen(child_relative) + 1);
-        *hash = ckpt_hash_bytes(*hash, &size, sizeof size);
+        uint64_t object = ckpt_hash_object(CKPT_HASH_BASIS, child_relative, size, NULL, 0);
         unsigned char buffer[65536];
         for (;;) {
             ssize_t received = read(fd, buffer, sizeof buffer);
             if (received > 0) {
-                *hash = ckpt_hash_bytes(*hash, buffer, (size_t)received);
+                object = ckpt_hash_bytes(object, buffer, (size_t)received);
                 continue;
             }
             if (received < 0 && errno == EINTR) continue;
@@ -520,6 +559,7 @@ static int ckpt_hash_tree(const char *base, const char *relative, uint64_t *hash
             break;
         }
         close(fd);
+        *hash = ckpt_hash_combine(*hash, child_relative, object);
         (*files)++;
         *bytes += size;
     }
@@ -534,7 +574,7 @@ fail:
 }
 
 static int ckpt_image_digest(const char *base, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
-    *hash = UINT64_C(14695981039346656037);
+    *hash = CKPT_HASH_BASIS;
     *files = 0;
     *bytes = 0;
     return ckpt_hash_tree(base, "", hash, files, bytes);
@@ -905,9 +945,15 @@ static int ckpt_control_init(void) {
     }
     if (!d || !d[0]) return 0;
     snprintf(g_ckpt_dir, sizeof g_ckpt_dir, "%s", d);
-    // Bind the process-wide checkpoint sink. Today the only implementation is the directory sink; a future
-    // caller-supplied sink is installed here instead and nothing else in the writer changes.
-    ckpt_sink_bind_directory(g_ckpt_dir);
+    // Bind the process-wide checkpoint sink. The sentinel selects the embedder-backed streaming sink; any
+    // other value is a workspace directory. Nothing else in the writer knows which one is installed.
+    if (!strcmp(d, HL_CKPT_STREAM_SENTINEL)) {
+        if (ckpt_sink_bind_stream() == NULL) {
+            fprintf(stderr, "[ckpt] streaming checkpoint requested without a broker descriptor\n");
+            return -1;
+        }
+    } else
+        ckpt_sink_bind_directory(g_ckpt_dir);
     g_ckpt_trigger = ckpt_map_trigger(d);
     if (!g_ckpt_trigger) return -1;
     g_ckpt_seen_gen = *g_ckpt_trigger;
@@ -1975,11 +2021,13 @@ done:
 // peer, then itself, then publish the MANIFEST. Never returns (_exit frees init's RAM).
 static void ckpt_coordinate_and_exit(struct cpu *c) {
     char base[1024];
+    struct ckpt_sink *sink = ckpt_sink_current();
     snprintf(base, sizeof base, "%s", g_ckpt_dir);
     // The requester prepared a fresh, empty base dir BEFORE advancing the trigger (so peers that see the
     // shared generation independently can drop their proc.<gpid> straight in). We must NOT rm it here — a
-    // peer may already have dumped into it. Just ensure it exists (idempotent) and proceed.
-    mkdir(base, 0700);
+    // peer may already have dumped into it. Just ensure it exists (idempotent) and proceed. A streaming sink
+    // has no workspace at all; the embedder's store is prepared before the launch.
+    if (sink != NULL && sink->root[0]) mkdir(base, 0700);
 
     size_t peer_capacity = 512;
     hl_host_process_peer *foll = malloc(peer_capacity * sizeof *foll);
@@ -2012,9 +2060,11 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     for (int t = 0; t < 500 && ndone != nfoll; t++) { // one whole-tree deadline: at most ~5s total
         for (int i = 0; i < nfoll; i++) {
             if (completed[i]) continue;
-            char pd[1200];
-            snprintf(pd, sizeof pd, "%s/proc.%lld", base, (long long)foll[i].identity);
-            if (access(pd, F_OK) == 0) {
+            char pd[64];
+            snprintf(pd, sizeof pd, "proc.%lld", (long long)foll[i].identity);
+            // Rendezvous through the sink, not through the store: "that peer finished" is defined as
+            // "its group was committed", which is exactly what group_commit means for every implementation.
+            if (ckpt_sink_group_present(sink, pd) == 1) {
                 completed[i] = 1;
                 ndone++;
             }
@@ -2044,15 +2094,8 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // assembling its atomic proc.* directory. A fixed quiescence window also covers the registration gap
     // where neither the peer snapshot nor the workspace contains the child yet.
     for (int settle = 0; settle < 200; settle++) {
-        int complete = 0;
-        DIR *bd = opendir(base);
-        if (bd) {
-            struct dirent *e;
-            while ((e = readdir(bd)))
-                if (!strncmp(e->d_name, "proc.", 5) && !strstr(e->d_name, ".tmp.")) complete++;
-            closedir(bd);
-        }
-        nproc = complete;
+        int complete = ckpt_sink_group_count(sink, "proc.");
+        if (complete >= 0) nproc = complete;
         usleep(10000);
     }
     if (nproc < nfoll + 1) {
@@ -2075,13 +2118,15 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         int fgh = (tf >= 0) ? tcgetpgrp(tf) : -1;
         man.fg_pgid_gpid = (fgh <= 0) ? 0 : (g_init_hostpid && fgh == g_init_hostpid) ? 1 : fgh;
     }
-    if (ckpt_image_digest(base, &man.image_hash, &man.image_files, &man.image_bytes) != 0) {
+    // The digest is asked of the sink: the directory sink walks the workspace, the streaming sink asks the
+    // server, which accumulated it while the bytes went past. Neither re-reads the embedder's store.
+    if (ckpt_sink_digest(sink, &man.image_hash, &man.image_files, &man.image_bytes) != 0) {
         fprintf(stderr, "[ckpt] cannot hash workspace image: %s\n", strerror(errno));
         _exit(70);
     }
     // Explicit completion. On the directory sink this is still "MANIFEST written last, then fsync the
     // workspace"; on any other sink it is the only signal that the image is complete.
-    if (ckpt_sink_commit(ckpt_sink_current(), &man, sizeof man) != 0) {
+    if (ckpt_sink_commit(sink, &man, sizeof man) != 0) {
         fprintf(stderr, "[ckpt] cannot publish workspace manifest: %s\n", strerror(errno));
         _exit(70);
     }

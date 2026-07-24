@@ -102,7 +102,7 @@ PRODUCTION_UNITY_DEPS := $(sort $(call rwildcard,src/core/,*.c) $(call rwildcard
 PROVIDER_SOURCES := src/core/environment.c src/core/provider/client.c \
 	src/core/provider/demux.c src/core/provider/files.c src/core/provider/handles.c \
 	src/core/provider/namespace.c
-CORE_SOURCES := src/core/bus.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
+CORE_SOURCES := src/core/bus.c src/core/checkpoint_channel.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c src/core/target/bus.c src/core/target/native.c src/core/target/run.c src/core/target/services.c $(PROVIDER_SOURCES)
 IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c \

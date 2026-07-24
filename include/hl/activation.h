@@ -57,6 +57,15 @@ HL_API hl_status hl_activation_start_terminal_with_transport(const char *executa
                                                              const char *config_path, hl_terminal_size size,
                                                              int32_t transport, int32_t *out_master,
                                                              hl_activation_process **out_process);
+/* General activation entry point: any combination of stdio OR a controlling terminal, an optional provider
+ * transport, and an optional checkpoint broker (include/hl/checkpoint_stream.h). Both descriptors are
+ * borrowed and transferred with SCM_RIGHTS; neither is a guest descriptor. `size` non-NULL selects the
+ * terminal form and requires `out_master`; `stdio` and `size` are mutually exclusive. */
+HL_API hl_status hl_activation_start_with_channels(const char *executable, uint32_t guest_isa,
+                                                   const char *config_path, const hl_activation_stdio *stdio,
+                                                   const hl_terminal_size *size, int32_t transport,
+                                                   int32_t checkpoint, int32_t trigger, int32_t *out_master,
+                                                   hl_activation_process **out_process);
 HL_API hl_status hl_terminal_resize(int32_t master, hl_terminal_size size);
 /* Returns the native child process identifier while the opaque handle exists. */
 HL_API hl_status hl_activation_process_id(const hl_activation_process *process, uint64_t *out_process_id);
