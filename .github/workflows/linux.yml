@@ -73,6 +73,36 @@ jobs:
             test -x build-ci-sdk/bin/hl-engine-runner
           '
 
+      # The three Rust gates below are plain `nix develop` steps, NOT flake
+      # checks, and that is deliberate. checks.rust is `buildRustPackage` with
+      # `doCheck = false` because its sandboxed src is a filtered copy of
+      # pkgs/rust that cannot link the frozen libhl-engine.a; wrapping fmt,
+      # clippy and the unit tests into derivations would mean three more vendored
+      # cargo builds of the same tree for no extra coverage. The devShell already
+      # ships rustfmt and clippy, so running them here is the honest, cheap
+      # option -- and each is its own step, matching the granularity above, so a
+      # failure names the gate that broke.
+      #
+      # These existed as intent-only until now: Cargo.toml sets
+      # `[lints.clippy] all/pedantic = "warn"` and the tree is rustfmt-shaped,
+      # but nothing enforced either, so both drifted red on main unnoticed.
+      - name: Check Rust formatting
+        run: nix develop --command cargo fmt --manifest-path pkgs/rust/Cargo.toml --check
+
+      # -D warnings promotes the crate's `warn` lint levels to hard errors here
+      # only: a local `cargo build` keeps showing them as warnings.
+      - name: Lint Rust crate (clippy)
+        run: nix develop --command cargo clippy --manifest-path pkgs/rust/Cargo.toml --all-targets --locked -- -D warnings
+
+      # --lib ONLY. The integration suites (spec, control, terminal, network,
+      # e2e) link the frozen activation archive and need a built engine plus
+      # guest fixtures; they are covered by the compat lanes and the CMake/CTest
+      # step, not here. The lib unit tests are pure host code -- including the
+      # wire encoder tests that pin the launch-config ABI against
+      # include/hl/config.h -- and are exactly what was silently failing on main.
+      - name: Test Rust unit suite
+        run: nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
+
       - name: Package Rust crate
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
