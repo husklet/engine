@@ -96,6 +96,45 @@ int hl_x86_trace_loop_hazard(uint64_t body, uint64_t end) {
     return 0;
 }
 
+// ==================== flag-transparent two-byte (0F xx) opcodes ====================
+// Both liveness scanners below (x86_flag_class, for the tier-2 self-loop NZCV-save elide, and
+// x86_flag_rw, for the cross-block NZCV/PF/AF live-in scan) used to bail out on EVERY two-byte
+// opcode they did not explicitly know, which meant any SSE instruction in a loop body forced the
+// whole flag substrate to be re-materialised every iteration. The SSE/MMX data-movement and packed
+// ALU space touches NO x86 flag at all, so it is flag-transparent for the scan.
+//
+// The claim that has to hold is stronger than "x86 says these do not write EFLAGS": it must hold for
+// hl's OWN emitters, which is why this is an explicit whitelist rather than a range. Every opcode
+// listed here lowers (translate.c's two-byte switch / lower/sse4x.c / lower/crypto.c / the do_sse3b
+// C fallback) to code that
+//   (a) never loads or stores cpu->nzcv / cpu->pf / cpu->af, and
+//   (b) leaves the LIVE ARM NZCV exactly as it found it -- the two lowerings that need host flags
+//       internally, e_sse_var_shift's count clamp (0F D1/D2/D3/E1/E2/F1/F2/F3) and the hoisted
+//       scalar generated-NaN fixup (0F 58/59/5C/5D/5E/5F/51), both bracket themselves with
+//       mrs x22,nzcv / msr nzcv,x22 for exactly this reason.
+// (b) matters because a deferred producer's flags live in the ARM NZCV across these instructions and
+// every block exit spills the LIVE NZCV (emit_spill -> e_nzcv_save).
+//
+// DELIBERATELY EXCLUDED (they are flag producers/consumers or membank readers in hl's lowering):
+//   0F 2C/2D cvtt?s?2si (2D brackets, but keep the whole cvt-to-GPR pair out), 0F 2E/2F ucomis/comis
+//   (e_nzcv_save_fcmp), 0F 40-4F cmovcc, 0F 80-8F jcc, 0F 90-9F setcc, 0F A3/AB/B3/BA/BB bt*,
+//   0F A4/A5/AC/AD shld/shrd, 0F AF imul, 0F B0/B1 cmpxchg, 0F B8 popcnt, 0F BC/BD bsf/bsr/tz/lz,
+//   0F C0/C1 xadd, 0F C7 cmpxchg8b/16b, 0F 77 emms, 0F AE fences, 0F 05 syscall, 0F 0B ud2,
+//   0F 31 rdtsc, 0F C3 movnti, and the whole VEX / 0F38 / 0F3A space (rejected by the callers).
+static int x86_two_byte_flagfree(uint8_t op) {
+    if (op >= 0x10 && op <= 0x17) return 1;               // movups/movss/movsd/movlps/unpck?ps/movhps
+    if (op == 0x28 || op == 0x29) return 1;               // movaps/movapd
+    if (op == 0x2A || op == 0x2B) return 1;               // cvtsi2ss/sd, movntps/pd
+    if (op >= 0x51 && op <= 0x5F) return 1;               // sqrt/and/andn/or/xor/add/mul/cvt/sub/min/div/max
+    if (op >= 0x60 && op <= 0x6F) return 1;               // punpck/pack/pcmpgt/movd/movq/movdqa/movdqu
+    if (op >= 0x70 && op <= 0x76) return 1;               // pshuf*, group12/13/14 imm shifts, pcmpeq (NOT 0x77 emms)
+    if (op >= 0x7C && op <= 0x7F) return 1;               // haddp/hsubp, movd/movq store, movdqa/movdqu store
+    if (op == 0xC4 || op == 0xC5 || op == 0xC6) return 1; // pinsrw/pextrw/shufps (NOT 0xC7)
+    if (op >= 0xD0 && op <= 0xEF) return 1;               // packed integer arith/logic/shift/avg/min/max
+    if (op >= 0xF1 && op <= 0xFE) return 1;               // packed shift/mul/sub/add (NOT 0xF0 lddqu, 0xFF ud0)
+    return 0;
+}
+
 // flag-liveness class of a guest x86 insn (for the dead-flag-save elision proof):
 //   2 = full NZCV producer (writes all flags, reads none): add/or/and/sub/xor/cmp/test/neg
 //   1 = flag CONSUMER (reads flags): adc/sbb/jcc/setcc/cmovcc
@@ -108,6 +147,7 @@ static int x86_flag_class(struct insn *I) {
         if ((op & 0xF0) == 0x90) return 1;                                  // setcc
         if ((op & 0xF0) == 0x40) return 1;                                  // cmovcc
         if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) return 0; // movzx/movsx
+        if (!I->vex && !I->map3 && x86_two_byte_flagfree(op)) return 0;     // SSE/MMX: no flag interaction
         return -1;                                                          // unknown 2-byte
     }
     if (op <= 0x3D && (op & 7) <= 5) { // primary ALU 00..3D
@@ -255,6 +295,7 @@ static int x86_flag_rw(const struct insn *I, int *rd, int *wr) {
             return XRW_OK;
         } // imul r,r/m: e_mul_set_oc builds a fresh
           // full NZCV word; PF/AF untouched
+        if (x86_two_byte_flagfree(op)) return XRW_OK; // SSE/MMX: reads no flag, writes no flag
         return XRW_UNK;
     }
     if (op < 0x40 && alu_kind_primary(op) >= 0) { // primary ALU add/or/adc/sbb/and/sub/xor/cmp

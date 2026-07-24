@@ -285,6 +285,34 @@ static uint64_t call_return_pc(uint64_t pc) {
 
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 void emit_ea(struct insn *I, uint64_t next_rip);
+
+// 128-bit guest vector load/store of an r/m128 operand. The `base + index*scale` addressing mode x86
+// uses for array traversal (`movaps (%rcx,%rax,1),%xmm0`) is exactly ARM's register-offset form, so
+// when ea_reg_fold() proves the EA needs no bias/segment/bus-guard/wrap handling the separate
+// `add x17, base, index` disappears and the access addresses [base, index] directly. Otherwise this
+// is byte-for-byte the emit_ea + g_ldr_q/g_str_q pair every call site used to write inline; the
+// x86-TSO barriers are the ones g_ldr_q/g_str_q emit, unchanged.
+static void g_ldr_q_ea(int t, struct insn *I, uint64_t next) {
+    int rn, rm, sh;
+    if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
+        e_ldr_q_reg(t, rn, rm, sh);
+        e_dmb_ishld();
+        return;
+    }
+    emit_ea(I, next);
+    g_ldr_q(t, 17, 0);
+}
+
+static void g_str_q_ea(int t, struct insn *I, uint64_t next) {
+    int rn, rm, sh;
+    if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
+        e_dmb_ish();
+        e_str_q_reg(t, rn, rm, sh);
+        return;
+    }
+    emit_ea(I, next);
+    g_str_q(t, 17, 0);
+}
 // unimplemented-insn diagnostic (defined below translate_block); fwd-declared so the instruction-class
 // helpers in translate/<class>.c (#included above translate_block) can defer a rare unhandled form.
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -632,6 +660,51 @@ static void e_af_addsub(int a, int b, int res, int tmp) {
     e_rrr(A_EOR, tmp, a, b, 0, 0);
     e_rrr(A_EOR, tmp, tmp, res, 0, 0);
     e_af_save(tmp);
+}
+
+// imm12 fast path for the ALU-with-immediate forms (group1 80/81/83 and the acc,imm forms). The
+// generic path materializes every immediate into a scratch register (e_movconst) and then runs the
+// register-register do_alu -- so `add $0x10,%rax` / `cmp $0x4000,%rax` each cost a `mov` the ARM
+// encoding does not need: ADDS/SUBS take a 12-bit unsigned immediate, optionally shifted left by 12.
+//
+// Applies only when the emitted bytes are provably the SAME arithmetic the generic path would do:
+//   * width >= 4 (narrow widths operate shifted into the high bits -- different code entirely),
+//   * kind add(0) / sub(5) / cmp(7) (ARM has no flag-setting AND/ORR/EOR *immediate* in this form),
+//   * g_pfaf_dead -- otherwise do_alu needs the immediate in a REGISTER for the PF source op and the
+//     (a ^ b ^ result) AF chain, so materializing it is not wasted work,
+//   * the immediate is a non-negative value that fits imm12 or imm12<<12 exactly. Negative
+//     immediates are deliberately NOT rewritten into the opposite operation: x86 CF/OF for
+//     `add $-16` are the ADD flags of a 64-bit -16, and the FL_ADD finalizer's C inversion is tied
+//     to that, so folding it into a SUBS would need a different finalizer.
+// Everything after the arithmetic (the deferred g_fl_pending state, and hence every consumer,
+// boundary and finalizer downstream) is identical to the register path. Returns 0 -> caller falls
+// back to e_movconst + do_alu.
+int do_alu_imm12(int kind, int dst, int a, uint64_t imm, int w) {
+    if (w < 4) return 0;
+    if (kind != 0 && kind != 5 && kind != 7) return 0;
+    if (g_pfaf_dead == 0) return 0;
+    if (kind == 0 && !lazyflags_on()) return 0; // NOLAZY add spills inline -- keep the generic path
+    int sf = (w == 8);
+    uint64_t v = sf ? imm : (uint64_t)(uint32_t)imm; // 32-bit ops only see the low 32 bits
+    unsigned im;
+    int sh;
+    if (v < 0x1000ull) {
+        im = (unsigned)v;
+        sh = 0;
+    } else if (v < 0x1000000ull && (v & 0xFFFull) == 0) {
+        im = (unsigned)(v >> 12);
+        sh = 1;
+    } else
+        return 0;
+    int out = dst < 0 ? 31 : dst;
+    if (kind == 0) {
+        e_addi_s_sh(out, a, im, sf, sh);
+        g_fl_pending = FL_ADD;
+    } else {
+        e_subi_s_sh(out, a, im, sf, sh);
+        g_fl_pending = FL_SUB;
+    }
+    return 1;
 }
 
 // Width-correct ALU: dst = a <kind> b, set cpu->nzcv.  dst<0 => cmp/test (no write).
@@ -4025,14 +4098,12 @@ static void *translate_block(uint64_t gpc) {
                         e_vmov8(vm, vd);
                 } else if (op == 0x6F || op == 0x28 || (op == 0x10 && !I.rep && !I.repne)) { // load 128 -> xmm
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(vd, 17, 0);
+                        g_ldr_q_ea(vd, &I, next);
                     } else
                         e_vmov(vd, vm);
                 } else if (op == 0x7F || op == 0x29 || (op == 0x11 && !I.rep && !I.repne)) { // store xmm -> 128
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_str_q(vd, 17, 0);
+                        g_str_q_ea(vd, &I, next);
                     } else
                         e_vmov(vm, vd);
                 } else if ((op == 0x10 || op == 0x11) && I.rep) { // movss (32-bit)
@@ -4585,13 +4656,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     uint32_t szb = (packed ? I.p66 : I.repne) ? 0x00400000u : 0;
@@ -4619,13 +4692,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
@@ -4794,13 +4869,15 @@ static void *translate_block(uint64_t gpc) {
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        if (packed)
-                            g_ldr_q(16, 17, 0);
-                        else if (I.repne)
-                            g_ldr_d(16, 17);
-                        else
-                            g_ldr_s(16, 17);
+                        if (packed) {
+                            g_ldr_q_ea(16, &I, next);
+                        } else {
+                            emit_ea(&I, next);
+                            if (I.repne)
+                                g_ldr_d(16, 17);
+                            else
+                                g_ldr_s(16, 17);
+                        }
                         s = 16;
                     }
                     int pred = (int)I.imm & 7;

@@ -178,6 +178,15 @@ void do_alu(int k, int d, int a, int b, int w) {
     (void)w;
 }
 
+int do_alu_imm12(int k, int d, int a, uint64_t imm, int w) {
+    (void)k;
+    (void)d;
+    (void)a;
+    (void)imm;
+    (void)w;
+    return 0;
+}
+
 void narrow_adcsbb(int a, int d, int l, int r, int w) {
     (void)a;
     (void)d;

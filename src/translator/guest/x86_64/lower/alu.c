@@ -57,8 +57,11 @@ int hl_x86_lower_alu(struct insn *I, uint64_t next) {
     if (op < 0x40 && ((op & 7) == 4 || (op & 7) == 5) && alu_kind_primary(op) >= 0) {
         int k = alu_kind_primary(op), w = (op & 7) == 4 ? 1 : I->opsize;
         if (!((k == 2 || k == 3) && w < 4)) {
-            e_movconst(16, (uint64_t)I->imm);
-            do_alu(k, k == 7 ? -1 : 0, 0, 16, w);
+            // imm12 fold: ADDS/SUBS take the immediate directly -- no e_movconst scratch.
+            if (!do_alu_imm12(k, k == 7 ? -1 : 0, 0, (uint64_t)I->imm, w)) {
+                e_movconst(16, (uint64_t)I->imm);
+                do_alu(k, k == 7 ? -1 : 0, 0, 16, w);
+            }
         } else { // byte/word ADC/SBB al/ax, imm -- do_alu is 32/64-only, mirror the group1 narrow path
             e_movconst(19, (uint64_t)I->imm);
             narrow_adcsbb(k == 2, 16, 0, 19, w);
@@ -75,11 +78,14 @@ int hl_x86_lower_alu(struct insn *I, uint64_t next) {
                 e_movconst(21, (uint64_t)I->imm); // operand in x21 (x19/x20 are lock_rmw scratch)
                 if (lock_rmw(k, w, 21)) { return TX_NEXT; }
             }
-            e_movconst(19, (uint64_t)I->imm); // imm in x19 (x16 holds the loaded value)
             // r/m register (non-mem, w>=4): compute straight into the guest home (rmv==I->rm_reg);
             // else scratch x16, then rm_store -> correct dest (handles mem + hi/lo byte regs).
             int out = (k == 7) ? -1 : (xaludirect_on() && !mem && w >= 4 ? rmv : 16);
-            do_alu(k, out, rmv, 19, w);
+            // imm12 fold: ADDS/SUBS take the immediate directly -- no e_movconst scratch.
+            if (!do_alu_imm12(k, out, rmv, (uint64_t)I->imm, w)) {
+                e_movconst(19, (uint64_t)I->imm); // imm in x19 (x16 holds the loaded value)
+                do_alu(k, out, rmv, 19, w);
+            }
             if (k != 7 && out == 16) rm_store(I, w, 16);
             return TX_NEXT;
         } else { // byte/word ADC/SBB r/m, imm
