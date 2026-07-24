@@ -49,6 +49,8 @@ mod terminal;
 pub mod transport;
 mod wire;
 
+pub use crate::wire::launch_abi;
+
 // --- Backend-independent contracts (re-exported from `api`) ---
 pub use crate::api::{checkpoint, observability};
 pub use crate::api::{Access, Guest, Mount, Sandbox, Stdio, Version};

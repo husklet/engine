@@ -15,6 +15,15 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 
 const MAGIC: u32 = 0x484c_4346;
 const ABI: u32 = 13;
+
+/// The launch ABI this crate encodes, as declared by `include/hl/config.h`.
+///
+/// Exposed so a test can compare it against both the C header and the archive
+/// committed under `assets/lib/`, which is what `cargo publish` ships.
+#[must_use]
+pub const fn launch_abi() -> u32 {
+    ABI
+}
 const HEADER_SIZE: usize = 200;
 const HEADER_SIZE_U32: u32 = 200;
 const MAGIC_OFFSET: usize = 0;
@@ -589,14 +598,14 @@ mod tests {
     }
 
     #[test]
-    fn overlay_paths_are_ordered_nul_records_in_abi_twelve() {
+    fn overlay_paths_are_ordered_nul_records_in_the_current_abi() {
         let config = Config::new().overlay(
             vec!["/lower/high".into(), "/lower/low".into()],
             "/overlay/upper",
             "/overlay/work",
         );
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
-        assert_eq!(word(&wire, ABI_OFFSET), 12);
+        assert_eq!(word(&wire, ABI_OFFSET), ABI);
         assert_eq!(word(&wire, HEADER_SIZE_OFFSET), 200);
         assert_eq!(word(&wire, LOWER_COUNT_OFFSET), 2);
         assert_eq!(string(&wire, ROOTFS_OFFSET), Some("/overlay/upper"));

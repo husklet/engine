@@ -106,6 +106,22 @@ jobs:
         timeout-minutes: 20
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
+      # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/
+      # links. It is the artifact `cargo publish` ships, and an ABI mismatch
+      # between it and include/hl/config.h is a *runtime* rejection, so linking
+      # succeeds while every guest launch fails. Releases 0.1.17-0.1.26 shipped an
+      # ABI-9 archive against an ABI-13 encoder for exactly that reason. Running
+      # the crate's tests here launches a guest through the committed archive.
+      #
+      # Only the guard suite runs on macOS. The rest of the crate's integration
+      # tests build static Linux guest probes with `cc` at test time (impossible
+      # here) or exercise checkpoint/restore, which is Linux-host only and which
+      # `e2e-mac-gates` likewise excludes. `packaged_archive` needs neither: it
+      # runs the committed testdata fixtures on both guest backends.
+      - name: Test Rust crate against the committed archive
+        timeout-minutes: 25
+        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
+
   # Runtime compatibility suites, split across parallel runners so wall-clock is the
   # slowest bucket (~20-25min) instead of the ~70min sequential `make e2e-compat`.
   # Each bucket builds compat-engines (a prereq of every compat-* target) then its suites.
