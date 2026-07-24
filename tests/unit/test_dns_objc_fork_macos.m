@@ -19,8 +19,13 @@ static int go;
 
 static void use_string(void) {
     @autoreleasepool {
+        NSString *constant = @"localhost";
+        if (constant.length != 9) _exit(19);
         NSString *value = [NSString stringWithUTF8String:"ports.ubuntu.com"];
         if (value.length != 16) _exit(20);
+        NSMutableString *mutable = [NSMutableString stringWithCapacity:16];
+        [mutable appendString:value];
+        if (mutable.length != 16) _exit(25);
     }
 }
 
