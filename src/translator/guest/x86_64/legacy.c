@@ -62,7 +62,9 @@ static __thread int g_x86_forksave_on;
 // never leak into a later call.
 static __thread int g_x86_dup2_compat;
 
-int hl_x86_legacy_is_dup2(void) { return g_x86_dup2_compat; }
+int hl_x86_legacy_is_dup2(void) {
+    return g_x86_dup2_compat;
+}
 
 void hl_x86_legacy_restore_fork(struct cpu *c) {
     if (!g_x86_forksave_on) return;
