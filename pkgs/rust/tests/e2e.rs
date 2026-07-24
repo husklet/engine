@@ -69,7 +69,7 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
         stderr: Stdio::Null,
     };
     let machine = Engine::new().spawn(capture, io).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + READY_DEADLINE;
     while machine.processes().unwrap().len() != 3 {
         assert!(
             Instant::now() < deadline,
@@ -77,10 +77,7 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(
-        machine.checkpoint(Duration::from_secs(10)).unwrap(),
-        checkpoint
-    );
+    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), checkpoint);
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
     assert_eq!(
         fs::read_dir(&checkpoint)
@@ -124,7 +121,7 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
         stderr: Stdio::Null,
     };
     let machine = Engine::new().spawn(capture, io).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let ready = fs::read_to_string(&output).unwrap_or_default();
         if machine.processes().unwrap().len() == 2
@@ -139,7 +136,7 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    machine.checkpoint(Duration::from_secs(10)).unwrap();
+    machine.checkpoint(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
@@ -178,7 +175,7 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
         stderr: Stdio::Null,
     };
     let machine = Engine::new().spawn(capture, io).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + READY_DEADLINE;
     while !fs::read_to_string(&output)
         .unwrap_or_default()
         .contains("READY 1")
@@ -189,7 +186,7 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    machine.checkpoint(Duration::from_secs(10)).unwrap();
+    machine.checkpoint(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
@@ -205,6 +202,18 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
         .contains("DELETED-RESTORED"));
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Deadlines for the checkpoint tests.
+///
+/// These bound a WAIT, not a performance claim: the assertion is that capture
+/// succeeds and the tree becomes ready, never that either is fast. They were 10s
+/// and 5s, which is ample on an idle machine and not on a contended CI runner --
+/// the three checkpoint tests capture multi-process trees CONCURRENTLY under
+/// `cargo test`, and all three failed in CI with "checkpoint deadline expired
+/// before manifest publication" while passing locally. A genuinely hung capture
+/// still fails, just later; a slow one no longer reports a false failure.
+const CHECKPOINT_DEADLINE: Duration = Duration::from_secs(120);
+const READY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn fixture_named(name: &str, guest: Guest) -> PathBuf {
     let isa = match guest {
