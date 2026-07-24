@@ -104,7 +104,9 @@ int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void 
     request->reserved = 0;
     if (checkpoint_write_all(descriptor, request, sizeof *request) != 0) return -1;
     if (name_size != 0 && checkpoint_write_all(descriptor, name, name_size) != 0) return -1;
-    if (request->length != 0 && checkpoint_write_all(descriptor, payload, (size_t)request->length) != 0)
+    /* A NULL payload with a non-zero length is a REQUESTED length (SOURCE_READ), not bytes to send. */
+    if (payload != NULL && request->length != 0 &&
+        checkpoint_write_all(descriptor, payload, (size_t)request->length) != 0)
         return -1;
     if (checkpoint_read_all(descriptor, reply, sizeof *reply) != 0) return -1;
     if (reply->magic != HL_CKPT_STREAM_MAGIC_REPLY || reply->abi != HL_CKPT_STREAM_ABI) return -1;

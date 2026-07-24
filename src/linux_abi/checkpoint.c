@@ -54,6 +54,7 @@
 #include "../host/system.h"
 #include "ckpt_sink_dir.h"    // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
 #include "ckpt_sink_stream.h" // ... and that sink can be an embedder callback on the far side of a socket
+#include "ckpt_source.h"      // restore reads the image back through the symmetric source interface
 
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
@@ -943,6 +944,7 @@ static int ckpt_control_init(void) {
         if (!g_init_hostpid) g_init_hostpid = getpid();
         hl_linux_snapshot_enable(&g_ckpt_snapshot);
     }
+    if (rd && rd[0] && ckpt_source_current() == NULL && ckpt_source_bind(rd) == NULL) return -1;
     if (!d || !d[0]) return 0;
     snprintf(g_ckpt_dir, sizeof g_ckpt_dir, "%s", d);
     // Bind the process-wide checkpoint sink. The sentinel selects the embedder-backed streaming sink; any
@@ -2142,7 +2144,7 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
 static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
     char pf[1200];
     snprintf(pf, sizeof pf, "%s/MANIFEST", dir);
-    if (hl_host_file_load(effective_host_services(), pf, man, sizeof *man) != 0) {
+    if (ckpt_source_load(pf, man, sizeof *man) != 0) {
         fprintf(stderr, "[restore] %s has no MANIFEST (not a complete checkpoint)\n", dir);
         return -1;
     }
@@ -2155,7 +2157,8 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
         return -1;
     }
     uint64_t image_hash, image_files, image_bytes;
-    if (ckpt_image_digest(dir, &image_hash, &image_files, &image_bytes) != 0 ||
+    (void)dir;
+    if (ckpt_source_digest(&image_hash, &image_files, &image_bytes) != 0 ||
         image_hash != man->image_hash || image_files != man->image_files || image_bytes != man->image_bytes) {
         fprintf(stderr, "[restore] checkpoint image integrity mismatch\n");
         return -1;
@@ -2170,7 +2173,7 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
 static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/meta", procdir);
-    if (hl_host_file_load(effective_host_services(), pf, m, sizeof *m) != 0) {
+    if (ckpt_source_load(pf, m, sizeof *m) != 0) {
         fprintf(stderr, "[restore] open %s: %s\n", pf, strerror(errno));
         return -1;
     }
@@ -2249,7 +2252,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
         return -1;
     char records_path[1300];
     snprintf(records_path, sizeof records_path, "%s/fds", procdir);
-    FILE *records = fopen(records_path, "rb");
+    FILE *records = ckpt_source_fopen(records_path);
     if (!records) return -1;
     struct ckpt_fd record;
     int found = 0;
@@ -2259,7 +2262,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
             found = 1;
             break;
         }
-    fclose(records);
+    ckpt_source_fclose(records);
     if (!found) return -1;
     int fd = -1;
     if (record.kind == CKF_FILE) {
@@ -2314,20 +2317,20 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     size_t nmapped = 0;
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/pages", procdir);
-    FILE *f = fopen(pf, "rb");
+    FILE *f = ckpt_source_fopen(pf);
     if (!f) {
         fprintf(stderr, "[restore] open %s: %s\n", pf, strerror(errno));
         return -1;
     }
     if (m->n_regions > SIZE_MAX / (2u * sizeof(*mapped))) {
-        fclose(f);
+        ckpt_source_fclose(f);
         return -1;
     }
     if (m->n_regions != 0) {
         mapped = calloc((size_t)m->n_regions * 2u, sizeof(*mapped));
         topology = calloc((size_t)m->n_regions, sizeof(*topology));
         if (mapped == NULL || topology == NULL) {
-            fclose(f);
+            ckpt_source_fclose(f);
             free(mapped);
             free(topology);
             return -1;
@@ -2390,7 +2393,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         else
             anon_track(reg.addr, reg.len, reg.prot);
     }
-    fclose(f);
+    ckpt_source_fclose(f);
     for (uint64_t i = 0; i < m->n_regions; i++) {
         struct ckpt_region *reg = &topology[i];
         if (reg->backing_object == 0) continue;
@@ -2419,7 +2422,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     g_stack_hi = m->stack_hi;
     return 0;
 fail:
-    fclose(f);
+    ckpt_source_fclose(f);
     free(mapped);
     free(topology);
     return -1;
@@ -2605,11 +2608,11 @@ static void ckpt_restore_socket_seeds_close(void) {
 static int ckpt_restore_file_blob(const char *procdir, const struct ckpt_fd *record) {
     char source_path[1400], temporary[] = "/tmp/hl-checkpoint-file.XXXXXX";
     snprintf(source_path, sizeof source_path, "%s/../%s", procdir, record->path);
-    FILE *source = fopen(source_path, "rb");
+    FILE *source = ckpt_source_fopen(source_path);
     if (!source) return -1;
     int staging = mkstemp(temporary);
     if (staging < 0) {
-        fclose(source);
+        ckpt_source_fclose(source);
         return -1;
     }
     unsigned char buffer[65536];
@@ -2630,7 +2633,7 @@ static int ckpt_restore_file_blob(const char *procdir, const struct ckpt_fd *rec
         if (failed) break;
     }
     if (ferror(source)) failed = 1;
-    fclose(source);
+    ckpt_source_fclose(source);
     if (!failed && fsync(staging) != 0) failed = 1;
     close(staging);
     if (failed) {
@@ -2656,12 +2659,12 @@ static int ckpt_restore_file_blob(const char *procdir, const struct ckpt_fd *rec
 
 static int ckpt_restore_epoll_watches(const char *procdir, const struct ckpt_fd *record) {
     char path[1400];
-    struct stat status;
     snprintf(path, sizeof path, "%s/%s", procdir, record->path);
-    if (stat(path, &status) != 0 || status.st_size < (off_t)sizeof(struct ckpt_epoll_header)) return -1;
-    size_t size = (size_t)status.st_size;
+    int64_t stored = ckpt_source_object_size(path);
+    if (stored < (int64_t)sizeof(struct ckpt_epoll_header)) return -1;
+    size_t size = (size_t)stored;
     unsigned char *image = malloc(size);
-    if (image == NULL || hl_host_file_load(effective_host_services(), path, image, size) != 0) {
+    if (image == NULL || ckpt_source_load(path, image, size) != 0) {
         free(image);
         return -1;
     }
@@ -2764,7 +2767,7 @@ static int ckpt_restore_epoll_watches(const char *procdir, const struct ckpt_fd 
 static int ckpt_restore_inotify_sidecar(const char *procdir) {
     char path[1300];
     snprintf(path, sizeof path, "%s/inotify", procdir);
-    FILE *file = fopen(path, "rb");
+    FILE *file = ckpt_source_fopen(path);
     if (!file) return errno == ENOENT ? 0 : -1;
     uint32_t watches = 0, moves = 0, raw_instances = 0;
     if (ckpt_rd_all(file, &watches, sizeof watches) != 0 || ckpt_rd_all(file, &moves, sizeof moves) != 0 ||
@@ -2855,10 +2858,10 @@ static int ckpt_restore_inotify_sidecar(const char *procdir) {
         int byte = fgetc(file);
         if (byte != EOF) goto fail;
     }
-    fclose(file);
+    ckpt_source_fclose(file);
     return 0;
 fail:
-    fclose(file);
+    ckpt_source_fclose(file);
     return -1;
 }
 
@@ -2867,13 +2870,13 @@ static int ckpt_restore_fds_dir(const char *procdir) {
     static unsigned char desired_pipe[HL_NFD];
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/fds", procdir);
-    FILE *f = fopen(pf, "rb");
+    FILE *f = ckpt_source_fopen(pf);
     if (!f) return 0;
     struct stat record_status;
     if (fstat(fileno(f), &record_status) != 0 || record_status.st_size < 0 ||
         record_status.st_size % (off_t)sizeof *records != 0 ||
         (uint64_t)record_status.st_size / sizeof *records > HL_NFD) {
-        fclose(f);
+        ckpt_source_fclose(f);
         return -1;
     }
     int count = (int)((uint64_t)record_status.st_size / sizeof *records);
@@ -2881,10 +2884,10 @@ static int ckpt_restore_fds_dir(const char *procdir) {
     if (records == NULL || (count != 0 && fread(records, sizeof *records, (size_t)count, f) != (size_t)count) ||
         fgetc(f) != EOF) {
         free(records);
-        fclose(f);
+        ckpt_source_fclose(f);
         return -1;
     }
-    fclose(f);
+    ckpt_source_fclose(f);
     /* A restored child inherits its restorer parent's public eventfd descriptors and process-local routing
      * tables. They are not part of the child's saved fd table merely because the parent owned them. Drop
      * those public copies without closing the inherited hidden writer seeds, then rebuild exactly this
@@ -3185,16 +3188,15 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 } else {
                     char image_path[1400];
                     snprintf(image_path, sizeof image_path, "%s/%s", procdir, r.path);
-                    struct stat image_stat;
-                    if (stat(image_path, &image_stat) != 0 || image_stat.st_size <= 0 ||
-                        (uint64_t)image_stat.st_size > SIZE_MAX) {
+                    int64_t stored = ckpt_source_object_size(image_path);
+                    if (stored <= 0) {
                         fprintf(stderr, "[restore] inotify %d image %s is invalid: %s\n", r.gfd, image_path,
                                 strerror(errno));
                         return -1;
                     }
-                    size_t image_size = (size_t)image_stat.st_size;
+                    size_t image_size = (size_t)stored;
                     void *image = malloc(image_size);
-                    if (image == NULL || hl_host_file_load(effective_host_services(), image_path, image, image_size) != 0) {
+                    if (image == NULL || ckpt_source_load(image_path, image, image_size) != 0) {
                         fprintf(stderr, "[restore] inotify %d cannot load %s\n", r.gfd, image_path);
                         free(image);
                         return -1;
@@ -3425,7 +3427,7 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
     size_t bytes = (size_t)m->n_threads * sizeof(struct cpu);
     size_t file_bytes = sizeof(struct ckpt_cpu_header) + bytes;
     struct ckpt_cpu_header *cpu_file = malloc(file_bytes);
-    if (!cpu_file || hl_host_file_load(effective_host_services(), pf, cpu_file, file_bytes) != 0) {
+    if (!cpu_file || ckpt_source_load(pf, cpu_file, file_bytes) != 0) {
         free(cpu_file);
         fprintf(stderr, "[restore] cannot read cpu state\n");
         return -1;
@@ -3516,25 +3518,26 @@ static struct ckpt_proc *g_rprocs;
 static int g_nrprocs;
 static int g_rprocs_capacity;
 
+// Enumerate the captured process images. This is the restore-side counterpart of the coordinator's group
+// count: the workspace was the only place that recorded "which processes are in this image", and a stream
+// cannot be listed, so the source answers it (an opendir for the directory source, a server query otherwise).
 static int ckpt_scan_procs(const char *base) {
+    char names[64 * 1024];
     g_nrprocs = 0;
-    DIR *d = opendir(base);
-    if (!d) return -1;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (strncmp(e->d_name, "proc.", 5)) continue;
-        if (strstr(e->d_name, ".tmp.")) continue;
-        int gpid = atoi(e->d_name + 5);
+    int listed = ckpt_source_list("proc.", names, sizeof names);
+    if (listed < 0) return -1;
+    const char *cursor = names;
+    for (int index = 0; index < listed; ++index, cursor += strlen(cursor) + 1) {
+        if (strstr(cursor, ".tmp.")) continue;
+        int gpid = atoi(cursor + 5);
         if (gpid <= 0) continue;
         char pd[1200];
-        snprintf(pd, sizeof pd, "%s/%s", base, e->d_name);
+        snprintf(pd, sizeof pd, "%s/%.200s", base, cursor);
         struct ckpt_meta m;
         if (ckpt_read_meta_dir(pd, &m) != 0) continue;
         if (ckpt_vector_reserve((void **)&g_rprocs, &g_rprocs_capacity, sizeof *g_rprocs,
-                                g_nrprocs + 1) != 0) {
-            closedir(d);
+                                g_nrprocs + 1) != 0)
             return -1;
-        }
         g_rprocs[g_nrprocs].gpid = gpid;
         g_rprocs[g_nrprocs].ppid = m.ppid_gpid;
         g_rprocs[g_nrprocs].pgid = m.pgid_gpid;
@@ -3543,7 +3546,6 @@ static int ckpt_scan_procs(const char *base) {
         g_rprocs[g_nrprocs].reason[0] = 0;
         g_nrprocs++;
     }
-    closedir(d);
     return g_nrprocs > 0 ? 0 : -1;
 }
 
@@ -3633,11 +3635,11 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
                                       const struct ckpt_fd *socket_record) {
     char path[1400];
     snprintf(path, sizeof path, "%s/%s", base, socket_record->path);
-    FILE *queue = fopen(path, "rb");
+    FILE *queue = ckpt_source_fopen(path);
     if (!queue) return -1;
     struct ckpt_socket_queue_header header;
     if (ckpt_rd_all(queue, &header, sizeof header) != 0 || header.magic != CKPT_SOCKET_QUEUE_MAGIC) {
-        fclose(queue);
+        ckpt_source_fclose(queue);
         return -1;
     }
     for (;;) {
@@ -3645,7 +3647,7 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
         size_t received = fread(&frame, 1, sizeof frame, queue);
         if (received == 0 && feof(queue)) break;
         if (received != sizeof frame || frame.size > (1u << 20) || frame.rights_count > 253) {
-            fclose(queue);
+            ckpt_source_fclose(queue);
             return -1;
         }
         unsigned char payload[4096];
@@ -3653,7 +3655,7 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
         while (remaining != 0) {
             size_t chunk = remaining < sizeof payload ? remaining : sizeof payload;
             if (ckpt_rd_all(queue, payload, chunk) != 0) {
-                fclose(queue);
+                ckpt_source_fclose(queue);
                 return -1;
             }
             remaining -= (uint32_t)chunk;
@@ -3661,7 +3663,7 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             struct ckpt_fd right;
             if (ckpt_rd_all(queue, &right, sizeof right) != 0) {
-                fclose(queue);
+                ckpt_source_fclose(queue);
                 return -1;
             }
             const char *outcome = !process->viable ? "stopped" :
@@ -3674,7 +3676,7 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
             fputs("}\n", report);
         }
     }
-    fclose(queue);
+    ckpt_source_fclose(queue);
     return 0;
 }
 
@@ -3694,7 +3696,7 @@ static int ckpt_recovery_report(const char *base, int policy) {
         fputs("}\n", file);
         char fd_path[1300];
         snprintf(fd_path, sizeof fd_path, "%s/proc.%d/fds", base, process->gpid);
-        FILE *fds = fopen(fd_path, "rb");
+        FILE *fds = ckpt_source_fopen(fd_path);
         if (fds) {
             struct ckpt_fd record;
             while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
@@ -3708,17 +3710,17 @@ static int ckpt_recovery_report(const char *base, int policy) {
                 ckpt_json_string(file, (record.kind == CKF_FILE || record.kind == CKF_DEVICE) ? record.path : "");
                 fputs("}\n", file);
                 if (record.kind == CKF_SOCKETPAIR && ckpt_recovery_report_queue(file, base, process, &record) != 0) {
-                    fclose(fds);
-                    fclose(file);
+                    ckpt_source_fclose(fds);
+                    ckpt_source_fclose(file);
                     unlink(temporary);
                     return -1;
                 }
             }
-            fclose(fds);
+            ckpt_source_fclose(fds);
         }
     }
     if (ckpt_close_sync(&file) != 0 || rename(temporary, published) != 0 || ckpt_sync_dir(base) != 0) {
-        if (file) fclose(file);
+        if (file) ckpt_source_fclose(file);
         unlink(temporary);
         return -1;
     }
@@ -3736,21 +3738,21 @@ static int ckpt_validate_process_image(const char *base, const struct ckpt_proc 
         return -1;
 
     snprintf(path, sizeof path, "%s/pages", procdir);
-    FILE *pages = fopen(path, "rb");
+    FILE *pages = ckpt_source_fopen(path);
     if (!pages) return -1;
     for (uint64_t index = 0; index < meta->n_regions; ++index) {
         struct ckpt_region region;
         if (ckpt_rd_all(pages, &region, sizeof region) != 0 || region.addr == 0 || region.len == 0 ||
             region.addr > UINT64_MAX - region.len || region.glen > region.len ||
             region.npages > (region.len - 1) / meta->pagesz + 1) {
-            fclose(pages);
+            ckpt_source_fclose(pages);
             return -1;
         }
         for (uint64_t page = 0; page < region.npages; ++page) {
             uint64_t address;
             if (ckpt_rd_all(pages, &address, sizeof address) != 0 || address < region.addr ||
                 address >= region.addr + region.len || (address - region.addr) % meta->pagesz != 0) {
-                fclose(pages);
+                ckpt_source_fclose(pages);
                 return -1;
             }
             uint64_t remaining = region.addr + region.len - address;
@@ -3759,7 +3761,7 @@ static int ckpt_validate_process_image(const char *base, const struct ckpt_proc 
             while (size != 0) {
                 size_t chunk = size < sizeof buffer ? size : sizeof buffer;
                 if (ckpt_rd_all(pages, buffer, chunk) != 0) {
-                    fclose(pages);
+                    ckpt_source_fclose(pages);
                     return -1;
                 }
                 size -= chunk;
@@ -3767,7 +3769,7 @@ static int ckpt_validate_process_image(const char *base, const struct ckpt_proc 
         }
     }
     int trailing = fgetc(pages);
-    fclose(pages);
+    ckpt_source_fclose(pages);
     if (trailing != EOF) return -1;
 
     struct cpu *images = NULL, leader;
@@ -3779,19 +3781,19 @@ static int ckpt_validate_process_image(const char *base, const struct ckpt_proc 
     free(images);
 
     snprintf(path, sizeof path, "%s/fds", procdir);
-    FILE *fds = fopen(path, "rb");
+    FILE *fds = ckpt_source_fopen(path);
     if (!fds) return -1;
     uint64_t descriptors = 0;
     struct ckpt_fd record;
     while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
         if (record.gfd < 0 || record.gfd >= HL_NFD || record.kind < CKF_TTY || record.kind > CKF_DEVICE) {
-            fclose(fds);
+            ckpt_source_fclose(fds);
             return -1;
         }
         descriptors++;
     }
     int valid_fds = feof(fds) && descriptors == meta->n_fds;
-    fclose(fds);
+    ckpt_source_fclose(fds);
     return valid_fds ? 0 : -1;
 }
 
@@ -3816,11 +3818,11 @@ static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *s
                                        struct ckpt_fd *unavailable) {
     char path[1400];
     snprintf(path, sizeof path, "%s/%s", base, socket_record->path);
-    FILE *file = fopen(path, "rb");
+    FILE *file = ckpt_source_fopen(path);
     if (!file) return -1;
     struct ckpt_socket_queue_header header;
     if (ckpt_rd_all(file, &header, sizeof header) != 0 || header.magic != CKPT_SOCKET_QUEUE_MAGIC) {
-        fclose(file);
+        ckpt_source_fclose(file);
         return -1;
     }
     for (;;) {
@@ -3828,7 +3830,7 @@ static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *s
         size_t received = fread(&frame, 1, sizeof frame, file);
         if (received == 0 && feof(file)) break;
         if (received != sizeof frame || frame.size > (1u << 20) || frame.rights_count > 253) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
         unsigned char payload[4096];
@@ -3836,7 +3838,7 @@ static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *s
         while (remaining != 0) {
             size_t chunk = remaining < sizeof payload ? remaining : sizeof payload;
             if (ckpt_rd_all(file, payload, chunk) != 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             remaining -= (uint32_t)chunk;
@@ -3844,17 +3846,17 @@ static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *s
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             struct ckpt_fd right;
             if (ckpt_rd_all(file, &right, sizeof right) != 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             if (ckpt_external_unavailable(&right)) {
                 *unavailable = right;
-                fclose(file);
+                ckpt_source_fclose(file);
                 return 1;
             }
         }
     }
-    fclose(file);
+    ckpt_source_fclose(file);
     return 0;
 }
 
@@ -3868,7 +3870,7 @@ static int ckpt_restore_preflight(const char *base, int policy) {
         }
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, process->gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) {
             ckpt_process_stop(process, "descriptor image is missing");
             continue;
@@ -3896,7 +3898,7 @@ static int ckpt_restore_preflight(const char *base, int policy) {
             }
         }
         if (!feof(file) && process->viable) ckpt_process_stop(process, "descriptor image is corrupt");
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     struct ckpt_proc *root = ckpt_proc_find(1);
     int stopped = 0;
@@ -3921,7 +3923,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
@@ -3931,7 +3933,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
             if (!pipe) {
                 if (ckpt_vector_reserve((void **)&g_restore_pipes, &g_restore_pipes_capacity,
                                         sizeof *g_restore_pipes, g_nrestore_pipes + 1) != 0) {
-                    fclose(file);
+                    ckpt_source_fclose(file);
                     return -1;
                 }
                 pipe = &g_restore_pipes[g_nrestore_pipes++];
@@ -3941,10 +3943,10 @@ static int ckpt_prepare_restore_pipes(const char *base) {
             if (size > pipe->size) pipe->size = size;
         }
         if (!feof(file)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     for (int i = 0; i < g_nrestore_pipes; i++) {
         char data_path[1300];
@@ -3972,7 +3974,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
         if (flags < 0 || fcntl(writer, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
         snprintf(data_path, sizeof data_path, "%s/pipe.%016llx", base,
                  (unsigned long long)g_restore_pipes[i].identity);
-        FILE *data = fopen(data_path, "rb");
+        FILE *data = ckpt_source_fopen(data_path);
         if (!data) continue;
         unsigned char buffer[65536];
         size_t count;
@@ -3985,15 +3987,15 @@ static int ckpt_prepare_restore_pipes(const char *base) {
                     continue;
                 }
                 if (written < 0 && errno == EINTR) continue;
-                fclose(data);
+                ckpt_source_fclose(data);
                 return -1;
             }
         }
         if (ferror(data)) {
-            fclose(data);
+            ckpt_source_fclose(data);
             return -1;
         }
-        fclose(data);
+        ckpt_source_fclose(data);
     }
     return 0;
 }
@@ -4024,14 +4026,12 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
     if (record->kind == CKF_INOTIFY) {
         char image_path[1400];
         snprintf(image_path, sizeof image_path, "%s/%s", base, record->path);
-        struct stat image_status;
-        if (g_linux_box == NULL || stat(image_path, &image_status) != 0 || image_status.st_size <= 0 ||
-            (uint64_t)image_status.st_size > 64u * 1024u * 1024u)
-            return -1;
-        size_t size = (size_t)image_status.st_size;
+        int64_t stored = ckpt_source_object_size(image_path);
+        if (g_linux_box == NULL || stored <= 0 || (uint64_t)stored > 64u * 1024u * 1024u) return -1;
+        size_t size = (size_t)stored;
         void *image = malloc(size);
         int shadow = bound_shadow_reserve(0);
-        if (image == NULL || shadow < 0 || hl_host_file_load(effective_host_services(), image_path, image, size) != 0) {
+        if (image == NULL || shadow < 0 || ckpt_source_load(image_path, image, size) != 0) {
             free(image);
             if (shadow >= 0) close(shadow);
             return -1;
@@ -4095,7 +4095,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
             *object = (struct ckpt_restore_signalfd){record->object_id, record->auxiliary, reader, writer};
             char queue_path[1300];
             snprintf(queue_path, sizeof queue_path, "%s/%s", base, record->path);
-            FILE *queue = fopen(queue_path, "rb");
+            FILE *queue = ckpt_source_fopen(queue_path);
             if (queue != NULL) {
                 unsigned char bytes[4096];
                 size_t count;
@@ -4106,16 +4106,16 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
                         if (written > 0) offset += (size_t)written;
                         else if (written < 0 && errno == EINTR) continue;
                         else {
-                            fclose(queue);
+                            ckpt_source_fclose(queue);
                             return -1;
                         }
                     }
                 }
                 if (ferror(queue)) {
-                    fclose(queue);
+                    ckpt_source_fclose(queue);
                     return -1;
                 }
-                fclose(queue);
+                ckpt_source_fclose(queue);
             }
         } else if (object->mask != record->auxiliary) {
             return -1;
@@ -4161,7 +4161,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
             if (writer_flags < 0 || fcntl(pipe_object->writer, F_SETFL, writer_flags | O_NONBLOCK) != 0) return -1;
             char data_path[1300];
             snprintf(data_path, sizeof data_path, "%s/pipe.%016llx", base, (unsigned long long)identity);
-            FILE *data = fopen(data_path, "rb");
+            FILE *data = ckpt_source_fopen(data_path);
             if (data != NULL) {
                 unsigned char buffer[65536];
                 size_t count;
@@ -4172,16 +4172,16 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
                         if (written > 0) offset += (size_t)written;
                         else if (written < 0 && errno == EINTR) continue;
                         else {
-                            fclose(data);
+                            ckpt_source_fclose(data);
                             return -1;
                         }
                     }
                 }
                 if (ferror(data)) {
-                    fclose(data);
+                    ckpt_source_fclose(data);
                     return -1;
                 }
-                fclose(data);
+                ckpt_source_fclose(data);
             }
         }
         fd = ((record->flags & O_ACCMODE) == O_WRONLY) ? pipe_object->writer : pipe_object->reader;
@@ -4359,18 +4359,18 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
 static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_socket_endpoint *endpoint) {
     char path[1300];
     snprintf(path, sizeof path, "%s/socket.%016llx", base, (unsigned long long)endpoint->identity);
-    FILE *file = fopen(path, "rb");
+    FILE *file = ckpt_source_fopen(path);
     if (!file) return errno == ENOENT ? 0 : -1;
     struct ckpt_socket_queue_header header;
     if (ckpt_rd_all(file, &header, sizeof header) != 0 || header.magic != CKPT_SOCKET_QUEUE_MAGIC ||
         header.type != (uint32_t)endpoint->type) {
-        fclose(file);
+        ckpt_source_fclose(file);
         return -1;
     }
     endpoint->peer_closed = header.peer_closed != 0;
     struct ckpt_restore_socket_endpoint *peer = ckpt_restore_socket_find(endpoint->peer_identity);
     if (peer == NULL || peer->fd < 0) {
-        fclose(file);
+        ckpt_source_fclose(file);
         return -1;
     }
     for (;;) {
@@ -4378,13 +4378,13 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
         size_t frame_bytes = fread(&frame, 1, sizeof frame, file);
         if (frame_bytes == 0 && feof(file)) break;
         if (frame_bytes != sizeof frame || ferror(file) || frame.rights_count > 253 || frame.size > (1u << 20)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
         unsigned char *payload = malloc(frame.size ? frame.size : 1u);
         if (payload == NULL || (frame.size != 0 && fread(payload, 1, frame.size, file) != frame.size)) {
             free(payload);
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
         struct ckpt_fd rights[253];
@@ -4392,14 +4392,14 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
         if (frame.rights_count != 0 &&
             fread(rights, sizeof rights[0], frame.rights_count, file) != frame.rights_count) {
             free(payload);
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             right_fds[index] = ckpt_restore_right_prepare(base, &rights[index]);
             if (right_fds[index] < 0) {
                 free(payload);
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
         }
@@ -4415,7 +4415,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     struct ckpt_restore_eventfd *eventfd = ckpt_restore_eventfd_find(rights[index].object_id);
                     if (eventfd == NULL || combo_count + 2 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     struct hl_cmsg_eventfd_meta metadata = {
@@ -4429,13 +4429,13 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     if (writer_flags < 0 || fcntl(eventfd->writer, F_SETFL, writer_flags | O_NONBLOCK) != 0 ||
                         fcntl(eventfd->writer, F_SETFD, FD_CLOEXEC) != 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     int marker = cmsg_eventfd_marker(&metadata);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = eventfd->writer;
@@ -4446,7 +4446,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     if (timerfd == NULL || timerfd->state == NULL ||
                         combo_count + 1 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     struct hl_cmsg_timerfd_meta metadata = {
@@ -4469,14 +4469,14 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     int placeholder = cmsg_timerfd_marker(&placeholder_metadata);
                     if (placeholder < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[index] = placeholder;
                     int marker = cmsg_timerfd_marker(&metadata);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = marker;
@@ -4485,7 +4485,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     uint64_t identity = (uint64_t)rights[index].offset;
                     if (!identity || combo_count + 1 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     struct hl_cmsg_pipe_meta metadata = {
@@ -4497,7 +4497,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     int marker = cmsg_pipe_marker(&metadata);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = marker;
@@ -4506,7 +4506,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     struct ckpt_restore_signalfd *object = ckpt_restore_signalfd_find(rights[index].object_id);
                     if (object == NULL || combo_count + 2 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     struct hl_cmsg_signalfd_meta metadata = {
@@ -4519,7 +4519,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     int marker = cmsg_signalfd_marker(&metadata);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = object->writer;
@@ -4528,7 +4528,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                 if (rights[index].kind == CKF_INOTIFY) {
                     if (combo_count + 1 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     struct hl_cmsg_kqueue_meta metadata = {
@@ -4544,14 +4544,14 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                     int placeholder = cmsg_kqueue_placeholder();
                     if (placeholder < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[index] = placeholder;
                     int marker = cmsg_kqueue_marker(&metadata);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = marker;
@@ -4559,20 +4559,20 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                 if (rights[index].kind == CKF_EPOLL) {
                     if (combo_count + 1 > (int)(sizeof combo / sizeof combo[0])) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     int placeholder = cmsg_kqueue_placeholder();
                     if (placeholder < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[index] = placeholder;
                     int marker = ckpt_restore_epoll_marker(base, &rights[index], index);
                     if (marker < 0) {
                         free(payload);
-                        fclose(file);
+                        ckpt_source_fclose(file);
                         return -1;
                     }
                     combo[combo_count++] = marker;
@@ -4582,7 +4582,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                 if (combo_count == (int)(sizeof combo / sizeof combo[0])) {
                     cmsg_tmpfds_close();
                     free(payload);
-                    fclose(file);
+                    ckpt_source_fclose(file);
                     return -1;
                 }
                 struct hl_cmsg_ofd_meta metadata = {
@@ -4592,7 +4592,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                 if (marker < 0) {
                     cmsg_tmpfds_close();
                     free(payload);
-                    fclose(file);
+                    ckpt_source_fclose(file);
                     return -1;
                 }
                 combo[combo_count++] = marker;
@@ -4621,7 +4621,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                         (unsigned long long)endpoint->identity, frame.rights_count, frame.size,
                         (long long)sent, strerror(errno));
                 free(payload);
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             offset = (size_t)sent;
@@ -4633,7 +4633,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
             } while (sent < 0 && errno == EINTR);
             if (sent < 0) {
                 free(payload);
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
         }
@@ -4645,12 +4645,12 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
             }
             if (sent < 0 && errno == EINTR) continue;
             free(payload);
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
         free(payload);
     }
-    fclose(file);
+    ckpt_source_fclose(file);
     return 0;
 }
 
@@ -4676,7 +4676,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
@@ -4684,7 +4684,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
             struct ckpt_restore_socket_endpoint *endpoint = ckpt_restore_socket_find(record.object_id);
             if (endpoint != NULL) {
                 if (endpoint->peer_identity != record.auxiliary || endpoint->type != record.offset) {
-                    fclose(file);
+                    ckpt_source_fclose(file);
                     return -1;
                 }
                 endpoint->guest_present = 1;
@@ -4694,7 +4694,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
                 (record.offset != SOCK_STREAM && record.offset != SOCK_DGRAM && record.offset != SOCK_SEQPACKET) ||
                 ckpt_vector_reserve((void **)&g_restore_socket_endpoints, &g_restore_socket_endpoints_capacity,
                                     sizeof *g_restore_socket_endpoints, g_nrestore_socket_endpoints + 1) != 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             endpoint = &g_restore_socket_endpoints[g_nrestore_socket_endpoints++];
@@ -4705,19 +4705,19 @@ static int ckpt_prepare_restore_sockets(const char *base) {
             char state_path[1400];
             snprintf(state_path, sizeof state_path, "%s/socket-state.%016llx", base,
                      (unsigned long long)record.object_id);
-            if (hl_host_file_load(effective_host_services(), state_path, &endpoint->state,
+            if (ckpt_source_load(state_path, &endpoint->state,
                                   sizeof endpoint->state) != 0 || endpoint->state.magic != CKPT_SOCKET_STATE_MAGIC ||
                 endpoint->state.local_size > sizeof endpoint->state.local) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             endpoint->state_loaded = 1;
         }
         if (!feof(file)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     for (int index = 0; index < g_nrestore_socket_endpoints; ++index) {
         struct ckpt_restore_socket_endpoint *endpoint = &g_restore_socket_endpoints[index];
@@ -4805,7 +4805,7 @@ static int ckpt_prepare_restore_socket_states(const char *base) {
     for (int process = 0; process < g_nrprocs; ++process) {
         char records_path[1300];
         snprintf(records_path, sizeof records_path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *records = fopen(records_path, "rb");
+        FILE *records = ckpt_source_fopen(records_path);
         if (!records) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(records, &record, sizeof record) == 0) {
@@ -4813,24 +4813,24 @@ static int ckpt_prepare_restore_socket_states(const char *base) {
             if (!record.object_id ||
                 ckpt_vector_reserve((void **)&g_restore_sockets, &g_restore_sockets_capacity,
                                     sizeof *g_restore_sockets, g_nrestore_sockets + 1) != 0) {
-                fclose(records);
+                ckpt_source_fclose(records);
                 return -1;
             }
             struct ckpt_restore_socket *socket_state = &g_restore_sockets[g_nrestore_sockets++];
             *socket_state = (struct ckpt_restore_socket){.identity = record.object_id, .fd = -1};
             char state_path[1400];
             snprintf(state_path, sizeof state_path, "%s/%s", base, record.path);
-            if (hl_host_file_load(effective_host_services(), state_path, &socket_state->state,
+            if (ckpt_source_load(state_path, &socket_state->state,
                                   sizeof socket_state->state) != 0 ||
                 socket_state->state.magic != CKPT_SOCKET_STATE_MAGIC ||
                 socket_state->state.local_size > sizeof socket_state->state.local)
                 return -1;
         }
         if (!feof(records)) {
-            fclose(records);
+            ckpt_source_fclose(records);
             return -1;
         }
-        fclose(records);
+        ckpt_source_fclose(records);
     }
     for (int index = 0; index < g_nrestore_sockets; ++index) {
         struct ckpt_restore_socket *saved = &g_restore_sockets[index];
@@ -4900,7 +4900,7 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
@@ -4909,7 +4909,7 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
             if (object) {
                 if (object->count != record.auxiliary || object->semaphore != (record.offset != 0) ||
                     object->guest_nonblock != ((record.flags & O_NONBLOCK) != 0)) {
-                    fclose(file);
+                    ckpt_source_fclose(file);
                     return -1;
                 }
                 continue;
@@ -4917,7 +4917,7 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
             if (!record.object_id ||
                 ckpt_vector_reserve((void **)&g_restore_eventfds, &g_restore_eventfds_capacity,
                                     sizeof *g_restore_eventfds, g_nrestore_eventfds + 1) != 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             object = &g_restore_eventfds[g_nrestore_eventfds++];
@@ -4931,15 +4931,15 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
                 .guest_nonblock = (record.flags & O_NONBLOCK) != 0,
             };
             if (object->slot < 0 || object->slot >= HL_NFD) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
         }
         if (!feof(file)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     for (int i = 0; i < g_nrestore_eventfds; i++) {
         int pair[2];
@@ -4978,21 +4978,21 @@ static int ckpt_prepare_restore_signalfds(const char *base) {
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
             if (record.kind != CKF_SIGNALFD || ckpt_restore_signalfd_find(record.object_id)) continue;
             if (ckpt_restore_right_prepare(base, &record) < 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
         }
         if (!feof(file)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     g_nrestore_rights = 0;
     return 0;
@@ -5003,7 +5003,7 @@ static int ckpt_prepare_restore_timerfds(const char *base) {
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
-        FILE *file = fopen(path, "rb");
+        FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
@@ -5011,7 +5011,7 @@ static int ckpt_prepare_restore_timerfds(const char *base) {
             if (!record.object_id ||
                 ckpt_vector_reserve((void **)&g_restore_timerfds, &g_restore_timerfds_capacity,
                                     sizeof *g_restore_timerfds, g_nrestore_timerfds + 1) != 0) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             int clock_id = 0;
@@ -5019,13 +5019,13 @@ static int ckpt_prepare_restore_timerfds(const char *base) {
             unsigned long long pending = 0;
             long long captured_ns = 0;
             if (sscanf(record.path, "%d %llu %u %lld", &clock_id, &pending, &first, &captured_ns) != 4) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             struct timerfd_shared_state *state = mmap(NULL, sizeof *state, PROT_READ | PROT_WRITE,
                                                        MAP_ANON | MAP_SHARED, -1, 0);
             if (state == MAP_FAILED) {
-                fclose(file);
+                ckpt_source_fclose(file);
                 return -1;
             }
             memset(state, 0, sizeof *state);
@@ -5059,10 +5059,10 @@ static int ckpt_prepare_restore_timerfds(const char *base) {
             };
         }
         if (!feof(file)) {
-            fclose(file);
+            ckpt_source_fclose(file);
             return -1;
         }
-        fclose(file);
+        ckpt_source_fclose(file);
     }
     return 0;
 }
@@ -5185,6 +5185,12 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
 // FIRST (before engine init, so MAP_FIXED lands on free VAs), then re-forks the tree.
 static int ckpt_restore_tree(const char *rootfs, const char *dir) {
     struct ckpt_manifest man;
+    // Bind the image source before anything is read. The sentinel selects the embedder-backed source; every
+    // re-forked child inherits this binding, exactly as it inherited the workspace path.
+    if (ckpt_source_bind(dir) == NULL) {
+        fprintf(stderr, "[restore] streaming restore requested without a broker descriptor\n");
+        return 2;
+    }
     if (ckpt_read_manifest(dir, &man) != 0) return 2;
     if (ckpt_scan_procs(dir) != 0) {
         fprintf(stderr, "[restore] no processes found in %s\n", dir);
