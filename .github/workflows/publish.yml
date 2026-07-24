@@ -50,6 +50,14 @@ jobs:
           fi
           test "$requested" = "$version"
 
+      # Last gate before the bytes leave the building. `cargo publish` ships the
+      # committed archives under pkgs/rust/assets/lib/ verbatim; it never
+      # compiles src/. If those archives have fallen behind include/hl/config.h
+      # the crate still builds and links, and only fails when a user launches a
+      # guest — which is how ABI-9 archives reached 0.1.17 through 0.1.26.
+      - name: Verify the archives about to be published launch a guest
+        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
+
       - name: Publish Rust crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

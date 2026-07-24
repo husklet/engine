@@ -106,6 +106,16 @@ jobs:
       - name: Package Rust crate
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
+      # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/
+      # links. It is the artifact `cargo publish` ships, and an ABI mismatch
+      # between it and include/hl/config.h is a *runtime* rejection, so linking
+      # succeeds while every guest launch fails. Releases 0.1.17-0.1.26 shipped an
+      # ABI-9 archive against an ABI-13 encoder for exactly that reason. Running
+      # the crate's tests here launches a guest through the committed archive.
+      - name: Test Rust crate against the committed archive
+        timeout-minutes: 25
+        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
+
   # Runtime compatibility, sharded across parallel runners. This used to be one
   # step inside `linux` running `test-linux-production-typed`, i.e. every suite
   # sequentially in a single job. Each bucket runs the same `typed-<suite>`

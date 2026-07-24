@@ -174,6 +174,8 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         hl_engine::spec::SpecErrorCategory::Invalid
     );
 
+    // The whole-container checkpoint format is architecture independent, so an
+    // x86_64 guest accepts a restore directory on the same terms as aarch64.
     let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
     value.checkpoint.enabled = true;
     value.checkpoint.restore_directory = Some("/tmp/restore".into());

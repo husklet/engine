@@ -15,6 +15,15 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 
 const MAGIC: u32 = 0x484c_4346;
 const ABI: u32 = 13;
+
+/// The launch ABI this crate encodes, as declared by `include/hl/config.h`.
+///
+/// Exposed so a test can compare it against both the C header and the archive
+/// committed under `assets/lib/`, which is what `cargo publish` ships.
+#[must_use]
+pub const fn launch_abi() -> u32 {
+    ABI
+}
 const HEADER_SIZE: usize = 200;
 const HEADER_SIZE_U32: u32 = 200;
 const MAGIC_OFFSET: usize = 0;
