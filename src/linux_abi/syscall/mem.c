@@ -353,6 +353,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
+        // A zero new_len is never legal (Linux mm/mremap.c: `if (!new_len) return -EINVAL;`). The engine
+        // had no check and fell into the shrink path, unmapping the whole source and reporting success.
+        if ((uint64_t)a2 == 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         if (a1 && !hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
