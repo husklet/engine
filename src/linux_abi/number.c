@@ -7,33 +7,34 @@
 
 static uint64_t x86_number(uint64_t nr) {
     switch (nr) {
-    case 0: return 63;                              // read
-    case 1: return 64;                              // write
-    case 3: return 57;                              // close
-    case 5: return 80;                              // fstat
-    case 8: return 62;                              // lseek
-    case 9: return 222;                             // mmap
-    case 10: return 226;                            // mprotect
-    case 11: return 215;                            // munmap
-    case 12: return 214;                            // brk
-    case 13: return 134;                            // rt_sigaction
-    case 14: return 135;                            // rt_sigprocmask
-    case 15: return 139;                            // rt_sigreturn
-    case 16: return 29;                             // ioctl
-    case 17: return 67;                             // pread64
-    case 18: return 68;                             // pwrite64
-    case 19: return 65;                             // readv
-    case 20: return 66;                             // writev
-    case 24: return 124;                            // sched_yield
-    case 25: return 216;                            // mremap
-    case 26: return 227;                            // msync
-    case 27: return 232;                            // mincore
-    case 28: return 233;                            // madvise
-    case 29: return 194;                            // shmget
-    case 30: return 196;                            // shmat
-    case 31: return 195;                            // shmctl
-    case 32: return 23;                             // dup
-    case 33: return 24;                             // dup2 -> canonical dup3 (the legacy rewrite in
+    case 0: return 63;   // read
+    case 1: return 64;   // write
+    case 3: return 57;   // close
+    case 5: return 80;   // fstat
+    case 8: return 62;   // lseek
+    case 9: return 222;  // mmap
+    case 10: return 226; // mprotect
+    case 11: return 215; // munmap
+    case 12: return 214; // brk
+    case 13: return 134; // rt_sigaction
+    case 14: return 135; // rt_sigprocmask
+    case 15: return 139; // rt_sigreturn
+    case 16: return 29;  // ioctl
+    case 17: return 67;  // pread64
+    case 18: return 68;  // pwrite64
+    case 19: return 65;  // readv
+    case 20: return 66;  // writev
+    case 24: return 124; // sched_yield
+    case 25: return 216; // mremap
+    case 26: return 227; // msync
+    case 27: return 232; // mincore
+    case 28: return 233; // madvise
+    case 29: return 194; // shmget
+    case 30: return 196; // shmat
+    case 31: return 195; // shmctl
+    case 32: return 23;  // dup
+    case 33:
+        return 24;                                  // dup2 -> canonical dup3 (the legacy rewrite in
                                                     // translator/guest/x86_64/legacy.c turns dup2 into dup3;
                                                     // report it as canonical 24 so the shared post-dispatch
                                                     // fd-publish switch (case 24) registers the target fd in
