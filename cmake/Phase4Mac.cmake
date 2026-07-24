@@ -135,6 +135,20 @@ set_target_properties(mac-dual-backend-link-test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/macos-aarch64)
 hl_codesign(mac-dual-backend-link-test)
 
+# `make test-dual-backend` (Makefile 1708): one process force-loading the dual
+# archive, launching both guest ISAs plus the exit70 / spin / output guests, to
+# prove the two backends coexist in a single embedder.
+add_test(NAME dual-backend.mac-link
+  COMMAND $<TARGET_FILE:mac-dual-backend-link-test>
+          ${CMAKE_BINARY_DIR}/e2e/guest-exit-aarch64
+          ${CMAKE_BINARY_DIR}/e2e/guest-exit-x86_64
+          ${CMAKE_BINARY_DIR}/e2e/guest-exit70-aarch64
+          ${CMAKE_BINARY_DIR}/e2e/guest-exit70-x86_64
+          ${CMAKE_BINARY_DIR}/e2e/guest-spin-aarch64
+          ${CMAKE_BINARY_DIR}/e2e/guest-output-aarch64)
+set_tests_properties(dual-backend.mac-link PROPERTIES
+  LABELS "embedding" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # --- mac host-service unit tests -------------------------------------------
 # These open "/", "/tmp" and resolve localhost DNS, so they are NOT part of the
 # sandboxed `unit` lane; they get their own label and a per-test timeout so a
@@ -246,3 +260,90 @@ add_test(NAME e2e.bridge-jobserver
 set_tests_properties(e2e.bridge-jobserver PROPERTIES
   LABELS "e2e;e2e-mac" RESOURCE_LOCK hl-mac-bridge
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ===========================================================================
+# perf-macos (Makefile 2579)
+# ===========================================================================
+# Same case list and same perf-runner invocation as the Linux lane, but with
+# the macOS thresholds (PERF_MAC_LIMIT_*) and the macOS production engines.
+# The --host-os/--host-release/--host-arch triple is what perf-runner records
+# in its report; the Makefile fills it from `$(MAC) uname`, which on a macOS
+# host is a plain local uname -- exactly what CMake already knows.
+# The sample counts live in the Linux-guarded section of Phase3Gates.cmake, so
+# on a Darwin configure they are not set yet. Same defaults, same cache names.
+set(HL_PERF_WARMUPS 3     CACHE STRING "perf warmup iterations")
+set(HL_PERF_SAMPLES 25    CACHE STRING "perf samples")
+set(HL_PERF_HEAVY_SAMPLES 7 CACHE STRING "perf samples for heavy cases")
+set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
+
+set(PERF_MAC_LIMIT_startup         30000 25000)
+set(PERF_MAC_LIMIT_compute         750000 650000)
+set(PERF_MAC_LIMIT_syscall-startup 40000 30000)
+set(PERF_MAC_LIMIT_syscall-1m      100000 80000)
+set(PERF_MAC_LIMIT_fork-stress     8000000 7000000)
+set(PERF_MAC_LIMIT_mmap            150000 120000)
+set(PERF_MAC_LIMIT_file            100000 80000)
+set(PERF_MAC_LIMIT_pipe            300000 250000)
+set(PERF_MAC_LIMIT_event           350000 300000)
+set(PERF_MAC_LIMIT_ipc-latency     200000 150000)
+set(PERF_MAC_LIMIT_ipc-throughput  100000 80000)
+set(PERF_MAC_LIMIT_translation     50000 40000)
+set(PERF_MAC_LIMIT_warm-cache      750000 650000)
+
+set(_HL_MAC_UNAME --host-os ${CMAKE_HOST_SYSTEM_NAME}
+                  --host-release ${CMAKE_HOST_SYSTEM_VERSION}
+                  --host-arch ${CMAKE_HOST_SYSTEM_PROCESSOR})
+
+# hl_perf_mac(<case> <arch> <warmups> <samples> <payload> <expect-status>)
+function(hl_perf_mac case arch warmups samples payload expect)
+  list(GET PERF_MAC_LIMIT_${case} 0 _cold)
+  list(GET PERF_MAC_LIMIT_${case} 1 _p99)
+  add_test(NAME perf.mac-${case}-${arch}
+    COMMAND $<TARGET_FILE:perf-runner> --label ${case}-${arch} ${_HL_MAC_UNAME}
+            --warmups ${warmups} --samples ${samples} --expect ${expect}
+            --max-cold-us ${_cold} --max-p99-us ${_p99} --
+            ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${arch} ${payload})
+  set_tests_properties(perf.mac-${case}-${arch} PROPERTIES
+    LABELS "perf;perf-macos" RUN_SERIAL TRUE TIMEOUT 1800
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endfunction()
+
+set(_MC ${CMAKE_BINARY_DIR}/compat)
+set(_MP ${CMAKE_BINARY_DIR}/perf)
+foreach(_arch aarch64 x86_64)
+  hl_perf_mac(startup ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES}
+              ${CMAKE_BINARY_DIR}/e2e/guest-exit-${_arch} 42)
+  hl_perf_mac(compute ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_HEAVY_SAMPLES}
+              ${_MC}/core/workload/${_arch}/busyloop 0)
+  hl_perf_mac(syscall-startup ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES}
+              ${_MC}/syscall/${_arch}/gettid 0)
+  hl_perf_mac(syscall-1m ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_HEAVY_SAMPLES}
+              ${_MP}/syscall-${_arch} 0)
+  hl_perf_mac(fork-stress ${_arch} 1 ${HL_PERF_HEAVY_SAMPLES}
+              ${_MC}/process/${_arch}/forkstorm 0)
+  hl_perf_mac(translation ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES}
+              ${_MP}/translate-${_arch} 0)
+  foreach(_op mmap file pipe event ipc-latency ipc-throughput)
+    hl_perf_mac(${_op} ${_arch} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES}
+                ${_MP}/${_op}-${_arch} 0)
+  endforeach()
+
+  # warm-cache: a persistent code-cache directory, wiped first (Makefile
+  # HL_PERF_CACHE_MAC). Two ordered steps, so it goes through RunSequence.
+  list(GET PERF_MAC_LIMIT_warm-cache 0 _wc_cold)
+  list(GET PERF_MAC_LIMIT_warm-cache 1 _wc_p99)
+  add_test(NAME perf.mac-warm-cache-${_arch}
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E rm -rf ${_MP}/cache-warm-mac-${_arch}"
+      "-DCMD1=$<TARGET_FILE:perf-runner> --label mac-warm-cache-${_arch} --host-os ${CMAKE_HOST_SYSTEM_NAME} --host-release ${CMAKE_HOST_SYSTEM_VERSION} --host-arch ${CMAKE_HOST_SYSTEM_PROCESSOR} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch} ${_MP}/translate-${_arch} 0 1 ${_MP}/cache-warm-mac-${_arch}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
+  set_tests_properties(perf.mac-warm-cache-${_arch} PROPERTIES
+    LABELS "perf;perf-macos" RUN_SERIAL TRUE TIMEOUT 1800
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+  add_test(NAME perf.mac-resource-${_arch}
+    COMMAND ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
+            ${_MP}/resource-${_arch})
+  set_tests_properties(perf.mac-resource-${_arch} PROPERTIES
+    LABELS "perf;perf-macos" RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endforeach()
