@@ -2632,6 +2632,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         const uint64_t *how = (const uint64_t *)how_ptr;
         uint64_t oflags = how[0], omode = how[1], resolve = how[2];
+        // openat2 (unlike openat, which silently ignores unknown bits) rejects any open-flag bit
+        // outside VALID_OPEN_FLAGS with EINVAL (fs/open.c build_open_flags). The mask is identical on
+        // both guest arches (0x7fffc3): the arch-varying O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE
+        // quartet is the same {0x4000,0x8000,0x10000,0x20000} set on x86-64 and aarch64.
+        if (oflags & ~0x7fffc3ULL) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // RESOLVE_* valid mask: NO_XDEV|NO_MAGICLINKS|NO_SYMLINKS|BENEATH|IN_ROOT|CACHED = 0x3f
         if ((resolve & ~0x3fULL) || (omode & ~07777ULL) ||
             (omode && !(oflags & (0x40ULL /*O_CREAT*/ | 0x400000ULL /*__O_TMPFILE*/)))) {
@@ -4076,8 +4084,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         G_RET(c) = (uint64_t)(unsigned)old;
         break;
     }
-    // fadvise64 -- advisory no-op
-    case 223: G_RET(c) = 0; break;
+    // fadvise64(fd, offset, len, advice) -- advisory no-op, but the ADVICE is a fixed-ABI enum:
+    // POSIX_FADV_NORMAL..NOREUSE are 0..5, and Linux (mm/fadvise.c) rejects any other value with
+    // EINVAL before doing anything advisory. The engine treated every advice as a silent success.
+    case 223:
+        if (a3 > 5) { G_RET(c) = (uint64_t)(int64_t)(-EINVAL); break; }
+        G_RET(c) = 0;
+        break;
     case 291: {
         struct stat s;
         // statx(dfd, path, flags, mask, buf)
