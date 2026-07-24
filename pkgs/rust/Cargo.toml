@@ -9,15 +9,22 @@ repository = "https://github.com/husklet/engine"
 readme = "README.md"
 keywords = ["linux", "emulation", "jit", "sandbox"]
 categories = ["emulators", "api-bindings"]
+# Published crate stays under crates.io's 10 MB compressed limit. The two
+# prebuilt libhl-engine.a archives (~48 MB uncompressed) are mandatory —
+# build.rs links them — so the room is made by excluding TEST-ONLY assets that
+# a downstream consumer never uses: the alpine rootfs fixture, the testdata
+# guest binaries, and the integration tests themselves. They are only needed to
+# run this crate's own tests, which happens in the repo, not from the published
+# package. Dropping them took 0.1.27 from 11.3 MB (over the limit, rejected) to
+# under it. assets/lib/** keeps the archives; assets/alpine and assets/PROVENANCE
+# are excluded.
 include = [
     "Cargo.toml",
     "README.md",
     "build.rs",
-    "assets/**",
+    "assets/lib/**",
     "examples/**",
     "src/**",
-    "testdata/**",
-    "tests/**",
 ]
 
 [lib]
