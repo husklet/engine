@@ -33,6 +33,13 @@ static uint64_t x86_number(uint64_t nr) {
     case 30: return 196;                            // shmat
     case 31: return 195;                            // shmctl
     case 32: return 23;                             // dup
+    case 33: return 24;                             // dup2 -> canonical dup3 (the legacy rewrite in
+                                                    // translator/guest/x86_64/legacy.c turns dup2 into dup3;
+                                                    // report it as canonical 24 so the shared post-dispatch
+                                                    // fd-publish switch (case 24) registers the target fd in
+                                                    // proc_fdvis. Without this a dup2'd fd (e.g. stdio
+                                                    // redirected onto a file) is invisible to checkpoint's
+                                                    // fd-table scan and is lost across restore.
     case 35: return 101;                            // nanosleep
     case 36: return 102;                            // getitimer
     case 38: return 103;                            // setitimer

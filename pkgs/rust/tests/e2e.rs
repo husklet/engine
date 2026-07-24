@@ -54,16 +54,15 @@ fn initial_executable_authority_is_not_reused_by_exec() {
 
 #[test]
 fn rust_api_checkpoints_and_restores_a_three_process_tree() {
-    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
-    // broken there -- the process returns with its file descriptors pointing at the
-    // launcher's stdio instead of the captured ones, while registers and memory
-    // restore correctly. Capture itself works. See the refusal assertion in
-    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    // Both arches: the x86_64 fd-restore bug (a dup2'd fd came back pointing at the
+    // launcher's stdio) is fixed -- x86 dup2 (33) now maps to canonical dup3 (24) so
+    // checkpoint captures dup2'd descriptors. See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable("rust_api_checkpoints_and_restores_a_three_process_tree")
     {
         return;
     }
     checkpoints_and_restores_a_three_process_tree(Guest::Aarch64);
+    checkpoints_and_restores_a_three_process_tree(Guest::X86_64);
 }
 
 fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
@@ -122,15 +121,13 @@ fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
 
 #[test]
 fn rust_api_restores_buffered_cross_process_pipe_state() {
-    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
-    // broken there -- the process returns with its file descriptors pointing at the
-    // launcher's stdio instead of the captured ones, while registers and memory
-    // restore correctly. Capture itself works. See the refusal assertion in
-    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
+    // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable("rust_api_restores_buffered_cross_process_pipe_state") {
         return;
     }
     restores_buffered_cross_process_pipe_state(Guest::Aarch64);
+    restores_buffered_cross_process_pipe_state(Guest::X86_64);
 }
 
 fn restores_buffered_cross_process_pipe_state(guest: Guest) {
@@ -186,17 +183,15 @@ fn restores_buffered_cross_process_pipe_state(guest: Guest) {
 
 #[test]
 fn rust_api_restores_unlinked_regular_file_content_and_offset() {
-    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
-    // broken there -- the process returns with its file descriptors pointing at the
-    // launcher's stdio instead of the captured ones, while registers and memory
-    // restore correctly. Capture itself works. See the refusal assertion in
-    // tests/policy.rs; re-add Guest::X86_64 once the fd-restore path is fixed.
+    // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
+    // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable(
         "rust_api_restores_unlinked_regular_file_content_and_offset",
     ) {
         return;
     }
     restores_unlinked_regular_file_content_and_offset(Guest::Aarch64);
+    restores_unlinked_regular_file_content_and_offset(Guest::X86_64);
 }
 
 fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
@@ -262,15 +257,13 @@ const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// prove the guest survived both hops instead of being relaunched.
 #[test]
 fn rust_api_restores_while_arming_the_next_capture() {
-    // aarch64 only: x86_64 checkpoint is refused by validation because RESTORE is
-    // broken there -- the process comes back with its file descriptors pointing at
-    // the launcher's stdio instead of the captured ones, while registers and memory
-    // restore correctly. Capture itself works. See the refusal assertion in
-    // tests/policy.rs; re-add Guest::X86_64 here once the fd-restore path is fixed.
+    // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
+    // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable("rust_api_restores_while_arming_the_next_capture") {
         return;
     }
     restores_while_arming_the_next_capture(Guest::Aarch64);
+    restores_while_arming_the_next_capture(Guest::X86_64);
 }
 
 fn restores_while_arming_the_next_capture(guest: Guest) {
