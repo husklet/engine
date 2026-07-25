@@ -1513,9 +1513,14 @@ test-linux-production-matrix: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/e2e/epoll_oneshot-x86_64 tests/compat/syscall/expected/epoll_oneshot.out 0 \
 		$(BUILD)/compat/procfs/x86_64/peerfd tests/compat/procfs/expected/shared/peerfd.out 0
 
+# GNU Make's filter patterns contain at most one wildcard.  Patterns such as
+# `%/aarch64/%` therefore do not select paths by an interior directory and can
+# silently leave a test gate with no binary prerequisites.
+arch_bins = $(foreach bin,$(2),$(if $(findstring /$(1)/,$(bin)),$(bin)))
+
 .PHONY: test-linux-production-core-abi
 test-linux-production-core-abi: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
-	$(BUILD)/tools/linux-matrix $(filter %/x86_64/%,$(CORE_ABI_BINS))
+	$(BUILD)/tools/linux-matrix $(call arch_bins,x86_64,$(CORE_ABI_BINS))
 	$(BUILD)/tools/linux-matrix --suite $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 		$(BUILD)/compat/core/abi/x86_64 tests/compat/core/abi
 
@@ -1531,13 +1536,13 @@ test-linux-production-config: $(BUILD)/linux-production/hl-engine-linux-x86_64 \
 	$(BUILD)/tools/config-e2e-runner env $(abspath $(BUILD)/linux-production/hl-engine-linux-x86_64) \
 		$(abspath $(BUILD)/e2e/guest-exit70-x86_64) 70
 
-LINUX_PRODUCTION_COMPAT_BINS := $(filter %/x86_64/%,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) $(LIBC_CASE_BINS) \
+LINUX_PRODUCTION_COMPAT_BINS := $(call arch_bins,x86_64,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) $(LIBC_CASE_BINS) \
 	$(COMPLETENESS_BINS) $(POSIX_CASE_BINS) $(SYSCALL_CASE_BINS) $(NETWORK_CASE_BINS) $(PROCFS_CASE_BINS) \
 	$(MEMORY_CASE_BINS) $(FILESYSTEM_CASE_BINS) $(SIGNALS_CASE_BINS) $(PROCESS_CASE_BINS) $(TIME_CASE_BINS) \
 	$(ISA_X86_64_BINS) $(CORE_ABI_BINS) $(CORE_WORKLOAD_BINS) $(CORE_SYSCALL_BINS) $(CORE_REGRESS_BINS) \
 	$(IPC_CASE_BINS) $(THREAD_CASE_BINS) $(ISOLATION_CASE_BINS) $(SYSCALL_EDGE_CASE_BINS) $(SOAK_CASE_BINS))
 
-LINUX_PRODUCTION_AARCH64_COMPAT_BINS := $(filter %/aarch64/%,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) \
+LINUX_PRODUCTION_AARCH64_COMPAT_BINS := $(call arch_bins,aarch64,$(ABI_CASE_BINS) $(ABI_CORPUS_BINS) \
 	$(LIBC_CASE_BINS) $(COMPLETENESS_BINS) $(POSIX_CASE_BINS) $(SYSCALL_CASE_BINS) $(NETWORK_CASE_BINS) \
 	$(PROCFS_CASE_BINS) $(MEMORY_CASE_BINS) $(FILESYSTEM_CASE_BINS) $(SIGNALS_CASE_BINS) $(PROCESS_CASE_BINS) \
 	$(TIME_CASE_BINS) $(CORE_ABI_BINS) $(CORE_WORKLOAD_BINS) $(CORE_SYSCALL_BINS) $(CORE_REGRESS_BINS) \
