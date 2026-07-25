@@ -146,6 +146,11 @@ invariants)
 			printf 'VIOLATION: I9 %s may cancel a main-branch verdict\n' "$workflow" >&2
 			exit 1
 		fi
+		if ! grep -Fq "github.ref == 'refs/heads/main' && github.sha || github.ref" \
+			"$workflow"; then
+			printf 'VIOLATION: I10 %s supersedes queued main-branch verdicts\n' "$workflow" >&2
+			exit 1
+		fi
 	done
 
 	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
@@ -154,7 +159,7 @@ invariants)
 		"$wfdir/linux.yml" | cut -d: -f1)
 	if [ -z "$full_line" ] || [ -z "$fresh_line" ] ||
 		[ "$fresh_line" -le "$full_line" ]; then
-		printf '%s\n' 'VIOLATION: I10 archive freshness masks the full integration gate' >&2
+		printf '%s\n' 'VIOLATION: I11 archive freshness masks the full integration gate' >&2
 		exit 1
 	fi
 	;;

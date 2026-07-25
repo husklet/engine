@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-${{ github.workflow }}-${{ github.ref }}
+  # Pending members of one concurrency group are superseded even when
+  # cancel-in-progress is false. Give every main commit its own group so queued
+  # verdicts are preserved too; other refs retain normal ref-level coalescing.
+  group: linux-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   # Every commit on main must reach a verdict. Pull requests and other branch
   # pushes may supersede an older run of the same ref.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
