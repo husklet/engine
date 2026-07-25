@@ -379,7 +379,18 @@ static struct {
 } g_gro[GNA_MAX];
 
 static int g_ngro;
+static _Atomic uint64_t g_gro_generation = 2;
+static atomic_flag g_gro_writer = ATOMIC_FLAG_INIT;
 static void gro_clear(uint64_t lo, uint64_t hi);
+static void gro_clear_raw(uint64_t lo, uint64_t hi);
+
+static void gro_writer_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_gro_writer, memory_order_acquire)) sched_yield();
+}
+
+static void gro_writer_unlock(void) {
+    atomic_flag_clear_explicit(&g_gro_writer, memory_order_release);
+}
 
 struct guest_bus_range {
     uint64_t lo, hi;
@@ -1220,34 +1231,51 @@ static uint64_t gna_prefix(uint64_t a, uint64_t len) {
 
 static void gro_add(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
-    gro_clear(lo, hi);
+    gro_writer_lock();
+    atomic_fetch_add_explicit(&g_gro_generation, 1, memory_order_acq_rel);
+    gro_clear_raw(lo, hi);
     if (g_ngro < GNA_MAX) {
-        g_gro[g_ngro].lo = lo;
-        g_gro[g_ngro].hi = hi;
+        __atomic_store_n(&g_gro[g_ngro].lo, lo, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_gro[g_ngro].hi, hi, __ATOMIC_RELAXED);
         __atomic_store_n(&g_ngro, g_ngro + 1, __ATOMIC_RELEASE);
     }
+    atomic_fetch_add_explicit(&g_gro_generation, 1, memory_order_release);
+    gro_writer_unlock();
 }
 
 static void gro_clear(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
+    gro_writer_lock();
+    atomic_fetch_add_explicit(&g_gro_generation, 1, memory_order_acq_rel);
+    gro_clear_raw(lo, hi);
+    atomic_fetch_add_explicit(&g_gro_generation, 1, memory_order_release);
+    gro_writer_unlock();
+}
+
+static void gro_clear_raw(uint64_t lo, uint64_t hi) {
     for (int i = 0; i < g_ngro;) {
-        uint64_t b = g_gro[i].lo, e = g_gro[i].hi;
+        uint64_t b = __atomic_load_n(&g_gro[i].lo, __ATOMIC_RELAXED);
+        uint64_t e = __atomic_load_n(&g_gro[i].hi, __ATOMIC_RELAXED);
         if (lo >= e || hi <= b) {
             i++;
             continue;
         }
         int keep_head = b < lo, keep_tail = hi < e;
         if (!keep_head && !keep_tail) {
-            g_gro[i] = g_gro[--g_ngro];
+            --g_ngro;
+            __atomic_store_n(&g_gro[i].lo, __atomic_load_n(&g_gro[g_ngro].lo, __ATOMIC_RELAXED),
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gro[i].hi, __atomic_load_n(&g_gro[g_ngro].hi, __ATOMIC_RELAXED),
+                             __ATOMIC_RELAXED);
             continue;
         }
         if (keep_head)
-            g_gro[i].hi = lo;
+            __atomic_store_n(&g_gro[i].hi, lo, __ATOMIC_RELAXED);
         else
-            g_gro[i].lo = hi;
+            __atomic_store_n(&g_gro[i].lo, hi, __ATOMIC_RELAXED);
         if (keep_head && keep_tail && g_ngro < GNA_MAX) {
-            g_gro[g_ngro].lo = hi;
-            g_gro[g_ngro].hi = e;
+            __atomic_store_n(&g_gro[g_ngro].lo, hi, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gro[g_ngro].hi, e, __ATOMIC_RELAXED);
             __atomic_store_n(&g_ngro, g_ngro + 1, __ATOMIC_RELEASE);
         }
         i++;
@@ -1257,9 +1285,20 @@ static void gro_clear(uint64_t lo, uint64_t hi) {
 static int gro_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE) == 0) return 0;
     uint64_t end = a + len;
-    for (int i = 0; i < g_ngro; i++)
-        if (a < g_gro[i].hi && end > g_gro[i].lo) return 1;
-    return 0;
+    uint64_t generation = atomic_load_explicit(&g_gro_generation, memory_order_acquire);
+    if (generation & 1) return 1;
+    int count = __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE);
+    int hit = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t lo = __atomic_load_n(&g_gro[i].lo, __ATOMIC_RELAXED);
+        uint64_t hi = __atomic_load_n(&g_gro[i].hi, __ATOMIC_RELAXED);
+        if (a < hi && end > lo) {
+            hit = 1;
+            break;
+        }
+    }
+    if (atomic_load_explicit(&g_gro_generation, memory_order_acquire) != generation) return 1;
+    return hit;
 }
 
 // execve replaces the whole address space -> drop all tracked PROT_NONE ranges (they're gone with the old
