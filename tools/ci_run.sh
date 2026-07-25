@@ -39,7 +39,7 @@ else
 	"$@" >"$log" 2>&1 </dev/null || status=$?
 fi
 
-tail -n 400 "$log"
+tail -n 2000 "$log"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
 	tail -c 200000 "$log" >>"$GITHUB_STEP_SUMMARY" || true
 fi
