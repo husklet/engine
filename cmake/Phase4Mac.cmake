@@ -157,6 +157,7 @@ function(hl_mac_test name)
   set_target_properties(${name} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   hl_codesign(${name})
+  set_property(GLOBAL APPEND PROPERTY HL_MACOS_TEST_TARGETS ${name})
   add_test(NAME macos.${name} COMMAND ${name})
   set_tests_properties(macos.${name} PROPERTIES
     LABELS "macos" TIMEOUT ${HL_MACOS_TEST_TIMEOUT}
@@ -194,6 +195,9 @@ hl_codesign(dns-objc-fork-macos)
 add_test(NAME macos.dns-objc-fork COMMAND dns-objc-fork-macos)
 set_tests_properties(macos.dns-objc-fork PROPERTIES
   LABELS "macos" TIMEOUT ${HL_MACOS_TEST_TIMEOUT})
+get_property(_HL_MACOS_TEST_TARGETS GLOBAL PROPERTY HL_MACOS_TEST_TARGETS)
+add_custom_target(macos-build
+  DEPENDS ${_HL_MACOS_TEST_TARGETS} dns-objc-fork-macos)
 
 # --- the six mac e2e gates --------------------------------------------------
 # FIREWALL CONSTRAINT (Makefile comment at line 1846): the host firewall
