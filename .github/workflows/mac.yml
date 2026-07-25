@@ -164,8 +164,11 @@ jobs:
         include:
           - name: abi-corpus
             targets: compat-abi-corpus
+          # compat-isa-aarch64 belongs here: the sharded buckets must cover
+          # every compat suite `make e2e-compat` runs, and it was the one
+          # omission -- the aarch64 ISA corpus went unrun on every push.
           - name: core
-            targets: compat-abi compat-core compat-isa-x86-64 compat-completeness
+            targets: compat-abi compat-core compat-isa-x86-64 compat-isa-aarch64 compat-completeness
           - name: net-ipc
             targets: compat-network compat-ipc compat-syscall compat-syscall-edges compat-libc
           - name: fs-proc

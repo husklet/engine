@@ -159,6 +159,54 @@ invariants)
 		fi
 	done
 
+	# I13-I15: the sharded compat matrices replaced whole-suite aggregates, so a
+	# suite the Makefile aggregate runs but no shard names is silently unrun.
+	logical_line() {
+		awk -v pat="$1" '
+		index($0, pat) == 1 { collecting = 1 }
+		collecting {
+			line = line " " $0
+			if ($0 !~ /\\$/) {
+				gsub(/\\/, " ", line)
+				print line
+				exit
+			}
+		}' Makefile
+	}
+	shard_targets() {
+		sed -n 's/^ *targets: *//p' "$1" | tr ' ' '\n' | sed '/^$/d'
+	}
+
+	shards=$(shard_targets "$wfdir/mac.yml")
+	for suite in $(logical_line 'e2e-compat:'); do
+		case "$suite" in
+		compat-engines) continue ;;
+		compat-*) ;;
+		*) continue ;;
+		esac
+		if ! printf '%s\n' "$shards" | grep -Fqx -- "$suite"; then
+			printf 'VIOLATION: I13 mac.yml runs no shard for `%s`\n' "$suite" >&2
+			exit 1
+		fi
+	done
+
+	shards=$(shard_targets "$wfdir/linux.yml")
+	typed_suites=$(logical_line 'TYPED_SUITES :=' | sed 's/.*TYPED_SUITES := *//')
+	for suite in $typed_suites; do
+		if ! printf '%s\n' "$shards" | grep -Fqx -- "typed-$suite"; then
+			printf 'VIOLATION: I14 linux.yml runs no shard for `typed-%s`\n' "$suite" >&2
+			exit 1
+		fi
+	done
+
+	parity=$(sed -n '/for s in /,/; do/p' "$wfdir/linux.yml" |
+		tr -d '\\' | sed 's/.*for s in //; s/; do.*//')
+	if [ "$(printf '%s\n' $typed_suites | LC_ALL=C sort)" != \
+		"$(printf '%s\n' $parity | LC_ALL=C sort)" ]; then
+		printf '%s\n' 'VIOLATION: I15 the CTest parity list is not TYPED_SUITES' >&2
+		exit 1
+	fi
+
 	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
 		cut -d: -f1)
 	fresh_line=$(grep -nF 'name: Check the committed crate archives match the C sources' \
