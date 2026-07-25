@@ -129,6 +129,13 @@ invariants)
 			if (step_runs[i] ~ /attempt 1/ &&
 			    (step_runs[i] !~ /deadline=/ || step_runs[i] !~ /run_bounded/))
 				bad("I16 " step_files[i] " step `" step_names[i] "` retries without a step deadline")
+			# Every test-lane gate must name its own failure: the job-log
+			# endpoint needs admin rights, so a step that only exits
+			# non-zero is undiagnosable from the public check-run data.
+			if (step_runs[i] ~ /(nix build|nix develop|make |cargo )/ &&
+			    step_runs[i] !~ /ci_run\.sh/ && step_runs[i] !~ /::error/ &&
+			    step_runs[i] !~ /for attempt in/)
+				bad("I17 " step_files[i] " step `" step_names[i] "` reports no ::error on failure")
 		}
 		if (jobs < 7)
 			bad("I7 parsed only " jobs " jobs; expected at least 7")

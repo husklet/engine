@@ -44,21 +44,21 @@ jobs:
 
       - name: Test C package
         timeout-minutes: 45
-        run: nix build --print-build-logs .#checks.aarch64-darwin.package
+        run: tools/ci_run.sh 2520 "Test C package" -- nix build --print-build-logs .#checks.aarch64-darwin.package
 
       # doCheck=false on darwin, so run the runtime suites unsandboxed here (they need "/",
       # "/tmp", JIT, localhost DNS). AR=ar forces the host archiver over the dev-shell cross-ar.
       - name: Test C unit suite
         timeout-minutes: 25
-        run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
+        run: tools/ci_run.sh 1320 "Test C unit suite" -- nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
 
       - name: Test C package integration
         timeout-minutes: 25
-        run: nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
+        run: tools/ci_run.sh 1320 "Test C package integration" -- nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
 
       - name: Test Rust package
         timeout-minutes: 25
-        run: nix build --print-build-logs .#checks.aarch64-darwin.rust
+        run: tools/ci_run.sh 1320 "Test Rust package" -- nix build --print-build-logs .#checks.aarch64-darwin.rust
 
       - name: Test macOS host services
         timeout-minutes: 30
@@ -183,7 +183,7 @@ jobs:
 
       - name: Package Rust crate
         timeout-minutes: 20
-        run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
+        run: tools/ci_run.sh 1020 "Package Rust crate" -- nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
       # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/
       # links. It is the artifact `cargo publish` ships, and an ABI mismatch
@@ -199,7 +199,7 @@ jobs:
       # runs the committed testdata fixtures on both guest backends.
       - name: Test Rust crate against the committed archive
         timeout-minutes: 25
-        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
+        run: tools/ci_run.sh 1320 "Test Rust crate against the committed archive" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
 
   # Runtime compatibility suites, split across parallel runners so wall-clock is the
   # slowest bucket (~20-25min) instead of the ~70min sequential `make e2e-compat`.
