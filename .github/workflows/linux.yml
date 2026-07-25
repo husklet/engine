@@ -18,9 +18,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
@@ -210,8 +210,8 @@ jobs:
           - name: mem-signals
             targets: typed-memory typed-signals typed-threads
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7

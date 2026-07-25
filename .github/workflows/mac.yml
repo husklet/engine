@@ -19,8 +19,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
@@ -168,8 +168,8 @@ jobs:
           - name: posix-signals
             targets: compat-isolation compat-posix compat-signals compat-soak compat-time
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
