@@ -140,13 +140,21 @@ invariants)
 		exit 1
 	fi
 
+	for workflow in "$wfdir/linux.yml" "$wfdir/mac.yml"; do
+		if ! grep -Fq "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" \
+			"$workflow"; then
+			printf 'VIOLATION: I9 %s may cancel a main-branch verdict\n' "$workflow" >&2
+			exit 1
+		fi
+	done
+
 	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
 		cut -d: -f1)
 	fresh_line=$(grep -nF 'name: Check the committed crate archives match the C sources' \
 		"$wfdir/linux.yml" | cut -d: -f1)
 	if [ -z "$full_line" ] || [ -z "$fresh_line" ] ||
 		[ "$fresh_line" -le "$full_line" ]; then
-		printf '%s\n' 'VIOLATION: I9 archive freshness masks the full integration gate' >&2
+		printf '%s\n' 'VIOLATION: I10 archive freshness masks the full integration gate' >&2
 		exit 1
 	fi
 	;;
