@@ -1535,8 +1535,14 @@ static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];
 static uint32_t g_udp_local_ip[HL_NFD], g_udp_peer_ip[HL_NFD];
 static uint8_t g_udp_local_interface[HL_NFD], g_udp_peer_interface[HL_NFD];
 static uint8_t g_udp_local_v6[HL_NFD], g_udp_peer_v6[HL_NFD];
+enum { HL_NETIF_MAX = 8 };
 #define UDP_REF_N 4096
-struct udp_ref { volatile uint32_t used, refs; char path[200]; };
+struct udp_ref {
+    volatile uint32_t used, refs;
+    char path[200];
+    uint8_t alias_count;
+    char aliases[HL_NETIF_MAX - 1][200];
+};
 static struct udp_ref *g_udp_refs;
 static uint16_t g_udp_ref[HL_NFD];
 // fd -> the socket's guest (Linux) address family, recorded at socket()/accept() so connect(203)/bind(200)
@@ -1568,12 +1574,28 @@ static int udp_ref_create(int fd, const char *path) {
     for (uint32_t i = 0; i < UDP_REF_N; i++) {
         if (!__sync_bool_compare_and_swap(&g_udp_refs[i].used, 0, 1)) continue;
         snprintf(g_udp_refs[i].path, sizeof g_udp_refs[i].path, "%s", path);
+        g_udp_refs[i].alias_count = 0;
         __atomic_store_n(&g_udp_refs[i].refs, 1, __ATOMIC_RELEASE);
         g_udp_ref[fd] = (uint16_t)(i + 1);
         return 0;
     }
     errno = ENFILE;
     return -1;
+}
+
+static int udp_ref_add_alias(int fd, const char *path) {
+    if (!g_udp_refs || fd < 0 || fd >= HL_NFD || !g_udp_ref[fd]) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct udp_ref *ref = &g_udp_refs[g_udp_ref[fd] - 1];
+    if (ref->alias_count >= sizeof ref->aliases / sizeof ref->aliases[0]) {
+        errno = ENOSPC;
+        return -1;
+    }
+    snprintf(ref->aliases[ref->alias_count], sizeof ref->aliases[ref->alias_count], "%s", path);
+    ref->alias_count++;
+    return 0;
 }
 
 static void udp_ref_dup(int dst, int src) {
@@ -1589,6 +1611,11 @@ static void udp_ref_drop(int fd) {
     g_udp_ref[fd] = 0;
     if (__atomic_sub_fetch(&g_udp_refs[slot].refs, 1, __ATOMIC_ACQ_REL) == 0) {
         unlink(g_udp_refs[slot].path);
+        for (uint8_t i = 0; i < g_udp_refs[slot].alias_count; i++) {
+            unlink(g_udp_refs[slot].aliases[i]);
+            g_udp_refs[slot].aliases[i][0] = 0;
+        }
+        g_udp_refs[slot].alias_count = 0;
         g_udp_refs[slot].path[0] = 0;
         __atomic_store_n(&g_udp_refs[slot].used, 0, __ATOMIC_RELEASE);
     }
@@ -1964,7 +1991,6 @@ static void fill_inet6_lo(uint8_t *sa, socklen_t *l, uint16_t port) {
 // is keyed by <netid> (mode 0700, the guest is path-jailed) so other networks never share sockets. The
 // 127/8 loopback path (g_netns / lo_*) is untouched and stays per-container; only non-127 in-subnet
 // AF_INET is bridged. Off when g_netbr[0]==0 || g_myip==0.
-enum { HL_NETIF_MAX = 8 };
 struct br_interface {
     char path[64];
     uint32_t ip;
@@ -2204,6 +2230,35 @@ static void br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *o
     br_path(interface, ip_be, port, out, n);
     size_t length = strlen(out);
     if (length < n) snprintf(out + length, n - length, ".v6only");
+}
+
+// A wildcard listener belongs to every attached interface, not just eth0. The switch transport is one
+// AF_UNIX listening socket, so expose that same inode at each interface's rendezvous name with symlinks.
+// connect(2) follows the symlink to the bound socket. The aliases are owned by the socket's shared
+// udp_ref and therefore disappear only when the final dup/fork reference closes.
+static int br_alias_wildcard_listener(int fd, int primary, uint16_t port, int v6only) {
+    char target[200];
+    if (v6only)
+        br_v6only_path(primary, g_netif[primary].ip, port, target, sizeof target);
+    else
+        br_path(primary, g_netif[primary].ip, port, target, sizeof target);
+    for (uint8_t interface = 0; interface < g_netif_count; interface++) {
+        if ((int)interface == primary) continue;
+        char alias[200];
+        if (v6only)
+            br_v6only_path(interface, g_netif[interface].ip, port, alias, sizeof alias);
+        else
+            br_path(interface, g_netif[interface].ip, port, alias, sizeof alias);
+        unlink(alias);
+        if (symlink(target, alias) < 0) return -1;
+        if (udp_ref_add_alias(fd, alias) < 0) {
+            int saved = errno;
+            unlink(alias);
+            errno = saved;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 // bind(:0) on the bridge -> a free, round-trippable ephemeral port keyed by OUR ip (cf. lo_alloc_ephemeral)

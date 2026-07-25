@@ -541,7 +541,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // instead of landing on the isolated per-container loopback (which broke cross-container reach-by-name).
         int bridge_enabled = br_on();
         int bridge_interface = bridge_enabled ? br_bind_interface(sa, (socklen_t)a2) : -1;
-        if (bridge_enabled && br6_any_is(sa, (socklen_t)a2)) bridge_interface = 0;
+        int bridge_v6_any = bridge_enabled && br6_any_is(sa, (socklen_t)a2);
+        int bridge_v4_any = bridge_enabled && sa && a2 >= 8 && *(uint16_t *)sa == AF_INET &&
+                            *(uint32_t *)(sa + 4) == 0;
+        if (bridge_v6_any) bridge_interface = 0;
         if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
             bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
@@ -579,7 +582,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // Own the bridge rendezvous inode with the refcounted-unlink mechanism (shared with UDP) so
                 // it is removed on the LAST reference's close instead of lingering to EADDRINUSE the next
                 // bind of the same ip:port (see the private-loopback path above for the full rationale).
-                udp_ref_create((int)a0, up);
+                if (udp_ref_create((int)a0, up) < 0 ||
+                    ((bridge_v4_any || bridge_v6_any) &&
+                     br_alias_wildcard_listener((int)a0, bridge_interface, p, bridge_v6only) < 0)) {
+                    int saved = errno;
+                    udp_ref_drop((int)a0);
+                    (void)lo_swap((int)a0); // discard the bound socket after a partial registration
+                    r = -1;
+                    errno = saved;
+                }
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             break;
