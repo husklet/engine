@@ -3385,10 +3385,18 @@ static int proc_fd_dir_pid_open(int guest, int host) {
 // (a peer pid already reports a live resident size through host process stats; self must not read 0). Floor the tracked
 // charge with this engine process's real resident size so the reported RSS is non-zero and plausible.
 static unsigned long long self_rss_bytes(void) {
+    static _Atomic unsigned long long cached_real_floor;
     unsigned long long charged = (unsigned long long)atomic_load(&g_mem_charged);
-    struct hl_procinfo pi;
-    unsigned long long real = hl_get_procinfo((int)getpid(), &pi) ? pi.rss : 0;
-    return real > charged ? real : charged;
+    unsigned long long real_floor = atomic_load(&cached_real_floor);
+    if (real_floor == 0) {
+        struct hl_procinfo pi;
+        real_floor = hl_get_procinfo((int)getpid(), &pi) ? pi.rss : 0;
+        if (real_floor != 0) {
+            unsigned long long empty = 0;
+            if (!atomic_compare_exchange_strong(&cached_real_floor, &empty, real_floor)) real_floor = empty;
+        }
+    }
+    return real_floor > charged ? real_floor : charged;
 }
 
 // Host boot epoch (seconds) -- the base for /proc/<pid> starttime and /proc/uptime. Cached.
