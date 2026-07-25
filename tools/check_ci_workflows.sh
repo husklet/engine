@@ -140,7 +140,8 @@ invariants)
 		exit 1
 	fi
 
-	if grep -Eq 'actions/checkout@v[1-4]([^0-9]|$)|nix-installer-action@v([1-9]|1[0-9]|2[01])([^0-9]|$)|nix-installer-action@main' \
+	# checkout<=v4, nix-installer<=v21 and cache-nix-action<=v6 run on node20.
+	if grep -Eq 'actions/checkout@v[1-4]([^0-9]|$)|nix-installer-action@v([1-9]|1[0-9]|2[01])([^0-9]|$)|nix-installer-action@main|cache-nix-action@(v[1-6]([^0-9]|$)|main)' \
 		"$wfdir"/*.yml; then
 		printf '%s\n' 'VIOLATION: I9 a workflow action still targets the Node 20 generation' >&2
 		exit 1
