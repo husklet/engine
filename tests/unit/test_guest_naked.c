@@ -14,7 +14,8 @@ static int findings;
 #define SCANNER_SOURCE "tests/unit/test_guest_naked.c"
 
 static int comment_line(const char *line) {
-    while (*line == ' ' || *line == '\t') line++;
+    while (*line == ' ' || *line == '\t')
+        line++;
     return line[0] == '*' || (line[0] == '/' && (line[1] == '/' || line[1] == '*'));
 }
 
@@ -69,9 +70,7 @@ static int scan_tree(const char *root) {
         if (!S_ISREG(info.st_mode)) continue;
         length = strlen(entry->d_name);
         if (length < 3) continue;
-        if (strcmp(entry->d_name + length - 2, ".c") != 0 &&
-            strcmp(entry->d_name + length - 2, ".h") != 0)
-            continue;
+        if (strcmp(entry->d_name + length - 2, ".c") != 0 && strcmp(entry->d_name + length - 2, ".h") != 0) continue;
         if (strcmp(path, SCANNER_SOURCE) == 0) continue;
         if (scan_file(path) != 0) {
             closedir(directory);
