@@ -38,6 +38,7 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Test C package
+        timeout-minutes: 45
         run: nix build --print-build-logs .#checks.aarch64-darwin.package
 
       # doCheck=false on darwin, so run the runtime suites unsandboxed here (they need "/",
@@ -51,6 +52,7 @@ jobs:
         run: nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
 
       - name: Test Rust package
+        timeout-minutes: 25
         run: nix build --print-build-logs .#checks.aarch64-darwin.rust
 
       - name: Test macOS host services
@@ -114,7 +116,11 @@ jobs:
           if ! run_gates gates.log; then
             warn=$(tail -c 1200 gates.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=e2e-mac-gates failed attempt 1 — retrying::$warn"
-            run_gates gates.log
+            if ! run_gates gates.log; then
+              message=$(tail -c 1500 gates.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
+              echo "::error title=e2e-mac-gates failed (both attempts)::$message"
+              exit 1
+            fi
           fi
 
       - name: Package Rust crate

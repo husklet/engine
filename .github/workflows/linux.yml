@@ -42,15 +42,19 @@ jobs:
       # thing that broke instead of "check failed". Together these are exactly
       # the four checks `nix flake check` runs.
       - name: Check formatting
+        timeout-minutes: 30
         run: nix build --print-build-logs .#checks.aarch64-linux.format
 
       - name: Test C package
+        timeout-minutes: 60
         run: nix build --print-build-logs .#checks.aarch64-linux.package
 
       - name: Test unit suite (CMake/CTest)
+        timeout-minutes: 30
         run: nix build --print-build-logs .#checks.aarch64-linux.unit
 
       - name: Test Rust package
+        timeout-minutes: 30
         run: nix build --print-build-logs .#checks.aarch64-linux.rust
 
       # The CMake build is being brought up as the standard build path to replace
@@ -81,6 +85,7 @@ jobs:
       # added to the Makefile side only) without a red build. It is a name/registry
       # check against `ctest -N`, so it costs seconds, not a suite run.
       - name: Compat coverage parity (make typed-* vs ctest labels)
+        timeout-minutes: 15
         run: |
           nix develop --command sh -c '
             set -e
@@ -112,11 +117,13 @@ jobs:
       # `[lints.clippy] all/pedantic = "warn"` and the tree is rustfmt-shaped,
       # but nothing enforced either, so both drifted red on main unnoticed.
       - name: Check Rust formatting
+        timeout-minutes: 15
         run: nix develop --command cargo fmt --manifest-path pkgs/rust/Cargo.toml --check
 
       # -D warnings promotes the crate's `warn` lint levels to hard errors here
       # only: a local `cargo build` keeps showing them as warnings.
       - name: Lint Rust crate (clippy)
+        timeout-minutes: 20
         run: nix develop --command cargo clippy --manifest-path pkgs/rust/Cargo.toml --all-targets --locked -- -D warnings
 
       # --lib ONLY. The integration suites (spec, control, terminal, network,
@@ -126,6 +133,7 @@ jobs:
       # wire encoder tests that pin the launch-config ABI against
       # include/hl/config.h -- and are exactly what was silently failing on main.
       - name: Test Rust unit suite
+        timeout-minutes: 20
         run: nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
 
       # The launch test below proves the committed archive WORKS; it cannot see
@@ -136,9 +144,11 @@ jobs:
       # pkgs/rust/assets/PROVENANCE.md and fails if the C sources have moved on.
       # Hashing only -- seconds, no extra compilation.
       - name: Check the committed crate archives match the C sources
+        timeout-minutes: 15
         run: nix develop --command make check-crate-archives
 
       - name: Package Rust crate
+        timeout-minutes: 20
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
       # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/

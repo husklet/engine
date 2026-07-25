@@ -47,6 +47,7 @@ jobs:
       # the committed archive, then uploads. No separate test steps. Retries with
       # backoff to ride out a transient crates.io upload outage.
       - name: Build and publish Rust crate
+        timeout-minutes: 40
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
