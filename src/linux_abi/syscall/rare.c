@@ -102,7 +102,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = (uint64_t)(int64_t)svc_ptrace(c, a0, a1, a2, a3);
         break;
 
-    case 279: { // memfd_create(name, flags) -> an anonymous file: a tmpfile, unlinked immediately
+    case 279: { // memfd_create(name, flags) -> an anonymous file
         // Validate `flags` exactly as Linux (mm/memfd.c): any unknown bit -> EINVAL. Shared-memory IPC
         // ChannelLinux::KernelSupportsUpgradeRequirements() probes memfd_create("", ~0) and PCHECKs the
         // call FAILS with EINVAL/ENOSYS/EPERM; without this the probe SUCCEEDED (fd>=0) and the caller
@@ -118,10 +118,22 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
         }
+        int fd;
+#if defined(__linux__)
+        /*
+         * A sparse unlinked file is not equivalent to memfd storage:
+         * ftruncate can succeed on a full /tmp and the first MAP_SHARED write
+         * then raises SIGBUS. Large dual-mapped JIT arenas such as BEAM's hit
+         * exactly that failure. Use the host's anonymous shmem object so guest
+         * memfd allocation is independent of filesystem capacity.
+         */
+        fd = memfd_create("hl-guest", MFD_CLOEXEC);
+#else
         char tn[] = "/tmp/.hl-memfdXXXXXX";
-        int fd = mkstemp(tn);
+        fd = mkstemp(tn);
+        if (fd >= 0) unlink(tn);
+#endif
         if (fd >= 0) {
-            unlink(tn);
             if (a1 & 1) fcntl(fd, F_SETFD, FD_CLOEXEC); // MFD_CLOEXEC
             // Track it as a memfd so F_ADD_SEALS/F_GET_SEALS (io.c fcntl) and the F_SEAL_WRITE write-guard
             // apply. Without MFD_ALLOW_SEALING (2) the file is born F_SEAL_SEAL'd -> later F_ADD_SEALS EPERMs,
