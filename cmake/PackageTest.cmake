@@ -29,6 +29,10 @@ file(MAKE_DIRECTORY "${BUILD_DIR}/package-consumer")
 run(${CMAKE_COMMAND} --install "${BUILD_DIR}" --prefix "${STAGE}")
 
 file(WRITE "${STAGE}/include/foreign.h" "not owned by hl-engine\n")
+file(STRINGS "${BUILD_DIR}/install_manifest.txt" installed_files)
+if(NOT installed_files)
+  message(FATAL_ERROR "package-test: install manifest contains no files")
+endif()
 
 run(${CC} -I${STAGE}/include ${SOURCE_DIR}/tests/integration/package.c
     -L${STAGE}/lib -lhl-host-${PACKAGE_HOST} -lhl-engine -lhl-translator -lhl-linux-abi
@@ -89,8 +93,14 @@ if(HAVE_ACTIVATION AND EXISTS "${STAGE}/lib/libhl-engine-activation.a")
   endif()
 endif()
 
-# Uninstall parity: the foreign file must survive, the owned headers must not.
-file(REMOVE "${STAGE}/include/hl/engine.h")
+# Uninstall parity: every manifest-owned file must disappear while the foreign
+# file sharing the include prefix survives.
+run(${CMAKE_COMMAND} --build "${BUILD_DIR}" --target uninstall)
+foreach(installed IN LISTS installed_files)
+  if(EXISTS "${installed}" OR IS_SYMLINK "${installed}")
+    message(FATAL_ERROR "package-test: uninstall left owned file ${installed}")
+  endif()
+endforeach()
 if(NOT EXISTS "${STAGE}/include/foreign.h")
   message(FATAL_ERROR "package-test: install/uninstall clobbered a foreign file")
 endif()

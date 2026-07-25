@@ -1,0 +1,20 @@
+set(manifest "@CMAKE_BINARY_DIR@/install_manifest.txt")
+if(NOT EXISTS "${manifest}")
+  message(FATAL_ERROR
+    "uninstall: ${manifest} does not exist; install this build tree first")
+endif()
+
+file(STRINGS "${manifest}" installed_files)
+if(NOT installed_files)
+  message(FATAL_ERROR "uninstall: ${manifest} contains no installed files")
+endif()
+
+foreach(path IN LISTS installed_files)
+  set(installed "$ENV{DESTDIR}${path}")
+  if(EXISTS "${installed}" OR IS_SYMLINK "${installed}")
+    message(STATUS "uninstall: removing ${installed}")
+    file(REMOVE "${installed}")
+  else()
+    message(STATUS "uninstall: already absent ${installed}")
+  endif()
+endforeach()

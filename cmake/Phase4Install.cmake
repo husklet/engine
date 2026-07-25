@@ -137,6 +137,18 @@ install(FILES ${HL_PUBLIC_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hl)
 install(FILES ${HL_PC_DIR}/hl-engine.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
+# Standard CMake does not generate an uninstall target.  Preserve the
+# historical Makefile contract with an exact install-manifest consumer: it
+# removes only files installed by this build tree and therefore cannot clobber
+# unrelated content sharing the prefix.
+configure_file(
+  ${CMAKE_SOURCE_DIR}/cmake/Uninstall.cmake.in
+  ${CMAKE_BINARY_DIR}/cmake_uninstall.cmake
+  @ONLY)
+add_custom_target(uninstall
+  COMMAND ${CMAKE_COMMAND} -P ${CMAKE_BINARY_DIR}/cmake_uninstall.cmake
+  COMMENT "Removing files recorded by install_manifest.txt")
+
 set(HL_ACTIVATION_TARGET "")
 if(TARGET hl-engine-activation)
   set(HL_ACTIVATION_TARGET hl-engine-activation)
