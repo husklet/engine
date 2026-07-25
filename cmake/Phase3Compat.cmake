@@ -288,7 +288,8 @@ function(hl_tool name source)
   add_executable(${name} ${source})
   target_compile_options(${name} PRIVATE
     -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-    -Wstrict-prototypes -Wmissing-prototypes ${T_FLAGS})
+    -Wstrict-prototypes -Wmissing-prototypes
+    -Werror=implicit-function-declaration -Werror=implicit-int ${T_FLAGS})
   target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
   target_link_options(${name} PRIVATE ${T_LINK})
   set_target_properties(${name} PROPERTIES

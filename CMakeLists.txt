@@ -61,6 +61,7 @@ target_compile_options(hl_engine_cflags INTERFACE
   -std=c11
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow
   -Wstrict-prototypes -Wmissing-prototypes
+  -Werror=implicit-function-declaration -Werror=implicit-int
   -fvisibility=hidden)
 
 # --- source lists (kept identical to the Makefile SOURCES variables) --------

@@ -81,7 +81,10 @@ X86_64_DYNAMIC_LIBC ?= /usr/x86_64-linux-gnu/lib/libc.so.6
 
 CPPFLAGS := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
 CFLAGS ?= -O2 -g
-WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes
+# Clang on macOS rejects implicit declarations outright in C99+, while GCC on Linux only warns.
+# Promoting both diagnostics to errors makes Linux enforce the same source-portability contract.
+WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes \
+	-Werror=implicit-function-declaration -Werror=implicit-int
 ENGINE_CFLAGS := $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 DEPFLAGS := -MMD -MP
 PRIVATE_HEADERS := src/core/cli.h src/core/target/native.h src/core/target/services.h src/host/sync.h src/linux_abi/encode.h src/linux_abi/seccomp_vm.h src/translator/guest/x86_64/decoder.h \

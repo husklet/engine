@@ -55,7 +55,8 @@ endforeach()
 add_executable(hl-remote-supervisor tools/remote_supervisor.c)
 target_compile_options(hl-remote-supervisor PRIVATE
   -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-  -Wstrict-prototypes -Wmissing-prototypes)
+  -Wstrict-prototypes -Wmissing-prototypes
+  -Werror=implicit-function-declaration -Werror=implicit-int)
 set_target_properties(hl-remote-supervisor PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/production)
 

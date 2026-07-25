@@ -196,7 +196,8 @@ foreach(_d log fatal)
   target_compile_definitions(test-${_d}-debug PRIVATE HL_ENABLE_LOGGING=1)
   target_compile_options(test-${_d}-debug PRIVATE
     -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-    -Wstrict-prototypes -Wmissing-prototypes -fvisibility=hidden)
+    -Wstrict-prototypes -Wmissing-prototypes
+    -Werror=implicit-function-declaration -Werror=implicit-int -fvisibility=hidden)
   set_target_properties(test-${_d}-debug PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   hl_codesign(test-${_d}-debug)
