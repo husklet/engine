@@ -136,17 +136,6 @@ jobs:
         timeout-minutes: 20
         run: nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
 
-      # The launch test below proves the committed archive WORKS; it cannot see
-      # that it is out of DATE. A slightly stale archive links and launches
-      # guests happily, it just does not contain the change that was made, so a
-      # commit touching src/ or include/ silently ships an archive missing it.
-      # This recomputes the source manifest hash recorded in
-      # pkgs/rust/assets/PROVENANCE.md and fails if the C sources have moved on.
-      # Hashing only -- seconds, no extra compilation.
-      - name: Check the committed crate archives match the C sources
-        timeout-minutes: 15
-        run: nix develop --command make check-crate-archives
-
       - name: Package Rust crate
         timeout-minutes: 20
         run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
@@ -186,6 +175,16 @@ jobs:
       - name: Full Rust integration suite
         timeout-minutes: 25
         run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
+
+      # The launch and integration tests above prove the committed archive
+      # works. This final hard gate independently proves that it is current.
+      # Keep freshness last: regenerating both host archives requires an
+      # aarch64 Linux host plus Apple silicon, so this runner can report but
+      # cannot remediate staleness. A stale manifest must not prevent the
+      # stronger release and integration gates from reporting their results.
+      - name: Check the committed crate archives match the C sources
+        timeout-minutes: 15
+        run: nix develop --command make check-crate-archives
 
   # Runtime compatibility, sharded across parallel runners. This used to be one
   # step inside `linux` running `test-linux-production-typed`, i.e. every suite
