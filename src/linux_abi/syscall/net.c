@@ -317,6 +317,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 ipopt_shadow_clear(r);        // ...nor shadowed IPPROTO_IP/IPV6 options
                 g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_connecting[r] = 0;
+                g_sock_host_backed[r] = 0;
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
                 g_lo_port[r] = 0;
                 g_lo_v6[r] = 0;
@@ -1112,6 +1113,20 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         {
             struct sockaddr_storage ss;
             socklen_t hl = sa_l2m(sa, (socklen_t)a2, &ss);
+            // bind(0.0.0.0, ...) on a virtual network swaps a stream onto the AF_UNIX switch so peer
+            // containers can reach a listener. Linux also permits that bound socket to connect outward.
+            // An external INET sockaddr cannot be passed to the substituted AF_UNIX descriptor
+            // (EAFNOSUPPORT), so restore a real INET stream while retaining the guest-visible local bind
+            // metadata. Drop the now-defunct switch rendezvous only after replacement succeeds.
+            if (hl != (socklen_t)-1 && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
+                (g_lo_port[(int)a0] || g_br_port[(int)a0]) && !g_sock_host_backed[(int)a0]) {
+                if (inet_stream_swap((int)a0) < 0) {
+                    G_RET(c) = (uint64_t)(-errno);
+                    break;
+                }
+                udp_ref_drop((int)a0);
+                g_sock_host_backed[(int)a0] = 1;
+            }
             // When HL_EGRESS_SOCKS is armed, funnel a genuine external TCP
             // connect through the SOCKS5 proxy instead of dialing directly. INERT when unset — egress_should_
             // redirect() short-circuits to 0, so control falls straight to the direct connect() below with no
@@ -1273,7 +1288,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < HL_NFD && g_lo_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_lo_port[fd] && !g_sock_host_backed[fd]) {
             if (g_lo_v6[fd])
                 fill_inet6_lo((uint8_t *)a1, (socklen_t *)a2, g_lo_port[fd]);
             else
@@ -1281,7 +1296,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
-        if (fd >= 0 && fd < HL_NFD && g_br_port[fd]) {
+        if (fd >= 0 && fd < HL_NFD && g_br_port[fd] && !g_sock_host_backed[fd]) {
             fill_inet_br((uint8_t *)a1, (socklen_t *)a2, g_br_ip[fd], g_br_port[fd]);
             G_RET(c) = 0;
             break;

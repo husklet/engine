@@ -1421,6 +1421,11 @@ static uint8_t g_lo_v6[HL_NFD];
 static uint8_t g_lo_v6only[HL_NFD];
 // fd -> 1 if created SOCK_STREAM (only those get loopback isolation)
 static uint8_t g_sock_stream[HL_NFD];
+// A stream that was initially switched to AF_UNIX by a virtual bind may later connect to a genuine
+// external INET peer. In that case getsockname still reports the guest's virtual bind address, while
+// getpeername must query the rehydrated host INET socket instead of mistaking the local virtual address
+// for its peer. Carried across dup and cleared when the descriptor is reused.
+static uint8_t g_sock_host_backed[HL_NFD];
 // fd -> 1 once a stream connect() SUCCEEDED on it. Linux keeps a connected stream socket in SS_CONNECTED
 // (a second connect -> EISCONN) until close, even after the peer sends FIN; macOS drops the peer
 // association after FIN so getpeername() there returns ENOTCONN. This sticky flag lets connect(203) report
@@ -1929,7 +1934,7 @@ static uint16_t lo_alloc_ephemeral(void) {
 static const int lo_carry_opts[] = {SO_REUSEADDR, SO_REUSEPORT, SO_RCVTIMEO, SO_SNDTIMEO,
                                     SO_KEEPALIVE, SO_BROADCAST, SO_OOBINLINE, SO_LINGER};
 
-static int lo_swap(int fd) {
+static int stream_swap(int fd, int family) {
     int fl = fcntl(fd, F_GETFL), df = fcntl(fd, F_GETFD);
     // Snapshot the carried SOL_SOCKET options from the old (INET) fd before dup2 replaces it.
     unsigned char ov[sizeof lo_carry_opts / sizeof lo_carry_opts[0]][64];
@@ -1938,8 +1943,9 @@ static int lo_swap(int fd) {
         ol[i] = sizeof ov[i];
         if (getsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], &ol[i]) < 0) ol[i] = 0;
     }
-    int u = socket(AF_UNIX, SOCK_STREAM, 0);
+    int u = socket(family, SOCK_STREAM, 0);
     if (u < 0) return -1;
+    (void)hl_native_set_no_sigpipe(u);
     if (u != fd) {
         if (dup2(u, fd) < 0) {
             close(u);
@@ -1955,6 +1961,30 @@ static int lo_swap(int fd) {
     for (unsigned i = 0; i < sizeof lo_carry_opts / sizeof lo_carry_opts[0]; i++)
         if (ol[i]) setsockopt(fd, SOL_SOCKET, lo_carry_opts[i], ov[i], ol[i]);
     return 0;
+}
+
+static int lo_swap(int fd) {
+    return stream_swap(fd, AF_UNIX);
+}
+
+// Restore the real INET transport after bind(0.0.0.0, ...) selected the virtual switch but connect()
+// targets an external address. The guest family is retained separately in g_sock_fam even while the host
+// descriptor is AF_UNIX, so IPv4 and IPv6 are reconstructed without inspecting the substituted socket.
+static int inet_stream_swap(int fd) {
+    if (fd < 0 || fd >= HL_NFD) {
+        errno = EBADF;
+        return -1;
+    }
+    int family;
+    if (g_sock_fam[fd] == AF_INET)
+        family = AF_INET;
+    else if (g_sock_fam[fd] == LX_AF_INET6_FAM)
+        family = AF_INET6;
+    else {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    return stream_swap(fd, family);
 }
 
 // report AF_INET 127.0.0.1:port back to the guest
@@ -2033,6 +2063,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_passcred[dst] = g_sock_passcred[src];
     g_sock_conn[dst] = g_sock_conn[src];
     g_sock_connecting[dst] = g_sock_connecting[src];
+    g_sock_host_backed[dst] = g_sock_host_backed[src];
     g_so_error[dst] = g_so_error[src];
     g_so_reuseport[dst] = g_so_reuseport[src];
     memcpy(g_tcp_optval[dst], g_tcp_optval[src], sizeof g_tcp_optval[dst]);
