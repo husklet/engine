@@ -1508,15 +1508,23 @@ static int host_range_writable(uintptr_t a, size_t len) {
         g_hrm_hi = end;
         for (uintptr_t p = lo; p < end; p += 0x1000) {
             uintptr_t begin = p < a ? a : p;
-            volatile uint8_t *first = (volatile uint8_t *)begin;
-            uint8_t value = *first;
-            *first = value;
+            uint8_t *first = (uint8_t *)begin;
+            uint8_t value = __atomic_load_n(first, __ATOMIC_RELAXED);
+            /*
+             * This is a write-intent fault probe, not a mutation.  A plain
+             * load followed by a same-byte store can resurrect the stale
+             * byte over a concurrent guest atomic update (PI futex owner
+             * words exposed this as 0x3ec -> 0x300).  A same-value CAS still
+             * faults on a non-writable mapping, but can only store if the
+             * byte has not changed since our load.
+             */
+            (void)__atomic_compare_exchange_n(first, &value, value, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
             uintptr_t q = p + 0xfff;
             if (q >= end) q = end - 1;
             if (q != begin) {
-                volatile uint8_t *last = (volatile uint8_t *)q;
-                value = *last;
-                *last = value;
+                uint8_t *last = (uint8_t *)q;
+                value = __atomic_load_n(last, __ATOMIC_RELAXED);
+                (void)__atomic_compare_exchange_n(last, &value, value, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
             }
         }
     }

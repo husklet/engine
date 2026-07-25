@@ -19,13 +19,26 @@
 
 static pthread_mutex_t pim;
 static long pisum = 0;
+static int pi_error;
 
 static void *pi_worker(void *a) {
     (void)a;
     for (int i = 0; i < NITER; i++) {
-        pthread_mutex_lock(&pim);
+        int lock_rc = pthread_mutex_lock(&pim);
+        if (lock_rc != 0) {
+            fprintf(stderr, "pi lock failed rc=%d word=%08x\n", lock_rc,
+                    __atomic_load_n((unsigned *)&pim, __ATOMIC_RELAXED));
+            __atomic_store_n(&pi_error, 1, __ATOMIC_RELAXED);
+            return NULL;
+        }
         pisum++; // guarded by the PI mutex; a fake-acquire would let two threads race and lose increments
-        pthread_mutex_unlock(&pim);
+        int unlock_rc = pthread_mutex_unlock(&pim);
+        if (unlock_rc != 0) {
+            fprintf(stderr, "pi unlock failed rc=%d word=%08x\n", unlock_rc,
+                    __atomic_load_n((unsigned *)&pim, __ATOMIC_RELAXED));
+            __atomic_store_n(&pi_error, 1, __ATOMIC_RELAXED);
+            return NULL;
+        }
     }
     return NULL;
 }
@@ -62,5 +75,5 @@ int main(void) {
     if (eod) pthread_mutex_consistent(&rbm);
     pthread_mutex_unlock(&rbm);
     printf("robust eownerdead=%d\n", eod);
-    return 0;
+    return pi_error ? 4 : 0;
 }
